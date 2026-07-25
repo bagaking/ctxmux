@@ -193,10 +193,11 @@ the committed bounded replay window across daemon restart.
 
 Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
-state lock. Exact schema version, SQLite integrity, typed JSON, lifecycle,
-lineage, cursor, contiguous chunk, byte-accounting, and quota invariants are
-validated before the socket is published. Unknown versions or corrupt state
-fail startup; there is no migration, reset, salvage, or partial exposure.
+state lock. Exact schema version, SQLite integrity, typed JSON, a required
+native `RunSpec` satisfying the live-start semantic rules, lifecycle, lineage,
+cursor, contiguous chunk, byte-accounting, and quota invariants are validated
+before the socket is published. Unknown versions or corrupt state fail startup;
+there is no migration, reset, salvage, or partial exposure.
 
 A prior-epoch running record becomes `interrupted { reason: daemon_restart }`
 with `pid: null`. Live PTY ownership and child control are not recovered. An old

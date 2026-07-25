@@ -13,6 +13,7 @@ use ctxmux_protocol::{
     ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, RunEvent, RunId, RunInfo, RunSpec,
     RunState, TerminalSize,
 };
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
@@ -446,6 +447,110 @@ async fn corrupt_replay_generation_fails_closed_without_partial_run_exposure() {
     assert!(!failed_socket.exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn semantically_invalid_native_specs_fail_before_socket_or_sibling_publication() {
+    let temp = TempDir::new().expect("create invalid spec fixture directory");
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let mut first = Daemon::start(socket, &state_dir).await;
+    let client = first.client();
+    let corrupted = client
+        .start(shell_spec("printf 'corrupted-source'"))
+        .await
+        .expect("start corruption source Run");
+    let sibling = client
+        .start(shell_spec("printf 'valid-sibling'"))
+        .await
+        .expect("start valid sibling Run");
+    wait_terminal(&client, corrupted.id).await;
+    wait_terminal(&client, sibling.id).await;
+    first.kill_and_wait();
+
+    let database = state_dir.join("state.sqlite3");
+    let original_json: String = rusqlite::Connection::open(&database)
+        .expect("open state for spec fixture")
+        .query_row(
+            "SELECT spec_json FROM runs WHERE id = ?1",
+            [corrupted.id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("read original native spec");
+    let original: Value = serde_json::from_str(&original_json).expect("parse original native spec");
+
+    let mut empty_program = original.clone();
+    empty_program["program"] = json!("");
+    let mut zero_columns = original.clone();
+    zero_columns["size"]["cols"] = json!(0);
+    let mut zero_rows = original.clone();
+    zero_rows["size"]["rows"] = json!(0);
+    let mut empty_reference = original.clone();
+    empty_reference["declared_inputs"] = json!([{ "kind": "workspace", "reference": "" }]);
+
+    let cases = [
+        ("null", "null".to_owned(), "invalid spec for"),
+        (
+            "empty-program",
+            serde_json::to_string(&empty_program).expect("encode empty program"),
+            "Run program must not be empty",
+        ),
+        (
+            "zero-columns",
+            serde_json::to_string(&zero_columns).expect("encode zero columns"),
+            "terminal rows and columns must be greater than zero",
+        ),
+        (
+            "zero-rows",
+            serde_json::to_string(&zero_rows).expect("encode zero rows"),
+            "terminal rows and columns must be greater than zero",
+        ),
+        (
+            "empty-reference",
+            serde_json::to_string(&empty_reference).expect("encode empty reference"),
+            "Run input references must not be empty",
+        ),
+    ];
+
+    for (label, spec_json, expected) in cases {
+        rewrite_persisted_spec(&database, corrupted.id, &spec_json);
+        let failed_socket = temp.path().join(format!("failed-{label}.sock"));
+        let output = rejected_persistent_daemon(&failed_socket, &state_dir);
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("corrupt"),
+            "unexpected {label} startup error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(expected),
+            "{label} failed through the wrong invariant: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !failed_socket.exists(),
+            "{label} published a socket exposing the valid sibling"
+        );
+        let rejected_client = Client::new(&failed_socket);
+        assert!(matches!(
+            rejected_client.list().await,
+            Err(ClientError::Connect { .. })
+        ));
+        assert!(matches!(
+            rejected_client.attach(sibling.id, 0).await,
+            Err(ClientError::Connect { .. })
+        ));
+    }
+
+    rewrite_persisted_spec(&database, corrupted.id, &original_json);
+    let recovered_socket = temp.path().join("recovered.sock");
+    let recovered = Daemon::start(recovered_socket, &state_dir).await;
+    let recovered_runs = recovered
+        .client()
+        .list()
+        .await
+        .expect("list repaired fixture state");
+    assert!(recovered_runs.iter().any(|run| run.id == corrupted.id));
+    assert!(recovered_runs.iter().any(|run| run.id == sibling.id));
+}
+
 #[test]
 fn unsafe_state_directory_and_sidecar_paths_fail_before_socket_publication() {
     let temp = TempDir::new().expect("create unsafe state path fixture directory");
@@ -493,6 +598,63 @@ fn process_is_alive(pid: u32) -> bool {
         .arg(pid.to_string())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+fn rewrite_persisted_spec(database: &Path, id: RunId, spec_json: &str) {
+    let connection = rusqlite::Connection::open(database).expect("open state to rewrite spec");
+    let updated = connection
+        .execute(
+            "UPDATE runs
+             SET metadata_bytes = metadata_bytes - length(CAST(spec_json AS BLOB)) + ?3,
+                 spec_json = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                id.to_string(),
+                spec_json,
+                i64::try_from(spec_json.len()).expect("fixture spec length fits SQLite")
+            ],
+        )
+        .expect("rewrite persisted native spec and metadata accounting");
+    assert_eq!(updated, 1);
+}
+
+fn rejected_persistent_daemon(socket: &Path, state_dir: &Path) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg("--socket")
+        .arg(socket)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn rejected persistent daemon");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child
+            .try_wait()
+            .expect("poll rejected persistent daemon")
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .expect("collect rejected persistent daemon output");
+            assert!(!output.status.success());
+            return output;
+        }
+        if socket.exists() || Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child
+                .wait_with_output()
+                .expect("reap unexpectedly live persistent daemon");
+            panic!(
+                "invalid state did not fail before socket publication: status={} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn kill_process(pid: u32) {

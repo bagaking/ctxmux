@@ -21,6 +21,8 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::run_spec::validate_run_spec;
+
 const SCHEMA_VERSION: i64 = 1;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
@@ -503,9 +505,9 @@ impl StateStore {
     }
 
     fn insert_start(&mut self, info: &RunInfo) -> Result<(), InsertStartError> {
+        let spec = validate_persistent_start(info)?;
         self.admit_transaction(1024 * 1024)?;
-        let spec_json =
-            serde_json::to_string(&info.spec).map_err(PersistenceError::serialization)?;
+        let spec_json = serde_json::to_string(spec).map_err(PersistenceError::serialization)?;
         let lineage_json = info
             .lineage
             .as_ref()
@@ -1152,9 +1154,7 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
             .parse()
             .map_err(|_| PersistenceError::Corrupt(format!("invalid Run id {id_text:?}")))?;
         let spec_json: String = row.get(1).map_err(PersistenceError::database)?;
-        let _: Option<RunSpec> = serde_json::from_str(&spec_json).map_err(|error| {
-            PersistenceError::Corrupt(format!("invalid spec for {id}: {error}"))
-        })?;
+        let _ = decode_native_spec(id, &spec_json)?;
         let lineage_json: Option<String> = row.get(2).map_err(PersistenceError::database)?;
         if let Some(lineage_json) = &lineage_json {
             let lineage: RunLineage = serde_json::from_str(lineage_json).map_err(|error| {
@@ -1304,11 +1304,10 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
         let id: RunId = id_text
             .parse()
             .map_err(|_| PersistenceError::Corrupt("invalid recovered Run id".to_owned()))?;
-        let spec: Option<RunSpec> = serde_json::from_str(
-            &row.get::<_, String>(1)
-                .map_err(PersistenceError::database)?,
-        )
-        .map_err(PersistenceError::database)?;
+        let spec_json = row
+            .get::<_, String>(1)
+            .map_err(PersistenceError::database)?;
+        let spec = decode_native_spec(id, &spec_json)?;
         let lineage = row
             .get::<_, Option<String>>(2)
             .map_err(PersistenceError::database)?
@@ -1357,7 +1356,7 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
         recovered.push(RecoveredRun {
             info: RunInfo {
                 id,
-                spec,
+                spec: Some(spec),
                 lineage,
                 backend: RunBackend::Native,
                 capabilities: RunCapabilities::NATIVE,
@@ -1377,6 +1376,43 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
         });
     }
     Ok(recovered)
+}
+
+fn validate_persistent_start(info: &RunInfo) -> Result<&RunSpec, PersistenceError> {
+    if info.backend != RunBackend::Native {
+        return Err(PersistenceError::Mutation(
+            "persistent Run start must use the native backend".to_owned(),
+        ));
+    }
+    if info.capabilities != RunCapabilities::NATIVE {
+        return Err(PersistenceError::Mutation(
+            "persistent native Run has invalid capabilities".to_owned(),
+        ));
+    }
+    if !info.state.is_running() {
+        return Err(PersistenceError::Mutation(
+            "persistent Run start must be running".to_owned(),
+        ));
+    }
+    let spec = info.spec.as_ref().ok_or_else(|| {
+        PersistenceError::Mutation(
+            "persistent native Run must have a launch specification".to_owned(),
+        )
+    })?;
+    validate_run_spec(spec).map_err(|error| {
+        PersistenceError::Mutation(format!(
+            "persistent native Run has invalid specification: {error}"
+        ))
+    })?;
+    Ok(spec)
+}
+
+fn decode_native_spec(id: RunId, spec_json: &str) -> Result<RunSpec, PersistenceError> {
+    let spec: RunSpec = serde_json::from_str(spec_json)
+        .map_err(|error| PersistenceError::Corrupt(format!("invalid spec for {id}: {error}")))?;
+    validate_run_spec(&spec)
+        .map_err(|error| PersistenceError::Corrupt(format!("invalid spec for {id}: {error}")))?;
+    Ok(spec)
 }
 
 fn reserve_run_capacity_to(
@@ -1937,6 +1973,71 @@ mod tests {
         assert_eq!(recovered[0].info.id, first.id);
         assert_eq!(recovered[0].replay.chunks, vec![chunk(1, b"committed")]);
         drop(reopened);
+    }
+
+    #[test]
+    fn persistent_insert_rejects_non_native_or_invalid_start_metadata_before_writing() {
+        let temp = TempDir::new().expect("create persistent insert invariant fixture");
+        let base = running_info(RunId::new());
+
+        let mut tmux_backend = base.clone();
+        tmux_backend.backend = RunBackend::Tmux {
+            socket_path: "/tmp/tmux.sock".to_owned(),
+            server_pid: 1,
+            server_started_at: 1,
+            session_id: "$1".to_owned(),
+            window_id: "@1".to_owned(),
+            pane_id: "%1".to_owned(),
+            tmux_version: "3.6b".to_owned(),
+        };
+
+        let mut tmux_capabilities = base.clone();
+        tmux_capabilities.capabilities = RunCapabilities::TMUX_READ_ONLY;
+
+        let mut missing_spec = base.clone();
+        missing_spec.spec = None;
+
+        let mut invalid_spec = base.clone();
+        invalid_spec
+            .spec
+            .as_mut()
+            .expect("fixture has a spec")
+            .program
+            .clear();
+
+        let mut terminal = base;
+        terminal.state = exited_state();
+
+        for (label, info, expected) in [
+            ("tmux-backend", tmux_backend, "native backend"),
+            (
+                "tmux-capabilities",
+                tmux_capabilities,
+                "invalid capabilities",
+            ),
+            ("missing-spec", missing_spec, "launch specification"),
+            (
+                "invalid-spec",
+                invalid_spec,
+                "Run program must not be empty",
+            ),
+            ("terminal-state", terminal, "must be running"),
+        ] {
+            let state_dir = temp.path().join(label);
+            let (persistence, recovered) =
+                Persistence::open(&state_dir).expect("open insert invariant actor");
+            assert!(recovered.is_empty());
+            let Err(error) = persistence.insert_start(&info) else {
+                panic!("invalid persistent insert {label} succeeded");
+            };
+            assert!(error.to_string().contains(expected));
+            drop(persistence);
+
+            let (reopened, recovered) =
+                Persistence::open(state_dir).expect("reopen rejected insert store");
+            assert!(recovered.is_empty(), "{label} left a partial durable row");
+            drop(reopened);
+        }
     }
 
     fn test_connection() -> Connection {

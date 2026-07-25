@@ -22,6 +22,7 @@ use std::{
 };
 
 mod persistence;
+mod run_spec;
 mod tmux;
 
 pub use persistence::PersistenceError;
@@ -35,6 +36,7 @@ use ctxmux_protocol::{
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -735,7 +737,7 @@ impl Run {
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
         G: FnOnce() + Send + 'static,
     {
-        validate_spec(&spec)?;
+        validate_run_spec(&spec).map_err(invalid_run_spec)?;
         let pair = native_pty_system()
             .openpty(to_pty_size(spec.size))
             .map_err(|error| spawn_error("open PTY", error))?;
@@ -1025,7 +1027,7 @@ impl Run {
     }
 
     fn resize(&self, size: TerminalSize) -> Result<RunInfo, ProtocolError> {
-        validate_size(size)?;
+        validate_terminal_size(size).map_err(invalid_run_spec)?;
         self.ensure_running("resize")?;
         let live = self.native_control()?;
         mutex_lock(&live.master)
@@ -1709,34 +1711,8 @@ fn read_output(run: &Run, mut reader: Box<dyn Read + Send>) {
     }
 }
 
-fn validate_spec(spec: &RunSpec) -> Result<(), ProtocolError> {
-    if spec.program.is_empty() {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "Run program must not be empty",
-        ));
-    }
-    if spec
-        .declared_inputs
-        .iter()
-        .any(|input| input.reference.is_empty())
-    {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "Run input references must not be empty",
-        ));
-    }
-    validate_size(spec.size)
-}
-
-fn validate_size(size: TerminalSize) -> Result<(), ProtocolError> {
-    if size.cols == 0 || size.rows == 0 {
-        return Err(ProtocolError::new(
-            ErrorCode::InvalidRequest,
-            "terminal rows and columns must be greater than zero",
-        ));
-    }
-    Ok(())
+fn invalid_run_spec(error: run_spec::RunSpecValidationError) -> ProtocolError {
+    ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
 }
 
 const fn to_pty_size(size: TerminalSize) -> PtySize {
@@ -2075,7 +2051,7 @@ mod tests {
     };
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
-    use ctxmux_protocol::{ErrorCode, RunEvent, RunSpec, TerminalSize};
+    use ctxmux_protocol::{ErrorCode, ForkPlan, RunEvent, RunSpec, TerminalSize};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
@@ -2115,6 +2091,41 @@ mod tests {
                 "{failed_step:?} left child {pid} live or unreaped"
             );
         }
+    }
+
+    #[test]
+    fn run_spec_semantics_map_to_invalid_request_for_start_fork_and_resize() {
+        let manager = RunManager::default();
+
+        let mut invalid_start = long_running_spec();
+        invalid_start.program.clear();
+        let start_error = manager
+            .start(invalid_start)
+            .expect_err("empty start program must fail");
+        assert_eq!(start_error.code, ErrorCode::InvalidRequest);
+        assert_eq!(start_error.message, "Run program must not be empty");
+
+        let parent = manager
+            .start(long_running_spec())
+            .expect("start valid fork parent");
+        let mut invalid_fork = long_running_spec();
+        invalid_fork.program.clear();
+        let fork_error = manager
+            .fork(parent.id, ForkPlan::LevelB { spec: invalid_fork })
+            .expect_err("invalid materialized fork must fail");
+        assert_eq!(fork_error.code, ErrorCode::InvalidRequest);
+        assert_eq!(fork_error.message, "Run program must not be empty");
+
+        let run = manager.get(parent.id).expect("resolve resize fixture Run");
+        let resize_error = run
+            .resize(TerminalSize { cols: 0, rows: 24 })
+            .expect_err("zero-width resize must fail");
+        assert_eq!(resize_error.code, ErrorCode::InvalidRequest);
+        assert_eq!(
+            resize_error.message,
+            "terminal rows and columns must be greater than zero"
+        );
+        run.stop().expect("stop validation fixture Run");
     }
 
     #[test]
