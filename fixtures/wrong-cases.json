@@ -116,12 +116,16 @@
       "invariant": "The public meaning of stop and the eventual child state agree.",
       "preconditions": "A Run child deliberately ignores SIGHUP.",
       "action": "Request stop and observe acknowledgement, Run state, and child liveness.",
-      "oracle": "Characterize whether stop means signal delivery or eventual termination before fixing a stronger contract.",
+      "oracle": "Stop is accepted through the owned child handle and the HUP-ignoring direct child reaches terminal state; repeated stop is rejected.",
       "platform": ["unix"],
       "tags": ["pty", "signals", "stop", "contract"],
-      "disposition": "characterization",
-      "activation_task": "future:stop-semantics-decision",
-      "reason": "The desired stop contract and escalation policy are not yet accepted."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "stop_escalates_past_ignored_hup_and_rejects_repeated_stop"
+        }
+      ]
     },
     {
       "id": "LP-01",
@@ -144,6 +148,10 @@
         {
           "path": "crates/ctxmux-daemon/src/lib.rs",
           "anchor": "socket_path_preparation_removes_only_an_inactive_socket"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "stale_socket_replacement_race_preserves_the_unrelated_live_target"
         },
         {
           "path": "crates/ctxmux-daemon/src/lib.rs",
@@ -225,9 +233,13 @@
       "oracle": "Retained chunks after the caller cursor appear exactly once and missing history is reported as a gap or truncation.",
       "platform": ["unix"],
       "tags": ["lifecycle", "concurrency", "lag", "cursor", "p0"],
-      "disposition": "future",
-      "activation_task": "future:deterministic-public-lag-replay-seam",
-      "reason": "The existing unit test composes a broadcast channel and replay log directly; it does not drive a real attachment through Gap and public cursor-based reattach."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "public_gap_reattaches_from_the_callers_cursor_without_loss_or_duplicates"
+        }
+      ]
     },
     {
       "id": "LC-002",
@@ -265,9 +277,13 @@
       "oracle": "The unrelated process with the recycled PID receives no signal.",
       "platform": ["unix"],
       "tags": ["lifecycle", "pid-reuse", "signal", "race"],
-      "disposition": "future",
-      "activation_task": "future:waiter-signaller-model",
-      "reason": "No deterministic process-identity and waiter/signaller seam exists."
+      "disposition": "covered",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "stop_after_wait_disables_signalling_before_state_publication"
+        }
+      ]
     },
     {
       "id": "OR-001",
@@ -303,9 +319,13 @@
       "oracle": "The client receives an explicit gap and recovered retained chunks contain no silent omission or duplicate.",
       "platform": ["unix"],
       "tags": ["output", "lag", "replay", "cursor", "p0"],
-      "disposition": "future",
-      "activation_task": "future:deterministic-public-lag-replay-seam",
-      "reason": "The existing unit test proves replay cursor arithmetic after channel lag but does not observe Gap and recover through a real attachment."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "public_gap_reattaches_from_the_callers_cursor_without_loss_or_duplicates"
+        }
+      ]
     },
     {
       "id": "OR-003",
@@ -547,14 +567,18 @@
       ],
       "failure_mechanism": "A stale record adopts or signals an unrelated process after numeric PID reuse.",
       "invariant": "Ambiguous recovered identity fails closed and leaves unrelated processes untouched.",
-      "preconditions": "Restart recovery and stable process-identity evidence exist.",
-      "action": "Recover a stale record whose PID now belongs to a different process and request control.",
-      "oracle": "Recovery rejects the record and sends no signal to the unrelated process.",
-      "platform": ["portable"],
+      "preconditions": "Persistent mode contains a running record whose stored PID is replaced with an unrelated live process.",
+      "action": "Kill the owning daemon, substitute the unrelated PID, restart, and request input, resize, stop, and Level B fork.",
+      "oracle": "The Run becomes interrupted with no PID, every live-control request fails, and both the unrelated process and old orphan remain alive.",
+      "platform": ["unix"],
       "tags": ["persistence", "recovery", "pid-reuse", "identity"],
-      "disposition": "future",
-      "activation_task": "future:persistence-recovery",
-      "reason": "Run identity and control currently end with the owning daemon process."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/persistence_recovery.rs",
+          "anchor": "running_record_becomes_interrupted_without_adopting_or_signalling_its_pid"
+        }
+      ]
     },
     {
       "id": "PERSIST-02",
@@ -563,14 +587,18 @@
       "source_refs": ["https://www.sqlite.org/atomiccommit.html"],
       "failure_mechanism": "A crash exposes a parseable mixture of two persistent generations.",
       "invariant": "Recovery selects one complete generation or reports typed corruption.",
-      "preconditions": "A durable Run store with an atomic commit protocol exists.",
-      "action": "Crash at each write, sync, rename, and directory-sync boundary, then recover.",
-      "oracle": "Recovery observes the old or new complete generation, never a mixed state.",
-      "platform": ["portable"],
+      "preconditions": "A stopped SQLite store contains a parseable Run row and replay window.",
+      "action": "Create a cursor/chunk mixed generation that SQLite accepts, then restart through the public daemon entrypoint.",
+      "oracle": "Startup returns typed corruption before publishing the socket or exposing any Run.",
+      "platform": ["unix"],
       "tags": ["persistence", "atomicity", "crash", "corruption"],
-      "disposition": "future",
-      "activation_task": "future:durable-run-store",
-      "reason": "ctxmux has no durable Run store."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/persistence_recovery.rs",
+          "anchor": "corrupt_replay_generation_fails_closed_without_partial_run_exposure"
+        }
+      ]
     },
     {
       "id": "INTEGRATION-01",
@@ -613,6 +641,10 @@
         {
           "path": "packages/sdk/test/codex-integration.test.ts",
           "anchor": "Codex detection fails closed across missing, malformed, incompatible, and hanging probes"
+        },
+        {
+          "path": "packages/sdk/test/codex-integration.test.ts",
+          "anchor": "Codex default probing tolerates the supported cold-start envelope"
         },
         {
           "path": "packages/sdk/test/integration.test.ts",
@@ -682,14 +714,34 @@
       ],
       "failure_mechanism": "A text parser corrupts octal-escaped bytes or mistakes payload for a Control Mode notification.",
       "invariant": "Framing and byte payload decode exactly across supported tmux transcripts.",
-      "preconditions": "T-006 implements the Control Mode parser.",
-      "action": "Replay versioned transcripts with interleaving, octal escapes, invalid UTF-8, and quoted names.",
-      "oracle": "Commands, notifications, pane identities, and decoded payload bytes match the transcript oracle exactly.",
+      "preconditions": "The checked-in Control Mode transcript and public tmux adapter fixtures run through the required gate.",
+      "action": "Replay interleaved command and notification records, octal escapes, invalid UTF-8, quoted names, and malformed post-readiness records.",
+      "oracle": "Command and notification framing stays separate, pane bytes decode exactly, and malformed or oversized post-readiness input becomes tmux_protocol_error.",
       "platform": ["unix"],
       "tags": ["tmux", "control-mode", "parser", "bytes"],
-      "disposition": "future",
-      "activation_task": "future:tmux-backend",
-      "reason": "The tmux Backend and Control Mode parser are not implemented."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/tmux.rs",
+          "anchor": "transcript_parser_separates_blocks_notifications_and_exact_pane_bytes"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/tmux.rs",
+          "anchor": "malformed_or_oversized_control_records_fail_boundedly"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "real_discovery_import_exposes_raw_since_import_without_prehistory"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "malformed_control_mode_after_readiness_is_a_protocol_interruption"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "oversized_control_mode_after_readiness_is_a_protocol_interruption"
+        }
+      ]
     },
     {
       "id": "TMUX-02",
@@ -701,14 +753,22 @@
       ],
       "failure_mechanism": "A slow Control Mode client pauses or disconnects and the adapter later claims a continuous raw stream.",
       "invariant": "The tmux-owned Run stays live and resync exposes an explicit gap without fabricated history.",
-      "preconditions": "T-006 implements tmux flow control, reconnect, and resync semantics.",
-      "action": "Pause or disconnect under pane output load, then reconnect and request resync.",
-      "oracle": "The pane process survives and output continuity is either proven or represented by an explicit gap.",
+      "preconditions": "A public attachment has a caller-owned cursor and a controlled tmux source can pause before emitting new output.",
+      "action": "Pause delivery, emit post-pause output, reattach from the caller cursor, and make a later attachment after the source gap.",
+      "oracle": "The live attachment receives Gap, caller-cursor recovery returns the exact surviving output, late replay remains truncated, and the tmux pane survives.",
       "platform": ["unix"],
       "tags": ["tmux", "flow-control", "resync", "gap"],
-      "disposition": "future",
-      "activation_task": "future:tmux-backend",
-      "reason": "The tmux Backend has no flow-control or resync contract."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "public_pause_emits_exact_gap_and_requests_control_mode_continue"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "replay_keeps_a_tmux_source_gap_visible_to_late_attachments"
+        }
+      ]
     },
     {
       "id": "TMUX-03",
@@ -718,15 +778,23 @@
         "https://github.com/tmux/tmux/commit/800837ff3f21799281525af3d8537f362e5cb43e"
       ],
       "failure_mechanism": "Queued pane output races teardown and leaves dangling adapter ownership or crashes detach.",
-      "invariant": "Detach under load is responsive and idempotent and preserves the tmux-owned pane PID.",
-      "preconditions": "T-006 implements attach and detach against a tmux version matrix.",
-      "action": "Detach repeatedly while pane output and Control Mode notifications remain queued.",
-      "oracle": "Every detach settles without crash, adapter resources close once, and the pane PID survives.",
+      "invariant": "One detach under queued load is responsive, closes adapter ownership once, and preserves the tmux-owned pane PID.",
+      "preconditions": "A real tmux pane is imported through a required qualified-version lane.",
+      "action": "Detach while pane output and Control Mode notifications remain queued, recover exact output by cursor, then shut down ctxmux.",
+      "oracle": "Detach and adapter teardown settle without crash, replay contains the exact queued bytes, and the tmux pane PID and server survive.",
       "platform": ["unix"],
       "tags": ["tmux", "detach", "teardown", "ownership"],
-      "disposition": "future",
-      "activation_task": "future:tmux-backend",
-      "reason": "The tmux Backend does not exist."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "detach_during_queued_output_preserves_replay_and_tmux_session"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "two_clients_disconnect_and_daemon_exit_preserve_tmux_ownership"
+        }
+      ]
     }
   ]
 }

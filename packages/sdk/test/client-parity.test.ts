@@ -14,12 +14,19 @@ import {
   Attachment,
   CtxmuxClient,
   CtxmuxProtocolError,
+  IntegrationProvenanceError,
   defineRun,
   registerIntegration,
+  type IntegrationObserver,
   type RunEvent,
   type RunId,
 } from "../src/index.ts";
-import { codexIntegration } from "../src/integrations/index.ts";
+import {
+  codexIntegration,
+  isCodexSessionProvenance,
+  type CodexSessionProvenance,
+  type CodexSemanticEvent,
+} from "../src/integrations/index.ts";
 
 const execFile = promisify(execFileCallback);
 const daemonBinary = requiredEnvironment("CTXMUXD_BIN");
@@ -181,6 +188,7 @@ if (args[0] === "--version") {
       { prompt, cwd: directory },
       { executable },
     );
+    assert.ok(run.spec);
     assert.deepEqual(run.spec.args, ["exec", "--json", "--", prompt]);
     assert.deepEqual(run.spec.declared_inputs, [
       { kind: "workspace", reference: directory },
@@ -200,22 +208,62 @@ if (args[0] === "--version") {
       attachment.snapshot.replay.head_seq,
       expectedRecord,
     );
-    const threadStarted = registered
-      .createObserver()
-      .observe({
-        type: "output",
-        chunk: {
-          seq: parentOutput.lastSequence,
-          data: [...parentOutput.observed],
-        },
-      })
-      .find((event) => event.name === "thread.started");
-    const sessionId = threadStarted?.data.thread_id;
-    if (typeof sessionId !== "string") {
-      throw new Error("Codex thread.started did not declare a session id");
-    }
-
+    assert.match(
+      new TextDecoder().decode(parentOutput.observed),
+      /session-123/,
+    );
     attachment.close();
+
+    const provenanceAttachment = await client.attach(run.id);
+    const parentObserver = registered.createObserver(run);
+    const session = await waitForCodexSession(
+      provenanceAttachment,
+      parentObserver,
+    );
+    const sessionId = session.sessionId;
+    const unrelatedRecord = JSON.stringify({
+      type: "thread.started",
+      thread_id: "from-unrelated-run",
+    });
+    const unrelated = await client.start(
+      defineRun("/bin/sh", {
+        args: ["-c", `printf '%s\\n' '${unrelatedRecord}'; sleep 30`],
+      }),
+    );
+    const unrelatedAttachment = await client.attach(unrelated.id);
+    const unrelatedOutput = await nextOutputEvent(unrelatedAttachment);
+    assert.throws(
+      () => parentObserver.observe(unrelatedOutput),
+      (error: unknown) => error instanceof IntegrationProvenanceError,
+      "another Run's real attachment event must not authenticate the parent",
+    );
+    const beforeRejectedForks = (await client.list()).map(({ id }) => id);
+    const rejectedConfig = {
+      session,
+      prompt: "must not create a child",
+      cwd: directory,
+    };
+    await assert.rejects(
+      registered.forkLevelB(unrelated, rejectedConfig, { executable }),
+      (error: unknown) => error instanceof IntegrationProvenanceError,
+    );
+    await assert.rejects(
+      registered.forkLevelB(
+        run,
+        { ...rejectedConfig, session: { ...session } },
+        { executable },
+      ),
+      (error: unknown) => error instanceof IntegrationProvenanceError,
+    );
+    assert.deepEqual(
+      (await client.list()).map(({ id }) => id),
+      beforeRejectedForks,
+      "rejected provenance must not create a daemon Run",
+    );
+    unrelatedAttachment.close();
+    await client.stop(unrelated.id);
+
+    provenanceAttachment.close();
     const rawStatus = await waitForNoAttachments(client, run.id);
     assert.equal(rawStatus.pid, pid);
     assert.equal(rawStatus.state.type, "running");
@@ -224,7 +272,7 @@ if (args[0] === "--version") {
     const child = await registered.forkLevelB(
       run,
       {
-        sessionId,
+        session,
         prompt: continuation,
         cwd: directory,
         artifactReferences: [artifactReference],
@@ -237,6 +285,7 @@ if (args[0] === "--version") {
       parent: run.id,
       fidelity: "level_b",
     });
+    assert.ok(child.spec);
     assert.deepEqual(child.spec.args, [
       "exec",
       "resume",
@@ -270,6 +319,87 @@ if (args[0] === "--version") {
   },
 );
 
+test(
+  "TypeScript SDK imports one real tmux pane through the public read-only Run boundary",
+  { timeout: 20_000 },
+  async (context) => {
+    const { client } = await startTestDaemon(context);
+    const tmux = await startTmuxFixture(context);
+    if (tmux === undefined) {
+      return;
+    }
+
+    const discovered = await step(
+      "discover real tmux pane",
+      client.discoverTmux(tmux.socketPath),
+    );
+    assert.equal(discovered.tmuxVersion, tmux.serverVersion);
+    const pane = discovered.panes.find(
+      ({ session_id }) => session_id === tmux.sessionId,
+    );
+    assert.ok(pane, "SDK discovery must expose the selected tmux session");
+    assert.equal(pane.socket_path, tmux.socketPath);
+    assert.equal(pane.tmux_version, tmux.serverVersion);
+
+    const run = await step(
+      "import real tmux pane",
+      client.importTmux(tmux.socketPath, pane.pane_id),
+    );
+    assert.equal(run.backend.type, "tmux");
+    if (run.backend.type !== "tmux") {
+      throw new Error("imported pane did not expose the tmux backend");
+    }
+    assert.equal(run.backend.pane_id, pane.pane_id);
+    assert.deepEqual(run.capabilities, {
+      input: false,
+      resize: false,
+      stop: false,
+      fork_level_a: false,
+      fork_level_b: false,
+      replay: "raw_since_import",
+    });
+
+    const attachment = await step(
+      "attach imported tmux pane",
+      client.attach(run.id),
+    );
+    assert.equal(attachment.snapshot.replay.truncated, true);
+    assert.deepEqual(attachment.snapshot.replay.chunks, []);
+    await tmux.command([
+      "send-keys",
+      "-t",
+      pane.pane_id,
+      "sdk-public-output",
+      "Enter",
+    ]);
+    const output = await waitForOutput(
+      attachment,
+      replayBytes(attachment.snapshot.replay.chunks),
+      attachment.snapshot.replay.head_seq,
+      "TMUX:sdk-public-output",
+    );
+    assert.match(text(output.observed), /TMUX:sdk-public-output/);
+    await attachment.detach();
+
+    const afterDetach = await waitForNoAttachments(client, run.id);
+    assert.equal(afterDetach.state.type, "running");
+    assert.equal(await tmux.panePid(pane.pane_id), pane.pane_pid);
+    for (const operation of [
+      () => client.input(run.id, "must-not-reach-tmux"),
+      () => client.resize(run.id, { cols: 100, rows: 40 }),
+      () => client.stop(run.id),
+    ]) {
+      await assert.rejects(
+        operation(),
+        (error: unknown) =>
+          error instanceof CtxmuxProtocolError &&
+          error.code === "unsupported_capability",
+      );
+    }
+    assert.equal(await tmux.panePid(pane.pane_id), pane.pane_pid);
+  },
+);
+
 async function startTestDaemon(context: test.TestContext): Promise<{
   client: CtxmuxClient;
   directory: string;
@@ -293,6 +423,123 @@ async function startTestDaemon(context: test.TestContext): Promise<{
   const client = new CtxmuxClient({ socketPath });
   await waitForDaemon(client, daemon, () => daemonError);
   return { client, directory, socketPath };
+}
+
+async function startTmuxFixture(context: test.TestContext): Promise<
+  | {
+      readonly socketPath: string;
+      readonly serverVersion: string;
+      readonly sessionId: string;
+      command(args: readonly string[]): Promise<string>;
+      panePid(paneId: string): Promise<number>;
+    }
+  | undefined
+> {
+  const executable = process.env.CTXMUX_TMUX_BIN ?? "tmux";
+  try {
+    await execFile(executable, ["-V"]);
+  } catch (error) {
+    if (process.env.CTXMUX_REQUIRE_TMUX === "1") {
+      throw new Error("required tmux executable is unavailable", {
+        cause: error,
+      });
+    }
+    context.diagnostic("skipping real tmux SDK test: tmux is unavailable");
+    context.skip("tmux executable is unavailable");
+    return undefined;
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), "ctxmux-sdk-tmux-"));
+  const socketPath = join(directory, "tmux.sock");
+  const sessionName = "ctxmux-sdk-target";
+  const baseArgs = ["-S", socketPath] as const;
+  const command = async (args: readonly string[]): Promise<string> => {
+    const result = await execFile(executable, [...baseArgs, ...args]);
+    return result.stdout.trim();
+  };
+  await command([
+    "new-session",
+    "-d",
+    "-s",
+    sessionName,
+    "/bin/sh",
+    "-c",
+    concatShell(
+      "stty -echo;",
+      "printf 'BEFORE-IMPORT\\n';",
+      "while IFS= read -r line; do",
+      "printf 'TMUX:%s\\n' \"$line\";",
+      "done",
+    ),
+  ]);
+  let serverPid: number | undefined;
+  context.after(async () => {
+    try {
+      await command(["kill-server"]);
+    } catch (error) {
+      if (serverPid === undefined || processIsRunning(serverPid)) {
+        throw new Error("failed to stop the tmux SDK fixture server", {
+          cause: error,
+        });
+      }
+    }
+    if (serverPid !== undefined) {
+      await waitForProcessExit(serverPid);
+    }
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const serverVersion = await command(["display-message", "-p", "#{version}"]);
+  serverPid = Number(await command(["display-message", "-p", "#{pid}"]));
+  if (!Number.isSafeInteger(serverPid) || serverPid <= 0) {
+    throw new Error("tmux SDK fixture returned an invalid server PID");
+  }
+  const sessionId = await command([
+    "display-message",
+    "-p",
+    "-t",
+    sessionName,
+    "#{session_id}",
+  ]);
+  return {
+    socketPath,
+    serverVersion,
+    sessionId,
+    command,
+    async panePid(paneId: string): Promise<number> {
+      return Number(
+        await command(["display-message", "-p", "-t", paneId, "#{pane_pid}"]),
+      );
+    },
+  };
+}
+
+async function waitForProcessExit(pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() <= deadline) {
+    if (!processIsRunning(pid)) {
+      return;
+    }
+    await delay(20);
+  }
+  throw new Error(`tmux SDK fixture server ${pid} did not exit`);
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ESRCH"
+    ) {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function waitForDaemon(
@@ -368,6 +615,58 @@ async function waitForExit(
     }
   }
   throw new Error("timed out waiting for Run exit");
+}
+
+async function waitForCodexSession(
+  attachment: Attachment,
+  observer: IntegrationObserver<CodexSemanticEvent>,
+): Promise<CodexSessionProvenance> {
+  for (const chunk of attachment.snapshot.replay.chunks) {
+    const session = observer
+      .observe({ type: "output", chunk })
+      .find(isCodexSessionProvenance);
+    if (session !== undefined) {
+      return session;
+    }
+  }
+  const deadline = Date.now() + 5_000;
+  while (Date.now() <= deadline) {
+    const event = await attachment.nextEvent();
+    if (event === undefined || event.type === "exited") {
+      break;
+    }
+    if (event.type === "gap") {
+      throw new Error(`unexpected output gap at ${event.head_seq}`);
+    }
+    const session = observer.observe(event).find(isCodexSessionProvenance);
+    if (session !== undefined) {
+      return session;
+    }
+  }
+  throw new Error("parent attachment did not emit Codex session provenance");
+}
+
+async function nextOutputEvent(
+  attachment: Attachment,
+): Promise<Extract<RunEvent, { type: "output" }>> {
+  const replay = attachment.snapshot.replay.chunks[0];
+  if (replay !== undefined) {
+    return { type: "output", chunk: replay };
+  }
+  const deadline = Date.now() + 5_000;
+  while (Date.now() <= deadline) {
+    const event = await attachment.nextEvent();
+    if (event?.type === "output") {
+      return event;
+    }
+    if (event === undefined || event.type === "exited") {
+      break;
+    }
+    if (event.type === "gap") {
+      throw new Error(`unexpected output gap at ${event.head_seq}`);
+    }
+  }
+  throw new Error("attachment did not produce an output event");
 }
 
 async function waitForNoAttachments(client: CtxmuxClient, id: RunId) {

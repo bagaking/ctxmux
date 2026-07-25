@@ -8,6 +8,7 @@ export type { ByteInput, CtxmuxClientOptions } from "./client.js";
 export {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
+  IntegrationProvenanceError,
   IntegrationUnavailableError,
   registerIntegration,
 } from "./integration.js";
@@ -25,16 +26,22 @@ export type {
   UnavailableIntegrationDetection,
 } from "./integration.js";
 export { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./generated/constants.js";
+export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 export type { ClientFrame } from "./generated/ClientFrame.js";
 export type { ErrorCode } from "./generated/ErrorCode.js";
 export type { ForkFidelity } from "./generated/ForkFidelity.js";
 export type { ForkPlan } from "./generated/ForkPlan.js";
+export type { InterruptionReason } from "./generated/InterruptionReason.js";
 export type { OutputChunk } from "./generated/OutputChunk.js";
 export type { OutputReplay } from "./generated/OutputReplay.js";
+export type { OutputReplayHeader } from "./generated/OutputReplayHeader.js";
 export type { ProtocolError } from "./generated/ProtocolError.js";
+export type { ReplayCapability } from "./generated/ReplayCapability.js";
 export type { Request } from "./generated/Request.js";
 export type { Response } from "./generated/Response.js";
+export type { RunBackend } from "./generated/RunBackend.js";
+export type { RunCapabilities } from "./generated/RunCapabilities.js";
 export type { RunEvent } from "./generated/RunEvent.js";
 export type { RunId } from "./generated/RunId.js";
 export type { RunInfo } from "./generated/RunInfo.js";
@@ -45,6 +52,8 @@ export type { RunSpec } from "./generated/RunSpec.js";
 export type { RunState } from "./generated/RunState.js";
 export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { TerminalSize } from "./generated/TerminalSize.js";
+export type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
+export type { TmuxRunEvent } from "./generated/TmuxRunEvent.js";
 
 import { PROTOCOL_VERSION } from "./generated/constants.js";
 import type { RunSpec } from "./generated/RunSpec.js";

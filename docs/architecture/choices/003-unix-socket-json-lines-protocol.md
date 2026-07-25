@@ -9,17 +9,22 @@ Rust and TypeScript clients need a simple local boundary that survives client re
 
 ## Decision
 
-Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The operator supplies the socket path. The daemon creates it with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket.
+Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The operator supplies the socket path. The daemon creates it with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
 
-The first frame is an exact protocol-generation handshake. Short-lived connections carry one request. Attachment connections carry one snapshot followed by bidirectional control frames and ordered events. One encoded frame is limited to 1 MiB.
+The first frame is an exact protocol-generation handshake. Short-lived connections carry one request. Attachment connections carry one metadata snapshot header, bounded ordered replay-output frames through that header's replay head, then bidirectional control frames and live events. One encoded frame is limited to 1 MiB; total retained replay is not required to fit in one frame.
 
 ## Quality attributes and invariants
 
 - Version mismatch fails before a request is executed.
 - A decoded invalid request receives a typed protocol error.
-- Socket cleanup never intentionally replaces an ordinary file or symlink.
+- Startup stale cleanup and shutdown never intentionally replace or remove an
+  ordinary file, symlink, or independently substituted listener.
 - Closing a transport connection changes attachment state only.
 - Rust and TypeScript enforce the same frame-byte limit.
+- Rust and TypeScript finish ordered replay reassembly before exposing the
+  public attachment snapshot.
+- The wire uses metadata-only `AttachedHeader`/`OutputReplayHeader` types;
+  client-only `AttachedSnapshot` cannot be mistaken for the first frame.
 
 ## Alternatives
 
@@ -30,7 +35,7 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 ## Known constraints
 
-The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. The stale-socket check and removal are separate filesystem operations. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
+The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. Startup revalidation closes the known probe-to-unlink replacement schedule. The shutdown guard retains the bound path's device/inode and removes the pathname only while its current socket identity matches. That check still cannot make pathname recheck plus unlink atomic or rediscover an original socket renamed elsewhere, so a hostile writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
 
 Protocol generation 2 replaces obsolete shapes directly. Compatibility policy is not yet a release guarantee.
 
@@ -48,9 +53,20 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 - Covered now: version mismatch, wrong lifecycle requests, socket mode, active-listener refusal, non-socket and symlink refusal.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.
+- Covered now: retained replay larger than one frame is sent as bounded ordered
+  output events and reassembled exactly by both public clients.
 - Covered now: `fixtures/malformed-protocol-frames.json` drives Rust decode, real-daemon no-mutation, and Node wire checks for malformed JSON, duplicate members at every object level, and invalid UTF-8. A malformed coalesced frame terminates the Node connection before later frames escape.
-- Candidate: fragmented valid frames, Unicode byte-length boundaries, and mid-frame disconnect.
-- Candidate: race between stale-socket probe and removal.
+- Covered now: bounded seeded Rust and TypeScript targets mutate retained
+  malformed plus valid Unicode frames. The TypeScript target partitions bytes
+  before the newline parser, and every successful typed decode must validate or
+  round-trip. The ordinary corpus remains the minimized regression owner.
+- Candidate: a dedicated mid-frame disconnect target and coverage-guided or
+  sanitizer-backed continuous fuzzing.
+- Covered now: a deterministic stale-socket replacement barrier substitutes an
+  unrelated live listener after the inactive probe and proves it is preserved.
+- Covered now: after the old daemon serves a public request, a real replacement
+  listener takes over its pathname; aborting the old server preserves that path
+  and new connections still reach the replacement.
 
 ## Open questions
 
@@ -64,6 +80,9 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 - `docs/protocol.md`
 - `crates/ctxmux-protocol/src/lib.rs`: frames, errors, `MAX_FRAME_BYTES`
+- `crates/ctxmux-protocol/tests/seeded_fuzz.rs`: bounded native byte target
 - `crates/ctxmux-daemon/src/lib.rs`: `prepare_socket_path`, `handle_connection`
 - `packages/sdk/src/wire.ts`
 - `fixtures/malformed-protocol-frames.json`
+- `packages/sdk/test/parser-fuzz.test.ts`
+- `scripts/run-seeded-qualification.mjs`

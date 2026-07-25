@@ -1,0 +1,132 @@
+{
+  "schema": "ctxmux.tmux-control-mode-transcript.v1",
+  "valid_transcript": {
+    "lines": [
+      "%begin 100 7 0",
+      "%output is command text inside a block",
+      "%end 100 7 0",
+      "%session-changed $1 mutable name",
+      "%output %2 A\\134B\\015\\012\\033[31m\\377",
+      "%extended-output %2 42 future fields : C\\000D",
+      "%session-renamed $1 renamed\\040session",
+      "%session-renamed $9 unrelated\\040session",
+      "%window-close @4",
+      "%pause %2",
+      "%continue %2",
+      "%future-notification extensible arguments",
+      "%exit detached"
+    ],
+    "expected": {
+      "primary_output_bytes": [65, 92, 66, 13, 10, 27, 91, 51, 49, 109, 255],
+      "extended_output_bytes": [67, 0, 68],
+      "session_name_bytes": [
+        114, 101, 110, 97, 109, 101, 100, 32, 115, 101, 115, 115, 105, 111, 110
+      ],
+      "unrelated_session_name_bytes": [
+        117, 110, 114, 101, 108, 97, 116, 101, 100, 32, 115, 101, 115, 115, 105,
+        111, 110
+      ]
+    }
+  },
+  "malformed_transcripts": [
+    {
+      "id": "truncated-octal-escape",
+      "lines": ["%output %0 bad\\12"],
+      "expected_error": "truncated tmux octal escape"
+    },
+    {
+      "id": "invalid-octal-escape",
+      "lines": ["%output %0 bad\\89A"],
+      "expected_error": "invalid tmux octal escape"
+    },
+    {
+      "id": "octal-escape-exceeds-byte",
+      "lines": ["%output %0 bad\\400"],
+      "expected_error": "tmux octal escape exceeds one byte"
+    },
+    {
+      "id": "nested-command-block",
+      "lines": ["%begin 1 2 0", "%begin 1 3 0"],
+      "expected_error": "nested tmux command block"
+    },
+    {
+      "id": "mismatched-command-terminator",
+      "lines": ["%begin 1 2 0", "%end 1 3 0"],
+      "expected_error": "tmux command block terminator does not match begin"
+    },
+    {
+      "id": "stray-command-end",
+      "lines": ["%end 1 2 0"],
+      "expected_error": "tmux command block terminator without begin"
+    },
+    {
+      "id": "stray-command-error",
+      "lines": ["%error 1 2 0"],
+      "expected_error": "tmux command block terminator without begin"
+    },
+    {
+      "id": "missing-extended-output-separator",
+      "lines": ["%extended-output %0 42 payload"],
+      "expected_error": "malformed tmux extended-output separator"
+    },
+    {
+      "id": "missing-session-rename-name",
+      "lines": ["%session-renamed $0"],
+      "expected_error": "malformed tmux session-renamed notification"
+    },
+    {
+      "id": "invalid-session-rename-id",
+      "lines": ["%session-renamed renamed renamed\\040session"],
+      "expected_error": "invalid tmux session ID"
+    },
+    {
+      "id": "unframed-control-line",
+      "lines": ["not a control notification"],
+      "expected_error": "tmux emitted an unframed control line"
+    }
+  ],
+  "generated_malformed_transcripts": [
+    {
+      "id": "cumulative-command-block-payload",
+      "begin": "%begin 10 20 0",
+      "line_byte": 120,
+      "line_bytes": 524289,
+      "repeat": 2,
+      "expected_error": "tmux command block output exceeds 1 MiB"
+    },
+    {
+      "id": "command-block-line-count",
+      "begin": "%begin 10 21 0",
+      "line_byte": 120,
+      "line_bytes": 0,
+      "repeat": 32769,
+      "expected_error": "tmux command block has too many output lines"
+    }
+  ],
+  "bounded_lines": [
+    {
+      "id": "exact-budget-at-eof",
+      "payload_bytes": 1048576,
+      "terminator": "none",
+      "accepted": true
+    },
+    {
+      "id": "one-over-budget-at-eof",
+      "payload_bytes": 1048577,
+      "terminator": "none",
+      "accepted": false
+    },
+    {
+      "id": "lf-within-budget",
+      "payload_bytes": 1048575,
+      "terminator": "lf",
+      "accepted": true
+    },
+    {
+      "id": "crlf-within-budget",
+      "payload_bytes": 1048574,
+      "terminator": "crlf",
+      "accepted": true
+    }
+  ]
+}

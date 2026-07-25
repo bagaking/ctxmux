@@ -15,9 +15,13 @@ path = "src/main.rs"
 ctxmux-protocol = { path = "../ctxmux-protocol" }
 futures-util.workspace = true
 portable-pty.workspace = true
+rusqlite.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

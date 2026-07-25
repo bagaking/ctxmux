@@ -8,6 +8,11 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "invalid_run_state",
   "spawn_failed",
   "io",
+  "persistence",
+  "backend_unavailable",
+  "unsupported_backend_version",
+  "unsupported_capability",
+  "target_changed",
   "internal",
 ]);
 
@@ -36,7 +41,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
       response(frame.response, "$frame.response");
       break;
     case "attached":
-      attachedSnapshot(frame.snapshot, "$frame.snapshot");
+      attachedHeader(frame.snapshot, "$frame.snapshot");
       break;
     case "event":
       runEvent(frame.event, "$frame.event");
@@ -63,10 +68,17 @@ function response(value: unknown, path: string): void {
   const valueRecord = record(value, path);
   switch (discriminant(valueRecord, path)) {
     case "started":
+    case "imported":
     case "forked":
     case "status":
     case "accepted":
       runInfo(valueRecord.run, `${path}.run`);
+      return;
+    case "tmux_panes":
+      string(valueRecord.tmux_version, `${path}.tmux_version`);
+      array(valueRecord.panes, `${path}.panes`).forEach((pane, index) =>
+        tmuxPaneInfo(pane, `${path}.panes[${index}]`),
+      );
       return;
     case "runs":
       array(valueRecord.runs, `${path}.runs`).forEach((run, index) =>
@@ -78,10 +90,10 @@ function response(value: unknown, path: string): void {
   }
 }
 
-function attachedSnapshot(value: unknown, path: string): void {
-  const snapshot = record(value, path);
-  runInfo(snapshot.run, `${path}.run`);
-  outputReplay(snapshot.replay, `${path}.replay`);
+function attachedHeader(value: unknown, path: string): void {
+  const header = record(value, path);
+  runInfo(header.run, `${path}.run`);
+  outputReplayHeader(header.replay, `${path}.replay`);
 }
 
 function runEvent(value: unknown, path: string): void {
@@ -91,7 +103,15 @@ function runEvent(value: unknown, path: string): void {
       outputChunk(event.chunk, `${path}.chunk`);
       return;
     case "exited":
-      runState(event.state, `${path}.state`);
+      if (runState(event.state, `${path}.state`) !== "exited") {
+        throw invalid(`${path}.state.type`, '"exited"');
+      }
+      return;
+    case "interrupted":
+      interruptionReason(event.reason, `${path}.reason`);
+      return;
+    case "tmux":
+      tmuxRunEvent(event.event, `${path}.event`);
       return;
     case "gap":
       validateCursorValue(event.head_seq, `${path}.head_seq`);
@@ -107,15 +127,28 @@ function runEvent(value: unknown, path: string): void {
 function runInfo(value: unknown, path: string): void {
   const run = record(value, path);
   runId(run.id, `${path}.id`);
-  runSpec(run.spec, `${path}.spec`);
+  if (run.spec !== null) {
+    runSpec(run.spec, `${path}.spec`);
+  }
   if (run.lineage !== null) {
     runLineage(run.lineage, `${path}.lineage`);
   }
   if (run.pid !== null) {
     unsignedInteger(run.pid, `${path}.pid`, 0xffff_ffff);
   }
+  const backend = runBackend(run.backend, `${path}.backend`);
+  runCapabilities(run.capabilities, `${path}.capabilities`, backend);
+  if (backend === "native" && run.spec === null) {
+    throw invalid(`${path}.spec`, "a native Run specification");
+  }
+  if (backend === "tmux" && run.spec !== null) {
+    throw invalid(`${path}.spec`, "null for an imported tmux pane");
+  }
   runState(run.state, `${path}.state`);
   validateCursorValue(run.head_seq, `${path}.head_seq`);
+  if (run.durable_head_seq !== null) {
+    validateCursorValue(run.durable_head_seq, `${path}.durable_head_seq`);
+  }
   validateCursorValue(run.oldest_seq, `${path}.oldest_seq`);
   safeUnsignedInteger(run.attachments, `${path}.attachments`);
 }
@@ -140,6 +173,82 @@ function runSpec(value: unknown, path: string): void {
   );
 }
 
+function runBackend(value: unknown, path: string): "native" | "tmux" {
+  const backend = record(value, path);
+  switch (discriminant(backend, path)) {
+    case "native":
+      return "native";
+    case "tmux":
+      string(backend.socket_path, `${path}.socket_path`);
+      unsignedInteger(backend.server_pid, `${path}.server_pid`, 0xffff_ffff);
+      validateCursorValue(
+        backend.server_started_at,
+        `${path}.server_started_at`,
+      );
+      tmuxId(backend.session_id, "$", `${path}.session_id`);
+      tmuxId(backend.window_id, "@", `${path}.window_id`);
+      tmuxId(backend.pane_id, "%", `${path}.pane_id`);
+      string(backend.tmux_version, `${path}.tmux_version`);
+      return "tmux";
+    default:
+      throw invalid(`${path}.type`, "a known Run backend");
+  }
+}
+
+function runCapabilities(
+  value: unknown,
+  path: string,
+  backend: "native" | "tmux",
+): void {
+  const capabilities = record(value, path);
+  const input = boolean(capabilities.input, `${path}.input`);
+  const resize = boolean(capabilities.resize, `${path}.resize`);
+  const stop = boolean(capabilities.stop, `${path}.stop`);
+  const forkLevelA = boolean(capabilities.fork_level_a, `${path}.fork_level_a`);
+  const forkLevelB = boolean(capabilities.fork_level_b, `${path}.fork_level_b`);
+  const replay = string(capabilities.replay, `${path}.replay`);
+  const native = backend === "native";
+  if (
+    input !== native ||
+    resize !== native ||
+    stop !== native ||
+    forkLevelA !== native ||
+    forkLevelB !== native ||
+    replay !== (native ? "raw_from_start" : "raw_since_import")
+  ) {
+    throw invalid(path, `capabilities for the ${backend} backend`);
+  }
+}
+
+function tmuxPaneInfo(value: unknown, path: string): void {
+  const pane = record(value, path);
+  string(pane.socket_path, `${path}.socket_path`);
+  string(pane.tmux_version, `${path}.tmux_version`);
+  unsignedInteger(pane.server_pid, `${path}.server_pid`, 0xffff_ffff);
+  validateCursorValue(pane.server_started_at, `${path}.server_started_at`);
+  tmuxId(pane.session_id, "$", `${path}.session_id`);
+  tmuxId(pane.window_id, "@", `${path}.window_id`);
+  tmuxId(pane.pane_id, "%", `${path}.pane_id`);
+  unsignedInteger(pane.pane_pid, `${path}.pane_pid`, 0xffff_ffff);
+  terminalSize(pane.size, `${path}.size`);
+}
+
+function tmuxRunEvent(value: unknown, path: string): void {
+  const event = record(value, path);
+  switch (discriminant(event, path)) {
+    case "session_renamed":
+      array(event.name, `${path}.name`).forEach((byte, index) =>
+        unsignedInteger(byte, `${path}.name[${index}]`, 0xff),
+      );
+      return;
+    case "paused":
+    case "continued":
+      return;
+    default:
+      throw invalid(`${path}.type`, "a known tmux Run event");
+  }
+}
+
 function runInputReference(value: unknown, path: string): void {
   const input = record(value, path);
   const kind = string(input.kind, `${path}.kind`);
@@ -158,27 +267,45 @@ function runLineage(value: unknown, path: string): void {
   }
 }
 
-function runState(value: unknown, path: string): void {
+function runState(
+  value: unknown,
+  path: string,
+): "running" | "exited" | "interrupted" {
   const state = record(value, path);
   switch (discriminant(state, path)) {
     case "running":
-      return;
+      return "running";
     case "exited":
       unsignedInteger(state.code, `${path}.code`, 0xffff_ffff);
       if (state.signal !== null) {
         string(state.signal, `${path}.signal`);
       }
-      return;
+      return "exited";
+    case "interrupted":
+      interruptionReason(state.reason, `${path}.reason`);
+      return "interrupted";
     default:
       throw invalid(`${path}.type`, "a known Run-state discriminant");
   }
 }
 
-function outputReplay(value: unknown, path: string): void {
+function interruptionReason(value: unknown, path: string): void {
+  const reason = string(value, path);
+  if (
+    reason !== "daemon_restart" &&
+    reason !== "tmux_server_unavailable" &&
+    reason !== "tmux_target_changed" &&
+    reason !== "tmux_protocol_error"
+  ) {
+    throw invalid(path, "a known interruption reason");
+  }
+}
+
+function outputReplayHeader(value: unknown, path: string): void {
   const replay = record(value, path);
-  array(replay.chunks, `${path}.chunks`).forEach((chunk, index) =>
-    outputChunk(chunk, `${path}.chunks[${index}]`),
-  );
+  if ("chunks" in replay) {
+    throw invalid(`${path}.chunks`, "absent from the metadata-only header");
+  }
   validateCursorValue(replay.oldest_seq, `${path}.oldest_seq`);
   validateCursorValue(replay.head_seq, `${path}.head_seq`);
   boolean(replay.truncated, `${path}.truncated`);
@@ -214,6 +341,13 @@ function runId(value: unknown, path: string): void {
   }
 }
 
+function tmuxId(value: unknown, prefix: "$" | "@" | "%", path: string): void {
+  const id = string(value, path);
+  if (!new RegExp(`^\\${prefix}[0-9]+$`).test(id)) {
+    throw invalid(path, `a ${prefix}-prefixed tmux ID`);
+  }
+}
+
 function discriminant(value: Record<string, unknown>, path: string): string {
   return string(value.type, `${path}.type`);
 }
@@ -239,10 +373,11 @@ function string(value: unknown, path: string): string {
   return value;
 }
 
-function boolean(value: unknown, path: string): void {
+function boolean(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") {
     throw invalid(path, "a boolean");
   }
+  return value;
 }
 
 function validateCursorValue(value: unknown, path: string): void {

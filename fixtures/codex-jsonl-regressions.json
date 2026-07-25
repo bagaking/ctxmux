@@ -1,0 +1,52 @@
+{
+  "schema": "ctxmux.codex-jsonl-regressions.v1",
+  "cases": [
+    {
+      "id": "partitioned-thread-started",
+      "chunks": [
+        [123, 34, 116, 121, 112, 101, 34, 58, 34, 116, 104, 114],
+        [101, 97, 100, 46, 115, 116, 97, 114, 116, 101, 100, 34, 44, 34],
+        [116, 104, 114, 101, 97, 100, 95, 105, 100, 34, 58, 34],
+        [115, 101, 115, 115, 105, 111, 110, 45, 102, 117, 122, 122, 34, 125, 10]
+      ],
+      "terminal": "none",
+      "expected_names": ["thread.started"],
+      "expected_diagnostics": []
+    },
+    {
+      "id": "invalid-json-line",
+      "chunks": [[110, 111, 116, 32, 106, 115, 111, 110, 10]],
+      "terminal": "none",
+      "expected_names": ["integration.parse_error"],
+      "expected_diagnostics": ["invalid_json"]
+    },
+    {
+      "id": "invalid-utf8-line",
+      "chunks": [[255, 10]],
+      "terminal": "none",
+      "expected_names": ["integration.parse_error"],
+      "expected_diagnostics": ["invalid_utf8"]
+    },
+    {
+      "id": "partial-record-reset-by-gap",
+      "chunks": [[123, 34, 116]],
+      "terminal": "gap",
+      "expected_names": ["integration.parse_error"],
+      "expected_diagnostics": ["output_gap"]
+    },
+    {
+      "id": "final-line-without-newline",
+      "chunks": [
+        [
+          123, 34, 116, 121, 112, 101, 34, 58, 34, 116, 117, 114, 110, 46, 99,
+          111, 109, 112, 108, 101, 116, 101, 100, 34, 44, 34, 117, 115, 97, 103,
+          101, 34, 58, 123, 34, 116, 111, 116, 97, 108, 95, 116, 111, 107, 101,
+          110, 115, 34, 58, 49, 125, 125
+        ]
+      ],
+      "terminal": "exit",
+      "expected_names": ["turn.completed"],
+      "expected_diagnostics": []
+    }
+  ]
+}

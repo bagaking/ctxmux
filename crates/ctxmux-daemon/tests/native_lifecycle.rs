@@ -93,7 +93,23 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.child.try_wait().ok().flatten().is_none() {
+            let interrupted = Command::new("kill")
+                .arg("-INT")
+                .arg(self.child.id().to_string())
+                .status()
+                .is_ok_and(|status| status.success());
+            if interrupted {
+                for _ in 0..100 {
+                    match self.child.try_wait() {
+                        Ok(Some(_)) => return,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                        Err(_) => break,
+                    }
+                }
+            }
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -161,6 +177,10 @@ async fn wait_for_output(
                 RunEvent::Exited { state } => {
                     panic!("Run exited before expected output: {state:?}")
                 }
+                RunEvent::Interrupted { reason } => {
+                    panic!("Run was interrupted before expected output: {reason:?}")
+                }
+                RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
             }
         }
     })
@@ -180,6 +200,10 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                 RunEvent::Exited { state } => return state,
                 RunEvent::Output { .. } | RunEvent::Accepted { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
+                RunEvent::Interrupted { reason } => {
+                    panic!("live Run was unexpectedly interrupted: {reason:?}")
+                }
+                RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
             }
         }
     })
@@ -315,6 +339,16 @@ fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
         ClientError::Protocol { code, .. } => assert_eq!(code, expected),
         other => panic!("expected protocol error {expected:?}, got {other:?}"),
     }
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -470,7 +504,7 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
         .start(spec.clone())
         .await
         .expect("start parent Run");
-    assert_eq!(parent.spec, spec);
+    assert_eq!(parent.spec, Some(spec));
     assert_eq!(parent.lineage, None);
 
     let child = daemon
@@ -488,7 +522,7 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
             fidelity: ForkFidelity::LevelA,
         })
     );
-    let mut rejected_spec = parent.spec.clone();
+    let mut rejected_spec = parent.spec.clone().expect("native parent has a spec");
     rejected_spec.declared_inputs.push(RunInputReference {
         kind: RunInputKind::Context,
         reference: String::new(),
@@ -640,6 +674,62 @@ async fn protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
+    // A 4 MiB raw replay expands far beyond the 1 MiB JSON frame cap when
+    // bytes are integer arrays. The public client must receive ordered replay
+    // chunks across frames instead of losing the retained contract at attach.
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "head -c 5242880 /dev/zero; printf FRAME-SPLIT-FINAL".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start frame-split replay Run");
+    wait_until_exited(&daemon.client, run.id).await;
+
+    let (_, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("stream retained replay across protocol frames");
+    let replay = replay_bytes(&snapshot.replay.chunks);
+    assert!(snapshot.replay.truncated);
+    assert!(replay.len() >= 4 * 1024 * 1024 - 8192);
+    assert!(replay.len() <= 4 * 1024 * 1024);
+    let marker = b"FRAME-SPLIT-FINAL";
+    let zero_prefix = replay
+        .len()
+        .checked_sub(marker.len())
+        .expect("retained replay contains the final marker");
+    assert!(replay[..zero_prefix].iter().all(|byte| *byte == 0));
+    assert_eq!(&replay[zero_prefix..], marker);
+    assert_eq!(
+        snapshot.replay.chunks.first().map(|chunk| chunk.seq),
+        Some(snapshot.replay.oldest_seq)
+    );
+    assert_eq!(
+        snapshot.replay.chunks.last().map(|chunk| chunk.seq),
+        Some(snapshot.replay.head_seq)
+    );
+    assert!(
+        snapshot
+            .replay
+            .chunks
+            .windows(2)
+            .all(|pair| pair[1].seq == pair[0].seq + 1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
     // LC-002 / OR-001: final state must not make retained raw bytes
     // unreachable, including NUL, invalid UTF-8, and split control bytes.
@@ -723,26 +813,35 @@ async fn native_pty_child_does_not_inherit_an_ambient_daemon_descriptor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_terminates_a_live_run_and_rejects_repeated_stop() {
+async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
     let daemon = TestDaemon::start().await;
     let run = daemon
         .client
         .start(RunSpec {
             program: "/bin/sh".to_owned(),
-            args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
+            args: vec![
+                "-c".to_owned(),
+                "trap '' HUP; printf 'READY\\n'; while :; do sleep 1; done".to_owned(),
+            ],
             cwd: None,
             env: BTreeMap::default(),
             size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
-        .expect("start long-lived Run");
+        .expect("start HUP-ignoring Run");
+    let pid = run.pid.expect("direct child exposes a PID");
 
-    let (attachment, _) = daemon
+    let (mut attachment, snapshot) = daemon
         .client
         .attach(run.id, 0)
         .await
         .expect("attach before clean detach");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
     attachment.detach().await.expect("detach cleanly");
     assert_eq!(
         daemon
@@ -753,18 +852,16 @@ async fn stop_terminates_a_live_run_and_rejects_repeated_stop() {
             .attachments,
         0
     );
-    daemon.client.stop(run.id).await.expect("stop live Run");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let status = daemon.client.status(run.id).await.expect("read stop state");
-            if !status.state.is_running() {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("stopped Run should exit");
+    daemon
+        .client
+        .stop(run.id)
+        .await
+        .expect("stop HUP-ignoring Run");
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
+    assert!(
+        !process_exists(pid),
+        "stopped direct child {pid} remained live"
+    );
     assert_protocol_error(
         daemon
             .client

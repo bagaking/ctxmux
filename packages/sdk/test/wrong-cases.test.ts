@@ -68,7 +68,7 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
     });
     peer.send({
       type: "attached",
-      snapshot: snapshot(Number.MAX_SAFE_INTEGER),
+      snapshot: attachedHeader(Number.MAX_SAFE_INTEGER),
     });
   });
 
@@ -86,6 +86,19 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
 
 test("SC-02 rejects malformed nested runtime frames", () => {
   const mutations: readonly [unknown, string][] = [
+    [{ type: "invented" }, "$frame.type"],
+    [
+      { type: "response", response: { type: "invented" } },
+      "$frame.response.type",
+    ],
+    [
+      { type: "response", response: { type: "started", run: null } },
+      "$frame.response.run",
+    ],
+    [
+      { type: "response", response: { type: "runs", runs: {} } },
+      "$frame.response.runs",
+    ],
     [
       {
         type: "response",
@@ -95,13 +108,57 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     ],
     [
       {
+        type: "response",
+        response: { type: "started", run: { ...runInfo(), id: "invalid" } },
+      },
+      "$frame.response.run.id",
+    ],
+    [
+      {
+        type: "response",
+        response: { type: "started", run: { ...runInfo(), pid: -1 } },
+      },
+      "$frame.response.run.pid",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: { ...runInfo(), durable_head_seq: -1 },
+        },
+      },
+      "$frame.response.run.durable_head_seq",
+    ],
+    [
+      {
         type: "attached",
         snapshot: {
-          ...snapshot(),
-          replay: { ...snapshot().replay, truncated: "false" },
+          ...attachedHeader(),
+          replay: { ...attachedHeader().replay, truncated: "false" },
         },
       },
       "$frame.snapshot.replay.truncated",
+    ],
+    [
+      {
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(),
+          replay: { ...attachedHeader().replay, oldest_seq: "0" },
+        },
+      },
+      "$frame.snapshot.replay.oldest_seq",
+    ],
+    [
+      {
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(),
+          replay: { ...attachedHeader().replay, chunks: [] },
+        },
+      },
+      "$frame.snapshot.replay.chunks",
     ],
     [
       {
@@ -109,6 +166,27 @@ test("SC-02 rejects malformed nested runtime frames", () => {
         event: { type: "output", chunk: { seq: 1, data: [0, 256] } },
       },
       "$frame.event.chunk.data[1]",
+    ],
+    [
+      {
+        type: "event",
+        event: {
+          type: "exited",
+          state: { type: "exited", code: 0, signal: 9 },
+        },
+      },
+      "$frame.event.state.signal",
+    ],
+    [
+      { type: "event", event: { type: "exited", state: { type: "invented" } } },
+      "$frame.event.state.type",
+    ],
+    [
+      {
+        type: "event",
+        event: { type: "interrupted", reason: "invented" },
+      },
+      "$frame.event.reason",
     ],
     [
       {
@@ -180,7 +258,7 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
     { type: "response", response: { type: "runs", runs: [runInfo()] } },
     { type: "response", response: { type: "status", run: runInfo() } },
     { type: "response", response: { type: "accepted", run: runInfo() } },
-    { type: "attached", snapshot: snapshot() },
+    { type: "attached", snapshot: attachedHeader() },
     {
       type: "event",
       event: { type: "output", chunk: { seq: 1, data: [0, 10, 255] } },
@@ -191,6 +269,14 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
         type: "exited",
         state: { type: "exited", code: 7, signal: null },
       },
+    },
+    {
+      type: "event",
+      event: { type: "interrupted", reason: "daemon_restart" },
+    },
+    {
+      type: "event",
+      event: { type: "interrupted", reason: "tmux_protocol_error" },
     },
     { type: "event", event: { type: "gap", head_seq: 1 } },
     { type: "event", event: { type: "accepted", run: runInfo() } },
@@ -256,6 +342,101 @@ test("LP-02 enforces the exact frame ceiling with and without a delimiter", asyn
   }
 });
 
+test("LP-02 reassembles retained replay streamed across bounded frames", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: { type: "attach", id: RUN_ID, after_seq: 0 },
+    });
+    peer.send({
+      type: "attached",
+      snapshot: {
+        ...attachedHeader(2),
+        replay: {
+          oldest_seq: 1,
+          head_seq: 2,
+          truncated: false,
+        },
+      },
+    });
+    peer.send({
+      type: "event",
+      event: { type: "output", chunk: { seq: 1, data: [0, 255] } },
+    });
+    peer.send({
+      type: "event",
+      event: { type: "output", chunk: { seq: 2, data: [1, 2, 3] } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  assert.deepEqual(attachment.snapshot.replay.chunks, [
+    { seq: 1, data: [0, 255] },
+    { seq: 2, data: [1, 2, 3] },
+  ]);
+  attachment.close();
+});
+
+test("LP-02 settles a truncated empty replay without inventing sequence zero", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: { type: "attach", id: RUN_ID, after_seq: 0 },
+    });
+    peer.send({
+      type: "attached",
+      snapshot: {
+        ...attachedHeader(),
+        replay: { oldest_seq: 0, head_seq: 0, truncated: true },
+      },
+    });
+  });
+
+  const attachment = await settleWithin(
+    new CtxmuxClient({ socketPath: daemon.socketPath }).attach(RUN_ID),
+    1_000,
+  );
+  assert.equal(attachment.snapshot.replay.truncated, true);
+  assert.deepEqual(attachment.snapshot.replay.chunks, []);
+  attachment.close();
+});
+
+test("LP-02 resumes after a retained source gap from the caller cursor", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: { type: "attach", id: RUN_ID, after_seq: 2 },
+    });
+    peer.send({
+      type: "attached",
+      snapshot: {
+        ...attachedHeader(3),
+        replay: { oldest_seq: 1, head_seq: 3, truncated: true },
+      },
+    });
+    peer.send({
+      type: "event",
+      event: { type: "output", chunk: { seq: 3, data: [3] } },
+    });
+  });
+
+  const attachment = await settleWithin(
+    new CtxmuxClient({ socketPath: daemon.socketPath }).attach(RUN_ID, 2),
+    1_000,
+  );
+  assert.equal(attachment.snapshot.replay.truncated, true);
+  assert.deepEqual(attachment.snapshot.replay.chunks, [{ seq: 3, data: [3] }]);
+  attachment.close();
+});
+
 test("LP-03 fails closed after a malformed coalesced frame", async () => {
   for (const delivery of ["queued", "waiting"] as const) {
     const socket = new Socket();
@@ -300,7 +481,7 @@ test(
         type: "request",
         request: { type: "attach", id: RUN_ID, after_seq: 0 },
       });
-      peer.send({ type: "attached", snapshot: snapshot() });
+      peer.send({ type: "attached", snapshot: attachedHeader() });
       assert.deepEqual(await peer.receive(), { type: "detach" });
       detachReceived.resolve();
       await releaseAcknowledgement.promise;
@@ -330,7 +511,7 @@ test(
       const peer = new MockPeer(socket);
       await peer.handshake();
       await peer.receive();
-      peer.send({ type: "attached", snapshot: snapshot() });
+      peer.send({ type: "attached", snapshot: attachedHeader() });
       const next = await peer.receiveOptional();
       assert.equal(next, undefined, "abrupt close sent a clean detach frame");
       abruptPeerClosed.resolve();
@@ -394,7 +575,7 @@ test(
       const peer = new MockPeer(socket);
       await peer.handshake();
       await peer.receive();
-      peer.send({ type: "attached", snapshot: snapshot() });
+      peer.send({ type: "attached", snapshot: attachedHeader() });
       floodStarted.resolve();
       for (let sequence = 1; sequence <= frameCount; sequence += 1) {
         await peer.sendWithBackpressure({
@@ -502,14 +683,17 @@ async function mockDaemon(
   const directory = await mkdtemp(join(tmpdir(), "ctxmux-sdk-fixture-"));
   const socketPath = join(directory, "daemon.sock");
   const handlerFailures: Promise<void>[] = [];
+  const sockets = new Set<Socket>();
   const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
     const failure = handler(socket);
     handlerFailures.push(failure);
     void failure.catch(() => undefined);
   });
   await listen(server, socketPath);
   context.after(async () => {
-    await closeServer(server);
+    await closeServer(server, sockets);
     await Promise.all(handlerFailures);
     await rm(directory, { recursive: true, force: true });
   });
@@ -521,12 +705,17 @@ async function listen(server: Server, socketPath: string): Promise<void> {
   await once(server, "listening");
 }
 
-async function closeServer(server: Server): Promise<void> {
+async function closeServer(
+  server: Server,
+  sockets: ReadonlySet<Socket>,
+): Promise<void> {
   if (!server.listening) {
     return;
   }
+  const closed = once(server, "close");
   server.close();
-  await once(server, "close");
+  for (const socket of sockets) socket.destroy();
+  await closed;
 }
 
 function runInfo() {
@@ -541,19 +730,28 @@ function runInfo() {
       declared_inputs: [],
     },
     lineage: null,
+    backend: { type: "native" as const },
+    capabilities: {
+      input: true,
+      resize: true,
+      stop: true,
+      fork_level_a: true,
+      fork_level_b: true,
+      replay: "raw_from_start" as const,
+    },
     pid: 42,
     state: { type: "running" as const },
     head_seq: 1,
+    durable_head_seq: null,
     oldest_seq: 1,
     attachments: 1,
   };
 }
 
-function snapshot(headSequence = 1) {
+function attachedHeader(headSequence = 0) {
   return {
     run: { ...runInfo(), head_seq: headSequence, oldest_seq: headSequence },
     replay: {
-      chunks: [],
       oldest_seq: headSequence,
       head_seq: headSequence,
       truncated: false,

@@ -205,7 +205,7 @@ export class JsonLinesConnection {
 
   #parse(line: string): unknown {
     try {
-      return parseJson(line);
+      return parseJsonFrame(line);
     } catch (error) {
       const terminalError = asError(error);
       this.#buffer = Buffer.alloc(0);
@@ -232,7 +232,8 @@ export class JsonLinesConnection {
   }
 }
 
-function parseJson(line: string): unknown {
+/** @internal Parse one complete wire frame for corpus and fuzz qualification. */
+export function parseJsonFrame(line: string): unknown {
   try {
     rejectDuplicateObjectMembers(line);
     return JSON.parse(line) as unknown;

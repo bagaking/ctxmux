@@ -1,0 +1,1888 @@
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    fs::{self, File, OpenOptions},
+    io,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use ctxmux_protocol::{
+    InterruptionReason, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo,
+    RunLineage, RunSpec, RunState,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use thiserror::Error;
+use uuid::Uuid;
+
+const SCHEMA_VERSION: i64 = 1;
+const DATABASE_FILE: &str = "state.sqlite3";
+const LOCK_FILE: &str = "state.lock";
+const PAGE_SIZE_BYTES: u64 = 4 * 1024;
+const DATABASE_MAX_BYTES: u64 = 384 * 1024 * 1024;
+const DATABASE_MAX_PAGES: u64 = DATABASE_MAX_BYTES / PAGE_SIZE_BYTES;
+const WAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+const WAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const SHM_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const STATE_FILES_MAX_BYTES: u64 = 404 * 1024 * 1024;
+const PER_RUN_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
+const GLOBAL_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
+const METADATA_BYTES: u64 = 64 * 1024 * 1024;
+const RUN_RECORDS: u64 = 4_096;
+const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
+const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
+const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
+
+#[derive(Debug, Error)]
+pub enum PersistenceError {
+    #[error("invalid ctxmux state directory {path}: {message}")]
+    InvalidDirectory { path: PathBuf, message: String },
+    #[error("ctxmux state directory is already in use: {0}")]
+    StateInUse(PathBuf),
+    #[error("unsupported ctxmux state schema {found}; expected {expected}")]
+    UnsupportedSchema { found: i64, expected: i64 },
+    #[error("ctxmux durable state is corrupt: {0}")]
+    Corrupt(String),
+    #[error("ctxmux durable state I/O failed at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("ctxmux durable state database failed: {0}")]
+    Database(String),
+    #[error("ctxmux persistence actor stopped")]
+    ActorStopped,
+    #[error("failed to start ctxmux persistence actor: {0}")]
+    ActorStart(String),
+    #[error("ctxmux durable state rejected a mutation: {0}")]
+    Mutation(String),
+}
+
+impl PersistenceError {
+    fn io(path: impl Into<PathBuf>, source: io::Error) -> Self {
+        Self::Io {
+            path: path.into(),
+            source,
+        }
+    }
+
+    fn database(error: impl std::fmt::Display) -> Self {
+        Self::Database(error.to_string())
+    }
+}
+
+pub(crate) struct RecoveredRun {
+    pub(crate) info: RunInfo,
+    pub(crate) replay: OutputReplay,
+}
+
+#[derive(Clone)]
+pub(crate) struct Persistence {
+    inner: Arc<PersistenceInner>,
+}
+
+struct PersistenceInner {
+    sender: mpsc::SyncSender<Command>,
+    failure: Arc<Mutex<Option<String>>>,
+    join: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl Drop for PersistenceInner {
+    fn drop(&mut self) {
+        let _ = self.sender.send(Command::Shutdown);
+        if let Some(join) = mutex_lock(&self.join).take() {
+            let _ = join.join();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PersistentRun {
+    persistence: Persistence,
+    durable_head: Arc<AtomicU64>,
+}
+
+impl PersistentRun {
+    pub(crate) fn durable_head(&self) -> u64 {
+        self.durable_head.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn append(&self, id: RunId, replay: OutputReplay) {
+        if mutex_lock(&self.persistence.inner.failure).is_some() {
+            return;
+        }
+        let _ = self.persistence.inner.sender.send(Command::Append {
+            id,
+            replay,
+            durable_head: Arc::clone(&self.durable_head),
+        });
+    }
+
+    pub(crate) fn finalize(&self, id: RunId, replay: OutputReplay, state: RunState) {
+        if mutex_lock(&self.persistence.inner.failure).is_some() {
+            return;
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        if self
+            .persistence
+            .inner
+            .sender
+            .send(Command::Finalize {
+                id,
+                replay,
+                state,
+                durable_head: Arc::clone(&self.durable_head),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let _ = reply_rx.recv();
+    }
+}
+
+impl Persistence {
+    pub(crate) fn open(
+        state_dir: impl Into<PathBuf>,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        let state_dir = state_dir.into();
+        let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
+        let (init_tx, init_rx) = mpsc::sync_channel(0);
+        let failure = Arc::new(Mutex::new(None));
+        let actor_failure = Arc::clone(&failure);
+        let join = thread::Builder::new()
+            .name("ctxmux-persistence".to_owned())
+            .spawn(move || actor_main(&state_dir, &command_rx, &init_tx, &actor_failure))
+            .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
+        let recovered = match init_rx.recv() {
+            Ok(Ok(recovered)) => recovered,
+            Ok(Err(error)) => {
+                let _ = join.join();
+                return Err(error);
+            }
+            Err(_) => {
+                let _ = join.join();
+                return Err(PersistenceError::ActorStopped);
+            }
+        };
+        let persistence = Self {
+            inner: Arc::new(PersistenceInner {
+                sender: command_tx,
+                failure,
+                join: Mutex::new(Some(join)),
+            }),
+        };
+        Ok((persistence, recovered))
+    }
+
+    pub(crate) fn insert_start(&self, info: &RunInfo) -> Result<PersistentRun, PersistenceError> {
+        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
+            return Err(PersistenceError::Mutation(message));
+        }
+        let durable_head = Arc::new(AtomicU64::new(0));
+        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        self.inner
+            .sender
+            .send(Command::InsertStart {
+                info: Box::new(info.clone()),
+                reply: reply_tx,
+            })
+            .map_err(|_| PersistenceError::ActorStopped)?;
+        reply_rx
+            .recv()
+            .map_err(|_| PersistenceError::ActorStopped)??;
+        Ok(PersistentRun {
+            persistence: self.clone(),
+            durable_head,
+        })
+    }
+
+    pub(crate) fn recovered_run(&self, durable_head: u64) -> PersistentRun {
+        PersistentRun {
+            persistence: self.clone(),
+            durable_head: Arc::new(AtomicU64::new(durable_head)),
+        }
+    }
+}
+
+enum Command {
+    InsertStart {
+        info: Box<RunInfo>,
+        reply: mpsc::SyncSender<Result<(), PersistenceError>>,
+    },
+    Append {
+        id: RunId,
+        replay: OutputReplay,
+        durable_head: Arc<AtomicU64>,
+    },
+    Finalize {
+        id: RunId,
+        replay: OutputReplay,
+        state: RunState,
+        durable_head: Arc<AtomicU64>,
+        reply: mpsc::SyncSender<Result<(), PersistenceError>>,
+    },
+    Shutdown,
+}
+
+fn actor_main(
+    state_dir: &Path,
+    receiver: &mpsc::Receiver<Command>,
+    init: &mpsc::SyncSender<Result<Vec<RecoveredRun>, PersistenceError>>,
+    failure: &Mutex<Option<String>>,
+) {
+    let (mut store, recovered) = match StateStore::open(state_dir) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = init.send(Err(error));
+            return;
+        }
+    };
+    if init.send(Ok(recovered)).is_err() {
+        return;
+    }
+
+    let mut pending = VecDeque::new();
+    loop {
+        let command = match pending.pop_front() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => return,
+            },
+        };
+        match command {
+            Command::InsertStart { info, reply } => {
+                let result = if let Some(message) = mutex_lock(failure).clone() {
+                    Err(PersistenceError::Mutation(message))
+                } else {
+                    store.insert_start(&info)
+                };
+                if let Err(error) = &result {
+                    remember_failure(failure, error);
+                }
+                let _ = reply.send(result);
+            }
+            Command::Append {
+                id,
+                replay,
+                durable_head,
+            } => {
+                let mut batch = vec![(id, replay, durable_head)];
+                let mut payload = replay_payload(&batch[0].1);
+                while payload < MAX_TRANSACTION_PAYLOAD_BYTES {
+                    match receiver.try_recv() {
+                        Ok(Command::Append {
+                            id,
+                            replay,
+                            durable_head,
+                        }) if payload.saturating_add(replay_payload(&replay))
+                            <= MAX_TRANSACTION_PAYLOAD_BYTES =>
+                        {
+                            payload = payload.saturating_add(replay_payload(&replay));
+                            batch.push((id, replay, durable_head));
+                        }
+                        Ok(command) => {
+                            pending.push_back(command);
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                if mutex_lock(failure).is_none()
+                    && let Err(error) = store.append_batch(&batch)
+                {
+                    remember_failure(failure, &error);
+                }
+            }
+            Command::Finalize {
+                id,
+                replay,
+                state,
+                durable_head,
+                reply,
+            } => {
+                let result = if let Some(message) = mutex_lock(failure).clone() {
+                    Err(PersistenceError::Mutation(message))
+                } else {
+                    store.finalize(id, &replay, &state, &durable_head)
+                };
+                if let Err(error) = &result {
+                    remember_failure(failure, error);
+                }
+                let _ = reply.send(result);
+            }
+            Command::Shutdown => return,
+        }
+    }
+}
+
+fn remember_failure(failure: &Mutex<Option<String>>, error: &PersistenceError) {
+    let mut failure = mutex_lock(failure);
+    if failure.is_none() {
+        *failure = Some(error.to_string());
+    }
+}
+
+fn replay_payload(replay: &OutputReplay) -> usize {
+    replay.chunks.iter().map(|chunk| chunk.data.len()).sum()
+}
+
+struct StateStore {
+    state_dir: PathBuf,
+    database_path: PathBuf,
+    wal_path: PathBuf,
+    shm_path: PathBuf,
+    connection: Connection,
+    epoch: String,
+    _lock: File,
+}
+
+impl StateStore {
+    fn open(state_dir: &Path) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        prepare_state_dir(state_dir)?;
+        let lock_path = state_dir.join(LOCK_FILE);
+        validate_optional_state_file(&lock_path)?;
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|source| PersistenceError::io(&lock_path, source))?;
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| PersistenceError::io(&lock_path, source))?;
+        validate_state_file(&lock_path)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(PersistenceError::StateInUse(state_dir.to_path_buf()));
+            }
+            Err(fs::TryLockError::Error(source)) => {
+                return Err(PersistenceError::io(&lock_path, source));
+            }
+        }
+
+        let database_path = state_dir.join(DATABASE_FILE);
+        let wal_path = state_dir.join(format!("{DATABASE_FILE}-wal"));
+        let shm_path = state_dir.join(format!("{DATABASE_FILE}-shm"));
+        for path in [&database_path, &wal_path, &shm_path] {
+            validate_optional_state_file(path)?;
+        }
+        let database_existed = database_path.exists();
+        if database_existed
+            && fs::metadata(&database_path)
+                .map_err(|source| PersistenceError::io(&database_path, source))?
+                .len()
+                == 0
+        {
+            return Err(PersistenceError::Corrupt(
+                "existing database file is empty".to_owned(),
+            ));
+        }
+
+        let connection = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(PersistenceError::database)?;
+        fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| PersistenceError::io(&database_path, source))?;
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;")
+            .map_err(PersistenceError::database)?;
+        if database_existed {
+            validate_existing_schema(&connection)?;
+        } else {
+            create_schema(&connection)?;
+        }
+        connection
+            .pragma_update(
+                None,
+                "max_page_count",
+                i64::try_from(DATABASE_MAX_PAGES).expect("database page limit fits SQLite"),
+            )
+            .map_err(PersistenceError::database)?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0;",
+            )
+            .map_err(PersistenceError::database)?;
+        for path in [&database_path, &wal_path, &shm_path] {
+            if path.exists() {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .map_err(|source| PersistenceError::io(path, source))?;
+                validate_state_file(path)?;
+            }
+        }
+        validate_quick_check(&connection)?;
+        validate_application_state(&connection)?;
+        validate_physical_limits(state_dir, &database_path, &wal_path, &shm_path)?;
+
+        let epoch = Uuid::new_v4().to_string();
+        reconcile_epoch(&connection, &epoch)?;
+        let recovered = load_recovered(&connection)?;
+        let store = Self {
+            state_dir: state_dir.to_path_buf(),
+            database_path,
+            wal_path,
+            shm_path,
+            connection,
+            epoch,
+            _lock: lock,
+        };
+        store.validate_files()?;
+        Ok((store, recovered))
+    }
+
+    fn insert_start(&mut self, info: &RunInfo) -> Result<(), PersistenceError> {
+        self.admit_transaction(1024 * 1024)?;
+        let spec_json = serde_json::to_string(&info.spec).map_err(PersistenceError::database)?;
+        let lineage_json = info
+            .lineage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(PersistenceError::database)?;
+        let state_json =
+            serde_json::to_string(&RunState::Running).map_err(PersistenceError::database)?;
+        let metadata_bytes = metadata_size(
+            &info.id.to_string(),
+            &spec_json,
+            lineage_json.as_deref(),
+            &state_json,
+            &self.epoch,
+        )?;
+        if metadata_bytes > METADATA_BYTES {
+            return Err(PersistenceError::Mutation(
+                "one Run metadata record exceeds the 64 MiB budget".to_owned(),
+            ));
+        }
+        let now = now_millis();
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(PersistenceError::database)?;
+        let evicted = reserve_run_capacity(&transaction, metadata_bytes)?;
+        transaction
+            .execute(
+                "INSERT INTO runs (
+                    id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
+                 ) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, 0, 0, 0, 0, ?7, ?8, ?8, NULL)",
+                params![
+                    info.id.to_string(),
+                    spec_json,
+                    lineage_json,
+                    state_json,
+                    self.epoch,
+                    info.pid,
+                    i64::try_from(metadata_bytes).expect("metadata budget fits SQLite"),
+                    now,
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        self.finish_transaction(evicted)
+    }
+
+    fn append_batch(
+        &mut self,
+        batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
+    ) -> Result<(), PersistenceError> {
+        for (id, replay, durable_head) in batch {
+            let groups = split_chunks(&replay.chunks)?;
+            if groups.is_empty() {
+                self.append_transaction(&[(*id, replay.clone(), Arc::clone(durable_head))], None)?;
+                continue;
+            }
+            for (index, chunks) in groups.iter().enumerate() {
+                let is_last = index + 1 == groups.len();
+                let partial = OutputReplay {
+                    chunks: chunks.clone(),
+                    oldest_seq: replay.oldest_seq,
+                    head_seq: if is_last {
+                        replay.head_seq
+                    } else {
+                        chunks.last().map_or(0, |chunk| chunk.seq)
+                    },
+                    truncated: replay.truncated,
+                };
+                self.append_transaction(&[(*id, partial, Arc::clone(durable_head))], None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &mut self,
+        id: RunId,
+        replay: &OutputReplay,
+        state: &RunState,
+        durable_head: &Arc<AtomicU64>,
+    ) -> Result<(), PersistenceError> {
+        if state.is_running() {
+            return Err(PersistenceError::Mutation(
+                "cannot persist a running terminal transition".to_owned(),
+            ));
+        }
+        let missing = self.missing_chunks(id, replay)?;
+        let mut prefix = Vec::new();
+        let mut final_chunks = Vec::new();
+        let mut final_bytes = 0_usize;
+        for chunk in missing.into_iter().rev() {
+            if final_bytes.saturating_add(chunk.data.len()) <= MAX_TRANSACTION_PAYLOAD_BYTES {
+                final_bytes = final_bytes.saturating_add(chunk.data.len());
+                final_chunks.push(chunk);
+            } else {
+                prefix.push(chunk);
+            }
+        }
+        prefix.reverse();
+        final_chunks.reverse();
+        for chunk_group in split_chunks(&prefix)? {
+            let prefix_replay = OutputReplay {
+                chunks: chunk_group.clone(),
+                oldest_seq: replay.oldest_seq,
+                head_seq: chunk_group.last().map_or(0, |chunk| chunk.seq),
+                truncated: replay.truncated,
+            };
+            self.append_transaction(&[(id, prefix_replay, Arc::clone(durable_head))], None)?;
+        }
+        let terminal_replay = OutputReplay {
+            chunks: final_chunks,
+            oldest_seq: replay.oldest_seq,
+            head_seq: replay.head_seq,
+            truncated: replay.truncated,
+        };
+        self.append_transaction(
+            &[(id, terminal_replay, Arc::clone(durable_head))],
+            Some((id, state)),
+        )
+    }
+
+    fn missing_chunks(
+        &self,
+        id: RunId,
+        replay: &OutputReplay,
+    ) -> Result<Vec<OutputChunk>, PersistenceError> {
+        let durable_head: i64 = self
+            .connection
+            .query_row(
+                "SELECT durable_head_seq FROM runs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let durable_head = u64::try_from(durable_head)
+            .map_err(|_| PersistenceError::Corrupt("negative durable head".to_owned()))?;
+        Ok(replay
+            .chunks
+            .iter()
+            .filter(|chunk| chunk.seq > durable_head)
+            .cloned()
+            .collect())
+    }
+
+    fn append_transaction(
+        &mut self,
+        batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
+        terminal: Option<(RunId, &RunState)>,
+    ) -> Result<(), PersistenceError> {
+        let payload = batch
+            .iter()
+            .map(|(_, replay, _)| replay_payload(replay))
+            .sum::<usize>();
+        if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
+            return Err(PersistenceError::Mutation(format!(
+                "output transaction payload {payload} exceeds the 1 MiB admission ceiling"
+            )));
+        }
+        self.admit_transaction((payload as u64).saturating_mul(4) + 1024 * 1024)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(PersistenceError::database)?;
+        let mut cursor_updates = HashMap::new();
+        let mut evicted = false;
+        for (id, replay, _) in batch {
+            evicted |= append_replay(&transaction, *id, replay)?;
+            let head = read_run_head(&transaction, *id)?;
+            cursor_updates.insert(*id, head);
+        }
+        evicted |= prune_global_replay(&transaction)?;
+        if let Some((id, state)) = terminal {
+            let (kind, state_json) = encoded_state(state)?;
+            let (id_text, spec_json, lineage_json, source_epoch): (
+                String,
+                String,
+                Option<String>,
+                String,
+            ) = transaction
+                .query_row(
+                    "SELECT id, spec_json, lineage_json, source_epoch FROM runs WHERE id = ?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .map_err(PersistenceError::database)?;
+            let metadata_bytes = metadata_size(
+                &id_text,
+                &spec_json,
+                lineage_json.as_deref(),
+                &state_json,
+                &source_epoch,
+            )?;
+            let now = now_millis();
+            let updated = transaction
+                .execute(
+                    "UPDATE runs SET state_kind = ?2, state_json = ?3, updated_at_ms = ?4,
+                     terminal_at_ms = ?4, metadata_bytes = ?5
+                     WHERE id = ?1 AND state_kind = 'running'",
+                    params![
+                        id.to_string(),
+                        kind,
+                        state_json,
+                        now,
+                        i64::try_from(metadata_bytes).expect("metadata budget fits SQLite")
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            if updated != 1 {
+                return Err(PersistenceError::Mutation(format!(
+                    "Run {id} is not durable running state"
+                )));
+            }
+        }
+        transaction.commit().map_err(PersistenceError::database)?;
+        for (id, _, durable_head) in batch {
+            if let Some(head) = cursor_updates.get(id) {
+                durable_head.store(*head, Ordering::Release);
+            }
+        }
+        self.finish_transaction(evicted)
+    }
+
+    fn admit_transaction(&mut self, worst_case_bytes: u64) -> Result<(), PersistenceError> {
+        if worst_case_bytes > WAL_CHECKPOINT_BYTES {
+            return Err(PersistenceError::Mutation(format!(
+                "transaction WAL estimate {worst_case_bytes} exceeds 8 MiB"
+            )));
+        }
+        let wal_bytes = file_len(&self.wal_path)?;
+        if wal_bytes > WAL_CHECKPOINT_BYTES {
+            let (busy, _, _): (i64, i64, i64) = self
+                .connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(PersistenceError::database)?;
+            if busy != 0 || file_len(&self.wal_path)? != 0 {
+                return Err(PersistenceError::Mutation(
+                    "WAL truncate checkpoint could not reach zero bytes".to_owned(),
+                ));
+            }
+        }
+        let current = file_len(&self.wal_path)?;
+        if current.saturating_add(worst_case_bytes) > WAL_MAX_BYTES {
+            return Err(PersistenceError::Mutation(
+                "WAL admission would exceed 16 MiB".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_transaction(&self, evicted: bool) -> Result<(), PersistenceError> {
+        if evicted {
+            self.connection
+                .execute_batch("PRAGMA incremental_vacuum(1024);")
+                .map_err(PersistenceError::database)?;
+        }
+        self.validate_files()
+    }
+
+    fn validate_files(&self) -> Result<(), PersistenceError> {
+        for path in [&self.database_path, &self.wal_path, &self.shm_path] {
+            if path.exists() {
+                validate_state_file(path)?;
+            }
+        }
+        validate_physical_limits(
+            &self.state_dir,
+            &self.database_path,
+            &self.wal_path,
+            &self.shm_path,
+        )
+    }
+}
+
+fn prepare_state_dir(path: &Path) -> Result<(), PersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(PersistenceError::InvalidDirectory {
+                    path: path.to_path_buf(),
+                    message: "path must be a real directory, not a symlink".to_owned(),
+                });
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| PersistenceError::io(path, source))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|source| PersistenceError::io(path, source))?;
+        }
+        Err(source) => return Err(PersistenceError::io(path, source)),
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| PersistenceError::io(path, source))?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: format!(
+                "owner {} does not match effective user {expected_uid}",
+                metadata.uid()
+            ),
+        });
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: "permissions must be exactly 0700".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_optional_state_file(path: &Path) -> Result<(), PersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_state_file(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PersistenceError::io(path, source)),
+    }
+}
+
+fn validate_state_file(path: &Path) -> Result<(), PersistenceError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| PersistenceError::io(path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: "state path must be a regular file".to_owned(),
+        });
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: "state file owner does not match the effective user".to_owned(),
+        });
+    }
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: "state file permissions must be exactly 0600".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn create_schema(connection: &Connection) -> Result<(), PersistenceError> {
+    connection
+        .execute_batch(&format!(
+            "PRAGMA page_size={PAGE_SIZE_BYTES};
+             PRAGMA auto_vacuum=INCREMENTAL;
+             PRAGMA user_version={SCHEMA_VERSION};
+             CREATE TABLE runtime_meta (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                schema_version INTEGER NOT NULL,
+                current_epoch TEXT NOT NULL
+             );
+             CREATE TABLE runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                spec_json TEXT NOT NULL,
+                lineage_json TEXT,
+                state_kind TEXT NOT NULL CHECK (state_kind IN ('running', 'exited', 'interrupted')),
+                state_json TEXT NOT NULL,
+                source_epoch TEXT NOT NULL,
+                pid INTEGER,
+                durable_oldest_seq INTEGER NOT NULL CHECK (durable_oldest_seq >= 0),
+                durable_head_seq INTEGER NOT NULL CHECK (durable_head_seq >= 0),
+                replay_bytes INTEGER NOT NULL CHECK (replay_bytes >= 0),
+                replay_truncated INTEGER NOT NULL CHECK (replay_truncated IN (0, 1)),
+                metadata_bytes INTEGER NOT NULL CHECK (metadata_bytes >= 0),
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                terminal_at_ms INTEGER
+             );
+             CREATE TABLE replay_chunks (
+                ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                seq INTEGER NOT NULL CHECK (seq > 0),
+                data BLOB NOT NULL,
+                UNIQUE(run_id, seq)
+             );
+             CREATE INDEX replay_chunks_run_seq ON replay_chunks(run_id, seq);
+             INSERT INTO runtime_meta(singleton, schema_version, current_epoch)
+             VALUES (1, {SCHEMA_VERSION}, 'initializing');"
+        ))
+        .map_err(PersistenceError::database)?;
+    Ok(())
+}
+
+fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceError> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(PersistenceError::database)?;
+    if version != SCHEMA_VERSION {
+        return Err(PersistenceError::UnsupportedSchema {
+            found: version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    let (meta_rows, meta_version, current_epoch): (i64, i64, String) = connection
+        .query_row(
+            "SELECT count(*), min(schema_version), min(current_epoch) FROM runtime_meta",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(PersistenceError::database)?;
+    if meta_rows != 1 || meta_version != SCHEMA_VERSION {
+        return Err(PersistenceError::UnsupportedSchema {
+            found: meta_version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    Uuid::parse_str(&current_epoch).map_err(|_| {
+        PersistenceError::Corrupt("runtime metadata has an invalid daemon epoch".to_owned())
+    })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT type, name FROM sqlite_schema
+             WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .map_err(PersistenceError::database)?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(PersistenceError::database)?
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map_err(PersistenceError::database)?;
+    let expected = BTreeSet::from([
+        ("index".to_owned(), "replay_chunks_run_seq".to_owned()),
+        ("table".to_owned(), "replay_chunks".to_owned()),
+        ("table".to_owned(), "runs".to_owned()),
+        ("table".to_owned(), "runtime_meta".to_owned()),
+    ]);
+    if actual != expected {
+        return Err(PersistenceError::Corrupt(format!(
+            "schema objects do not match version {SCHEMA_VERSION}: {actual:?}"
+        )));
+    }
+    validate_table_columns(
+        connection,
+        "runtime_meta",
+        &["singleton", "schema_version", "current_epoch"],
+    )?;
+    validate_table_columns(
+        connection,
+        "runs",
+        &[
+            "id",
+            "spec_json",
+            "lineage_json",
+            "state_kind",
+            "state_json",
+            "source_epoch",
+            "pid",
+            "durable_oldest_seq",
+            "durable_head_seq",
+            "replay_bytes",
+            "replay_truncated",
+            "metadata_bytes",
+            "created_at_ms",
+            "updated_at_ms",
+            "terminal_at_ms",
+        ],
+    )?;
+    validate_table_columns(
+        connection,
+        "replay_chunks",
+        &["ordinal", "run_id", "seq", "data"],
+    )?;
+    let page_size: i64 = connection
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(PersistenceError::database)?;
+    if page_size != i64::try_from(PAGE_SIZE_BYTES).expect("SQLite page size fits a signed integer")
+    {
+        return Err(PersistenceError::Corrupt(format!(
+            "database page size is {page_size}, expected {PAGE_SIZE_BYTES}"
+        )));
+    }
+    let auto_vacuum: i64 = connection
+        .pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .map_err(PersistenceError::database)?;
+    if auto_vacuum != 2 {
+        return Err(PersistenceError::Corrupt(
+            "database must use incremental auto-vacuum".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_table_columns(
+    connection: &Connection,
+    table: &str,
+    expected: &[&str],
+) -> Result<(), PersistenceError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(PersistenceError::database)?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(PersistenceError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PersistenceError::database)?;
+    if actual != expected {
+        return Err(PersistenceError::Corrupt(format!(
+            "table {table} columns do not match schema version {SCHEMA_VERSION}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_quick_check(connection: &Connection) -> Result<(), PersistenceError> {
+    let result: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(PersistenceError::database)?;
+    if result != "ok" {
+        return Err(PersistenceError::Corrupt(format!(
+            "SQLite quick_check returned {result:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn reconcile_epoch(connection: &Connection, epoch: &str) -> Result<(), PersistenceError> {
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(PersistenceError::database)?;
+    let interrupted = RunState::Interrupted {
+        reason: InterruptionReason::DaemonRestart,
+    };
+    let state_json = serde_json::to_string(&interrupted).map_err(PersistenceError::database)?;
+    let now = now_millis();
+    let running = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT id, spec_json, lineage_json, source_epoch FROM runs WHERE state_kind = 'running'",
+            )
+            .map_err(PersistenceError::database)?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(PersistenceError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::database)?
+    };
+    for (id, spec_json, lineage_json, source_epoch) in running {
+        let metadata_bytes = metadata_size(
+            &id,
+            &spec_json,
+            lineage_json.as_deref(),
+            &state_json,
+            &source_epoch,
+        )?;
+        transaction
+            .execute(
+                "UPDATE runs SET state_kind = 'interrupted', state_json = ?2, pid = NULL,
+                 updated_at_ms = ?3, terminal_at_ms = ?3, metadata_bytes = ?4 WHERE id = ?1",
+                params![
+                    id,
+                    state_json,
+                    now,
+                    i64::try_from(metadata_bytes).expect("metadata budget fits SQLite")
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    evict_terminal_overflow(&transaction)?;
+    transaction
+        .execute(
+            "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
+            [epoch],
+        )
+        .map_err(PersistenceError::database)?;
+    transaction.commit().map_err(PersistenceError::database)
+}
+
+fn evict_terminal_overflow(transaction: &Transaction<'_>) -> Result<(), PersistenceError> {
+    loop {
+        let (records, metadata): (i64, i64) = transaction
+            .query_row(
+                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        if nonnegative_u64(records, "record count")? <= RUN_RECORDS
+            && nonnegative_u64(metadata, "metadata total")? <= METADATA_BYTES
+        {
+            return Ok(());
+        }
+        let candidate: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM runs WHERE state_kind != 'running'
+                 ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some(candidate) = candidate else {
+            return Err(PersistenceError::Corrupt(
+                "running records exceed startup metadata retention".to_owned(),
+            ));
+        };
+        transaction
+            .execute("DELETE FROM runs WHERE id = ?1", [candidate])
+            .map_err(PersistenceError::database)?;
+    }
+}
+
+fn validate_application_state(connection: &Connection) -> Result<(), PersistenceError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    metadata_bytes FROM runs ORDER BY id",
+        )
+        .map_err(PersistenceError::database)?;
+    let mut rows = statement.query([]).map_err(PersistenceError::database)?;
+    let mut record_count = 0_u64;
+    let mut metadata_total = 0_u64;
+    let mut replay_total = 0_u64;
+    while let Some(row) = rows.next().map_err(PersistenceError::database)? {
+        record_count += 1;
+        let id_text: String = row.get(0).map_err(PersistenceError::database)?;
+        let id: RunId = id_text
+            .parse()
+            .map_err(|_| PersistenceError::Corrupt(format!("invalid Run id {id_text:?}")))?;
+        let spec_json: String = row.get(1).map_err(PersistenceError::database)?;
+        let _: Option<RunSpec> = serde_json::from_str(&spec_json).map_err(|error| {
+            PersistenceError::Corrupt(format!("invalid spec for {id}: {error}"))
+        })?;
+        let lineage_json: Option<String> = row.get(2).map_err(PersistenceError::database)?;
+        if let Some(lineage_json) = &lineage_json {
+            let lineage: RunLineage = serde_json::from_str(lineage_json).map_err(|error| {
+                PersistenceError::Corrupt(format!("invalid lineage for {id}: {error}"))
+            })?;
+            if lineage.parent == id {
+                return Err(PersistenceError::Corrupt(format!(
+                    "Run {id} has self lineage"
+                )));
+            }
+        }
+        let state_kind: String = row.get(3).map_err(PersistenceError::database)?;
+        let state_json: String = row.get(4).map_err(PersistenceError::database)?;
+        let state: RunState = serde_json::from_str(&state_json).map_err(|error| {
+            PersistenceError::Corrupt(format!("invalid state for {id}: {error}"))
+        })?;
+        if state_kind != state_kind_for(&state) {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} state kind does not match its JSON"
+            )));
+        }
+        let source_epoch: String = row.get(5).map_err(PersistenceError::database)?;
+        Uuid::parse_str(&source_epoch)
+            .map_err(|_| PersistenceError::Corrupt(format!("Run {id} has invalid source epoch")))?;
+        let pid: Option<i64> = row.get(6).map_err(PersistenceError::database)?;
+        if pid.is_some_and(|pid| u32::try_from(pid).is_err()) {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} has invalid PID"
+            )));
+        }
+        if matches!(state, RunState::Interrupted { .. }) && pid.is_some() {
+            return Err(PersistenceError::Corrupt(format!(
+                "interrupted Run {id} retains a PID"
+            )));
+        }
+        let oldest = nonnegative_u64(row.get(7).map_err(PersistenceError::database)?, "oldest")?;
+        let head = nonnegative_u64(row.get(8).map_err(PersistenceError::database)?, "head")?;
+        let replay_bytes = nonnegative_u64(
+            row.get(9).map_err(PersistenceError::database)?,
+            "replay bytes",
+        )?;
+        let truncated: i64 = row.get(10).map_err(PersistenceError::database)?;
+        if !matches!(truncated, 0 | 1) {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} has invalid replay truncation flag"
+            )));
+        }
+        let stored_metadata = nonnegative_u64(
+            row.get(11).map_err(PersistenceError::database)?,
+            "metadata bytes",
+        )?;
+        let actual_metadata = metadata_size(
+            &id_text,
+            &spec_json,
+            lineage_json.as_deref(),
+            &state_json,
+            &source_epoch,
+        )?;
+        if stored_metadata != actual_metadata {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} metadata accounting does not match"
+            )));
+        }
+        validate_replay_window(connection, id, oldest, head, replay_bytes, truncated != 0)?;
+        metadata_total = metadata_total.saturating_add(stored_metadata);
+        replay_total = replay_total.saturating_add(replay_bytes);
+    }
+    if record_count > RUN_RECORDS
+        || metadata_total > METADATA_BYTES
+        || replay_total > GLOBAL_REPLAY_BYTES
+    {
+        return Err(PersistenceError::Corrupt(
+            "stored logical quota accounting exceeds the format limits".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_replay_window(
+    connection: &Connection,
+    id: RunId,
+    oldest: u64,
+    head: u64,
+    replay_bytes: u64,
+    truncated: bool,
+) -> Result<(), PersistenceError> {
+    let mut statement = connection
+        .prepare("SELECT seq, length(data) FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
+        .map_err(PersistenceError::database)?;
+    let chunks = statement
+        .query_map([id.to_string()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(PersistenceError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PersistenceError::database)?;
+    if chunks.is_empty() {
+        if oldest != 0 || head != 0 || replay_bytes != 0 || truncated {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} has empty replay with non-empty cursors"
+            )));
+        }
+        return Ok(());
+    }
+    let mut expected = oldest;
+    let mut bytes = 0_u64;
+    for (seq, len) in chunks {
+        let seq = nonnegative_u64(seq, "chunk sequence")?;
+        let len = nonnegative_u64(len, "chunk length")?;
+        if seq != expected {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} replay is not contiguous at {seq}, expected {expected}"
+            )));
+        }
+        expected = expected.saturating_add(1);
+        bytes = bytes.saturating_add(len);
+    }
+    if expected.saturating_sub(1) != head || bytes != replay_bytes {
+        return Err(PersistenceError::Corrupt(format!(
+            "Run {id} replay cursors or bytes do not match chunks"
+        )));
+    }
+    if oldest > 1 && !truncated {
+        return Err(PersistenceError::Corrupt(format!(
+            "Run {id} pruned replay is not marked truncated"
+        )));
+    }
+    if replay_bytes > PER_RUN_REPLAY_BYTES {
+        return Err(PersistenceError::Corrupt(format!(
+            "Run {id} replay exceeds 4 MiB"
+        )));
+    }
+    Ok(())
+}
+
+fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, PersistenceError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, spec_json, lineage_json, state_json, pid, durable_oldest_seq,
+                    durable_head_seq, replay_truncated FROM runs ORDER BY created_at_ms, id",
+        )
+        .map_err(PersistenceError::database)?;
+    let mut rows = statement.query([]).map_err(PersistenceError::database)?;
+    let mut recovered = Vec::new();
+    while let Some(row) = rows.next().map_err(PersistenceError::database)? {
+        let id_text: String = row.get(0).map_err(PersistenceError::database)?;
+        let id: RunId = id_text
+            .parse()
+            .map_err(|_| PersistenceError::Corrupt("invalid recovered Run id".to_owned()))?;
+        let spec: Option<RunSpec> = serde_json::from_str(
+            &row.get::<_, String>(1)
+                .map_err(PersistenceError::database)?,
+        )
+        .map_err(PersistenceError::database)?;
+        let lineage = row
+            .get::<_, Option<String>>(2)
+            .map_err(PersistenceError::database)?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()
+            .map_err(PersistenceError::database)?;
+        let state: RunState = serde_json::from_str(
+            &row.get::<_, String>(3)
+                .map_err(PersistenceError::database)?,
+        )
+        .map_err(PersistenceError::database)?;
+        let pid = row
+            .get::<_, Option<i64>>(4)
+            .map_err(PersistenceError::database)?
+            .map(u32::try_from)
+            .transpose()
+            .map_err(|_| PersistenceError::Corrupt("invalid recovered PID".to_owned()))?;
+        let oldest_seq = nonnegative_u64(
+            row.get(5).map_err(PersistenceError::database)?,
+            "recovered oldest",
+        )?;
+        let head_seq = nonnegative_u64(
+            row.get(6).map_err(PersistenceError::database)?,
+            "recovered head",
+        )?;
+        let truncated = row.get::<_, i64>(7).map_err(PersistenceError::database)? != 0;
+        let mut chunk_statement = connection
+            .prepare("SELECT seq, data FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
+            .map_err(PersistenceError::database)?;
+        let chunks = chunk_statement
+            .query_map([&id_text], |chunk_row| {
+                Ok(OutputChunk {
+                    seq: u64::try_from(chunk_row.get::<_, i64>(0)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    data: chunk_row.get(1)?,
+                })
+            })
+            .map_err(PersistenceError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::database)?;
+        recovered.push(RecoveredRun {
+            info: RunInfo {
+                id,
+                spec,
+                lineage,
+                backend: RunBackend::Native,
+                capabilities: RunCapabilities::NATIVE,
+                pid,
+                state,
+                head_seq,
+                durable_head_seq: Some(head_seq),
+                oldest_seq,
+                attachments: 0,
+            },
+            replay: OutputReplay {
+                chunks,
+                oldest_seq,
+                head_seq,
+                truncated,
+            },
+        });
+    }
+    Ok(recovered)
+}
+
+fn reserve_run_capacity(
+    transaction: &Transaction<'_>,
+    new_metadata_bytes: u64,
+) -> Result<bool, PersistenceError> {
+    reserve_run_capacity_to(transaction, new_metadata_bytes, RUN_RECORDS, METADATA_BYTES)
+}
+
+fn reserve_run_capacity_to(
+    transaction: &Transaction<'_>,
+    new_metadata_bytes: u64,
+    record_limit: u64,
+    metadata_limit: u64,
+) -> Result<bool, PersistenceError> {
+    let mut evicted = false;
+    loop {
+        let (records, metadata): (i64, i64) = transaction
+            .query_row(
+                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        let records = nonnegative_u64(records, "record count")?;
+        let metadata = nonnegative_u64(metadata, "metadata total")?;
+        if records < record_limit && metadata.saturating_add(new_metadata_bytes) <= metadata_limit {
+            return Ok(evicted);
+        }
+        let candidate: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM runs WHERE state_kind != 'running'
+                 ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some(candidate) = candidate else {
+            return Err(PersistenceError::Mutation(
+                "running Run records exhaust the durable metadata budget".to_owned(),
+            ));
+        };
+        transaction
+            .execute("DELETE FROM runs WHERE id = ?1", [candidate])
+            .map_err(PersistenceError::database)?;
+        evicted = true;
+    }
+}
+
+fn append_replay(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    replay: &OutputReplay,
+) -> Result<bool, PersistenceError> {
+    let id_text = id.to_string();
+    let (mut durable_oldest, mut durable_head, mut replay_bytes, state_kind): (
+        i64,
+        i64,
+        i64,
+        String,
+    ) = transaction
+        .query_row(
+            "SELECT durable_oldest_seq, durable_head_seq, replay_bytes, state_kind
+             FROM runs WHERE id = ?1",
+            [&id_text],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(PersistenceError::database)?;
+    let durable_head_unsigned = nonnegative_u64(durable_head, "durable head")?;
+    if state_kind != "running"
+        && replay
+            .chunks
+            .iter()
+            .any(|chunk| chunk.seq > durable_head_unsigned)
+    {
+        return Err(PersistenceError::Mutation(format!(
+            "cannot advance replay for terminal Run {id}"
+        )));
+    }
+    for chunk in &replay.chunks {
+        let seq = i64::try_from(chunk.seq)
+            .map_err(|_| PersistenceError::Mutation("output sequence exceeds SQLite".to_owned()))?;
+        if seq <= durable_head {
+            if seq >= durable_oldest && durable_oldest != 0 {
+                let stored: Vec<u8> = transaction
+                    .query_row(
+                        "SELECT data FROM replay_chunks WHERE run_id = ?1 AND seq = ?2",
+                        params![&id_text, seq],
+                        |row| row.get(0),
+                    )
+                    .map_err(PersistenceError::database)?;
+                if stored != chunk.data {
+                    return Err(PersistenceError::Mutation(format!(
+                        "Run {id} replay sequence {} changed bytes",
+                        chunk.seq
+                    )));
+                }
+            }
+            continue;
+        }
+        if durable_head == 0 && durable_oldest == 0 {
+            durable_oldest = seq;
+        } else if seq != durable_head + 1 {
+            return Err(PersistenceError::Mutation(format!(
+                "Run {id} durable replay gap: got {seq}, expected {}",
+                durable_head + 1
+            )));
+        }
+        transaction
+            .execute(
+                "INSERT INTO replay_chunks(run_id, seq, data) VALUES (?1, ?2, ?3)",
+                params![&id_text, seq, &chunk.data],
+            )
+            .map_err(PersistenceError::database)?;
+        durable_head = seq;
+        replay_bytes = replay_bytes.saturating_add(
+            i64::try_from(chunk.data.len())
+                .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?,
+        );
+    }
+    let evicted = prune_run_replay(
+        transaction,
+        id,
+        &id_text,
+        &mut durable_oldest,
+        &mut replay_bytes,
+    )?;
+    let truncated = replay.truncated || durable_oldest > 1;
+    transaction
+        .execute(
+            "UPDATE runs SET durable_oldest_seq = ?2, durable_head_seq = ?3,
+             replay_bytes = ?4, replay_truncated = ?5, updated_at_ms = ?6 WHERE id = ?1",
+            params![
+                &id_text,
+                durable_oldest,
+                durable_head,
+                replay_bytes,
+                i64::from(truncated),
+                now_millis(),
+            ],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(evicted)
+}
+
+fn prune_run_replay(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    id_text: &str,
+    durable_oldest: &mut i64,
+    replay_bytes: &mut i64,
+) -> Result<bool, PersistenceError> {
+    prune_run_replay_to(
+        transaction,
+        id,
+        id_text,
+        durable_oldest,
+        replay_bytes,
+        PER_RUN_REPLAY_BYTES,
+    )
+}
+
+fn prune_run_replay_to(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    id_text: &str,
+    durable_oldest: &mut i64,
+    replay_bytes: &mut i64,
+    replay_limit: u64,
+) -> Result<bool, PersistenceError> {
+    let mut evicted_any = false;
+    while u64::try_from(*replay_bytes).unwrap_or(u64::MAX) > replay_limit {
+        let evicted: Option<(i64, i64)> = transaction
+            .query_row(
+                "SELECT seq, length(data) FROM replay_chunks WHERE run_id = ?1 ORDER BY seq LIMIT 1",
+                [id_text],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some((seq, bytes)) = evicted else {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} replay accounting has no chunks"
+            )));
+        };
+        transaction
+            .execute(
+                "DELETE FROM replay_chunks WHERE run_id = ?1 AND seq = ?2",
+                params![id_text, seq],
+            )
+            .map_err(PersistenceError::database)?;
+        evicted_any = true;
+        *replay_bytes = replay_bytes.saturating_sub(bytes);
+        *durable_oldest = transaction
+            .query_row(
+                "SELECT coalesce(min(seq), 0) FROM replay_chunks WHERE run_id = ?1",
+                [id_text],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+    }
+    Ok(evicted_any)
+}
+
+fn prune_global_replay(transaction: &Transaction<'_>) -> Result<bool, PersistenceError> {
+    prune_global_replay_to(transaction, GLOBAL_REPLAY_BYTES)
+}
+
+fn prune_global_replay_to(
+    transaction: &Transaction<'_>,
+    replay_limit: u64,
+) -> Result<bool, PersistenceError> {
+    let mut evicted = false;
+    loop {
+        let total: i64 = transaction
+            .query_row(
+                "SELECT coalesce(sum(replay_bytes), 0) FROM runs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if nonnegative_u64(total, "global replay bytes")? <= replay_limit {
+            return Ok(evicted);
+        }
+        let candidate: Option<(i64, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT chunk.ordinal, chunk.run_id, chunk.seq, length(chunk.data)
+                 FROM replay_chunks AS chunk
+                 WHERE (SELECT count(*) FROM replay_chunks AS retained
+                        WHERE retained.run_id = chunk.run_id) > 1
+                 ORDER BY chunk.ordinal LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some((ordinal, run_id, _seq, bytes)) = candidate else {
+            return Err(PersistenceError::Corrupt(
+                "global replay accounting has no chunks".to_owned(),
+            ));
+        };
+        transaction
+            .execute("DELETE FROM replay_chunks WHERE ordinal = ?1", [ordinal])
+            .map_err(PersistenceError::database)?;
+        evicted = true;
+        transaction
+            .execute(
+                "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
+                 durable_oldest_seq = coalesce(
+                   (SELECT min(seq) FROM replay_chunks WHERE run_id = ?1), 0
+                 ) WHERE id = ?1",
+                params![run_id, bytes],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+}
+
+fn read_run_head(transaction: &Transaction<'_>, id: RunId) -> Result<u64, PersistenceError> {
+    let value: i64 = transaction
+        .query_row(
+            "SELECT durable_head_seq FROM runs WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    nonnegative_u64(value, "durable head")
+}
+
+fn encoded_state(state: &RunState) -> Result<(&'static str, String), PersistenceError> {
+    Ok((
+        state_kind_for(state),
+        serde_json::to_string(state).map_err(PersistenceError::database)?,
+    ))
+}
+
+const fn state_kind_for(state: &RunState) -> &'static str {
+    match state {
+        RunState::Running => "running",
+        RunState::Exited { .. } => "exited",
+        RunState::Interrupted { .. } => "interrupted",
+    }
+}
+
+fn metadata_size(
+    id: &str,
+    spec: &str,
+    lineage: Option<&str>,
+    state: &str,
+    epoch: &str,
+) -> Result<u64, PersistenceError> {
+    u64::try_from(
+        id.len()
+            .saturating_add(spec.len())
+            .saturating_add(lineage.map_or(0, str::len))
+            .saturating_add(state.len().max(LIFECYCLE_METADATA_RESERVE_BYTES))
+            .saturating_add(epoch.len()),
+    )
+    .map_err(|_| PersistenceError::Mutation("metadata size overflow".to_owned()))
+}
+
+fn split_chunks(chunks: &[OutputChunk]) -> Result<Vec<Vec<OutputChunk>>, PersistenceError> {
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut bytes = 0_usize;
+    for chunk in chunks {
+        if chunk.data.len() > MAX_TRANSACTION_PAYLOAD_BYTES {
+            return Err(PersistenceError::Mutation(format!(
+                "output chunk {} exceeds the transaction payload ceiling",
+                chunk.seq
+            )));
+        }
+        if !current.is_empty()
+            && bytes.saturating_add(chunk.data.len()) > MAX_TRANSACTION_PAYLOAD_BYTES
+        {
+            groups.push(std::mem::take(&mut current));
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(chunk.data.len());
+        current.push(chunk.clone());
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
+
+fn nonnegative_u64(value: i64, label: &str) -> Result<u64, PersistenceError> {
+    u64::try_from(value)
+        .map_err(|_| PersistenceError::Corrupt(format!("negative {label} in durable state")))
+}
+
+fn now_millis() -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}
+
+fn file_len(path: &Path) -> Result<u64, PersistenceError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(PersistenceError::io(path, source)),
+    }
+}
+
+fn validate_physical_limits(
+    state_dir: &Path,
+    database_path: &Path,
+    wal_path: &Path,
+    shm_path: &Path,
+) -> Result<(), PersistenceError> {
+    let database = file_len(database_path)?;
+    let wal = file_len(wal_path)?;
+    let shm = file_len(shm_path)?;
+    if database > DATABASE_MAX_BYTES {
+        return Err(PersistenceError::Corrupt(
+            "main database exceeds 384 MiB".to_owned(),
+        ));
+    }
+    if wal > WAL_MAX_BYTES {
+        return Err(PersistenceError::Corrupt("WAL exceeds 16 MiB".to_owned()));
+    }
+    if shm > SHM_MAX_BYTES {
+        return Err(PersistenceError::Corrupt(
+            "shared-memory sidecar exceeds 4 MiB".to_owned(),
+        ));
+    }
+    if database.saturating_add(wal).saturating_add(shm) > STATE_FILES_MAX_BYTES {
+        return Err(PersistenceError::Corrupt(format!(
+            "state files in {} exceed 404 MiB",
+            state_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ctxmux_protocol::{OutputChunk, OutputReplay, RunId, RunSpec, RunState, TerminalSize};
+    use rusqlite::{Connection, OptionalExtension, params};
+
+    use super::{
+        DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES,
+        PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES, PERSISTENCE_QUEUE_CAPACITY, PersistenceError,
+        RUN_RECORDS, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES,
+        append_replay, create_schema, metadata_size, prune_global_replay_to,
+        reserve_run_capacity_to,
+    };
+
+    #[test]
+    fn format_limits_match_the_accepted_physical_and_logical_budgets() {
+        assert_eq!(PAGE_SIZE_BYTES, 4 * 1024);
+        assert_eq!(PER_RUN_REPLAY_BYTES, 4 * 1024 * 1024);
+        assert_eq!(GLOBAL_REPLAY_BYTES, 256 * 1024 * 1024);
+        assert_eq!(METADATA_BYTES, 64 * 1024 * 1024);
+        assert_eq!(RUN_RECORDS, 4_096);
+        assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 1_024);
+        assert_eq!(DATABASE_MAX_BYTES, 384 * 1024 * 1024);
+        assert_eq!(WAL_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(SHM_MAX_BYTES, 4 * 1024 * 1024);
+        assert_eq!(
+            DATABASE_MAX_BYTES + WAL_MAX_BYTES + SHM_MAX_BYTES,
+            STATE_FILES_MAX_BYTES
+        );
+        let worst_admitted_output =
+            u64::try_from(MAX_TRANSACTION_PAYLOAD_BYTES).expect("payload limit fits u64") * 4
+                + 1024 * 1024;
+        assert!(worst_admitted_output <= WAL_CHECKPOINT_BYTES);
+    }
+
+    #[test]
+    fn global_replay_pruning_evicts_oldest_chunks_and_preserves_each_tail() {
+        let mut connection = test_connection();
+        let first = RunId::new();
+        let second = RunId::new();
+        let transaction = connection.transaction().expect("start replay transaction");
+        insert_test_run(&transaction, first, "running", 1);
+        insert_test_run(&transaction, second, "running", 1);
+        append_replay(
+            &transaction,
+            first,
+            &replay(vec![chunk(1, b"aaa"), chunk(2, b"bbb")]),
+        )
+        .expect("append first replay");
+        append_replay(
+            &transaction,
+            second,
+            &replay(vec![chunk(1, b"ccc"), chunk(2, b"ddd")]),
+        )
+        .expect("append second replay");
+        assert!(prune_global_replay_to(&transaction, 7).expect("prune global replay"));
+        for id in [first, second] {
+            let (oldest, head, bytes, truncated): (i64, i64, i64, i64) = transaction
+                .query_row(
+                    "SELECT durable_oldest_seq, durable_head_seq, replay_bytes,
+                            replay_truncated FROM runs WHERE id = ?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read pruned replay accounting");
+            assert_eq!((oldest, head, bytes, truncated), (2, 2, 3, 1));
+        }
+        transaction.commit().expect("commit replay pruning");
+    }
+
+    #[test]
+    fn record_capacity_evicts_terminal_history_but_never_a_running_owner() {
+        let mut connection = test_connection();
+        let transaction = connection
+            .transaction()
+            .expect("start record capacity transaction");
+        let running = RunId::new();
+        let terminal = RunId::new();
+        insert_test_run(&transaction, running, "running", 1);
+        insert_test_run(&transaction, terminal, "exited", 1);
+        assert!(
+            reserve_run_capacity_to(&transaction, 1, 2, 3)
+                .expect("evict terminal record for new reservation")
+        );
+        assert!(run_exists(&transaction, running));
+        assert!(!run_exists(&transaction, terminal));
+        transaction.rollback().expect("rollback capacity fixture");
+
+        let transaction = connection
+            .transaction()
+            .expect("start running-only capacity transaction");
+        insert_test_run(&transaction, RunId::new(), "running", 1);
+        insert_test_run(&transaction, RunId::new(), "running", 1);
+        assert!(matches!(
+            reserve_run_capacity_to(&transaction, 1, 2, 3),
+            Err(PersistenceError::Mutation(_))
+        ));
+    }
+
+    fn test_connection() -> Connection {
+        let connection = Connection::open_in_memory().expect("open in-memory persistence store");
+        connection
+            .execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable test foreign keys");
+        create_schema(&connection).expect("create test persistence schema");
+        connection
+            .execute(
+                "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
+                [uuid::Uuid::new_v4().to_string()],
+            )
+            .expect("set test daemon epoch");
+        connection
+    }
+
+    fn insert_test_run(
+        transaction: &rusqlite::Transaction<'_>,
+        id: RunId,
+        state_kind: &str,
+        metadata_bytes: i64,
+    ) {
+        let spec = RunSpec {
+            program: "/bin/true".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        };
+        let spec_json = serde_json::to_string(&spec).expect("encode test spec");
+        let state = if state_kind == "running" {
+            RunState::Running
+        } else {
+            RunState::Exited {
+                code: 0,
+                signal: None,
+            }
+        };
+        let state_json = serde_json::to_string(&state).expect("encode test state");
+        let epoch = uuid::Uuid::new_v4().to_string();
+        let _actual_metadata =
+            metadata_size(&id.to_string(), &spec_json, None, &state_json, &epoch)
+                .expect("measure test metadata");
+        transaction
+            .execute(
+                "INSERT INTO runs (
+                    id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, 0, 0, 0, 0, ?6, 1, 1, ?7)",
+                params![
+                    id.to_string(),
+                    spec_json,
+                    state_kind,
+                    state_json,
+                    epoch,
+                    metadata_bytes,
+                    (state_kind != "running").then_some(1_i64),
+                ],
+            )
+            .expect("insert test Run row");
+    }
+
+    fn replay(chunks: Vec<OutputChunk>) -> OutputReplay {
+        OutputReplay {
+            oldest_seq: chunks.first().map_or(0, |chunk| chunk.seq),
+            head_seq: chunks.last().map_or(0, |chunk| chunk.seq),
+            chunks,
+            truncated: false,
+        }
+    }
+
+    fn chunk(seq: u64, data: &[u8]) -> OutputChunk {
+        OutputChunk {
+            seq,
+            data: data.to_vec(),
+        }
+    }
+
+    fn run_exists(transaction: &rusqlite::Transaction<'_>, id: RunId) -> bool {
+        transaction
+            .query_row("SELECT 1 FROM runs WHERE id = ?1", [id.to_string()], |_| {
+                Ok(())
+            })
+            .optional()
+            .expect("query test Run existence")
+            .is_some()
+    }
+}

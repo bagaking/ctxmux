@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  Attachment,
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationUnavailableError,
@@ -28,9 +29,19 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         id: "00000000-0000-0000-0000-000000000001",
         spec,
         lineage: null,
+        backend: { type: "native" },
+        capabilities: {
+          input: true,
+          resize: true,
+          stop: true,
+          fork_level_a: true,
+          fork_level_b: true,
+          replay: "raw_from_start",
+        },
         pid: 123,
         state: { type: "running" },
         head_seq: 0,
+        durable_head_seq: null,
         oldest_seq: 0,
         attachments: 0,
       };
@@ -125,8 +136,9 @@ test("registerIntegration fails closed before start when detection is unavailabl
   assert.equal(starts, 0);
 });
 
-test("registerIntegration rejects missing or downgraded Level B plans before raw fork", async () => {
+test("registerIntegration rejects incomplete or downgraded Level B implementations before raw fork", async () => {
   let forks = 0;
+  let plans = 0;
   const client = {
     async start(): Promise<RunInfo> {
       throw new Error("unreachable raw start");
@@ -155,6 +167,8 @@ test("registerIntegration rejects missing or downgraded Level B plans before raw
     },
   };
   const parent = rootRun();
+  const parentSpec = parent.spec;
+  assert.ok(parentSpec);
 
   await assert.rejects(
     registerIntegration(client, withoutPlanner).forkLevelB(parent, undefined),
@@ -162,18 +176,68 @@ test("registerIntegration rejects missing or downgraded Level B plans before raw
       error instanceof IntegrationCapabilityError &&
       error.capability === "level_b_fork",
   );
-  const downgraded = {
+  const withoutProvenance = {
     ...withoutPlanner,
-    id: "downgraded",
+    id: "missing-provenance",
     planLevelBFork(): LevelBForkPlan {
-      return { type: "level_a" } as unknown as LevelBForkPlan;
+      plans += 1;
+      return { type: "level_b", spec: parentSpec };
     },
   };
   await assert.rejects(
-    registerIntegration(client, downgraded).forkLevelB(parent, undefined),
+    registerIntegration(client, withoutProvenance).forkLevelB(
+      parent,
+      undefined,
+    ),
+    (error: unknown) =>
+      error instanceof IntegrationCapabilityError &&
+      error.capability === "level_b_fork",
+  );
+
+  const emitted: TestEvent = {
+    integrationId: "test",
+    name: "receipt",
+    data: {},
+  };
+  const downgraded: Integration<
+    Record<string, never>,
+    { readonly receipt: TestEvent },
+    TestEvent
+  > = {
+    ...withoutPlanner,
+    id: "downgraded",
+    createObserver() {
+      return { observe: () => [emitted] };
+    },
+    levelBForkProvenance(config) {
+      return config.receipt;
+    },
+    planLevelBFork() {
+      plans += 1;
+      return { type: "level_a" } as unknown as LevelBForkPlan;
+    },
+  };
+  const chunk = { seq: 1, data: [65] };
+  new Attachment({} as never, {
+    run: parent,
+    replay: {
+      chunks: [chunk],
+      oldest_seq: 1,
+      head_seq: 1,
+      truncated: false,
+    },
+  });
+  const registered = registerIntegration(client, downgraded);
+  const receipt = registered
+    .createObserver(parent)
+    .observe({ type: "output", chunk })[0];
+  assert.notEqual(receipt, undefined);
+  await assert.rejects(
+    registered.forkLevelB(parent, { receipt: receipt! }),
     /returned a non-Level-B fork plan/,
   );
   assert.equal(forks, 0);
+  assert.equal(plans, 1);
 });
 
 test("registerIntegration rejects blank identities and unsupported generations", () => {
@@ -232,9 +296,19 @@ function rootRun(): RunInfo {
       declared_inputs: [],
     },
     lineage: null,
+    backend: { type: "native" },
+    capabilities: {
+      input: true,
+      resize: true,
+      stop: true,
+      fork_level_a: true,
+      fork_level_b: true,
+      replay: "raw_from_start",
+    },
     pid: 123,
     state: { type: "running" },
     head_seq: 0,
+    durable_head_seq: null,
     oldest_seq: 0,
     attachments: 0,
   };

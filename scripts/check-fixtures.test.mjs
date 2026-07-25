@@ -69,7 +69,21 @@ test("rejects a test in an unexecuted Rust source", (context) => {
   write(root, "crates/demo/src/unused.rs", "#[test]\nfn unused() {}\n");
   assert.match(
     fixtureErrors(root, "crates/demo/src/unused.rs", "unused"),
-    /not a Cargo/u,
+    /not reachable from a Cargo/u,
+  );
+});
+
+test("accepts a Rust test in a module reachable from the crate root", (context) => {
+  const root = setup(context);
+  write(root, "crates/demo/src/lib.rs", "mod parser;\n");
+  write(
+    root,
+    "crates/demo/src/parser.rs",
+    "#[test]\nfn exact_parser_contract() {}\n",
+  );
+  assert.equal(
+    fixtureErrors(root, "crates/demo/src/parser.rs", "exact_parser_contract"),
+    "",
   );
 });
 

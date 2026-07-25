@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename, posix, resolve } from "node:path";
 
 function readText(path, errors, label) {
@@ -151,13 +151,56 @@ function hasTypeScriptTest(source, anchor) {
   ).test(withoutComments(source));
 }
 
+function reachableRustModules(context, cratePath) {
+  const reachable = new Set();
+  const queue = ["src/lib.rs", "src/main.rs"].filter((relative) =>
+    existsSync(resolve(context.root, cratePath, relative)),
+  );
+  while (queue.length > 0) {
+    const relative = queue.shift();
+    if (relative === undefined || reachable.has(relative)) continue;
+    reachable.add(relative);
+    const source = withoutComments(
+      readFileSync(resolve(context.root, cratePath, relative), "utf8"),
+    );
+    const filename = posix.basename(relative);
+    const moduleRoot =
+      filename === "lib.rs" || filename === "main.rs" || filename === "mod.rs"
+        ? posix.dirname(relative)
+        : posix.join(posix.dirname(relative), filename.slice(0, -".rs".length));
+    for (const match of source.matchAll(
+      /(?:^|\n)\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*;/gu,
+    )) {
+      const name = match[1];
+      const candidates = [
+        posix.join(moduleRoot, `${name}.rs`),
+        posix.join(moduleRoot, name, "mod.rs"),
+      ];
+      const found = candidates.filter((candidate) =>
+        existsSync(resolve(context.root, cratePath, candidate)),
+      );
+      if (found.length === 1) queue.push(found[0]);
+    }
+  }
+  return reachable;
+}
+
 function rustErrors(context, reference, source) {
   const errors = [];
   const target = reference.path.match(
-    /^(crates\/[^/]+)\/(src\/(?:lib|main)\.rs|tests\/[^/]+\.rs)$/u,
+    /^(crates\/[^/]+)\/(src\/.+\.rs|tests\/[^/]+\.rs)$/u,
   );
   if (target === null || !context.members.has(target[1])) {
     return ["Rust path is not a Cargo workspace test target"];
+  }
+  const directTarget = /^(?:src\/(?:lib|main)\.rs|tests\/[^/]+\.rs)$/u.test(
+    target[2],
+  );
+  if (
+    !directTarget &&
+    !reachableRustModules(context, target[1]).has(target[2])
+  ) {
+    return ["Rust path is not reachable from a Cargo workspace test target"];
   }
   const manifest = readText(
     resolve(context.root, target[1], "Cargo.toml"),

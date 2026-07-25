@@ -29,7 +29,13 @@ When either stream is not a terminal, attach is output-only and never changes te
 
 ## Known constraints
 
-The checked-in tests cover prefix routing and zero-size normalization, not a real pseudo-terminal. Signal-driven process termination may bypass or race ordinary guard cleanup. The background stdin thread cannot be cancelled cleanly and may remain blocked until process exit. Output backpressure blocks the interactive loop while stdout is written.
+A checked-in controlling-PTY test covers raw-mode entry, input, `SIGWINCH`
+resize propagation, acknowledged detach, exact terminal restoration for that
+ordinary detach path, and survival of the same daemon-owned Run PID.
+Signal-driven process termination, daemon loss, and unwind remain broader
+restoration cases. The background stdin thread cannot be cancelled cleanly and
+may remain blocked until process exit. Output backpressure blocks the
+interactive loop while stdout is written.
 
 On `Gap`, the CLI tells the user the daemon head sequence but does not track and print the last successfully displayed sequence needed for a precise reattach command.
 
@@ -46,8 +52,10 @@ Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engin
 ## Fixture mapping
 
 - Covered now: prefix router, trailing prefix, non-detach forwarding, and zero-size fallback.
-- Manual evidence: pseudo-terminal attach, command execution, `Ctrl-b d`, and surviving Run.
-- Future: checked-in pseudo-terminal restoration after the termios/PENDIN contract is decided.
+- Covered now: checked-in controlling-PTY attach, raw input, `SIGWINCH` resize,
+  `Ctrl-b d`, terminal restoration, and surviving Run identity.
+- Future: restoration across daemon loss, recoverable errors, unwind, and the
+  reviewed transient-termios policy.
 - Future: raw restoration on signals after the catchable-signal policy is defined.
 - Covered: exhaustive split-prefix, trailing-prefix, unknown sequence, and detach-byte suppression.
 - Candidate: resize propagation under repeated `SIGWINCH` and slow stdout.
@@ -62,5 +70,6 @@ Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engin
 ## Repository evidence
 
 - `crates/ctxmux/src/main.rs`: `attach`, `PrefixRouter`, `RawModeGuard`
+- `crates/ctxmux/tests/interactive_attach.rs`
 - `crates/ctxmux-client/src/lib.rs`: `Attachment::detach`
 - `Cargo.toml`: `crossterm`

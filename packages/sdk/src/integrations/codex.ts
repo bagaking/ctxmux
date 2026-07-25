@@ -13,7 +13,7 @@ import type { RunEvent } from "../generated/RunEvent.js";
 import type { RunSpec } from "../generated/RunSpec.js";
 import type { TerminalSize } from "../generated/TerminalSize.js";
 
-const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
+const DEFAULT_PROBE_TIMEOUT_MS = 5_000;
 const MAX_PROBE_BUFFER_BYTES = 64 * 1024;
 const MAX_SEMANTIC_RECORD_CHARS = 1024 * 1024;
 const VERSION_PATTERN =
@@ -30,13 +30,20 @@ export interface CodexRunConfig {
 
 /** Inputs for one Codex-native session continuation. */
 export interface CodexForkConfig extends CodexRunConfig {
-  readonly sessionId: string;
+  readonly session: CodexSessionProvenance;
   readonly artifactReferences?: readonly string[];
+}
+
+/** Host-local proof that one Codex session was observed from one parent Run. */
+export interface CodexSessionProvenance extends CodexSemanticEvent {
+  readonly name: "thread.started";
+  readonly sessionId: string;
 }
 
 /** Host-local event normalized from one valid Codex JSONL record. */
 export interface CodexSemanticEvent extends IntegrationSemanticEvent {
   readonly integrationId: "codex";
+  readonly sessionId?: string;
 }
 
 /** Explicit Codex exec Integration; interactive resume and fork are separate capabilities. */
@@ -126,9 +133,7 @@ export const codexIntegration: Integration<
     };
   },
   planLevelBFork(_parent, config, detection) {
-    if (config.sessionId.trim().length === 0) {
-      throw new TypeError("Codex session id must not be empty");
-    }
+    const sessionId = verifiedSessionId(config.session);
     if (config.prompt.trim().length === 0) {
       throw new TypeError("Codex prompt must not be empty");
     }
@@ -148,14 +153,7 @@ export const codexIntegration: Integration<
       type: "level_b",
       spec: {
         program: detection.executable,
-        args: [
-          "exec",
-          "resume",
-          "--json",
-          "--",
-          config.sessionId,
-          config.prompt,
-        ],
+        args: ["exec", "resume", "--json", "--", sessionId, config.prompt],
         cwd: config.cwd,
         env: { ...(config.env ?? {}) },
         size: config.size ?? { cols: 80, rows: 24 },
@@ -165,13 +163,41 @@ export const codexIntegration: Integration<
             kind: "artifact" as const,
             reference,
           })),
-          { kind: "context", reference: config.sessionId },
+          { kind: "context", reference: sessionId },
         ],
       },
     };
   },
+  levelBForkProvenance(config) {
+    return config.session;
+  },
   createObserver: createCodexObserver,
 };
+
+function verifiedSessionId(provenance: CodexSessionProvenance): string {
+  if (
+    provenance.integrationId !== "codex" ||
+    provenance.name !== "thread.started" ||
+    provenance.sessionId.trim().length === 0
+  ) {
+    throw new TypeError(
+      "Codex session provenance is not a thread.started event",
+    );
+  }
+  return provenance.sessionId;
+}
+
+/** Narrow one semantic event to a Codex session receipt. */
+export function isCodexSessionProvenance(
+  event: CodexSemanticEvent,
+): event is CodexSessionProvenance {
+  return (
+    event.name === "thread.started" &&
+    "sessionId" in event &&
+    typeof event.sessionId === "string" &&
+    event.sessionId.trim().length > 0
+  );
+}
 
 type ProbeResult =
   | { readonly status: "ok"; readonly stdout: string }
@@ -241,7 +267,11 @@ function createCodexObserver(): IntegrationObserver<CodexSemanticEvent> {
         reset();
         return [diagnostic("output_gap")];
       }
-      if (event.type !== "output" && event.type !== "exited") {
+      if (
+        event.type !== "output" &&
+        event.type !== "exited" &&
+        event.type !== "interrupted"
+      ) {
         return [];
       }
 
@@ -299,7 +329,19 @@ function parseLine(line: string): CodexSemanticEvent {
   ) {
     return diagnostic("invalid_event");
   }
-  return { integrationId: "codex", name: value.type, data: value };
+  const event = {
+    integrationId: "codex",
+    name: value.type,
+    data: value,
+  } as const satisfies CodexSemanticEvent;
+  if (
+    value.type === "thread.started" &&
+    typeof value.thread_id === "string" &&
+    value.thread_id.trim().length > 0
+  ) {
+    return { ...event, name: "thread.started", sessionId: value.thread_id };
+  }
+  return event;
 }
 
 function diagnostic(reason: string): CodexSemanticEvent {

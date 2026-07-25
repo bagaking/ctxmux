@@ -11,12 +11,30 @@ import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
+import type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
 import {
   CtxmuxInvalidFrameError,
   validateCursor,
   validateServerFrame,
 } from "./validation.js";
 import { JsonLinesConnection } from "./wire.js";
+
+const runEventSources = new WeakMap<object, RunId>();
+
+function rememberRunEventSource(event: RunEvent, runId: RunId): void {
+  runEventSources.set(event, runId);
+  if (event.type === "output") {
+    runEventSources.set(event.chunk, runId);
+  }
+}
+
+/** @internal Source identity retained by the Attachment that owned an event. */
+export function runEventSource(event: RunEvent): RunId | undefined {
+  return (
+    runEventSources.get(event) ??
+    (event.type === "output" ? runEventSources.get(event.chunk) : undefined)
+  );
+}
 
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
@@ -54,6 +72,41 @@ export class CtxmuxClient {
     const response = await this.#request({ type: "start", spec });
     if (response.type !== "started") {
       throw unexpected("started response", response.type);
+    }
+    return response.run;
+  }
+
+  public async discoverTmux(socketPath: string): Promise<{
+    readonly tmuxVersion: string;
+    readonly panes: readonly TmuxPaneInfo[];
+  }> {
+    if (socketPath.length === 0) {
+      throw new TypeError("tmux socketPath must not be empty");
+    }
+    const response = await this.#request({
+      type: "discover_tmux",
+      socket_path: socketPath,
+    });
+    if (response.type !== "tmux_panes") {
+      throw unexpected("tmux panes response", response.type);
+    }
+    return { tmuxVersion: response.tmux_version, panes: response.panes };
+  }
+
+  public async importTmux(
+    socketPath: string,
+    paneId: string,
+  ): Promise<RunInfo> {
+    if (socketPath.length === 0 || paneId.length === 0) {
+      throw new TypeError("tmux socketPath and paneId must not be empty");
+    }
+    const response = await this.#request({
+      type: "import_tmux",
+      socket_path: socketPath,
+      pane_id: paneId,
+    });
+    if (response.type !== "imported") {
+      throw unexpected("imported response", response.type);
     }
     return response.run;
   }
@@ -114,7 +167,8 @@ export class CtxmuxClient {
       if (frame.type !== "attached") {
         throw unexpected("attached snapshot", frame.type);
       }
-      return new Attachment(wire, frame.snapshot);
+      const snapshot = await receiveReplay(wire, afterSeq, frame.snapshot);
+      return new Attachment(wire, snapshot);
     } catch (error) {
       wire.close();
       throw error;
@@ -160,6 +214,40 @@ export class CtxmuxClient {
   }
 }
 
+async function receiveReplay(
+  wire: JsonLinesConnection,
+  afterSeq: number,
+  header: Extract<ServerFrame, { readonly type: "attached" }>["snapshot"],
+): Promise<AttachedSnapshot> {
+  const chunks: AttachedSnapshot["replay"]["chunks"] = [];
+  if (afterSeq >= header.replay.head_seq) {
+    return {
+      run: header.run,
+      replay: { ...header.replay, chunks },
+    };
+  }
+  let nextSequence = Math.max(afterSeq, header.replay.oldest_seq - 1);
+  while (nextSequence < header.replay.head_seq) {
+    const frame = serverFrame(await wire.receive());
+    if (frame.type === "error") {
+      throw protocolError(frame.error);
+    }
+    if (
+      frame.type !== "event" ||
+      frame.event.type !== "output" ||
+      frame.event.chunk.seq !== nextSequence + 1
+    ) {
+      throw unexpected("ordered replay output", frame.type);
+    }
+    chunks.push(frame.event.chunk);
+    nextSequence = frame.event.chunk.seq;
+  }
+  return {
+    run: header.run,
+    replay: { ...header.replay, chunks },
+  };
+}
+
 /** Live TypeScript attachment to one daemon-owned Run. */
 export class Attachment {
   readonly #wire: JsonLinesConnection;
@@ -169,6 +257,9 @@ export class Attachment {
   public constructor(wire: JsonLinesConnection, snapshot: AttachedSnapshot) {
     this.#wire = wire;
     this.snapshot = snapshot;
+    for (const chunk of snapshot.replay.chunks) {
+      runEventSources.set(chunk, snapshot.run.id);
+    }
   }
 
   public async input(data: ByteInput): Promise<void> {
@@ -205,6 +296,7 @@ export class Attachment {
       throw error;
     }
     if (frame.type === "event") {
+      rememberRunEventSource(frame.event, this.snapshot.run.id);
       return frame.event;
     }
     if (frame.type === "detached") {
@@ -224,7 +316,7 @@ export class Attachment {
         return;
       }
       yield event;
-      if (event.type === "exited") {
+      if (event.type === "exited" || event.type === "interrupted") {
         return;
       }
     }

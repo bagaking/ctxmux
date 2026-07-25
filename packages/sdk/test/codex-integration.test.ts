@@ -10,9 +10,37 @@ import type {
   RunInfo,
 } from "../src/index.ts";
 import {
+  Attachment,
+  IntegrationProvenanceError,
+  registerIntegration,
+} from "../src/index.ts";
+import {
   codexIntegration,
+  isCodexSessionProvenance,
+  type CodexSessionProvenance,
   type CodexSemanticEvent,
 } from "../src/integrations/index.ts";
+
+const FIXTURE_PROBE_TIMEOUT_MS = 5_000;
+
+test("Codex default probing tolerates the supported cold-start envelope", async (context) => {
+  const delayed = await executable(
+    context,
+    probeProgram(
+      "codex-cli 0.144.4",
+      "      --json  Print JSONL",
+      "      --json  Resume as JSONL",
+      1_250,
+    ),
+  );
+
+  assert.deepEqual(await codexIntegration.detect({ executable: delayed }), {
+    status: "available",
+    executable: delayed,
+    version: "0.144.4",
+    capabilities: ["semantic_events", "level_b_fork"],
+  });
+});
 
 test("Codex detection fails closed across missing, malformed, incompatible, and hanging probes", async (context) => {
   const compatible = await executable(
@@ -23,19 +51,28 @@ test("Codex detection fails closed across missing, malformed, incompatible, and 
       "      --json  Resume as JSONL",
     ),
   );
-  assert.deepEqual(await codexIntegration.detect({ executable: compatible }), {
-    status: "available",
-    executable: compatible,
-    version: "0.144.4",
-    capabilities: ["semantic_events", "level_b_fork"],
-  });
+  assert.deepEqual(
+    await codexIntegration.detect({
+      executable: compatible,
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
+    }),
+    {
+      status: "available",
+      executable: compatible,
+      version: "0.144.4",
+      capabilities: ["semantic_events", "level_b_fork"],
+    },
+  );
 
   const semanticOnly = await executable(
     context,
     probeProgram("codex-cli 0.144.4", "      --json  Print JSONL"),
   );
   assert.deepEqual(
-    await codexIntegration.detect({ executable: semanticOnly }),
+    await codexIntegration.detect({
+      executable: semanticOnly,
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
+    }),
     {
       status: "available",
       executable: semanticOnly,
@@ -47,6 +84,7 @@ test("Codex detection fails closed across missing, malformed, incompatible, and 
   assert.deepEqual(
     await codexIntegration.detect({
       executable: join(tmpdir(), "ctxmux-missing-codex"),
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
     }),
     {
       status: "unavailable",
@@ -59,18 +97,27 @@ test("Codex detection fails closed across missing, malformed, incompatible, and 
     context,
     probeProgram("surprising version output", "      --json"),
   );
-  assert.deepEqual(await codexIntegration.detect({ executable: malformed }), {
-    status: "unavailable",
-    executable: malformed,
-    reason: "invalid_version",
-  });
+  assert.deepEqual(
+    await codexIntegration.detect({
+      executable: malformed,
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
+    }),
+    {
+      status: "unavailable",
+      executable: malformed,
+      reason: "invalid_version",
+    },
+  );
 
   const incompatible = await executable(
     context,
     probeProgram("codex-cli 0.144.4", "      --color"),
   );
   assert.deepEqual(
-    await codexIntegration.detect({ executable: incompatible }),
+    await codexIntegration.detect({
+      executable: incompatible,
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
+    }),
     {
       status: "unavailable",
       executable: incompatible,
@@ -89,11 +136,17 @@ test("Codex detection fails closed across missing, malformed, incompatible, and 
   );
 
   const failed = "/usr/bin/false";
-  assert.deepEqual(await codexIntegration.detect({ executable: failed }), {
-    status: "unavailable",
-    executable: failed,
-    reason: "probe_failed",
-  });
+  assert.deepEqual(
+    await codexIntegration.detect({
+      executable: failed,
+      timeoutMs: FIXTURE_PROBE_TIMEOUT_MS,
+    }),
+    {
+      status: "unavailable",
+      executable: failed,
+      reason: "probe_failed",
+    },
+  );
 });
 
 test("Codex launch planning keeps the prompt in one exact argv value", () => {
@@ -148,19 +201,40 @@ test("Codex Level B planning resumes one declared native session", () => {
       ],
     },
     lineage: null,
+    backend: { type: "native" },
+    capabilities: {
+      input: true,
+      resize: true,
+      stop: true,
+      fork_level_a: true,
+      fork_level_b: true,
+      replay: "raw_from_start",
+    },
     pid: 123,
     state: { type: "running" },
     head_seq: 1,
+    durable_head_seq: null,
     oldest_seq: 1,
     attachments: 0,
   };
   const prompt = "continue 'exactly'; $(touch never)";
+  const observedSession = codexIntegration
+    .createObserver()
+    .observe(
+      output(1, [
+        ...new TextEncoder().encode(
+          `${JSON.stringify({ type: "thread.started", thread_id: "session-123" })}\n`,
+        ),
+      ]),
+    )[0];
+  assert.notEqual(observedSession, undefined);
+  assert.equal(isCodexSessionProvenance(observedSession!), true);
 
   assert.deepEqual(
     codexIntegration.planLevelBFork?.(
       parent,
       {
-        sessionId: "session-123",
+        session: observedSession as CodexSessionProvenance,
         prompt,
         cwd: "/workspace with spaces",
         env: { DECLARED: "one two" },
@@ -185,6 +259,108 @@ test("Codex Level B planning resumes one declared native session", () => {
       },
     },
   );
+});
+
+test("Codex Level B rejects unrelated and unverifiable provenance before raw fork", async (context) => {
+  const executablePath = await executable(
+    context,
+    probeProgram(
+      "codex-cli 0.144.4",
+      "      --json  Print JSONL",
+      "      --json  Resume as JSONL",
+    ),
+  );
+  const parent = rootRun("00000000-0000-0000-0000-000000000001");
+  const unrelated = rootRun("00000000-0000-0000-0000-000000000002");
+  let rawForks = 0;
+  const client = {
+    async start(): Promise<RunInfo> {
+      throw new Error("unreachable raw start");
+    },
+    async fork(): Promise<RunInfo> {
+      rawForks += 1;
+      throw new Error("unreachable raw fork");
+    },
+  };
+  const registered = registerIntegration(client, codexIntegration);
+  const ownedOutput = sourcedOutput(parent, 1, [
+    ...new TextEncoder().encode(
+      `${JSON.stringify({ type: "thread.started", thread_id: "session-123" })}\n`,
+    ),
+  ]);
+  if (ownedOutput.type !== "output") {
+    throw new Error("source fixture returned a non-output event");
+  }
+  assert.throws(
+    () =>
+      registered.createObserver(parent).observe({
+        type: "output",
+        chunk: {
+          seq: ownedOutput.chunk.seq,
+          data: [...ownedOutput.chunk.data],
+        },
+      }),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  assert.throws(
+    () =>
+      registered
+        .createObserver(parent)
+        .observe(
+          sourcedOutput(unrelated, 1, [
+            ...new TextEncoder().encode(
+              `${JSON.stringify({ type: "thread.started", thread_id: "wrong-source" })}\n`,
+            ),
+          ]),
+        ),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  const observedSession = registered
+    .createObserver(parent)
+    .observe(ownedOutput)[0];
+  assert.notEqual(observedSession, undefined);
+  assert.equal(isCodexSessionProvenance(observedSession!), true);
+  const session = observedSession as CodexSessionProvenance;
+  const config = { session, prompt: "continue", cwd: "/workspace" };
+
+  await assert.rejects(
+    registered.forkLevelB(unrelated, config, { executable: executablePath }),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  await assert.rejects(
+    registered.forkLevelB(
+      parent,
+      { ...config, session: { ...session } },
+      { executable: executablePath },
+    ),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  const unboundSession = registered
+    .createObserver()
+    .observe(
+      output(2, [
+        ...new TextEncoder().encode(
+          `${JSON.stringify({ type: "thread.started", thread_id: "session-unbound" })}\n`,
+        ),
+      ]),
+    )[0];
+  assert.notEqual(unboundSession, undefined);
+  assert.equal(isCodexSessionProvenance(unboundSession!), true);
+  await assert.rejects(
+    registered.forkLevelB(
+      parent,
+      { ...config, session: unboundSession as CodexSessionProvenance },
+      { executable: executablePath },
+    ),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  await assert.rejects(
+    registerIntegration(client, codexIntegration).forkLevelB(parent, config, {
+      executable: executablePath,
+    }),
+    (error: unknown) => error instanceof IntegrationProvenanceError,
+  );
+  assert.equal(rawForks, 0);
 });
 
 test("Codex observer normalizes partitioned JSONL and isolates parser failures", () => {
@@ -246,11 +422,58 @@ function output(seq: number, data: number[]): RunEvent {
   return { type: "output", chunk: { seq, data } };
 }
 
+function sourcedOutput(run: RunInfo, seq: number, data: number[]): RunEvent {
+  const event = output(seq, data);
+  if (event.type !== "output") {
+    throw new Error("output fixture returned a non-output event");
+  }
+  new Attachment({} as never, {
+    run,
+    replay: {
+      chunks: [event.chunk],
+      oldest_seq: seq,
+      head_seq: seq,
+      truncated: false,
+    },
+  });
+  return event;
+}
+
 function diagnostic(reason: string) {
   return {
     integrationId: "codex",
     name: "integration.parse_error",
     data: { reason },
+  };
+}
+
+function rootRun(id: RunInfo["id"]): RunInfo {
+  return {
+    id,
+    spec: {
+      program: "/opt/codex",
+      args: ["exec", "--json", "--", "first"],
+      cwd: "/workspace",
+      env: {},
+      size: { cols: 80, rows: 24 },
+      declared_inputs: [{ kind: "workspace", reference: "/workspace" }],
+    },
+    lineage: null,
+    backend: { type: "native" },
+    capabilities: {
+      input: true,
+      resize: true,
+      stop: true,
+      fork_level_a: true,
+      fork_level_b: true,
+      replay: "raw_from_start",
+    },
+    pid: 123,
+    state: { type: "running" },
+    head_seq: 1,
+    durable_head_seq: null,
+    oldest_seq: 1,
+    attachments: 0,
   };
 }
 
@@ -263,11 +486,16 @@ async function executable(context: TestContext, body: string): Promise<string> {
   return path;
 }
 
-function probeProgram(version: string, help: string, resumeHelp = ""): string {
+function probeProgram(
+  version: string,
+  help: string,
+  resumeHelp = "",
+  versionDelayMs = 0,
+): string {
   return `
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
-  process.stdout.write(${JSON.stringify(`${version}\n`)});
+  setTimeout(() => process.stdout.write(${JSON.stringify(`${version}\n`)}), ${versionDelayMs});
 } else if (args[0] === "exec" && args[1] === "--help") {
   process.stdout.write(${JSON.stringify(`${help}\n`)});
 } else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--help") {

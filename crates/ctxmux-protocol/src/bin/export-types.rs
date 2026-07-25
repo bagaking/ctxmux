@@ -6,7 +6,9 @@ use std::{
     process::ExitCode,
 };
 
-use ctxmux_protocol::{ClientFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
+use ctxmux_protocol::{
+    AttachedSnapshot, ClientFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame,
+};
 use ts_rs::{Config, TS};
 
 fn main() -> ExitCode {
@@ -29,6 +31,7 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
         .with_large_int("number");
     ClientFrame::export_all(&config)?;
     ServerFrame::export_all(&config)?;
+    AttachedSnapshot::export_all(&config)?;
     fs::write(
         output.join("constants.ts"),
         format!(

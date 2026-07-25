@@ -10,8 +10,8 @@ use std::{
 
 use ctxmux_protocol::{
     AttachedSnapshot, ClientFrame, ClientHello, ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk,
-    PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo, RunSpec,
-    ServerFrame, TerminalSize, decode_frame, encode_frame,
+    OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo,
+    RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -104,6 +104,53 @@ impl Client {
         match self.request(Request::Start { spec }).await? {
             Response::Started { run } => Ok(run),
             _ => Err(ClientError::UnexpectedFrame("expected started response")),
+        }
+    }
+
+    /// Discover existing panes from one explicit tmux server socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the daemon or selected tmux server is
+    /// unavailable, incompatible, or returns an invalid response.
+    pub async fn discover_tmux(
+        &self,
+        socket_path: impl Into<String>,
+    ) -> Result<(String, Vec<TmuxPaneInfo>), ClientError> {
+        match self
+            .request(Request::DiscoverTmux {
+                socket_path: socket_path.into(),
+            })
+            .await?
+        {
+            Response::TmuxPanes {
+                tmux_version,
+                panes,
+            } => Ok((tmux_version, panes)),
+            _ => Err(ClientError::UnexpectedFrame("expected tmux panes response")),
+        }
+    }
+
+    /// Import one existing tmux pane as a read-only observable Run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the daemon rejects the pane, the tmux
+    /// target changes, or Control Mode cannot establish observation.
+    pub async fn import_tmux(
+        &self,
+        socket_path: impl Into<String>,
+        pane_id: impl Into<String>,
+    ) -> Result<RunInfo, ClientError> {
+        match self
+            .request(Request::ImportTmux {
+                socket_path: socket_path.into(),
+                pane_id: pane_id.into(),
+            })
+            .await?
+        {
+            Response::Imported { run } => Ok(run),
+            _ => Err(ClientError::UnexpectedFrame("expected imported response")),
         }
     }
 
@@ -204,7 +251,19 @@ impl Client {
         .await?;
 
         match receive(&mut wire).await? {
-            ServerFrame::Attached { snapshot } => Ok((Attachment { wire }, snapshot)),
+            ServerFrame::Attached { snapshot: header } => {
+                let mut snapshot = AttachedSnapshot {
+                    run: header.run,
+                    replay: OutputReplay {
+                        chunks: Vec::new(),
+                        oldest_seq: header.replay.oldest_seq,
+                        head_seq: header.replay.head_seq,
+                        truncated: header.replay.truncated,
+                    },
+                };
+                receive_replay(&mut wire, after_seq, &mut snapshot).await?;
+                Ok((Attachment { wire }, snapshot))
+            }
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected attached snapshot")),
         }
@@ -241,6 +300,46 @@ impl Client {
             ServerFrame::Hello { protocol } if protocol == PROTOCOL_VERSION => Ok(wire),
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected compatible hello")),
+        }
+    }
+}
+
+async fn receive_replay(
+    wire: &mut Wire,
+    after_seq: u64,
+    snapshot: &mut AttachedSnapshot,
+) -> Result<(), ClientError> {
+    if snapshot
+        .replay
+        .chunks
+        .last()
+        .is_some_and(|chunk| chunk.seq == snapshot.replay.head_seq)
+        || (snapshot.replay.chunks.is_empty() && after_seq >= snapshot.replay.head_seq)
+    {
+        return Ok(());
+    }
+    let mut next_seq = snapshot.replay.chunks.last().map_or_else(
+        || after_seq.saturating_add(1).max(snapshot.replay.oldest_seq),
+        |chunk| chunk.seq + 1,
+    );
+    loop {
+        match receive(wire).await? {
+            ServerFrame::Event {
+                event: RunEvent::Output { chunk },
+            } if chunk.seq == next_seq => {
+                let complete = chunk.seq == snapshot.replay.head_seq;
+                snapshot.replay.chunks.push(chunk);
+                if complete {
+                    return Ok(());
+                }
+                next_seq += 1;
+            }
+            ServerFrame::Error { error } => return Err(error.into()),
+            _ => {
+                return Err(ClientError::UnexpectedFrame(
+                    "expected ordered replay output",
+                ));
+            }
         }
     }
 }

@@ -27,6 +27,8 @@ usage:
   ctxmux --version
   ctxmux --socket <path> ping
   ctxmux --socket <path> start [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
+  ctxmux --socket <path> tmux-list <tmux-socket>
+  ctxmux --socket <path> tmux-import <tmux-socket> <pane-id>
   ctxmux --socket <path> fork <run-id>
   ctxmux --socket <path> list
   ctxmux --socket <path> status <run-id>
@@ -71,6 +73,8 @@ async fn run() -> Result<(), String> {
             println!("ok");
         }
         "start" => start(&client, args).await?,
+        "tmux-list" => tmux_list(&client, args).await?,
+        "tmux-import" => tmux_import(&client, args).await?,
         "fork" => {
             let parent = take_run_id(&mut args)?;
             ensure_empty(&args)?;
@@ -168,6 +172,40 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
     Ok(())
 }
 
+async fn tmux_list(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let socket = take_string(&mut args, "tmux socket")?;
+    ensure_empty(&args)?;
+    let (version, panes) = client
+        .discover_tmux(socket)
+        .await
+        .map_err(|error| error.to_string())?;
+    for pane in panes {
+        println!(
+            "{}\tsession={}\twindow={}\tpid={}\tsize={}x{}\ttmux={}",
+            pane.pane_id,
+            pane.session_id,
+            pane.window_id,
+            pane.pane_pid,
+            pane.size.cols,
+            pane.size.rows,
+            version
+        );
+    }
+    Ok(())
+}
+
+async fn tmux_import(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let socket = take_string(&mut args, "tmux socket")?;
+    let pane_id = take_string(&mut args, "tmux pane id")?;
+    ensure_empty(&args)?;
+    let run = client
+        .import_tmux(socket, pane_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_run(&run);
+    Ok(())
+}
+
 async fn input(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
     let id = take_run_id(&mut args)?;
     let data = if args.first().is_some_and(|arg| arg == "--stdin") {
@@ -234,18 +272,32 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         return follow_output(&mut attachment, &mut stdout).await;
     }
 
-    let initial_size = current_terminal_size(snapshot.run.spec.size)?;
-    attachment
-        .resize(initial_size)
-        .await
-        .map_err(|error| error.to_string())?;
+    let input_enabled = snapshot.run.capabilities.input;
+    let initial_size = if snapshot.run.capabilities.resize {
+        let size = current_terminal_size(
+            snapshot
+                .run
+                .spec
+                .as_ref()
+                .map_or(TerminalSize::default(), |spec| spec.size),
+        )?;
+        attachment
+            .resize(size)
+            .await
+            .map_err(|error| error.to_string())?;
+        Some(size)
+    } else {
+        None
+    };
     let _raw_mode = RawModeGuard::enable()?;
     let (input_tx, mut input_rx) = mpsc::channel(16);
     thread::Builder::new()
         .name("ctxmux-terminal-input".to_owned())
         .spawn(move || read_terminal_input(&input_tx))
         .map_err(|error| format!("failed to start terminal input: {error}"))?;
-    let mut resize_signal = signal(SignalKind::window_change())
+    let mut resize_signal = initial_size
+        .map(|_| signal(SignalKind::window_change()))
+        .transpose()
         .map_err(|error| format!("failed to watch terminal resize: {error}"))?;
 
     loop {
@@ -260,21 +312,29 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
             }
             input = input_rx.recv() => {
                 match input {
-                    Some(TerminalInput::Data(data)) => attachment
+                    Some(TerminalInput::Data(data)) if input_enabled => attachment
                         .input(data)
                         .await
                         .map_err(|error| error.to_string())?,
+                    Some(TerminalInput::Data(_)) => {}
                     Some(TerminalInput::Detach | TerminalInput::Closed) | None => {
                         return attachment.detach().await.map_err(|error| error.to_string());
                     }
                     Some(TerminalInput::Error(error)) => return Err(error),
                 }
             }
-            resized = resize_signal.recv() => {
+            resized = async {
+                match &mut resize_signal {
+                    Some(signal) => signal.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 if resized.is_none() {
                     return Err("terminal resize signal stream closed".to_owned());
                 }
-                let size = current_terminal_size(initial_size)?;
+                let size = current_terminal_size(
+                    initial_size.expect("resize signal exists only with an initial size"),
+                )?;
                 attachment
                     .resize(size)
                     .await
@@ -309,11 +369,11 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
                 .map_err(|error| format!("failed to write output: {error}"))?;
             Ok(true)
         }
-        RunEvent::Exited { .. } => Ok(false),
+        RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
+        RunEvent::Tmux { .. } | RunEvent::Accepted { .. } => Ok(true),
         RunEvent::Gap { head_seq } => Err(format!(
             "attachment fell behind at output sequence {head_seq}; reattach from the last observed sequence"
         )),
-        RunEvent::Accepted { .. } => Ok(true),
     }
 }
 
@@ -468,6 +528,7 @@ fn print_run(run: &RunInfo) {
             Some(signal) => format!("exited({code}, {signal})"),
             None => format!("exited({code})"),
         },
+        RunState::Interrupted { reason } => format!("interrupted({reason:?})"),
     };
     let lineage = run.lineage.as_ref().map_or_else(
         || "root".to_owned(),
@@ -479,15 +540,22 @@ fn print_run(run: &RunInfo) {
             format!("{}:{fidelity}", lineage.parent)
         },
     );
+    let backend = match &run.backend {
+        ctxmux_protocol::RunBackend::Native => "native".to_owned(),
+        ctxmux_protocol::RunBackend::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
+    };
     println!(
-        "{}\t{}\tpid={}\tlineage={}\tattachments={}\thead={}",
+        "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}",
         run.id,
         state,
         run.pid
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+        backend,
         lineage,
         run.attachments,
-        run.head_seq
+        run.head_seq,
+        run.durable_head_seq
+            .map_or_else(|| "memory-only".to_owned(), |seq| seq.to_string())
     );
 }
 

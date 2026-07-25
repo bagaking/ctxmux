@@ -52,6 +52,14 @@ strategy, artifact store, idempotency key, cleanup protocol, or persistence.
 Opaque references do not prove existence, immutability, ownership, portability,
 inclusion policy, or secret safety.
 
+The TypeScript Level B receipt is host-local and source-bound through Attachment
+ownership. The SDK records actual live events and replay chunks against their
+Run, rejects missing or mismatched source identity at a parent-scoped observer,
+and requires every Level B Integration to expose a checked provenance receipt.
+This prevents accidental cross-Run certification through the supported API; it
+does not turn the JavaScript host into a security boundary against callers that
+bypass the Integration and invoke raw fork directly.
+
 ## Wrong-case corpus
 
 Evidence pack: [context-fork track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/context-fork.md), claim `C011`.
@@ -67,10 +75,23 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - Covered: the public Rust client and daemon prove that Level A reproduces only
   the complete declared `RunSpec`, records parent plus `level_a`, creates a
   distinct child PID, and leaves parent and child independently usable.
-- Covered: the Codex Integration obtains a real session id from raw Run output,
-  invokes `exec resume --json` through the public fork path, and records its
-  workspace, artifact, and session references plus `level_b` lineage.
+- Covered: the Codex Integration obtains a session event through a source-bound
+  parent observer, rejects copied, unbound, mismatched, and unrelated-Run input
+  before raw fork, invokes `exec resume --json` through the public fork path,
+  and records workspace, artifact, and session references plus `level_b`
+  lineage.
+- Scheduled external evidence: a credential-controlled real Codex parent
+  establishes a unique fact and a Level B continuation whose prompt omits that
+  fact must return it exactly; artifacts retain only hashes, version, timing,
+  event names, and lineage.
+- Current real-vendor evidence: Codex 0.147.0 passed the same canary locally via
+  explicitly authorized CLI login, with distinct parent/child Runs, exact fact
+  continuation, `level_b` lineage, and no fatal gap, UTF-8, or record-size
+  diagnostic. Non-JSON PTY lines remain visible as aggregate counts.
 - Covered: Shell rejects Level B before any raw fork request or child creation.
+- Covered: every Level B Integration requires a provenance hook; missing-hook
+  and unrelated-source regressions keep planner/raw fork count zero and create
+  no child Run.
 - Candidate activation fixture: partial fork failure removes provisional artifacts and lineage.
 - Candidate activation fixture: concurrent retry is idempotent.
 - Candidate activation fixture: secret and machine-local path policy fails closed.
@@ -88,3 +109,4 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`: public Level A behavior
 - `packages/sdk/test/client-parity.test.ts`: public Codex Level B behavior
 - `packages/sdk/test/shell-integration.test.ts`: unsupported Level B rejection
+- `scripts/codex-semantic-canary.ts`: real Codex semantic continuation

@@ -46,32 +46,43 @@ guarantee even when every line executed.
 
 The repository gate is `scripts/check.sh`. It runs formatting, Clippy, Rust
 tests, protocol generation drift, TypeScript formatting/typechecking/build,
-SDK tests, and two cross-language real-daemon tests. GitHub runs that gate for
-pushes and pull requests on one `ubuntu-latest` job. The full gate also passed
-locally on Darwin arm64 during this audit.
+SDK tests, two cross-language real-daemon tests, and a public CLI lifecycle
+smoke plus the bounded reliability smoke. GitHub runs the full critical gate for pushes and pull requests on both
+fixed `ubuntu-24.04` and `macos-15` runners. A required Ubuntu coverage job runs the same
+test owners under Rust and TypeScript instrumentation.
 
-There is currently no checked-in line-coverage reporter or threshold, fuzzer,
-property-test framework, deterministic scheduler, sanitizer job, benchmark,
-resource census, load runner, or durable macOS CI job.
+The checked-in coverage ratchet and CI reachability map are implemented. The
+critical gate now includes owner-local subscribe/snapshot, detach/output, and
+wait/exit barriers, a seeded public multi-client mutation model, shared parser
+regression corpora, and bounded seeded Rust/TypeScript/Integration parser
+targets. The same harness now covers Integration-host exit, child and daemon
+kill, hostile frames and launch inputs, high-volume final drain, fan-out lag,
+concurrent start, lifecycle churn, and idle/active resource census. The
+scheduled reliability workflow raises parser/model counts and runs 30-minute
+nightly or explicitly dispatched two-hour release soak profiles on Linux and
+macOS while preserving receipts and daemon logs. Coverage-guided fuzzing,
+native sanitizers, comparative benchmarks, peer-identity policy, memory-mode
+global quotas, and Run GC remain absent.
 
-| Contract area                                    | Strongest current evidence                                                                                  | Confidence                              | Important gap                                                                                      |
-| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- | --------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| Daemon-owned Run survives client disconnect      | Real Rust daemon/PTY E2E plus CLI/TypeScript cross-language E2E; same PID is controlled after reconnect     | Strong for normal timing                | No Integration-host process-exit fixture and no restart guarantee                                  |
-| Start, input, resize, output, exit, detach, stop | Real shell child through public Unix-socket clients                                                         | Strong for the happy lifecycle          | Concurrent mutations, hostile child, process tree, and stop-after-wait/PID-reuse race are unproved |
-| Rejected post-spawn setup                        | Deterministic owner seam with a real child proves kill, reap, and no published Run                          | Strong owner-level evidence             | Not driven through a public request; final handoff failure is not forced                           |
-| Ordered binary replay after exit                 | Real PTY replay preserves NUL, invalid UTF-8, control bytes, and terminal exit                              | Strong for retained late replay         | Public live lag → `Gap` → cursor reattach is missing                                               |
-| 4 MiB retention and truncation arithmetic        | `OutputLog` units cover cursor boundaries and oversized chunks                                              | Strong arithmetic, weak system evidence | No real high-volume daemon/SDK fixture crosses retention                                           |
-| Protocol generation and malformed frames         | Shared corpus reaches Rust decode, real daemon, and Node validation; exact frame cap is checked             | Strong for retained cases               | No continuous fuzzing or Rust-produced all-variant golden matrix                                   |
-| Socket path safety and mode `0600`               | Sequential path-type, live-listener, stale-socket, and permission tests                                     | Good for ordinary startup               | Stale-path swap/TOCTOU and peer-identity policy are untested                                       |
-| SDK backpressure and close races                 | Deterministic mock socket tests, including 20,000 queued frames, plus real clean detach                     | Strong for SDK queue logic              | Real daemon lag recovery and silent-peer cancellation are absent                                   |
-| Level A fork                                     | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control        | Strong                                  | Post-spawn fork failure is not forced through the public boundary                                  |
-| Codex Level B                                    | Cross-language E2E proves exact planned argv, lineage, and distinct real child using a recording executable | Strong adapter proof only               | It does not prove a real Codex session retains prior semantic context                              |
-| Interactive CLI attach                           | Prefix-state units and one archived manual macOS PTY characterization                                       | Weak                                    | Checked-in PTY E2E for raw mode, resize, detach, restoration, and Run survival is absent           |
-| Future tmux Backend and restart recovery         | Architecture decisions and future cases only                                                                | Not implemented                         | Their activation suites must precede capability claims                                             |
+| Contract area                                    | Strongest current evidence                                                                                                                                                                             | Confidence                                                  | Important gap                                                                                                         |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Daemon-owned Run survives client disconnect      | Real Rust daemon/PTY E2E plus CLI/TypeScript cross-language E2E and Integration-host process exit; same PID is controlled after reconnect                                                              | Strong for current daemon lifetime                          | Daemon restart remains a separately owned, unshipped guarantee                                                        |
+| Start, input, resize, output, exit, detach, stop | Real shell child, HUP-ignoring stop, four owner barriers, and a seeded public input/resize/stop result model                                                                                           | Strong for declared direct-child lifecycle and forced joins | Hostile child, undefined writer/resize arbitration, and process-tree policy beyond the direct child remain open       |
+| Rejected post-spawn setup                        | Deterministic owner seam with a real child proves kill, reap, and no published Run                                                                                                                     | Strong owner-level evidence                                 | Not driven through a public request; final handoff failure is not forced                                              |
+| Ordered binary replay after exit                 | Real PTY replay, forced public `Gap`, caller-cursor reattach, and multi-frame native/SDK replay preserve exact ordered bytes                                                                           | Strong for retained replay and live lag                     | Incremental raw-byte encoding performance remains unqualified                                                         |
+| 4 MiB retention and truncation arithmetic        | `OutputLog` units plus live and restarted persistent public workloads prove bounded retained tail, truncation, final marker, and attach reassembly                                                     | Strong arithmetic and real-system evidence                  | The 256 MiB global replay quota applies only to persistent mode; memory-only Runs still have no global quota          |
+| Protocol generation and malformed frames         | Shared corpus reaches Rust decode, real daemon, and Node validation; exact frame cap plus seeded Rust and TypeScript byte targets are checked                                                          | Strong for retained and seeded cases                        | No coverage-guided continuous fuzzer, sanitizer, or Rust-produced all-variant golden matrix                           |
+| Socket path safety and mode `0600`               | Sequential targets plus forced startup and shutdown replacement prove identity recheck, live-listener preservation, and mode                                                                           | Strong for checked owner-controlled schedules               | Hostile writable-parent atomicity, renamed-original cleanup, and peer identity remain open                            |
+| SDK backpressure and close races                 | Deterministic mock socket tests, including 20,000 queued frames, plus real 8/32-way fast/slow fan-out with explicit `Gap`                                                                              | Strong for SDK queue and real lag behavior                  | Silent-peer cancellation and request deadlines are absent                                                             |
+| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-2 matrix           | Hostile writable-parent atomicity, fd/thread exhaustion injection, global quotas, and exited-Run GC are open          |
+| Level A fork                                     | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control                                                                                                   | Strong                                                      | Post-spawn fork failure is not forced through the public boundary                                                     |
+| Codex Level B                                    | Source-bound receipt negatives, unrelated-Run public E2E, minimized JSONL corpus, seeded observer target, and a redacted real-Codex continuation artifact                                              | Strong supported-API owner, parser, and semantic proof      | Host-local provenance is not authentication; scheduled hosted evidence remains separate                               |
+| Interactive CLI attach                           | Checked-in controlling-PTY E2E proves raw input, `SIGWINCH`, detach, exact restoration, and same-PID survival                                                                                          | Strong for ordinary detach on Unix                          | Daemon-loss, error, unwind, and catchable-signal restoration remain open                                              |
+| Persistent historical recovery                   | Real daemon restart restores exited replay/lineage and Level A fork; live rows become interrupted; stale unrelated PID, lock, schema, corrupt generation, modes, symlinks, and retention fail closed   | Strong for the declared historical class                    | Kill-at-every-SQLite-transition injection, power-loss filesystems, live PTY handoff, and migration remain unsupported |
+| Read-only tmux pane adapter                      | Transcript parser; real-session discovery/import and exact post-import bytes; complete tuple, corruption, pause/late-replay, ownership and detach fixtures; TypeScript and controlling-PTY CLI clients | Implemented; required version lanes pending                 | Ubuntu minimum and macOS current CI must produce their asserted server-version evidence before Feature archive        |
 
-The audit found 24 Rust tests, 25 TypeScript unit/mock/schema tests, two
-TypeScript-to-Rust real-daemon E2Es, and seven fixture-validator tests. These
-counts describe gate composition only; they are not a maturity score.
+Exact suite reach is machine-checked by `.github/ci-evidence-map.json`; test
+counts describe gate composition only and are not a maturity score.
 
 ## Competitive evidence
 
@@ -86,19 +97,19 @@ The comparison uses immutable upstream revisions:
 tree, manifests, and workflows. “Unknown” means the available test cannot prove
 the property. Neither label excludes private CI or downstream testing.
 
-| Dimension                    | ctxmux now                                                     | tmux                                                                        | Zellij                                                          | WezTerm / `portable-pty`                                                    | Alacritty                                                            |
-| ---------------------------- | -------------------------------------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| Real owner-boundary E2E      | Strong but narrow native Run slice                             | Very broad real server/client/PTY shell regressions                         | Strong Linux real-PTY E2E                                       | Remote SSH PTY exists; local backend lifecycle proof is thin                | One Windows child-exit case; mux lifecycle is out of scope           |
-| Deterministic whole-app seam | Partial owner fault seam and SDK mocks                         | No general fake OS harness found                                            | Strong fake PTY plus real server/client threads and IPC         | Injectable PTY interface exists, but no corresponding lifecycle suite found | Terminal model is deterministic, not a mux seam                      |
-| Replay/golden evidence       | Malformed corpus and exact raw-byte replay                     | Many exact state/transcript checks and screen goldens                       | `insta` snapshots for fake and real E2E                         | Parser action snapshots                                                     | Strong recorded bytes → semantic terminal-grid goldens               |
-| Chaos/fault injection        | Partial launch faults and transport failures                   | Scenario faults: killed/stalled clients, permission errors, unread FIFO     | Graceful quit/resurrection only; no systematic chaos            | No lifecycle chaos target found                                             | One child-kill path; no chaos target                                 |
-| Stress/soak                  | Mock 20,000-frame queue and small replay units                 | Bounded reflow, lifecycle, and output-backlog stresses                      | No dedicated load/soak target found                             | No PTY/mux load target found                                                | No process/PTY load target found                                     |
-| Concurrency/race             | Weak; key replay and stop races are not forced                 | Real black-box concurrency regressions, but no deterministic scheduler/TSan | Good deterministic multi-client tests; no scheduler exploration | Concurrent production code, little matching test evidence                   | One race-sensitive Windows watcher test                              |
-| Fuzz/sanitizer/security      | Malformed corpus and socket/argv tests; no fuzzer/sanitizer CI | Four parser fuzz targets; ASan regression build; fuzz not run there         | No first-party fuzz/sanitizer target found                      | No first-party fuzz/sanitizer target found                                  | No first-party fuzz/sanitizer target found                           |
-| Resource leaks               | Launch rollback and limited attachment/fd checks               | Cleanup proxies and ASan; no explicit FD/zombie/RSS census                  | Functional joins/count settling; direct leak freedom unknown    | Careful implementation/drop behavior; direct leak freedom unknown           | Direct handle/process leak freedom unknown                           |
-| Benchmark/performance        | Absent                                                         | No regression benchmark found                                               | No PTY/mux benchmark found                                      | Adjacent cell/width/range benches only; no PTY lifecycle benchmark          | No relevant benchmark found                                          |
-| Platform evidence            | Required Ubuntu CI; local macOS pass is not durable CI         | Nightly/manual Ubuntu x64 + macOS arm64                                     | Unit matrix is broad; whole-app and real PTY are Linux-only     | Broadest cargo CI: Linux, macOS, Windows; local PTY behavior still unproved | Push/PR tests on Windows + macOS; Linux absent in inspected workflow |
-| Submission reach             | Critical suite on every push/PR                                | Full regression is daily/manual, not push/PR                                | Unit, fake-PTY integration, and real-PTY E2E on push/PR         | Cross-platform cargo tests on relevant changes                              | Cargo tests on every push/PR                                         |
+| Dimension                    | ctxmux now                                                                                                                                                 | tmux                                                                        | Zellij                                                          | WezTerm / `portable-pty`                                                    | Alacritty                                                            |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | --------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Real owner-boundary E2E      | Strong but narrow native Run slice                                                                                                                         | Very broad real server/client/PTY shell regressions                         | Strong Linux real-PTY E2E                                       | Remote SSH PTY exists; local backend lifecycle proof is thin                | One Windows child-exit case; mux lifecycle is out of scope           |
+| Deterministic whole-app seam | Partial owner fault seam and SDK mocks                                                                                                                     | No general fake OS harness found                                            | Strong fake PTY plus real server/client threads and IPC         | Injectable PTY interface exists, but no corresponding lifecycle suite found | Terminal model is deterministic, not a mux seam                      |
+| Replay/golden evidence       | Malformed corpus and exact raw-byte replay                                                                                                                 | Many exact state/transcript checks and screen goldens                       | `insta` snapshots for fake and real E2E                         | Parser action snapshots                                                     | Strong recorded bytes → semantic terminal-grid goldens               |
+| Chaos/fault injection        | Named Integration-host, child, and daemon loss plus transport and launch negatives                                                                         | Scenario faults: killed/stalled clients, permission errors, unread FIFO     | Graceful quit/resurrection only; no systematic chaos            | No lifecycle chaos target found                                             | One child-kill path; no chaos target                                 |
+| Stress/soak                  | Bounded replay/final-drain, 1/8/32 fan-out, start pressure, churn, 1/32/128 resources, and scheduled 30-minute/2-hour soak profiles                        | Bounded reflow, lifecycle, and output-backlog stresses                      | No dedicated load/soak target found                             | No PTY/mux load target found                                                | No process/PTY load target found                                     |
+| Concurrency/race             | Owner barriers force subscribe/snapshot, detach/output, final-output/exit, and stop/wait; a seeded public mutation model constrains only declared outcomes | Real black-box concurrency regressions, but no deterministic scheduler/TSan | Good deterministic multi-client tests; no scheduler exploration | Concurrent production code, little matching test evidence                   | One race-sensitive Windows watcher test                              |
+| Fuzz/sanitizer/security      | Malformed corpus and socket/argv tests; no fuzzer/sanitizer CI                                                                                             | Four parser fuzz targets; ASan regression build; fuzz not run there         | No first-party fuzz/sanitizer target found                      | No first-party fuzz/sanitizer target found                                  | No first-party fuzz/sanitizer target found                           |
+| Resource leaks               | Frozen CPU/RSS/retention and per-Run thread/fd budgets with child/attachment/thread cleanup oracles; no-GC state remains visible                           | Cleanup proxies and ASan; no explicit FD/zombie/RSS census                  | Functional joins/count settling; direct leak freedom unknown    | Careful implementation/drop behavior; direct leak freedom unknown           | Direct handle/process leak freedom unknown                           |
+| Benchmark/performance        | Absent                                                                                                                                                     | No regression benchmark found                                               | No PTY/mux benchmark found                                      | Adjacent cell/width/range benches only; no PTY lifecycle benchmark          | No relevant benchmark found                                          |
+| Platform evidence            | Required Ubuntu 24.04 and macOS 15 critical CI; coverage instrumentation and tmux 3.4 assertion are required on Ubuntu                                     | Nightly/manual Ubuntu x64 + macOS arm64                                     | Unit matrix is broad; whole-app and real PTY are Linux-only     | Broadest cargo CI: Linux, macOS, Windows; local PTY behavior still unproved | Push/PR tests on Windows + macOS; Linux absent in inspected workflow |
+| Submission reach             | Critical suite on every push/PR                                                                                                                            | Full regression is daily/manual, not push/PR                                | Unit, fake-PTY integration, and real-PTY E2E on push/PR         | Cross-platform cargo tests on relevant changes                              | Cargo tests on every push/PR                                         |
 
 ### What to borrow
 
@@ -137,7 +148,7 @@ barrier:
 - child wait complete but terminal state not published;
 - socket target checked but not removed/bound;
 - client frame accepted but downstream consumer stalled;
-- future persistence generation written but not committed.
+- persistence transaction admitted but not committed.
 
 The seam must remain owner-local and test-only. Do not build a general public
 fault-injection or plugin framework. Each fault has a deterministic seed or
@@ -162,6 +173,26 @@ Readiness uses protocol checkpoints or bounded state polling, never an
 unexplained sleep. Every fixture receives a private socket, directory, process
 namespace, fixed geometry, explicit environment, deadline, and failure trace.
 
+The tmux public-boundary suite additionally requires:
+
+- mixed live/dead discovery where an unrelated dead pane cannot hide a live
+  target;
+- full import-tuple changes for session, window, pane PID, and server epoch,
+  including reused tmux IDs;
+- client/server version mismatch plus exact selected-server version reporting;
+- post-readiness malformed and oversized Control records reported as
+  `tmux_protocol_error`, not server loss;
+- pause followed by new output, caller-cursor reattach, late replay marked
+  truncated, exact surviving bytes, and a still-live tmux pane;
+- queued-output detach and ctxmux shutdown that close only ctxmux-owned Control
+  clients;
+- first-party Rust, CLI controlling-PTY, and TypeScript SDK behavior through
+  the same public daemon protocol.
+
+A test that returns success when `tmux` is missing is diagnostic-only. Required
+CI installs tmux first, asserts the lane's actual selected-server version, and
+fails before the suite if either condition is absent.
+
 ### Layer 4 — parser and compatibility corpora
 
 Keep versioned corpora for:
@@ -170,8 +201,8 @@ Keep versioned corpora for:
 - arbitrary fragmentation, coalescing, invalid UTF-8, duplicate keys, extreme
   numbers, nesting, exact size limits, and early close;
 - Codex and future Agent JSONL/event reduction;
-- future tmux Control Mode guards, notifications, escaping, interleaving, and
-  supported-version behavior.
+- tmux Control Mode guards, notifications, escaping, interleaving, malformed
+  post-readiness records, and qualified-version behavior.
 
 Every production crash or rejected edge case becomes a small deterministic
 regression. Fuzz-discovered seeds are minimized and checked into the ordinary
@@ -189,12 +220,12 @@ oracle. Cover:
 - kill the child during output, resize, input, and detach;
 - stall client reads and child reads independently;
 - force partial frames, reset sockets, invalid socket targets, fd exhaustion,
-  thread/task creation failure, and future persistence write failure;
+  thread/task creation failure, and persistence write failure;
 - send signal/resize storms with a recorded seed;
 - when restart recovery exists, kill the daemon at every durable transition and
   prove either the declared recovery class or explicit fail-closed loss;
-- when the tmux Backend exists, kill the control client/server and prove pane
-  ownership and resynchronization semantics.
+- kill the tmux Control client/server and prove pane ownership, distinct
+  interruption meaning, and resynchronization semantics.
 
 Each run records the seed, action trace, daemon log, process tree, and resource
 census. A failure must replay as one ordinary test before it is considered
@@ -216,6 +247,40 @@ The oracle includes no deadlock, no unexplained gap, exact declared gap/truncate
 behavior, bounded shutdown, stable daemon health, and resource deltas within
 documented bounds.
 
+Fast fan-out consumers must prove contiguous output sequences and exact seeded
+payload bytes, not only total byte count. The qualification seed selects that
+payload so the structured receipt replays a material stress input. A supervisor
+runs the complete qualification in its own process group and force-terminates
+that group when `time_budget_seconds` expires; an incomplete stage becomes an
+explicit failed receipt rather than relying only on the CI job timeout.
+
+High-Run-count qualification measures both idle and active workloads at
+1/32/128 Runs. After a clean observation baseline and before optimization
+results guide changes, freeze core-normalized daemon CPU, peak and steady-state
+RSS, retained-output bytes, and per-Run RSS/thread/fd slopes. Repeated lifecycle
+churn must return cleanup-owned resources to the documented baseline envelope;
+intentional retained state and the current absence of global Run GC or quotas
+remain visible rather than being subtracted from the result.
+
+`reliability-budgets.json` freezes the six idle/active × 1/32/128 cells from
+three Darwin arm64 observation rounds before optimization. CPU is percent of
+one logical core; RSS peak is sampled every 25 ms. Resource census starts Runs
+with concurrency 8: on the observation host, 128 idle Runs completed at launch
+concurrency 1/4/8, while concurrency 16 reproduced Darwin `openpty -6` after
+123 successful responses. This is recorded as burst-start pressure rather than
+misreported as a 128-Run steady-state limit. A separate 32-Run/concurrency-16
+oracle preserves concurrent-start stress without weakening the 128 census.
+The three complete observation receipts live under `fixtures/reliability/`.
+The policy gate verifies each SHA-256 and recomputes every recorded maximum
+from those durable raw receipts before accepting the budget file.
+
+The PR profile runs the full named matrix with the one-Run resource cells and
+no time soak. Nightly uses the complete resource matrix plus a real 30-minute
+active soak inside a 45-minute harness budget. Explicit release dispatch uses a
+two-hour soak inside a three-hour harness budget. Both scheduled profiles run
+on Ubuntu and macOS and upload the structured receipt plus every daemon log even
+when the gate fails.
+
 ### Concurrency and race testing
 
 Use three complementary techniques:
@@ -230,6 +295,14 @@ Use three complementary techniques:
 Loom or an equivalent scheduler belongs only around a genuinely small extracted
 owner state machine. ThreadSanitizer can be a scheduled native/dependency smoke,
 but it is not a replacement for protocol-level race oracles.
+
+The current bounded model races public input, resize, and direct-child stop
+through separate socket clients. It accepts only success, the declared
+post-exit rejection, or an owner I/O failure where those outcomes are honest;
+it does not infer byte ordering or resize arbitration. The scheduled runner
+records seed, case counts, exact commands, environment, covered owner
+boundaries, and excluded claims before execution, so a failure retains replay
+information even when a later command never runs.
 
 ### Benchmarks and performance regression
 
@@ -285,13 +358,13 @@ make that open policy visible rather than normalize unbounded growth.
 
 ## Gate topology
 
-| Lane                  | Trigger                                                                | Required evidence                                                                                                                                              | Failure policy                                                                |
-| --------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| PR critical           | Every pull request; Linux and macOS for the native contract            | Static checks, units/properties, malformed corpus, critical real daemon/PTY lifecycle, deterministic replay/stop/socket races, security smoke, coverage report | Blocking; no retries that hide deterministic failure                          |
-| PR changed-platform   | Changes to platform, PTY, protocol, SDK, Integration, or Backend paths | The owning platform and contract subset selected through explicit path/job mapping                                                                             | Blocking                                                                      |
-| Nightly reliability   | Scheduled                                                              | Seeded fuzz, sanitizer/race smoke, chaos matrix, load/leak run, benchmark trend, larger platform/tool/version matrix                                           | Blocking for release readiness; preserve seeds and artifacts                  |
-| Release qualification | Release candidate                                                      | Multi-hour soak, supported OS/architecture matrix, minimum/current external tool compatibility, recovery and upgrade policy tests                              | Blocks release                                                                |
-| External canary       | Scheduled and credential-controlled                                    | Real Codex/Agent semantic continuation and other vendor-dependent contracts                                                                                    | Never substitutes for hermetic adapter tests; narrows claims when unavailable |
+| Lane                  | Trigger                                                                | Required evidence                                                                                                                                                                     | Failure policy                                                                |
+| --------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| PR critical           | Every pull request; Linux and macOS for the native contract            | Static checks, units/properties, malformed corpus, critical real daemon/PTY lifecycle, deterministic replay/stop/socket races, bounded chaos/security/resource smoke, coverage report | Blocking; no retries that hide deterministic failure                          |
+| PR changed-platform   | Changes to platform, PTY, protocol, SDK, Integration, or Backend paths | The owning platform and contract subset selected through explicit path/job mapping                                                                                                    | Blocking                                                                      |
+| Nightly reliability   | Scheduled                                                              | Seeded fuzz/model receipt plus Linux/macOS chaos, full 1/32/128 resource matrix, and 30-minute load/leak soak; sanitizer and benchmark trend remain open                              | Blocking for release readiness; preserve seeds and artifacts                  |
+| Release qualification | Explicit release dispatch                                              | Linux/macOS two-hour soak plus the same frozen budgets; external-tool, recovery, and upgrade qualification remain with their owning tasks                                             | Blocks release                                                                |
+| External canary       | Scheduled and credential-controlled                                    | Real Codex/Agent semantic continuation and other vendor-dependent contracts                                                                                                           | Never substitutes for hermetic adapter tests; narrows claims when unavailable |
 
 The full critical lifecycle suite should remain on pull requests even if the
 nightly suite grows. Tmux is a warning here: its broad regression suite is
@@ -299,8 +372,8 @@ excellent, but the inspected workflow reaches it only daily or manually.
 
 ### Code-coverage ratchet
 
-Add Rust and TypeScript coverage reporting as an auxiliary PR artifact. After a
-baseline is measured and exclusions are reviewed, adopt these initial floors:
+Rust and TypeScript coverage reporting is a required PR job. The enforced
+initial floors are:
 
 - at least 90% changed-line coverage;
 - at least 85% line coverage for hand-written runtime/client/SDK code;
@@ -312,6 +385,34 @@ Exceptions require a linked owner-boundary test or a documented unreachable
 branch. The invariant matrix still blocks a release when the percentage passes
 but required behavioral evidence is absent.
 
+`scripts/check.sh --coverage` owns the reproducible local gate. It emits raw
+LCOV/JSON under the ignored `coverage/` directory and validates the reviewed
+groups in `coverage-policy.json`. The first enforced baseline on Darwin arm64
+was 87.01% for Rust runtime/clients, 98.03% for Rust protocol/codegen, 91.88%
+for the hand-written TypeScript SDK, 96.57% for TypeScript protocol validators,
+and 100% for changed executable lines. Per-file results remain visible even
+when a group passes, so lower CLI or wire-validator coverage cannot disappear
+inside one repository aggregate.
+
+Generated TypeScript protocol declarations are excluded from the denominator
+and remain protected by the Rust-owner drift check. The `cfg(not(unix))`
+compile failures are reported as platform-impossible because generation 2
+declares a Unix transport. No test fixture or hand-written runtime file is
+silently excluded. The required changed-line comparison uses the pull-request
+base or prior push revision supplied by CI and fails below 90% when executable
+product lines changed. A pure documentation change may report the absence of
+such lines honestly. A result retained as changed-line proof must set
+`CTXMUX_COVERAGE_REQUIRE_CHANGED_LINES=true`; if its base produces no changed
+executable product lines, evidence mode fails rather than converting a
+clean-tree no-op into proof. Retained evidence records its explicit base and
+nonzero denominator.
+
+`.github/ci-evidence-map.json` maps every discovered Rust, TypeScript, script,
+and public-smoke suite to invariants, selection owners, required jobs, and
+platforms. `scripts/ci-reachability.mjs` rejects unmapped tests, hidden
+`skip`/`ignore`, workflow or selector drift, incomplete platform reach, and
+unclassified skipped, conditional, ignored, or schedule-only evidence.
+
 ## Adoption sequence
 
 ### P0 — close false-confidence gaps
@@ -322,10 +423,19 @@ but required behavioral evidence is absent.
    stop-after-wait/PID-identity races.
 3. Check in the interactive CLI controlling-PTY fixture for raw mode, input,
    resize, detach, restoration, and surviving Run identity.
-4. Force the socket stale-target swap race and assert no unrelated replacement.
+4. Force the socket startup stale-target swap race and assert no unrelated
+   replacement; separately owner-fence shutdown unlink against a replacement
+   listener.
 5. Add durable macOS CI beside Ubuntu and publish job-to-invariant selection.
 6. Add coverage reporting in observation mode, establish the baseline, then
    enable the ratchet.
+
+Items 1 through 4 are implemented by the public Gap/cursor fixture, owned-child
+stop and wait/publication barrier, controlling-PTY CLI fixture, and startup
+plus shutdown socket-identity barriers. Items 5 and 6 are implemented by the
+required `critical`/`coverage` jobs, `.github/ci-evidence-map.json`, and
+`coverage-policy.json`. Coverage does not substitute for the owner-boundary
+fixtures.
 
 ### P1 — establish the reliability system
 
@@ -340,17 +450,102 @@ but required behavioral evidence is absent.
    budgets.
 6. Generate Rust-authored protocol goldens consumed by the TypeScript SDK.
 
+The deterministic owner barriers, public mutation model, native/TypeScript/
+Codex seeded targets, minimized corpora, high-volume replay/fan-out, named chaos
+matrix, resource census, frozen budgets, and scheduled soak profiles implement
+the bounded portions of items 1 through 4. Coverage-guided fuzzing, sanitizer
+coverage, the broader controllable PTY seam, benchmark trends, high-volume
+mutation, and Rust-authored all-variant goldens remain open rather than being
+inferred from this lane.
+
 ### P2 — qualify capability-specific risk
 
 1. Gate persistence/recovery with kill-at-every-transition, corrupt/torn state,
    and wrong-PID adoption fixtures before claiming restart continuity.
-2. Gate the tmux Backend across its supported minimum/current versions with
-   real Control Mode framing, capture/live joins, slow consumers, detach under
-   load, server loss, and pane PID survival.
-3. Add controlled real-Agent compatibility canaries for fidelity claims while
-   keeping hermetic recording executables for argv/protocol correctness.
-4. Expand architecture and release matrices only when ctxmux declares support
+2. Gate the tmux Backend across its qualified minimum/current versions with
+   real Control Mode framing, raw-since-import joins, slow consumers, detach
+   under load, server loss, and pane PID survival. The minimum lane pins Ubuntu
+   tmux 3.4 and asserts the selected server version; the macOS lane installs
+   the current package and records/asserts the selected server version. This
+   qualifies those two versions, not every future 3.x release.
+3. Close Level B provenance before broadening the claim: a continuation must
+   bind to a session created for the declared parent Run, and an unrelated or
+   unverifiable session must fail before a raw fork request can create a Run.
+4. Keep hermetic recording executables for exact argv, protocol, lineage, and
+   failure regressions, and add a credential-controlled real Codex canary that
+   proves a unique fact established in the parent session remains observable in
+   the Level B continuation.
+5. Measure real Codex cold-start behavior and make the default availability
+   probe tolerant of the supported startup envelope. An explicit timeout must
+   still fail closed deterministically; retries must not turn a semantic or
+   availability failure green.
+6. Expand architecture and release matrices only when ctxmux declares support
    for those platforms or backends.
+
+### Capability Feature closure before final qualification
+
+Persistence/recovery and the tmux adapter keep their implementation truth in
+their existing Feature Tracker Features because they have different owners and
+failure models. Reliability qualification must nevertheless keep the following
+closure obligations explicit:
+
+- `f-223czq75x` is archived after completing its accepted contract and
+  implementation tasks and passing real restart, corruption, stale-identity,
+  retention, cleanup, and applicable wrong-case gates. Final qualification now
+  binds that archived evidence and keeps unsupported live continuity excluded.
+- `f-224czneed` completes its tmux public-Control-Mode adapter task, passes the
+  complete-identity, qualified-version, framing-corruption, pause/late-replay,
+  detach, server-loss, first-party-client, and process-ownership gates, and is
+  formally archived before tmux behavior is counted in final qualification or
+  peer comparisons.
+- `f-226cz5zdq` owns the cross-Feature closure and qualification evidence, not a
+  duplicate persistence or tmux implementation plan. The qualification report
+  records each archived Feature, exact shipped boundary, versions and evidence,
+  and keeps unsupported recovery or Backend semantics excluded.
+
+### Embeddable Run Kernel adoption closure
+
+Consumer demand may reveal a missing kernel contract, but it does not redefine
+ctxmux around one consumer. Candidate work enters qualification under this
+order:
+
+1. include it when the daemon, PTY, protocol, SDK, lifecycle, or raw-stream
+   owner boundary gives ctxmux itself a clear correctness, reliability,
+   performance, or operability benefit;
+2. when it merely fits the Run model, require an explicit benefit-to-state,
+   protocol, implementation, and test-complexity argument;
+3. reject it when it moves Agent semantics, orchestration, workspace policy,
+   terminal rendering, or speculative remote-product behavior into the mux.
+
+The current clean-consumer audit admits four bounded gaps:
+
+- **Retry-safe Run creation:** a caller-supplied operation key may make `start`
+  and `fork` converge after response loss, but `RunId` remains the physical
+  incarnation. The same key with a different canonical request conflicts. Key
+  retention follows Run retention and recovery; this must not grow into mutable
+  tags, metadata CRUD, a second Session identity, or silent attach-or-create.
+- **Observable attachment controls:** persistent input, resize, and stop need
+  bounded command correlation and exact accepted/error results. Acceptance
+  proves only what the PTY owner completed; it does not claim a child consumed
+  input. Resize reports the applied terminal size, and stop acceptance remains
+  distinct from final `Exited`.
+- **Race-safe local activation:** a framework-neutral consumer needs one
+  explicit connect-or-activate contract with readiness, version compatibility,
+  concurrent-start, socket safety, daemon ownership, logging, and cleanup
+  semantics. It must not silently download a binary, mutate global state, bind
+  ctxmux lifetime to Electron, or imply SSH/remote support.
+- **Earned streaming optimization:** freeze an incremental raw-byte consumer
+  workload before changing generation-2 integer-array encoding. Adopt a new
+  versioned representation only when the measured end-to-end gain exceeds its
+  protocol and validation cost while exact bytes, sequence, replay, `Gap`, frame
+  limits, backpressure, security, and resource bounds remain green. A measured
+  no-change decision is preferable to an elegant-looking rewrite without ROI.
+
+Agent catalogs, ACP, Hooks and their durability, Agent activity/status,
+Workspace/Git/worktree metadata, xterm screen snapshots, and remote ctxmuxd/SSH
+deployment remain consumer or future-Backend responsibilities. Process-tree
+shutdown, daemon restart recovery, packaging, and release claims stay in their
+already-owned tasks rather than being duplicated here.
 
 This sequence deliberately reuses the existing gate, corpus, lifecycle harness,
 and launch-transition seam. It does not require a new test framework for every

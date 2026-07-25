@@ -128,6 +128,93 @@ pub struct RunLineage {
     pub fidelity: ForkFidelity,
 }
 
+/// Backend owner of one ctxmux Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RunBackend {
+    /// The ctxmux daemon owns the native PTY and direct child handle.
+    Native,
+    /// tmux owns the server, session, pane PTY, and pane process. ctxmux owns
+    /// only one public Control Mode observation client.
+    Tmux {
+        /// Explicit tmux server socket selected by the caller.
+        socket_path: String,
+        /// tmux server PID at import time.
+        server_pid: u32,
+        /// tmux server start time at import time.
+        server_started_at: u64,
+        /// Stable session ID within that tmux server lifetime.
+        session_id: String,
+        /// Stable window ID within that tmux server lifetime.
+        window_id: String,
+        /// Stable pane ID represented by this Run.
+        pane_id: String,
+        /// Released tmux version accepted by the adapter.
+        tmux_version: String,
+    },
+}
+
+/// Replay fidelity available for one Run backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayCapability {
+    /// Raw bytes are retained from native Run start.
+    RawFromStart,
+    /// Raw bytes are retained only after ctxmux imports an existing pane.
+    RawSinceImport,
+}
+
+/// Generic operations honestly supported by one Run backend.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent public capability bits must remain explicit on the wire"
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RunCapabilities {
+    pub input: bool,
+    pub resize: bool,
+    pub stop: bool,
+    pub fork_level_a: bool,
+    pub fork_level_b: bool,
+    pub replay: ReplayCapability,
+}
+
+impl RunCapabilities {
+    /// Capabilities of the current native PTY backend.
+    pub const NATIVE: Self = Self {
+        input: true,
+        resize: true,
+        stop: true,
+        fork_level_a: true,
+        fork_level_b: true,
+        replay: ReplayCapability::RawFromStart,
+    };
+
+    /// Deliberately read-only capabilities of an imported tmux pane.
+    pub const TMUX_READ_ONLY: Self = Self {
+        input: false,
+        resize: false,
+        stop: false,
+        fork_level_a: false,
+        fork_level_b: false,
+        replay: ReplayCapability::RawSinceImport,
+    };
+}
+
+/// One existing pane returned by public tmux discovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct TmuxPaneInfo {
+    pub socket_path: String,
+    pub tmux_version: String,
+    pub server_pid: u32,
+    pub server_started_at: u64,
+    pub session_id: String,
+    pub window_id: String,
+    pub pane_id: String,
+    pub pane_pid: u32,
+    pub size: TerminalSize,
+}
+
 /// Explicit fork plan. The daemon never substitutes one variant for another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -152,6 +239,12 @@ pub enum RunState {
         /// Signal description when termination was signal-driven.
         signal: Option<String>,
     },
+    /// The prior daemon lost live ownership and no replacement process was
+    /// adopted or signalled.
+    Interrupted {
+        /// Explicit reason that live ownership ended without an exit status.
+        reason: InterruptionReason,
+    },
 }
 
 impl RunState {
@@ -162,21 +255,42 @@ impl RunState {
     }
 }
 
+/// Why a Run became historical without a portable child exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptionReason {
+    /// A new daemon epoch reconciled a previously running durable record.
+    DaemonRestart,
+    /// The public tmux Control Mode client lost its tmux server.
+    TmuxServerUnavailable,
+    /// The tmux Control Mode stream violated its bounded public framing.
+    TmuxProtocolError,
+    /// The imported tmux pane identity disappeared or changed.
+    TmuxTargetChanged,
+}
+
 /// Current public metadata for one Run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct RunInfo {
     /// Stable Run identity.
     pub id: RunId,
     /// Portable inputs used to launch the Run.
-    pub spec: RunSpec,
+    pub spec: Option<RunSpec>,
     /// Immediate parent and actual fidelity for a fork, or `None` for start.
     pub lineage: Option<RunLineage>,
+    /// Runtime owner and backend-specific stable identity.
+    pub backend: RunBackend,
+    /// Operations and replay fidelity honestly supported by this backend.
+    pub capabilities: RunCapabilities,
     /// Child process identifier when supplied by the platform.
     pub pid: Option<u32>,
     /// Current lifecycle state.
     pub state: RunState,
     /// Highest output sequence allocated so far, or zero before output.
     pub head_seq: u64,
+    /// Highest output sequence committed by the persistence actor, or `None`
+    /// when this daemon is running without a state directory.
+    pub durable_head_seq: Option<u64>,
     /// Oldest output sequence still retained, or zero before output.
     pub oldest_seq: u64,
     /// Number of live attachment connections.
@@ -205,6 +319,17 @@ pub struct OutputReplay {
     pub truncated: bool,
 }
 
+/// Replay metadata sent in the initial attachment frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct OutputReplayHeader {
+    /// Oldest retained sequence, or zero when there has been no output.
+    pub oldest_seq: u64,
+    /// Highest allocated output sequence, or zero when there has been no output.
+    pub head_seq: u64,
+    /// Whether output newer than the requested cursor had already been evicted.
+    pub truncated: bool,
+}
+
 /// First message sent by every client connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ClientHello {
@@ -218,6 +343,13 @@ pub struct ClientHello {
 pub enum Request {
     /// Start a new daemon-owned Run.
     Start { spec: RunSpec },
+    /// Discover panes from one explicitly selected tmux server socket.
+    DiscoverTmux { socket_path: String },
+    /// Import one existing tmux pane as a read-only observable Run.
+    ImportTmux {
+        socket_path: String,
+        pane_id: String,
+    },
     /// Create one child Run from an explicit fidelity plan.
     Fork { parent: RunId, plan: ForkPlan },
     /// List all Runs retained by this daemon.
@@ -263,6 +395,13 @@ pub enum ClientFrame {
 pub enum Response {
     /// A Run was created.
     Started { run: RunInfo },
+    /// Existing panes discovered through the tmux executable.
+    TmuxPanes {
+        tmux_version: String,
+        panes: Vec<TmuxPaneInfo>,
+    },
+    /// One existing tmux pane was imported as a ctxmux Run.
+    Imported { run: RunInfo },
     /// A forked child Run was created.
     Forked { run: RunInfo },
     /// Current Runs retained by the daemon.
@@ -282,6 +421,15 @@ pub struct AttachedSnapshot {
     pub replay: OutputReplay,
 }
 
+/// Metadata-only first frame for an attachment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct AttachedHeader {
+    /// Current Run metadata.
+    pub run: RunInfo,
+    /// Replay bounds whose chunks follow as ordered output-event frames.
+    pub replay: OutputReplayHeader,
+}
+
 /// Event delivered after an attachment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -290,10 +438,27 @@ pub enum RunEvent {
     Output { chunk: OutputChunk },
     /// Terminal lifecycle state.
     Exited { state: RunState },
+    /// Historical terminal state produced by restart reconciliation.
+    Interrupted { reason: InterruptionReason },
+    /// Backend-specific observable event that does not change generic Run
+    /// ownership semantics.
+    Tmux { event: TmuxRunEvent },
     /// The attachment lagged behind live delivery and should request replay.
     Gap { head_seq: u64 },
     /// A state-changing attachment command was accepted.
-    Accepted { run: RunInfo },
+    Accepted { run: Box<RunInfo> },
+}
+
+/// Observable public-Control-Mode event for one imported tmux pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TmuxRunEvent {
+    /// The imported session's mutable name changed. Identity remains its ID.
+    SessionRenamed { name: Vec<u8> },
+    /// tmux paused delivery for this control client.
+    Paused,
+    /// tmux resumed delivery for this control client.
+    Continued,
 }
 
 /// Stable error categories exposed by the protocol.
@@ -312,6 +477,16 @@ pub enum ErrorCode {
     SpawnFailed,
     /// A local I/O operation failed.
     Io,
+    /// Durable state could not accept or commit a mutation.
+    Persistence,
+    /// The selected Backend executable, server, or transport is unavailable.
+    BackendUnavailable,
+    /// The installed Backend version is outside the declared supported range.
+    UnsupportedBackendVersion,
+    /// The Run backend explicitly does not support the requested operation.
+    UnsupportedCapability,
+    /// The selected external Backend target changed or disappeared.
+    TargetChanged,
     /// An unexpected daemon failure occurred.
     Internal,
 }
@@ -344,8 +519,8 @@ pub enum ServerFrame {
     Hello { protocol: u16 },
     /// Successful short-lived request response.
     Response { response: Response },
-    /// Initial attachment state and retained output.
-    Attached { snapshot: AttachedSnapshot },
+    /// Initial attachment metadata. Retained output follows as event frames.
+    Attached { snapshot: AttachedHeader },
     /// Live attachment event.
     Event { event: RunEvent },
     /// The daemon acknowledged a clean detach.
@@ -449,26 +624,8 @@ impl<'de> Visitor<'de> for RejectDuplicateObjectMembers {
         Ok(())
     }
 
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(())
-    }
-
     fn visit_unit<E>(self) -> Result<Self::Value, E> {
         Ok(())
-    }
-
-    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        self.deserialize(deserializer)
-    }
-
-    fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        self.deserialize(deserializer)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -591,13 +748,36 @@ mod tests {
         // LP-03: the protocol owner rejects one shared raw-byte corpus before
         // typed decoding, including map and unknown nested object members.
         for (id, bytes) in malformed_protocol_frames() {
+            let error = decode_frame::<ClientFrame>(&bytes)
+                .expect_err("shared malformed frame must fail before typed decoding");
             assert!(
-                matches!(
-                    decode_frame::<ClientFrame>(&bytes),
-                    Err(FrameError::Decode(_))
-                ),
+                matches!(error, FrameError::Decode(_)),
                 "shared malformed frame {id} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_guard_accepts_every_valid_json_value_shape() {
+        // The duplicate-name guard walks the untyped value before serde performs
+        // typed decoding, so every JSON scalar and container shape is part of
+        // the protocol codec contract rather than an unreachable visitor arm.
+        let value = br#"{
+            "bool": true,
+            "negative": -1,
+            "positive": 1,
+            "float": 1.5,
+            "string": "value",
+            "null": null,
+            "array": [false, -2, 2, 2.5, "nested", null],
+            "object": {"member": "value"}
+        }"#;
+
+        let decoded = decode_frame::<serde_json::Value>(value).expect("decode every JSON shape");
+        assert_eq!(decoded["negative"], -1);
+        assert_eq!(decoded["array"][4], "nested");
+        let run_id = RunId::default();
+        assert_eq!(run_id.to_string().parse::<RunId>(), Ok(run_id));
+        assert!("not-a-run-id".parse::<RunId>().is_err());
     }
 }

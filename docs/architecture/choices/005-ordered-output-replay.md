@@ -9,7 +9,10 @@ A reattaching client needs more than future bytes. It needs a cursor, retained h
 
 ## Decision
 
-Each successful PTY read becomes one `OutputChunk` with a monotonically increasing `u64` sequence. The daemon retains chunks by raw byte count up to a 4 MiB target while always keeping at least one chunk. Attach names the last observed sequence and receives retained newer chunks, oldest and head cursors, and `truncated`.
+Each successful PTY read becomes one `OutputChunk` with a monotonically increasing `u64` sequence. The daemon retains chunks by raw byte count up to a 4 MiB target while always keeping at least one chunk. Attach names the last observed sequence and receives oldest/head cursors plus `truncated` in an initial metadata header. Retained newer chunks follow as ordered output frames, and public clients reassemble them before returning the snapshot.
+
+The metadata header and reassembled snapshot are different protocol types.
+`AttachedHeader` has no chunks field; `AttachedSnapshot` is a client API result.
 
 Live output is delivered through a bounded broadcast channel. A lagging receiver gets `Gap { head_seq }` and must reattach using the client's last successfully observed sequence.
 
@@ -20,6 +23,8 @@ Live output is delivered through a bounded broadcast channel. A lagging receiver
 - Eviction is explicit through `truncated`; missing history never looks complete.
 - Subscribe-before-snapshot plus deduplication prevents replay/live duplication.
 - Exited Runs remain attachable for replay and one terminal state event.
+- Retained history larger than one transport frame remains exact because replay
+  uses the same bounded output-frame representation as live delivery.
 
 ## Alternatives
 
@@ -47,10 +52,13 @@ Short reads do not preserve application write boundaries. The core promise is by
 ## Fixture mapping
 
 - Covered now: exact binary retained replay after exit, one terminal event on late attach, ordered reconnect, and cursor/retention boundary units.
+- Covered now: replay larger than the 1 MiB frame ceiling is streamed and
+  reassembled exactly across native and TypeScript public clients.
 - Candidate: cursors at zero, `oldest - 1`, oldest, head, and future.
 - Candidate: retention eviction across many chunks and one oversized chunk.
-- Candidate: lag a real attachment, observe `Gap`, disconnect, replay from the caller-owned cursor, and prove exactly ordered continuation. The current unit seam does not yet cross the attachment protocol.
-- Candidate: high-volume final output followed by immediate exit.
+- Covered now: a real attachment observes `Gap`, disconnects, replays from the caller-owned cursor, and proves contiguous sequences plus exact raw-byte continuation through the public protocol.
+- Covered now: a 5 MiB final-output workload retains the bounded tail, marks
+  truncation, preserves the final marker, and remains attachable.
 - Candidate: attach to an already-exited Run.
 
 ## Open questions

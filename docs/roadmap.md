@@ -113,6 +113,9 @@ Acceptance:
 
 ## M3.5 — Persistence and restart recovery
 
+Status: implemented for the declared historical recovery class; live PTY
+handoff and process adoption remain unsupported.
+
 First accept a recovery contract that distinguishes durable metadata, replay,
 and live PTY ownership. Then implement only the recovery class that can be
 identified and proven without adopting a process by PID guesswork or moving Run
@@ -132,17 +135,27 @@ Acceptance:
 
 ## M4 — tmux adapter
 
-Connect existing tmux sessions through public tmux integration surfaces while
-keeping native Run semantics and tmux implementation details separated.
+Status: implemented under Feature `f-224czneed`; required minimum/current
+version-lane qualification remains before archive.
+
+Connect existing tmux panes through the public ctxmux protocol while keeping
+native Run semantics and tmux implementation details separated.
 
 Acceptance:
 
-- ctxmux can list and attach to a selected existing tmux session through the
-  adapter;
-- disconnecting the ctxmux client does not kill the tmux session;
+- ctxmux can list and attach to a selected live tmux pane, with the complete
+  import identity tuple fenced against relocation, respawn, death, and server
+  replacement;
+- disconnecting the ctxmux client or daemon does not kill the tmux pane,
+  session, or server;
 - the implementation does not speak tmux's private client-server wire
   protocol;
-- documentation names any behavioral differences from the native backend.
+- read-only controls, raw-since-import replay, source gaps, and memory-only
+  import are capability-visible and documented;
+- Control Mode corruption, target change, and server loss remain distinct;
+- required Ubuntu tmux 3.4 and macOS current-version lanes prove the declared
+  minimum/current qualification boundary without claiming every future 3.x
+  release.
 
 ## M5 — Composition proof and release
 

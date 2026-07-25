@@ -1,4 +1,4 @@
-import type { CtxmuxClient } from "./client.js";
+import { runEventSource, type CtxmuxClient } from "./client.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
 import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunInfo } from "./generated/RunInfo.js";
@@ -75,6 +75,7 @@ export interface Integration<
     config: ForkConfig,
     detection: AvailableIntegrationDetection,
   ): LevelBForkPlan;
+  levelBForkProvenance?(config: ForkConfig): object;
   createObserver(): IntegrationObserver<Event>;
 }
 
@@ -95,7 +96,7 @@ export interface RegisteredIntegration<
     config: ForkConfig,
     options?: IntegrationDetectionOptions,
   ): Promise<RunInfo>;
-  createObserver(): IntegrationObserver<Event>;
+  createObserver(parent?: RunInfo): IntegrationObserver<Event>;
 }
 
 /** Detection failed before an Integration could honestly plan a Run. */
@@ -125,6 +126,21 @@ export class IntegrationCapabilityError extends Error {
   }
 }
 
+/** A Level B plan did not carry evidence observed from its declared parent. */
+export class IntegrationProvenanceError extends Error {
+  public readonly integrationId: string;
+  public readonly parentId: RunInfo["id"];
+
+  public constructor(integrationId: string, parentId: RunInfo["id"]) {
+    super(
+      `Integration ${integrationId} has no verified Level B provenance for parent Run ${parentId}`,
+    );
+    this.name = "IntegrationProvenanceError";
+    this.integrationId = integrationId;
+    this.parentId = parentId;
+  }
+}
+
 /**
  * Bind an explicitly imported Integration to the same public client used by
  * raw Runs. Registration performs no discovery and owns no daemon state.
@@ -149,6 +165,7 @@ export function registerIntegration<
   const detect = (
     options?: IntegrationDetectionOptions,
   ): Promise<IntegrationDetection> => integration.detect(options);
+  const observedProvenance = new WeakMap<object, RunInfo["id"]>();
 
   return {
     integration,
@@ -167,9 +184,18 @@ export function registerIntegration<
       }
       if (
         !detection.capabilities.includes("level_b_fork") ||
-        integration.planLevelBFork === undefined
+        integration.planLevelBFork === undefined ||
+        integration.levelBForkProvenance === undefined
       ) {
         throw new IntegrationCapabilityError(integration.id, "level_b_fork");
+      }
+      const provenance = integration.levelBForkProvenance(config);
+      if (
+        typeof provenance !== "object" ||
+        provenance === null ||
+        observedProvenance.get(provenance) !== parent.id
+      ) {
+        throw new IntegrationProvenanceError(integration.id, parent.id);
       }
       const plan: unknown = integration.planLevelBFork(
         parent,
@@ -188,8 +214,22 @@ export function registerIntegration<
       }
       return client.fork(parent.id, plan as LevelBForkPlan);
     },
-    createObserver() {
-      return integration.createObserver();
+    createObserver(parent) {
+      const observer = integration.createObserver();
+      return {
+        observe(event) {
+          if (parent !== undefined && runEventSource(event) !== parent.id) {
+            throw new IntegrationProvenanceError(integration.id, parent.id);
+          }
+          const observed = observer.observe(event);
+          if (parent !== undefined) {
+            for (const semanticEvent of observed) {
+              observedProvenance.set(semanticEvent, parent.id);
+            }
+          }
+          return observed;
+        },
+      };
     },
   };
 }

@@ -9,9 +9,13 @@ Multiple short requests and long-lived attachments may act on the same Run while
 
 ## Decision
 
-`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and child killer; an atomic counter tracks attachments. Blocking reader and waiter threads update the Run, while a Tokio broadcast channel feeds each attachment task.
+`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and disables the sender immediately after wait observes exit. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
 
 Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` decrements the counter on every return path, including transport failure.
+
+Test builds can pause the attachment owner at three private points: after
+subscribe, after snapshot, and after receiving detach but before acknowledgement.
+The hook is not a public fault API and cannot change production scheduling.
 
 ## Quality attributes and invariants
 
@@ -20,6 +24,8 @@ Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` de
 - Output sequence allocation and log insertion are one locked operation.
 - A dropped attachment eventually decrements the observable count.
 - Lifecycle errors are explicit after a Run reaches `exited`.
+- A stop after child wait cannot signal by stale numeric identity, even while
+  public state publication is deliberately paused.
 
 ## Alternatives
 
@@ -29,7 +35,7 @@ Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` de
 
 ## Known constraints
 
-`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal exit. Broadcast lag reports one `head_seq` but does not automatically replay. Exited Runs are never collected, and daemon shutdown semantics are unspecified.
+`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Exited Runs are never collected, and daemon shutdown semantics are unspecified.
 
 Poisoned locks recover their inner value; this prevents secondary panics but is not a declared consistency-recovery strategy.
 
@@ -39,17 +45,28 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
 
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered sequence can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
-- `LC-003` (`d03`): the waiter can reap a child before public state changes; a concurrent stop that still signals by cached numeric PID risks a reused process identity. This needs a deterministic lifecycle model rather than probabilistic PID churn.
+- `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now removes signalling authority before publication, and a deterministic barrier proves stop rejects during that interval without touching an unrelated process.
 
 Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux's composition of broadcast, replay, and lifecycle state, not a claim that current Tokio loses messages.
 
 ## Fixture mapping
 
 - Covered now: disconnect and reattach, attachment count release, invalid operations after exit, and exact retained final bytes followed by one terminal event on late attach.
-- Candidate: output produced exactly between subscribe and snapshot.
-- Candidate: two observers plus concurrent input and resize.
-- Candidate: stop racing with output, input, and natural exit.
-- Candidate: force a real attachment through broadcast lag, observe `Gap`, and recover through public cursor-based reattach. The current channel-plus-log unit test is mechanism evidence, not this end-to-end oracle.
+- Covered now: output produced exactly between subscribe and snapshot appears
+  once in replay and is suppressed once from the already-subscribed live queue.
+- Covered now: output produced after detach is received but before its
+  acknowledgement remains replayable, while the attachment guard settles to
+  zero.
+- Covered now: output recorded after child wait but before public exit is
+  delivered before `Exited` and remains available to a late reattachment.
+- Covered now: a seeded public multi-client model races input, resize, and two
+  stops. Exactly one stop is accepted; other results are limited to the
+  protocol's declared success, exited-state, and owner-I/O outcomes without
+  inventing writer or resize arbitration.
+- Candidate: broader stop races with hostile output, natural exit, and a
+  controllable process/PTY seam under sustained load.
+- Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous sequences and exact raw bytes.
+- Covered now: a child-wait barrier pauses public state publication after signalling authority is removed and proves concurrent stop cannot affect an unrelated process identity.
 - Candidate: exited-Run collection and attachment during collection.
 
 ## Open questions

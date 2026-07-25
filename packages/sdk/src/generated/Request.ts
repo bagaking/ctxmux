@@ -9,6 +9,8 @@ import type { TerminalSize } from "./TerminalSize.js";
  */
 export type Request =
   | { type: "start"; spec: RunSpec }
+  | { type: "discover_tmux"; socket_path: string }
+  | { type: "import_tmux"; socket_path: string; pane_id: string }
   | { type: "fork"; parent: RunId; plan: ForkPlan }
   | { type: "list" }
   | { type: "status"; id: RunId }

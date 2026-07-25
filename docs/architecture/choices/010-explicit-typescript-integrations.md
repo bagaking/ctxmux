@@ -30,7 +30,9 @@ The daemon does not discover npm packages, load JavaScript, start a plugin proce
 
 ## Known constraints
 
-The TypeScript SDK owns the Integration API generation 2 interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic or Level B claims. The Codex Integration uses bounded `--version`, `exec --help`, and `exec resume --help` probes, launches `codex exec --json`, and materializes `codex exec resume --json` only when native resume support is present. Workspace snapshots, artifact ownership, secrets, and Integration implementation-version identity remain open.
+The TypeScript SDK owns the Integration API generation 2 interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic or Level B claims. The Codex Integration uses bounded `--version`, `exec --help`, and `exec resume --help` probes with a five-second default budget, launches `codex exec --json`, and materializes `codex exec resume --json` only when native resume support is present.
+
+For session-backed Level B, the SDK Attachment owner records each live `RunEvent` and retained replay chunk against its actual source Run in a private host-local `WeakMap`. A parent-scoped registered observer rejects an event with a missing or different source before the Integration parser runs, then binds each emitted semantic receipt to that verified source. A Level B-capable Integration must implement `levelBForkProvenance`; absence, a copied/unowned receipt, or a parent mismatch fails before planner execution or raw fork. Codex uses the verified `thread.started` event as its session provenance. This is a supported-API ownership check against accidental fabrication and cross-Run routing, not daemon persistence or authentication against a malicious host that can bypass the Integration and call raw fork. Workspace snapshots, artifact ownership, secrets, and Integration implementation-version identity remain open.
 
 ## Wrong-case corpus
 
@@ -44,10 +46,29 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 ## Fixture mapping
 
 - Active: a public Codex recording-child launch proves exact argv and that the raw Run stays usable without an observer.
-- Active: the Codex probe matrix covers missing, malformed, incompatible, and hanging executables before Run launch.
+- Active: the Codex probe matrix covers missing, malformed, incompatible, hanging, explicit-timeout, and delayed-default-envelope executables before Run launch.
+- Active: copied, explicitly unbound, cross-registration, and differently
+  declared receipt objects are rejected before raw fork. A real unrelated Run
+  emits a valid Codex-shaped event through its own Attachment; routing it to the
+  parent observer is rejected, and the public daemon Run list remains unchanged.
+- Scheduled: `.github/workflows/reliability.yml` runs the credential-controlled
+  real Codex semantic continuation canary and preserves redacted evidence.
+- Local characterization may use an already authenticated Codex CLI only with
+  explicit `CTXMUX_ALLOW_CODEX_LOGIN_AUTH=1`; absent keys and absent opt-in fail
+  visibly, while the scheduled workflow continues to require its secret.
+- Real PTY output may contain ordinary non-JSON lines beside Codex JSONL. The
+  canary retains diagnostic and raw line-class counts. Gap, invalid UTF-8, and
+  oversized semantic records are fatal; non-JSON lines remain visible without
+  hiding successfully parsed events or raw output.
 - Current: SDK tests also cover explicit binding, structured shell planning, a no-claim shell observer, partitioned Codex JSONL, gaps, and parser diagnostics.
+- Current: `fixtures/codex-jsonl-regressions.json` retains minimized ordinary
+  JSONL cases, while the bounded seeded observer target mutates those cases and
+  arbitrary bytes without turning parser evidence into a real-vendor claim.
 - Candidate activation fixture: Integration host exits while the raw child and Run remain usable.
-- Covered: unsupported Level B capability fails before any raw fork request.
+- Covered: an Integration that does not declare Level B capability or a planner
+  fails before any raw fork request.
+- Covered: an Integration that declares Level B but omits a provenance hook
+  fails before planner or raw fork; the raw fork count remains zero.
 
 ## Open questions
 
@@ -63,3 +84,4 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 - `packages/sdk/src/integrations/`: current shell and Codex implementations
 - `packages/sdk/test/codex-integration.test.ts`: Codex probe and observer fixtures
 - `packages/sdk/test/client-parity.test.ts`: public Integration launch and raw Run continuity
+- `scripts/codex-semantic-canary.ts`: credential-controlled semantic continuation

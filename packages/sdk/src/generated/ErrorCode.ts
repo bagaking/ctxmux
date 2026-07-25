@@ -10,4 +10,9 @@ export type ErrorCode =
   | "invalid_run_state"
   | "spawn_failed"
   | "io"
+  | "persistence"
+  | "backend_unavailable"
+  | "unsupported_backend_version"
+  | "unsupported_capability"
+  | "target_changed"
   | "internal";
