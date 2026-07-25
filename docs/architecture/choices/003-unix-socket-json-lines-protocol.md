@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 2
+# 003 — Unix socket and NDJSON protocol generation 3
 
-- Status: accepted for generation 2; pre-stable
+- Status: accepted for generation 3; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -37,7 +37,11 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. Startup revalidation closes the known probe-to-unlink replacement schedule. The shutdown guard retains the bound path's device/inode and removes the pathname only while its current socket identity matches. That check still cannot make pathname recheck plus unlink atomic or rediscover an original socket renamed elsewhere, so a hostile writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
 
-Protocol generation 2 replaces obsolete shapes directly. Compatibility policy is not yet a release guarantee.
+Protocol generation 3 directly replaces the incompatible generation-2 Run,
+Backend, interruption, persistence-cursor, and streamed-replay shapes. An older
+peer fails the exact generation handshake before request dispatch; ctxmux does
+not provide a generation-2 fallback, migration, alias, or dual encoding.
+Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
 

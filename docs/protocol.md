@@ -1,4 +1,4 @@
-# Local Protocol Generation 2
+# Local Protocol Generation 3
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 2.
+- Raw PTY bytes are represented as integer arrays in generation 3.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -64,14 +64,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 2.
+ownership in generation 3.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Every generation-2 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-3 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -116,7 +116,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 2 import accepts only socket path plus pane ID, so it
+associations. Generation 3 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -126,7 +126,7 @@ Control output is parsed as bounded framing plus octal-escaped byte payloads.
 A malformed escape, oversized record, invalid command block, or other
 post-readiness transcript corruption interrupts the Run with
 `tmux_protocol_error`; it is not relabeled as ordinary server unavailability.
-Generation 2 does not claim general command correlation beyond the adapter's
+Generation 3 does not claim general command correlation beyond the adapter's
 bounded, serial identity and continue probes.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -166,7 +166,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-2 peer that puts `chunks` back into the header is invalid.
+generation-3 peer that puts `chunks` back into the header is invalid.
 
 `Gap { head_seq }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -214,6 +214,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-2 frame at runtime, rejects duplicate
+validates the complete nested generation-3 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

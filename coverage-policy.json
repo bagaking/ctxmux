@@ -57,7 +57,7 @@
         "crates/ctxmux-client/src/lib.rs:cfg(not(unix))",
         "crates/ctxmux-daemon/src/lib.rs:cfg(not(unix))"
       ],
-      "reason": "Generation 2 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
+      "reason": "Generation 3 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
       "evidence": "docs/protocol.md#transport"
     }
   ]

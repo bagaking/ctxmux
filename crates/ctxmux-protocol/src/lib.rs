@@ -11,7 +11,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -302,7 +302,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in v2.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 3.
     pub data: Vec<u8>,
 }
 

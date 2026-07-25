@@ -35,7 +35,7 @@ target. Until a separately reviewed follow-target contract exists, a change to
 any member of the imported tuple interrupts the Run explicitly.
 
 Tmux links can expose one pane ID through multiple session/window associations.
-Discovery reports those rows, but the generation-2 import request names only
+Discovery reports those rows, but the generation-3 import request names only
 socket path plus pane ID. Import therefore fails closed unless that pair
 resolves to exactly one tuple; it never chooses an association by output order.
 
@@ -155,4 +155,4 @@ server-version evidence.
 - `fixtures/tmux-control-mode.json`: checked-in byte/transcript corpus
 - `fixtures/wrong-cases.json`: active `TMUX-01`, `TMUX-02`, and `TMUX-03`
 - `.github/ci-evidence-map.json`: required job and platform reachability
-- `docs/protocol.md`: public generation-2 behavior
+- `docs/protocol.md`: public generation-3 behavior

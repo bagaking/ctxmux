@@ -213,7 +213,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-2 frames, limits, identifiers, and duplicate rejection are exact"
+        "generation-3 frames, limits, identifiers, and duplicate rejection are exact"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",

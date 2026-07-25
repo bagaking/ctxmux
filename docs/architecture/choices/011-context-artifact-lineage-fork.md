@@ -17,7 +17,7 @@ The target contract has two supported fidelity levels and one non-goal:
 
 The caller requests a level. The runtime never silently substitutes a lower one.
 
-In generation 2, `RunSpec.declared_inputs` is the sole immutable truth for
+In generation 3, `RunSpec.declared_inputs` is the sole immutable truth for
 ordered workspace, artifact, and context references. Values are non-empty and
 opaque; the daemon records them but does not dereference, normalize, copy, or
 infer ownership. `RunInfo.lineage` records derivation only: the immediate parent

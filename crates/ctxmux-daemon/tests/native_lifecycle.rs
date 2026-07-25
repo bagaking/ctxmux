@@ -599,29 +599,62 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_an_incompatible_protocol_generation() {
+async fn daemon_rejects_generation_2_before_request_dispatch() {
+    assert_eq!(
+        PROTOCOL_VERSION, 3,
+        "fixture must name the current generation"
+    );
     let daemon = TestDaemon::start().await;
-    let stream = UnixStream::connect(daemon.client.socket_path())
+    let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
-    wire.send(
-        encode_frame(&ClientFrame::Hello {
-            hello: ClientHello { protocol: 999 },
-        })
-        .expect("encode incompatible hello"),
-    )
-    .await
-    .expect("send incompatible hello");
-    let line = wire
-        .next()
+    let generation_2_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 2 },
+    })
+    .expect("encode generation-2 hello");
+    let start = encode_frame(&ClientFrame::Request {
+        request: ctxmux_protocol::Request::Start {
+            spec: RunSpec {
+                program: "/bin/sh".to_owned(),
+                args: vec!["-c".to_owned(), "printf must-not-run".to_owned()],
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            },
+        },
+    })
+    .expect("encode queued start request");
+    stream
+        .write_all(format!("{generation_2_hello}\n{start}\n").as_bytes())
         .await
+        .expect("send coalesced old hello and start request");
+    let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
+    let line = timeout(Duration::from_secs(5), wire.next())
+        .await
+        .expect("version mismatch response must be bounded")
         .expect("daemon responds")
         .expect("read daemon response");
     match decode_frame::<ServerFrame>(&line).expect("decode daemon response") {
         ServerFrame::Error { error } => assert_eq!(error.code, ErrorCode::VersionMismatch),
         other => panic!("expected version mismatch, got {other:?}"),
     }
+    assert!(
+        timeout(Duration::from_secs(5), wire.next())
+            .await
+            .expect("old-generation connection close must be bounded")
+            .is_none(),
+        "daemon must close the old-generation connection"
+    );
+    assert!(
+        daemon
+            .client
+            .list()
+            .await
+            .expect("list current Runs")
+            .is_empty(),
+        "a request queued behind an old hello reached dispatch"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------- |
 | Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                                                        | Restart recovery and upgrade continuity are open.                           |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                  | Windows transport, discovery, and daemon activation are open.               |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 2.                                                                   | Other SDKs appear only for a real client requirement.                       |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 3.                                                                   | Other SDKs appear only for a real client requirement.                       |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                      | Screen reconstruction and a multi-writer policy are open.                   |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.    | Wider tmux control and other Backends require separate evidence.            |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                    | Broader Integration coverage and context capture remain open.               |
@@ -37,7 +37,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v2)
+                    Unix domain socket (v3)
                               |
                     long-lived ctxmux daemon
                     - RunManager / Run identity
@@ -171,7 +171,7 @@ daemon-loss, and unwind restoration paths remain broader qualification work.
 
 ### Cross-language client parity
 
-The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-2 server variant before exposing it. The cross-client test creates a Run with one client, disconnects, reconnects with the other, verifies the same PID, and controls the shared Run.
+The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-3 server variant before exposing it. The cross-client test creates a Run with one client, disconnects, reconnects with the other, verifies the same PID, and controls the shared Run.
 
 Generated TypeScript types prevent a second handwritten wire schema. Current `u64` fields are still emitted as JavaScript `number`, so the SDK rejects values outside the safe-integer range rather than exposing a rounded cursor. A future exact large-integer representation remains a protocol decision.
 
@@ -255,7 +255,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 2                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 3                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |

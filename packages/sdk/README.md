@@ -49,7 +49,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 2 imports by socket path plus pane ID, an ambiguous linked
+because generation 3 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -161,13 +161,13 @@ running. `stop()` explicitly terminates it.
 
 On a live attachment, `input()`, `resize()`, and `stop()` resolve when Node's
 socket write callback completes. The daemon reports remote acceptance or error
-through the attachment event stream. Generation 2 has no command correlation
+through the attachment event stream. Generation 3 has no command correlation
 ID, so these promises must not be treated as remote acknowledgements. Short
 `CtxmuxClient` request methods do wait for their protocol response.
 
 `attach(id, afterSeq)` resumes ordered output after the last observed sequence.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 2 represents cursors as
+4 MiB replay contains the complete history. Generation 3 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 
