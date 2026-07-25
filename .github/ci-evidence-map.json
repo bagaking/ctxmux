@@ -1,0 +1,417 @@
+{
+  "schema": "ctxmux.ci-evidence-map.v1",
+  "jobs": [
+    {
+      "id": "critical",
+      "platforms": ["ubuntu-24.04", "macos-15"],
+      "command": "scripts/check.sh",
+      "trigger": "pull_request and push to main",
+      "required": true
+    },
+    {
+      "id": "coverage",
+      "platforms": ["ubuntu-24.04"],
+      "command": "scripts/check.sh --coverage",
+      "trigger": "pull_request and push to main",
+      "required": true
+    }
+  ],
+  "suites": [
+    {
+      "id": "fixture-validator-contracts",
+      "kind": "test",
+      "path": "scripts/check-fixtures.test.mjs",
+      "invariants": ["wrong-case anchors are executable and gate-reachable"],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "coverage-policy-contracts",
+      "kind": "test",
+      "path": "scripts/coverage-policy.test.mjs",
+      "invariants": ["coverage groups and changed-line math fail closed"],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "ci-reachability-contracts",
+      "kind": "test",
+      "path": "scripts/ci-reachability.test.mjs",
+      "invariants": [
+        "every critical suite has explicit job and platform reach"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "reliability-policy-contracts",
+      "kind": "test",
+      "path": "scripts/reliability-policy.test.mjs",
+      "invariants": [
+        "frozen 1/32/128 CPU, RSS, retention, slope, and cleanup budgets remain complete and gate-reachable"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "reliability-budget-policy",
+      "kind": "contract_check",
+      "path": "reliability-budgets.json",
+      "invariants": [
+        "pre-optimization resource ceilings and PR/nightly/release reachability fail closed on drift"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node scripts/reliability-policy.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "cli-unit-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux/src/main.rs",
+      "invariants": [
+        "terminal prefix routing and size normalization are deterministic"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "cli-controlling-pty-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux/tests/interactive_attach.rs",
+      "invariants": [
+        "interactive CLI raw input, resize, detach, restoration, and Run survival cross a real controlling PTY",
+        "read-only tmux attach does not forward input, still observes external output, detaches with Ctrl-b d, restores termios, and preserves the pane"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
+      "id": "daemon-owner-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/lib.rs",
+      "invariants": [
+        "launch rollback, replay retention, and socket ownership remain owner-local"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "persistence-store-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/persistence.rs",
+      "invariants": [
+        "durable format ceilings, terminal-record reservation, and cross-Run replay pruning remain exact"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "tmux-control-parser-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/tmux.rs",
+      "invariants": [
+        "Control Mode command blocks, notifications, octal bytes, malformed records, and line limits remain exact and bounded"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "tmux-public-adapter-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+      "invariants": [
+        "real public discovery and import bind the complete target identity and selected server version",
+        "dead panes do not hide live panes and a linked pane with duplicate associations is rejected as ambiguous",
+        "raw-since-import pause recovery and queued detach remain honest while the tmux-owned pane survives",
+        "target change, server loss, and transcript corruption remain distinct fail-closed outcomes"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-lifecycle-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+      "invariants": [
+        "real daemon, process, PTY, replay, stop, and fork behavior cross the public boundary"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "persistence-recovery-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/persistence_recovery.rs",
+      "invariants": [
+        "real restart recovers only committed historical state and fails closed on stale PID, corrupt generation, unsafe state paths, lock contention, and retention overflow"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "rust-protocol-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-protocol/src/lib.rs",
+      "invariants": [
+        "generation-2 frames, limits, identifiers, and duplicate rejection are exact"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "rust-protocol-fuzz-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-protocol/tests/seeded_fuzz.rs",
+      "invariants": [
+        "seeded native protocol bytes never panic and every accepted typed frame round-trips"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "sdk-index-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/index.test.ts",
+      "invariants": ["portable SDK defaults and version identity remain exact"],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/index.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "sdk-integration-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/integration.test.ts",
+      "invariants": [
+        "explicit Integration registration and capability gates fail closed"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/integration.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "shell-integration-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/shell-integration.test.ts",
+      "invariants": [
+        "shell launch planning stays structured and Level B stays unsupported"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/shell-integration.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "codex-integration-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/codex-integration.test.ts",
+      "invariants": [
+        "Codex detection, argv, Level B planning, and observation remain explicit"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/codex-integration.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "sdk-hostile-frame-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/wrong-cases.test.ts",
+      "invariants": [
+        "runtime validation, framing, backpressure, and close races reject hostile input"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/wrong-cases.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "sdk-parser-fuzz-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/parser-fuzz.test.ts",
+      "invariants": [
+        "seeded TypeScript wire and Codex JSONL fuzz targets stay total, bounded, and replayable",
+        "the minimized Codex JSONL regression corpus remains an ordinary required test"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/parser-fuzz.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "cross-client-lifecycle-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/client-parity.test.ts",
+      "invariants": [
+        "CLI and SDK share daemon-owned Run identity and Level B continuation",
+        "TypeScript SDK discovers, imports, attaches, and detaches one real read-only tmux pane without taking ownership"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/client-parity.test.ts",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "public-cli-smoke",
+      "kind": "public_smoke",
+      "path": "scripts/smoke-cli.sh",
+      "invariants": [
+        "public CLI lifecycle, argument, and daemon boundaries work end to end"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "scripts/smoke-cli.sh",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "tmux-required-version-gate",
+      "kind": "contract_check",
+      "path": "scripts/check.sh",
+      "invariants": [
+        "required CI fails before tests when tmux is missing, client/server versions differ, or the lane server version is not qualified"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "CTXMUX_TMUX_QUALIFICATION",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "generated-protocol-drift",
+      "kind": "contract_check",
+      "path": "scripts/check-protocol-types.sh",
+      "invariants": [
+        "generated TypeScript declarations match the Rust protocol owner"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "scripts/check-protocol-types.sh",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "public-reliability-smoke",
+      "kind": "public_smoke",
+      "path": "scripts/check-reliability.sh",
+      "invariants": [
+        "PR smoke crosses real daemon chaos, security, stress, CPU, RSS, and cleanup boundaries"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "scripts/check-reliability.sh --profile smoke",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    }
+  ],
+  "non_required_evidence": {
+    "skipped": [],
+    "ignored": [],
+    "conditional": [],
+    "schedule_only": [
+      {
+        "id": "seeded-parser-and-model-qualification",
+        "reason": "reliability.yml raises deterministic native/TypeScript parser fuzz and public multi-client model case counts, records the exact seed and owner boundaries, and preserves a replay receipt without replacing PR corpus/model coverage."
+      },
+      {
+        "id": "real-codex-semantic-canary",
+        "reason": "Credential-controlled vendor evidence runs from reliability.yml and never substitutes for required hermetic Integration tests."
+      },
+      {
+        "id": "nightly-reliability-qualification",
+        "reason": "The scheduled Linux and macOS lane runs the full 1/32/128 resource matrix and a real 30-minute soak, preserving its receipt and daemon logs outside the PR time budget."
+      },
+      {
+        "id": "release-reliability-soak",
+        "reason": "Explicit release dispatch runs a two-hour Linux and macOS soak inside a three-hour harness budget and preserves all evidence for release qualification."
+      }
+    ]
+  }
+}

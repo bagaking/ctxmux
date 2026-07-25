@@ -9,9 +9,20 @@ permissions:
   contents: read
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  critical:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            tmux_lane: minimum-3.4
+          - os: macos-15
+            tmux_lane: current
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      CTXMUX_REQUIRE_TMUX: "1"
+      CTXMUX_TMUX_QUALIFICATION: ${{ matrix.tmux_lane }}
 
     steps:
       - uses: actions/checkout@v4
@@ -24,8 +35,59 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show active-toolchain
 
+      - name: Install required real tmux
+        run: |
+          if [[ "$CTXMUX_TMUX_QUALIFICATION" == "minimum-3.4" ]]; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends tmux
+          else
+            brew update
+            if brew list --versions tmux >/dev/null; then
+              brew upgrade tmux
+            else
+              brew install tmux
+            fi
+          fi
+          command -v tmux
+
       - name: Install JavaScript dependencies
         run: npm ci
 
       - name: Check workspace
         run: scripts/check.sh
+
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CTXMUX_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      CTXMUX_REQUIRE_TMUX: "1"
+      CTXMUX_TMUX_QUALIFICATION: minimum-3.4
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain and coverage support
+        run: |
+          rustup show active-toolchain
+          rustup component add llvm-tools-preview
+          cargo install --locked --version 0.8.7 cargo-llvm-cov
+
+      - name: Install required real tmux
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends tmux
+          command -v tmux
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Check coverage policy
+        run: scripts/check.sh --coverage

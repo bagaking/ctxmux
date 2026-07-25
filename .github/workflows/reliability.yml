@@ -1,0 +1,174 @@
+name: Reliability
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      qualification:
+        description: Reliability qualification lane
+        required: true
+        default: nightly
+        type: choice
+        options:
+          - nightly
+          - release
+
+permissions:
+  contents: read
+
+jobs:
+  reliability-nightly:
+    if: github.event_name == 'schedule' || inputs.qualification == 'nightly'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
+      CTXMUX_RELIABILITY_ARTIFACT_DIR: ${{ github.workspace }}/target/reliability/nightly
+      CTXMUX_RELIABILITY_EVIDENCE: ${{ github.workspace }}/target/reliability/nightly/result.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Run 30-minute chaos, stress, resource, and leak qualification
+        run: scripts/check-reliability.sh --profile nightly
+
+      - name: Preserve nightly receipt and daemon logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-nightly-${{ matrix.os }}-${{ github.run_id }}
+          path: target/reliability/nightly
+          if-no-files-found: warn
+          retention-days: 30
+
+  release-soak:
+    if: github.event_name == 'workflow_dispatch' && inputs.qualification == 'release'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 210
+    env:
+      CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
+      CTXMUX_RELIABILITY_ARTIFACT_DIR: ${{ github.workspace }}/target/reliability/release
+      CTXMUX_RELIABILITY_EVIDENCE: ${{ github.workspace }}/target/reliability/release/result.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Run two-hour release soak inside a three-hour qualification budget
+        run: scripts/check-reliability.sh --profile release
+
+      - name: Preserve release receipt and daemon logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-release-${{ matrix.os }}-${{ github.run_id }}
+          path: target/reliability/release
+          if-no-files-found: warn
+          retention-days: 90
+
+  seeded-parser-and-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
+      CTXMUX_FUZZ_CASES: 10000
+      CTXMUX_MODEL_CASES: 128
+      CTXMUX_SEEDED_EVIDENCE: target/reliability/seeded-qualification.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Run seeded parser fuzz and public mutation model
+        run: npm run test:seeded-qualification
+
+      - name: Preserve exact replay seed and boundary receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seeded-parser-model-${{ github.run_id }}
+          path: target/reliability/seeded-qualification.json
+          if-no-files-found: error
+          retention-days: 30
+
+  real-codex-semantic-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CTXMUXD_BIN: ${{ github.workspace }}/target/debug/ctxmuxd
+      CTXMUX_CODEX_CANARY_EVIDENCE: ${{ github.workspace }}/target/codex-canary/result.json
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain
+
+      - name: Require canary credentials
+        run: test -n "$OPENAI_API_KEY"
+
+      - name: Install workspace and pinned Codex CLI
+        run: |
+          npm ci
+          npm install --global @openai/codex@0.147.0
+
+      - name: Build ctxmux daemon
+        run: cargo build --locked --package ctxmux-daemon
+
+      - name: Prove real Codex semantic continuation
+        run: npm run test:codex-canary
+
+      - name: Preserve redacted canary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-semantic-canary-${{ github.run_id }}
+          path: target/codex-canary/result.json
+          if-no-files-found: warn
+          retention-days: 30

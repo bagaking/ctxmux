@@ -1,0 +1,64 @@
+{
+  "schema": "ctxmux.coverage-policy.v1",
+  "changed_line_minimum": 90,
+  "groups": [
+    {
+      "id": "rust-runtime-and-clients",
+      "language": "rust",
+      "minimum_line_percent": 85,
+      "paths": [
+        "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/main.rs",
+        "crates/ctxmux-client/src/lib.rs",
+        "crates/ctxmux/src/main.rs"
+      ]
+    },
+    {
+      "id": "rust-protocol-and-codegen",
+      "language": "rust",
+      "minimum_line_percent": 95,
+      "paths": [
+        "crates/ctxmux-protocol/src/lib.rs",
+        "crates/ctxmux-protocol/src/bin/export-types.rs"
+      ]
+    },
+    {
+      "id": "typescript-sdk",
+      "language": "typescript",
+      "minimum_line_percent": 85,
+      "paths": [
+        "packages/sdk/src/client.ts",
+        "packages/sdk/src/index.ts",
+        "packages/sdk/src/integration.ts",
+        "packages/sdk/src/integrations/codex.ts",
+        "packages/sdk/src/integrations/index.ts",
+        "packages/sdk/src/integrations/shell.ts"
+      ]
+    },
+    {
+      "id": "typescript-protocol-validators",
+      "language": "typescript",
+      "minimum_line_percent": 95,
+      "paths": ["packages/sdk/src/validation.ts", "packages/sdk/src/wire.ts"]
+    }
+  ],
+  "reported_exclusions": [
+    {
+      "id": "generated-typescript-protocol",
+      "category": "generated",
+      "paths": ["packages/sdk/src/generated/**"],
+      "reason": "Rust-authored declarations are generated output, not a second hand-written implementation.",
+      "evidence": "scripts/check-protocol-types.sh"
+    },
+    {
+      "id": "non-unix-native-transport",
+      "category": "platform_impossible",
+      "paths": [
+        "crates/ctxmux-client/src/lib.rs:cfg(not(unix))",
+        "crates/ctxmux-daemon/src/lib.rs:cfg(not(unix))"
+      ],
+      "reason": "Generation 2 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
+      "evidence": "docs/protocol.md#transport"
+    }
+  ]
+}

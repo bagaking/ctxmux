@@ -1,0 +1,157 @@
+{
+  "schema": "ctxmux.reliability-budgets.v1",
+  "frozen_before_optimization": true,
+  "frozen_at": "2026-08-10T04:02:00.000Z",
+  "observation_baseline": {
+    "profile": "observe",
+    "rounds": 3,
+    "environment": {
+      "os": "darwin",
+      "architecture": "arm64",
+      "logical_cpus": 14
+    },
+    "resource_start_concurrency": 8,
+    "peak_rss_sample_interval_ms": 25,
+    "raw_receipts": [
+      {
+        "path": "fixtures/reliability/observe-darwin-arm64-r1.json",
+        "sha256": "875e7aa7b021098287e0b229d5f41b12d17c028d68fa9da57a2a7cca336162db"
+      },
+      {
+        "path": "fixtures/reliability/observe-darwin-arm64-r2.json",
+        "sha256": "59a39f382f359e9a7825b49d258c76fc39740b27d517bf23832d261950dcd841"
+      },
+      {
+        "path": "fixtures/reliability/observe-darwin-arm64-r3.json",
+        "sha256": "c0ec6a5d88719ece0a9ba10db9db0d611e60639583d598cf025740b6b7bab697"
+      }
+    ],
+    "observed_maxima": {
+      "idle": {
+        "1": {
+          "cpu_core_percent": 1.153,
+          "peak_rss_kib": 4416,
+          "steady_rss_kib": 4400,
+          "rss_kib_per_run": 800
+        },
+        "32": {
+          "cpu_core_percent": 1.158,
+          "peak_rss_kib": 10000,
+          "steady_rss_kib": 9840,
+          "rss_kib_per_run": 194.5
+        },
+        "128": {
+          "cpu_core_percent": 10.275,
+          "peak_rss_kib": 22240,
+          "steady_rss_kib": 22160,
+          "rss_kib_per_run": 145
+        }
+      },
+      "active": {
+        "1": {
+          "cpu_core_percent": 0,
+          "peak_rss_kib": 4832,
+          "steady_rss_kib": 4816,
+          "rss_kib_per_run": 1232
+        },
+        "32": {
+          "cpu_core_percent": 84.28,
+          "peak_rss_kib": 12736,
+          "steady_rss_kib": 12608,
+          "rss_kib_per_run": 282
+        },
+        "128": {
+          "cpu_core_percent": 272.692,
+          "peak_rss_kib": 26640,
+          "steady_rss_kib": 26480,
+          "rss_kib_per_run": 179
+        }
+      }
+    },
+    "margin_policy": "RSS ceilings preserve roughly 1.5-2x the observed maxima; slope ceilings preserve smaller owner-local margins. CPU ceilings cover sample quantization and supported-platform variance without weakening the fixed workload. CI failures revise workload or budgets only through a new clean observation receipt, never from optimized candidate results."
+  },
+  "measurement_contract": {
+    "cpu": "Daemon CPU time divided by wall time and reported as percent of one logical core; 100 means one fully occupied core.",
+    "rss": "Daemon-only RSS in KiB; peak is sampled every 25 ms from before Run creation through post-stop cleanup, and steady is sampled after the fixed workload dwell.",
+    "slopes": "Positive daemon RSS, thread, and descriptor deltas from the fresh-daemon baseline divided by the exact live Run count.",
+    "cleanup": "Direct children, attachments, and transient threads return to their envelope. Exited Run metadata, retained PTY descriptors, and RSS remain explicit because global Run GC is not implemented."
+  },
+  "budgets": {
+    "idle": {
+      "1": {
+        "max_cpu_core_percent": 5,
+        "max_peak_rss_kib": 8192,
+        "max_steady_rss_kib": 8192,
+        "max_retained_output_bytes_per_run": 0,
+        "max_rss_kib_per_run": 1536,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      },
+      "32": {
+        "max_cpu_core_percent": 5,
+        "max_peak_rss_kib": 16384,
+        "max_steady_rss_kib": 16384,
+        "max_retained_output_bytes_per_run": 0,
+        "max_rss_kib_per_run": 384,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      },
+      "128": {
+        "max_cpu_core_percent": 20,
+        "max_peak_rss_kib": 32768,
+        "max_steady_rss_kib": 32768,
+        "max_retained_output_bytes_per_run": 0,
+        "max_rss_kib_per_run": 512,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      }
+    },
+    "active": {
+      "1": {
+        "max_cpu_core_percent": 10,
+        "max_peak_rss_kib": 8192,
+        "max_steady_rss_kib": 8192,
+        "max_retained_output_bytes_per_run": 12288,
+        "max_rss_kib_per_run": 2048,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      },
+      "32": {
+        "max_cpu_core_percent": 125,
+        "max_peak_rss_kib": 24576,
+        "max_steady_rss_kib": 24576,
+        "max_retained_output_bytes_per_run": 12288,
+        "max_rss_kib_per_run": 512,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      },
+      "128": {
+        "max_cpu_core_percent": 400,
+        "max_peak_rss_kib": 49152,
+        "max_steady_rss_kib": 49152,
+        "max_retained_output_bytes_per_run": 12288,
+        "max_rss_kib_per_run": 512,
+        "max_threads_per_run": 2.25,
+        "max_fds_per_run": 3.25,
+        "max_cleanup_threads_delta": 1,
+        "max_cleanup_live_children": 0,
+        "max_cleanup_attachments": 0
+      }
+    }
+  }
+}

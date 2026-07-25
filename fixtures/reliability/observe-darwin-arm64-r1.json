@@ -1,0 +1,4642 @@
+{
+  "schema": "ctxmux.reliability-qualification.v1",
+  "status": "pass",
+  "profile": "observe",
+  "seed": 226004,
+  "recorded_at": "2026-08-10T03:54:02.578Z",
+  "completed_at": "2026-08-10T03:54:23.984Z",
+  "time_budget_seconds": 2700,
+  "environment": {
+    "os": "darwin",
+    "architecture": "arm64",
+    "logical_cpus": 14,
+    "node": "v24.14.1",
+    "daemon": "target/debug/ctxmuxd",
+    "git_head": "b2bbc7a219753ad2664a438ab89347df180b7d31",
+    "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+  },
+  "declared_limits": {
+    "frame_bytes": 1048576,
+    "retained_output_bytes_per_run": 4194304,
+    "live_event_capacity": 256,
+    "global_run_quota": null,
+    "global_attachment_quota": null,
+    "exited_run_gc": null,
+    "qualification_stage": "all",
+    "resource_counts": [
+      1,
+      32,
+      128
+    ],
+    "resource_modes": [
+      "idle",
+      "active"
+    ],
+    "resource_start_concurrency": 8,
+    "peak_rss_sample_interval_ms": 25,
+    "soak_seconds": 0,
+    "note": "Absent global quotas and GC remain visible; the harness bounds are qualification workloads, not product limits."
+  },
+  "action_trace": [
+    {
+      "timestamp": "2026-08-10T03:54:02.627Z",
+      "action": "stage.start",
+      "id": "chaos-owner-matrix"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:02.642Z",
+      "action": "chaos.integration_host.spawn",
+      "daemon_pid": 70404
+    },
+    {
+      "timestamp": "2026-08-10T03:54:02.798Z",
+      "action": "chaos.child.kill",
+      "daemon_pid": 70426,
+      "child_pid": 70448
+    },
+    {
+      "timestamp": "2026-08-10T03:54:02.898Z",
+      "action": "chaos.daemon.kill",
+      "daemon_pid": 70455,
+      "child_pid": 70456,
+      "process_tree": [
+        {
+          "pid": 70456,
+          "ppid": 70455,
+          "state": "Ss+",
+          "command": "/bin/cat"
+        }
+      ]
+    },
+    {
+      "timestamp": "2026-08-10T03:54:02.901Z",
+      "action": "stage.pass",
+      "id": "chaos-owner-matrix"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:02.901Z",
+      "action": "stage.start",
+      "id": "security-negative-space"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:03.110Z",
+      "action": "security.negative_space",
+      "rejected_spawn_published_run": false,
+      "invalid_resize_added_run": false,
+      "argv_executed_shell": false,
+      "secret_logged": false,
+      "long_lived_partial_blocked_daemon": false,
+      "oversized_frame_mutated_daemon": false
+    },
+    {
+      "timestamp": "2026-08-10T03:54:03.113Z",
+      "action": "stage.pass",
+      "id": "security-negative-space"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:03.114Z",
+      "action": "stage.start",
+      "id": "stress-and-soak"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:03.732Z",
+      "action": "stress.fanout",
+      "fanout": 1,
+      "payload_bytes": 262144,
+      "slow_gap": false
+    },
+    {
+      "timestamp": "2026-08-10T03:54:04.676Z",
+      "action": "stress.fanout",
+      "fanout": 8,
+      "payload_bytes": 2097152,
+      "slow_gap": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:07.603Z",
+      "action": "stress.fanout",
+      "fanout": 32,
+      "payload_bytes": 4194304,
+      "slow_gap": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:08.389Z",
+      "action": "stress.concurrent_start",
+      "runs": 32,
+      "start_concurrency": 16,
+      "successful_start_responses": 32,
+      "cleanup_live_children": 0
+    },
+    {
+      "timestamp": "2026-08-10T03:54:11.360Z",
+      "action": "stage.pass",
+      "id": "stress-and-soak"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:11.360Z",
+      "action": "stage.start",
+      "id": "resource-census"
+    },
+    {
+      "timestamp": "2026-08-10T03:54:12.913Z",
+      "action": "resource.measurement",
+      "mode": "idle",
+      "runs": 1,
+      "baseline": {
+        "rss_kib": 3616,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 4384,
+        "cpu_seconds": 0.01,
+        "threads": 17,
+        "fds": 16,
+        "descendants": [
+          {
+            "pid": 73522,
+            "ppid": 73394,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 4416,
+        "cpu_seconds": 0.01,
+        "threads": 15,
+        "fds": 15,
+        "descendants": []
+      },
+      "peak_rss_kib": 4416,
+      "peak_rss_sample_count": 36,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 0,
+      "retained_output_bytes": 0,
+      "retained_output_bytes_per_run": 0,
+      "rss_kib_per_run": 768,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 800,
+      "cleanup_fds_delta": 2,
+      "cleanup_retained_runs": 1,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:14.666Z",
+      "action": "resource.measurement",
+      "mode": "idle",
+      "runs": 32,
+      "baseline": {
+        "rss_kib": 3616,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 9840,
+        "cpu_seconds": 0.24,
+        "threads": 79,
+        "fds": 109,
+        "descendants": [
+          {
+            "pid": 74795,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74798,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74797,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74799,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74796,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74800,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74805,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74808,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74806,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74809,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74810,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74823,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74826,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74824,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74825,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74830,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74828,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74829,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74827,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74831,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74832,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74850,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74849,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74851,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74853,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74852,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74854,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74860,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74855,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74858,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74857,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 74859,
+            "ppid": 74550,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 9056,
+        "cpu_seconds": 0.27,
+        "threads": 15,
+        "fds": 77,
+        "descendants": []
+      },
+      "peak_rss_kib": 10000,
+      "peak_rss_sample_count": 44,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 1.145,
+      "retained_output_bytes": 0,
+      "retained_output_bytes_per_run": 0,
+      "rss_kib_per_run": 194.5,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 5440,
+      "cleanup_fds_delta": 64,
+      "cleanup_retained_runs": 32,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:17.144Z",
+      "action": "resource.measurement",
+      "mode": "idle",
+      "runs": 128,
+      "baseline": {
+        "rss_kib": 3600,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 22160,
+        "cpu_seconds": 0.94,
+        "threads": 271,
+        "fds": 397,
+        "descendants": [
+          {
+            "pid": 76067,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76070,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76066,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76069,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76073,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76075,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76076,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76078,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76079,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76080,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76084,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76081,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76082,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76083,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76097,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76098,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76099,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76100,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76101,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76102,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76103,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76104,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76105,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76106,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76107,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76108,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76109,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76110,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76127,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76128,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76129,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76132,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76131,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76133,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76134,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76135,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76136,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76137,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76141,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76138,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76139,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76140,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76156,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76159,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76160,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76161,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76163,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76162,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76164,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76166,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76165,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76168,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76172,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76167,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76183,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76184,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76185,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76186,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76187,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76189,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76188,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76190,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76191,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76192,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76202,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76208,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76197,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76203,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76212,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76215,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76214,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76217,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76218,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76219,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76221,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76222,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76220,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76223,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76236,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76237,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76242,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76238,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76244,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76245,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76246,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76247,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76249,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76254,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76263,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76265,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76264,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76267,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76268,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76271,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76276,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76274,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76277,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76329,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76328,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76332,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76331,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76334,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76447,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76457,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76467,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76462,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76483,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76469,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76471,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76482,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76488,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76489,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76502,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76503,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76504,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76505,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76506,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76508,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76509,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76510,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76519,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76524,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76530,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76532,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76534,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76541,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76533,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 76548,
+            "ppid": 75976,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 18336,
+        "cpu_seconds": 1.05,
+        "threads": 15,
+        "fds": 269,
+        "descendants": []
+      },
+      "peak_rss_kib": 22208,
+      "peak_rss_sample_count": 67,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 8.061,
+      "retained_output_bytes": 0,
+      "retained_output_bytes_per_run": 0,
+      "rss_kib_per_run": 145,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 14736,
+      "cleanup_fds_delta": 256,
+      "cleanup_retained_runs": 128,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:18.661Z",
+      "action": "resource.measurement",
+      "mode": "active",
+      "runs": 1,
+      "baseline": {
+        "rss_kib": 3584,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 4736,
+        "cpu_seconds": 0.01,
+        "threads": 17,
+        "fds": 16,
+        "descendants": [
+          {
+            "pid": 78140,
+            "ppid": 78025,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 4720,
+        "cpu_seconds": 0.01,
+        "threads": 15,
+        "fds": 15,
+        "descendants": []
+      },
+      "peak_rss_kib": 4736,
+      "peak_rss_sample_count": 33,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 0,
+      "retained_output_bytes": 8197,
+      "retained_output_bytes_per_run": 8197,
+      "rss_kib_per_run": 1152,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 1136,
+      "cleanup_fds_delta": 2,
+      "cleanup_retained_runs": 1,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:20.763Z",
+      "action": "resource.measurement",
+      "mode": "active",
+      "runs": 32,
+      "baseline": {
+        "rss_kib": 3600,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 12464,
+        "cpu_seconds": 1.29,
+        "threads": 79,
+        "fds": 109,
+        "descendants": [
+          {
+            "pid": 79158,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79154,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79186,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79197,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79203,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79205,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79201,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79192,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79202,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79208,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79210,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79211,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79215,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79212,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79221,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79226,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79219,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79230,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79231,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79234,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79236,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79235,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79238,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79237,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79239,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79241,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79244,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79245,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79246,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79247,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79249,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 79303,
+            "ppid": 79048,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 11680,
+        "cpu_seconds": 1.34,
+        "threads": 15,
+        "fds": 77,
+        "descendants": []
+      },
+      "peak_rss_kib": 12608,
+      "peak_rss_sample_count": 51,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 65.124,
+      "retained_output_bytes": 262304,
+      "retained_output_bytes_per_run": 8197,
+      "rss_kib_per_run": 277,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 8080,
+      "cleanup_fds_delta": 64,
+      "cleanup_retained_runs": 32,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:23.983Z",
+      "action": "resource.measurement",
+      "mode": "active",
+      "runs": 128,
+      "baseline": {
+        "rss_kib": 3600,
+        "cpu_seconds": 0,
+        "threads": 15,
+        "fds": 13,
+        "descendants": []
+      },
+      "steady": {
+        "rss_kib": 26112,
+        "cpu_seconds": 7.55,
+        "threads": 271,
+        "fds": 397,
+        "descendants": [
+          {
+            "pid": 80733,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80734,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80735,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80737,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80741,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80738,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80743,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80745,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80746,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80749,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80748,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80747,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80752,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80753,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80754,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80762,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80760,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80771,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80773,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80772,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80777,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80778,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80780,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80779,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80781,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80782,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80784,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80786,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80791,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80788,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80789,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80809,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80813,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80817,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80818,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80820,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80821,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80823,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80825,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80826,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80829,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80831,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80836,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80843,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80846,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80833,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80853,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80855,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80864,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80865,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80866,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80867,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80870,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80869,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80882,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80885,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80886,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80889,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80894,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80898,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80900,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80901,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80903,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80905,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80906,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80908,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80910,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80912,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80913,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80929,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80927,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80941,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80946,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80955,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80957,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80962,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80966,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80967,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80964,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80982,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80983,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80984,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80986,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80989,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80990,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80992,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80994,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80995,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80999,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 80998,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81001,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81002,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81017,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81037,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81043,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81050,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81053,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81051,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81064,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81069,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81070,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81074,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81076,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81080,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81082,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81083,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81085,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81094,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81106,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81107,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81110,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81115,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81118,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81121,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81122,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81141,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81143,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81147,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81151,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81154,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81155,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81157,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81158,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81173,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81179,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81180,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81182,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          },
+          {
+            "pid": 81217,
+            "ppid": 80642,
+            "state": "Ss+",
+            "command": "/bin/cat"
+          }
+        ]
+      },
+      "cleanup": {
+        "rss_kib": 22256,
+        "cpu_seconds": 7.78,
+        "threads": 15,
+        "fds": 269,
+        "descendants": []
+      },
+      "peak_rss_kib": 26256,
+      "peak_rss_sample_count": 88,
+      "peak_rss_sample_interval_ms": 25,
+      "cpu_core_percent": 272.692,
+      "retained_output_bytes": 1049216,
+      "retained_output_bytes_per_run": 8197,
+      "rss_kib_per_run": 175.875,
+      "threads_per_run": 2,
+      "fds_per_run": 3,
+      "cleanup_rss_kib_delta": 18656,
+      "cleanup_fds_delta": 256,
+      "cleanup_retained_runs": 128,
+      "cleanup_live_children": 0,
+      "cleanup_attachments": 0,
+      "intentional_retained_state_without_gc": true
+    },
+    {
+      "timestamp": "2026-08-10T03:54:23.983Z",
+      "action": "stage.pass",
+      "id": "resource-census"
+    }
+  ],
+  "stages": [
+    {
+      "id": "chaos-owner-matrix",
+      "status": "pass",
+      "started_at": "2026-08-10T03:54:02.627Z",
+      "completed_at": "2026-08-10T03:54:02.901Z",
+      "result": {
+        "integration_host_exit": {
+          "run_id": "73d49276-b9c8-460a-87a5-c70c344635b2",
+          "pid": 70416,
+          "same_pid_after_host_exit": true,
+          "cleanup": "exited"
+        },
+        "child_kill": {
+          "child_pid": 70448,
+          "final_output_replayable": true,
+          "daemon_healthy": true
+        },
+        "daemon_kill": {
+          "run_id_lost_as_declared": true,
+          "child_survived_daemon_kill": false,
+          "harness_cleanup": "complete",
+          "process_tree_before": [
+            {
+              "pid": 70456,
+              "ppid": 70455,
+              "state": "Ss+",
+              "command": "/bin/cat"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "security-negative-space",
+      "status": "pass",
+      "started_at": "2026-08-10T03:54:02.901Z",
+      "completed_at": "2026-08-10T03:54:03.113Z",
+      "result": {
+        "socket_mode": 384,
+        "malformed_and_long_lived_frames": "no mutation",
+        "argv_and_environment": "structured and redacted",
+        "absent_denial_of_service_quotas": [
+          "Runs",
+          "attachments",
+          "exited Runs"
+        ]
+      }
+    },
+    {
+      "id": "stress-and-soak",
+      "status": "pass",
+      "started_at": "2026-08-10T03:54:03.114Z",
+      "completed_at": "2026-08-10T03:54:11.360Z",
+      "result": {
+        "replay_and_final_drain": {
+          "produced_bytes": 5242891,
+          "retained_bytes": 4193291,
+          "truncated": true,
+          "final_marker": true
+        },
+        "fanout": [
+          {
+            "fanout": 1,
+            "payload_bytes": 262144,
+            "fast_exact": true,
+            "slow_gap": false
+          },
+          {
+            "fanout": 8,
+            "payload_bytes": 2097152,
+            "fast_exact": true,
+            "slow_gap": true
+          },
+          {
+            "fanout": 32,
+            "payload_bytes": 4194304,
+            "fast_exact": true,
+            "slow_gap": true
+          }
+        ],
+        "concurrent_start_pressure": {
+          "runs": 32,
+          "start_concurrency": 16,
+          "successful_start_responses": 32,
+          "cleanup_live_children": 0
+        },
+        "lifecycle_churn": {
+          "cycles": 32,
+          "cleanup_threads_delta": 0,
+          "live_children": 0,
+          "retained_runs": 32,
+          "retained_runs_are_intentional_without_gc": true
+        },
+        "soak": {
+          "duration_seconds": 0,
+          "skipped_by_profile": true
+        }
+      }
+    },
+    {
+      "id": "resource-census",
+      "status": "pass",
+      "started_at": "2026-08-10T03:54:11.360Z",
+      "completed_at": "2026-08-10T03:54:23.983Z",
+      "result": [
+        {
+          "mode": "idle",
+          "runs": 1,
+          "baseline": {
+            "rss_kib": 3616,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 4384,
+            "cpu_seconds": 0.01,
+            "threads": 17,
+            "fds": 16,
+            "descendants": [
+              {
+                "pid": 73522,
+                "ppid": 73394,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 4416,
+            "cpu_seconds": 0.01,
+            "threads": 15,
+            "fds": 15,
+            "descendants": []
+          },
+          "peak_rss_kib": 4416,
+          "peak_rss_sample_count": 36,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 0,
+          "retained_output_bytes": 0,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 768,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 800,
+          "cleanup_fds_delta": 2,
+          "cleanup_retained_runs": 1,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        },
+        {
+          "mode": "idle",
+          "runs": 32,
+          "baseline": {
+            "rss_kib": 3616,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 9840,
+            "cpu_seconds": 0.24,
+            "threads": 79,
+            "fds": 109,
+            "descendants": [
+              {
+                "pid": 74795,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74798,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74797,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74799,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74796,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74800,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74805,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74808,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74806,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74809,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74810,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74823,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74826,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74824,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74825,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74830,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74828,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74829,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74827,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74831,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74832,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74850,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74849,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74851,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74853,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74852,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74854,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74860,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74855,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74858,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74857,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 74859,
+                "ppid": 74550,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 9056,
+            "cpu_seconds": 0.27,
+            "threads": 15,
+            "fds": 77,
+            "descendants": []
+          },
+          "peak_rss_kib": 10000,
+          "peak_rss_sample_count": 44,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 1.145,
+          "retained_output_bytes": 0,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 194.5,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 5440,
+          "cleanup_fds_delta": 64,
+          "cleanup_retained_runs": 32,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        },
+        {
+          "mode": "idle",
+          "runs": 128,
+          "baseline": {
+            "rss_kib": 3600,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 22160,
+            "cpu_seconds": 0.94,
+            "threads": 271,
+            "fds": 397,
+            "descendants": [
+              {
+                "pid": 76067,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76070,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76066,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76069,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76073,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76075,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76076,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76078,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76079,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76080,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76084,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76081,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76082,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76083,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76097,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76098,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76099,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76100,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76101,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76102,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76103,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76104,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76105,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76106,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76107,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76108,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76109,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76110,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76127,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76128,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76129,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76132,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76131,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76133,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76134,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76135,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76136,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76137,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76141,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76138,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76139,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76140,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76156,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76159,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76160,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76161,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76163,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76162,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76164,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76166,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76165,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76168,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76172,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76167,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76183,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76184,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76185,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76186,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76187,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76189,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76188,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76190,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76191,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76192,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76202,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76208,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76197,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76203,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76212,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76215,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76214,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76217,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76218,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76219,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76221,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76222,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76220,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76223,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76236,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76237,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76242,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76238,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76244,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76245,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76246,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76247,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76249,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76254,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76263,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76265,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76264,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76267,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76268,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76271,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76276,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76274,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76277,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76329,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76328,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76332,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76331,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76334,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76447,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76457,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76467,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76462,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76483,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76469,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76471,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76482,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76488,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76489,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76502,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76503,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76504,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76505,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76506,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76508,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76509,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76510,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76519,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76524,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76530,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76532,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76534,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76541,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76533,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 76548,
+                "ppid": 75976,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 18336,
+            "cpu_seconds": 1.05,
+            "threads": 15,
+            "fds": 269,
+            "descendants": []
+          },
+          "peak_rss_kib": 22208,
+          "peak_rss_sample_count": 67,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 8.061,
+          "retained_output_bytes": 0,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 145,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 14736,
+          "cleanup_fds_delta": 256,
+          "cleanup_retained_runs": 128,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        },
+        {
+          "mode": "active",
+          "runs": 1,
+          "baseline": {
+            "rss_kib": 3584,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 4736,
+            "cpu_seconds": 0.01,
+            "threads": 17,
+            "fds": 16,
+            "descendants": [
+              {
+                "pid": 78140,
+                "ppid": 78025,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 4720,
+            "cpu_seconds": 0.01,
+            "threads": 15,
+            "fds": 15,
+            "descendants": []
+          },
+          "peak_rss_kib": 4736,
+          "peak_rss_sample_count": 33,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 0,
+          "retained_output_bytes": 8197,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 1152,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 1136,
+          "cleanup_fds_delta": 2,
+          "cleanup_retained_runs": 1,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        },
+        {
+          "mode": "active",
+          "runs": 32,
+          "baseline": {
+            "rss_kib": 3600,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 12464,
+            "cpu_seconds": 1.29,
+            "threads": 79,
+            "fds": 109,
+            "descendants": [
+              {
+                "pid": 79158,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79154,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79186,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79197,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79203,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79205,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79201,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79192,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79202,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79208,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79210,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79211,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79215,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79212,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79221,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79226,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79219,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79230,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79231,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79234,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79236,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79235,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79238,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79237,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79239,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79241,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79244,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79245,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79246,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79247,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79249,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 79303,
+                "ppid": 79048,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 11680,
+            "cpu_seconds": 1.34,
+            "threads": 15,
+            "fds": 77,
+            "descendants": []
+          },
+          "peak_rss_kib": 12608,
+          "peak_rss_sample_count": 51,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 65.124,
+          "retained_output_bytes": 262304,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 277,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 8080,
+          "cleanup_fds_delta": 64,
+          "cleanup_retained_runs": 32,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        },
+        {
+          "mode": "active",
+          "runs": 128,
+          "baseline": {
+            "rss_kib": 3600,
+            "cpu_seconds": 0,
+            "threads": 15,
+            "fds": 13,
+            "descendants": []
+          },
+          "steady": {
+            "rss_kib": 26112,
+            "cpu_seconds": 7.55,
+            "threads": 271,
+            "fds": 397,
+            "descendants": [
+              {
+                "pid": 80733,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80734,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80735,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80737,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80741,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80738,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80743,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80745,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80746,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80749,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80748,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80747,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80752,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80753,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80754,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80762,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80760,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80771,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80773,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80772,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80777,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80778,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80780,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80779,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80781,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80782,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80784,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80786,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80791,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80788,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80789,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80809,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80813,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80817,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80818,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80820,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80821,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80823,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80825,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80826,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80829,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80831,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80836,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80843,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80846,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80833,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80853,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80855,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80864,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80865,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80866,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80867,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80870,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80869,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80882,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80885,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80886,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80889,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80894,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80898,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80900,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80901,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80903,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80905,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80906,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80908,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80910,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80912,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80913,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80929,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80927,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80941,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80946,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80955,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80957,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80962,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80966,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80967,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80964,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80982,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80983,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80984,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80986,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80989,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80990,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80992,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80994,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80995,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80999,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 80998,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81001,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81002,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81017,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81037,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81043,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81050,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81053,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81051,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81064,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81069,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81070,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81074,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81076,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81080,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81082,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81083,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81085,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81094,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81106,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81107,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81110,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81115,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81118,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81121,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81122,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81141,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81143,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81147,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81151,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81154,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81155,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81157,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81158,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81173,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81179,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81180,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81182,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              },
+              {
+                "pid": 81217,
+                "ppid": 80642,
+                "state": "Ss+",
+                "command": "/bin/cat"
+              }
+            ]
+          },
+          "cleanup": {
+            "rss_kib": 22256,
+            "cpu_seconds": 7.78,
+            "threads": 15,
+            "fds": 269,
+            "descendants": []
+          },
+          "peak_rss_kib": 26256,
+          "peak_rss_sample_count": 88,
+          "peak_rss_sample_interval_ms": 25,
+          "cpu_core_percent": 272.692,
+          "retained_output_bytes": 1049216,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 175.875,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_rss_kib_delta": 18656,
+          "cleanup_fds_delta": 256,
+          "cleanup_retained_runs": 128,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0,
+          "intentional_retained_state_without_gc": true
+        }
+      ]
+    }
+  ],
+  "daemon_logs": [
+    "target/reliability/observe-r1/integration-host-daemon.log",
+    "target/reliability/observe-r1/child-kill-daemon.log",
+    "target/reliability/observe-r1/daemon-kill-daemon.log",
+    "target/reliability/observe-r1/security-daemon.log",
+    "target/reliability/observe-r1/final-output-daemon.log",
+    "target/reliability/observe-r1/fanout-1-daemon.log",
+    "target/reliability/observe-r1/fanout-8-daemon.log",
+    "target/reliability/observe-r1/fanout-32-daemon.log",
+    "target/reliability/observe-r1/concurrent-start-32-daemon.log",
+    "target/reliability/observe-r1/lifecycle-churn-daemon.log",
+    "target/reliability/observe-r1/resources-idle-1-daemon.log",
+    "target/reliability/observe-r1/resources-idle-32-daemon.log",
+    "target/reliability/observe-r1/resources-idle-128-daemon.log",
+    "target/reliability/observe-r1/resources-active-1-daemon.log",
+    "target/reliability/observe-r1/resources-active-32-daemon.log",
+    "target/reliability/observe-r1/resources-active-128-daemon.log"
+  ],
+  "error": null
+}
