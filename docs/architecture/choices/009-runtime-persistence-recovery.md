@@ -74,10 +74,15 @@ mode and transactions define four indivisible application units:
 
 Output batches may lag live delivery but advance only contiguously. Process crash
 or torn WAL recovery therefore yields the previous or next complete unit, never
-a lifecycle/cursor/chunk hybrid. A persistence write failure freezes the durable
-cursor and rejects new start/fork mutations with a typed persistence error;
-already-owned live Runs may still be explicitly controlled so storage failure
-does not strand a child behind a false success.
+a lifecycle/cursor/chunk hybrid. A start or fork that cannot reserve one new
+record within the immutable record and metadata budgets rejects only that
+unpublished Run; because no row was written, the actor continues serving
+existing Runs and later admissible starts. Every append or finalize error, and
+every serialization, database, I/O, commit, integrity, or owner-invariant
+failure still latches the actor, freezes the durable cursor, and rejects later
+mutations with a typed persistence error. Already-owned live Runs may still be
+explicitly controlled so storage failure does not strand a child behind a false
+success.
 
 Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
 replay tail remains. Persistent replay has a 256 MiB global logical byte budget;

@@ -39,6 +39,19 @@ const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 
+#[derive(Clone, Copy)]
+struct AdmissionLimits {
+    run_records: u64,
+    metadata_bytes: u64,
+}
+
+impl AdmissionLimits {
+    const FORMAT: Self = Self {
+        run_records: RUN_RECORDS,
+        metadata_bytes: METADATA_BYTES,
+    };
+}
+
 #[derive(Debug, Error)]
 pub enum PersistenceError {
     #[error("invalid ctxmux state directory {path}: {message}")]
@@ -75,6 +88,22 @@ impl PersistenceError {
 
     fn database(error: impl std::fmt::Display) -> Self {
         Self::Database(error.to_string())
+    }
+
+    fn serialization(error: impl std::fmt::Display) -> Self {
+        Self::Mutation(format!("serialization failed: {error}"))
+    }
+}
+
+#[derive(Debug)]
+enum InsertStartError {
+    AdmissionRejected(String),
+    Fatal(PersistenceError),
+}
+
+impl From<PersistenceError> for InsertStartError {
+    fn from(error: PersistenceError) -> Self {
+        Self::Fatal(error)
     }
 }
 
@@ -153,14 +182,28 @@ impl Persistence {
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
-        let state_dir = state_dir.into();
+        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::FORMAT)
+    }
+
+    fn open_with_admission_limits(
+        state_dir: PathBuf,
+        admission_limits: AdmissionLimits,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
         let join = thread::Builder::new()
             .name("ctxmux-persistence".to_owned())
-            .spawn(move || actor_main(&state_dir, &command_rx, &init_tx, &actor_failure))
+            .spawn(move || {
+                actor_main(
+                    &state_dir,
+                    admission_limits,
+                    &command_rx,
+                    &init_tx,
+                    &actor_failure,
+                );
+            })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
         let recovered = match init_rx.recv() {
             Ok(Ok(recovered)) => recovered,
@@ -235,11 +278,12 @@ enum Command {
 
 fn actor_main(
     state_dir: &Path,
+    admission_limits: AdmissionLimits,
     receiver: &mpsc::Receiver<Command>,
     init: &mpsc::SyncSender<Result<Vec<RecoveredRun>, PersistenceError>>,
     failure: &Mutex<Option<String>>,
 ) {
-    let (mut store, recovered) = match StateStore::open(state_dir) {
+    let (mut store, recovered) = match StateStore::open(state_dir, admission_limits) {
         Ok(value) => value,
         Err(error) => {
             let _ = init.send(Err(error));
@@ -261,15 +305,22 @@ fn actor_main(
         };
         match command {
             Command::InsertStart { info, reply } => {
-                let result = if let Some(message) = mutex_lock(failure).clone() {
-                    Err(PersistenceError::Mutation(message))
-                } else {
-                    store.insert_start(&info)
-                };
-                if let Err(error) = &result {
-                    remember_failure(failure, error);
+                if let Some(message) = mutex_lock(failure).clone() {
+                    let _ = reply.send(Err(PersistenceError::Mutation(message)));
+                    continue;
                 }
-                let _ = reply.send(result);
+                match store.insert_start(&info) {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(InsertStartError::AdmissionRejected(message)) => {
+                        let _ = reply.send(Err(PersistenceError::Mutation(message)));
+                    }
+                    Err(InsertStartError::Fatal(error)) => {
+                        remember_failure(failure, &error);
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             Command::Append {
                 id,
@@ -343,11 +394,15 @@ struct StateStore {
     shm_path: PathBuf,
     connection: Connection,
     epoch: String,
+    admission_limits: AdmissionLimits,
     _lock: File,
 }
 
 impl StateStore {
-    fn open(state_dir: &Path) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+    fn open(
+        state_dir: &Path,
+        admission_limits: AdmissionLimits,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         prepare_state_dir(state_dir)?;
         let lock_path = state_dir.join(LOCK_FILE);
         validate_optional_state_file(&lock_path)?;
@@ -440,23 +495,25 @@ impl StateStore {
             shm_path,
             connection,
             epoch,
+            admission_limits,
             _lock: lock,
         };
         store.validate_files()?;
         Ok((store, recovered))
     }
 
-    fn insert_start(&mut self, info: &RunInfo) -> Result<(), PersistenceError> {
+    fn insert_start(&mut self, info: &RunInfo) -> Result<(), InsertStartError> {
         self.admit_transaction(1024 * 1024)?;
-        let spec_json = serde_json::to_string(&info.spec).map_err(PersistenceError::database)?;
+        let spec_json =
+            serde_json::to_string(&info.spec).map_err(PersistenceError::serialization)?;
         let lineage_json = info
             .lineage
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(PersistenceError::database)?;
+            .map_err(PersistenceError::serialization)?;
         let state_json =
-            serde_json::to_string(&RunState::Running).map_err(PersistenceError::database)?;
+            serde_json::to_string(&RunState::Running).map_err(PersistenceError::serialization)?;
         let metadata_bytes = metadata_size(
             &info.id.to_string(),
             &spec_json,
@@ -464,17 +521,23 @@ impl StateStore {
             &state_json,
             &self.epoch,
         )?;
-        if metadata_bytes > METADATA_BYTES {
-            return Err(PersistenceError::Mutation(
-                "one Run metadata record exceeds the 64 MiB budget".to_owned(),
-            ));
+        if metadata_bytes > self.admission_limits.metadata_bytes {
+            return Err(InsertStartError::AdmissionRejected(format!(
+                "one Run metadata record exceeds the {} byte budget",
+                self.admission_limits.metadata_bytes
+            )));
         }
         let now = now_millis();
         let transaction = self
             .connection
             .transaction()
             .map_err(PersistenceError::database)?;
-        let evicted = reserve_run_capacity(&transaction, metadata_bytes)?;
+        let evicted = reserve_run_capacity_to(
+            &transaction,
+            metadata_bytes,
+            self.admission_limits.run_records,
+            self.admission_limits.metadata_bytes,
+        )?;
         transaction
             .execute(
                 "INSERT INTO runs (
@@ -495,7 +558,8 @@ impl StateStore {
             )
             .map_err(PersistenceError::database)?;
         transaction.commit().map_err(PersistenceError::database)?;
-        self.finish_transaction(evicted)
+        self.finish_transaction(evicted)?;
+        Ok(())
     }
 
     fn append_batch(
@@ -982,7 +1046,8 @@ fn reconcile_epoch(connection: &Connection, epoch: &str) -> Result<(), Persisten
     let interrupted = RunState::Interrupted {
         reason: InterruptionReason::DaemonRestart,
     };
-    let state_json = serde_json::to_string(&interrupted).map_err(PersistenceError::database)?;
+    let state_json =
+        serde_json::to_string(&interrupted).map_err(PersistenceError::serialization)?;
     let now = now_millis();
     let running = {
         let mut statement = transaction
@@ -1314,19 +1379,12 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
     Ok(recovered)
 }
 
-fn reserve_run_capacity(
-    transaction: &Transaction<'_>,
-    new_metadata_bytes: u64,
-) -> Result<bool, PersistenceError> {
-    reserve_run_capacity_to(transaction, new_metadata_bytes, RUN_RECORDS, METADATA_BYTES)
-}
-
 fn reserve_run_capacity_to(
     transaction: &Transaction<'_>,
     new_metadata_bytes: u64,
     record_limit: u64,
     metadata_limit: u64,
-) -> Result<bool, PersistenceError> {
+) -> Result<bool, InsertStartError> {
     let mut evicted = false;
     loop {
         let (records, metadata): (i64, i64) = transaction
@@ -1351,8 +1409,8 @@ fn reserve_run_capacity_to(
             .optional()
             .map_err(PersistenceError::database)?;
         let Some(candidate) = candidate else {
-            return Err(PersistenceError::Mutation(
-                "running Run records exhaust the durable metadata budget".to_owned(),
+            return Err(InsertStartError::AdmissionRejected(
+                "running Run records exhaust the durable record or metadata budget".to_owned(),
             ));
         };
         transaction
@@ -1584,7 +1642,7 @@ fn read_run_head(transaction: &Transaction<'_>, id: RunId) -> Result<u64, Persis
 fn encoded_state(state: &RunState) -> Result<(&'static str, String), PersistenceError> {
     Ok((
         state_kind_for(state),
-        serde_json::to_string(state).map_err(PersistenceError::database)?,
+        serde_json::to_string(state).map_err(PersistenceError::serialization)?,
     ))
 }
 
@@ -1701,15 +1759,19 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use ctxmux_protocol::{OutputChunk, OutputReplay, RunId, RunSpec, RunState, TerminalSize};
+    use ctxmux_protocol::{
+        OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState,
+        TerminalSize,
+    };
     use rusqlite::{Connection, OptionalExtension, params};
+    use tempfile::TempDir;
 
     use super::{
-        DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES,
-        PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES, PERSISTENCE_QUEUE_CAPACITY, PersistenceError,
-        RUN_RECORDS, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES,
-        append_replay, create_schema, metadata_size, prune_global_replay_to,
-        reserve_run_capacity_to,
+        AdmissionLimits, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, InsertStartError,
+        MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
+        PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, RUN_RECORDS, SHM_MAX_BYTES,
+        STATE_FILES_MAX_BYTES, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay, create_schema,
+        metadata_size, prune_global_replay_to, reserve_run_capacity_to,
     };
 
     #[test]
@@ -1793,8 +1855,88 @@ mod tests {
         insert_test_run(&transaction, RunId::new(), "running", 1);
         assert!(matches!(
             reserve_run_capacity_to(&transaction, 1, 2, 3),
-            Err(PersistenceError::Mutation(_))
+            Err(InsertStartError::AdmissionRejected(_))
         ));
+    }
+
+    #[test]
+    fn rejected_start_admission_does_not_poison_the_actor() {
+        let temp = TempDir::new().expect("create persistence admission fixture");
+        let state_dir = temp.path().join("state");
+        let limits = AdmissionLimits {
+            run_records: 1,
+            metadata_bytes: METADATA_BYTES,
+        };
+        let (persistence, recovered) =
+            Persistence::open_with_admission_limits(state_dir.clone(), limits)
+                .expect("open small-capacity persistence actor");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let first_durable = persistence
+            .insert_start(&first)
+            .expect("insert first running record");
+        let second = running_info(RunId::new());
+        let Err(rejection) = persistence.insert_start(&second) else {
+            panic!("running-only capacity admitted a second record");
+        };
+        assert!(matches!(rejection, PersistenceError::Mutation(_)));
+        assert!(
+            rejection
+                .to_string()
+                .contains("durable record or metadata budget")
+        );
+
+        let first_replay = replay(vec![chunk(1, b"first")]);
+        first_durable.append(first.id, first_replay.clone());
+        first_durable.finalize(first.id, first_replay, exited_state());
+        assert_eq!(first_durable.durable_head(), 1);
+
+        let second_durable = persistence
+            .insert_start(&second)
+            .expect("same actor admits a Run after terminal eviction");
+        second_durable.finalize(second.id, replay(Vec::new()), exited_state());
+        drop(second_durable);
+        drop(first_durable);
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen admitted state");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].info.id, second.id);
+        assert_eq!(recovered[0].info.state, exited_state());
+        drop(reopened);
+    }
+
+    #[test]
+    fn conflicting_replay_bytes_latch_the_actor_and_freeze_the_cursor() {
+        let temp = TempDir::new().expect("create persistence fatal fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&first)
+            .expect("insert fatal fixture record");
+        durable.append(first.id, replay(vec![chunk(1, b"committed")]));
+        durable.append(first.id, replay(vec![chunk(1, b"conflict")]));
+
+        let later = running_info(RunId::new());
+        let Err(error) = persistence.insert_start(&later) else {
+            panic!("fatal replay conflict admitted a later mutation");
+        };
+        assert!(matches!(error, PersistenceError::Mutation(_)));
+        assert!(error.to_string().contains("changed bytes"));
+        assert_eq!(durable.durable_head(), 1);
+        drop(durable);
+        drop(persistence);
+
+        let (reopened, recovered) =
+            Persistence::open(state_dir).expect("reopen prior durable unit");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].info.id, first.id);
+        assert_eq!(recovered[0].replay.chunks, vec![chunk(1, b"committed")]);
+        drop(reopened);
     }
 
     fn test_connection() -> Connection {
@@ -1858,6 +2000,36 @@ mod tests {
                 ],
             )
             .expect("insert test Run row");
+    }
+
+    fn running_info(id: RunId) -> RunInfo {
+        RunInfo {
+            id,
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            head_seq: 0,
+            durable_head_seq: Some(0),
+            oldest_seq: 0,
+            attachments: 0,
+        }
+    }
+
+    const fn exited_state() -> RunState {
+        RunState::Exited {
+            code: 0,
+            signal: None,
+        }
     }
 
     fn replay(chunks: Vec<OutputChunk>) -> OutputReplay {
