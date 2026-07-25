@@ -297,6 +297,175 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
   });
 });
 
+test("SC-02 validates tmux-owned and interrupted Run wire contracts", () => {
+  const interruptionReasons = [
+    "daemon_restart",
+    "tmux_server_unavailable",
+    "tmux_target_changed",
+    "tmux_protocol_error",
+  ] as const;
+  const frames: readonly ServerFrame[] = [
+    {
+      type: "response",
+      response: {
+        type: "tmux_panes",
+        tmux_version: "3.6b",
+        panes: [tmuxPaneInfo()],
+      },
+    },
+    {
+      type: "response",
+      response: { type: "imported", run: tmuxRunInfo() },
+    },
+    {
+      type: "response",
+      response: {
+        type: "runs",
+        runs: interruptionReasons.map((reason) => ({
+          ...runInfo(),
+          pid: null,
+          state: { type: "interrupted" as const, reason },
+        })),
+      },
+    },
+    {
+      type: "event",
+      event: {
+        type: "tmux",
+        event: { type: "session_renamed", name: [0, 65, 255] },
+      },
+    },
+    { type: "event", event: { type: "tmux", event: { type: "paused" } } },
+    {
+      type: "event",
+      event: { type: "tmux", event: { type: "continued" } },
+    },
+  ];
+
+  for (const frame of frames) {
+    assert.deepEqual(validateServerFrame(structuredClone(frame)), frame);
+  }
+
+  const native = runInfo();
+  const tmux = tmuxRunInfo();
+  const pane = tmuxPaneInfo();
+  const mutations: readonly [unknown, string][] = [
+    [
+      {
+        type: "event",
+        event: {
+          type: "exited",
+          state: { type: "interrupted", reason: "daemon_restart" },
+        },
+      },
+      "$frame.event.state.type",
+    ],
+    [
+      { type: "event", event: { type: "tmux", event: { type: "invented" } } },
+      "$frame.event.event.type",
+    ],
+    [
+      {
+        type: "response",
+        response: { type: "started", run: { ...native, spec: null } },
+      },
+      "$frame.response.run.spec",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "imported",
+          run: { ...tmux, spec: native.spec },
+        },
+      },
+      "$frame.response.run.spec",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: {
+            ...native,
+            capabilities: { ...native.capabilities, input: false },
+          },
+        },
+      },
+      "$frame.response.run.capabilities",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "imported",
+          run: {
+            ...tmux,
+            capabilities: {
+              ...tmux.capabilities,
+              replay: "raw_from_start",
+            },
+          },
+        },
+      },
+      "$frame.response.run.capabilities",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: { ...native, backend: { type: "invented" } },
+        },
+      },
+      "$frame.response.run.backend.type",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "imported",
+          run: {
+            ...tmux,
+            backend: { ...tmux.backend, pane_id: "@56" },
+          },
+        },
+      },
+      "$frame.response.run.backend.pane_id",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "tmux_panes",
+          tmux_version: "3.6b",
+          panes: [{ ...pane, session_id: "12" }],
+        },
+      },
+      "$frame.response.panes[0].session_id",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "status",
+          run: { ...native, attachments: Number.MAX_SAFE_INTEGER + 1 },
+        },
+      },
+      "$frame.response.run.attachments",
+    ],
+  ];
+
+  for (const [mutation, expectedPath] of mutations) {
+    assert.throws(
+      () => validateServerFrame(mutation),
+      (error: unknown) =>
+        error instanceof CtxmuxInvalidFrameError && error.path === expectedPath,
+      JSON.stringify(mutation),
+    );
+  }
+});
+
 test("LP-03 rejects malformed UTF-8, duplicate members, and invalid JSON", async (context) => {
   for (const { id, bytes } of MALFORMED_PROTOCOL_FRAMES) {
     const daemon = await mockDaemon(context, async (socket) => {
@@ -745,6 +914,47 @@ function runInfo() {
     durable_head_seq: null,
     oldest_seq: 1,
     attachments: 1,
+  };
+}
+
+function tmuxPaneInfo() {
+  return {
+    socket_path: "/tmp/ctxmux-tmux.sock",
+    tmux_version: "3.6b",
+    server_pid: 0xffff_ffff,
+    server_started_at: Number.MAX_SAFE_INTEGER,
+    session_id: "$12",
+    window_id: "@34",
+    pane_id: "%56",
+    pane_pid: 0xffff_ffff,
+    size: { cols: 120, rows: 40 },
+  };
+}
+
+function tmuxRunInfo() {
+  const pane = tmuxPaneInfo();
+  return {
+    ...runInfo(),
+    spec: null,
+    backend: {
+      type: "tmux" as const,
+      socket_path: pane.socket_path,
+      server_pid: pane.server_pid,
+      server_started_at: pane.server_started_at,
+      session_id: pane.session_id,
+      window_id: pane.window_id,
+      pane_id: pane.pane_id,
+      tmux_version: pane.tmux_version,
+    },
+    capabilities: {
+      input: false,
+      resize: false,
+      stop: false,
+      fork_level_a: false,
+      fork_level_b: false,
+      replay: "raw_since_import" as const,
+    },
+    pid: pane.pane_pid,
   };
 }
 
