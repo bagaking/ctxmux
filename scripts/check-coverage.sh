@@ -52,10 +52,23 @@ npx c8 --clean --all \
   --exclude='packages/sdk/src/generated/**' \
   npm test
 
-node scripts/coverage-policy.mjs \
-  --root . \
-  --policy coverage-policy.json \
-  --rust-lcov coverage/rust/lcov.info \
-  --typescript-json coverage/typescript/coverage-final.json \
-  --base "${CTXMUX_COVERAGE_BASE:-HEAD}" \
-  --require-changed-lines "${CTXMUX_COVERAGE_REQUIRE_CHANGED_LINES:-false}"
+ctxmux_coverage_changed_line_mode=${CTXMUX_COVERAGE_CHANGED_LINE_MODE:-false}
+ctxmux_coverage_policy_args=(
+  --root .
+  --policy coverage-policy.json
+  --rust-lcov coverage/rust/lcov.info
+  --typescript-json coverage/typescript/coverage-final.json
+  --changed-line-mode "$ctxmux_coverage_changed_line_mode"
+)
+if [[ ${CTXMUX_COVERAGE_BASE+x} == x ]]
+then
+  ctxmux_coverage_policy_args+=(--base "$CTXMUX_COVERAGE_BASE")
+fi
+if [[ ${CTXMUX_COVERAGE_COMPARISON_MODE+x} == x ]]
+then
+  ctxmux_coverage_policy_args+=(
+    --comparison-mode "$CTXMUX_COVERAGE_COMPARISON_MODE"
+  )
+fi
+
+node scripts/coverage-policy.mjs "${ctxmux_coverage_policy_args[@]}"

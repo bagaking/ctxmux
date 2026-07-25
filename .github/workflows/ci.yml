@@ -21,7 +21,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
+      CTXMUX_FUZZ_CASES: "512"
+      CTXMUX_MODEL_CASES: "8"
       CTXMUX_REQUIRE_TMUX: "1"
+      CTXMUX_TMUX_BIN: tmux
       CTXMUX_TMUX_QUALIFICATION: ${{ matrix.tmux_lane }}
 
     steps:
@@ -53,15 +56,25 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"
+
       - name: Check workspace
+        env:
+          CTXMUX_FUZZ_CASES: "512"
+          CTXMUX_MODEL_CASES: "8"
+          CTXMUX_REQUIRE_TMUX: "1"
+          CTXMUX_TMUX_BIN: tmux
+          CTXMUX_TMUX_QUALIFICATION: ${{ matrix.tmux_lane }}
         run: scripts/check.sh
 
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      CTXMUX_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+      CTXMUX_FUZZ_CASES: "512"
+      CTXMUX_MODEL_CASES: "8"
       CTXMUX_REQUIRE_TMUX: "1"
+      CTXMUX_TMUX_BIN: tmux
       CTXMUX_TMUX_QUALIFICATION: minimum-3.4
 
     steps:
@@ -89,5 +102,16 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"
+
       - name: Check coverage policy
+        env:
+          CTXMUX_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          CTXMUX_COVERAGE_CHANGED_LINE_MODE: auto
+          CTXMUX_COVERAGE_COMPARISON_MODE: ${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}
+          CTXMUX_FUZZ_CASES: "512"
+          CTXMUX_MODEL_CASES: "8"
+          CTXMUX_REQUIRE_TMUX: "1"
+          CTXMUX_TMUX_BIN: tmux
+          CTXMUX_TMUX_QUALIFICATION: minimum-3.4
         run: scripts/check.sh --coverage

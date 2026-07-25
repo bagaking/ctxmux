@@ -38,10 +38,12 @@ cargo install --locked --version 0.8.7 cargo-llvm-cov
 scripts/check.sh --coverage
 ```
 
-The gate reports the reviewed Rust runtime/client, Rust protocol/codegen,
-TypeScript SDK, validator, and changed-line groups from `coverage-policy.json`.
-Generated declarations and platform-impossible branches remain explicit rather
-than diluting those denominators. CI suite/platform ownership is recorded in
+The gate reports seven reviewed owners from `coverage-policy.json`: Rust
+runtime/clients, persistence, tmux, RunSpec validation, protocol/codegen, the
+hand-written TypeScript SDK, and TypeScript protocol validation. Runtime owners
+hold the ordinary 85% floor and pure validators hold 95%. Generated declarations
+and platform-impossible branches remain explicit rather than diluting those
+denominators. CI suite/platform ownership is recorded in
 `.github/ci-evidence-map.json` and checked by the same gate.
 
 An ordinary clean-tree run may honestly report that there are no changed
@@ -49,15 +51,28 @@ executable product lines. When the result will be retained as changed-line
 evidence, require a meaningful base and a non-empty denominator explicitly:
 
 ```bash
-CTXMUX_COVERAGE_BASE=HEAD \
-CTXMUX_COVERAGE_REQUIRE_CHANGED_LINES=true \
+BASE_COMMIT=HEAD^
+CTXMUX_COVERAGE_BASE="$BASE_COMMIT" \
+CTXMUX_COVERAGE_CHANGED_LINE_MODE=true \
+CTXMUX_COVERAGE_COMPARISON_MODE=direct \
 scripts/check.sh --coverage
 ```
 
-CI supplies the pull-request base or prior push revision. A pure documentation
-change may still report no executable product lines honestly. Any run retained
-as proof of the changed-line ratchet must enable evidence mode; a zero
-denominator then fails instead of being promoted into proof.
+Changed-line mode accepts `false`, `true`, or `auto`. `false` is ordinary
+reporting. `true` is explicit retained evidence and fails on a zero executable
+denominator. Required CI uses `auto`: changes to owned product files require a
+nonzero denominator, including comment-only edits, while pure documentation
+changes may report none honestly. CI supplies the pull-request base with
+merge-base comparison or the prior push revision with direct comparison. A run
+retained as changed-line proof must use an explicit base plus `true` and
+`direct`, as above. `HEAD^` makes the example executable for a one-commit
+comparison. Retained evidence for a larger change must replace it with that
+work's actual pre-change revision. The base must resolve in the current
+repository and must not be `HEAD`; the evidence policy rejects `HEAD` as a
+zero-distance base. A direct evidence base must also be an ancestor of `HEAD`;
+future or unrelated commits fail closed. New untracked product sources are
+counted from all executable lines reported for that file rather than disappearing
+from the changed-line denominator.
 
 The default gate also runs the bounded reliability smoke against the frozen
 one-Run CPU, RSS, retention, thread, fd, and cleanup budgets. To reproduce the

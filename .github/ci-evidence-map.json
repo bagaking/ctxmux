@@ -13,6 +13,12 @@
       "platforms": ["ubuntu-24.04"],
       "command": "scripts/check.sh --coverage",
       "trigger": "pull_request and push to main",
+      "coverage_contract": {
+        "checkout_fetch_depth": 0,
+        "base": "${{ github.event.pull_request.base.sha || github.event.before }}",
+        "changed_line_mode": "auto",
+        "comparison_mode": "${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}"
+      },
       "required": true
     }
   ],
@@ -33,7 +39,9 @@
       "id": "coverage-policy-contracts",
       "kind": "test",
       "path": "scripts/coverage-policy.test.mjs",
-      "invariants": ["coverage groups and changed-line math fail closed"],
+      "invariants": [
+        "seven coverage owner groups and changed-line ordinary, explicit, and CI-auto modes fail closed"
+      ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test scripts/*.test.mjs",
       "reach": [
@@ -46,7 +54,9 @@
       "kind": "test",
       "path": "scripts/ci-reachability.test.mjs",
       "invariants": [
-        "every critical suite has explicit job and platform reach"
+        "every critical suite has explicit job and platform reach",
+        "required coverage reach binds pull-request and main-push triggers, one unconditional canonical command step with protected same-step environment, default execution settings, exact clean source identity, and one prior canonical full-history checkout",
+        "required critical and coverage commands bind canonical tmux lanes plus fuzz and model case counts"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test scripts/*.test.mjs",

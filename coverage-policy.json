@@ -1,11 +1,37 @@
 {
-  "schema": "ctxmux.coverage-policy.v1",
-  "changed_line_minimum": 90,
+  "schema": "ctxmux.coverage-policy.v2",
+  "floors": {
+    "changed_line_percent": 90,
+    "runtime_line_percent": 85,
+    "pure_validator_line_percent": 95
+  },
+  "source_inventory": {
+    "includes": [
+      {
+        "language": "rust",
+        "glob": "crates/*/src/**/*.rs"
+      },
+      {
+        "language": "typescript",
+        "glob": "packages/sdk/src/**/*.ts"
+      }
+    ],
+    "exclusions": [
+      {
+        "id": "generated-typescript-protocol",
+        "category": "generated",
+        "language": "typescript",
+        "glob": "packages/sdk/src/generated/**",
+        "reason": "Rust-authored declarations are generated output, not a second hand-written implementation.",
+        "evidence": "scripts/check-protocol-types.sh"
+      }
+    ]
+  },
   "groups": [
     {
       "id": "rust-runtime-and-clients",
       "language": "rust",
-      "minimum_line_percent": 85,
+      "floor_class": "runtime",
       "paths": [
         "crates/ctxmux-daemon/src/lib.rs",
         "crates/ctxmux-daemon/src/main.rs",
@@ -14,9 +40,27 @@
       ]
     },
     {
+      "id": "rust-persistence",
+      "language": "rust",
+      "floor_class": "runtime",
+      "paths": ["crates/ctxmux-daemon/src/persistence.rs"]
+    },
+    {
+      "id": "rust-tmux",
+      "language": "rust",
+      "floor_class": "runtime",
+      "paths": ["crates/ctxmux-daemon/src/tmux.rs"]
+    },
+    {
+      "id": "rust-run-spec-validator",
+      "language": "rust",
+      "floor_class": "pure_validator",
+      "paths": ["crates/ctxmux-daemon/src/run_spec.rs"]
+    },
+    {
       "id": "rust-protocol-and-codegen",
       "language": "rust",
-      "minimum_line_percent": 95,
+      "floor_class": "pure_validator",
       "paths": [
         "crates/ctxmux-protocol/src/lib.rs",
         "crates/ctxmux-protocol/src/bin/export-types.rs"
@@ -25,7 +69,7 @@
     {
       "id": "typescript-sdk",
       "language": "typescript",
-      "minimum_line_percent": 85,
+      "floor_class": "runtime",
       "paths": [
         "packages/sdk/src/client.ts",
         "packages/sdk/src/index.ts",
@@ -38,18 +82,11 @@
     {
       "id": "typescript-protocol-validators",
       "language": "typescript",
-      "minimum_line_percent": 95,
+      "floor_class": "pure_validator",
       "paths": ["packages/sdk/src/validation.ts", "packages/sdk/src/wire.ts"]
     }
   ],
   "reported_exclusions": [
-    {
-      "id": "generated-typescript-protocol",
-      "category": "generated",
-      "paths": ["packages/sdk/src/generated/**"],
-      "reason": "Rust-authored declarations are generated output, not a second hand-written implementation.",
-      "evidence": "scripts/check-protocol-types.sh"
-    },
     {
       "id": "non-unix-native-transport",
       "category": "platform_impossible",

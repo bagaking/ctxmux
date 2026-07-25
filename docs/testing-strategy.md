@@ -368,7 +368,8 @@ make that open policy visible rather than normalize unbounded growth.
 
 The full critical lifecycle suite should remain on pull requests even if the
 nightly suite grows. Tmux is a warning here: its broad regression suite is
-excellent, but the inspected workflow reaches it only daily or manually.
+excellent, but upstream tmux's inspected workflow reaches it only daily or
+manually.
 
 ### Code-coverage ratchet
 
@@ -386,32 +387,65 @@ branch. The invariant matrix still blocks a release when the percentage passes
 but required behavioral evidence is absent.
 
 `scripts/check.sh --coverage` owns the reproducible local gate. It emits raw
-LCOV/JSON under the ignored `coverage/` directory and validates the reviewed
-groups in `coverage-policy.json`. The first enforced baseline on Darwin arm64
-was 87.01% for Rust runtime/clients, 98.03% for Rust protocol/codegen, 91.88%
-for the hand-written TypeScript SDK, 96.57% for TypeScript protocol validators,
-and 100% for changed executable lines. Per-file results remain visible even
-when a group passes, so lower CLI or wire-validator coverage cannot disappear
-inside one repository aggregate.
+LCOV/JSON under the ignored `coverage/` directory and validates seven reviewed
+owner groups in `coverage-policy.json`. The earlier four-group Darwin
+observation is superseded by the fresh T-020 seven-owner baseline:
+
+| Coverage owner                 | Floor | Fresh T-020 observation |
+| ------------------------------ | ----: | ----------------------- |
+| Rust runtime and clients       |   85% | 86.44% (2,569/2,972)    |
+| Rust persistence               |   85% | 85.35% (1,509/1,768)    |
+| Rust tmux adapter              |   85% | 85.99% (675/785)        |
+| Rust RunSpec validator         |   95% | 100.00% (20/20)         |
+| Rust protocol and codegen      |   95% | 98.04% (200/204)        |
+| Hand-written TypeScript SDK    |   85% | 93.36% (1,068/1,144)    |
+| TypeScript protocol validators |   95% | 97.91% (704/719)        |
+
+The fresh retained run compared the current tree directly with audited commit
+`b80a5cf44d1fafc653d9440eb5611e1e57e26d18`; changed executable product lines
+passed at 99.32% (147/148) against the 90% floor. Persistence and tmux remain
+independent ordinary 85% owners; neither is omitted, diluted into the runtime
+aggregate, nor labeled as an exception. Per-file results remain visible even
+when a group passes, so lower CLI or validator coverage cannot disappear inside
+one repository aggregate.
 
 Generated TypeScript protocol declarations are excluded from the denominator
 and remain protected by the Rust-owner drift check. The `cfg(not(unix))`
 compile failures are reported as platform-impossible because generation 3
 declares a Unix transport. No test fixture or hand-written runtime file is
-silently excluded. The required changed-line comparison uses the pull-request
-base or prior push revision supplied by CI and fails below 90% when executable
-product lines changed. A pure documentation change may report the absence of
-such lines honestly. A result retained as changed-line proof must set
-`CTXMUX_COVERAGE_REQUIRE_CHANGED_LINES=true`; if its base produces no changed
-executable product lines, evidence mode fails rather than converting a
-clean-tree no-op into proof. Retained evidence records its explicit base and
-nonzero denominator.
+silently excluded. Changed-line mode is explicit:
+
+- `false` performs ordinary reporting and may report no executable product
+  denominator;
+- `true` is retained evidence and requires a nonzero executable denominator;
+- `auto` is the required CI mode: an owned product-file change requires a
+  nonzero executable denominator, including when the edit changes only comments,
+  while a pure documentation change may report none honestly.
+
+Required CI supplies the pull-request base with `merge-base` comparison or the
+prior push revision with direct comparison. An empty, zero, or invalid revision
+fails closed rather than falling back to `HEAD` or `HEAD^`; a direct evidence
+base must also be an ancestor of `HEAD`. Untracked owned sources contribute all
+reported executable lines to the current-tree denominator. Product source paths
+outside the policy's safe POSIX character set fail inventory validation instead
+of relying on ambiguous unified-diff quoting. Retained local evidence sets an
+explicit base,
+`CTXMUX_COVERAGE_CHANGED_LINE_MODE=true`, and
+`CTXMUX_COVERAGE_COMPARISON_MODE=direct`, and records the base, comparison,
+every owner result, and nonzero denominator.
 
 `.github/ci-evidence-map.json` maps every discovered Rust, TypeScript, script,
 and public-smoke suite to invariants, selection owners, required jobs, and
-platforms. `scripts/ci-reachability.mjs` rejects unmapped tests, hidden
-`skip`/`ignore`, workflow or selector drift, incomplete platform reach, and
-unclassified skipped, conditional, ignored, or schedule-only evidence.
+platforms. It also binds the coverage job to full Git history, event-specific
+base and comparison semantics, and `auto` mode. `scripts/ci-reachability.mjs`
+rejects unmapped tests, hidden `skip`/`ignore`, workflow or selector drift,
+conditional required jobs, non-executing command or environment prose, trigger
+drift, weakened coverage reach, incomplete platform reach, and unclassified
+skipped, conditional, ignored, or schedule-only evidence. Required jobs use one
+canonical repository checkout, then immediately before the Gate verify exact
+`GITHUB_SHA` identity and a clean worktree. The Gate step rebinds the required
+tmux executable/profile and fuzz/model case counts so an inherited or persisted
+environment cannot silently downgrade mapped evidence.
 
 ## Adoption sequence
 
