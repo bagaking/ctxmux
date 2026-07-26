@@ -18,11 +18,47 @@ case "$ctxmux_reliability_profile" in
     ;;
 esac
 
-cargo build --locked --quiet --package ctxmux-daemon
+ctxmux_reliability_build_target_dir=target/reliability/provenance-build
+ctxmux_reliability_daemon_bin=$ctxmux_reliability_build_target_dir/debug/ctxmuxd
+ctxmux_reliability_build_argv=(
+  cargo
+  build
+  --locked
+  --quiet
+  --package
+  ctxmux-daemon
+  --target-dir
+  "$ctxmux_reliability_build_target_dir"
+)
+ctxmux_reliability_build_source_commit=$(git rev-parse HEAD)
+ctxmux_reliability_build_source_tree=$(git rev-parse 'HEAD^{tree}')
+if [[ -z $(git status --porcelain=v1 --untracked-files=all) ]]
+then
+  ctxmux_reliability_build_worktree_clean=true
+else
+  ctxmux_reliability_build_worktree_clean=false
+fi
+rm -f -- "$ctxmux_reliability_daemon_bin"
+"${ctxmux_reliability_build_argv[@]}"
+if [[ ! -x $ctxmux_reliability_daemon_bin ]]
+then
+  echo "locked build did not produce $ctxmux_reliability_daemon_bin" >&2
+  exit 1
+fi
 cargo test --locked --quiet --package ctxmux-daemon socket_path
 cargo test --locked --quiet --package ctxmux-daemon stop_after_wait_disables_signalling_before_state_publication
 cargo test --locked --quiet --package ctxmux-daemon --test native_lifecycle protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation
 node --import tsx --test packages/sdk/test/wrong-cases.test.ts
-node --import tsx scripts/reliability-qualification.ts \
+ctxmux_reliability_build_argv_json=$(
+  node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' \
+    "${ctxmux_reliability_build_argv[@]}"
+)
+CTXMUXD_BIN="$PWD/$ctxmux_reliability_daemon_bin" \
+CTXMUX_RELIABILITY_BUILD_ARGV_JSON="$ctxmux_reliability_build_argv_json" \
+CTXMUX_RELIABILITY_BUILD_SOURCE_COMMIT="$ctxmux_reliability_build_source_commit" \
+CTXMUX_RELIABILITY_BUILD_SOURCE_TREE="$ctxmux_reliability_build_source_tree" \
+CTXMUX_RELIABILITY_BUILD_WORKTREE_CLEAN="$ctxmux_reliability_build_worktree_clean" \
+CTXMUX_RELIABILITY_BUILD_TARGET_DIR="$ctxmux_reliability_build_target_dir" \
+  node --import tsx scripts/reliability-qualification.ts \
   --profile "$ctxmux_reliability_profile" \
   "$@"

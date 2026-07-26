@@ -2,6 +2,7 @@
 
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   createWriteStream,
   existsSync,
@@ -13,7 +14,7 @@ import {
 } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
-import { arch, cpus, platform, tmpdir } from "node:os";
+import { arch, cpus, platform, release, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { finished } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
@@ -108,15 +109,57 @@ interface StageResult {
   readonly error?: string;
 }
 
+interface FileIdentity {
+  readonly path: string;
+  readonly sha256: string;
+}
+
+interface QualificationProvenance {
+  readonly claim_scope: "locally_observed";
+  readonly binary_source_attestation: false;
+  readonly source: {
+    readonly commit: string;
+    readonly tree: string;
+    readonly worktree: {
+      readonly status_format: "git-status-porcelain-v1-z";
+      readonly clean: boolean;
+      readonly entries: readonly string[];
+    };
+  };
+  readonly harness: FileIdentity;
+  readonly launcher: FileIdentity;
+  readonly daemon: FileIdentity;
+  readonly lockfiles: readonly FileIdentity[];
+  readonly build: {
+    readonly cwd: ".";
+    readonly argv: readonly string[];
+    readonly source_commit: string;
+    readonly source_tree: string;
+    readonly worktree_clean: boolean;
+    readonly target_directory: string;
+    readonly daemon_path: string;
+    readonly locked: boolean;
+  };
+  readonly toolchain: {
+    readonly rustc_version_verbose: string;
+    readonly cargo_version: string;
+    readonly node_version: string;
+  };
+  readonly measurement_contract_encoding: "json-stringify-utf8";
+  readonly measurement_contract_sha256: string;
+}
+
 interface QualificationReceipt {
-  readonly schema: "ctxmux.reliability-qualification.v1";
+  readonly schema: "ctxmux.reliability-qualification.v2";
   status: "running" | "pass" | "fail";
   readonly profile: QualificationProfile;
+  readonly observation_round: number | null;
   readonly seed: number;
   readonly recorded_at: string;
   completed_at: string | null;
   readonly time_budget_seconds: number;
   readonly environment: Record<string, unknown>;
+  readonly provenance: QualificationProvenance;
   readonly declared_limits: Record<string, unknown>;
   readonly action_trace: Array<Record<string, unknown>>;
   readonly stages: StageResult[];
@@ -126,6 +169,7 @@ interface QualificationReceipt {
 
 interface QualificationOptions {
   readonly profile: QualificationProfile;
+  readonly observationRound: number | null;
   readonly stage: QualificationStage;
   readonly seed: number;
   readonly evidencePath: string;
@@ -143,14 +187,24 @@ interface RssSampler {
   readonly stop: () => Promise<void>;
 }
 
-const root = resolve(
-  dirname(process.argv[1] ?? "scripts/reliability-qualification.ts"),
-  "..",
+const harnessPath = resolve(
+  process.argv[1] ?? "scripts/reliability-qualification.ts",
 );
-const daemonBinary = resolve(
-  root,
-  process.env.CTXMUXD_BIN ?? "target/debug/ctxmuxd",
-);
+const root = resolve(dirname(harnessPath), "..");
+const launcherPath = resolve(root, "scripts/check-reliability.sh");
+const fixedBuildTargetDirectory = "target/reliability/provenance-build";
+const fixedDaemonPath = `${fixedBuildTargetDirectory}/debug/ctxmuxd`;
+const fixedBuildArgv = [
+  "cargo",
+  "build",
+  "--locked",
+  "--quiet",
+  "--package",
+  "ctxmux-daemon",
+  "--target-dir",
+  fixedBuildTargetDirectory,
+] as const;
+const daemonBinary = resolve(root, process.env.CTXMUXD_BIN ?? fixedDaemonPath);
 const budgetPath = resolve(root, "reliability-budgets.json");
 
 async function main(): Promise<void> {
@@ -257,28 +311,26 @@ function recordSupervisorTimeout(options: QualificationOptions): void {
 }
 
 async function qualify(options: QualificationOptions): Promise<void> {
-  assert.ok(
-    existsSync(daemonBinary),
-    `ctxmux daemon binary is missing: ${daemonBinary}`,
-  );
   mkdirSync(options.artifactDirectory, { recursive: true });
+  const provenance = captureProvenance();
+  const cpu = cpus();
   const receipt: QualificationReceipt = {
-    schema: "ctxmux.reliability-qualification.v1",
+    schema: "ctxmux.reliability-qualification.v2",
     status: "running",
     profile: options.profile,
+    observation_round: options.observationRound,
     seed: options.seed,
     recorded_at: new Date().toISOString(),
     completed_at: null,
     time_budget_seconds: options.timeBudgetSeconds,
     environment: {
       os: platform(),
+      os_release: release(),
       architecture: arch(),
-      logical_cpus: cpus().length,
-      node: process.version,
-      daemon: portablePath(daemonBinary),
-      git_head: commandOutput("git", ["rev-parse", "HEAD"]).trim(),
-      rustc: commandOutput("rustc", ["--version"]).trim(),
+      logical_cpus: cpu.length,
+      cpu_model: cpu[0]?.model ?? "unknown",
     },
+    provenance,
     declared_limits: {
       frame_bytes: MAX_FRAME_BYTES,
       retained_output_bytes_per_run: 4 * 1024 * 1024,
@@ -351,7 +403,20 @@ async function qualify(options: QualificationOptions): Promise<void> {
   };
 
   writeReceipt();
+  trace("provenance.captured", {
+    source_commit: provenance.source.commit,
+    source_tree: provenance.source.tree,
+    worktree_clean: provenance.source.worktree.clean,
+    harness_sha256: provenance.harness.sha256,
+    launcher_sha256: provenance.launcher.sha256,
+    daemon_sha256: provenance.daemon.sha256,
+    measurement_contract_sha256: provenance.measurement_contract_sha256,
+  });
   try {
+    assertQualificationProvenance(options, provenance);
+    trace("provenance.verified", {
+      observation_round: options.observationRound,
+    });
     if (options.stage === "all") {
       await stage("chaos-owner-matrix", () =>
         runChaosOwnerMatrix(options, receipt, trace),
@@ -378,6 +443,10 @@ async function qualify(options: QualificationOptions): Promise<void> {
         };
       });
     }
+    assertQualificationProvenance(options, provenance);
+    trace("provenance.reverified", {
+      daemon_sha256: provenance.daemon.sha256,
+    });
     receipt.status = "pass";
   } catch (error) {
     receipt.status = "fail";
@@ -1083,6 +1152,11 @@ class DaemonFixture {
     options: QualificationOptions,
     receipt: QualificationReceipt,
   ): Promise<DaemonFixture> {
+    assert.deepEqual(
+      fileIdentity(daemonBinary),
+      receipt.provenance.daemon,
+      "ctxmux daemon bytes changed during qualification",
+    );
     const directory = await mkdtemp(join(tmpdir(), `ctxmux-${label}-`));
     const socketPath = join(directory, "ctxmux.sock");
     const logPath = join(
@@ -1196,6 +1270,11 @@ function parseOptions(): QualificationOptions {
     `invalid reliability profile: ${String(rawProfile)}`,
   );
   const profile = rawProfile as QualificationProfile;
+  const rawObservationRound = optionValue("--observation-round");
+  const observationRound =
+    rawObservationRound === undefined
+      ? null
+      : positiveInteger("--observation-round", rawObservationRound);
   const rawStage = optionValue("--stage") ?? "all";
   assert.ok(
     rawStage === "all" || rawStage === "resource-census",
@@ -1258,6 +1337,7 @@ function parseOptions(): QualificationOptions {
   );
   return {
     profile,
+    observationRound,
     stage,
     seed,
     evidencePath,
@@ -1273,6 +1353,7 @@ function parseOptions(): QualificationOptions {
 function assertKnownOptions(): void {
   const names = new Set([
     "--profile",
+    "--observation-round",
     "--stage",
     "--resource-counts",
     "--resource-modes",
@@ -1335,6 +1416,204 @@ function workloadModeList(raw: string | undefined): readonly WorkloadMode[] {
     "--resource-modes contains duplicates",
   );
   return values as WorkloadMode[];
+}
+
+function captureProvenance(): QualificationProvenance {
+  const budgets = JSON.parse(readFileSync(budgetPath, "utf8")) as {
+    readonly measurement_contract?: unknown;
+  };
+  assert.notEqual(
+    budgets.measurement_contract,
+    undefined,
+    "reliability budgets have no measurement contract",
+  );
+  const buildArgv = buildArgvFromEnvironment();
+  const targetDirectory = process.env.CTXMUX_RELIABILITY_BUILD_TARGET_DIR ?? "";
+  return {
+    claim_scope: "locally_observed",
+    binary_source_attestation: false,
+    source: captureSourceIdentity(),
+    harness: fileIdentity(harnessPath),
+    launcher: fileIdentity(launcherPath),
+    daemon: fileIdentity(daemonBinary),
+    lockfiles: [
+      fileIdentity(resolve(root, "Cargo.lock")),
+      fileIdentity(resolve(root, "package-lock.json")),
+    ],
+    build: {
+      cwd: ".",
+      argv: buildArgv,
+      source_commit: process.env.CTXMUX_RELIABILITY_BUILD_SOURCE_COMMIT ?? "",
+      source_tree: process.env.CTXMUX_RELIABILITY_BUILD_SOURCE_TREE ?? "",
+      worktree_clean:
+        process.env.CTXMUX_RELIABILITY_BUILD_WORKTREE_CLEAN === "true",
+      target_directory: targetDirectory,
+      daemon_path: provenancePath(daemonBinary),
+      locked: buildArgv.includes("--locked"),
+    },
+    toolchain: {
+      rustc_version_verbose: commandOutput("rustc", [
+        "--version",
+        "--verbose",
+      ]).trim(),
+      cargo_version: commandOutput("cargo", ["--version"]).trim(),
+      node_version: process.version,
+    },
+    measurement_contract_encoding: "json-stringify-utf8",
+    measurement_contract_sha256: sha256(
+      JSON.stringify(budgets.measurement_contract),
+    ),
+  };
+}
+
+function captureSourceIdentity(): QualificationProvenance["source"] {
+  const entries = commandOutput("git", [
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+  ])
+    .split("\0")
+    .filter((entry) => entry.length > 0);
+  return {
+    commit: commandOutput("git", ["rev-parse", "HEAD"]).trim(),
+    tree: commandOutput("git", ["rev-parse", "HEAD^{tree}"]).trim(),
+    worktree: {
+      status_format: "git-status-porcelain-v1-z",
+      clean: entries.length === 0,
+      entries,
+    },
+  };
+}
+
+function buildArgvFromEnvironment(): readonly string[] {
+  const raw = process.env.CTXMUX_RELIABILITY_BUILD_ARGV_JSON;
+  if (raw === undefined) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    return Array.isArray(value) &&
+      value.every((item) => typeof item === "string")
+      ? value
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function fileIdentity(path: string): FileIdentity {
+  return {
+    path: provenancePath(path),
+    sha256: sha256(readFileSync(path)),
+  };
+}
+
+function provenancePath(path: string): string {
+  const absolute = resolve(path);
+  const portable = relative(root, absolute).replaceAll("\\", "/");
+  return portable === ".." || portable.startsWith("../") ? absolute : portable;
+}
+
+function sha256(value: string | Buffer): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function assertQualificationProvenance(
+  options: QualificationOptions,
+  provenance: QualificationProvenance,
+): void {
+  assert.deepEqual(
+    provenance.build.argv,
+    fixedBuildArgv,
+    "qualification must use the fixed locked daemon build argv",
+  );
+  assert.equal(
+    provenance.build.target_directory,
+    fixedBuildTargetDirectory,
+    "qualification must use the fixed provenance build directory",
+  );
+  assert.equal(provenance.build.daemon_path, fixedDaemonPath);
+  assert.equal(provenance.build.locked, true);
+  assert.equal(
+    provenance.build.source_commit,
+    provenance.source.commit,
+    "source commit changed after the locked daemon build",
+  );
+  assert.equal(
+    provenance.build.source_tree,
+    provenance.source.tree,
+    "source tree changed after the locked daemon build",
+  );
+  assert.equal(
+    provenance.build.worktree_clean,
+    provenance.source.worktree.clean,
+    "worktree clean state changed after the locked daemon build",
+  );
+  assert.equal(provenance.harness.path, "scripts/reliability-qualification.ts");
+  assert.equal(provenance.launcher.path, "scripts/check-reliability.sh");
+  assert.equal(provenance.daemon.path, fixedDaemonPath);
+  assert.deepEqual(
+    provenance.lockfiles.map(({ path }) => path),
+    ["Cargo.lock", "package-lock.json"],
+  );
+
+  assert.deepEqual(
+    provenance.source,
+    captureSourceIdentity(),
+    "source identity changed after provenance capture",
+  );
+  assert.deepEqual(provenance.harness, fileIdentity(harnessPath));
+  assert.deepEqual(provenance.launcher, fileIdentity(launcherPath));
+  assert.deepEqual(provenance.daemon, fileIdentity(daemonBinary));
+  assert.deepEqual(provenance.lockfiles, [
+    fileIdentity(resolve(root, "Cargo.lock")),
+    fileIdentity(resolve(root, "package-lock.json")),
+  ]);
+  const budgets = JSON.parse(readFileSync(budgetPath, "utf8")) as {
+    readonly measurement_contract?: unknown;
+  };
+  assert.notEqual(budgets.measurement_contract, undefined);
+  assert.equal(
+    provenance.measurement_contract_sha256,
+    sha256(JSON.stringify(budgets.measurement_contract)),
+    "measurement contract changed after provenance capture",
+  );
+
+  if (options.profile === "observe") {
+    assert.ok(
+      options.observationRound !== null &&
+        options.observationRound >= 1 &&
+        options.observationRound <= 3,
+      "observe requires --observation-round 1, 2, or 3",
+    );
+    assert.equal(
+      provenance.source.worktree.clean,
+      true,
+      "observe requires a clean worktree",
+    );
+    assert.equal(options.stage, "all", "observe requires --stage all");
+    assert.deepEqual(
+      options.resourceCounts,
+      [1, 32, 128],
+      "observe requires the complete 1/32/128 resource matrix",
+    );
+    assert.deepEqual(
+      options.resourceModes,
+      ["idle", "active"],
+      "observe requires the complete idle/active resource matrix",
+    );
+    assert.equal(
+      options.resourceStartConcurrency,
+      8,
+      "observe requires resource start concurrency 8",
+    );
+    assert.equal(options.soakSeconds, 0, "observe must not run a time soak");
+  } else {
+    assert.equal(
+      options.observationRound,
+      null,
+      "--observation-round is reserved for observe",
+    );
+  }
 }
 
 function readBudgets(): BudgetFile {
