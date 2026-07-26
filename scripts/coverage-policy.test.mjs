@@ -17,6 +17,7 @@ import {
   parseIstanbul,
   parseLcov,
   resolveComparisonBase,
+  runPolicy,
 } from "./coverage-policy.mjs";
 
 const root = "/repo";
@@ -137,6 +138,40 @@ function evaluateAutoGitChanges(repo, base, reports, candidate = policy) {
     { mode: "auto", productChanged: productFiles.size > 0 },
   );
   return { productFiles, result };
+}
+
+function rustOnlyPolicy() {
+  const candidate = structuredClone(policy);
+  candidate.source_inventory.includes = [
+    { language: "rust", glob: "src/**/*.rs" },
+  ];
+  candidate.source_inventory.exclusions = [];
+  candidate.groups = [candidate.groups[0]];
+  return candidate;
+}
+
+function runAutoGitPolicy(repo, base, rustLcov) {
+  const output = [];
+  const originalLog = console.log;
+  console.log = (...values) => output.push(values.join(" "));
+  try {
+    const result = runPolicy({
+      root: repo,
+      policy: rustOnlyPolicy(),
+      rustLcov,
+      typescriptJson: {},
+      base,
+      comparison: "direct",
+      changedLineMode: "auto",
+    });
+    return { output, result };
+  } finally {
+    console.log = originalLog;
+  }
+}
+
+function coveredRustLcov(repo, filename = "src/lib.rs") {
+  return `TN:\nSF:${path.join(repo, filename)}\nDA:1,1\nLF:1\nLH:1\nend_of_record\n`;
 }
 
 test("parses LCOV and Istanbul line evidence into portable repository paths", () => {
@@ -291,7 +326,7 @@ diff --git a/docs/readme.md b/docs/readme.md
   assert.equal(result.covered, 3);
   assert.equal(result.total, 4);
   assert.equal(result.percent, 75);
-  assert.equal(result.passed, false);
+  assert.equal(result.outcome, "fail");
 });
 
 test("false, true, and auto distinguish reporting from required evidence", () => {
@@ -306,49 +341,62 @@ test("false, true, and auto distinguish reporting from required evidence", () =>
   });
   assert.equal(ordinary.percent, null);
   assert.equal(ordinary.evidence_required, false);
-  assert.equal(ordinary.passed, true);
+  assert.equal(ordinary.outcome, "not_applicable");
 
   const explicit = evaluateChangedLines(policy, reports, changed, {
     mode: "true",
   });
   assert.equal(explicit.evidence_missing, true);
-  assert.equal(explicit.passed, false);
+  assert.equal(explicit.outcome, "fail");
 
   const documentation = evaluateChangedLines(policy, reports, changed, {
     mode: "auto",
     productChanged: false,
   });
   assert.equal(documentation.evidence_required, false);
-  assert.equal(documentation.passed, true);
+  assert.equal(documentation.outcome, "not_applicable");
 
   const commentOnlyProduct = evaluateChangedLines(policy, reports, changed, {
     mode: "auto",
     productChanged: true,
   });
-  assert.equal(commentOnlyProduct.evidence_missing, true);
-  assert.equal(commentOnlyProduct.passed, false);
+  assert.equal(commentOnlyProduct.percent, null);
+  assert.equal(commentOnlyProduct.evidence_required, false);
+  assert.equal(commentOnlyProduct.evidence_missing, false);
+  assert.equal(commentOnlyProduct.outcome, "not_applicable");
+  assert.equal(Object.hasOwn(commentOnlyProduct, "passed"), false);
 });
 
 test("required changed-line evidence passes only with a non-empty denominator", () => {
-  const result = evaluateChangedLines(
-    policy,
-    {
-      rust: new Map([["src/lib.rs", new Map([[10, 1]])]]),
-      typescript: new Map([["src/client.ts", new Map([[10, 1]])]]),
-    },
-    parseChangedLines(`
+  const reports = {
+    rust: new Map([["src/lib.rs", new Map([[10, 1]])]]),
+    typescript: new Map([["src/client.ts", new Map([[10, 1]])]]),
+  };
+  const changed = parseChangedLines(`
 diff --git a/src/lib.rs b/src/lib.rs
 --- a/src/lib.rs
 +++ b/src/lib.rs
 @@ -9,0 +10 @@
-`),
-    { mode: "true", productChanged: true },
-  );
+`);
+  const result = evaluateChangedLines(policy, reports, changed, {
+    mode: "true",
+    productChanged: true,
+  });
 
   assert.equal(result.total, 1);
   assert.equal(result.percent, 100);
   assert.equal(result.evidence_missing, false);
-  assert.equal(result.passed, true);
+  assert.equal(result.outcome, "pass");
+
+  reports.rust.get("src/lib.rs").set(10, 0);
+  const belowFloor = evaluateChangedLines(policy, reports, changed, {
+    mode: "true",
+    productChanged: true,
+  });
+  assert.equal(belowFloor.total, 1);
+  assert.equal(belowFloor.percent, 0);
+  assert.equal(belowFloor.evidence_missing, false);
+  assert.equal(belowFloor.outcome, "fail");
 });
 
 test("base resolution rejects missing evidence inputs, zero SHA, HEAD, and invalid objects", (t) => {
@@ -515,7 +563,7 @@ test("name-status observes documentation, comment, deletion, rename, and untrack
   );
 });
 
-test("auto mode passes documentation-only changes and fails zero-denominator product changes", (t) => {
+test("auto mode reports zero executable denominators as N/A without skipping owner gates", (t) => {
   const cases = [
     {
       label: "documentation only",
@@ -525,7 +573,7 @@ test("auto mode passes documentation-only changes and fails zero-denominator pro
         git(repo, ["commit", "-m", "documentation only"]);
       },
       productChanged: false,
-      passed: true,
+      gateErrors: false,
     },
     {
       label: "product comment only",
@@ -538,7 +586,7 @@ test("auto mode passes documentation-only changes and fails zero-denominator pro
         git(repo, ["commit", "-m", "product comment only"]);
       },
       productChanged: true,
-      passed: false,
+      gateErrors: false,
     },
     {
       label: "deleted product source",
@@ -548,7 +596,22 @@ test("auto mode passes documentation-only changes and fails zero-denominator pro
         git(repo, ["commit", "-m", "delete product source"]);
       },
       productChanged: true,
-      passed: false,
+      gateErrors: true,
+      rustLcov: "",
+    },
+    {
+      label: "renamed product source",
+      change(repo) {
+        fs.renameSync(
+          path.join(repo, "src", "lib.rs"),
+          path.join(repo, "src", "renamed.rs"),
+        );
+        git(repo, ["add", "."]);
+        git(repo, ["commit", "-m", "rename product source"]);
+      },
+      productChanged: true,
+      gateErrors: true,
+      rustLcov: "",
     },
     {
       label: "untracked product source",
@@ -565,7 +628,7 @@ test("auto mode passes documentation-only changes and fails zero-denominator pro
         );
       },
       productChanged: true,
-      passed: false,
+      gateErrors: true,
     },
   ];
   const reports = {
@@ -589,10 +652,75 @@ test("auto mode passes documentation-only changes and fails zero-denominator pro
     );
     assert.equal(result.total, 0, fixtureCase.label);
     assert.equal(result.percent, null, fixtureCase.label);
-    assert.equal(result.evidence_required, fixtureCase.productChanged);
-    assert.equal(result.evidence_missing, fixtureCase.productChanged);
-    assert.equal(result.passed, fixtureCase.passed, fixtureCase.label);
+    assert.equal(result.evidence_required, false, fixtureCase.label);
+    assert.equal(result.evidence_missing, false, fixtureCase.label);
+    assert.equal(result.outcome, "not_applicable", fixtureCase.label);
+
+    const gate = runAutoGitPolicy(
+      repo,
+      base,
+      fixtureCase.rustLcov ?? coveredRustLcov(repo),
+    );
+    assert.equal(gate.result.grouped.results.length, 1, fixtureCase.label);
+    assert.equal(
+      gate.result.errors.length > 0,
+      fixtureCase.gateErrors,
+      fixtureCase.label,
+    );
+    const changedLineOutput = gate.output.find((line) =>
+      line.startsWith("N/A changed lines (auto):"),
+    );
+    assert.ok(changedLineOutput, fixtureCase.label);
+    assert.doesNotMatch(changedLineOutput, /\d+(?:\.\d+)?%/u);
   }
+});
+
+test("auto mode enforces the 90 percent floor for a nonzero mixed denominator", () => {
+  const changed = parseChangedLines(`
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -0,0 +1,12 @@
+diff --git a/docs/readme.md b/docs/readme.md
+--- a/docs/readme.md
++++ b/docs/readme.md
+@@ -0,0 +1 @@
+`);
+  const reports = {
+    rust: new Map([
+      [
+        "src/lib.rs",
+        new Map(Array.from({ length: 10 }, (_, index) => [index + 1, 1])),
+      ],
+    ]),
+    typescript: new Map(),
+  };
+
+  const allCovered = evaluateChangedLines(policy, reports, changed, {
+    mode: "auto",
+    productChanged: true,
+  });
+  reports.rust.get("src/lib.rs").set(10, 0);
+  const atFloor = evaluateChangedLines(policy, reports, changed, {
+    mode: "auto",
+    productChanged: true,
+  });
+
+  assert.equal(allCovered.total, 10);
+  assert.equal(allCovered.percent, 100);
+  assert.equal(allCovered.outcome, "pass");
+  assert.equal(atFloor.total, 10);
+  assert.equal(atFloor.percent, 90);
+  assert.equal(atFloor.outcome, "pass");
+
+  reports.rust.get("src/lib.rs").set(9, 0);
+  const failing = evaluateChangedLines(policy, reports, changed, {
+    mode: "auto",
+    productChanged: true,
+  });
+  assert.equal(failing.total, 10);
+  assert.equal(failing.percent, 80);
+  assert.equal(failing.outcome, "fail");
 });
 
 test("tracked diff keeps current worktree coordinates across committed and dirty changes", (t) => {
@@ -633,7 +761,7 @@ test("tracked diff keeps current worktree coordinates across committed and dirty
 
   assert.deepEqual([...changed.get("src/lib.rs")], [1, 2]);
   assert.equal(result.percent, 50);
-  assert.equal(result.passed, false);
+  assert.equal(result.outcome, "fail");
 });
 
 test("mixed tracked and untracked product lines share one changed-line denominator", (t) => {
@@ -686,7 +814,7 @@ test("mixed tracked and untracked product lines share one changed-line denominat
   assert.equal(result.covered, 1);
   assert.equal(result.total, 5);
   assert.equal(result.percent, 20);
-  assert.equal(result.passed, false);
+  assert.equal(result.outcome, "fail");
 });
 
 test("checked-in policy fixes every current product owner and floor", () => {

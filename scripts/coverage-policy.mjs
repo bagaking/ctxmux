@@ -340,9 +340,16 @@ export function evaluateChangedLines(
   }
 
   const percent = total === 0 ? null : (covered / total) * 100;
-  const evidenceRequired =
-    parsedMode === "true" || (parsedMode === "auto" && productChanged);
+  const evidenceRequired = parsedMode === "true";
   const evidenceMissing = evidenceRequired && percent === null;
+  const outcome =
+    percent === null
+      ? evidenceMissing
+        ? "fail"
+        : "not_applicable"
+      : percent >= policy.floors.changed_line_percent
+        ? "pass"
+        : "fail";
   return {
     files,
     covered,
@@ -352,9 +359,7 @@ export function evaluateChangedLines(
     product_changed: productChanged,
     evidence_required: evidenceRequired,
     evidence_missing: evidenceMissing,
-    passed:
-      !evidenceMissing &&
-      (percent === null || percent >= policy.floors.changed_line_percent),
+    outcome,
   };
 }
 
@@ -588,14 +593,16 @@ function printGroup(result) {
 
 function printChangedLines(patch, policy) {
   if (patch.percent === null) {
-    const status = patch.passed ? "N/A" : "FAIL";
-    const reason = patch.product_changed
-      ? "product source changed but no executable denominator was reported"
-      : "no product source changed with an executable denominator";
+    const status = patch.outcome === "not_applicable" ? "N/A" : "FAIL";
+    const reason = patch.evidence_missing
+      ? "explicit retained evidence requires a nonzero executable denominator"
+      : patch.product_changed
+        ? "product source changed but no executable denominator was reported"
+        : "no product source changed with an executable denominator";
     console.log(`${status} changed lines (${patch.mode}): ${reason}`);
   } else {
     console.log(
-      `${patch.passed ? "PASS" : "FAIL"} changed lines (${patch.mode}): ${patch.percent.toFixed(2)}% (${patch.covered}/${patch.total}, minimum ${policy.floors.changed_line_percent}%)`,
+      `${patch.outcome === "pass" ? "PASS" : "FAIL"} changed lines (${patch.mode}): ${patch.percent.toFixed(2)}% (${patch.covered}/${patch.total}, minimum ${policy.floors.changed_line_percent}%)`,
     );
   }
 }
@@ -658,14 +665,16 @@ export function runPolicy({
   printChangedLines(patch, policy);
 
   const errors = [...inventory.errors, ...grouped.errors];
-  if (patch.evidence_missing) {
-    errors.push(
-      "changed-line evidence was required but the comparison contained no changed executable product lines",
-    );
-  } else if (!patch.passed) {
-    errors.push(
-      `changed-line coverage ${patch.percent.toFixed(2)}% is below ${policy.floors.changed_line_percent}%`,
-    );
+  if (patch.outcome === "fail") {
+    if (patch.evidence_missing) {
+      errors.push(
+        "changed-line evidence was required but the comparison contained no changed executable product lines",
+      );
+    } else {
+      errors.push(
+        `changed-line coverage ${patch.percent.toFixed(2)}% is below ${policy.floors.changed_line_percent}%`,
+      );
+    }
   }
   return { reports, inventory, grouped, resolution, patch, errors };
 }

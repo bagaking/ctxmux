@@ -418,9 +418,16 @@ silently excluded. Changed-line mode is explicit:
 - `false` performs ordinary reporting and may report no executable product
   denominator;
 - `true` is retained evidence and requires a nonzero executable denominator;
-- `auto` is the required CI mode: an owned product-file change requires a
-  nonzero executable denominator, including when the edit changes only comments,
-  while a pure documentation change may report none honestly.
+- `auto` is the required CI mode: a nonzero executable denominator must meet
+  the 90% floor, while documentation-only, comment-only, deletion-only, or other
+  zero-executable-denominator changes report N/A.
+
+Auto N/A means no changed-line proposition exists for that diff. It is not a
+passing changed-line percentage and cannot be retained as changed-line evidence.
+The filesystem inventory, every owner group, missing-report checks, and the
+ordinary repository Gate still execute, so N/A does not exempt product sources
+or weaken the fixed owner floors. This avoids incentivizing an unrelated
+executable edit merely to manufacture a denominator.
 
 Required CI supplies the pull-request base with `merge-base` comparison or the
 prior push revision with direct comparison. An empty, zero, or invalid revision

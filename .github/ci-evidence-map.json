@@ -40,7 +40,7 @@
       "kind": "test",
       "path": "scripts/coverage-policy.test.mjs",
       "invariants": [
-        "seven coverage owner groups and changed-line ordinary, explicit, and CI-auto modes fail closed"
+        "seven coverage owner groups remain fail-closed while changed-line ordinary, explicit retained-evidence, and CI-auto N/A modes stay semantically distinct"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test scripts/*.test.mjs",

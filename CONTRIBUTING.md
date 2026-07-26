@@ -60,19 +60,20 @@ scripts/check.sh --coverage
 
 Changed-line mode accepts `false`, `true`, or `auto`. `false` is ordinary
 reporting. `true` is explicit retained evidence and fails on a zero executable
-denominator. Required CI uses `auto`: changes to owned product files require a
-nonzero denominator, including comment-only edits, while pure documentation
-changes may report none honestly. CI supplies the pull-request base with
-merge-base comparison or the prior push revision with direct comparison. A run
-retained as changed-line proof must use an explicit base plus `true` and
-`direct`, as above. `HEAD^` makes the example executable for a one-commit
-comparison. Retained evidence for a larger change must replace it with that
-work's actual pre-change revision. The base must resolve in the current
-repository and must not be `HEAD`; the evidence policy rejects `HEAD` as a
-zero-distance base. A direct evidence base must also be an ancestor of `HEAD`;
-future or unrelated commits fail closed. New untracked product sources are
-counted from all executable lines reported for that file rather than disappearing
-from the changed-line denominator.
+denominator. Required CI uses `auto`: a nonzero executable denominator must meet
+the 90% floor, while documentation-only, comment-only, or deletion-only changes
+report changed-line coverage as N/A. N/A is not retained changed-line proof;
+filesystem inventory and every owner floor still run and may fail the Gate. CI
+supplies the pull-request base with merge-base comparison or the prior push
+revision with direct comparison. A run retained as changed-line proof must use
+an explicit base plus `true` and `direct`, as above. `HEAD^` makes the example
+executable for a one-commit comparison. Retained evidence for a larger change
+must replace it with that work's actual pre-change revision. The base must
+resolve in the current repository and must not be `HEAD`; the evidence policy
+rejects `HEAD` as a zero-distance base. A direct evidence base must also be an
+ancestor of `HEAD`; future or unrelated commits fail closed. New untracked
+product sources are counted from all executable lines reported for that file
+rather than disappearing from the changed-line denominator.
 
 The default gate also runs the bounded reliability smoke against the frozen
 one-Run CPU, RSS, retention, thread, fd, and cleanup budgets. To reproduce the
