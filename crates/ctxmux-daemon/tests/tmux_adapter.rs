@@ -122,6 +122,11 @@ impl TestDaemon {
         self.client.clone()
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn file_descriptor_count(&self) -> usize {
+        process_file_descriptor_count(self.child.id())
+    }
+
     fn shutdown_clean(&mut self) {
         let status = self.shutdown_status(Duration::from_secs(2));
         assert!(status.success(), "ctxmuxd clean shutdown failed: {status}");
@@ -943,6 +948,55 @@ fn process_exists(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn process_file_descriptor_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read daemon file descriptors from procfs")
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn process_file_descriptor_count(pid: u32) -> usize {
+    let pid = pid.to_string();
+    let output = Command::new("lsof")
+        .args(["-a", "-p", pid.as_str(), "-Fn"])
+        .output()
+        .expect("inspect daemon file descriptors with lsof");
+    assert!(
+        output.status.success(),
+        "lsof daemon file descriptor census failed: {}",
+        stderr(&output)
+    );
+    String::from_utf8(output.stdout)
+        .expect("lsof file descriptor census is UTF-8")
+        .lines()
+        .filter(|line| line.starts_with('f'))
+        .count()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stable_daemon_file_descriptor_count(daemon: &TestDaemon) -> usize {
+    timeout(Duration::from_secs(3), async {
+        let mut previous = None;
+        let mut stable_samples = 0;
+        loop {
+            let current = daemon.file_descriptor_count();
+            if previous == Some(current) {
+                stable_samples += 1;
+            } else {
+                previous = Some(current);
+                stable_samples = 1;
+            }
+            if stable_samples == 5 {
+                return current;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon file descriptor census should settle")
 }
 
 fn read_pid_file(path: &Path) -> Vec<u32> {
@@ -1879,6 +1933,74 @@ async fn control_eof_distinguishes_server_loss_from_an_open_command_block() {
         assert!(process_exists(fake.pane_pid()));
         daemon.shutdown_clean();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn terminal_tmux_runs_release_control_writers_without_a_daemon_fd_slope() {
+    const ROUNDS: usize = 4;
+
+    let fake = FakeTmuxControl::create();
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let baseline = stable_daemon_file_descriptor_count(&daemon).await;
+
+    for round in 1..=ROUNDS {
+        let run = import_fake_pane(&client, &fake).await;
+        let control_pid = *fake
+            .control_pids(round)
+            .last()
+            .expect("current fake Control Mode PID");
+
+        fake.trigger_control("eof");
+        wait_for_interruption(&client, run.id, InterruptionReason::TmuxServerUnavailable).await;
+        assert_process_exits(control_pid);
+
+        let historical = client
+            .status(run.id)
+            .await
+            .expect("status retains interrupted tmux Run");
+        assert_eq!(historical.id, run.id);
+        assert_eq!(&historical.backend, &run.backend);
+        assert_eq!(
+            historical.state,
+            RunState::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            }
+        );
+        let (attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
+        assert_eq!(snapshot.run.id, historical.id);
+        assert_eq!(&snapshot.run.backend, &historical.backend);
+        assert_eq!(snapshot.run.state, historical.state);
+        let mut attachment = attachment;
+        assert_eq!(
+            next_event_with_timeout(&mut attachment)
+                .await
+                .expect("read historical tmux terminal event"),
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(
+            next_event_with_timeout(&mut attachment)
+                .await
+                .expect("historical tmux attachment closes after its terminal event"),
+            None
+        );
+        drop(attachment);
+        assert_eq!(client.list().await.unwrap().len(), round);
+        assert_eq!(client.status(run.id).await.unwrap().attachments, 0);
+        assert!(process_exists(fake.pane_pid()));
+
+        let settled = stable_daemon_file_descriptor_count(&daemon).await;
+        assert_eq!(
+            settled, baseline,
+            "terminal tmux Run {round}/{ROUNDS} retained a daemon file descriptor"
+        );
+    }
+
+    daemon.shutdown_clean();
+    assert!(process_exists(fake.pane_pid()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

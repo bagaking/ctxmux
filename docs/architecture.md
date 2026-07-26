@@ -232,9 +232,14 @@ Each Run retains at most 4 MiB of raw output by byte count, except that one over
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
 workloads. Cleanup requires no live direct child or attachment and no transient
-thread growth. RSS and two daemon-owned descriptors per exited Run remain
-visible after stop because the retained Run map has no GC; qualification does
-not subtract that intentional state or mislabel it as cleanup-owned leakage.
+thread growth. RSS and two daemon-owned descriptors per stopped native Run
+remain visible because the retained Run map has no GC; qualification does not
+subtract that intentional state or mislabel it as cleanup-owned leakage. On the
+EOF-driven successful-Control path qualified below, an imported tmux Run instead
+releases its incarnation-local Control stdin and stdout reader descriptors and
+reaps its Control process before `Interrupted` becomes observable. Retaining its
+historical Run record therefore has no per-terminal Control descriptor slope;
+this cleanup does not imply Run GC.
 
 Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread

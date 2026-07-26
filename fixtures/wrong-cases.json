@@ -817,13 +817,13 @@
       "source_refs": [
         "https://github.com/tmux/tmux/commit/800837ff3f21799281525af3d8537f362e5cb43e"
       ],
-      "failure_mechanism": "Queued pane output races teardown and leaves dangling adapter ownership or crashes detach.",
-      "invariant": "One detach under queued load is responsive, closes adapter ownership once, and preserves the tmux-owned pane PID.",
-      "preconditions": "A real tmux pane is imported through a required qualified-version lane.",
-      "action": "Detach while pane output and Control Mode notifications remain queued, recover exact output by cursor, then shut down ctxmux.",
-      "oracle": "Detach and adapter teardown settle without crash, replay contains the exact queued bytes, and the tmux pane PID and server survive.",
+      "failure_mechanism": "Transferred from l03: queued pane output races Control Mode detach or teardown and leaves dangling adapter ownership. Ctxmux-local regression extension, not derived from l03: a terminal imported Run retains its dead Control writer and creates a per-terminal descriptor slope.",
+      "invariant": "Queued detach settles once with exact queued replay; successful EOF cleanup releases Control stdin and stdout reader descriptors, reaps the Control process, and has no per-terminal slope while terminal history and tmux pane ownership remain.",
+      "preconditions": "For the transferred l03 failure, a real tmux pane is imported through a required qualified-version lane. For the ctxmux-local regression extension, a deterministic fake Control client and an independent pane process sentinel support repeated successful import and EOF cleanup in one daemon.",
+      "action": "Against real tmux, detach while pane output and Control Mode notifications remain queued and recover exact output by cursor. Against fake Control, repeat public import and EOF interruption while retaining terminal Runs and counting daemon descriptors.",
+      "oracle": "The real-session detach settles without crash, exact queued replay survives, and tmux ownership remains. Every qualified fake-Control cleanup retains historical status and terminal attach behavior, leaves the independent pane sentinel alive, and returns daemon descriptors exactly to baseline.",
       "platform": ["unix"],
-      "tags": ["tmux", "detach", "teardown", "ownership"],
+      "tags": ["tmux", "detach", "teardown", "ownership", "fd", "terminal"],
       "disposition": "active",
       "test_refs": [
         {
@@ -833,6 +833,10 @@
         {
           "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
           "anchor": "two_clients_disconnect_and_daemon_exit_preserve_tmux_ownership"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "terminal_tmux_runs_release_control_writers_without_a_daemon_fd_slope"
         }
       ]
     },

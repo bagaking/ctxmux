@@ -96,6 +96,11 @@ daemon.
 - Short-lived executable probes have one owner deadline and bounded stdout and
   stderr capture. Timeout or overflow terminates the helper process group and
   reaps its direct child without blocking unrelated daemon requests.
+- An EOF-driven terminal path whose Control cleanup succeeds releases the
+  ctxmux-owned stdin and stdout reader descriptors and reaps the Control process
+  before publishing `Interrupted`. Historical Run status and terminal attachment
+  remain available without retaining a live Control descriptor, and cleanup does
+  not terminate a still-live tmux-owned pane.
 - A paused or lagged source never becomes a falsely continuous replay.
 - Native Runs do not acquire a tmux dependency.
 
@@ -120,8 +125,14 @@ Evidence pack: [tmux-backend track](../../../.bagakit/researcher/topics/engineer
   command blocks, and numbered results whose ownership must fail closed.
 - `TMUX-02` (`l01`, `l02`): tmux can pause or terminate a slow control client.
   Recovery must expose a gap and cannot relabel screen state as raw history.
-- `TMUX-03` (`l03`): queued output can race Control Mode detach and teardown;
-  ctxmux must close only its adapter resources while the pane survives.
+- `TMUX-03` (`l03`) transfers only the upstream queued-output detach/teardown
+  failure: ctxmux must close only its incarnation-local adapter resources while
+  preserving exact queued replay and leaving any still-live pane tmux-owned.
+  Retaining a dead Control writer after interruption is a ctxmux-local regression
+  extension under the same dangling-ownership case, not a failure derived from
+  `l03`; its EOF-driven successful-cleanup fixture requires release before
+  terminal publication while historical status and terminal attachment remain
+  available.
 - `TMUX-04` (cross-track `a01`, `a02`): executable probes can wait without a
   cleanup owner, and started blocking work is not cancelled by dropping its
   async handle. Probe time, capture, and rollback therefore remain explicitly
@@ -139,7 +150,8 @@ the rest of the import tuple therefore participate in the target fence.
   dual-pipe capture limits, helper cleanup, request isolation, and failed-import
   rollback before publication.
 - Real-session fixtures prove discovery, raw-since-import output, target and
-  server loss, multi-client detach, queued-output teardown, and tmux ownership.
+  server loss, multi-client detach, queued-output teardown with exact replay,
+  and tmux ownership.
 - First-party TypeScript and controlling-PTY CLI fixtures prove public
   discover/import/attach, read-only rejection, ordinary input suppression,
   external output, `Ctrl-b d`, terminal restoration, detach, and pane survival.
@@ -147,7 +159,11 @@ the rest of the import tuple therefore participate in the target fence.
   tracking, EOF classification, blank-line output continuity, and pause-storm
   deduplication. The public pause fixture also proves post-pause output,
   caller-cursor reattach, late replay truncation, exact surviving bytes, and
-  pane survival.
+  pane survival. A deterministic fake Control fixture with an independent pane
+  process sentinel proves repeated public import and EOF-driven successful
+  cleanup: historical status and terminal attachment remain available, the
+  sentinel remains alive, and the daemon descriptor census returns exactly to
+  its baseline after every qualified cleanup.
 - Required CI must fail when tmux is missing or the lane's server-version
   assertion does not hold.
 

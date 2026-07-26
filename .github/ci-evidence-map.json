@@ -195,9 +195,10 @@
         "real public discovery and import bind the complete target identity and selected server version",
         "dead panes do not hide live panes and a linked pane with duplicate associations is rejected as ambiguous",
         "bounded discovery and import failures remain request-local, yield the async runtime, and publish no Run",
-        "raw-since-import pause recovery and queued detach remain honest while the tmux-owned pane survives",
+        "real tmux raw-since-import pause recovery and queued detach preserve exact replay while the tmux-owned pane survives",
         "bootstrap and serial command-result mismatches fail closed while pause storms emit one Continue and leave the Run live",
         "blank records preserve exact following output while server loss and incomplete transcript corruption remain distinct fail-closed outcomes",
+        "deterministic fake Control repeated import and EOF-driven successful cleanup retain historical status and terminal attach behavior, leave the independent pane sentinel alive, and return daemon Control descriptors exactly to baseline",
         "target change, server loss, and transcript corruption remain distinct fail-closed outcomes"
       ],
       "selection_ref": "scripts/check.sh",

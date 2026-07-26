@@ -678,7 +678,7 @@ struct NativeRunControl {
 }
 
 struct TmuxRunControl {
-    writer: Mutex<TmuxCommandWriter>,
+    writer: Mutex<Option<TmuxCommandWriter>>,
     commands: mpsc::Sender<TmuxControlCommand>,
     completion: Mutex<mpsc::Receiver<Result<(), String>>>,
 }
@@ -694,6 +694,29 @@ struct TmuxCommandTracker {
     bootstrap_result_seen: bool,
     last_result_number: Option<u64>,
     pending: VecDeque<TmuxCommandKind>,
+}
+
+impl TmuxRunControl {
+    fn with_writer<T>(
+        &self,
+        operation: impl FnOnce(&mut TmuxCommandWriter) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let mut writer = mutex_lock(&self.writer);
+        let writer = writer.as_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "tmux control client is closed")
+        })?;
+        operation(writer)
+    }
+
+    fn correlate_result(&self, number: u64) -> Result<TmuxCommandResultKind, &'static str> {
+        let mut writer = mutex_lock(&self.writer);
+        let writer = writer.as_mut().ok_or("tmux control client is closed")?;
+        writer.tracker.correlate_result(number)
+    }
+
+    fn close_writer(&self) -> bool {
+        mutex_lock(&self.writer).take().is_some()
+    }
 }
 
 impl TmuxCommandWriter {
@@ -1007,7 +1030,7 @@ impl Run {
             state: Mutex::new(RunState::Running),
             output: Mutex::new(OutputLog::with_initial_truncation()),
             live: Some(RunControl::Tmux(TmuxRunControl {
-                writer: Mutex::new(TmuxCommandWriter::new(stdin)),
+                writer: Mutex::new(Some(TmuxCommandWriter::new(stdin))),
                 commands: commands_tx,
                 completion: Mutex::new(completion_rx),
             })),
@@ -1272,7 +1295,7 @@ impl Run {
                 "Run has no tmux control client",
             ));
         };
-        mutex_lock(&control.writer).write_command(kind, command)
+        control.with_writer(|writer| writer.write_command(kind, command))
     }
 
     fn write_tmux_periodic_probe(&self, command: &[u8]) -> io::Result<()> {
@@ -1282,7 +1305,7 @@ impl Run {
                 "Run has no tmux control client",
             ));
         };
-        mutex_lock(&control.writer).write_periodic_probe(command)
+        control.with_writer(|writer| writer.write_periodic_probe(command))
     }
 
     fn establish_tmux_session(&self, command: &[u8]) -> io::Result<()> {
@@ -1292,8 +1315,9 @@ impl Run {
                 "Run has no tmux control client",
             ));
         };
-        mutex_lock(&control.writer)
-            .establish_session_and_write(TmuxCommandKind::TargetProbe, command)
+        control.with_writer(|writer| {
+            writer.establish_session_and_write(TmuxCommandKind::TargetProbe, command)
+        })
     }
 
     fn correlate_tmux_command_result(
@@ -1303,7 +1327,7 @@ impl Run {
         let Some(RunControl::Tmux(control)) = &self.live else {
             return Err("Run has no tmux control client");
         };
-        mutex_lock(&control.writer).tracker.correlate_result(number)
+        control.correlate_result(number)
     }
 
     fn interrupt_tmux(&self, reason: InterruptionReason) {
@@ -1497,6 +1521,9 @@ fn complete_tmux_control(
         ),
     };
     let termination = resolve_tmux_termination(outcome.cause, reader_termination, control_pid);
+    if let Some(RunControl::Tmux(control)) = &run.live {
+        control.close_writer();
+    }
     let _ = ready.try_send(Err(termination.error));
     *mutex_lock(&run.state) = RunState::Interrupted {
         reason: termination.reason,
@@ -2364,9 +2391,10 @@ mod tests {
         OutputLog, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
         TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
         TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
-        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxReaderTermination,
-        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
-        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
+        TmuxReaderTermination, TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock,
+        prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
+        serve_with_manager, spawn_error,
     };
 
     #[test]
@@ -2378,6 +2406,58 @@ mod tests {
         );
         assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
         assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn tmux_control_writer_close_is_owner_bound_idempotent_and_fail_closed() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tmux writer close sentinel");
+        let stdin = child.stdin.take().expect("take sentinel stdin");
+        let (commands, _command_rx) = std::sync::mpsc::channel();
+        let (_completion_tx, completion) = std::sync::mpsc::channel::<Result<(), String>>();
+        let control = TmuxRunControl {
+            writer: std::sync::Mutex::new(Some(TmuxCommandWriter::new(stdin))),
+            commands,
+            completion: std::sync::Mutex::new(completion),
+        };
+
+        control
+            .with_writer(|writer| {
+                writer
+                    .establish_session_and_write(TmuxCommandKind::TargetProbe, b"display-message\n")
+            })
+            .expect("write while the Control owner is live");
+        assert!(control.close_writer());
+        assert!(!control.close_writer());
+
+        let error = control
+            .with_writer(|writer| writer.write_periodic_probe(b"display-message\n"))
+            .expect_err("closed Control writer must reject writes");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotConnected);
+        assert_eq!(error.to_string(), "tmux control client is closed");
+        assert_eq!(
+            control.correlate_result(0).unwrap_err(),
+            "tmux control client is closed"
+        );
+
+        for _ in 0..100 {
+            if child
+                .try_wait()
+                .expect("poll tmux writer close sentinel")
+                .is_some()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("dropping the Control writer did not close its child pipe");
     }
 
     #[test]
