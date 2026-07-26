@@ -123,11 +123,16 @@ tuple; it never chooses an association by row order.
 Control Mode remains a public tmux boundary. ctxmux neither speaks the private
 tmux client-server protocol nor asks clients to bypass the ctxmux protocol.
 Control output is parsed as bounded framing plus octal-escaped byte payloads.
-A malformed escape, oversized record, invalid command block, or other
-post-readiness transcript corruption interrupts the Run with
-`tmux_protocol_error`; it is not relabeled as ordinary server unavailability.
-Generation 3 does not claim general command correlation beyond the adapter's
-bounded, serial identity and continue probes.
+Empty LF and CRLF records remain records; a true EOF is distinct, and EOF in an
+open command block is incomplete framing. Before readiness, malformed or
+incomplete framing and invalid or unowned command results reject import with an
+explicit Backend error, and no Run is published. After readiness, the same
+faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
+readiness rejects import; after readiness it interrupts the Run with
+`tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
+result and keeps at most one identity probe plus one continue request pending.
+Generation 3 does not claim general command correlation beyond those bounded
+serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
 shutting down ctxmux closes only ctxmux-owned Control clients. A read-only CLI

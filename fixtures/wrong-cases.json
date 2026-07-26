@@ -712,11 +712,11 @@
         "https://github.com/tmux/tmux/wiki/Control-Mode",
         "https://github.com/tmux/tmux/blob/851c5a933d4838c32ad06c248b2ba975d106149c/tmux.1"
       ],
-      "failure_mechanism": "A text parser corrupts octal-escaped bytes or mistakes payload for a Control Mode notification.",
-      "invariant": "Framing and byte payload decode exactly across supported tmux transcripts.",
+      "failure_mechanism": "A text parser corrupts octal-escaped bytes, mistakes an empty record for EOF, leaves an incomplete command block unclassified, or accepts an unowned or non-advancing command result.",
+      "invariant": "Line, EOF, command-block, command-result ownership, and byte payload decode exactly across supported tmux transcripts.",
       "preconditions": "The checked-in Control Mode transcript and public tmux adapter fixtures run through the required gate.",
-      "action": "Replay interleaved command and notification records, octal escapes, invalid UTF-8, quoted names, and malformed post-readiness records.",
-      "oracle": "Command and notification framing stays separate, pane bytes decode exactly, and malformed or oversized post-readiness input becomes tmux_protocol_error.",
+      "action": "Replay fragmented and empty records, complete and incomplete command blocks, serial result mismatches, interleaved notifications, octal escapes, invalid UTF-8, quoted names, and malformed post-readiness records.",
+      "oracle": "Empty records remain lines, incomplete blocks and unowned or non-advancing results fail closed, command and notification framing stays separate, and pane bytes decode exactly.",
       "platform": ["unix"],
       "tags": ["tmux", "control-mode", "parser", "bytes"],
       "disposition": "active",
@@ -730,6 +730,18 @@
           "anchor": "malformed_or_oversized_control_records_fail_boundedly"
         },
         {
+          "path": "crates/ctxmux-daemon/src/tmux.rs",
+          "anchor": "fragmented_reader_and_parser_preserve_blocks_and_classify_final_eof"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "tmux_command_tracker_bounds_and_deduplicates_serial_commands"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "tmux_command_tracker_allows_one_pre_session_bootstrap_and_monotonic_gaps"
+        },
+        {
           "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
           "anchor": "real_discovery_import_exposes_raw_since_import_without_prehistory"
         },
@@ -740,6 +752,34 @@
         {
           "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
           "anchor": "oversized_control_mode_after_readiness_is_a_protocol_interruption"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "blank_control_lines_preserve_import_and_exact_following_output"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "open_command_block_before_readiness_rejects_import_with_transcript_detail"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "control_eof_distinguishes_server_loss_from_an_open_command_block"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "command_result_number_or_pending_mismatch_fails_closed"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "bootstrap_accepts_a_nonzero_start_and_command_number_gap"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "bootstrap_must_be_unique_successful_and_empty"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "pause_storm_writes_one_bounded_continue_command"
         }
       ]
     },

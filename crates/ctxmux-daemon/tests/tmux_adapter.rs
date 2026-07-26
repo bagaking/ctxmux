@@ -464,6 +464,8 @@ struct FakeTmuxControl {
     pause_trigger: PathBuf,
     output_trigger: PathBuf,
     protocol_corruption_trigger: PathBuf,
+    control_startup_mode: PathBuf,
+    control_trigger: PathBuf,
     probe_signature: PathBuf,
     server_version: PathBuf,
     include_dead_pane: PathBuf,
@@ -493,6 +495,8 @@ impl FakeTmuxControl {
         let pause_trigger = directory.path().join("pause-trigger");
         let output_trigger = directory.path().join("output-trigger");
         let protocol_corruption_trigger = directory.path().join("protocol-corruption-trigger");
+        let control_startup_mode = directory.path().join("control-startup-mode");
+        let control_trigger = directory.path().join("control-trigger");
         let probe_signature = directory.path().join("probe-signature");
         let server_version = directory.path().join("server-version");
         let include_dead_pane = directory.path().join("include-dead-pane");
@@ -510,6 +514,8 @@ fixture_dir=${0%/*}
 pause_trigger=$fixture_dir/pause-trigger
 output_trigger=$fixture_dir/output-trigger
 protocol_corruption_trigger=$fixture_dir/protocol-corruption-trigger
+control_startup_mode_file=$fixture_dir/control-startup-mode
+control_trigger_file=$fixture_dir/control-trigger
 probe_signature=$fixture_dir/probe-signature
 server_version=$fixture_dir/server-version
 include_dead_pane=$fixture_dir/include-dead-pane
@@ -583,10 +589,83 @@ if [ -f "$hold_stdout_open" ]; then
     sleep 30 &
     printf '%s\n' "$!" >> "$descendant_pids_file"
 fi
+control_startup_mode=default
+if [ -f "$control_startup_mode_file" ]; then
+    control_startup_mode=$(cat "$control_startup_mode_file")
+fi
+bootstrap_number=0
+sequence=1
+case "$control_startup_mode" in
+    default)
+        ;;
+    blank-lines)
+        printf '\n'
+        ;;
+    nonzero-gap)
+        bootstrap_number=41
+        sequence=47
+        ;;
+    bootstrap-error|bootstrap-nonempty|double-bootstrap|open-block-eof)
+        ;;
+    *)
+        exit 26
+        ;;
+esac
+if [ "$control_startup_mode" = "open-block-eof" ]; then
+    printf '%%begin 1 %s 0\n' "$bootstrap_number"
+    exit 0
+fi
+printf '%%begin 1 %s 0\n' "$bootstrap_number"
+if [ "$control_startup_mode" = "bootstrap-nonempty" ]; then
+    printf 'unexpected bootstrap output\n'
+fi
+if [ "$control_startup_mode" = "bootstrap-error" ]; then
+    printf '%%error 1 %s 0\n' "$bootstrap_number"
+else
+    printf '%%end 1 %s 0\n' "$bootstrap_number"
+fi
+if [ "$control_startup_mode" = "double-bootstrap" ]; then
+    printf '%%begin 1 1 0\n'
+    printf '%%end 1 1 0\n'
+    sequence=2
+fi
 printf '%%session-changed $0 ctxmux-fake\n'
 paused=0
-sequence=1
+blank_after_ready=0
+storm_wait_for_probe=0
+if [ "$control_startup_mode" = "blank-lines" ]; then
+    blank_after_ready=1
+fi
 while IFS= read -r line; do
+    control_trigger=
+    storm_started=0
+    if [ -f "$control_trigger_file" ]; then
+        control_trigger=$(cat "$control_trigger_file")
+        rm -f "$control_trigger_file"
+        case "$control_trigger" in
+            eof)
+                exit 0
+                ;;
+            open-block-eof)
+                printf '%%begin 1 %s 0\n' "$sequence"
+                exit 0
+                ;;
+            pause-storm)
+                storm_index=0
+                while [ "$storm_index" -lt 64 ]; do
+                    printf '%%pause %%0\n'
+                    storm_index=$((storm_index + 1))
+                done
+                storm_wait_for_probe=1
+                storm_started=1
+                ;;
+            duplicate|backwards|no-pending)
+                ;;
+            *)
+                exit 27
+                ;;
+        esac
+    fi
     if [ -f "$output_trigger" ]; then
         output=$(cat "$output_trigger")
         rm -f "$output_trigger"
@@ -622,18 +701,42 @@ while IFS= read -r line; do
     fi
     case "$line" in
         display-message*)
-            printf '%%begin 1 %s 0\n' "$sequence"
+            storm_finishing=0
+            if [ "$storm_wait_for_probe" -eq 1 ] && [ "$storm_started" -eq 0 ]; then
+                storm_finishing=1
+            fi
+            result_number=$sequence
+            if [ "$control_trigger" = "duplicate" ]; then
+                result_number=$((sequence - 1))
+            elif [ "$control_trigger" = "backwards" ]; then
+                result_number=0
+            fi
+            printf '%%begin 1 %s 0\n' "$result_number"
             if [ -f "$probe_signature" ]; then
                 cat "$probe_signature"
                 printf '\n'
             else
                 printf '4100\t1700000000\t$0\t@0\t%%0\t%s\n' "$pane_pid"
             fi
-            printf '%%end 1 %s 0\n' "$sequence"
+            printf '%%end 1 %s 0\n' "$result_number"
             sequence=$((sequence + 1))
+            if [ "$control_trigger" = "no-pending" ]; then
+                printf '%%begin 1 %s 0\n' "$sequence"
+                printf '%%end 1 %s 0\n' "$sequence"
+                sequence=$((sequence + 1))
+            fi
+            if [ "$blank_after_ready" -eq 1 ]; then
+                printf '\r\n'
+                printf '%s\n' '%output %0 BLANK-EXACT\015\012'
+                blank_after_ready=0
+            fi
+            if [ "$storm_finishing" -eq 1 ]; then
+                printf '%s\n' '%output %0 STORM-DRAINED\015\012'
+                storm_wait_for_probe=0
+            fi
             ;;
         'refresh-client -A %0:continue')
-            printf '%s\n' "$line" > "$refresh_log"
+            printf '%s\n' "$line" >> "$refresh_log"
             printf '%%begin 1 %s 0\n' "$sequence"
             printf '%%end 1 %s 0\n' "$sequence"
             sequence=$((sequence + 1))
@@ -661,6 +764,8 @@ exit 0
             pause_trigger,
             output_trigger,
             protocol_corruption_trigger,
+            control_startup_mode,
+            control_trigger,
             probe_signature,
             server_version,
             include_dead_pane,
@@ -694,6 +799,14 @@ exit 0
     fn trigger_protocol_corruption(&self, corruption: &str) {
         std::fs::write(&self.protocol_corruption_trigger, corruption)
             .expect("trigger fake tmux protocol corruption");
+    }
+
+    fn set_control_startup_mode(&self, mode: &str) {
+        std::fs::write(&self.control_startup_mode, mode).expect("set fake Control startup mode");
+    }
+
+    fn trigger_control(&self, trigger: &str) {
+        std::fs::write(&self.control_trigger, trigger).expect("trigger fake Control behavior");
     }
 
     fn set_probe_signature(&self, signature: &str) {
@@ -756,6 +869,15 @@ exit 0
     fn assert_refresh_command(&self) {
         let command = std::fs::read(&self.refresh_log).expect("read fake tmux refresh command");
         assert_eq!(command, b"refresh-client -A %0:continue\n");
+    }
+
+    fn refresh_command_count(&self) -> usize {
+        std::fs::read(&self.refresh_log).map_or(0, |commands| {
+            commands
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count()
+        })
     }
 }
 
@@ -1582,6 +1704,158 @@ async fn replacement_tmux_socket_path_invalidates_the_import_identity() {
     let _replacement_listener = fake.replace_socket_path();
     wait_for_interruption(&client, run.id, InterruptionReason::TmuxTargetChanged).await;
     assert_process_exits(control_pid);
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blank_control_lines_preserve_import_and_exact_following_output() {
+    let fake = FakeTmuxControl::create();
+    fake.set_control_startup_mode("blank-lines");
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let run = import_fake_pane(&client, &fake).await;
+    let (mut attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
+    let observed = wait_for_output(
+        &mut attachment,
+        replay_bytes(&snapshot.replay.chunks),
+        b"BLANK-EXACT\r\n",
+    )
+    .await;
+    assert_eq!(observed, b"BLANK-EXACT\r\n");
+    assert!(client.status(run.id).await.unwrap().state.is_running());
+    detach_with_timeout(attachment).await;
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_accepts_a_nonzero_start_and_command_number_gap() {
+    let fake = FakeTmuxControl::create();
+    fake.set_control_startup_mode("nonzero-gap");
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let run = import_fake_pane(&client, &fake).await;
+    assert!(run.state.is_running());
+    assert!(client.status(run.id).await.unwrap().state.is_running());
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_must_be_unique_successful_and_empty() {
+    for mode in ["double-bootstrap", "bootstrap-error", "bootstrap-nonempty"] {
+        let fake = FakeTmuxControl::create();
+        fake.set_control_startup_mode(mode);
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let (_, panes) = client
+            .discover_tmux(fake.socket_string())
+            .await
+            .expect("discover fake pane before invalid bootstrap");
+        let error = client
+            .import_tmux(fake.socket_string(), &panes[0].pane_id)
+            .await
+            .expect_err("invalid bootstrap must reject import");
+        assert_protocol_error(error, ErrorCode::BackendUnavailable);
+        assert!(client.list().await.unwrap().is_empty());
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_command_block_before_readiness_rejects_import_with_transcript_detail() {
+    let fake = FakeTmuxControl::create();
+    fake.set_control_startup_mode("open-block-eof");
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let (_, panes) = client
+        .discover_tmux(fake.socket_string())
+        .await
+        .expect("discover fake pane before truncated bootstrap");
+    match client
+        .import_tmux(fake.socket_string(), &panes[0].pane_id)
+        .await
+        .expect_err("truncated bootstrap must reject import")
+    {
+        ClientError::Protocol { code, message } => {
+            assert_eq!(code, ErrorCode::BackendUnavailable);
+            assert!(
+                message.contains("ended inside a command block"),
+                "truncated transcript detail was lost: {message}"
+            );
+        }
+        error => panic!("expected protocol error for truncated bootstrap, got {error:?}"),
+    }
+    assert!(client.list().await.unwrap().is_empty());
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn command_result_number_or_pending_mismatch_fails_closed() {
+    for trigger in ["duplicate", "backwards", "no-pending"] {
+        let fake = FakeTmuxControl::create();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        fake.trigger_control(trigger);
+        wait_for_interruption(&client, run.id, InterruptionReason::TmuxProtocolError).await;
+        assert!(process_exists(fake.pane_pid()));
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_eof_distinguishes_server_loss_from_an_open_command_block() {
+    for (trigger, expected) in [
+        ("eof", InterruptionReason::TmuxServerUnavailable),
+        ("open-block-eof", InterruptionReason::TmuxProtocolError),
+    ] {
+        let fake = FakeTmuxControl::create();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
+        fake.trigger_control(trigger);
+        assert_eq!(
+            next_event_with_timeout(&mut attachment)
+                .await
+                .expect("read one EOF interruption event"),
+            Some(RunEvent::Interrupted { reason: expected })
+        );
+        assert_eq!(
+            next_event_with_timeout(&mut attachment)
+                .await
+                .expect("EOF closes after one interruption event"),
+            None
+        );
+        wait_for_interruption(&client, run.id, expected).await;
+        assert!(process_exists(fake.pane_pid()));
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pause_storm_writes_one_bounded_continue_command() {
+    let fake = FakeTmuxControl::create();
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let run = import_fake_pane(&client, &fake).await;
+    fake.trigger_control("pause-storm");
+
+    timeout(Duration::from_secs(5), async {
+        while client.status(run.id).await.unwrap().head_seq < 2 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("post-storm output should follow the draining target probe result");
+    let (attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
+    assert_eq!(
+        replay_bytes(&snapshot.replay.chunks),
+        b"AFTER-CONTINUE\r\nSTORM-DRAINED\r\n"
+    );
+    assert_eq!(fake.refresh_command_count(), 1);
+    assert!(client.status(run.id).await.unwrap().state.is_running());
+    assert!(process_exists(fake.pane_pid()));
+    detach_with_timeout(attachment).await;
     daemon.shutdown_clean();
 }
 

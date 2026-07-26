@@ -73,9 +73,13 @@ Control Mode transcript corruption has its own public failure meaning,
 `tmux_protocol_error`. A malformed escape, oversized record, invalid command
 block, or other framing violation after import is not reported as ordinary
 server unavailability.
-Commands are issued serially enough for the current bounded identity and
-continue probes, but this decision does not claim a general strong command
-correlation facility.
+An empty LF or CRLF record remains a record rather than masquerading as EOF;
+EOF inside an open command block is transcript corruption. Adapter commands
+use one bounded serial tracker: at most one identity probe and one continue
+request may be pending, command-result numbers must advance, and only the
+single pre-session attach bootstrap result is accepted without an adapter
+command. This is the correlation needed by the current identity and continue
+probes, not a general strong command-correlation facility.
 
 ctxmux will not implement tmux's private client-server socket protocol and will
 not promise that an unmodified `tmux attach` command can connect to a ctxmux
@@ -112,7 +116,8 @@ daemon.
 Evidence pack: [tmux-backend track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/tmux-backend.md), claim `C012`.
 
 - `TMUX-01` (`l01`, `l02`): Control Mode payload is octal-escaped bytes, can
-  be invalid UTF-8, and is interleaved with notifications and command blocks.
+  be invalid UTF-8, and is interleaved with empty records, notifications,
+  command blocks, and numbered results whose ownership must fail closed.
 - `TMUX-02` (`l01`, `l02`): tmux can pause or terminate a slow control client.
   Recovery must expose a gap and cannot relabel screen state as raw history.
 - `TMUX-03` (`l03`): queued output can race Control Mode detach and teardown;
@@ -127,8 +132,9 @@ the rest of the import tuple therefore participate in the target fence.
 
 ## Fixture mapping
 
-- Transcript parser fixtures prove command/notification separation, octal
-  decoding, invalid UTF-8 preservation, and bounded malformed input.
+- Transcript parser fixtures prove command/notification separation, empty-line
+  and EOF distinction, command-block completion, octal decoding, invalid UTF-8
+  preservation, and bounded malformed input.
 - Deterministic executable fixtures prove version and pane discovery deadlines,
   dual-pipe capture limits, helper cleanup, request isolation, and failed-import
   rollback before publication.
@@ -137,8 +143,11 @@ the rest of the import tuple therefore participate in the target fence.
 - First-party TypeScript and controlling-PTY CLI fixtures prove public
   discover/import/attach, read-only rejection, ordinary input suppression,
   external output, `Ctrl-b d`, terminal restoration, detach, and pane survival.
-- The public pause fixture proves post-pause output, caller-cursor reattach,
-  late replay truncation, exact surviving bytes, and pane survival.
+- Public deterministic fixtures prove bootstrap and bounded command-result
+  tracking, EOF classification, blank-line output continuity, and pause-storm
+  deduplication. The public pause fixture also proves post-pause output,
+  caller-cursor reattach, late replay truncation, exact surviving bytes, and
+  pane survival.
 - Required CI must fail when tmux is missing or the lane's server-version
   assertion does not hold.
 

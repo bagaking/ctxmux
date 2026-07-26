@@ -45,7 +45,9 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::persistence::{Persistence, PersistentRun, RecoveredRun};
-use crate::tmux::{ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity};
+use crate::tmux::{
+    BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
+};
 
 const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
 const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
@@ -683,6 +685,14 @@ struct TmuxRunControl {
 
 struct TmuxCommandWriter {
     stdin: std::process::ChildStdin,
+    tracker: TmuxCommandTracker,
+}
+
+#[derive(Default)]
+struct TmuxCommandTracker {
+    session_established: bool,
+    bootstrap_result_seen: bool,
+    last_result_number: Option<u64>,
     pending: VecDeque<TmuxCommandKind>,
 }
 
@@ -690,8 +700,89 @@ impl TmuxCommandWriter {
     fn new(stdin: std::process::ChildStdin) -> Self {
         Self {
             stdin,
-            pending: VecDeque::new(),
+            tracker: TmuxCommandTracker::default(),
         }
+    }
+
+    fn establish_session_and_write(
+        &mut self,
+        kind: TmuxCommandKind,
+        command: &[u8],
+    ) -> io::Result<()> {
+        if !self.tracker.observe_session() {
+            return Ok(());
+        }
+        self.write_command(kind, command)
+    }
+
+    fn write_command(&mut self, kind: TmuxCommandKind, command: &[u8]) -> io::Result<()> {
+        if !self
+            .tracker
+            .prepare_enqueue(kind)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?
+        {
+            return Ok(());
+        }
+        self.stdin.write_all(command)?;
+        self.stdin.flush()?;
+        self.tracker.commit_enqueue(kind);
+        Ok(())
+    }
+
+    fn write_periodic_probe(&mut self, command: &[u8]) -> io::Result<()> {
+        if !self.tracker.session_established {
+            return Ok(());
+        }
+        self.write_command(TmuxCommandKind::TargetProbe, command)
+    }
+}
+
+impl TmuxCommandTracker {
+    const MAX_PENDING: usize = 2;
+
+    fn observe_session(&mut self) -> bool {
+        if self.session_established {
+            false
+        } else {
+            self.session_established = true;
+            true
+        }
+    }
+
+    fn prepare_enqueue(&self, kind: TmuxCommandKind) -> Result<bool, &'static str> {
+        if !self.session_established {
+            return Err("tmux adapter command arrived before session establishment");
+        }
+        if self.pending.contains(&kind) {
+            return Ok(false);
+        }
+        if self.pending.len() >= Self::MAX_PENDING {
+            return Err("tmux adapter command queue exceeded its bound");
+        }
+        Ok(true)
+    }
+
+    fn commit_enqueue(&mut self, kind: TmuxCommandKind) {
+        debug_assert!(self.session_established);
+        debug_assert!(!self.pending.contains(&kind));
+        debug_assert!(self.pending.len() < Self::MAX_PENDING);
+        self.pending.push_back(kind);
+    }
+
+    fn correlate_result(&mut self, number: u64) -> Result<TmuxCommandResultKind, &'static str> {
+        if self.last_result_number.is_some_and(|last| number <= last) {
+            return Err("tmux command result number did not advance");
+        }
+        self.last_result_number = Some(number);
+
+        if let Some(kind) = self.pending.pop_front() {
+            return Ok(TmuxCommandResultKind::Pending(kind));
+        }
+        if !self.session_established && !self.bootstrap_result_seen {
+            self.bootstrap_result_seen = true;
+            return Ok(TmuxCommandResultKind::Bootstrap);
+        }
+        Err("tmux returned a command result without a pending adapter command")
     }
 }
 
@@ -699,6 +790,12 @@ impl TmuxCommandWriter {
 enum TmuxCommandKind {
     TargetProbe,
     Continue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TmuxCommandResultKind {
+    Bootstrap,
+    Pending(TmuxCommandKind),
 }
 
 enum TmuxControlCommand {
@@ -1163,26 +1260,38 @@ impl Run {
                 "Run has no tmux control client",
             ));
         };
-        let mut writer = mutex_lock(&control.writer);
-        if kind == TmuxCommandKind::TargetProbe
-            && writer
-                .pending
-                .iter()
-                .any(|pending| *pending == TmuxCommandKind::TargetProbe)
-        {
-            return Ok(());
-        }
-        writer.stdin.write_all(command)?;
-        writer.stdin.flush()?;
-        writer.pending.push_back(kind);
-        Ok(())
+        mutex_lock(&control.writer).write_command(kind, command)
     }
 
-    fn take_tmux_command(&self) -> Option<TmuxCommandKind> {
+    fn write_tmux_periodic_probe(&self, command: &[u8]) -> io::Result<()> {
         let Some(RunControl::Tmux(control)) = &self.live else {
-            return None;
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Run has no tmux control client",
+            ));
         };
-        mutex_lock(&control.writer).pending.pop_front()
+        mutex_lock(&control.writer).write_periodic_probe(command)
+    }
+
+    fn establish_tmux_session(&self, command: &[u8]) -> io::Result<()> {
+        let Some(RunControl::Tmux(control)) = &self.live else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Run has no tmux control client",
+            ));
+        };
+        mutex_lock(&control.writer)
+            .establish_session_and_write(TmuxCommandKind::TargetProbe, command)
+    }
+
+    fn correlate_tmux_command_result(
+        &self,
+        number: u64,
+    ) -> Result<TmuxCommandResultKind, &'static str> {
+        let Some(RunControl::Tmux(control)) = &self.live else {
+            return Err("Run has no tmux control client");
+        };
+        mutex_lock(&control.writer).tracker.correlate_result(number)
     }
 
     fn interrupt_tmux(&self, reason: InterruptionReason) {
@@ -1303,10 +1412,7 @@ fn wait_for_tmux_control(
                 };
             }
             let command = tmux::target_probe_command(&target.pane_id);
-            if run
-                .write_tmux_command(TmuxCommandKind::TargetProbe, command.as_bytes())
-                .is_err()
-            {
+            if run.write_tmux_periodic_probe(command.as_bytes()).is_err() {
                 return TmuxWaitOutcome {
                     reason: InterruptionReason::TmuxServerUnavailable,
                     cleanup: terminate_tmux_control_child(child),
@@ -1385,7 +1491,20 @@ fn read_tmux_output(
     let mut readiness = TmuxReadiness::default();
     loop {
         match tmux::read_bounded_line(&mut reader, &mut line) {
-            Ok(0) => {
+            Ok(BoundedLineRead::Eof) => {
+                if let Err(error) = parser.finish() {
+                    fail_tmux_control(
+                        run,
+                        ready,
+                        backend_protocol_error("finish tmux Control Mode stream", error),
+                        if readiness.ready {
+                            InterruptionReason::TmuxProtocolError
+                        } else {
+                            InterruptionReason::TmuxServerUnavailable
+                        },
+                    );
+                    return;
+                }
                 fail_tmux_control(
                     run,
                     ready,
@@ -1397,7 +1516,7 @@ fn read_tmux_output(
                 );
                 return;
             }
-            Ok(_) => {}
+            Ok(BoundedLineRead::Line) => {}
             Err(error) => {
                 let reason = if readiness.ready {
                     InterruptionReason::TmuxProtocolError
@@ -1441,7 +1560,6 @@ fn read_tmux_output(
 
 #[derive(Default)]
 struct TmuxReadiness {
-    session_seen: bool,
     ready: bool,
 }
 
@@ -1457,19 +1575,14 @@ fn handle_tmux_control_item(
             run.record_output(data);
         }
         ControlItem::SessionChanged { session_id } if session_id == target.session_id => {
-            if !readiness.session_seen {
-                readiness.session_seen = true;
-                let command = tmux::target_probe_command(&target.pane_id);
-                if let Err(error) =
-                    run.write_tmux_command(TmuxCommandKind::TargetProbe, command.as_bytes())
-                {
-                    return fail_tmux_control(
-                        run,
-                        ready,
-                        backend_protocol_error("write initial tmux target probe", error),
-                        InterruptionReason::TmuxServerUnavailable,
-                    );
-                }
+            let command = tmux::target_probe_command(&target.pane_id);
+            if let Err(error) = run.establish_tmux_session(command.as_bytes()) {
+                return fail_tmux_control(
+                    run,
+                    ready,
+                    backend_protocol_error("write initial tmux target probe", error),
+                    InterruptionReason::TmuxServerUnavailable,
+                );
             }
         }
         ControlItem::SessionChanged { .. } => {
@@ -1484,8 +1597,14 @@ fn handle_tmux_control_item(
             );
         }
         ControlItem::CommandResult {
-            success, output, ..
-        } => return handle_tmux_command_result(run, target, ready, readiness, success, &output),
+            number,
+            success,
+            output,
+        } => {
+            return handle_tmux_command_result(
+                run, target, ready, readiness, number, success, &output,
+            );
+        }
         ControlItem::SessionRenamed { session_id, name } if session_id == target.session_id => {
             let _ = run.events.send(RunEvent::Tmux {
                 event: TmuxRunEvent::SessionRenamed { name },
@@ -1534,10 +1653,39 @@ fn handle_tmux_command_result(
     target: &ctxmux_protocol::TmuxPaneInfo,
     ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
     readiness: &mut TmuxReadiness,
+    number: u64,
     success: bool,
     output: &[Vec<u8>],
 ) -> bool {
-    let pending = run.take_tmux_command();
+    let result_kind = match run.correlate_tmux_command_result(number) {
+        Ok(kind) => kind,
+        Err(error) => {
+            return fail_tmux_control(
+                run,
+                ready,
+                backend_protocol_error("correlate tmux command result", error),
+                if readiness.ready {
+                    InterruptionReason::TmuxProtocolError
+                } else {
+                    InterruptionReason::TmuxServerUnavailable
+                },
+            );
+        }
+    };
+    if result_kind == TmuxCommandResultKind::Bootstrap {
+        if success && output.is_empty() {
+            return true;
+        }
+        return fail_tmux_control(
+            run,
+            ready,
+            ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "tmux Control Mode bootstrap returned an unexpected result",
+            ),
+            InterruptionReason::TmuxServerUnavailable,
+        );
+    }
     if !success {
         return fail_tmux_control(
             run,
@@ -1552,8 +1700,8 @@ fn handle_tmux_command_result(
             InterruptionReason::TmuxTargetChanged,
         );
     }
-    match pending {
-        Some(TmuxCommandKind::TargetProbe) => {
+    match result_kind {
+        TmuxCommandResultKind::Pending(TmuxCommandKind::TargetProbe) => {
             if output.len() != 1 {
                 return fail_tmux_control(
                     run,
@@ -1593,7 +1741,7 @@ fn handle_tmux_command_result(
                 }
             }
         }
-        Some(TmuxCommandKind::Continue) => {
+        TmuxCommandResultKind::Pending(TmuxCommandKind::Continue) => {
             if !output.is_empty() {
                 return fail_tmux_control(
                     run,
@@ -1606,19 +1754,7 @@ fn handle_tmux_command_result(
                 );
             }
         }
-        None => {
-            if readiness.ready {
-                return fail_tmux_control(
-                    run,
-                    ready,
-                    ProtocolError::new(
-                        ErrorCode::BackendUnavailable,
-                        "tmux returned a command result without a pending adapter command",
-                    ),
-                    InterruptionReason::TmuxProtocolError,
-                );
-            }
-        }
+        TmuxCommandResultKind::Bootstrap => unreachable!("bootstrap handled above"),
     }
     true
 }
@@ -2111,7 +2247,8 @@ mod tests {
         AttachmentHookPoint, AttachmentTestHook, LaunchSetupStep, OUTPUT_RETENTION_BYTES,
         OutputLog, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
         TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
-        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT, mutex_lock,
+        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, mutex_lock,
         prepare_socket_path, prepare_socket_path_with_hook, serve_with_manager, spawn_error,
     };
 
@@ -2124,6 +2261,107 @@ mod tests {
         );
         assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
         assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn tmux_command_tracker_bounds_and_deduplicates_serial_commands() {
+        let mut tracker = TmuxCommandTracker::default();
+        assert_eq!(
+            tracker
+                .prepare_enqueue(TmuxCommandKind::Continue)
+                .unwrap_err(),
+            "tmux adapter command arrived before session establishment"
+        );
+        assert!(tracker.observe_session());
+        assert!(!tracker.observe_session());
+
+        assert!(
+            tracker
+                .prepare_enqueue(TmuxCommandKind::TargetProbe)
+                .unwrap()
+        );
+        tracker.commit_enqueue(TmuxCommandKind::TargetProbe);
+        assert!(
+            !tracker
+                .prepare_enqueue(TmuxCommandKind::TargetProbe)
+                .unwrap()
+        );
+
+        for _ in 0..64 {
+            if tracker.prepare_enqueue(TmuxCommandKind::Continue).unwrap() {
+                tracker.commit_enqueue(TmuxCommandKind::Continue);
+            }
+        }
+        assert_eq!(tracker.pending.len(), TmuxCommandTracker::MAX_PENDING);
+        assert_eq!(
+            tracker.correlate_result(10).unwrap(),
+            TmuxCommandResultKind::Pending(TmuxCommandKind::TargetProbe)
+        );
+        assert_eq!(
+            tracker.correlate_result(42).unwrap(),
+            TmuxCommandResultKind::Pending(TmuxCommandKind::Continue)
+        );
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[test]
+    fn tmux_command_tracker_allows_one_pre_session_bootstrap_and_monotonic_gaps() {
+        let mut tracker = TmuxCommandTracker::default();
+        assert_eq!(
+            tracker.correlate_result(0).unwrap(),
+            TmuxCommandResultKind::Bootstrap
+        );
+        assert_eq!(
+            tracker.correlate_result(7).unwrap_err(),
+            "tmux returned a command result without a pending adapter command"
+        );
+
+        let mut nonzero = TmuxCommandTracker::default();
+        assert_eq!(
+            nonzero.correlate_result(41).unwrap(),
+            TmuxCommandResultKind::Bootstrap
+        );
+        assert!(nonzero.observe_session());
+        assert!(
+            nonzero
+                .prepare_enqueue(TmuxCommandKind::TargetProbe)
+                .unwrap()
+        );
+        nonzero.commit_enqueue(TmuxCommandKind::TargetProbe);
+        assert_eq!(
+            nonzero.correlate_result(47).unwrap(),
+            TmuxCommandResultKind::Pending(TmuxCommandKind::TargetProbe)
+        );
+    }
+
+    #[test]
+    fn tmux_command_tracker_rejects_duplicate_and_backward_numbers_before_pop() {
+        for invalid in [7, 6] {
+            let mut tracker = TmuxCommandTracker::default();
+            assert_eq!(
+                tracker.correlate_result(7).unwrap(),
+                TmuxCommandResultKind::Bootstrap
+            );
+            assert!(tracker.observe_session());
+            assert!(
+                tracker
+                    .prepare_enqueue(TmuxCommandKind::TargetProbe)
+                    .unwrap()
+            );
+            tracker.commit_enqueue(TmuxCommandKind::TargetProbe);
+            assert_eq!(
+                tracker.correlate_result(invalid).unwrap_err(),
+                "tmux command result number did not advance"
+            );
+            assert_eq!(tracker.pending.front(), Some(&TmuxCommandKind::TargetProbe));
+        }
+
+        let mut ready = TmuxCommandTracker::default();
+        assert!(ready.observe_session());
+        assert_eq!(
+            ready.correlate_result(0).unwrap_err(),
+            "tmux returned a command result without a pending adapter command"
+        );
     }
 
     #[test]

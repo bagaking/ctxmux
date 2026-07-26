@@ -737,6 +737,14 @@ impl ControlParser {
         }
         Err("tmux emitted an unframed control line".to_owned())
     }
+
+    pub(crate) fn finish(&self) -> Result<(), String> {
+        if self.block.is_some() {
+            Err("tmux Control Mode stream ended inside a command block".to_owned())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn reject_stray_block_terminator(line: &[u8]) -> Result<(), String> {
@@ -820,15 +828,25 @@ fn split_once(value: &[u8], separator: u8) -> Option<(&[u8], &[u8])> {
     Some((&value[..index], &value[index + 1..]))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedLineRead {
+    Line,
+    Eof,
+}
+
 pub(crate) fn read_bounded_line(
     reader: &mut impl BufRead,
     line: &mut Vec<u8>,
-) -> io::Result<usize> {
+) -> io::Result<BoundedLineRead> {
     line.clear();
     loop {
         let available = reader.fill_buf()?;
         if available.is_empty() {
-            return Ok(line.len());
+            return Ok(if line.is_empty() {
+                BoundedLineRead::Eof
+            } else {
+                BoundedLineRead::Line
+            });
         }
         let take = available
             .iter()
@@ -848,7 +866,7 @@ pub(crate) fn read_bounded_line(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(line.len());
+            return Ok(BoundedLineRead::Line);
         }
     }
 }
@@ -859,7 +877,7 @@ mod tests {
 
     use serde_json::Value;
 
-    use super::{ControlItem, ControlParser, ParsedVersion, read_bounded_line};
+    use super::{BoundedLineRead, ControlItem, ControlParser, ParsedVersion, read_bounded_line};
 
     fn transcript_fixture() -> Value {
         let fixture: Value =
@@ -981,6 +999,119 @@ mod tests {
     }
 
     #[test]
+    fn command_blocks_distinguish_empty_output_lines_from_no_output() {
+        let mut parser = ControlParser::default();
+        assert_eq!(parser.parse_line(b"%begin 1 7 0").unwrap(), None);
+        assert_eq!(parser.parse_line(b"").unwrap(), None);
+        assert_eq!(
+            parser.parse_line(b"%end 1 7 0").unwrap(),
+            Some(ControlItem::CommandResult {
+                number: 7,
+                success: true,
+                output: vec![Vec::new()],
+            })
+        );
+
+        assert_eq!(parser.parse_line(b"%begin 2 8 0").unwrap(), None);
+        assert_eq!(
+            parser.parse_line(b"%end 2 8 0").unwrap(),
+            Some(ControlItem::CommandResult {
+                number: 8,
+                success: true,
+                output: Vec::new(),
+            })
+        );
+        assert_eq!(parser.finish(), Ok(()));
+    }
+
+    #[test]
+    fn bounded_reader_preserves_empty_and_partial_final_lines() {
+        let mut reader = BufReader::with_capacity(1, b"\n\r\npartial".as_slice());
+        let mut line = Vec::new();
+
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLineRead::Line
+        );
+        assert!(line.is_empty());
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLineRead::Line
+        );
+        assert!(line.is_empty());
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLineRead::Line
+        );
+        assert_eq!(line, b"partial");
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut line).unwrap(),
+            BoundedLineRead::Eof
+        );
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn fragmented_reader_and_parser_preserve_blocks_and_classify_final_eof() {
+        let (items, finish) = parse_fragmented_control(
+            b"%begin 1 7 0\r\n\r\n%end 1 7 0\r\n%begin 2 8 0\npayload\n%end 2 8 0",
+        );
+        assert_eq!(
+            items,
+            vec![
+                ControlItem::CommandResult {
+                    number: 7,
+                    success: true,
+                    output: vec![Vec::new()],
+                },
+                ControlItem::CommandResult {
+                    number: 8,
+                    success: true,
+                    output: vec![b"payload".to_vec()],
+                },
+            ]
+        );
+        assert_eq!(finish, Ok(()));
+
+        let (items, finish) = parse_fragmented_control(b"%begin 3 9 0\npayload");
+        assert!(items.is_empty());
+        assert_eq!(
+            finish.unwrap_err(),
+            "tmux Control Mode stream ended inside a command block"
+        );
+    }
+
+    fn parse_fragmented_control(bytes: &[u8]) -> (Vec<ControlItem>, Result<(), String>) {
+        let mut reader = BufReader::with_capacity(1, bytes);
+        let mut parser = ControlParser::default();
+        let mut line = Vec::new();
+        let mut items = Vec::new();
+        loop {
+            match read_bounded_line(&mut reader, &mut line).expect("read fragmented control line") {
+                BoundedLineRead::Line => {
+                    if let Some(item) = parser
+                        .parse_line(&line)
+                        .expect("parse fragmented control line")
+                    {
+                        items.push(item);
+                    }
+                }
+                BoundedLineRead::Eof => return (items, parser.finish()),
+            }
+        }
+    }
+
+    #[test]
+    fn parser_finish_rejects_an_open_command_block() {
+        let mut parser = ControlParser::default();
+        assert_eq!(parser.parse_line(b"%begin 1 7 0").unwrap(), None);
+        assert_eq!(
+            parser.finish().unwrap_err(),
+            "tmux Control Mode stream ended inside a command block"
+        );
+    }
+
+    #[test]
     fn malformed_or_oversized_control_records_fail_boundedly() {
         let fixture = transcript_fixture();
         assert_malformed_transcript_cases(&fixture);
@@ -1007,7 +1138,8 @@ mod tests {
                                 .as_bytes(),
                         )
                         .err()
-                });
+                })
+                .or_else(|| parser.finish().err());
             assert_eq!(
                 error.as_deref(),
                 case["expected_error"].as_str(),
@@ -1108,7 +1240,7 @@ mod tests {
             {
                 assert_eq!(
                     result.expect("accept bounded fixture line"),
-                    payload_bytes,
+                    BoundedLineRead::Line,
                     "bounded fixture {case_id}"
                 );
                 assert_eq!(line.len(), payload_bytes, "bounded fixture {case_id}");

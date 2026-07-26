@@ -50,6 +50,11 @@
       "expected_error": "nested tmux command block"
     },
     {
+      "id": "incomplete-command-block",
+      "lines": ["%begin 1 2 0", "partial output"],
+      "expected_error": "tmux Control Mode stream ended inside a command block"
+    },
+    {
       "id": "mismatched-command-terminator",
       "lines": ["%begin 1 2 0", "%end 1 3 0"],
       "expected_error": "tmux command block terminator does not match begin"
