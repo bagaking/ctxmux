@@ -5,14 +5,23 @@ use std::{
     io::{self, BufRead},
     os::unix::fs::{FileTypeExt, MetadataExt},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use ctxmux_protocol::{ErrorCode, ProtocolError, TerminalSize, TmuxPaneInfo};
+
+use self::short_command::{BoundedOutput, CaptureLimits};
+
+mod short_command;
 
 pub(crate) const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_BLOCK_LINES: usize = 32 * 1024;
 const MINIMUM_TMUX_MAJOR: u32 = 3;
 const MINIMUM_TMUX_MINOR: u32 = 4;
+const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
+const VERSION_STDOUT_BYTES: usize = 4 * 1024;
+const DISCOVERY_STDOUT_BYTES: usize = 128 * 1024;
+const SHORT_COMMAND_STDERR_BYTES: usize = 16 * 1024;
 const PANE_FORMAT: &str = concat!(
     "#{version}\t#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{pane_id}\t",
     "#{pane_pid}\t#{pane_width}\t#{pane_height}\t#{pane_dead}"
@@ -67,7 +76,11 @@ impl Drop for PendingControl {
     }
 }
 
-pub(crate) fn discover(socket_path: &str) -> Result<TmuxDiscovery, ProtocolError> {
+pub(crate) fn discover(
+    socket_path: &str,
+    deadline: Instant,
+) -> Result<TmuxDiscovery, ProtocolError> {
+    ensure_before_deadline(deadline, "tmux pane discovery")?;
     if socket_path.is_empty() {
         return Err(ProtocolError::new(
             ErrorCode::InvalidRequest,
@@ -75,14 +88,20 @@ pub(crate) fn discover(socket_path: &str) -> Result<TmuxDiscovery, ProtocolError
         ));
     }
     let executable = executable();
-    read_supported_client_version(&executable)?;
+    read_supported_client_version(&executable, deadline)?;
     let socket_identity = read_socket_identity(socket_path)?;
-    let output = base_command(&executable)
+    let mut command = base_command(&executable);
+    command
         .arg("-S")
         .arg(socket_path)
-        .args(["list-panes", "-a", "-F", PANE_FORMAT])
-        .output()
-        .map_err(|error| backend_error("run tmux pane discovery", error))?;
+        .args(["list-panes", "-a", "-F", PANE_FORMAT]);
+    let output = run_short_command(
+        &mut command,
+        deadline,
+        DISCOVERY_STDOUT_BYTES,
+        "run tmux pane discovery",
+    )?;
+    ensure_before_deadline(deadline, "tmux pane discovery")?;
     if !output.status.success() {
         return Err(ProtocolError::new(
             ErrorCode::BackendUnavailable,
@@ -127,6 +146,7 @@ pub(crate) fn discover(socket_path: &str) -> Result<TmuxDiscovery, ProtocolError
             "tmux pane discovery returned no target server rows",
         )
     })?;
+    ensure_before_deadline(deadline, "tmux pane discovery")?;
     Ok(TmuxDiscovery {
         version,
         panes,
@@ -137,9 +157,10 @@ pub(crate) fn discover(socket_path: &str) -> Result<TmuxDiscovery, ProtocolError
 pub(crate) fn spawn_control(
     socket_path: &str,
     pane_id: &str,
+    discovery_deadline: Instant,
 ) -> Result<PendingControl, ProtocolError> {
     validate_pane_id(pane_id)?;
-    let discovery = discover(socket_path)?;
+    let discovery = discover(socket_path, discovery_deadline)?;
     let socket_identity = discovery.socket_identity;
     let mut matches = discovery
         .panes
@@ -213,11 +234,19 @@ fn base_command(executable: &OsString) -> Command {
     command
 }
 
-fn read_supported_client_version(executable: &OsString) -> Result<(), ProtocolError> {
-    let output = base_command(executable)
-        .arg("-V")
-        .output()
-        .map_err(|error| backend_error("read tmux version", error))?;
+fn read_supported_client_version(
+    executable: &OsString,
+    deadline: Instant,
+) -> Result<(), ProtocolError> {
+    let mut command = base_command(executable);
+    command.arg("-V");
+    let output = run_short_command(
+        &mut command,
+        deadline,
+        VERSION_STDOUT_BYTES,
+        "read tmux version",
+    )?;
+    ensure_before_deadline(deadline, "tmux client version probe")?;
     if !output.status.success() {
         return Err(ProtocolError::new(
             ErrorCode::BackendUnavailable,
@@ -243,6 +272,35 @@ fn read_supported_client_version(executable: &OsString) -> Result<(), ProtocolEr
     })?;
     validate_supported_version(version, "client")?;
     Ok(())
+}
+
+fn run_short_command(
+    command: &mut Command,
+    owner_deadline: Instant,
+    stdout_bytes: usize,
+    action: &str,
+) -> Result<BoundedOutput, ProtocolError> {
+    let command_deadline = owner_deadline.min(Instant::now() + SHORT_COMMAND_TIMEOUT);
+    short_command::run(
+        command,
+        command_deadline,
+        CaptureLimits {
+            stdout_bytes,
+            stderr_bytes: SHORT_COMMAND_STDERR_BYTES,
+        },
+    )
+    .map_err(|error| backend_error(action, error))
+}
+
+fn ensure_before_deadline(deadline: Instant, action: &str) -> Result<(), ProtocolError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            format!("{action} exceeded its execution deadline"),
+        ))
+    }
 }
 
 fn validate_supported_version(version: &str, owner: &str) -> Result<(), ProtocolError> {
@@ -502,9 +560,13 @@ fn backend_error(action: &str, error: impl std::fmt::Display) -> ProtocolError {
 
 fn bounded_stderr(stderr: &[u8]) -> String {
     const LIMIT: usize = 4096;
-    String::from_utf8_lossy(&stderr[..stderr.len().min(LIMIT)])
+    let mut value = String::from_utf8_lossy(&stderr[..stderr.len().min(LIMIT)])
         .trim()
-        .to_owned()
+        .to_owned();
+    if stderr.len() > LIMIT {
+        value.push_str(" [truncated]");
+    }
+    value
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

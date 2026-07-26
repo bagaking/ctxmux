@@ -858,7 +858,10 @@ test("checked-in policy fixes every current product owner and floor", () => {
         id: "rust-tmux",
         language: "rust",
         floor_class: "runtime",
-        paths: ["crates/ctxmux-daemon/src/tmux.rs"],
+        paths: [
+          "crates/ctxmux-daemon/src/tmux.rs",
+          "crates/ctxmux-daemon/src/tmux/short_command.rs",
+        ],
       },
       {
         id: "rust-run-spec-validator",

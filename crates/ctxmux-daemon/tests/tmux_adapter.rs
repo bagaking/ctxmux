@@ -10,6 +10,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -23,6 +24,7 @@ use tokio::time::{sleep, timeout};
 
 const TARGET_SESSION: &str = "ctxmux-target";
 const PUBLIC_ATTACHMENT_TIMEOUT: Duration = Duration::from_secs(5);
+static TMUX_FIXTURE_OWNER: Mutex<()> = Mutex::new(());
 const FIXTURE_SHELL: &str = concat!(
     "stty -echo; printf 'BEFORE-IMPORT\\n'; : > \"$1\"; ",
     "while IFS= read -r line; do case \"$line\" in ",
@@ -43,25 +45,38 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start() -> Self {
-        Self::start_with_options(None, None).await
+        Self::start_with_options(None, None, None).await
     }
 
     async fn start_persistent() -> Self {
         let directory = tempfile::tempdir().expect("create persistent daemon directory");
         let state_dir = directory.path().join("state");
-        Self::spawn(directory, Some(&state_dir), None).await
+        Self::spawn(directory, Some(&state_dir), None, None).await
     }
 
     async fn start_with_tmux_bin(executable: &Path) -> Self {
-        Self::start_with_options(None, Some(executable)).await
+        Self::start_with_options(None, Some(executable), None).await
     }
 
-    async fn start_with_options(state_dir: Option<&Path>, tmux_bin: Option<&Path>) -> Self {
+    async fn start_with_single_worker_and_tmux_bin(executable: &Path) -> Self {
+        Self::start_with_options(None, Some(executable), Some("1")).await
+    }
+
+    async fn start_with_options(
+        state_dir: Option<&Path>,
+        tmux_bin: Option<&Path>,
+        worker_threads: Option<&str>,
+    ) -> Self {
         let directory = tempfile::tempdir().expect("create daemon temp directory");
-        Self::spawn(directory, state_dir, tmux_bin).await
+        Self::spawn(directory, state_dir, tmux_bin, worker_threads).await
     }
 
-    async fn spawn(directory: TempDir, state_dir: Option<&Path>, tmux_bin: Option<&Path>) -> Self {
+    async fn spawn(
+        directory: TempDir,
+        state_dir: Option<&Path>,
+        tmux_bin: Option<&Path>,
+        worker_threads: Option<&str>,
+    ) -> Self {
         let socket = directory.path().join("ctxmux.sock");
         let mut command = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"));
         command.arg("--socket").arg(&socket);
@@ -70,6 +85,9 @@ impl TestDaemon {
         }
         if let Some(tmux_bin) = tmux_bin {
             command.env("CTXMUX_TMUX_BIN", tmux_bin);
+        }
+        if let Some(worker_threads) = worker_threads {
+            command.env("TOKIO_WORKER_THREADS", worker_threads);
         }
         let child = command
             .stdin(Stdio::null())
@@ -169,6 +187,7 @@ impl Drop for TestDaemon {
 }
 
 struct TmuxServer {
+    _fixture_owner: MutexGuard<'static, ()>,
     executable: OsString,
     _directory: TempDir,
     socket: PathBuf,
@@ -178,6 +197,7 @@ struct TmuxServer {
 
 impl TmuxServer {
     fn start() -> Option<Self> {
+        let fixture_owner = lock_tmux_fixture_owner();
         let executable =
             std::env::var_os("CTXMUX_TMUX_BIN").unwrap_or_else(|| OsString::from("tmux"));
         match Command::new(&executable).arg("-V").output() {
@@ -202,6 +222,7 @@ impl TmuxServer {
         let socket = directory.path().join("tmux.sock");
         let ready = directory.path().join("pane-ready");
         let mut server = Self {
+            _fixture_owner: fixture_owner,
             executable,
             _directory: directory,
             socket,
@@ -434,6 +455,7 @@ impl Drop for TmuxServer {
 }
 
 struct FakeTmuxControl {
+    _fixture_owner: MutexGuard<'static, ()>,
     _directory: TempDir,
     _socket_listener: UnixListener,
     pane_process: Child,
@@ -450,10 +472,13 @@ struct FakeTmuxControl {
     control_pids_file: PathBuf,
     descendant_pids_file: PathBuf,
     hold_stdout_open: PathBuf,
+    short_command_mode: PathBuf,
+    short_command_pids_file: PathBuf,
 }
 
 impl FakeTmuxControl {
     fn create() -> Self {
+        let fixture_owner = lock_tmux_fixture_owner();
         let directory = tempfile::tempdir().expect("create fake tmux fixture directory");
         let socket = directory.path().join("tmux.sock");
         let socket_listener = UnixListener::bind(&socket).expect("bind fake tmux socket identity");
@@ -476,6 +501,8 @@ impl FakeTmuxControl {
         let control_pids_file = directory.path().join("control.pids");
         let descendant_pids_file = directory.path().join("descendant.pids");
         let hold_stdout_open = directory.path().join("hold-stdout-open");
+        let short_command_mode = directory.path().join("short-command-mode");
+        let short_command_pids_file = directory.path().join("short-command.pids");
         std::fs::write(
             &executable,
             r#"#!/bin/sh
@@ -492,8 +519,19 @@ pane_pid=$(cat "$fixture_dir/pane.pid")
 control_pids_file=$fixture_dir/control.pids
 descendant_pids_file=$fixture_dir/descendant.pids
 hold_stdout_open=$fixture_dir/hold-stdout-open
+short_command_mode=$fixture_dir/short-command-mode
+short_command_pids_file=$fixture_dir/short-command.pids
+
+mode=
+if [ -f "$short_command_mode" ]; then
+    mode=$(cat "$short_command_mode")
+fi
 
 if [ "$#" -eq 1 ] && [ "$1" = "-V" ]; then
+    if [ "$mode" = "hang-version" ]; then
+        printf '%s\n' "$$" >> "$short_command_pids_file"
+        exec sleep 30
+    fi
     printf 'tmux 3.6\n'
     exit 0
 fi
@@ -506,6 +544,15 @@ shift 2
 if [ "$1" = "list-panes" ]; then
     if [ "$#" -ne 4 ] || [ "$2" != "-a" ] || [ "$3" != "-F" ]; then
         exit 21
+    fi
+    if [ "$mode" = "hang-discovery" ]; then
+        printf '%s\n' "$$" >> "$short_command_pids_file"
+        exec sleep 30
+    fi
+    if [ "$mode" = "overflow-discovery" ]; then
+        printf '%s\n' "$$" >> "$short_command_pids_file"
+        dd if=/dev/zero bs=131073 count=1 2>/dev/null | tr '\000' x
+        exit 0
     fi
     if [ -f "$server_version" ]; then
         version=$(cat "$server_version")
@@ -529,6 +576,9 @@ if [ "$#" -ne 6 ] || [ "$1" != "-C" ] || [ "$2" != "attach-session" ] || \
 fi
 
 printf '%s\n' "$$" >> "$control_pids_file"
+if [ "$mode" = "hang-readiness" ]; then
+    exec sleep 30
+fi
 if [ -f "$hold_stdout_open" ]; then
     sleep 30 &
     printf '%s\n' "$!" >> "$descendant_pids_file"
@@ -602,6 +652,7 @@ exit 0
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
             .expect("make fake tmux executable executable");
         Self {
+            _fixture_owner: fixture_owner,
             _directory: directory,
             _socket_listener: socket_listener,
             pane_process,
@@ -618,6 +669,8 @@ exit 0
             control_pids_file,
             descendant_pids_file,
             hold_stdout_open,
+            short_command_mode,
+            short_command_pids_file,
         }
     }
 
@@ -678,6 +731,14 @@ exit 0
             .expect("enable held fake Control Mode stdout");
     }
 
+    fn set_short_command_mode(&self, mode: &str) {
+        std::fs::write(&self.short_command_mode, mode).expect("set fake short-command mode");
+    }
+
+    fn short_command_pids(&self, expected: usize) -> Vec<u32> {
+        wait_for_pid_file(&self.short_command_pids_file, expected)
+    }
+
     fn control_pids(&self, expected: usize) -> Vec<u32> {
         wait_for_pid_file(&self.control_pids_file, expected)
     }
@@ -698,9 +759,23 @@ exit 0
     }
 }
 
+fn lock_tmux_fixture_owner() -> MutexGuard<'static, ()> {
+    // Each real/fake fixture starts independent daemon/server process trees.
+    // Serialize those owners so cross-test process pressure cannot consume a
+    // fixed production wall deadline; concurrency inside one daemon remains
+    // explicit in the dedicated adversarial tests.
+    TMUX_FIXTURE_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl Drop for FakeTmuxControl {
     fn drop(&mut self) {
-        for pid in read_pid_file(&self.descendant_pids_file) {
+        for pid in read_pid_file(&self.descendant_pids_file)
+            .into_iter()
+            .chain(read_pid_file(&self.short_command_pids_file))
+            .chain(read_pid_file(&self.control_pids_file))
+        {
             if !process_exists(pid) {
                 continue;
             }
@@ -970,6 +1045,159 @@ async fn assert_fake_protocol_corruption(corruption: &str) {
     wait_for_interruption(&client, run.id, InterruptionReason::TmuxProtocolError).await;
     assert_process_exits(control_pid);
     daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hanging_discoveries_yield_single_worker_to_unrelated_native_requests() {
+    const HANGING_REQUESTS: usize = 2;
+
+    let fake = FakeTmuxControl::create();
+    fake.set_short_command_mode("hang-discovery");
+    let mut daemon = TestDaemon::start_with_single_worker_and_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let mut hanging = Vec::new();
+    for _ in 0..HANGING_REQUESTS {
+        let request_client = client.clone();
+        let socket_path = fake.socket_string();
+        hanging.push(tokio::spawn(async move {
+            request_client.discover_tmux(socket_path).await
+        }));
+    }
+    let helper_pids = fake.short_command_pids(HANGING_REQUESTS);
+
+    let native = timeout(Duration::from_secs(1), client.start(portable_spec()))
+        .await
+        .expect("native start must not wait for hanging tmux discovery")
+        .expect("start unrelated native Run");
+    let listed = timeout(Duration::from_secs(1), client.list())
+        .await
+        .expect("list must not wait for hanging tmux discovery")
+        .expect("list Runs during hanging tmux discovery");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, native.id);
+
+    for request in hanging {
+        let error = timeout(Duration::from_secs(6), request)
+            .await
+            .expect("tmux discovery must honor its public deadline")
+            .expect("join hanging discovery task")
+            .expect_err("hanging tmux discovery must fail");
+        assert_protocol_error(error, ErrorCode::BackendUnavailable);
+    }
+    for pid in helper_pids {
+        assert_process_exits(pid);
+    }
+    assert_eq!(client.list().await.expect("list after failures").len(), 1);
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hanging_version_probe_is_bounded_reaped_and_request_local() {
+    let fake = FakeTmuxControl::create();
+    fake.set_short_command_mode("hang-version");
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let request_client = client.clone();
+    let socket_path = fake.socket_string();
+    let request = tokio::spawn(async move { request_client.discover_tmux(socket_path).await });
+    let helper_pid = fake.short_command_pids(1)[0];
+
+    let error = timeout(Duration::from_secs(6), request)
+        .await
+        .expect("tmux version probe must honor its command deadline")
+        .expect("join hanging version probe")
+        .expect_err("hanging tmux version probe must fail");
+    assert_protocol_error(error, ErrorCode::BackendUnavailable);
+    assert_process_exits(helper_pid);
+    assert!(
+        client
+            .list()
+            .await
+            .expect("list after version timeout")
+            .is_empty()
+    );
+    assert!(process_exists(fake.pane_pid()));
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn import_readiness_timeout_yields_and_rolls_back_before_publication() {
+    let fake = FakeTmuxControl::create();
+    fake.set_short_command_mode("hang-readiness");
+    let mut daemon = TestDaemon::start_with_single_worker_and_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+    let import_client = client.clone();
+    let socket_path = fake.socket_string();
+    let import = tokio::spawn(async move { import_client.import_tmux(socket_path, "%0").await });
+    let control_pid = fake.control_pid();
+
+    let native = timeout(Duration::from_secs(1), client.start(portable_spec()))
+        .await
+        .expect("native start must not wait for tmux Control Mode readiness")
+        .expect("start unrelated native Run");
+    let error = timeout(Duration::from_secs(9), import)
+        .await
+        .expect("tmux import must honor its total deadline")
+        .expect("join tmux import task")
+        .expect_err("missing Control Mode readiness must reject import");
+    assert_protocol_error(error, ErrorCode::BackendUnavailable);
+    assert_process_exits(control_pid);
+    assert!(process_exists(fake.pane_pid()));
+    let listed = client.list().await.expect("list after rejected import");
+    assert_eq!(listed.len(), 1, "rejected tmux import published a Run");
+    assert_eq!(listed[0].id, native.id);
+    daemon.shutdown_clean();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_discovery_output_fails_explicitly_without_publication() {
+    let fake = FakeTmuxControl::create();
+    fake.set_short_command_mode("overflow-discovery");
+    let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+    let client = daemon.client();
+
+    let discovery_error = client
+        .discover_tmux(fake.socket_string())
+        .await
+        .expect_err("oversized discovery stdout must fail");
+    assert_bounded_capture_error(discovery_error);
+    let first_pid = fake.short_command_pids(1)[0];
+    assert_process_exits(first_pid);
+
+    let import_error = client
+        .import_tmux(fake.socket_string(), "%0")
+        .await
+        .expect_err("import must not parse truncated discovery stdout");
+    assert_bounded_capture_error(import_error);
+    for pid in fake.short_command_pids(2) {
+        assert_process_exits(pid);
+    }
+    assert!(
+        client
+            .list()
+            .await
+            .expect("list after overflows")
+            .is_empty()
+    );
+    assert!(process_exists(fake.pane_pid()));
+    daemon.shutdown_clean();
+}
+
+fn assert_bounded_capture_error(error: ClientError) {
+    match error {
+        ClientError::Protocol { code, message } => {
+            assert_eq!(code, ErrorCode::BackendUnavailable);
+            assert!(
+                message.contains("131072-byte capture limit"),
+                "overflow error must name its bounded owner: {message}"
+            );
+            assert!(
+                message.len() < 1024,
+                "overflow error frame grew unexpectedly"
+            );
+        }
+        other => panic!("expected bounded backend error, got {other:?}"),
+    }
 }
 
 fn expected_burst() -> Vec<u8> {

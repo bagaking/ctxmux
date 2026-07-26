@@ -174,12 +174,27 @@
       ]
     },
     {
+      "id": "tmux-short-command-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/tmux/short_command.rs",
+      "invariants": [
+        "tmux executable probes bound both output pipes and execution time; timeout or overflow kills the helper group and reaps the direct child"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "tmux-public-adapter-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
       "invariants": [
         "real public discovery and import bind the complete target identity and selected server version",
         "dead panes do not hide live panes and a linked pane with duplicate associations is rejected as ambiguous",
+        "bounded discovery and import failures remain request-local, yield the async runtime, and publish no Run",
         "raw-since-import pause recovery and queued detach remain honest while the tmux-owned pane survives",
         "target change, server loss, and transcript corruption remain distinct fail-closed outcomes"
       ],

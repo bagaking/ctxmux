@@ -54,6 +54,10 @@ const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const TMUX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(4);
+const TMUX_IMPORT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const TMUX_IMPORT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
+const TMUX_IMPORT_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
 const TMUX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Failure that prevents the daemon server from running.
@@ -372,7 +376,9 @@ impl RunManager {
     }
 
     fn discover_tmux(&self, socket_path: &str) -> Result<tmux::TmuxDiscovery, ProtocolError> {
-        self.with_tmux_operation(|| tmux::discover(socket_path))
+        self.with_tmux_operation(|| {
+            tmux::discover(socket_path, Instant::now() + TMUX_DISCOVERY_TIMEOUT)
+        })
     }
 
     fn import_tmux(&self, socket_path: &str, pane_id: &str) -> Result<RunInfo, ProtocolError> {
@@ -383,7 +389,15 @@ impl RunManager {
             ));
         }
         self.with_tmux_operation(|| {
-            let run = Run::import_tmux(socket_path, pane_id, self.live_event_capacity)?;
+            let started_at = Instant::now();
+            let run = Run::import_tmux(
+                socket_path,
+                pane_id,
+                self.live_event_capacity,
+                started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
+                started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
+                started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
+            )?;
             let info = run.info();
             write_lock(&self.runs).insert(info.id, run);
             Ok(info)
@@ -841,8 +855,11 @@ impl Run {
         socket_path: &str,
         pane_id: &str,
         live_event_capacity: usize,
+        discovery_deadline: Instant,
+        prepare_deadline: Instant,
+        total_deadline: Instant,
     ) -> Result<Arc<Self>, ProtocolError> {
-        let mut pending = tmux::spawn_control(socket_path, pane_id)?;
+        let mut pending = tmux::spawn_control(socket_path, pane_id, discovery_deadline)?;
         let target = pending.target.clone();
         let socket_identity = pending.socket_identity;
         let control_pid = pending.child_id();
@@ -943,20 +960,29 @@ impl Run {
             ));
         }
 
-        Self::finish_tmux_import(run, &ready_rx)
+        Self::finish_tmux_import(run, &ready_rx, prepare_deadline, total_deadline)
     }
 
     fn finish_tmux_import(
         run: Arc<Self>,
         ready: &mpsc::Receiver<Result<(), ProtocolError>>,
+        prepare_deadline: Instant,
+        total_deadline: Instant,
     ) -> Result<Arc<Self>, ProtocolError> {
-        let readiness = match ready.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => return Ok(run),
-            Ok(Err(error)) => error,
-            Err(error) => backend_protocol_error("wait for tmux Control Mode readiness", error),
-        };
+        let readiness =
+            match ready.recv_timeout(prepare_deadline.saturating_duration_since(Instant::now())) {
+                Ok(Ok(())) if Instant::now() < prepare_deadline => return Ok(run),
+                Ok(Ok(())) => ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "tmux Control Mode readiness exceeded the import preparation deadline",
+                ),
+                Ok(Err(error)) => error,
+                Err(error) => backend_protocol_error("wait for tmux Control Mode readiness", error),
+            };
         run.interrupt_tmux(InterruptionReason::TmuxServerUnavailable);
-        match run.wait_for_tmux_completion(TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT) {
+        let cleanup_timeout = TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT
+            .min(total_deadline.saturating_duration_since(Instant::now()));
+        match run.wait_for_tmux_completion(cleanup_timeout) {
             Ok(()) => Err(readiness),
             Err(cleanup_error) => Err(ProtocolError::new(
                 readiness.code,
@@ -1783,7 +1809,7 @@ async fn handle_connection(
     if let Request::Attach { id, after_seq } = request {
         return handle_attachment(wire, manager, id, after_seq).await;
     }
-    let response = execute_request(&manager, request);
+    let response = execute_request(&manager, request).await;
     match response {
         Ok(response) => send(&mut wire, &ServerFrame::Response { response }).await?,
         Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
@@ -1791,13 +1817,19 @@ async fn handle_connection(
     Ok(())
 }
 
-fn execute_request(manager: &RunManager, request: Request) -> Result<Response, ProtocolError> {
+async fn execute_request(
+    manager: &Arc<RunManager>,
+    request: Request,
+) -> Result<Response, ProtocolError> {
     match request {
         Request::Start { spec } => Ok(Response::Started {
             run: manager.start(spec)?,
         }),
         Request::DiscoverTmux { socket_path } => {
-            let discovery = manager.discover_tmux(&socket_path)?;
+            let operation_manager = Arc::clone(manager);
+            let discovery =
+                run_blocking_tmux_operation(move || operation_manager.discover_tmux(&socket_path))
+                    .await?;
             Ok(Response::TmuxPanes {
                 tmux_version: discovery.version,
                 panes: discovery.panes,
@@ -1806,9 +1838,14 @@ fn execute_request(manager: &RunManager, request: Request) -> Result<Response, P
         Request::ImportTmux {
             socket_path,
             pane_id,
-        } => Ok(Response::Imported {
-            run: manager.import_tmux(&socket_path, &pane_id)?,
-        }),
+        } => {
+            let operation_manager = Arc::clone(manager);
+            let run = run_blocking_tmux_operation(move || {
+                operation_manager.import_tmux(&socket_path, &pane_id)
+            })
+            .await?;
+            Ok(Response::Imported { run })
+        }
         Request::Fork { parent, plan } => Ok(Response::Forked {
             run: manager.fork(parent, plan)?,
         }),
@@ -1832,6 +1869,22 @@ fn execute_request(manager: &RunManager, request: Request) -> Result<Response, P
             "attach request reached short-lived request handler",
         )),
     }
+}
+
+async fn run_blocking_tmux_operation<T>(
+    operation: impl FnOnce() -> Result<T, ProtocolError> + Send + 'static,
+) -> Result<T, ProtocolError>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                format!("tmux operation worker failed: {error}"),
+            )
+        })?
 }
 
 async fn handle_attachment(
@@ -2056,9 +2109,22 @@ mod tests {
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, LaunchSetupStep, OUTPUT_RETENTION_BYTES,
-        OutputLog, Run, RunManager, ServerError, mutex_lock, prepare_socket_path,
-        prepare_socket_path_with_hook, serve_with_manager, spawn_error,
+        OutputLog, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
+        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
+        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT, mutex_lock,
+        prepare_socket_path, prepare_socket_path_with_hook, serve_with_manager, spawn_error,
     };
+
+    #[test]
+    fn tmux_import_stages_share_one_shutdown_bounded_budget() {
+        assert!(TMUX_IMPORT_DISCOVERY_TIMEOUT < TMUX_IMPORT_PREPARE_TIMEOUT);
+        assert_eq!(
+            TMUX_IMPORT_PREPARE_TIMEOUT + TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
+            TMUX_IMPORT_TOTAL_TIMEOUT
+        );
+        assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+        assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
 
     #[test]
     fn post_spawn_setup_failures_terminate_reap_and_publish_nothing() {

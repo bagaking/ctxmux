@@ -89,6 +89,9 @@ daemon.
   public interruption or import errors.
 - Unsupported native semantics are capability-visible instead of emulated.
 - Control Mode framing and octal byte decoding are bounded and exact.
+- Short-lived executable probes have one owner deadline and bounded stdout and
+  stderr capture. Timeout or overflow terminates the helper process group and
+  reaps its direct child without blocking unrelated daemon requests.
 - A paused or lagged source never becomes a falsely continuous replay.
 - Native Runs do not acquire a tmux dependency.
 
@@ -114,6 +117,10 @@ Evidence pack: [tmux-backend track](../../../.bagakit/researcher/topics/engineer
   Recovery must expose a gap and cannot relabel screen state as raw history.
 - `TMUX-03` (`l03`): queued output can race Control Mode detach and teardown;
   ctxmux must close only its adapter resources while the pane survives.
+- `TMUX-04` (cross-track `a01`, `a02`): executable probes can wait without a
+  cleanup owner, and started blocking work is not cancelled by dropping its
+  async handle. Probe time, capture, and rollback therefore remain explicitly
+  bounded inside the tmux owner.
 
 Pane IDs are stable only within one tmux server lifetime. The server epoch and
 the rest of the import tuple therefore participate in the target fence.
@@ -122,6 +129,9 @@ the rest of the import tuple therefore participate in the target fence.
 
 - Transcript parser fixtures prove command/notification separation, octal
   decoding, invalid UTF-8 preservation, and bounded malformed input.
+- Deterministic executable fixtures prove version and pane discovery deadlines,
+  dual-pipe capture limits, helper cleanup, request isolation, and failed-import
+  rollback before publication.
 - Real-session fixtures prove discovery, raw-since-import output, target and
   server loss, multi-client detach, queued-output teardown, and tmux ownership.
 - First-party TypeScript and controlling-PTY CLI fixtures prove public
@@ -153,6 +163,6 @@ server-version evidence.
 - `packages/sdk/test/client-parity.test.ts`: real TypeScript discovery, import,
   attach, capability, detach, and pane-survival behavior
 - `fixtures/tmux-control-mode.json`: checked-in byte/transcript corpus
-- `fixtures/wrong-cases.json`: active `TMUX-01`, `TMUX-02`, and `TMUX-03`
+- `fixtures/wrong-cases.json`: active `TMUX-01` through `TMUX-04`
 - `.github/ci-evidence-map.json`: required job and platform reachability
 - `docs/protocol.md`: public generation-3 behavior

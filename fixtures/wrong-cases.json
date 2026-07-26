@@ -795,6 +795,53 @@
           "anchor": "two_clients_disconnect_and_daemon_exit_preserve_tmux_ownership"
         }
       ]
+    },
+    {
+      "id": "TMUX-04",
+      "choice": "012-tmux-control-mode-backend",
+      "source_ids": ["a01", "a02"],
+      "source_refs": [
+        "https://doc.rust-lang.org/std/process/struct.Child.html",
+        "https://docs.rs/tokio/1.53.1/tokio/task/fn.spawn_blocking.html"
+      ],
+      "failure_mechanism": "A tmux executable probe waits without an owner deadline, captures helper-controlled output without byte ceilings, or is moved to spawn_blocking while cancellation is incorrectly delegated to the async JoinHandle.",
+      "invariant": "Every tmux executable probe has one monotonic owner deadline and separate capture ceilings; timeout or capture overflow terminates its helper group and reaps the direct child, while every rejected import remains request-local and unpublished.",
+      "preconditions": "A fake tmux executable can hang or overflow independently in version discovery, pane discovery, and Control Mode readiness while recording helper PIDs.",
+      "action": "Hang each executable/readiness boundary, overflow bounded discovery output, and issue unrelated native requests through a single-worker daemon.",
+      "oracle": "Every tmux request fails explicitly within its owner budget, recorded direct helper PIDs disappear, unrelated native requests complete first, the tmux-owned pane survives, and no rejected import is listed.",
+      "platform": ["unix"],
+      "tags": ["tmux", "subprocess", "deadline", "capture-bound", "rollback"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/tmux/short_command.rs",
+          "anchor": "finite_dual_pipe_pressure_drains_without_deadlock"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/tmux/short_command.rs",
+          "anchor": "timeout_kills_same_group_descendant_holding_pipes"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/tmux/short_command.rs",
+          "anchor": "timeout_kills_and_reaps_live_direct_child"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "hanging_version_probe_is_bounded_reaped_and_request_local"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "hanging_discoveries_yield_single_worker_to_unrelated_native_requests"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "import_readiness_timeout_yields_and_rolls_back_before_publication"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "oversized_discovery_output_fails_explicitly_without_publication"
+        }
+      ]
     }
   ]
 }
