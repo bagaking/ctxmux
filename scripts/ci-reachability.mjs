@@ -43,8 +43,23 @@ const requiredCriticalMatrix = [
   { os: "ubuntu-24.04", tmux_lane: "minimum-3.4" },
   { os: "macos-15", tmux_lane: "current" },
 ];
+const requiredStartupEnvironment = {
+  BASH_ENV: "/dev/null",
+  ENV: "/dev/null",
+};
+const requiredEnvironmentNeutralizationCommand =
+  'unset BASH_ENV ENV GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"';
+const requiredGitCommand =
+  "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git";
+const requiredGitStatusCommand = `${requiredGitCommand} -c core.excludesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false status --porcelain --untracked-files=all`;
+const requiredEventSha = '"${{ github.sha }}"';
 const requiredSourceIdentityCommand =
-  'test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"';
+  requiredEnvironmentNeutralizationCommand +
+  ` && test "$(${requiredGitCommand} rev-parse HEAD)" = ${requiredEventSha} && test -z "$(${requiredGitStatusCommand})"`;
+
+function requiredGateRun(command) {
+  return `${requiredSourceIdentityCommand} && exec /bin/bash --noprofile --norc ${command}`;
+}
 
 function walk(root) {
   const files = [];
@@ -182,7 +197,8 @@ function jobSteps(job) {
 }
 
 function commandSteps(job, command) {
-  return jobSteps(job).filter((step) => step.run === command);
+  const run = requiredGateRun(command);
+  return jobSteps(job).filter((step) => step.run === run);
 }
 
 function canonicalCheckoutPrecedesCommand(job, commandStep, fetchDepth) {
@@ -207,17 +223,6 @@ function canonicalCheckoutPrecedesCommand(job, commandStep, fetchDepth) {
   );
 }
 
-function sourceIdentityFencePrecedesCommand(job, commandStep) {
-  const steps = jobSteps(job);
-  const commandIndex = steps.indexOf(commandStep);
-  if (commandIndex < 1) return false;
-  const fence = steps[commandIndex - 1];
-  return (
-    fence.run === requiredSourceIdentityCommand &&
-    sameMembers(Object.keys(fence), ["run"])
-  );
-}
-
 function validatesCoverageEnvironment(steps, expected) {
   return steps.some((step) =>
     Object.entries(expected).every(
@@ -237,6 +242,7 @@ function validateRequiredGateEnvironment(jobId, workflowJob, runSteps, errors) {
   const commandEnvironment = record(runSteps[0]?.env);
   const allowedCommandNames = [
     ...Object.keys(expected),
+    ...Object.keys(requiredStartupEnvironment),
     ...(jobId === "coverage"
       ? [
           "CTXMUX_COVERAGE_BASE",
@@ -260,7 +266,7 @@ function validateRequiredGateEnvironment(jobId, workflowJob, runSteps, errors) {
     runSteps.length !== 1 ||
     !commandEnvironment ||
     !sameMembers(Object.keys(commandEnvironment), allowedCommandNames) ||
-    !Object.entries(expected).every(
+    !Object.entries({ ...expected, ...requiredStartupEnvironment }).every(
       ([name, value]) => commandEnvironment[name] === value,
     )
   ) {
@@ -506,10 +512,10 @@ export function validateCiReachability({ root, map, workflow }) {
       }
       if (
         unconditionalSteps.length !== 1 ||
-        !sourceIdentityFencePrecedesCommand(workflowJob, unconditionalSteps[0])
+        jobSteps(workflowJob).at(-1) !== unconditionalSteps[0]
       ) {
         errors.push(
-          `required workflow job ${job.id} must verify exact clean source identity immediately before its command`,
+          `required workflow job ${job.id} must run its exact startup-neutralized source fence and Gate as the final step`,
         );
       }
       validateRequiredGateEnvironment(

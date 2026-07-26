@@ -449,10 +449,24 @@ rejects unmapped tests, hidden `skip`/`ignore`, workflow or selector drift,
 conditional required jobs, non-executing command or environment prose, trigger
 drift, weakened coverage reach, incomplete platform reach, and unclassified
 skipped, conditional, ignored, or schedule-only evidence. Required jobs use one
-canonical repository checkout, then immediately before the Gate verify exact
-`GITHUB_SHA` identity and a clean worktree. The Gate step rebinds the required
-tmux executable/profile and fuzz/model case counts so an inherited or persisted
-environment cannot silently downgrade mapped evidence.
+canonical repository checkout, then end in one inline Gate step whose startup
+environment binds `BASH_ENV` and `ENV` to `/dev/null`. That step clears the
+startup variables, common Git repository redirection variables, and Git config
+override channels including counted `GIT_CONFIG_KEY_*` / `GIT_CONFIG_VALUE_*`
+pairs. Both identity commands bind global and system Git configuration to
+`/dev/null`; the worktree check additionally overrides `core.excludesFile`,
+disables `core.fsmonitor`, and disables `core.untrackedCache`. It then uses the
+neutralized `/usr/bin/git` report to verify the worktree state it observes and
+`HEAD` against `${{ github.sha }}`, and immediately execs the existing Gate
+under `/bin/bash --noprofile --norc`. The same final step rebinds the required tmux
+executable/profile and fuzz/model case counts, so a prior step cannot use
+persisted shell startup, counted config, `HOME/.gitconfig`, or
+`XDG_CONFIG_HOME/git/config` state to cross a post-fence runner boundary, hide
+untracked source, or silently downgrade mapped evidence. This boundary does not
+claim hostile-runner, arbitrary-action, background-process, dynamic-loader,
+complete PATH/toolchain, Git metadata or object-store tampering (including
+repository-local excludes and index flags), Windows, or self-hosted-runner
+attestation.
 
 ## Adoption sequence
 

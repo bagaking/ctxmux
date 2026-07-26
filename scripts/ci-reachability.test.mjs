@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -13,6 +14,24 @@ const coverageBase =
   "${{ github.event.pull_request.base.sha || github.event.before }}";
 const coverageComparison =
   "${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}";
+const environmentNeutralizationCommand =
+  'unset BASH_ENV ENV GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM "${!GIT_CONFIG_KEY_@}" "${!GIT_CONFIG_VALUE_@}"';
+const gitCommand =
+  "GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null GIT_CONFIG_NOSYSTEM=1 /usr/bin/git";
+const gitStatusCommand = `${gitCommand} -c core.excludesFile=/dev/null -c core.fsmonitor=false -c core.untrackedCache=false status --porcelain --untracked-files=all`;
+const eventSha = '"${{ github.sha }}"';
+const sourceIdentityCommand =
+  environmentNeutralizationCommand +
+  ` && test "$(${gitCommand} rev-parse HEAD)" = ${eventSha} && test -z "$(${gitStatusCommand})"`;
+
+function gateRun(command) {
+  return `${sourceIdentityCommand} && exec /bin/bash --noprofile --norc ${command}`;
+}
+
+const criticalGateRun = gateRun("scripts/check.sh");
+const coverageGateRun = gateRun("scripts/check.sh --coverage");
+const criticalRunLine = `      - run: ${criticalGateRun}`;
+const coverageRunLine = `      - run: ${coverageGateRun}`;
 
 function createFixture(t) {
   const root = fs.mkdtempSync(
@@ -112,14 +131,15 @@ jobs:
       CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}
     steps:
       - uses: actions/checkout@v4
-      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"
-      - run: scripts/check.sh
+      - run: ${criticalGateRun}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_FUZZ_CASES: "512"
           CTXMUX_MODEL_CASES: "8"
           CTXMUX_REQUIRE_TMUX: "1"
           CTXMUX_TMUX_BIN: tmux
           CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}
+          ENV: /dev/null
   coverage:
     runs-on: ubuntu-24.04
     env:
@@ -132,9 +152,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"
-      - run: scripts/check.sh --coverage
+      - run: ${coverageGateRun}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_COVERAGE_BASE: \${{ github.event.pull_request.base.sha || github.event.before }}
           CTXMUX_COVERAGE_CHANGED_LINE_MODE: auto
           CTXMUX_COVERAGE_COMPARISON_MODE: \${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}
@@ -143,6 +163,7 @@ jobs:
           CTXMUX_REQUIRE_TMUX: "1"
           CTXMUX_TMUX_BIN: tmux
           CTXMUX_TMUX_QUALIFICATION: minimum-3.4
+          ENV: /dev/null
 `;
   return { root, map, workflow };
 }
@@ -159,6 +180,203 @@ test("discovers every checked-in Rust, TypeScript, and script test surface", (t)
 test("accepts complete required-job, platform, invariant, and selection reach", (t) => {
   const fixture = createFixture(t);
   assert.deepEqual(validateCiReachability(fixture), []);
+});
+
+test("canonical final steps override persisted shell startup paths", (t) => {
+  const fixture = createFixture(t);
+  const poison =
+    '      - run: echo "BASH_ENV=/tmp/ctxmux-startup-poison" >> "$GITHUB_ENV"';
+  fixture.workflow = fixture.workflow.replace(
+    criticalRunLine,
+    `${poison}\n${criticalRunLine}`,
+  );
+  fixture.workflow = fixture.workflow.replace(
+    coverageRunLine,
+    `${poison}\n${coverageRunLine}`,
+  );
+
+  assert.deepEqual(validateCiReachability(fixture), []);
+});
+
+test("neutralized final step blocks delayed Bash startup mutation", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmux-bash-startup-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const hook = path.join(root, "bash-env.sh");
+  const marker = path.join(root, "first-shell-complete");
+  const mutation = path.join(root, "mutation-observed");
+  fs.writeFileSync(
+    hook,
+    `if [[ -e "$CTXMUX_STARTUP_MARKER" ]]; then
+  export CTXMUX_FUZZ_CASES=1
+  : > "$CTXMUX_STARTUP_MUTATION"
+else
+  : > "$CTXMUX_STARTUP_MARKER"
+fi
+`,
+  );
+  const poisonedEnvironment = {
+    ...process.env,
+    BASH_ENV: hook,
+    CTXMUX_FUZZ_CASES: "512",
+    CTXMUX_STARTUP_MARKER: marker,
+    CTXMUX_STARTUP_MUTATION: mutation,
+  };
+  const observeDepth = 'printf %s "$CTXMUX_FUZZ_CASES"';
+  const finalStepBody = `${environmentNeutralizationCommand} && exec /bin/bash --noprofile --norc -c 'printf %s "$CTXMUX_FUZZ_CASES"'`;
+  const bash = (body, environment) =>
+    execFileSync("/bin/bash", ["-e", "-c", body], {
+      encoding: "utf8",
+      env: environment,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+  assert.equal(bash(observeDepth, poisonedEnvironment), "512");
+  assert.equal(fs.existsSync(mutation), false);
+  assert.equal(bash(observeDepth, poisonedEnvironment), "1");
+  assert.equal(fs.existsSync(mutation), true);
+
+  fs.rmSync(mutation);
+  assert.equal(bash(finalStepBody, poisonedEnvironment), "1");
+  assert.equal(fs.existsSync(mutation), true);
+
+  fs.rmSync(mutation);
+  const neutralizedEnvironment = {
+    ...poisonedEnvironment,
+    BASH_ENV: "/dev/null",
+    ENV: "/dev/null",
+    CTXMUX_FUZZ_CASES: "512",
+  };
+  assert.equal(bash(finalStepBody, neutralizedEnvironment), "512");
+  assert.equal(fs.existsSync(mutation), false);
+});
+
+test("neutralized final step restores Git status hidden by config environment", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmux-git-config-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, "repo");
+  const excludes = path.join(root, "ignore-all");
+  fs.mkdirSync(repo);
+  fs.writeFileSync(excludes, "*\n");
+  fs.writeFileSync(path.join(repo, "untracked.txt"), "must remain visible\n");
+  execFileSync("/usr/bin/git", ["init", "--quiet"], { cwd: repo });
+  const statusArguments = ["status", "--porcelain", "--untracked-files=all"];
+  const status = (environment) =>
+    execFileSync("/usr/bin/git", statusArguments, {
+      cwd: repo,
+      encoding: "utf8",
+      env: environment,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  const ordinary = status(process.env);
+  assert.match(ordinary, /^\?\? untracked\.txt$/mu);
+
+  const poisonedEnvironment = {
+    ...process.env,
+    GIT_CONFIG_COUNT: "1",
+    GIT_CONFIG_KEY_0: "core.excludesFile",
+    GIT_CONFIG_KEY_17: "unused.extra.key",
+    GIT_CONFIG_VALUE_0: excludes,
+    GIT_CONFIG_VALUE_17: "unused",
+  };
+  assert.equal(status(poisonedEnvironment), "");
+
+  const nestedStatusProbe =
+    environmentNeutralizationCommand +
+    " && exec /bin/bash --noprofile --norc -c 'test -z \"${GIT_CONFIG_COUNT+x}${GIT_CONFIG_KEY_0+x}${GIT_CONFIG_KEY_17+x}${GIT_CONFIG_VALUE_0+x}${GIT_CONFIG_VALUE_17+x}\" && /usr/bin/git status --porcelain --untracked-files=all'";
+  const restored = execFileSync(
+    "/bin/bash",
+    ["--noprofile", "--norc", "-e", "-c", nestedStatusProbe],
+    {
+      cwd: repo,
+      encoding: "utf8",
+      env: poisonedEnvironment,
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  assert.equal(restored, ordinary);
+});
+
+test("safe identity Git ignores HOME and XDG global excludes", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "ctxmux-git-home-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const repo = path.join(root, "repo");
+  const excludes = path.join(root, "ignore-all");
+  const cleanHome = path.join(root, "clean-home");
+  const cleanXdg = path.join(root, "clean-xdg");
+  const poisonedHome = path.join(root, "poisoned-home");
+  const poisonedXdg = path.join(root, "poisoned-xdg");
+  for (const directory of [
+    repo,
+    cleanHome,
+    cleanXdg,
+    poisonedHome,
+    path.join(poisonedXdg, "git"),
+  ]) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
+  fs.writeFileSync(excludes, "*\n");
+  const globalConfig = `[core]\n\texcludesFile = ${excludes}\n`;
+  fs.writeFileSync(path.join(poisonedHome, ".gitconfig"), globalConfig);
+  fs.writeFileSync(path.join(poisonedXdg, "git", "config"), globalConfig);
+  fs.writeFileSync(path.join(repo, "untracked.txt"), "must remain visible\n");
+  execFileSync("/usr/bin/git", ["init", "--quiet"], { cwd: repo });
+  const cleanEnvironment = {
+    ...process.env,
+    HOME: cleanHome,
+    XDG_CONFIG_HOME: cleanXdg,
+  };
+  const runStatus = (body, environment) =>
+    execFileSync("/bin/bash", ["--noprofile", "--norc", "-e", "-c", body], {
+      cwd: repo,
+      encoding: "utf8",
+      env: environment,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  const ordinary = runStatus(
+    "/usr/bin/git status --porcelain --untracked-files=all",
+    cleanEnvironment,
+  );
+  assert.match(ordinary, /^\?\? untracked\.txt$/mu);
+
+  const cases = [
+    {
+      label: "HOME/.gitconfig",
+      environment: { ...cleanEnvironment, HOME: poisonedHome },
+    },
+    {
+      label: "XDG_CONFIG_HOME/git/config",
+      environment: {
+        ...cleanEnvironment,
+        XDG_CONFIG_HOME: poisonedXdg,
+      },
+    },
+  ];
+  for (const fixtureCase of cases) {
+    assert.equal(
+      runStatus(
+        "/usr/bin/git status --porcelain --untracked-files=all",
+        fixtureCase.environment,
+      ),
+      "",
+      fixtureCase.label,
+    );
+    assert.equal(
+      runStatus(
+        `${environmentNeutralizationCommand} && /usr/bin/git status --porcelain --untracked-files=all`,
+        fixtureCase.environment,
+      ),
+      "",
+      `${fixtureCase.label} bypasses unset-only neutralization`,
+    );
+    assert.equal(
+      runStatus(
+        `${environmentNeutralizationCommand} && ${gitStatusCommand}`,
+        fixtureCase.environment,
+      ),
+      ordinary,
+      `${fixtureCase.label} is ignored by safe identity Git`,
+    );
+  }
 });
 
 test("rejects unmapped and skipped critical tests", (t) => {
@@ -303,24 +521,186 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       expected: "must have one prior unconditional full-history checkout",
     },
     {
-      label: "source identity fence must be immediately before the Gate",
+      label: "source identity fence and Gate cannot be split across steps",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: git checkout HEAD^\n      - run: scripts/check.sh --coverage",
+          coverageRunLine,
+          `      - run: ${sourceIdentityCommand}
+      - run: exec /bin/bash --noprofile --norc scripts/check.sh --coverage`,
         );
       },
-      expected: "must verify exact clean source identity immediately before",
+      expected:
+        "must run its exact startup-neutralized source fence and Gate as the final step",
+    },
+    {
+      label: "critical source identity fence and Gate cannot be split",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          criticalRunLine,
+          `      - run: ${sourceIdentityCommand}
+      - run: exec /bin/bash --noprofile --norc scripts/check.sh`,
+        );
+      },
+      expected:
+        "required workflow job critical must run its exact startup-neutralized source fence and Gate as the final step",
     },
     {
       label: "source identity fence must check both HEAD and worktree",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          'test "$(git rev-parse HEAD)" = "$GITHUB_SHA" && test -z "$(git status --porcelain --untracked-files=all)"',
-          'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(
+            ` && test -z "$(${gitStatusCommand})"`,
+            "",
+          )}`,
         );
       },
-      expected: "must verify exact clean source identity immediately before",
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "critical Gate requires BASH_ENV at step scope",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          `${criticalRunLine}\n        env:\n          BASH_ENV: /dev/null\n`,
+          `${criticalRunLine}\n        env:\n`,
+        );
+      },
+      expected:
+        "required workflow job critical must bind the canonical Gate environment to its command step",
+    },
+    {
+      label: "critical Gate rejects a changed ENV startup path",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          "          CTXMUX_TMUX_QUALIFICATION: ${{ matrix.tmux_lane }}\n          ENV: /dev/null",
+          "          CTXMUX_TMUX_QUALIFICATION: ${{ matrix.tmux_lane }}\n          ENV: /tmp/poison",
+        );
+      },
+      expected:
+        "required workflow job critical must bind the canonical Gate environment to its command step",
+    },
+    {
+      label: "coverage Gate rejects a changed BASH_ENV startup path",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          `${coverageRunLine}\n        env:\n          BASH_ENV: /dev/null`,
+          `${coverageRunLine}\n        env:\n          BASH_ENV: /tmp/poison`,
+        );
+      },
+      expected:
+        "required workflow job coverage must bind the canonical Gate environment to its command step",
+    },
+    {
+      label: "coverage Gate requires ENV at step scope",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          "          CTXMUX_TMUX_QUALIFICATION: minimum-3.4\n          ENV: /dev/null\n",
+          "          CTXMUX_TMUX_QUALIFICATION: minimum-3.4\n",
+        );
+      },
+      expected:
+        "required workflow job coverage must bind the canonical Gate environment to its command step",
+    },
+    {
+      label: "source identity fence must unset Git redirection variables",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(" GIT_COMMON_DIR", "")}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "source identity fence must unset GIT_CONFIG_COUNT",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(" GIT_CONFIG_COUNT", "")}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "source identity fence must unset GIT_CONFIG_PARAMETERS",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(
+            " GIT_CONFIG_PARAMETERS",
+            "",
+          )}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    ...[
+      ["global config path", "GIT_CONFIG_GLOBAL=/dev/null "],
+      ["system config path", "GIT_CONFIG_SYSTEM=/dev/null "],
+      ["system config suppression", "GIT_CONFIG_NOSYSTEM=1 "],
+      ["excludes override", "-c core.excludesFile=/dev/null "],
+      ["fsmonitor override", "-c core.fsmonitor=false "],
+      ["untracked-cache override", "-c core.untrackedCache=false "],
+    ].map(([label, binding]) => ({
+      label: `safe identity Git requires its ${label}`,
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(binding, "")}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    })),
+    {
+      label: "source identity fence must use platform Git",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replaceAll("/usr/bin/git", "git")}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "source identity fence must use the workflow event SHA",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          `      - run: ${coverageGateRun.replace(
+            '"${{ github.sha }}"',
+            '"$GITHUB_SHA"',
+          )}`,
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "required Gate must remain the final workflow step",
+      mutate(fixture) {
+        fixture.workflow += "      - run: echo after-gate\n";
+      },
+      expected:
+        "must run its exact startup-neutralized source fence and Gate as the final step",
+    },
+    {
+      label: "repository helper cannot self-verify the required Gate",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          coverageRunLine,
+          "      - run: scripts/ci-gate-helper.sh --coverage",
+        );
+      },
+      expected: "does not run scripts/check.sh --coverage",
+    },
+    {
+      label: "repository helper cannot self-verify the critical Gate",
+      mutate(fixture) {
+        fixture.workflow = fixture.workflow.replace(
+          criticalRunLine,
+          "      - run: scripts/ci-gate-helper.sh",
+        );
+      },
+      expected: "workflow job critical does not run scripts/check.sh",
     },
     {
       label: "critical matrix cannot weaken the minimum tmux lane",
@@ -346,8 +726,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "command environment cannot disable required tmux",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          `      - run: scripts/check.sh --coverage
+          `${coverageRunLine}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_COVERAGE_BASE: \${{ github.event.pull_request.base.sha || github.event.before }}
           CTXMUX_COVERAGE_CHANGED_LINE_MODE: auto
           CTXMUX_COVERAGE_COMPARISON_MODE: \${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}
@@ -355,9 +736,11 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
           CTXMUX_MODEL_CASES: "8"
           CTXMUX_REQUIRE_TMUX: "1"
           CTXMUX_TMUX_BIN: tmux
-          CTXMUX_TMUX_QUALIFICATION: minimum-3.4`,
-          `      - run: scripts/check.sh --coverage
+          CTXMUX_TMUX_QUALIFICATION: minimum-3.4
+          ENV: /dev/null`,
+          `${coverageRunLine}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_COVERAGE_BASE: \${{ github.event.pull_request.base.sha || github.event.before }}
           CTXMUX_COVERAGE_CHANGED_LINE_MODE: auto
           CTXMUX_COVERAGE_COMPARISON_MODE: \${{ github.event_name == 'pull_request' && 'merge-base' || 'direct' }}
@@ -365,7 +748,8 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
           CTXMUX_MODEL_CASES: "8"
           CTXMUX_REQUIRE_TMUX: "0"
           CTXMUX_TMUX_BIN: missing-tmux
-          CTXMUX_TMUX_QUALIFICATION: optional`,
+          CTXMUX_TMUX_QUALIFICATION: optional
+          ENV: /dev/null`,
         );
       },
       expected: "must bind the canonical Gate environment to its command step",
@@ -374,20 +758,24 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "command environment cannot reduce fuzz and model depth",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          `      - run: scripts/check.sh
+          `${criticalRunLine}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_FUZZ_CASES: "512"
           CTXMUX_MODEL_CASES: "8"
           CTXMUX_REQUIRE_TMUX: "1"
           CTXMUX_TMUX_BIN: tmux
-          CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}`,
-          `      - run: scripts/check.sh
+          CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}
+          ENV: /dev/null`,
+          `${criticalRunLine}
         env:
+          BASH_ENV: /dev/null
           CTXMUX_FUZZ_CASES: "1"
           CTXMUX_MODEL_CASES: "1"
           CTXMUX_REQUIRE_TMUX: "1"
           CTXMUX_TMUX_BIN: tmux
-          CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}`,
+          CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}
+          ENV: /dev/null`,
         );
       },
       expected: "must bind the canonical Gate environment to its command step",
@@ -502,8 +890,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "coverage command condition",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - if: false\n        run: scripts/check.sh --coverage",
+          coverageRunLine,
+          `      - if: false
+        run: ${coverageGateRun}`,
         );
       },
       expected: "must not conditionally skip its command",
@@ -512,8 +901,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "quoted coverage command condition",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          '      - "if": false\n        run: scripts/check.sh --coverage',
+          coverageRunLine,
+          `      - "if": false
+        run: ${coverageGateRun}`,
         );
       },
       expected: "must not conditionally skip its command",
@@ -522,7 +912,7 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "coverage prose and checkout env do not prove execution",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
+          coverageRunLine,
           "      - name: scripts/check.sh --coverage\n        run: echo coverage-not-executed",
         );
       },
@@ -534,8 +924,8 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
         fixture.map.jobs.find(({ id }) => id === "coverage").command =
           "echo coverage";
         fixture.workflow = fixture.workflow.replace(
-          "run: scripts/check.sh --coverage",
-          "run: echo coverage",
+          coverageRunLine,
+          `      - run: ${gateRun("echo coverage")}`,
         );
       },
       expected:
@@ -545,8 +935,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "coverage command cannot select a custom shell",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: scripts/check.sh --coverage\n        shell: bash {0}",
+          coverageRunLine,
+          `${coverageRunLine}
+        shell: bash {0}`,
         );
       },
       expected: "must use default shell and working directory",
@@ -555,8 +946,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "Unicode-escaped shell key is normalized",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          '      - run: scripts/check.sh --coverage\n        "\\u0073hell": bash {0}',
+          coverageRunLine,
+          `${coverageRunLine}
+        "\\u0073hell": bash {0}`,
         );
       },
       expected: "must use default shell and working directory",
@@ -565,8 +957,9 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
       label: "coverage command cannot select a working directory",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: scripts/check.sh --coverage\n        working-directory: scripts",
+          coverageRunLine,
+          `${coverageRunLine}
+        working-directory: scripts`,
         );
       },
       expected: "must use default shell and working directory",
@@ -649,8 +1042,9 @@ ${fixture.workflow.slice(insertion)}`;
       label: "required command cannot continue on error",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: scripts/check.sh --coverage\n        continue-on-error: true",
+          coverageRunLine,
+          `${coverageRunLine}
+        continue-on-error: true`,
         );
       },
       expected: "must not continue on error",
@@ -659,8 +1053,9 @@ ${fixture.workflow.slice(insertion)}`;
       label: "quoted continue-on-error key cannot wash the command green",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          '      - run: scripts/check.sh --coverage\n        "continue-on-error": true',
+          coverageRunLine,
+          `${coverageRunLine}
+        "continue-on-error": true`,
         );
       },
       expected: "must not continue on error",
@@ -669,8 +1064,9 @@ ${fixture.workflow.slice(insertion)}`;
       label: "Unicode-escaped continue-on-error key is normalized",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          '      - run: scripts/check.sh --coverage\n        "continue-on-\\u0065rror": false',
+          coverageRunLine,
+          `${coverageRunLine}
+        "continue-on-\\u0065rror": false`,
         );
       },
       expected: "must not continue on error",
@@ -679,8 +1075,9 @@ ${fixture.workflow.slice(insertion)}`;
       label: "dynamic continue-on-error cannot wash the command green",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: scripts/check.sh --coverage\n        continue-on-error: ${{ true }}",
+          coverageRunLine,
+          `${coverageRunLine}
+        continue-on-error: \${{ true }}`,
         );
       },
       expected: "must not continue on error",
@@ -699,8 +1096,9 @@ ${fixture.workflow.slice(insertion)}`;
       label: "duplicate YAML keys fail before reachability evaluation",
       mutate(fixture) {
         fixture.workflow = fixture.workflow.replace(
-          "      - run: scripts/check.sh --coverage",
-          "      - run: scripts/check.sh --coverage\n        run: echo duplicate",
+          coverageRunLine,
+          `${coverageRunLine}
+        run: echo duplicate`,
         );
       },
       expected: "workflow YAML parse failed",
