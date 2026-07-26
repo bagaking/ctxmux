@@ -1696,14 +1696,37 @@ async fn pane_id_reuse_in_a_new_server_epoch_invalidates_the_import_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replacement_tmux_socket_path_invalidates_the_import_identity() {
     let fake = FakeTmuxControl::create();
+    fake.hold_stdout_open_after_control_exit();
     let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
     let client = daemon.client();
     let run = import_fake_pane(&client, &fake).await;
+    let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
     let control_pid = fake.control_pid();
+    let descendant_pids = fake.descendant_pids(1);
 
     let _replacement_listener = fake.replace_socket_path();
-    wait_for_interruption(&client, run.id, InterruptionReason::TmuxTargetChanged).await;
     assert_process_exits(control_pid);
+    assert!(
+        descendant_pids.iter().all(|pid| process_exists(*pid)),
+        "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+    );
+    fake.terminate_descendants();
+    assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
+    assert_eq!(
+        next_event_with_timeout(&mut attachment)
+            .await
+            .expect("read target-change interruption event"),
+        Some(RunEvent::Interrupted {
+            reason: InterruptionReason::TmuxTargetChanged,
+        })
+    );
+    assert_eq!(
+        next_event_with_timeout(&mut attachment)
+            .await
+            .expect("target change closes after one interruption event"),
+        None
+    );
+    wait_for_interruption(&client, run.id, InterruptionReason::TmuxTargetChanged).await;
     daemon.shutdown_clean();
 }
 
@@ -1764,15 +1787,31 @@ async fn bootstrap_must_be_unique_successful_and_empty() {
 async fn open_command_block_before_readiness_rejects_import_with_transcript_detail() {
     let fake = FakeTmuxControl::create();
     fake.set_control_startup_mode("open-block-eof");
+    fake.hold_stdout_open_after_control_exit();
     let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
     let client = daemon.client();
     let (_, panes) = client
         .discover_tmux(fake.socket_string())
         .await
         .expect("discover fake pane before truncated bootstrap");
-    match client
-        .import_tmux(fake.socket_string(), &panes[0].pane_id)
+    let import_client = client.clone();
+    let socket_path = fake.socket_string();
+    let pane_id = panes[0].pane_id.clone();
+    let import =
+        tokio::spawn(async move { import_client.import_tmux(socket_path, &pane_id).await });
+    let control_pid = fake.control_pid();
+    let descendant_pids = fake.descendant_pids(1);
+    assert_process_exits(control_pid);
+    assert!(
+        descendant_pids.iter().all(|pid| process_exists(*pid)),
+        "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+    );
+    fake.terminate_descendants();
+    assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
+
+    match import
         .await
+        .expect("join truncated-bootstrap import")
         .expect_err("truncated bootstrap must reject import")
     {
         ClientError::Protocol { code, message } => {
@@ -1809,11 +1848,21 @@ async fn control_eof_distinguishes_server_loss_from_an_open_command_block() {
         ("open-block-eof", InterruptionReason::TmuxProtocolError),
     ] {
         let fake = FakeTmuxControl::create();
+        fake.hold_stdout_open_after_control_exit();
         let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
         let client = daemon.client();
         let run = import_fake_pane(&client, &fake).await;
         let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
+        let control_pid = fake.control_pid();
+        let descendant_pids = fake.descendant_pids(1);
         fake.trigger_control(trigger);
+        assert_process_exits(control_pid);
+        assert!(
+            descendant_pids.iter().all(|pid| process_exists(*pid)),
+            "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+        );
+        fake.terminate_descendants();
+        assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
         assert_eq!(
             next_event_with_timeout(&mut attachment)
                 .await

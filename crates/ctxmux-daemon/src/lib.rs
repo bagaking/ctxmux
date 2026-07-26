@@ -800,11 +800,35 @@ enum TmuxCommandResultKind {
 
 enum TmuxControlCommand {
     Interrupt(InterruptionReason),
+    ReaderTerminated,
     Shutdown,
 }
 
-struct TmuxWaitOutcome {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxTermination {
+    error: ProtocolError,
     reason: InterruptionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxReaderTermination {
+    failure: TmuxTermination,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TmuxWaitCause {
+    ReaderTerminated,
+    Interrupted(InterruptionReason),
+    Shutdown,
+    CommandChannelClosed,
+    SocketTargetChanged,
+    ProbeWriteFailed(String),
+    ChildExited,
+    ChildStatusFailed(String),
+}
+
+struct TmuxWaitOutcome {
+    cause: TmuxWaitCause,
     cleanup: Result<(), String>,
 }
 
@@ -999,8 +1023,11 @@ impl Run {
         thread::Builder::new()
             .name(format!("ctxmux-tmux-output-{}", run.id))
             .spawn(move || {
-                read_tmux_output(&output_run, stdout, &output_target, &output_ready);
-                let _ = output_done_tx.send(());
+                let termination =
+                    read_tmux_output(&output_run, stdout, &output_target, &output_ready);
+                if output_done_tx.send(termination).is_ok() {
+                    output_run.notify_tmux_reader_terminated();
+                }
             })
             .map_err(|error| backend_protocol_error("start tmux output reader", error))?;
 
@@ -1021,29 +1048,14 @@ impl Run {
                     &wait_target,
                     socket_identity,
                 );
-                let _ = wait_ready.try_send(Err(ProtocolError::new(
-                    ErrorCode::BackendUnavailable,
-                    format!("tmux Control Mode client {control_pid} exited before import"),
-                )));
-                let cleanup = match output_done_rx.recv_timeout(TMUX_OUTPUT_DRAIN_TIMEOUT) {
-                    Ok(()) => outcome.cleanup,
-                    Err(mpsc::RecvTimeoutError::Timeout) => combine_cleanup_failure(
-                        outcome.cleanup,
-                        "tmux output reader did not finish during shutdown",
-                    ),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => combine_cleanup_failure(
-                        outcome.cleanup,
-                        "tmux output reader ended without a completion receipt",
-                    ),
-                };
-                let state = RunState::Interrupted {
-                    reason: outcome.reason,
-                };
-                *mutex_lock(&wait_run.state) = state;
-                let _ = wait_run.events.send(RunEvent::Interrupted {
-                    reason: outcome.reason,
-                });
-                let _ = completion_tx.send(cleanup);
+                complete_tmux_control(
+                    &wait_run,
+                    outcome,
+                    &output_done_rx,
+                    &wait_ready,
+                    &completion_tx,
+                    control_pid,
+                );
             })
             .map_err(|error| backend_protocol_error("start tmux control waiter", error))?;
         let child = pending.take_child();
@@ -1300,6 +1312,12 @@ impl Run {
         }
     }
 
+    fn notify_tmux_reader_terminated(&self) {
+        if let Some(RunControl::Tmux(control)) = &self.live {
+            let _ = control.commands.send(TmuxControlCommand::ReaderTerminated);
+        }
+    }
+
     fn wait_for_tmux_completion(&self, timeout: Duration) -> Result<(), String> {
         let Some(RunControl::Tmux(control)) = &self.live else {
             return Ok(());
@@ -1392,13 +1410,25 @@ fn wait_for_tmux_control(
         match commands.recv_timeout(CHILD_CONTROL_POLL) {
             Ok(TmuxControlCommand::Interrupt(reason)) => {
                 return TmuxWaitOutcome {
-                    reason,
+                    cause: TmuxWaitCause::Interrupted(reason),
                     cleanup: terminate_tmux_control_child(child),
                 };
             }
-            Ok(TmuxControlCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(TmuxControlCommand::ReaderTerminated) => {
                 return TmuxWaitOutcome {
-                    reason: InterruptionReason::TmuxServerUnavailable,
+                    cause: TmuxWaitCause::ReaderTerminated,
+                    cleanup: terminate_tmux_control_child(child),
+                };
+            }
+            Ok(TmuxControlCommand::Shutdown) => {
+                return TmuxWaitOutcome {
+                    cause: TmuxWaitCause::Shutdown,
+                    cleanup: terminate_tmux_control_child(child),
+                };
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return TmuxWaitOutcome {
+                    cause: TmuxWaitCause::CommandChannelClosed,
                     cleanup: terminate_tmux_control_child(child),
                 };
             }
@@ -1407,14 +1437,14 @@ fn wait_for_tmux_control(
         if Instant::now() >= next_target_poll {
             if !tmux::socket_identity_matches(&target.socket_path, socket_identity) {
                 return TmuxWaitOutcome {
-                    reason: InterruptionReason::TmuxTargetChanged,
+                    cause: TmuxWaitCause::SocketTargetChanged,
                     cleanup: terminate_tmux_control_child(child),
                 };
             }
             let command = tmux::target_probe_command(&target.pane_id);
-            if run.write_tmux_periodic_probe(command.as_bytes()).is_err() {
+            if let Err(error) = run.write_tmux_periodic_probe(command.as_bytes()) {
                 return TmuxWaitOutcome {
-                    reason: InterruptionReason::TmuxServerUnavailable,
+                    cause: TmuxWaitCause::ProbeWriteFailed(error.to_string()),
                     cleanup: terminate_tmux_control_child(child),
                 };
             }
@@ -1423,14 +1453,14 @@ fn wait_for_tmux_control(
         match child.try_wait() {
             Ok(Some(_)) => {
                 return TmuxWaitOutcome {
-                    reason: InterruptionReason::TmuxServerUnavailable,
+                    cause: TmuxWaitCause::ChildExited,
                     cleanup: Ok(()),
                 };
             }
             Ok(None) => {}
             Err(error) => {
                 return TmuxWaitOutcome {
-                    reason: InterruptionReason::TmuxServerUnavailable,
+                    cause: TmuxWaitCause::ChildStatusFailed(error.to_string()),
                     cleanup: combine_cleanup_failure(
                         terminate_tmux_control_child(child),
                         &format!("failed to query tmux Control Mode client status: {error}"),
@@ -1438,6 +1468,115 @@ fn wait_for_tmux_control(
                 };
             }
         }
+    }
+}
+
+fn complete_tmux_control(
+    run: &Run,
+    outcome: TmuxWaitOutcome,
+    output_done: &mpsc::Receiver<TmuxReaderTermination>,
+    ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
+    completion: &mpsc::SyncSender<Result<(), String>>,
+    control_pid: u32,
+) {
+    let (reader_termination, cleanup) = match output_done.recv_timeout(TMUX_OUTPUT_DRAIN_TIMEOUT) {
+        Ok(termination) => (Some(termination), outcome.cleanup),
+        Err(mpsc::RecvTimeoutError::Timeout) => (
+            None,
+            combine_cleanup_failure(
+                outcome.cleanup,
+                "tmux output reader did not finish during shutdown",
+            ),
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => (
+            None,
+            combine_cleanup_failure(
+                outcome.cleanup,
+                "tmux output reader ended without a completion receipt",
+            ),
+        ),
+    };
+    let termination = resolve_tmux_termination(outcome.cause, reader_termination, control_pid);
+    let _ = ready.try_send(Err(termination.error));
+    *mutex_lock(&run.state) = RunState::Interrupted {
+        reason: termination.reason,
+    };
+    let _ = run.events.send(RunEvent::Interrupted {
+        reason: termination.reason,
+    });
+    let _ = completion.send(cleanup);
+}
+
+fn resolve_tmux_termination(
+    cause: TmuxWaitCause,
+    reader: Option<TmuxReaderTermination>,
+    control_pid: u32,
+) -> TmuxTermination {
+    match cause {
+        cause @ (TmuxWaitCause::ReaderTerminated | TmuxWaitCause::ChildExited) => reader
+            .map_or_else(
+                || fallback_tmux_termination(cause, control_pid),
+                |termination| termination.failure,
+            ),
+        cause => fallback_tmux_termination(cause, control_pid),
+    }
+}
+
+fn fallback_tmux_termination(cause: TmuxWaitCause, control_pid: u32) -> TmuxTermination {
+    let (code, message, reason) = match cause {
+        TmuxWaitCause::ReaderTerminated => (
+            ErrorCode::BackendUnavailable,
+            "tmux output reader ended without a termination receipt".to_owned(),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+        TmuxWaitCause::Interrupted(reason) => (
+            interruption_error_code(reason),
+            "tmux Control Mode client was interrupted".to_owned(),
+            reason,
+        ),
+        TmuxWaitCause::Shutdown => (
+            ErrorCode::BackendUnavailable,
+            "tmux Control Mode client stopped during daemon shutdown".to_owned(),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+        TmuxWaitCause::CommandChannelClosed => (
+            ErrorCode::BackendUnavailable,
+            "tmux Control Mode command channel closed".to_owned(),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+        TmuxWaitCause::SocketTargetChanged => (
+            ErrorCode::TargetChanged,
+            "tmux server socket identity changed".to_owned(),
+            InterruptionReason::TmuxTargetChanged,
+        ),
+        TmuxWaitCause::ProbeWriteFailed(error) => (
+            ErrorCode::BackendUnavailable,
+            format!("failed to write tmux target probe: {error}"),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+        TmuxWaitCause::ChildExited => (
+            ErrorCode::BackendUnavailable,
+            format!("tmux Control Mode client {control_pid} exited before import"),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+        TmuxWaitCause::ChildStatusFailed(error) => (
+            ErrorCode::BackendUnavailable,
+            format!("failed to query tmux Control Mode client {control_pid}: {error}"),
+            InterruptionReason::TmuxServerUnavailable,
+        ),
+    };
+    TmuxTermination {
+        error: ProtocolError::new(code, message),
+        reason,
+    }
+}
+
+const fn interruption_error_code(reason: InterruptionReason) -> ErrorCode {
+    match reason {
+        InterruptionReason::TmuxTargetChanged => ErrorCode::TargetChanged,
+        InterruptionReason::DaemonRestart
+        | InterruptionReason::TmuxServerUnavailable
+        | InterruptionReason::TmuxProtocolError => ErrorCode::BackendUnavailable,
     }
 }
 
@@ -1484,18 +1623,16 @@ fn read_tmux_output(
     stdout: std::process::ChildStdout,
     target: &ctxmux_protocol::TmuxPaneInfo,
     ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
-) {
+) -> TmuxReaderTermination {
     let mut reader = io::BufReader::new(stdout);
     let mut parser = ControlParser::default();
     let mut line = Vec::new();
     let mut readiness = TmuxReadiness::default();
-    loop {
+    let failure = loop {
         match tmux::read_bounded_line(&mut reader, &mut line) {
             Ok(BoundedLineRead::Eof) => {
                 if let Err(error) = parser.finish() {
-                    fail_tmux_control(
-                        run,
-                        ready,
+                    break tmux_control_failure(
                         backend_protocol_error("finish tmux Control Mode stream", error),
                         if readiness.ready {
                             InterruptionReason::TmuxProtocolError
@@ -1503,18 +1640,14 @@ fn read_tmux_output(
                             InterruptionReason::TmuxServerUnavailable
                         },
                     );
-                    return;
                 }
-                fail_tmux_control(
-                    run,
-                    ready,
+                break tmux_control_failure(
                     ProtocolError::new(
                         ErrorCode::BackendUnavailable,
                         "tmux Control Mode stream closed",
                     ),
                     InterruptionReason::TmuxServerUnavailable,
                 );
-                return;
             }
             Ok(BoundedLineRead::Line) => {}
             Err(error) => {
@@ -1523,13 +1656,10 @@ fn read_tmux_output(
                 } else {
                     InterruptionReason::TmuxServerUnavailable
                 };
-                fail_tmux_control(
-                    run,
-                    ready,
+                break tmux_control_failure(
                     backend_protocol_error("read tmux Control Mode stream", &error),
                     reason,
                 );
-                return;
             }
         }
         let item = match parser.parse_line(&line) {
@@ -1540,22 +1670,20 @@ fn read_tmux_output(
                 } else {
                     InterruptionReason::TmuxServerUnavailable
                 };
-                fail_tmux_control(
-                    run,
-                    ready,
+                break tmux_control_failure(
                     backend_protocol_error("parse tmux Control Mode stream", &error),
                     reason,
                 );
-                return;
             }
         };
         let Some(item) = item else {
             continue;
         };
-        if !handle_tmux_control_item(run, target, ready, &mut readiness, item) {
-            return;
+        if let Err(failure) = handle_tmux_control_item(run, target, ready, &mut readiness, item) {
+            break failure;
         }
-    }
+    };
+    TmuxReaderTermination { failure }
 }
 
 #[derive(Default)]
@@ -1569,7 +1697,7 @@ fn handle_tmux_control_item(
     ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
     readiness: &mut TmuxReadiness,
     item: ControlItem,
-) -> bool {
+) -> Result<(), TmuxTermination> {
     match item {
         ControlItem::Output { pane_id, data, .. } if pane_id == target.pane_id => {
             run.record_output(data);
@@ -1577,24 +1705,20 @@ fn handle_tmux_control_item(
         ControlItem::SessionChanged { session_id } if session_id == target.session_id => {
             let command = tmux::target_probe_command(&target.pane_id);
             if let Err(error) = run.establish_tmux_session(command.as_bytes()) {
-                return fail_tmux_control(
-                    run,
-                    ready,
+                return Err(tmux_control_failure(
                     backend_protocol_error("write initial tmux target probe", error),
                     InterruptionReason::TmuxServerUnavailable,
-                );
+                ));
             }
         }
         ControlItem::SessionChanged { .. } => {
-            return fail_tmux_control(
-                run,
-                ready,
+            return Err(tmux_control_failure(
                 ProtocolError::new(
                     ErrorCode::TargetChanged,
                     "tmux Control Mode client attached to a different session",
                 ),
                 InterruptionReason::TmuxTargetChanged,
-            );
+            ));
         }
         ControlItem::CommandResult {
             number,
@@ -1611,8 +1735,13 @@ fn handle_tmux_control_item(
             });
         }
         ControlItem::WindowClosed { window_id } if window_id == target.window_id => {
-            run.interrupt_tmux(InterruptionReason::TmuxTargetChanged);
-            return false;
+            return Err(tmux_control_failure(
+                ProtocolError::new(
+                    ErrorCode::TargetChanged,
+                    format!("tmux target window {window_id} closed"),
+                ),
+                InterruptionReason::TmuxTargetChanged,
+            ));
         }
         ControlItem::Paused { pane_id } if pane_id == target.pane_id => {
             let head_seq = run.mark_output_source_gap();
@@ -1621,12 +1750,13 @@ fn handle_tmux_control_item(
             });
             let _ = run.events.send(RunEvent::Gap { head_seq });
             let command = format!("refresh-client -A {pane_id}:continue\n");
-            if run
-                .write_tmux_command(TmuxCommandKind::Continue, command.as_bytes())
-                .is_err()
+            if let Err(error) =
+                run.write_tmux_command(TmuxCommandKind::Continue, command.as_bytes())
             {
-                run.interrupt_tmux(InterruptionReason::TmuxServerUnavailable);
-                return false;
+                return Err(tmux_control_failure(
+                    backend_protocol_error("write tmux continue command", error),
+                    InterruptionReason::TmuxServerUnavailable,
+                ));
             }
         }
         ControlItem::Continued { pane_id } if pane_id == target.pane_id => {
@@ -1635,8 +1765,13 @@ fn handle_tmux_control_item(
             });
         }
         ControlItem::Exit => {
-            run.interrupt_tmux(InterruptionReason::TmuxServerUnavailable);
-            return false;
+            return Err(tmux_control_failure(
+                ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "tmux Control Mode client reported exit",
+                ),
+                InterruptionReason::TmuxServerUnavailable,
+            ));
         }
         ControlItem::Output { .. }
         | ControlItem::Notification
@@ -1645,7 +1780,7 @@ fn handle_tmux_control_item(
         | ControlItem::Paused { .. }
         | ControlItem::Continued { .. } => {}
     }
-    true
+    Ok(())
 }
 
 fn handle_tmux_command_result(
@@ -1656,40 +1791,34 @@ fn handle_tmux_command_result(
     number: u64,
     success: bool,
     output: &[Vec<u8>],
-) -> bool {
+) -> Result<(), TmuxTermination> {
     let result_kind = match run.correlate_tmux_command_result(number) {
         Ok(kind) => kind,
         Err(error) => {
-            return fail_tmux_control(
-                run,
-                ready,
+            return Err(tmux_control_failure(
                 backend_protocol_error("correlate tmux command result", error),
                 if readiness.ready {
                     InterruptionReason::TmuxProtocolError
                 } else {
                     InterruptionReason::TmuxServerUnavailable
                 },
-            );
+            ));
         }
     };
     if result_kind == TmuxCommandResultKind::Bootstrap {
         if success && output.is_empty() {
-            return true;
+            return Ok(());
         }
-        return fail_tmux_control(
-            run,
-            ready,
+        return Err(tmux_control_failure(
             ProtocolError::new(
                 ErrorCode::BackendUnavailable,
                 "tmux Control Mode bootstrap returned an unexpected result",
             ),
             InterruptionReason::TmuxServerUnavailable,
-        );
+        ));
     }
     if !success {
-        return fail_tmux_control(
-            run,
-            ready,
+        return Err(tmux_control_failure(
             ProtocolError::new(
                 ErrorCode::TargetChanged,
                 format!(
@@ -1698,20 +1827,18 @@ fn handle_tmux_command_result(
                 ),
             ),
             InterruptionReason::TmuxTargetChanged,
-        );
+        ));
     }
     match result_kind {
         TmuxCommandResultKind::Pending(TmuxCommandKind::TargetProbe) => {
             if output.len() != 1 {
-                return fail_tmux_control(
-                    run,
-                    ready,
+                return Err(tmux_control_failure(
                     ProtocolError::new(
                         ErrorCode::BackendUnavailable,
                         "tmux target probe returned an unexpected output shape",
                     ),
                     InterruptionReason::TmuxProtocolError,
-                );
+                ));
             }
             match tmux::target_identity_matches(target, &output[0]) {
                 Ok(true) => {
@@ -1721,53 +1848,40 @@ fn handle_tmux_command_result(
                     }
                 }
                 Ok(false) => {
-                    return fail_tmux_control(
-                        run,
-                        ready,
+                    return Err(tmux_control_failure(
                         ProtocolError::new(
                             ErrorCode::TargetChanged,
                             "tmux target identity changed after import",
                         ),
                         InterruptionReason::TmuxTargetChanged,
-                    );
+                    ));
                 }
                 Err(error) => {
-                    return fail_tmux_control(
-                        run,
-                        ready,
+                    return Err(tmux_control_failure(
                         backend_protocol_error("parse tmux target probe", error),
                         InterruptionReason::TmuxProtocolError,
-                    );
+                    ));
                 }
             }
         }
         TmuxCommandResultKind::Pending(TmuxCommandKind::Continue) => {
             if !output.is_empty() {
-                return fail_tmux_control(
-                    run,
-                    ready,
+                return Err(tmux_control_failure(
                     ProtocolError::new(
                         ErrorCode::BackendUnavailable,
                         "tmux continue command returned unexpected output",
                     ),
                     InterruptionReason::TmuxProtocolError,
-                );
+                ));
             }
         }
         TmuxCommandResultKind::Bootstrap => unreachable!("bootstrap handled above"),
     }
-    true
+    Ok(())
 }
 
-fn fail_tmux_control(
-    run: &Run,
-    ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
-    error: ProtocolError,
-    reason: InterruptionReason,
-) -> bool {
-    let _ = ready.try_send(Err(error));
-    run.interrupt_tmux(reason);
-    false
+fn tmux_control_failure(error: ProtocolError, reason: InterruptionReason) -> TmuxTermination {
+    TmuxTermination { error, reason }
 }
 
 fn backend_protocol_error(action: &str, error: impl fmt::Display) -> ProtocolError {
@@ -2240,7 +2354,9 @@ mod tests {
     };
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
-    use ctxmux_protocol::{ErrorCode, ForkPlan, RunEvent, RunSpec, TerminalSize};
+    use ctxmux_protocol::{
+        ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunEvent, RunSpec, TerminalSize,
+    };
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
@@ -2248,8 +2364,9 @@ mod tests {
         OutputLog, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
         TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
         TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
-        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, mutex_lock,
-        prepare_socket_path, prepare_socket_path_with_hook, serve_with_manager, spawn_error,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxReaderTermination,
+        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
+        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
     };
 
     #[test]
@@ -2362,6 +2479,92 @@ mod tests {
             ready.correlate_result(0).unwrap_err(),
             "tmux returned a command result without a pending adapter command"
         );
+    }
+
+    #[test]
+    fn tmux_child_exit_resolution_preserves_the_reader_protocol_receipt() {
+        let observed = TmuxTermination {
+            error: ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Control Mode stream ended inside a command block",
+            ),
+            reason: InterruptionReason::TmuxProtocolError,
+        };
+
+        for cause in [TmuxWaitCause::ReaderTerminated, TmuxWaitCause::ChildExited] {
+            assert_eq!(
+                resolve_tmux_termination(
+                    cause,
+                    Some(TmuxReaderTermination {
+                        failure: observed.clone(),
+                    }),
+                    42,
+                ),
+                observed,
+            );
+        }
+    }
+
+    #[test]
+    fn tmux_owner_causes_are_not_overwritten_by_cleanup_eof() {
+        let cleanup_eof = TmuxReaderTermination {
+            failure: TmuxTermination {
+                error: ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "tmux Control Mode stream closed",
+                ),
+                reason: InterruptionReason::TmuxServerUnavailable,
+            },
+        };
+        let cases = [
+            (
+                TmuxWaitCause::Interrupted(InterruptionReason::TmuxTargetChanged),
+                InterruptionReason::TmuxTargetChanged,
+                ErrorCode::TargetChanged,
+                "interrupted",
+            ),
+            (
+                TmuxWaitCause::Shutdown,
+                InterruptionReason::TmuxServerUnavailable,
+                ErrorCode::BackendUnavailable,
+                "shutdown",
+            ),
+            (
+                TmuxWaitCause::CommandChannelClosed,
+                InterruptionReason::TmuxServerUnavailable,
+                ErrorCode::BackendUnavailable,
+                "command channel closed",
+            ),
+            (
+                TmuxWaitCause::SocketTargetChanged,
+                InterruptionReason::TmuxTargetChanged,
+                ErrorCode::TargetChanged,
+                "socket identity changed",
+            ),
+            (
+                TmuxWaitCause::ProbeWriteFailed("broken pipe".to_owned()),
+                InterruptionReason::TmuxServerUnavailable,
+                ErrorCode::BackendUnavailable,
+                "broken pipe",
+            ),
+            (
+                TmuxWaitCause::ChildStatusFailed("fixture status failure".to_owned()),
+                InterruptionReason::TmuxServerUnavailable,
+                ErrorCode::BackendUnavailable,
+                "fixture status failure",
+            ),
+        ];
+
+        for (cause, expected_reason, expected_code, expected_detail) in cases {
+            let resolved = resolve_tmux_termination(cause, Some(cleanup_eof.clone()), 42);
+            assert_eq!(resolved.reason, expected_reason);
+            assert_eq!(resolved.error.code, expected_code);
+            assert!(
+                resolved.error.message.contains(expected_detail),
+                "owner detail was lost: {}",
+                resolved.error.message,
+            );
+        }
     }
 
     #[test]
