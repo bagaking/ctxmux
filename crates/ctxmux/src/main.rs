@@ -94,8 +94,8 @@ async fn run() -> Result<(), String> {
         "stop" => {
             let id = take_run_id(&mut args)?;
             ensure_empty(&args)?;
-            let run = client.stop(id).await.map_err(|error| error.to_string())?;
-            print_run(&run);
+            let accepted = client.stop(id).await.map_err(|error| error.to_string())?;
+            print_run(&accepted.run);
         }
         _ => return Err(format!("unknown command {command:?}\n\n{}", usage())),
     }
@@ -283,7 +283,7 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         take_number(&mut args, "output sequence")?
     };
     ensure_empty(&args)?;
-    let (mut attachment, snapshot) = client
+    let (attachment, snapshot) = client
         .attach(id, after_seq)
         .await
         .map_err(|error| error.to_string())?;
@@ -304,33 +304,18 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
 
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if !interactive {
-        return follow_output(&mut attachment, &mut stdout).await;
+        return follow_output(&attachment, &mut stdout).await;
     }
 
     let input_enabled = snapshot.run.capabilities.input;
-    let initial_size = if snapshot.run.capabilities.resize {
-        let size = current_terminal_size(
-            snapshot
-                .run
-                .spec
-                .as_ref()
-                .map_or(TerminalSize::default(), |spec| spec.size),
-        )?;
-        attachment
-            .resize(size)
-            .await
-            .map_err(|error| error.to_string())?;
-        Some(size)
-    } else {
-        None
-    };
+    let mut applied_size = apply_initial_terminal_size(&attachment, &snapshot.run).await?;
     let _raw_mode = RawModeGuard::enable()?;
     let (input_tx, mut input_rx) = mpsc::channel(16);
     thread::Builder::new()
         .name("ctxmux-terminal-input".to_owned())
         .spawn(move || read_terminal_input(&input_tx))
         .map_err(|error| format!("failed to start terminal input: {error}"))?;
-    let mut resize_signal = initial_size
+    let mut resize_signal = applied_size
         .map(|_| signal(SignalKind::window_change()))
         .transpose()
         .map_err(|error| format!("failed to watch terminal resize: {error}"))?;
@@ -347,10 +332,12 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
             }
             input = input_rx.recv() => {
                 match input {
-                    Some(TerminalInput::Data(data)) if input_enabled => attachment
-                        .input(data)
-                        .await
-                        .map_err(|error| error.to_string())?,
+                    Some(TerminalInput::Data(data)) if input_enabled => {
+                        attachment
+                            .input(data)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
                     Some(TerminalInput::Data(_)) => {}
                     Some(TerminalInput::Detach | TerminalInput::Closed) | None => {
                         return attachment.detach().await.map_err(|error| error.to_string());
@@ -368,19 +355,39 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
                     return Err("terminal resize signal stream closed".to_owned());
                 }
                 let size = current_terminal_size(
-                    initial_size.expect("resize signal exists only with an initial size"),
+                    applied_size.expect("resize signal exists only with an applied size"),
                 )?;
-                attachment
+                let accepted = attachment
                     .resize(size)
                     .await
                     .map_err(|error| error.to_string())?;
+                applied_size = Some(accepted.receipt.applied_size);
             }
         }
     }
 }
 
+async fn apply_initial_terminal_size(
+    attachment: &ctxmux_client::Attachment,
+    run: &RunInfo,
+) -> Result<Option<TerminalSize>, String> {
+    if !run.capabilities.resize {
+        return Ok(None);
+    }
+    let requested = current_terminal_size(
+        run.spec
+            .as_ref()
+            .map_or(TerminalSize::default(), |spec| spec.size),
+    )?;
+    let accepted = attachment
+        .resize(requested)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(Some(accepted.receipt.applied_size))
+}
+
 async fn follow_output(
-    attachment: &mut ctxmux_client::Attachment,
+    attachment: &ctxmux_client::Attachment,
     stdout: &mut io::StdoutLock<'_>,
 ) -> Result<(), String> {
     while let Some(event) = attachment
@@ -405,7 +412,7 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
             Ok(true)
         }
         RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
-        RunEvent::Tmux { .. } | RunEvent::Accepted { .. } => Ok(true),
+        RunEvent::Tmux { .. } => Ok(true),
         RunEvent::Gap { head_seq } => Err(format!(
             "attachment fell behind at output sequence {head_seq}; reattach from the last observed sequence"
         )),

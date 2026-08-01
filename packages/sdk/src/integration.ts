@@ -1,4 +1,5 @@
-import { runEventSource, type CtxmuxClient } from "./client.js";
+import { runEventSource } from "./attachment.js";
+import type { CtxmuxClient } from "./client.js";
 import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
 import type { RunEvent } from "./generated/RunEvent.js";

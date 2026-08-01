@@ -11,13 +11,75 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Maximum UTF-8 byte length of one caller-owned Run creation operation key.
 pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
+
+/// Attachment-local correlation identity for one control command.
+///
+/// The first ID is one and later IDs are strictly greater; gaps are allowed, so
+/// the daemon need retain only the latest structurally valid ID it observed.
+/// IDs are not idempotency keys, replay credentials, or identities that survive
+/// reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, TS)]
+#[serde(transparent)]
+#[ts(type = "number")]
+pub struct AttachmentCommandId(u32);
+
+impl AttachmentCommandId {
+    /// Validate one attachment-local command identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttachmentCommandIdError`] when `value` is zero.
+    pub const fn new(value: u32) -> Result<Self, AttachmentCommandIdError> {
+        if value == 0 {
+            return Err(AttachmentCommandIdError::Zero);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the numeric correlation identity.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for AttachmentCommandId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(u32::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl TryFrom<u32> for AttachmentCommandId {
+    type Error = AttachmentCommandIdError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<AttachmentCommandId> for u32 {
+    fn from(value: AttachmentCommandId) -> Self {
+        value.get()
+    }
+}
+
+/// Invalid attachment-local control correlation identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AttachmentCommandIdError {
+    /// Zero is reserved so every accepted command has a positive identity.
+    #[error("attachment command id must be greater than zero")]
+    Zero,
+}
 
 /// Caller-owned idempotency key for one bounded Run creation operation.
 ///
@@ -330,7 +392,10 @@ pub enum RunState {
 }
 
 impl RunState {
-    /// Whether the Run still accepts control operations.
+    /// Whether terminal lifecycle publication has not occurred yet.
+    ///
+    /// Live-control authority is owned separately by the current daemon
+    /// incarnation and may already be fenced while this still returns true.
     #[must_use]
     pub const fn is_running(&self) -> bool {
         matches!(self, Self::Running)
@@ -384,7 +449,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 4.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 5.
     pub data: Vec<u8>,
 }
 
@@ -469,16 +534,64 @@ pub enum ClientFrame {
     /// One short-lived request.
     Request { request: Request },
     /// Write bytes through a live attachment.
-    Input { data: Vec<u8> },
+    Input {
+        command_id: AttachmentCommandId,
+        data: Vec<u8>,
+    },
     /// Resize through a live attachment.
-    Resize { size: TerminalSize },
+    Resize {
+        command_id: AttachmentCommandId,
+        size: TerminalSize,
+    },
     /// Stop the attached Run.
-    Stop,
+    Stop { command_id: AttachmentCommandId },
     /// Close this attachment without affecting the Run.
     Detach,
 }
 
-/// Successful response to a short-lived request.
+/// Owner-boundary receipt for one accepted Run control operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlReceipt {
+    /// The complete input reached the daemon-owned PTY write boundary.
+    Input { written_bytes: u32 },
+    /// The owning PTY reported this size after the resize attempt.
+    Resize { applied_size: TerminalSize },
+    /// The direct-child control owner accepted the termination request.
+    Stop,
+}
+
+/// Whether a rejected control command may already have crossed its owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandDisposition {
+    /// The command did not cross the operation's mutation boundary.
+    NotApplied,
+    /// The command may have crossed the mutation boundary; callers must not
+    /// infer that retry is safe.
+    Unknown,
+}
+
+/// One correlated control failure and its retry-safety boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct ControlFailure {
+    /// Machine-readable public failure.
+    pub error: ProtocolError,
+    /// Whether the failed command is known not to have been applied.
+    pub disposition: CommandDisposition,
+}
+
+/// Correlated result of one attachment control command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlOutcome {
+    /// The command reached its documented owner boundary.
+    Accepted { receipt: ControlReceipt },
+    /// The command failed with an explicit application disposition.
+    Rejected { failure: ControlFailure },
+}
+
+/// Response to a short-lived request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
@@ -497,8 +610,13 @@ pub enum Response {
     Runs { runs: Vec<RunInfo> },
     /// Current metadata for one Run.
     Status { run: RunInfo },
-    /// A state-changing request was accepted.
-    Accepted { run: RunInfo },
+    /// A short-lived control request reached its documented owner boundary.
+    ControlAccepted {
+        run: RunInfo,
+        receipt: ControlReceipt,
+    },
+    /// A short-lived control request failed with an explicit disposition.
+    ControlRejected { failure: ControlFailure },
 }
 
 /// Snapshot delivered when attachment begins.
@@ -534,8 +652,6 @@ pub enum RunEvent {
     Tmux { event: TmuxRunEvent },
     /// The attachment lagged behind live delivery and should request replay.
     Gap { head_seq: u64 },
-    /// A state-changing attachment command was accepted.
-    Accepted { run: Box<RunInfo> },
 }
 
 /// Observable public-Control-Mode event for one imported tmux pane.
@@ -578,6 +694,8 @@ pub enum ErrorCode {
     TargetChanged,
     /// A retained Run creation key names a different canonical request.
     CreationConflict,
+    /// The bounded live-control path has no capacity for this command.
+    ControlBackpressure,
     /// An unexpected daemon failure occurred.
     Internal,
 }
@@ -608,12 +726,17 @@ impl ProtocolError {
 pub enum ServerFrame {
     /// Successful protocol handshake.
     Hello { protocol: u16 },
-    /// Successful short-lived request response.
+    /// Result of one short-lived request.
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
     Attached { snapshot: AttachedHeader },
     /// Live attachment event.
     Event { event: RunEvent },
+    /// Result of one attachment-local control command.
+    CommandResult {
+        command_id: AttachmentCommandId,
+        outcome: ControlOutcome,
+    },
     /// The daemon acknowledged a clean detach.
     Detached,
     /// Explicit request or lifecycle error.
@@ -747,9 +870,35 @@ impl<'de> Visitor<'de> for RejectDuplicateObjectMembers {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFrame, ClientHello, CreateOperationKey, FrameError, MAX_CREATE_OPERATION_KEY_BYTES,
-        MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId, decode_frame, encode_frame,
+        AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlFailure,
+        ControlOutcome, ControlReceipt, CreateOperationKey, ErrorCode, FrameError,
+        MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Response,
+        RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState, ServerFrame, TerminalSize,
+        decode_frame, encode_frame,
     };
+
+    fn sample_run_info() -> RunInfo {
+        RunInfo {
+            id: RunId::new(),
+            spec: Some(RunSpec {
+                program: "fixture".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            head_seq: 0,
+            durable_head_seq: None,
+            oldest_seq: 0,
+            attachments: 1,
+        }
+    }
 
     fn malformed_protocol_frames() -> Vec<(String, Vec<u8>)> {
         let corpus: serde_json::Value = serde_json::from_str(include_str!(
@@ -812,6 +961,165 @@ mod tests {
         assert!(CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3)).is_ok());
         assert!(
             CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3 + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn attachment_command_ids_enforce_the_u32_nonzero_boundary() {
+        let last = AttachmentCommandId::new(u32::MAX).expect("accept maximum command id");
+        assert!(AttachmentCommandId::new(1).is_ok());
+        assert_eq!(u32::from(last), u32::MAX);
+        assert!(AttachmentCommandId::new(0).is_err());
+        assert!(decode_frame::<AttachmentCommandId>("0").is_err());
+        assert!(decode_frame::<AttachmentCommandId>("4294967296").is_err());
+        assert_eq!(
+            decode_frame::<AttachmentCommandId>(&encode_frame(&last).unwrap()).unwrap(),
+            last
+        );
+        assert!(decode_frame::<ClientFrame>(r#"{"type":"stop","command_id":0}"#).is_err());
+    }
+
+    #[test]
+    fn attachment_control_commands_have_exact_correlated_wire_shapes() {
+        let first = AttachmentCommandId::new(1).unwrap();
+        let later = AttachmentCommandId::new(8).unwrap();
+        assert_eq!(
+            serde_json::to_value(ClientFrame::Input {
+                command_id: first,
+                data: vec![0, 255],
+            })
+            .unwrap(),
+            serde_json::json!({"type": "input", "command_id": 1, "data": [0, 255]})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientFrame::Resize {
+                command_id: later,
+                size: TerminalSize { cols: 90, rows: 30 },
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "resize",
+                "command_id": 8,
+                "size": {"cols": 90, "rows": 30}
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientFrame::Stop { command_id: later }).unwrap(),
+            serde_json::json!({"type": "stop", "command_id": 8})
+        );
+        assert_eq!(
+            serde_json::to_value(ControlReceipt::Stop).unwrap(),
+            serde_json::json!({"type": "stop"})
+        );
+    }
+
+    #[test]
+    fn attachment_control_results_round_trip_separately_from_run_events() {
+        let command_id = AttachmentCommandId::new(7).unwrap();
+        let accepted = ServerFrame::CommandResult {
+            command_id,
+            outcome: ControlOutcome::Accepted {
+                receipt: ControlReceipt::Resize {
+                    applied_size: TerminalSize {
+                        cols: 132,
+                        rows: 43,
+                    },
+                },
+            },
+        };
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encode_frame(&accepted).unwrap()).unwrap(),
+            accepted
+        );
+        assert_eq!(
+            serde_json::to_value(&accepted).unwrap(),
+            serde_json::json!({
+                "type": "command_result",
+                "command_id": 7,
+                "outcome": {
+                    "type": "accepted",
+                    "receipt": {
+                        "type": "resize",
+                        "applied_size": {"cols": 132, "rows": 43}
+                    }
+                }
+            })
+        );
+
+        let rejected = ServerFrame::CommandResult {
+            command_id,
+            outcome: ControlOutcome::Rejected {
+                failure: ControlFailure {
+                    error: ProtocolError::new(
+                        ErrorCode::ControlBackpressure,
+                        "input capacity is full",
+                    ),
+                    disposition: CommandDisposition::NotApplied,
+                },
+            },
+        };
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encode_frame(&rejected).unwrap()).unwrap(),
+            rejected
+        );
+        assert_eq!(
+            serde_json::to_value(&rejected).unwrap(),
+            serde_json::json!({
+                "type": "command_result",
+                "command_id": 7,
+                "outcome": {
+                    "type": "rejected",
+                    "failure": {
+                        "error": {
+                            "code": "control_backpressure",
+                            "message": "input capacity is full"
+                        },
+                        "disposition": "not_applied"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn short_lived_control_responses_share_the_receipt_and_failure_contract() {
+        let accepted = Response::ControlAccepted {
+            run: sample_run_info(),
+            receipt: ControlReceipt::Input { written_bytes: 3 },
+        };
+        assert_eq!(
+            decode_frame::<Response>(&encode_frame(&accepted).unwrap()).unwrap(),
+            accepted
+        );
+        let accepted_value = serde_json::to_value(&accepted).unwrap();
+        assert_eq!(accepted_value["type"], "control_accepted");
+        assert_eq!(
+            accepted_value["receipt"],
+            serde_json::json!({"type": "input", "written_bytes": 3})
+        );
+
+        let rejected = Response::ControlRejected {
+            failure: ControlFailure {
+                error: ProtocolError::new(ErrorCode::Io, "PTY write outcome is unknown"),
+                disposition: CommandDisposition::Unknown,
+            },
+        };
+        assert_eq!(
+            decode_frame::<Response>(&encode_frame(&rejected).unwrap()).unwrap(),
+            rejected
+        );
+        assert_eq!(
+            serde_json::to_value(&rejected).unwrap(),
+            serde_json::json!({
+                "type": "control_rejected",
+                "failure": {
+                    "error": {
+                        "code": "io",
+                        "message": "PTY write outcome is unknown"
+                    },
+                    "disposition": "unknown"
+                }
+            })
         );
     }
 

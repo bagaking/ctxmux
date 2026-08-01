@@ -1,11 +1,20 @@
 export {
   Attachment,
   CtxmuxClient,
+  CtxmuxCommandError,
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
   createOperationKey,
 } from "./client.js";
-export type { ByteInput, CtxmuxClientOptions } from "./client.js";
+export type {
+  AttachmentControlAccepted,
+  ByteInput,
+  ControlAccepted,
+  CtxmuxClientOptions,
+  InputReceipt,
+  ResizeReceipt,
+  StopReceipt,
+} from "./client.js";
 export {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
@@ -34,7 +43,12 @@ export {
 } from "./generated/constants.js";
 export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
+export type { AttachmentCommandId } from "./generated/AttachmentCommandId.js";
 export type { ClientFrame } from "./generated/ClientFrame.js";
+export type { CommandDisposition } from "./generated/CommandDisposition.js";
+export type { ControlFailure } from "./generated/ControlFailure.js";
+export type { ControlOutcome } from "./generated/ControlOutcome.js";
+export type { ControlReceipt } from "./generated/ControlReceipt.js";
 export type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 export type { ErrorCode } from "./generated/ErrorCode.js";
 export type { ForkFidelity } from "./generated/ForkFidelity.js";
@@ -82,7 +96,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 4. */
+/** Fill the portable defaults required by protocol generation 5. */
 export function defineRun(
   program: string,
   options: {

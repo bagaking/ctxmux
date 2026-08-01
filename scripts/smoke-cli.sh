@@ -135,8 +135,8 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 4"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 4"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 5"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 5"
 
 expect_failure "--socket or CTXMUX_SOCKET is required" env -u CTXMUX_SOCKET "$ctxmux_cli_bin" list
 expect_failure "unknown command" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" unknown

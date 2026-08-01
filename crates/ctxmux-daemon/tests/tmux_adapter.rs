@@ -936,6 +936,7 @@ fn portable_spec() -> RunSpec {
 fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
     match error {
         ClientError::Protocol { code, .. } => assert_eq!(code, expected),
+        ClientError::ControlRejected { failure } => assert_eq!(failure.error.code, expected),
         other => panic!("expected protocol error {expected:?}, got {other:?}"),
     }
 }
@@ -1100,7 +1101,7 @@ async fn wait_for_output(
                 .expect("tmux attachment remains live")
             {
                 RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
-                RunEvent::Tmux { .. } | RunEvent::Accepted { .. } => {}
+                RunEvent::Tmux { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
@@ -1126,7 +1127,7 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                 RunEvent::Tmux { event } => {
                     panic!("unexpected tmux event while waiting for {expected:?}: {event:?}")
                 }
-                RunEvent::Output { .. } | RunEvent::Accepted { .. } => {}
+                RunEvent::Output { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
@@ -1429,7 +1430,7 @@ async fn collect_exact_output_with_gap_replay(
                         drop(attachment);
                         break;
                     }
-                    RunEvent::Tmux { .. } | RunEvent::Accepted { .. } => {}
+                    RunEvent::Tmux { .. } => {}
                     RunEvent::Exited { state } => {
                         panic!("tmux Run exited during queued output: {state:?}")
                     }
@@ -2183,32 +2184,26 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
     let client = daemon.client();
     let (run, pane_process_id) = import_only_pane(&client, &server).await;
 
-    let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
-    attachment
-        .input(b"forbidden attachment input".to_vec())
-        .await
-        .expect("send attachment input request");
+    let (attachment, _) = attach_with_timeout(&client, run.id, 0).await;
     assert_protocol_error(
-        next_event_with_timeout(&mut attachment).await.unwrap_err(),
+        attachment
+            .input(b"forbidden attachment input".to_vec())
+            .await
+            .unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
-    attachment
-        .resize(TerminalSize {
-            cols: 101,
-            rows: 41,
-        })
-        .await
-        .expect("send attachment resize request");
     assert_protocol_error(
-        next_event_with_timeout(&mut attachment).await.unwrap_err(),
+        attachment
+            .resize(TerminalSize {
+                cols: 101,
+                rows: 41,
+            })
+            .await
+            .unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
-    attachment
-        .stop()
-        .await
-        .expect("send attachment stop request");
     assert_protocol_error(
-        next_event_with_timeout(&mut attachment).await.unwrap_err(),
+        attachment.stop().await.unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
     detach_with_timeout(attachment).await;

@@ -1,9 +1,25 @@
 import { randomUUID } from "node:crypto";
 
+import { Attachment } from "./attachment.js";
+import {
+  asError,
+  bytes,
+  CtxmuxCommandError,
+  CtxmuxProtocolError,
+  decodeInputReceipt,
+  decodeResizeReceipt,
+  decodeShortControl,
+  decodeStopReceipt,
+  protocolError,
+  type ByteInput,
+  type ControlAccepted,
+  type InputReceipt,
+  type ResizeReceipt,
+  type StopReceipt,
+} from "./control.js";
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 import type { ClientFrame } from "./generated/ClientFrame.js";
 import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
-import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
 import {
   MAX_CREATE_OPERATION_KEY_BYTES,
@@ -11,7 +27,6 @@ import {
 } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
-import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunId } from "./generated/RunId.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
@@ -23,30 +38,11 @@ import {
   validateCursor,
   validateServerFrame,
 } from "./validation.js";
-import { JsonLinesConnection } from "./wire.js";
-
-const runEventSources = new WeakMap<object, RunId>();
-
-function rememberRunEventSource(event: RunEvent, runId: RunId): void {
-  runEventSources.set(event, runId);
-  if (event.type === "output") {
-    runEventSources.set(event.chunk, runId);
-  }
-}
-
-/** @internal Source identity retained by the Attachment that owned an event. */
-export function runEventSource(event: RunEvent): RunId | undefined {
-  return (
-    runEventSources.get(event) ??
-    (event.type === "output" ? runEventSources.get(event.chunk) : undefined)
-  );
-}
+import { encodeJsonLine, JsonLinesConnection } from "./wire.js";
 
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
 }
-
-export type ByteInput = string | Uint8Array;
 
 /** Validate or generate one caller-retained Run creation operation key. */
 export function createOperationKey(
@@ -60,13 +56,13 @@ export function createOperationKey(
       "Run creation operation key must be well-formed UTF-16",
     );
   }
-  const bytes = new TextEncoder().encode(value).byteLength;
-  if (bytes === 0) {
+  const byteLength = new TextEncoder().encode(value).byteLength;
+  if (byteLength === 0) {
     throw new TypeError("Run creation operation key must not be empty");
   }
-  if (bytes > MAX_CREATE_OPERATION_KEY_BYTES) {
+  if (byteLength > MAX_CREATE_OPERATION_KEY_BYTES) {
     throw new TypeError(
-      `Run creation operation key is ${String(bytes)} bytes; maximum is ${String(MAX_CREATE_OPERATION_KEY_BYTES)}`,
+      `Run creation operation key is ${String(byteLength)} bytes; maximum is ${String(MAX_CREATE_OPERATION_KEY_BYTES)}`,
     );
   }
   return value;
@@ -86,16 +82,6 @@ function isWellFormedUtf16(value: string): boolean {
     }
   }
   return true;
-}
-
-export class CtxmuxProtocolError extends Error {
-  public readonly code: ErrorCode;
-
-  public constructor(code: ErrorCode, message: string) {
-    super(message);
-    this.name = "CtxmuxProtocolError";
-    this.code = code;
-  }
 }
 
 /** Stateless connector to one local ctxmux daemon. */
@@ -197,21 +183,36 @@ export class CtxmuxClient {
     return response.run;
   }
 
-  public async input(id: RunId, data: ByteInput): Promise<RunInfo> {
-    const response = await this.#request({
+  public async input(
+    id: RunId,
+    data: ByteInput,
+  ): Promise<ControlAccepted<InputReceipt>> {
+    const payload = bytes(data);
+    const response = await this.#controlRequest({
       type: "input",
       id,
-      data: bytes(data),
+      data: payload,
     });
-    return accepted(response);
+    return decodeShortControl(response, (receipt) =>
+      decodeInputReceipt(receipt, payload.length),
+    );
   }
 
-  public async resize(id: RunId, size: TerminalSize): Promise<RunInfo> {
-    return accepted(await this.#request({ type: "resize", id, size }));
+  public async resize(
+    id: RunId,
+    size: TerminalSize,
+  ): Promise<ControlAccepted<ResizeReceipt>> {
+    return decodeShortControl(
+      await this.#controlRequest({ type: "resize", id, size }),
+      decodeResizeReceipt,
+    );
   }
 
-  public async stop(id: RunId): Promise<RunInfo> {
-    return accepted(await this.#request({ type: "stop", id }));
+  public async stop(id: RunId): Promise<ControlAccepted<StopReceipt>> {
+    return decodeShortControl(
+      await this.#controlRequest({ type: "stop", id }),
+      decodeStopReceipt,
+    );
   }
 
   public async attach(id: RunId, afterSeq = 0): Promise<Attachment> {
@@ -247,6 +248,65 @@ export class CtxmuxClient {
       }
       if (frame.type !== "response") {
         throw unexpected("request response", frame.type);
+      }
+      return frame.response;
+    } finally {
+      wire.close();
+    }
+  }
+
+  async #controlRequest(request: Request): Promise<Response> {
+    let wire: JsonLinesConnection;
+    try {
+      wire = await this.#connect();
+    } catch (error) {
+      throw new CtxmuxCommandError(
+        error instanceof CtxmuxProtocolError ? error.code : "io",
+        asError(error).message,
+        "not_applied",
+      );
+    }
+    try {
+      let encodedFrame: string;
+      try {
+        encodedFrame = encodeJsonLine({
+          type: "request",
+          request,
+        } satisfies ClientFrame);
+      } catch (error) {
+        throw new CtxmuxCommandError(
+          "invalid_request",
+          asError(error).message,
+          "not_applied",
+        );
+      }
+      let frame: ServerFrame;
+      try {
+        await wire.sendEncoded(encodedFrame);
+        frame = serverFrame(await wire.receive());
+      } catch (error) {
+        if (error instanceof CtxmuxCommandError) {
+          throw error;
+        }
+        throw new CtxmuxCommandError(
+          error instanceof CtxmuxInvalidFrameError ? "internal" : "io",
+          asError(error).message,
+          "unknown",
+        );
+      }
+      if (frame.type === "error") {
+        throw new CtxmuxCommandError(
+          frame.error.code,
+          frame.error.message,
+          "unknown",
+        );
+      }
+      if (frame.type !== "response") {
+        throw new CtxmuxCommandError(
+          "internal",
+          `expected request response, received ${frame.type}`,
+          "unknown",
+        );
       }
       return frame.response;
     } finally {
@@ -310,124 +370,6 @@ async function receiveReplay(
   };
 }
 
-/** Live TypeScript attachment to one daemon-owned Run. */
-export class Attachment {
-  readonly #wire: JsonLinesConnection;
-  #detachPromise: Promise<void> | undefined;
-  public readonly snapshot: AttachedSnapshot;
-
-  public constructor(wire: JsonLinesConnection, snapshot: AttachedSnapshot) {
-    this.#wire = wire;
-    this.snapshot = snapshot;
-    for (const chunk of snapshot.replay.chunks) {
-      runEventSources.set(chunk, snapshot.run.id);
-    }
-  }
-
-  public async input(data: ByteInput): Promise<void> {
-    await this.#wire.send({
-      type: "input",
-      data: bytes(data),
-    } satisfies ClientFrame);
-  }
-
-  public async resize(size: TerminalSize): Promise<void> {
-    await this.#wire.send({ type: "resize", size } satisfies ClientFrame);
-  }
-
-  public async stop(): Promise<void> {
-    await this.#wire.send({ type: "stop" } satisfies ClientFrame);
-  }
-
-  public detach(): Promise<void> {
-    this.#detachPromise ??= this.#detachCleanly();
-    return this.#detachPromise;
-  }
-
-  /** Abruptly close this client attachment without affecting its Run. */
-  public close(): void {
-    this.#wire.close();
-  }
-
-  public async nextEvent(): Promise<RunEvent | undefined> {
-    let frame: ServerFrame;
-    try {
-      frame = serverFrame(await this.#wire.receive());
-    } catch (error) {
-      this.#wire.close();
-      throw error;
-    }
-    if (frame.type === "event") {
-      rememberRunEventSource(frame.event, this.snapshot.run.id);
-      return frame.event;
-    }
-    if (frame.type === "detached") {
-      this.#wire.close();
-      return undefined;
-    }
-    if (frame.type === "error") {
-      throw protocolError(frame.error);
-    }
-    throw unexpected("attachment event", frame.type);
-  }
-
-  public async *events(): AsyncGenerator<RunEvent, void, void> {
-    while (true) {
-      const event = await this.nextEvent();
-      if (event === undefined) {
-        return;
-      }
-      yield event;
-      if (event.type === "exited" || event.type === "interrupted") {
-        return;
-      }
-    }
-  }
-
-  async #detachCleanly(): Promise<void> {
-    await this.#wire.send({ type: "detach" } satisfies ClientFrame);
-    try {
-      while (true) {
-        const frame = serverFrame(await this.#wire.receive());
-        if (frame.type === "detached") {
-          this.#wire.close();
-          return;
-        }
-        if (frame.type === "event") {
-          continue;
-        }
-        if (frame.type === "error") {
-          throw protocolError(frame.error);
-        }
-        throw unexpected("detached frame", frame.type);
-      }
-    } catch (error) {
-      this.#wire.close();
-      throw error;
-    }
-  }
-}
-
-function bytes(input: ByteInput): number[] {
-  return Array.from(
-    typeof input === "string" ? new TextEncoder().encode(input) : input,
-  );
-}
-
-function accepted(response: Response): RunInfo {
-  if (response.type !== "accepted") {
-    throw unexpected("accepted response", response.type);
-  }
-  return response.run;
-}
-
-function protocolError(error: {
-  readonly code: ErrorCode;
-  readonly message: string;
-}): Error {
-  return new CtxmuxProtocolError(error.code, error.message);
-}
-
 function unexpected(expected: string, actual: string): Error {
   return new Error(`expected ${expected}, received ${actual}`);
 }
@@ -436,4 +378,17 @@ function serverFrame(value: unknown): ServerFrame {
   return validateServerFrame(value);
 }
 
-export { CtxmuxInvalidFrameError };
+export {
+  Attachment,
+  CtxmuxCommandError,
+  CtxmuxInvalidFrameError,
+  CtxmuxProtocolError,
+};
+export type {
+  AttachmentControlAccepted,
+  ByteInput,
+  ControlAccepted,
+  InputReceipt,
+  ResizeReceipt,
+  StopReceipt,
+} from "./control.js";

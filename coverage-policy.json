@@ -42,9 +42,12 @@
       "floor_class": "runtime",
       "paths": [
         "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/attachment.rs",
         "crates/ctxmux-daemon/src/creation.rs",
+        "crates/ctxmux-daemon/src/native_control.rs",
         "crates/ctxmux-daemon/src/main.rs",
         "crates/ctxmux-client/src/lib.rs",
+        "crates/ctxmux-client/src/attachment.rs",
         "crates/ctxmux/src/main.rs"
       ]
     },
@@ -84,6 +87,8 @@
       "floor_class": "runtime",
       "paths": [
         "packages/sdk/src/client.ts",
+        "packages/sdk/src/attachment.ts",
+        "packages/sdk/src/control.ts",
         "packages/sdk/src/index.ts",
         "packages/sdk/src/integration.ts",
         "packages/sdk/src/integrations/codex.ts",
@@ -106,7 +111,7 @@
         "crates/ctxmux-client/src/lib.rs:cfg(not(unix))",
         "crates/ctxmux-daemon/src/lib.rs:cfg(not(unix))"
       ],
-      "reason": "Generation 4 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
+      "reason": "Generation 5 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
       "evidence": "docs/protocol.md#transport"
     }
   ]

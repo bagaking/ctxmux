@@ -1,4 +1,4 @@
-# Local Protocol Generation 4
+# Local Protocol Generation 5
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 4.
+- Raw PTY bytes are represented as integer arrays in generation 5.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -24,6 +24,10 @@ left untouched.
 Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
+
+The generation fence covers the wire contract only. Generation 5 does not yet
+negotiate runtime build identity, host identity, or a daemon-wide capability
+manifest; those remain separate open work.
 
 After the handshake, a connection has one of two shapes:
 
@@ -50,7 +54,8 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 - `list`: return all Runs retained by this daemon.
 - `status`: return current metadata for one Run.
 - `input`: write raw bytes to a live Run's PTY.
-- `resize`: change live PTY rows and columns.
+- `resize`: request new live PTY rows and columns and report the size read back
+  from the owning PTY.
 - `attach`: return retained output after a sequence cursor and follow new
   output and exit events.
 - `stop`: request termination of the owned direct child and return after the
@@ -66,24 +71,27 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 4.
+ownership in generation 5.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Every generation-4 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-5 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
 
 Level A fork resolves the retained parent and clones its complete immutable
-`RunSpec`, including `declared_inputs`. Level B executes one caller-materialized
-`RunSpec` without merging it with or falling back to the parent. Both variants
-publish the child only after native launch succeeds. A Level B tag is not by
-itself proof that an external Integration preserved richer state; the
-Integration capability gate and its behavioral evidence own that claim.
+`RunSpec`, including `declared_inputs`. Level B requires a current-incarnation
+native control owner that is still open, then executes one caller-materialized
+`RunSpec` without merging it with or falling back to the parent. A same-epoch
+exited or stopping parent and a recovered historical parent therefore reject a
+fresh Level B request. Both variants publish the child only after native launch
+succeeds. A Level B tag is not by itself proof that an external Integration
+preserved richer state; the Integration capability gate and its behavioral
+evidence own that claim.
 
 ### Retry-safe Run creation
 
@@ -93,7 +101,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-4 decoding and
+The daemon compares canonical typed requests after generation-5 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -124,6 +132,86 @@ Run and its mapping are collected, the key may create a new Run. A daemon crash
 before atomic persistent publication is still outside live process recovery;
 ctxmux does not preserve a pending tombstone, adopt an unrecorded process, or
 claim that such a process cannot have survived.
+
+### Control correlation and owner receipts
+
+Short-lived `input`, `resize`, and `stop` requests and the corresponding
+persistent-attachment commands share one `ControlReceipt` contract. A
+successful short-lived operation returns `control_accepted` with current Run
+metadata and its receipt. A rejected short-lived control returns
+`control_rejected` with a `ControlFailure`; other request classes continue to
+use their ordinary response or top-level error frames.
+
+Each attachment `input`, `resize`, or `stop` frame carries an
+`AttachmentCommandId`, an unsigned 32-bit integer in `1..=4294967295`. The
+first ID is one; each later ID is strictly greater, and gaps are allowed. The
+daemon therefore needs to retain only the latest structurally valid ID it
+observed per attachment, not an unbounded set. It returns a separate
+`command_result` frame carrying the same ID and either an accepted receipt or a
+rejected failure. Command results are not Run events: output, gap, Backend
+observation, and terminal lifecycle remain on the event stream and cannot
+consume a command promise accidentally.
+
+An attachment command ID provides correlation only. It is not an idempotency
+key, permission to retry, durable command identity, or deduplication record.
+IDs reset when a new attachment connection is created. A non-increasing ID or a
+first ID other than one is an attachment-fatal, pre-dispatch protocol violation:
+the daemon applies no command for that frame, sends no `command_result` that
+could be mistaken for an earlier occurrence of the same ID, and closes the
+attachment. Zero is rejected by frame decoding. Once a structurally valid ID is
+observed it is consumed before owner admission, so a command rejected for
+backpressure, capability, or state cannot reuse that ID. Once the maximum ID is
+consumed, the client waits for its pending results, detaches cleanly, and uses a
+new attachment for future commands.
+
+For each structurally and sequentially valid command, the daemon sends exactly
+one `command_result` or the connection terminates. Reconnecting does not resolve
+whether a command whose result was lost took effect. On EOF, transport error,
+or fatal protocol violation, the client locally marks every command without its
+unique result as disposition unknown and must not replay uncertain input unless
+a separate operation-specific deduplication contract is introduced.
+
+Receipts name the precise owner boundary reached:
+
+- `input { written_bytes }` is accepted only when the complete input reached the
+  daemon-owned PTY write boundary. The count equals that command's input length;
+  a partial write is never an accepted receipt. It does not prove that the child
+  read or interpreted those bytes.
+- `resize { applied_size }` is the terminal size read back from the owning PTY
+  after resize. It lets clients detect and repair requested-versus-applied
+  drift rather than treating the requested size as fact.
+- `stop` means the direct-child control owner accepted the termination request.
+  Final `exited` remains a later lifecycle event and may carry the actual code
+  or signal.
+
+Every wire `ControlFailure` carries `not_applied` or `unknown`. `not_applied` means
+the command did not cross its mutation boundary. `unknown` means it may have
+crossed that boundary, so retry must fail closed at the client unless the
+operation has independent idempotency evidence. A partial PTY write, a resize
+whose readback fails after mutation, or another daemon-observed ambiguous owner
+failure may therefore be rejected as unknown. Transport loss has no wire
+failure frame; it produces the separate client-local unknown result described
+above.
+The `control_backpressure` code reports bounded live-control admission failure
+with `not_applied`; input saturation must not be represented as successful
+acceptance or allowed to starve resize and stop.
+
+Clients bind each control result to its originating command; attachment results
+additionally bind its ID. An unknown or already-completed ID, duplicate result,
+receipt-kind mismatch, input count other than the original data length, or zero
+applied rows or columns is a daemon contract violation: the client closes the
+attachment and marks every unresolved pending command, including the implicated
+one, unknown. Ordinary decoded control failures use correlated
+`control_rejected` or `command_result { rejected }`; top-level errors are
+reserved for handshake, malformed frame, attachment sequencing, and other
+pre-dispatch failures.
+
+First-party clients exact-encode a control frame before consuming its
+attachment command ID or admitting it to the writer. A local connect or encode
+failure is therefore `not_applied`; a transport failure after send begins is
+`unknown`. One Attachment permits one pending event-consumer call. After the
+single terminal event is delivered, ordinary daemon EOF ends that event stream
+cleanly even though any still-unresolved command result remains unknown.
 
 Every `RunInfo` declares a Backend and its generic capabilities. Native Runs
 have a `RunSpec` and daemon-owned child authority. Imported tmux Runs have no
@@ -158,7 +246,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 4 import accepts only socket path plus pane ID, so it
+associations. Generation 5 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -173,7 +261,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 4 does not claim general command correlation beyond those bounded
+Generation 5 does not claim general tmux command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -190,12 +278,17 @@ and receives:
 - retained chunks newer than that sequence;
 - the oldest and newest retained sequences;
 - a `truncated` flag when required output was already evicted;
-- future ordered output, accepted-operation, gap, and exit events.
+- future ordered output, Backend observation, gap, and exit events.
 
 The daemon subscribes an attachment before taking its replay snapshot and
 deduplicates live events already covered by that snapshot. Before publishing an
 exit event, it gives the PTY reader a bounded opportunity to drain the child's
 final output.
+
+Attachment command results are multiplexed beside these events but are not
+part of replay and are never retained across reconnect. A client that permits
+multiple in-flight commands must demultiplex the single inbound stream by
+`AttachmentCommandId`; competing socket readers are outside the contract.
 
 `RunInfo.durable_head_seq` is `null` in memory-only mode. In persistent mode it
 is the highest contiguous output sequence committed by the store actor and may
@@ -213,7 +306,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-4 peer that puts `chunks` back into the header is invalid.
+generation-5 peer that puts `chunks` back into the header is invalid.
 
 `Gap { head_seq }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -262,6 +355,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-4 frame at runtime, rejects duplicate
+validates the complete nested generation-5 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

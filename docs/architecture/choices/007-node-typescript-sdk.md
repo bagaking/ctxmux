@@ -30,7 +30,13 @@ The SDK exposes byte input as string or `Uint8Array`; strings are UTF-8 encoded 
 
 Node 24 or newer and Unix sockets are required. There is no timeout, `AbortSignal`, reconnection helper, request ID, or packaging release. Concurrent `receive()` semantics are not documented.
 
-The SDK now validates full nested generation-4 frames, rejects unsafe cursors, bounds queued input to 256 frames or 1 MiB before pausing the socket, and waits for `Detached` on clean detach. Short request methods wait for `Response` or `Error`. `Attachment.input()`, `resize()`, and `stop()` currently resolve after their frame's socket-write callback; remote `Accepted` or `Error` remains a separate attachment event because generation 4 has no command correlation ID.
+The SDK validates full nested generation-5 frames, rejects unsafe cursors, and
+bounds the JSON-lines transport before pausing the socket. Each Attachment has
+one receive pump, a 64-command pending map with separate 32-command/1 MiB input
+bounds, and a 256-event/1 MiB delivery inbox. `input()`, `resize()`, and
+`stop()` resolve only from their correlated daemon owner receipt. Clean detach
+fences new commands, drains pending results, and waits for `Detached`; abrupt
+close makes unresolved commands unknown without stopping the Run.
 
 ## Wrong-case corpus
 
@@ -44,14 +50,17 @@ Awaiting each write callback already bounds normal outbound accumulation. The re
 
 ## Fixture mapping
 
-- Covered now: CLI/SDK shared Run, abrupt SDK disconnect, reconnect, input, resize, stop, and typed invalid-state error.
+- Covered now: CLI/SDK shared Run, abrupt SDK disconnect, reconnect, correlated
+  input/resize/stop, applied size, typed disposition, and invalid-state error.
 - Active: clean detach acknowledgement, abrupt-close distinction, FIN/destroy/write-error settlement, bounded slow-consumer delivery, unsafe cursors, and invalid nested frames.
 - Active: malformed UTF-8, duplicate JSON members, and invalid JSON close the SDK boundary.
-- Future: caller-controlled cancellation, deadlines, reconnection, and concurrent attachment operations after their public contracts exist.
+- Covered now: concurrent attachment controls use one reader router, bounded
+  pending state, exact result-kind validation, and fail-closed unknown
+  disposition on connection loss.
+- Future: caller-controlled cancellation, deadlines, and reconnection helpers.
 
 ## Open questions
 
-- Should attachment mutations gain correlated acknowledgements, or should their promises remain transport-completion APIs with results observed through events?
 - Which calls accept `AbortSignal` and which errors are retryable?
 - How much runtime frame validation is required at a local trust boundary?
 - What Node and operating-system matrix is supported at release?

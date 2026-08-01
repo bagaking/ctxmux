@@ -21,7 +21,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod attachment;
 mod creation;
+mod native_control;
 mod persistence;
 mod run_spec;
 mod tmux;
@@ -29,14 +31,14 @@ mod tmux;
 pub use persistence::PersistenceError;
 
 use ctxmux_protocol::{
-    AttachedHeader, AttachedSnapshot, ClientFrame, CreateOperationKey, ErrorCode, ForkFidelity,
-    ForkPlan, InterruptionReason, MAX_FRAME_BYTES, OutputChunk, OutputReplay, OutputReplayHeader,
-    PROTOCOL_VERSION, ProtocolError, Request, Response, RunBackend, RunCapabilities, RunEvent,
-    RunId, RunInfo, RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, TmuxRunEvent,
-    decode_frame, encode_frame,
+    AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure, CreateOperationKey,
+    ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, MAX_FRAME_BYTES, OutputChunk,
+    OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunBackend, RunCapabilities,
+    RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState, ServerFrame, TerminalSize,
+    TmuxRunEvent, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
@@ -46,6 +48,9 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{CreationFlightOwner, CreationRequest, RunRegistry};
+use crate::native_control::{
+    ChildCommand, ControlResult, InputDrainGate, NativeControlOwner, PendingInput, PendingStop,
+};
 use crate::persistence::{Persistence, PersistentRun, RecoveredRun};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
@@ -278,6 +283,7 @@ impl Drop for SocketGuard {
 struct RunManager {
     registry: RunRegistry,
     creation_flights: CreationFlightOwner,
+    native_input_drains: InputDrainGate,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
     tmux_shutting_down: AtomicBool,
@@ -350,6 +356,7 @@ impl Default for RunManager {
         Self {
             registry: RunRegistry::default(),
             creation_flights: CreationFlightOwner::default(),
+            native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             tmux_shutting_down: AtomicBool::new(false),
@@ -383,6 +390,7 @@ impl RunManager {
         Self {
             registry: RunRegistry::recovered(runs),
             creation_flights: CreationFlightOwner::default(),
+            native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             tmux_shutting_down: AtomicBool::new(false),
@@ -454,9 +462,13 @@ impl RunManager {
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
         let run = match request {
-            CreationRequest::Start { spec } => {
-                Run::spawn(spec, None, persistence_mode, self.live_event_capacity)?
-            }
+            CreationRequest::Start { spec } => Run::spawn(
+                spec,
+                None,
+                persistence_mode,
+                self.live_event_capacity,
+                self.native_input_drains.clone(),
+            )?,
             CreationRequest::Fork { parent, plan } => {
                 let parent_run = self.get(parent)?;
                 let (spec, fidelity) = match plan {
@@ -470,10 +482,12 @@ impl RunManager {
                         ForkFidelity::LevelA,
                     ),
                     ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
-                        if parent_run.live.is_none() {
+                        if !parent_run.has_continuation_authority() {
                             return Err(ProtocolError::new(
                                 ErrorCode::InvalidRunState,
-                                format!("cannot Level B fork historical Run {parent}"),
+                                format!(
+                                    "cannot Level B fork Run {parent} without live continuation authority"
+                                ),
                             ));
                         }
                         (spec, ForkFidelity::LevelB)
@@ -490,6 +504,7 @@ impl RunManager {
                     Some(RunLineage { parent, fidelity }),
                     persistence_mode,
                     self.live_event_capacity,
+                    self.native_input_drains.clone(),
                 )?
             }
         };
@@ -601,11 +616,11 @@ impl RunManager {
             .registry
             .snapshot()
             .into_iter()
-            .filter(|run| matches!(run.live, Some(RunControl::Tmux(_))))
+            .filter(|run| matches!(run.incarnation_control, Some(RunControl::Tmux(_))))
             .collect::<Vec<_>>();
 
         for run in &pending {
-            if let Some(RunControl::Tmux(control)) = &run.live {
+            if let Some(RunControl::Tmux(control)) = &run.incarnation_control {
                 // A failed send can race a naturally completed waiter. Its
                 // completion receipt, not channel state, is authoritative.
                 let _ = control.commands.send(TmuxControlCommand::Shutdown);
@@ -617,7 +632,7 @@ impl RunManager {
             let mut index = 0;
             while index < pending.len() {
                 let run = Arc::clone(&pending[index]);
-                let Some(RunControl::Tmux(control)) = &run.live else {
+                let Some(RunControl::Tmux(control)) = &run.incarnation_control else {
                     pending.swap_remove(index);
                     continue;
                 };
@@ -763,15 +778,6 @@ struct PendingChild {
     child: Option<Box<dyn Child + Send + Sync>>,
 }
 
-enum ChildCommand {
-    Stop(mpsc::SyncSender<Result<(), String>>),
-}
-
-struct ChildController {
-    sender: Option<mpsc::Sender<ChildCommand>>,
-    stop_requested: bool,
-}
-
 impl PendingChild {
     const fn new(child: Box<dyn Child + Send + Sync>) -> Self {
         Self { child: Some(child) }
@@ -809,7 +815,7 @@ struct Run {
     pid: Option<u32>,
     state: Mutex<RunState>,
     output: Mutex<OutputLog>,
-    live: Option<RunControl>,
+    incarnation_control: Option<RunControl>,
     persistence_mode: PersistenceMode,
     persistence_transition: Mutex<()>,
     persistence: Mutex<Option<PersistentRun>>,
@@ -818,14 +824,8 @@ struct Run {
 }
 
 enum RunControl {
-    Native(NativeRunControl),
+    Native(NativeControlOwner),
     Tmux(TmuxRunControl),
-}
-
-struct NativeRunControl {
-    master: Mutex<Box<dyn MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    child_controller: Mutex<ChildController>,
 }
 
 struct TmuxRunControl {
@@ -1012,12 +1012,14 @@ impl Run {
         lineage: Option<RunLineage>,
         persistence_mode: PersistenceMode,
         live_event_capacity: usize,
+        input_drains: InputDrainGate,
     ) -> Result<Arc<Self>, ProtocolError> {
         Self::spawn_with_hooks(
             spec,
             lineage,
             persistence_mode,
             live_event_capacity,
+            input_drains,
             |_, _| Ok(()),
             || {},
         )
@@ -1038,6 +1040,7 @@ impl Run {
             lineage,
             persistence_mode,
             LIVE_EVENT_CAPACITY,
+            InputDrainGate::default(),
             setup,
             || {},
         )
@@ -1057,6 +1060,7 @@ impl Run {
             None,
             persistence_mode,
             LIVE_EVENT_CAPACITY,
+            InputDrainGate::default(),
             |_, _| Ok(()),
             after_wait,
         )
@@ -1067,6 +1071,7 @@ impl Run {
         lineage: Option<RunLineage>,
         persistence_mode: PersistenceMode,
         live_event_capacity: usize,
+        input_drains: InputDrainGate,
         mut setup: F,
         after_wait: G,
     ) -> Result<Arc<Self>, ProtocolError>
@@ -1104,10 +1109,12 @@ impl Run {
             .master
             .take_writer()
             .map_err(|error| spawn_error("take PTY writer", error))?;
-        let (child_command_tx, child_command_rx) = mpsc::channel();
         let (events, _) = broadcast::channel(live_event_capacity);
+        let id = RunId::new();
+        let (native_control, child_command_rx) =
+            NativeControlOwner::new(id, pair.master, writer, input_drains);
         let run = Arc::new(Self {
-            id: RunId::new(),
+            id,
             spec: Some(spec),
             lineage,
             backend: RunBackend::Native,
@@ -1115,14 +1122,7 @@ impl Run {
             pid,
             state: Mutex::new(RunState::Running),
             output: Mutex::new(OutputLog::default()),
-            live: Some(RunControl::Native(NativeRunControl {
-                master: Mutex::new(pair.master),
-                writer: Mutex::new(writer),
-                child_controller: Mutex::new(ChildController {
-                    sender: Some(child_command_tx),
-                    stop_requested: false,
-                }),
-            })),
+            incarnation_control: Some(RunControl::Native(native_control)),
             persistence_mode,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(None),
@@ -1152,13 +1152,11 @@ impl Run {
                 };
                 let mut child = pending_child.into_child();
                 let state = wait_for_child(child.as_mut(), &child_command_rx);
-                mutex_lock(
-                    &wait_run
-                        .native_control()
-                        .expect("spawned Run retains native control")
-                        .child_controller,
-                )
-                .sender = None;
+                drop(child_command_rx);
+                wait_run
+                    .native_control()
+                    .expect("spawned Run retains native control")
+                    .mark_closed();
                 after_wait();
                 let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
                 wait_run.publish_terminal(state);
@@ -1208,7 +1206,7 @@ impl Run {
             pid: Some(target.pane_pid),
             state: Mutex::new(RunState::Running),
             output: Mutex::new(OutputLog::with_initial_truncation()),
-            live: Some(RunControl::Tmux(TmuxRunControl {
+            incarnation_control: Some(RunControl::Tmux(TmuxRunControl {
                 writer: Mutex::new(Some(TmuxCommandWriter::new(stdin))),
                 commands: commands_tx,
                 completion: Mutex::new(completion_rx),
@@ -1319,7 +1317,7 @@ impl Run {
             pid: recovered.info.pid,
             state: Mutex::new(recovered.info.state),
             output: Mutex::new(OutputLog::from_replay(recovered.replay)),
-            live: None,
+            incarnation_control: None,
             persistence_mode: PersistenceMode::PersistentCapable,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(Some(persistence)),
@@ -1353,82 +1351,34 @@ impl Run {
         info
     }
 
-    fn ensure_running(&self, operation: &str) -> Result<(), ProtocolError> {
-        if mutex_lock(&self.state).is_running() {
-            Ok(())
-        } else {
-            Err(ProtocolError::new(
-                ErrorCode::InvalidRunState,
-                format!("cannot {operation} terminal Run {}", self.id),
-            ))
+    async fn input(&self, data: Vec<u8>) -> ControlResult {
+        self.begin_input(data)?.resolve().await
+    }
+
+    fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
+        self.native_control()
+            .map_err(control_not_applied)?
+            .begin_input(data)
+    }
+
+    fn resize(&self, size: TerminalSize) -> ControlResult {
+        if let Err(error) = validate_terminal_size(size) {
+            return Err(control_not_applied(invalid_run_spec(error)));
+        }
+        match self.native_control() {
+            Ok(control) => control.resize(size),
+            Err(error) => Err(control_not_applied(error)),
         }
     }
 
-    fn input(&self, data: &[u8]) -> Result<RunInfo, ProtocolError> {
-        self.ensure_running("write to")?;
-        let live = self.native_control()?;
-        let mut writer = mutex_lock(&live.writer);
-        writer.write_all(data).map_err(io_protocol_error)?;
-        writer.flush().map_err(io_protocol_error)?;
-        Ok(self.info())
+    async fn stop(&self) -> ControlResult {
+        self.begin_stop()?.resolve(STOP_ACK_TIMEOUT).await
     }
 
-    fn resize(&self, size: TerminalSize) -> Result<RunInfo, ProtocolError> {
-        validate_terminal_size(size).map_err(invalid_run_spec)?;
-        self.ensure_running("resize")?;
-        let live = self.native_control()?;
-        mutex_lock(&live.master)
-            .resize(to_pty_size(size))
-            .map_err(io_protocol_error)?;
-        Ok(self.info())
-    }
-
-    fn stop(&self) -> Result<RunInfo, ProtocolError> {
-        self.ensure_running("stop")?;
-        let live = self.native_control()?;
-        let sender = {
-            let mut controller = mutex_lock(&live.child_controller);
-            if controller.stop_requested {
-                return Err(ProtocolError::new(
-                    ErrorCode::InvalidRunState,
-                    format!("stop already requested for Run {}", self.id),
-                ));
-            }
-            let Some(sender) = controller.sender.clone() else {
-                return Err(ProtocolError::new(
-                    ErrorCode::InvalidRunState,
-                    format!("cannot stop exited Run {}", self.id),
-                ));
-            };
-            controller.stop_requested = true;
-            sender
-        };
-        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        if sender.send(ChildCommand::Stop(reply_tx)).is_err() {
-            mutex_lock(&live.child_controller).sender = None;
-            return Err(ProtocolError::new(
-                ErrorCode::InvalidRunState,
-                format!("cannot stop exited Run {}", self.id),
-            ));
-        }
-        match reply_rx.recv_timeout(STOP_ACK_TIMEOUT) {
-            Ok(Ok(())) => Ok(self.info()),
-            Ok(Err(error)) => {
-                let mut controller = mutex_lock(&live.child_controller);
-                if controller.sender.is_some() {
-                    controller.stop_requested = false;
-                }
-                Err(io_protocol_error(error))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(ProtocolError::new(
-                ErrorCode::Internal,
-                format!("timed out while stopping Run {}", self.id),
-            )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ProtocolError::new(
-                ErrorCode::InvalidRunState,
-                format!("cannot stop exited Run {}", self.id),
-            )),
-        }
+    fn begin_stop(&self) -> Result<PendingStop, ControlFailure> {
+        self.native_control()
+            .map_err(control_not_applied)?
+            .begin_stop()
     }
 
     fn record_output(&self, data: Vec<u8>) {
@@ -1472,8 +1422,8 @@ impl Run {
         self.events.subscribe()
     }
 
-    fn native_control(&self) -> Result<&NativeRunControl, ProtocolError> {
-        match &self.live {
+    fn native_control(&self) -> Result<&NativeControlOwner, ProtocolError> {
+        match &self.incarnation_control {
             Some(RunControl::Native(control)) => Ok(control),
             Some(RunControl::Tmux(_)) => Err(ProtocolError::new(
                 ErrorCode::UnsupportedCapability,
@@ -1486,8 +1436,15 @@ impl Run {
         }
     }
 
+    fn has_continuation_authority(&self) -> bool {
+        matches!(
+            &self.incarnation_control,
+            Some(RunControl::Native(control)) if control.has_continuation_authority()
+        )
+    }
+
     fn write_tmux_command(&self, kind: TmuxCommandKind, command: &[u8]) -> io::Result<()> {
-        let Some(RunControl::Tmux(control)) = &self.live else {
+        let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Run has no tmux control client",
@@ -1497,7 +1454,7 @@ impl Run {
     }
 
     fn write_tmux_periodic_probe(&self, command: &[u8]) -> io::Result<()> {
-        let Some(RunControl::Tmux(control)) = &self.live else {
+        let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Run has no tmux control client",
@@ -1507,7 +1464,7 @@ impl Run {
     }
 
     fn establish_tmux_session(&self, command: &[u8]) -> io::Result<()> {
-        let Some(RunControl::Tmux(control)) = &self.live else {
+        let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
                 "Run has no tmux control client",
@@ -1522,26 +1479,26 @@ impl Run {
         &self,
         number: u64,
     ) -> Result<TmuxCommandResultKind, &'static str> {
-        let Some(RunControl::Tmux(control)) = &self.live else {
+        let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Err("Run has no tmux control client");
         };
         control.correlate_result(number)
     }
 
     fn interrupt_tmux(&self, reason: InterruptionReason) {
-        if let Some(RunControl::Tmux(control)) = &self.live {
+        if let Some(RunControl::Tmux(control)) = &self.incarnation_control {
             let _ = control.commands.send(TmuxControlCommand::Interrupt(reason));
         }
     }
 
     fn notify_tmux_reader_terminated(&self) {
-        if let Some(RunControl::Tmux(control)) = &self.live {
+        if let Some(RunControl::Tmux(control)) = &self.incarnation_control {
             let _ = control.commands.send(TmuxControlCommand::ReaderTerminated);
         }
     }
 
     fn wait_for_tmux_completion(&self, timeout: Duration) -> Result<(), String> {
-        let Some(RunControl::Tmux(control)) = &self.live else {
+        let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Ok(());
         };
         match mutex_lock(&control.completion).recv_timeout(timeout) {
@@ -1604,8 +1561,10 @@ impl Run {
     }
 
     fn terminate_unpublished(&self) {
-        if mutex_lock(&self.state).is_running() {
-            let _ = self.stop();
+        if mutex_lock(&self.state).is_running()
+            && let Ok(control) = self.native_control()
+        {
+            let _ = control.stop_detached();
         }
         for _ in 0..1_000 {
             if !mutex_lock(&self.state).is_running() {
@@ -1747,7 +1706,7 @@ fn complete_tmux_control(
         ),
     };
     let termination = resolve_tmux_termination(outcome.cause, reader_termination, control_pid);
-    if let Some(RunControl::Tmux(control)) = &run.live {
+    if let Some(RunControl::Tmux(control)) = &run.incarnation_control {
         control.close_writer();
     }
     let _ = ready.try_send(Err(termination.error));
@@ -2260,8 +2219,11 @@ fn spawn_error(action: &str, error: impl fmt::Display) -> ProtocolError {
     )
 }
 
-fn io_protocol_error(error: impl fmt::Display) -> ProtocolError {
-    ProtocolError::new(ErrorCode::Io, error.to_string())
+fn control_not_applied(error: ProtocolError) -> ControlFailure {
+    ControlFailure {
+        error,
+        disposition: CommandDisposition::NotApplied,
+    }
 }
 
 async fn handle_connection(
@@ -2310,7 +2272,7 @@ async fn handle_connection(
     };
 
     if let Request::Attach { id, after_seq } = request {
-        return handle_attachment(wire, manager, id, after_seq).await;
+        return attachment::handle(wire, manager, id, after_seq).await;
     }
     let response = execute_request(&manager, request).await;
     match response {
@@ -2369,19 +2331,53 @@ async fn execute_request(
         Request::Status { id } => Ok(Response::Status {
             run: manager.get(id)?.info(),
         }),
-        Request::Input { id, data } => Ok(Response::Accepted {
-            run: manager.get(id)?.input(&data)?,
-        }),
-        Request::Resize { id, size } => Ok(Response::Accepted {
-            run: manager.get(id)?.resize(size)?,
-        }),
-        Request::Stop { id } => Ok(Response::Accepted {
-            run: manager.get(id)?.stop()?,
-        }),
+        Request::Input { id, data } => {
+            let run = match manager.get(id) {
+                Ok(run) => run,
+                Err(error) => {
+                    return Ok(Response::ControlRejected {
+                        failure: control_not_applied(error),
+                    });
+                }
+            };
+            Ok(short_control_response(&run, run.input(data).await))
+        }
+        Request::Resize { id, size } => {
+            let run = match manager.get(id) {
+                Ok(run) => run,
+                Err(error) => {
+                    return Ok(Response::ControlRejected {
+                        failure: control_not_applied(error),
+                    });
+                }
+            };
+            Ok(short_control_response(&run, run.resize(size)))
+        }
+        Request::Stop { id } => {
+            let run = match manager.get(id) {
+                Ok(run) => run,
+                Err(error) => {
+                    return Ok(Response::ControlRejected {
+                        failure: control_not_applied(error),
+                    });
+                }
+            };
+            Ok(short_control_response(&run, run.stop().await))
+        }
         Request::Attach { .. } => Err(ProtocolError::new(
             ErrorCode::Internal,
             "attach request reached short-lived request handler",
         )),
+    }
+}
+
+fn short_control_response(run: &Run, result: ControlResult) -> Response {
+    match result {
+        Ok(receipt) => Response::ControlAccepted {
+            run: run.info(),
+            receipt,
+        },
+        Err(failure) => Response::ControlRejected { failure },
     }
 }
 
@@ -2399,154 +2395,6 @@ where
                 format!("tmux operation worker failed: {error}"),
             )
         })?
-}
-
-async fn handle_attachment(
-    mut wire: Framed<UnixStream, LinesCodec>,
-    manager: Arc<RunManager>,
-    id: RunId,
-    after_seq: u64,
-) -> Result<(), ConnectionError> {
-    let run = match manager.get(id) {
-        Ok(run) => run,
-        Err(error) => {
-            send(&mut wire, &ServerFrame::Error { error }).await?;
-            return Ok(());
-        }
-    };
-    let mut events = run.subscribe();
-    #[cfg(test)]
-    if let Some(hook) = &manager.attachment_hook {
-        hook.pause_once(AttachmentHookPoint::AfterSubscribe).await;
-    }
-    let (_guard, snapshot) = run.attach(after_seq);
-    let (header, replay_chunks, terminal_state) = split_attachment_snapshot(snapshot);
-    let mut last_sent_seq = header.replay.head_seq;
-    send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;
-    for chunk in replay_chunks {
-        send(
-            &mut wire,
-            &ServerFrame::Event {
-                event: RunEvent::Output { chunk },
-            },
-        )
-        .await?;
-    }
-    #[cfg(test)]
-    if let Some(hook) = &manager.attachment_hook {
-        hook.pause_once(AttachmentHookPoint::AfterSnapshot).await;
-    }
-    if !terminal_state.is_running() {
-        send(
-            &mut wire,
-            &ServerFrame::Event {
-                event: terminal_event(terminal_state),
-            },
-        )
-        .await?;
-        return Ok(());
-    }
-
-    loop {
-        tokio::select! {
-            incoming = receive(&mut wire) => {
-                let Some(frame) = incoming? else {
-                    return Ok(());
-                };
-                match frame {
-                    ClientFrame::Input { data } => send_attachment_result(&mut wire, run.input(&data)).await?,
-                    ClientFrame::Resize { size } => send_attachment_result(&mut wire, run.resize(size)).await?,
-                    ClientFrame::Stop => send_attachment_result(&mut wire, run.stop()).await?,
-                    ClientFrame::Detach => {
-                        #[cfg(test)]
-                        if let Some(hook) = &manager.attachment_hook {
-                            hook.pause_once(AttachmentHookPoint::BeforeDetachAck).await;
-                        }
-                        send(&mut wire, &ServerFrame::Detached).await?;
-                        return Ok(());
-                    }
-                    ClientFrame::Hello { .. } | ClientFrame::Request { .. } => {
-                        send(&mut wire, &invalid_request("frame is not valid during attachment")).await?;
-                    }
-                }
-            }
-            event = events.recv() => {
-                match event {
-                    Ok(RunEvent::Output { chunk }) if chunk.seq <= last_sent_seq => {}
-                    Ok(RunEvent::Output { chunk }) => {
-                        last_sent_seq = chunk.seq;
-                        send(&mut wire, &ServerFrame::Event {
-                            event: RunEvent::Output { chunk },
-                        }).await?;
-                    }
-                    Ok(event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. })) => {
-                        send(&mut wire, &ServerFrame::Event { event }).await?;
-                        return Ok(());
-                    }
-                    Ok(event) => send(&mut wire, &ServerFrame::Event { event }).await?,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let head_seq = run.info().head_seq;
-                        last_sent_seq = head_seq;
-                        send(&mut wire, &ServerFrame::Event {
-                            event: RunEvent::Gap { head_seq },
-                        }).await?;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                }
-            }
-        }
-    }
-}
-
-fn terminal_event(state: RunState) -> RunEvent {
-    match state {
-        RunState::Interrupted { reason } => RunEvent::Interrupted { reason },
-        state @ RunState::Exited { .. } => RunEvent::Exited { state },
-        RunState::Running => unreachable!("running state is not terminal"),
-    }
-}
-
-fn split_attachment_snapshot(
-    snapshot: AttachedSnapshot,
-) -> (AttachedHeader, Vec<OutputChunk>, RunState) {
-    let AttachedSnapshot {
-        run: run_info,
-        replay,
-    } = snapshot;
-    let OutputReplay {
-        chunks,
-        oldest_seq,
-        head_seq,
-        truncated,
-    } = replay;
-    let terminal_state = run_info.state.clone();
-    let header = AttachedHeader {
-        run: run_info,
-        replay: OutputReplayHeader {
-            oldest_seq,
-            head_seq,
-            truncated,
-        },
-    };
-    (header, chunks, terminal_state)
-}
-
-async fn send_attachment_result(
-    wire: &mut Framed<UnixStream, LinesCodec>,
-    result: Result<RunInfo, ProtocolError>,
-) -> Result<(), ConnectionError> {
-    match result {
-        Ok(run) => {
-            send(
-                wire,
-                &ServerFrame::Event {
-                    event: RunEvent::Accepted { run: Box::new(run) },
-                },
-            )
-            .await
-        }
-        Err(error) => send(wire, &ServerFrame::Error { error }).await,
-    }
 }
 
 fn invalid_request(message: impl Into<String>) -> ServerFrame {
@@ -2921,8 +2769,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn run_spec_semantics_map_to_invalid_request_for_start_fork_and_resize() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_spec_semantics_map_to_invalid_request_for_start_fork_and_resize() {
         let manager = RunManager::default();
 
         let mut invalid_start = long_running_spec();
@@ -2948,16 +2796,16 @@ mod tests {
         let resize_error = run
             .resize(TerminalSize { cols: 0, rows: 24 })
             .expect_err("zero-width resize must fail");
-        assert_eq!(resize_error.code, ErrorCode::InvalidRequest);
+        assert_eq!(resize_error.error.code, ErrorCode::InvalidRequest);
         assert_eq!(
-            resize_error.message,
+            resize_error.error.message,
             "terminal rows and columns must be greater than zero"
         );
-        run.stop().expect("stop validation fixture Run");
+        run.stop().await.expect("stop validation fixture Run");
     }
 
-    #[test]
-    fn stop_after_wait_disables_signalling_before_state_publication() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_after_wait_disables_signalling_before_state_publication() {
         struct ChildGuard(std::process::Child);
 
         impl Drop for ChildGuard {
@@ -3013,8 +2861,9 @@ mod tests {
 
         let error = run
             .stop()
+            .await
             .expect_err("reaped child rejects stop before state publication");
-        assert_eq!(error.code, ErrorCode::InvalidRunState);
+        assert_eq!(error.error.code, ErrorCode::InvalidRunState);
         assert!(
             process_exists(unrelated_pid),
             "stop after wait signalled unrelated identity {unrelated_pid}"
@@ -3123,7 +2972,7 @@ mod tests {
         recorded.record_output(b"between".to_vec());
         hook.release.notify_one();
 
-        let (mut attachment, snapshot) = attaching
+        let (attachment, snapshot) = attaching
             .await
             .expect("attachment task completes")
             .expect("attach after subscribe/snapshot barrier");
@@ -3228,7 +3077,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("child wait reaches final-output barrier");
 
-        let (mut attachment, snapshot) = server
+        let (attachment, snapshot) = server
             .client
             .attach(run.id, 0)
             .await
@@ -3312,11 +3161,14 @@ mod tests {
                 tasks.push(tokio::spawn(async move {
                     start.wait().await;
                     let result = match operation {
-                        MutationOperation::Input(byte) => client.input(id, vec![byte]).await,
-                        MutationOperation::Resize(cols) => {
-                            client.resize(id, TerminalSize { cols, rows: 24 }).await
+                        MutationOperation::Input(byte) => {
+                            client.input(id, vec![byte]).await.map(|_| ())
                         }
-                        MutationOperation::Stop => client.stop(id).await,
+                        MutationOperation::Resize(cols) => client
+                            .resize(id, TerminalSize { cols, rows: 24 })
+                            .await
+                            .map(|_| ()),
+                        MutationOperation::Stop => client.stop(id).await.map(|_| ()),
                     };
                     (operation, result)
                 }));
@@ -3329,26 +3181,31 @@ mod tests {
                 let (operation, result) = task
                     .await
                     .unwrap_or_else(|error| panic!("seed {seed} case {case_index}: {error}"));
-                match (operation, result) {
-                    (MutationOperation::Stop, Ok(_)) => accepted_stops += 1,
-                    (
-                        MutationOperation::Stop,
-                        Err(ClientError::Protocol {
-                            code: ErrorCode::InvalidRunState,
-                            ..
-                        }),
-                    ) => rejected_stops += 1,
-                    (
-                        MutationOperation::Input(_) | MutationOperation::Resize(_),
-                        Ok(_)
-                        | Err(ClientError::Protocol {
-                            code: ErrorCode::InvalidRunState | ErrorCode::Io,
-                            ..
-                        }),
-                    ) => {}
-                    (operation, result) => panic!(
-                        "seed {seed} case {case_index}: undeclared {operation:?} result {result:?}"
-                    ),
+                match operation {
+                    MutationOperation::Stop => match result {
+                        Ok(()) => accepted_stops += 1,
+                        Err(ClientError::ControlRejected { failure })
+                            if failure.error.code == ErrorCode::InvalidRunState =>
+                        {
+                            rejected_stops += 1;
+                        }
+                        result => panic!(
+                            "seed {seed} case {case_index}: undeclared Stop result {result:?}"
+                        ),
+                    },
+                    operation @ (MutationOperation::Input(_) | MutationOperation::Resize(_)) => {
+                        match result {
+                            Ok(()) => {}
+                            Err(ClientError::ControlRejected { failure })
+                                if matches!(
+                                    failure.error.code,
+                                    ErrorCode::InvalidRunState | ErrorCode::Io
+                                ) => {}
+                            result => panic!(
+                                "seed {seed} case {case_index}: undeclared {operation:?} result {result:?}"
+                            ),
+                        }
+                    }
                 }
             }
             assert_eq!(
@@ -3607,7 +3464,7 @@ mod tests {
         .await
         .expect("child reaches raw-input barrier");
 
-        let (mut lagged_attachment, initial) = client
+        let (lagged_attachment, initial) = client
             .attach(run.id, 0)
             .await
             .expect("open public attachment before output");

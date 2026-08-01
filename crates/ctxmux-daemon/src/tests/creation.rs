@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_control::InputDrainGate;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
@@ -87,17 +88,19 @@ async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
         .get(original.id)
         .expect("resolve shutdown fixture Run")
         .stop()
+        .await
         .expect("stop shutdown fixture Run");
     wait_for_run_terminal_async(&manager.get(original.id).unwrap()).await;
 }
 
-#[test]
-fn memory_only_output_does_not_take_durable_transition_locks() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_only_output_does_not_take_durable_transition_locks() {
     let run = Run::spawn(
         long_running_spec(),
         None,
         PersistenceMode::MemoryOnly,
         LIVE_EVENT_CAPACITY,
+        InputDrainGate::default(),
     )
     .expect("spawn memory-only output fixture");
     let transition = mutex_lock(&run.persistence_transition);
@@ -124,7 +127,7 @@ fn memory_only_output_does_not_take_durable_transition_locks() {
         b"memory-only-fast-path"
     );
 
-    run.stop().expect("stop memory-only output fixture");
+    run.stop().await.expect("stop memory-only output fixture");
     wait_for_run_terminal(&run);
     wait_for_direct_run_workers(&run);
 }
@@ -448,6 +451,7 @@ async fn committed_creation_survives_a_post_commit_failure_and_restart() {
         .get(original.id)
         .expect("resolve committed Run")
         .stop()
+        .await
         .expect("stop committed Run");
     wait_for_run_terminal_async(&manager.get(original.id).unwrap()).await;
     assert!(!manager.get(original.id).unwrap().info().state.is_running());

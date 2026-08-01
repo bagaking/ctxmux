@@ -2,12 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  Attachment,
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationUnavailableError,
   registerIntegration,
 } from "../src/index.ts";
+import { rememberRunEventSource } from "../src/attachment.ts";
 import type {
   Integration,
   IntegrationDetectionOptions,
@@ -238,15 +238,7 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
     },
   };
   const chunk = { seq: 1, data: [65] };
-  new Attachment({} as never, {
-    run: parent,
-    replay: {
-      chunks: [chunk],
-      oldest_seq: 1,
-      head_seq: 1,
-      truncated: false,
-    },
-  });
+  rememberRunEventSource({ type: "output", chunk }, parent.id);
   const registered = registerIntegration(client, downgraded);
   const receipt = registered
     .createObserver(parent)

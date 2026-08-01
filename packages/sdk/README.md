@@ -63,7 +63,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 4 imports by socket path plus pane ID, an ambiguous linked
+because generation 5 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -161,8 +161,10 @@ produce a passing artifact.
 ```ts
 const attachment = await client.attach(run.id);
 
-await attachment.input("printf 'hello\\n'\n");
-await attachment.resize({ cols: 100, rows: 30 });
+const input = await attachment.input("printf 'hello\\n'\n");
+const resize = await attachment.resize({ cols: 100, rows: 30 });
+console.log(input.commandId, input.receipt.written_bytes);
+console.log(resize.commandId, resize.receipt.applied_size);
 
 for await (const event of attachment.events()) {
   if (event.type === "output") {
@@ -177,15 +179,31 @@ disconnect. `detach()` resolves after the daemon acknowledges `Detached`;
 `close()` returns immediately without sending that frame. Both leave a live Run
 running. `stop()` explicitly terminates it.
 
-On a live attachment, `input()`, `resize()`, and `stop()` resolve when Node's
-socket write callback completes. The daemon reports remote acceptance or error
-through the attachment event stream. Generation 4 has no command correlation
-ID, so these promises must not be treated as remote acknowledgements. Short
-`CtxmuxClient` request methods do wait for their protocol response.
+On a live attachment, `input()`, `resize()`, and `stop()` allocate a
+connection-local command ID and resolve only after the daemon returns the
+matching owner receipt. One background receive pump demultiplexes command
+results from Run events, so a slow event consumer cannot steal an acknowledgement
+or block control correlation. Pending controls are bounded to 64 commands, of
+which at most 32 may be input, with at most 1 MiB of raw input pending; this
+keeps capacity available for resize and stop.
+
+An input receipt proves that all reported bytes reached the daemon-owned PTY
+write boundary, not that the child consumed or interpreted them. A resize
+receipt contains the size read back from the owning PTY, which may differ from
+the request. A stop receipt means the direct-child owner accepted termination;
+the final `exited` event remains a later lifecycle fact.
+
+`CtxmuxClient.input()`, `resize()`, and `stop()` expose the same typed receipts
+as `{ run, receipt }` over short-lived connections. A rejected control throws
+`CtxmuxCommandError` with `not_applied` or `unknown`. If a sent command loses its
+unique result, the SDK reports `unknown`, closes that attachment when required,
+and never reconnects, replays, or guesses. Callers must not automatically retry
+uncertain input. `detach()` first fences new commands, waits for every pending
+result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterSeq)` resumes ordered output after the last observed sequence.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 4 represents cursors as
+4 MiB replay contains the complete history. Generation 5 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 
@@ -201,6 +219,10 @@ first-frame payload.
 Every daemon frame is runtime-validated before generated TypeScript types are
 exposed. Malformed JSON, invalid UTF-8, duplicate object members, invalid nested
 variants, and unsafe cursor integers fail closed with a boundary error.
+Live events are queued under fixed count and byte budgets. Only dropped output
+may be coalesced into an explicit `gap`; tmux and other non-output events are
+never disguised as output loss, and terminal lifecycle gets an independent
+reserved slot.
 
 ## Protocol source of truth
 

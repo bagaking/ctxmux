@@ -144,6 +144,50 @@
       ]
     },
     {
+      "id": "rust-client-attachment-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-client/src/attachment.rs",
+      "invariants": [
+        "one attachment reader correlates bounded pending controls while event pressure remains separately bounded and explicit",
+        "lost transport and invalid receipts fail unresolved commands closed as unknown rather than replaying uncertain input"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "daemon-attachment-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/attachment.rs",
+      "invariants": [
+        "replay and live events stay distinct from correlated control results while attachment command identifiers remain strictly increasing"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-control-owner-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/native_control.rs",
+      "invariants": [
+        "native input receipts follow complete PTY writes, resize receipts follow PTY readback, and stop acceptance stays distinct from terminal publication",
+        "per-Run input admission and daemon-wide lazy drain workers remain bounded without starving resize or stop"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "persistence-store-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/persistence.rs",
@@ -271,7 +315,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-4 frames, creation keys, limits, identifiers, and duplicate rejection are exact"
+        "generation-5 frames, creation keys, correlated controls, limits, identifiers, and duplicate rejection are exact"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",

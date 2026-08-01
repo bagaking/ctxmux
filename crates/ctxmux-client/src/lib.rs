@@ -3,16 +3,20 @@
 #[cfg(not(unix))]
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
+mod attachment;
+
+pub use attachment::Attachment;
+
 use std::{
     io,
     path::{Path, PathBuf},
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, ClientHello, CreateOperationKey, ForkPlan, FrameError,
-    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response,
-    RunEvent, RunId, RunInfo, RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame,
-    encode_frame,
+    AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
+    ControlFailure, ControlReceipt, CreateOperationKey, ForkPlan, FrameError, MAX_FRAME_BYTES,
+    OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId,
+    RunInfo, RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -50,9 +54,150 @@ pub enum ClientError {
         /// Human-readable detail.
         message: String,
     },
+    /// A correlated control request was rejected with a known application
+    /// boundary.
+    #[error("ctxmux control request was rejected: {failure:?}")]
+    ControlRejected {
+        /// Typed daemon failure, including whether the command may have been
+        /// applied.
+        failure: ControlFailure,
+    },
+    /// A short-lived control request was sent but its unique correlated result
+    /// was not proven.
+    #[error("ctxmux short-lived control request has unknown disposition: {source}")]
+    ControlRequestUnknown {
+        /// Transport or contract failure that prevented a unique result.
+        #[source]
+        source: Box<ClientError>,
+    },
+    /// A local control preflight failed before the command reached transport.
+    #[error("ctxmux control command was not applied: {source}")]
+    ControlNotApplied {
+        /// Local connection or encoding failure observed before send.
+        #[source]
+        source: Box<ClientError>,
+    },
+    /// The client could not admit another attachment command without
+    /// violating its local hard bounds.
+    #[error("ctxmux attachment command backpressure: {limit}")]
+    AttachmentBackpressure {
+        /// Bound that rejected the command before an ID was allocated.
+        limit: &'static str,
+    },
+    /// The attachment no longer accepts new commands.
+    #[error("ctxmux attachment does not accept new commands: {reason}")]
+    AttachmentUnavailable {
+        /// Stable local reason for fencing new commands.
+        reason: AttachmentUnavailableReason,
+    },
+    /// An attachment command lost its unique result and may have crossed its
+    /// owner boundary.
+    #[error("ctxmux attachment command {command_id:?} has unknown disposition: {reason}")]
+    AttachmentCommandUnknown {
+        /// Connection-local command correlation identity.
+        command_id: AttachmentCommandId,
+        /// Why the client cannot prove the command result.
+        reason: AttachmentUnknownReason,
+    },
+    /// More than one caller tried to await the same attachment event stream.
+    #[error("only one Attachment::next_event call may be active at a time")]
+    ConcurrentEventRead,
+    /// The daemon violated a control receipt or attachment delivery invariant.
+    #[error("ctxmux protocol contract violated: {0}")]
+    ProtocolContractViolation(&'static str),
     /// The daemon returned a valid frame in the wrong protocol state.
     #[error("unexpected ctxmux frame: {0}")]
     UnexpectedFrame(&'static str),
+}
+
+impl ClientError {
+    /// Return the known application disposition for a failed control command.
+    ///
+    /// `None` means the error is not itself a correlated control outcome.
+    #[must_use]
+    pub const fn control_disposition(&self) -> Option<CommandDisposition> {
+        match self {
+            Self::ControlRejected { failure } => Some(failure.disposition),
+            Self::ControlRequestUnknown { .. } | Self::AttachmentCommandUnknown { .. } => {
+                Some(CommandDisposition::Unknown)
+            }
+            Self::ControlNotApplied { .. }
+            | Self::AttachmentBackpressure { .. }
+            | Self::AttachmentUnavailable { .. } => Some(CommandDisposition::NotApplied),
+            Self::Connect { .. }
+            | Self::Closed
+            | Self::Transport(_)
+            | Self::Frame(_)
+            | Self::Protocol { .. }
+            | Self::ConcurrentEventRead
+            | Self::ProtocolContractViolation(_)
+            | Self::UnexpectedFrame(_) => None,
+        }
+    }
+}
+
+/// Why an Attachment no longer admits commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AttachmentUnavailableReason {
+    /// A clean detach has started.
+    #[error("clean detach is in progress")]
+    Detaching,
+    /// The connection has terminated or was closed locally.
+    #[error("the attachment is closed")]
+    Closed,
+    /// The connection-local u32 command-id space was consumed.
+    #[error("the attachment command-id space is exhausted")]
+    CommandIdsExhausted,
+}
+
+/// Why a sent or ambiguously sent attachment command has no unique result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum AttachmentUnknownReason {
+    /// The transport ended before the unique result arrived.
+    #[error("the attachment transport terminated")]
+    TransportTerminated,
+    /// A daemon frame violated correlation or receipt invariants.
+    #[error("the daemon violated the attachment protocol")]
+    ProtocolViolation,
+    /// The caller abruptly closed the attachment.
+    #[error("the attachment was closed locally")]
+    ClosedLocally,
+}
+
+/// Typed receipt for one complete PTY input write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputReceipt {
+    /// Bytes that reached the daemon-owned PTY write boundary.
+    pub written_bytes: u32,
+}
+
+/// Typed receipt for one applied PTY resize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResizeReceipt {
+    /// Size read back from the owning PTY.
+    pub applied_size: TerminalSize,
+}
+
+/// Typed receipt that the direct-child owner accepted a stop request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopReceipt;
+
+/// One accepted short-lived control request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlAccepted<R> {
+    /// Current Run metadata returned with the owner receipt.
+    pub run: RunInfo,
+    /// Operation-specific owner-boundary receipt.
+    pub receipt: R,
+}
+
+/// One accepted command on a persistent attachment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentControlAccepted<R> {
+    /// Connection-local command correlation identity.
+    pub command_id: AttachmentCommandId,
+    /// Operation-specific owner-boundary receipt.
+    pub receipt: R,
 }
 
 impl From<ProtocolError> for ClientError {
@@ -247,11 +392,16 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] when the Run is not live or PTY input fails.
-    pub async fn input(&self, id: RunId, data: Vec<u8>) -> Result<RunInfo, ClientError> {
-        match self.request(Request::Input { id, data }).await? {
-            Response::Accepted { run } => Ok(run),
-            _ => Err(ClientError::UnexpectedFrame("expected accepted response")),
-        }
+    pub async fn input(
+        &self,
+        id: RunId,
+        data: Vec<u8>,
+    ) -> Result<ControlAccepted<InputReceipt>, ClientError> {
+        let expected_bytes = data.len();
+        decode_short_control(
+            self.control_request(Request::Input { id, data }).await?,
+            |receipt| decode_input_receipt(receipt, expected_bytes),
+        )
     }
 
     /// Resize one live Run.
@@ -260,11 +410,15 @@ impl Client {
     ///
     /// Returns [`ClientError`] when the size is invalid, the Run is not live,
     /// or the PTY resize fails.
-    pub async fn resize(&self, id: RunId, size: TerminalSize) -> Result<RunInfo, ClientError> {
-        match self.request(Request::Resize { id, size }).await? {
-            Response::Accepted { run } => Ok(run),
-            _ => Err(ClientError::UnexpectedFrame("expected accepted response")),
-        }
+    pub async fn resize(
+        &self,
+        id: RunId,
+        size: TerminalSize,
+    ) -> Result<ControlAccepted<ResizeReceipt>, ClientError> {
+        decode_short_control(
+            self.control_request(Request::Resize { id, size }).await?,
+            decode_resize_receipt,
+        )
     }
 
     /// Terminate one live Run.
@@ -272,11 +426,11 @@ impl Client {
     /// # Errors
     ///
     /// Returns [`ClientError`] when the Run is not live or termination fails.
-    pub async fn stop(&self, id: RunId) -> Result<RunInfo, ClientError> {
-        match self.request(Request::Stop { id }).await? {
-            Response::Accepted { run } => Ok(run),
-            _ => Err(ClientError::UnexpectedFrame("expected accepted response")),
-        }
+    pub async fn stop(&self, id: RunId) -> Result<ControlAccepted<StopReceipt>, ClientError> {
+        decode_short_control(
+            self.control_request(Request::Stop { id }).await?,
+            decode_stop_receipt,
+        )
     }
 
     /// Attach after the last output sequence already observed by the caller.
@@ -311,7 +465,7 @@ impl Client {
                     },
                 };
                 receive_replay(&mut wire, after_seq, &mut snapshot).await?;
-                Ok((Attachment { wire }, snapshot))
+                Ok((Attachment::from_wire(wire), snapshot))
             }
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected attached snapshot")),
@@ -325,6 +479,24 @@ impl Client {
             ServerFrame::Response { response } => Ok(response),
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected request response")),
+        }
+    }
+
+    async fn control_request(&self, request: Request) -> Result<Response, ClientError> {
+        let mut wire = self.connect().await.map_err(control_not_applied)?;
+        let encoded = encode_frame(&ClientFrame::Request { request })
+            .map_err(ClientError::Frame)
+            .map_err(control_not_applied)?;
+        send_encoded_sink(&mut wire, encoded)
+            .await
+            .map_err(control_request_unknown)?;
+        let frame = receive(&mut wire).await.map_err(control_request_unknown)?;
+        match frame {
+            ServerFrame::Response { response } => Ok(response),
+            ServerFrame::Error { error } => Err(control_request_unknown(error.into())),
+            _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
+                "expected correlated control response",
+            ))),
         }
     }
 
@@ -350,6 +522,95 @@ impl Client {
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected compatible hello")),
         }
+    }
+}
+
+fn decode_short_control<R>(
+    response: Response,
+    decode_receipt: impl FnOnce(&ControlReceipt) -> Result<R, ClientError>,
+) -> Result<ControlAccepted<R>, ClientError> {
+    match response {
+        Response::ControlAccepted { run, receipt } => decode_receipt(&receipt)
+            .map(|receipt| ControlAccepted { run, receipt })
+            .map_err(control_request_unknown),
+        Response::ControlRejected { failure } => {
+            validate_control_failure(&failure)
+                .map_err(ClientError::ProtocolContractViolation)
+                .map_err(control_request_unknown)?;
+            Err(ClientError::ControlRejected { failure })
+        }
+        _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
+            "expected correlated control response",
+        ))),
+    }
+}
+
+fn control_request_unknown(source: ClientError) -> ClientError {
+    ClientError::ControlRequestUnknown {
+        source: Box::new(source),
+    }
+}
+
+fn control_not_applied(source: ClientError) -> ClientError {
+    ClientError::ControlNotApplied {
+        source: Box::new(source),
+    }
+}
+
+fn validate_control_failure(failure: &ControlFailure) -> Result<(), &'static str> {
+    if failure.error.code == ctxmux_protocol::ErrorCode::ControlBackpressure
+        && failure.disposition != CommandDisposition::NotApplied
+    {
+        return Err("control_backpressure must have not_applied disposition");
+    }
+    Ok(())
+}
+
+fn decode_input_receipt(
+    receipt: &ControlReceipt,
+    expected_bytes: usize,
+) -> Result<InputReceipt, ClientError> {
+    match receipt {
+        ControlReceipt::Input { written_bytes }
+            if usize::try_from(*written_bytes).ok() == Some(expected_bytes) =>
+        {
+            Ok(InputReceipt {
+                written_bytes: *written_bytes,
+            })
+        }
+        ControlReceipt::Input { .. } => Err(ClientError::ProtocolContractViolation(
+            "input receipt byte count differs from the command payload",
+        )),
+        ControlReceipt::Resize { .. } | ControlReceipt::Stop => Err(
+            ClientError::ProtocolContractViolation("input returned another receipt kind"),
+        ),
+    }
+}
+
+fn decode_resize_receipt(receipt: &ControlReceipt) -> Result<ResizeReceipt, ClientError> {
+    match receipt {
+        ControlReceipt::Resize { applied_size }
+            if applied_size.cols != 0 && applied_size.rows != 0 =>
+        {
+            Ok(ResizeReceipt {
+                applied_size: *applied_size,
+            })
+        }
+        ControlReceipt::Resize { .. } => Err(ClientError::ProtocolContractViolation(
+            "resize receipt reported a zero applied dimension",
+        )),
+        ControlReceipt::Input { .. } | ControlReceipt::Stop => Err(
+            ClientError::ProtocolContractViolation("resize returned another receipt kind"),
+        ),
+    }
+}
+
+fn decode_stop_receipt(receipt: &ControlReceipt) -> Result<StopReceipt, ClientError> {
+    match receipt {
+        ControlReceipt::Stop => Ok(StopReceipt),
+        ControlReceipt::Input { .. } | ControlReceipt::Resize { .. } => Err(
+            ClientError::ProtocolContractViolation("stop returned another receipt kind"),
+        ),
     }
 }
 
@@ -393,76 +654,6 @@ async fn receive_replay(
     }
 }
 
-/// Live attachment to one daemon-owned Run.
-pub struct Attachment {
-    wire: Wire,
-}
-
-impl Attachment {
-    /// Write bytes through this attachment.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] when the attachment transport is closed or
-    /// cannot encode the frame.
-    pub async fn input(&mut self, data: Vec<u8>) -> Result<(), ClientError> {
-        send(&mut self.wire, &ClientFrame::Input { data }).await
-    }
-
-    /// Resize through this attachment.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] when the attachment transport is closed or
-    /// cannot encode the frame.
-    pub async fn resize(&mut self, size: TerminalSize) -> Result<(), ClientError> {
-        send(&mut self.wire, &ClientFrame::Resize { size }).await
-    }
-
-    /// Stop the attached Run.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] when the attachment transport is closed or
-    /// cannot encode the frame.
-    pub async fn stop(&mut self) -> Result<(), ClientError> {
-        send(&mut self.wire, &ClientFrame::Stop).await
-    }
-
-    /// Wait for the next live Run event. A clean detach or closed daemon returns `None`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] when transport, frame decoding, or a Run
-    /// operation reports an error.
-    pub async fn next_event(&mut self) -> Result<Option<RunEvent>, ClientError> {
-        match receive_optional(&mut self.wire).await? {
-            Some(ServerFrame::Event { event }) => Ok(Some(event)),
-            Some(ServerFrame::Detached) | None => Ok(None),
-            Some(ServerFrame::Error { error }) => Err(error.into()),
-            Some(_) => Err(ClientError::UnexpectedFrame("expected attachment event")),
-        }
-    }
-
-    /// Detach cleanly without affecting the Run.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ClientError`] when the detach frame cannot be sent or the
-    /// acknowledgement cannot be read.
-    pub async fn detach(mut self) -> Result<(), ClientError> {
-        send(&mut self.wire, &ClientFrame::Detach).await?;
-        loop {
-            match receive_optional(&mut self.wire).await? {
-                Some(ServerFrame::Detached) | None => return Ok(()),
-                Some(ServerFrame::Event { .. }) => {}
-                Some(ServerFrame::Error { error }) => return Err(error.into()),
-                Some(_) => return Err(ClientError::UnexpectedFrame("expected detached frame")),
-            }
-        }
-    }
-}
-
 fn codec() -> LinesCodec {
     LinesCodec::new_with_max_length(MAX_FRAME_BYTES)
 }
@@ -475,7 +666,14 @@ async fn send_sink<S>(sink: &mut S, frame: &ClientFrame) -> Result<(), ClientErr
 where
     S: futures_util::Sink<String, Error = LinesCodecError> + Unpin,
 {
-    sink.send(encode_frame(frame)?).await?;
+    send_encoded_sink(sink, encode_frame(frame)?).await
+}
+
+async fn send_encoded_sink<S>(sink: &mut S, encoded: String) -> Result<(), ClientError>
+where
+    S: futures_util::Sink<String, Error = LinesCodecError> + Unpin,
+{
+    sink.send(encoded).await?;
     Ok(())
 }
 

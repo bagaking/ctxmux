@@ -67,12 +67,13 @@ export class JsonLinesConnection {
   }
 
   public async send(value: unknown): Promise<void> {
+    await this.sendEncoded(encodeJsonLine(value));
+  }
+
+  /** Send one line already encoded by {@link encodeJsonLine}. */
+  public async sendEncoded(payload: string): Promise<void> {
     if (this.#terminalError !== undefined) {
       throw this.#terminalError;
-    }
-    const payload = `${JSON.stringify(value)}\n`;
-    if (Buffer.byteLength(payload) - 1 > MAX_FRAME_BYTES) {
-      throw new RangeError(`ctxmux frame exceeds ${MAX_FRAME_BYTES} bytes`);
     }
     await new Promise<void>((resolve, reject) => {
       const pending: PendingWrite = { reject };
@@ -230,6 +231,15 @@ export class JsonLinesConnection {
       waiting.reject(error);
     }
   }
+}
+
+/** Encode and size-check one outbound JSON-lines frame before owner admission. */
+export function encodeJsonLine(value: unknown): string {
+  const payload = `${JSON.stringify(value)}\n`;
+  if (Buffer.byteLength(payload) - 1 > MAX_FRAME_BYTES) {
+    throw new RangeError(`ctxmux frame exceeds ${MAX_FRAME_BYTES} bytes`);
+  }
+  return payload;
 }
 
 /** @internal Parse one complete wire frame for corpus and fuzz qualification. */

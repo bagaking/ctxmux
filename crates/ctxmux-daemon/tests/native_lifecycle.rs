@@ -8,11 +8,12 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    ClientFrame, ClientHello, CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, RunEvent, RunId, RunInputKind, RunInputReference,
-    RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
+    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    Request, RunEvent, RunId, RunInputKind, RunInputReference, RunLineage, RunSpec, RunState,
+    ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, future::join_all};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -137,6 +138,62 @@ fn interactive_shell() -> RunSpec {
     }
 }
 
+fn raw_capture_shell(expected_bytes: usize) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            format!(
+                concat!(
+                    "stty raw -echo; ",
+                    "printf 'READY\\n'; ",
+                    "dd bs=1 count={} 2>/dev/null | od -An -v -tx1; ",
+                    "trap 'printf \\\"FINAL\\n\\\"; exit 0' HUP TERM; ",
+                    "printf 'CAPTURED\\n'; ",
+                    "while IFS= read -r ignored; do :; done"
+                ),
+                expected_bytes
+            ),
+        ],
+        cwd: None,
+        env: BTreeMap::default(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn non_reading_shell() -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "stty raw -echo; printf 'READY\\n'; exec /bin/sleep 30".to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::default(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn fragmented_terminal_chunks() -> Vec<Vec<u8>> {
+    let fragments = [
+        b"\x1b[".as_slice(),
+        b"200~".as_slice(),
+        b"pasted".as_slice(),
+        b"-bytes".as_slice(),
+        b"\x1b".as_slice(),
+        b"[201~".as_slice(),
+        b"\x1b[<".as_slice(),
+        b"0;40;12".as_slice(),
+        b"M".as_slice(),
+        b"raw".as_slice(),
+    ];
+    (0..1_000)
+        .map(|index| fragments[index % fragments.len()].to_vec())
+        .collect()
+}
+
 fn marker_shell(marker: &Path) -> RunSpec {
     RunSpec {
         program: "/bin/sh".to_owned(),
@@ -231,6 +288,19 @@ async fn send_request_without_reading_response(client: &Client, request: Request
     drop(wire);
 }
 
+async fn receive_server_frame(
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    context: &str,
+) -> ServerFrame {
+    let line = timeout(Duration::from_secs(5), wire.next())
+        .await
+        .unwrap_or_else(|_| panic!("timed out while {context}"))
+        .unwrap_or_else(|| panic!("daemon closed while {context}"))
+        .unwrap_or_else(|error| panic!("transport failed while {context}: {error}"));
+    decode_frame(&line)
+        .unwrap_or_else(|error| panic!("invalid server frame while {context}: {error}"))
+}
+
 async fn wait_for_run_count(client: &Client, expected: usize) -> Vec<ctxmux_protocol::RunInfo> {
     timeout(Duration::from_secs(5), async {
         loop {
@@ -280,7 +350,6 @@ async fn wait_for_output(
                     *last_seq = chunk.seq;
                     observed.extend_from_slice(&chunk.data);
                 }
-                RunEvent::Accepted { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
                 RunEvent::Exited { state } => {
                     panic!("Run exited before expected output: {state:?}")
@@ -306,7 +375,7 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                 .expect("exit event arrives before attachment closes")
             {
                 RunEvent::Exited { state } => return state,
-                RunEvent::Output { .. } | RunEvent::Accepted { .. } => {}
+                RunEvent::Output { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
                 RunEvent::Interrupted { reason } => {
                     panic!("live Run was unexpectedly interrupted: {reason:?}")
@@ -445,6 +514,7 @@ fn malformed_protocol_frames() -> Vec<(String, Vec<u8>)> {
 fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
     match error {
         ClientError::Protocol { code, .. } => assert_eq!(code, expected),
+        ClientError::ControlRejected { failure } => assert_eq!(failure.error.code, expected),
         other => panic!("expected protocol error {expected:?}, got {other:?}"),
     }
 }
@@ -600,6 +670,386 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
             .expect_err("unknown Run is rejected"),
         ErrorCode::RunNotFound,
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real-PTY proof keeps command correlation, raw-byte fidelity, resize readback, and stop ordering auditable together"
+)]
+async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering() {
+    let daemon = TestDaemon::start().await;
+    let chunks = fragmented_terminal_chunks();
+    let expected = chunks.concat();
+    let run = daemon
+        .client
+        .start(raw_capture_shell(expected.len()))
+        .await
+        .expect("start raw capture Run");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach raw pipeline client");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let requested_size = TerminalSize {
+        rows: 41,
+        cols: 123,
+    };
+    let mut command_ids = Vec::with_capacity(1_001);
+    let mut resize_receipt = None;
+    for (window_index, window) in chunks.chunks(31).enumerate() {
+        let input_results = join_all(window.iter().cloned().map(|data| {
+            let attachment = &attachment;
+            async move {
+                let expected_bytes = u32::try_from(data.len()).expect("fixture chunk fits u32");
+                let accepted = attachment
+                    .input(data)
+                    .await
+                    .expect("pipeline input accepted");
+                assert_eq!(accepted.receipt.written_bytes, expected_bytes);
+                accepted.command_id.get()
+            }
+        }));
+        if window_index == 7 {
+            let (input_ids, resize) =
+                tokio::join!(input_results, attachment.resize(requested_size));
+            command_ids.extend(input_ids);
+            let resize = resize.expect("concurrent resize accepted");
+            command_ids.push(resize.command_id.get());
+            resize_receipt = Some(resize.receipt);
+        } else {
+            command_ids.extend(input_results.await);
+        }
+    }
+    command_ids.sort_unstable();
+    assert_eq!(
+        command_ids,
+        (1..=1_001).collect::<Vec<_>>(),
+        "every pipelined command has one unique correlated result"
+    );
+    assert_eq!(
+        resize_receipt
+            .expect("fixture issues one resize")
+            .applied_size,
+        requested_size,
+        "resize receipt comes from PTY readback"
+    );
+
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"CAPTURED").await;
+    let ready = observed
+        .windows(b"READY\n".len())
+        .position(|window| window == b"READY\n")
+        .expect("raw child published readiness")
+        + b"READY\n".len();
+    let captured = observed[ready..]
+        .windows(b"CAPTURED".len())
+        .position(|window| window == b"CAPTURED")
+        .expect("raw child published capture marker")
+        + ready;
+    let oracle = std::str::from_utf8(&observed[ready..captured])
+        .expect("od byte oracle is ASCII")
+        .split_ascii_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("od emits hexadecimal bytes"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        oracle, expected,
+        "real PTY preserved every opaque input byte"
+    );
+
+    let mut stop = Box::pin(attachment.stop());
+    let mut stop_command_id = None;
+    let mut after_stop_output = Vec::new();
+    let terminal = timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                biased;
+                accepted = &mut stop, if stop_command_id.is_none() => {
+                    let accepted = accepted.expect("stop reaches child owner");
+                    stop_command_id = Some(accepted.command_id.get());
+                }
+                event = attachment.next_event() => {
+                    match event
+                        .expect("read post-stop event")
+                        .expect("terminal event precedes attachment EOF")
+                    {
+                        RunEvent::Output { chunk } => after_stop_output.extend_from_slice(&chunk.data),
+                        RunEvent::Exited { state } => {
+                            assert!(stop_command_id.is_some(), "stop receipt precedes Exited");
+                            assert!(
+                                after_stop_output.windows(b"FINAL".len()).any(|bytes| bytes == b"FINAL"),
+                                "final child output precedes Exited"
+                            );
+                            return state;
+                        }
+                        RunEvent::Gap { head_seq } => panic!("unexpected post-stop gap at {head_seq}"),
+                        RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
+                        RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("stop receipt, final output, and exit arrive");
+    assert_eq!(stop_command_id, Some(1_002));
+    assert_eq!(
+        terminal,
+        RunState::Exited {
+            code: 0,
+            signal: None,
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one non-reading real PTY proves daemon backpressure and the independent resize/stop lanes under saturation"
+)]
+async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop() {
+    const SEED_ATTACHMENTS: usize = 17;
+    const INPUTS_PER_ATTACHMENT: usize = 32;
+    const INPUT_BYTES: usize = 8 * 1024;
+
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(non_reading_shell())
+        .await
+        .expect("start non-reading PTY Run");
+    let (mut control, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach independent control lane");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut control, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let mut seed_tasks = Vec::with_capacity(SEED_ATTACHMENTS);
+    for _ in 0..SEED_ATTACHMENTS {
+        let (attachment, _) = daemon
+            .client
+            .attach(run.id, last_seq)
+            .await
+            .expect("attach input saturation client");
+        seed_tasks.push(tokio::spawn(async move {
+            let payload = vec![b'x'; INPUT_BYTES];
+            join_all((0..INPUTS_PER_ATTACHMENT).map(|_| attachment.input(payload.clone()))).await
+        }));
+    }
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            let (probe, _) = daemon
+                .client
+                .attach(run.id, last_seq)
+                .await
+                .expect("attach input backpressure probe");
+            match timeout(
+                Duration::from_millis(250),
+                probe.input(vec![b'p'; INPUT_BYTES]),
+            )
+            .await
+            {
+                Ok(Err(ClientError::ControlRejected { failure }))
+                    if failure.error.code == ErrorCode::ControlBackpressure =>
+                {
+                    assert_eq!(failure.disposition, CommandDisposition::NotApplied);
+                    return;
+                }
+                Ok(Ok(_)) | Err(_) => drop(probe),
+                Ok(Err(error)) => panic!("unexpected saturation probe result: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("real PTY reaches the daemon input queue bound");
+
+    let requested_size = TerminalSize {
+        rows: 43,
+        cols: 127,
+    };
+    let resize = timeout(Duration::from_secs(2), control.resize(requested_size))
+        .await
+        .expect("resize is not starved by saturated input")
+        .expect("resize reaches the PTY owner");
+    assert_eq!(resize.command_id.get(), 1);
+    assert_eq!(resize.receipt.applied_size, requested_size);
+    let stop = timeout(Duration::from_secs(3), control.stop())
+        .await
+        .expect("stop is not starved by saturated input")
+        .expect("stop reaches the child owner");
+    assert_eq!(stop.command_id.get(), 2);
+
+    let terminal = timeout(Duration::from_secs(5), async {
+        loop {
+            match control
+                .next_event()
+                .await
+                .expect("read saturated Run event")
+                .expect("Exited precedes attachment EOF")
+            {
+                RunEvent::Exited { state } => return state,
+                RunEvent::Output { .. } => {}
+                RunEvent::Gap { head_seq } => panic!("unexpected saturation gap at {head_seq}"),
+                RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
+                RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("saturated Run publishes Exited after stop acceptance");
+    assert!(!terminal.is_running());
+
+    let mut not_applied = 0;
+    for task in seed_tasks {
+        let results = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("saturated input task resolves after stop")
+            .expect("saturated input task does not panic");
+        for result in results {
+            match result {
+                Ok(_) | Err(ClientError::AttachmentCommandUnknown { .. }) => {}
+                Err(ClientError::ControlRejected { failure }) => {
+                    if failure.disposition == CommandDisposition::NotApplied {
+                        not_applied += 1;
+                    }
+                }
+                Err(error) => panic!("unexpected saturated input result: {error:?}"),
+            }
+        }
+    }
+    assert!(
+        not_applied > 0,
+        "stop rejects queued commands that never reached PTY I/O"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one raw connection proves the command-id fence precedes PTY mutation and closes transport"
+)]
+async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start command-id fence Run");
+    let stream = UnixStream::connect(daemon.client.socket_path())
+        .await
+        .expect("connect raw attachment");
+    let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
+    wire.send(
+        encode_frame(&ClientFrame::Hello {
+            hello: ClientHello {
+                protocol: PROTOCOL_VERSION,
+            },
+        })
+        .expect("encode current hello"),
+    )
+    .await
+    .expect("send current hello");
+    assert!(matches!(
+        receive_server_frame(&mut wire, "reading attachment hello").await,
+        ServerFrame::Hello {
+            protocol: PROTOCOL_VERSION
+        }
+    ));
+    wire.send(
+        encode_frame(&ClientFrame::Request {
+            request: Request::Attach {
+                id: run.id,
+                after_seq: 0,
+            },
+        })
+        .expect("encode raw attach"),
+    )
+    .await
+    .expect("send raw attach");
+    assert!(matches!(
+        receive_server_frame(&mut wire, "reading attached header").await,
+        ServerFrame::Attached { .. }
+    ));
+
+    for (command_id, data) in [(1, b"A".to_vec()), (3, Vec::new())] {
+        let command_id = AttachmentCommandId::new(command_id).unwrap();
+        wire.send(
+            encode_frame(&ClientFrame::Input { command_id, data }).expect("encode ordered input"),
+        )
+        .await
+        .expect("send ordered input");
+        loop {
+            if let ServerFrame::CommandResult {
+                command_id: returned,
+                outcome: ControlOutcome::Accepted { .. },
+            } = receive_server_frame(&mut wire, "awaiting ordered command result").await
+            {
+                assert_eq!(returned, command_id);
+                break;
+            }
+        }
+    }
+
+    wire.send(
+        encode_frame(&ClientFrame::Input {
+            command_id: AttachmentCommandId::new(2).unwrap(),
+            data: b"B".to_vec(),
+        })
+        .expect("encode backward input"),
+    )
+    .await
+    .expect("send backward input");
+    loop {
+        if let ServerFrame::Error { error } =
+            receive_server_frame(&mut wire, "awaiting fatal command-id error").await
+        {
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+            break;
+        }
+    }
+    assert!(
+        timeout(Duration::from_secs(5), wire.next())
+            .await
+            .expect("fatal attachment close is bounded")
+            .is_none(),
+        "command-id violation closes the attachment"
+    );
+
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("reattach after fatal command-id violation");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    let reconnected = attachment
+        .input(b"\n".to_vec())
+        .await
+        .expect("complete the line after reattach");
+    assert_eq!(
+        reconnected.command_id.get(),
+        1,
+        "a fresh attachment restarts its connection-local command IDs"
+    );
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"OUT:A").await;
+    assert!(
+        !observed
+            .windows(b"OUT:AB".len())
+            .any(|bytes| bytes == b"OUT:AB"),
+        "backward command mutated the PTY before the fatal fence"
+    );
+    attachment.stop().await.expect("stop command-id fence Run");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -789,19 +1239,64 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_3_before_request_dispatch() {
+async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
+    let daemon = TestDaemon::start().await;
+    let parent = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "exit 0".to_owned()],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start short-lived Level B parent");
+    assert!(matches!(
+        wait_until_exited(&daemon.client, parent.id).await,
+        RunState::Exited { .. }
+    ));
+
+    assert_protocol_error(
+        daemon
+            .client
+            .fork(
+                parent.id,
+                ForkPlan::LevelB {
+                    spec: interactive_shell(),
+                },
+            )
+            .await
+            .expect_err("exited parent has no live Level B continuation authority"),
+        ErrorCode::InvalidRunState,
+    );
     assert_eq!(
-        PROTOCOL_VERSION, 4,
+        daemon
+            .client
+            .list()
+            .await
+            .expect("list retained Runs")
+            .len(),
+        1,
+        "rejected Level B fork must not publish a child",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_rejects_generation_4_before_request_dispatch() {
+    assert_eq!(
+        PROTOCOL_VERSION, 5,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_3_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 3 },
+    let generation_4_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 4 },
     })
-    .expect("encode generation-2 hello");
+    .expect("encode generation-4 hello");
     let start = encode_frame(&ClientFrame::Request {
         request: ctxmux_protocol::Request::Start {
             operation_key: CreateOperationKey::new("old-generation-must-not-run").unwrap(),
@@ -817,7 +1312,7 @@ async fn daemon_rejects_generation_3_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_3_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_4_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -980,7 +1475,7 @@ async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
         .expect("start binary-output Run");
     let exited = wait_until_exited(&daemon.client, run.id).await;
 
-    let (mut attachment, snapshot) = daemon
+    let (attachment, snapshot) = daemon
         .client
         .attach(run.id, 0)
         .await

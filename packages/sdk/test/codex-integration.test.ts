@@ -10,10 +10,10 @@ import type {
   RunInfo,
 } from "../src/index.ts";
 import {
-  Attachment,
   IntegrationProvenanceError,
   registerIntegration,
 } from "../src/index.ts";
+import { rememberRunEventSource } from "../src/attachment.ts";
 import {
   codexIntegration,
   isCodexSessionProvenance,
@@ -429,15 +429,7 @@ function sourcedOutput(run: RunInfo, seq: number, data: number[]): RunEvent {
   if (event.type !== "output") {
     throw new Error("output fixture returned a non-output event");
   }
-  new Attachment({} as never, {
-    run,
-    replay: {
-      chunks: [event.chunk],
-      oldest_seq: seq,
-      head_seq: seq,
-      truncated: false,
-    },
-  });
+  rememberRunEventSource(event, run.id);
   return event;
 }
 

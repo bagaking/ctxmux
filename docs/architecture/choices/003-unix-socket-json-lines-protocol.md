@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 4
+# 003 — Unix socket and NDJSON protocol generation 5
 
-- Status: accepted for generation 4; pre-stable
+- Status: accepted for generation 5; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -25,6 +25,9 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
   public attachment snapshot.
 - The wire uses metadata-only `AttachedHeader`/`OutputReplayHeader` types;
   client-only `AttachedSnapshot` cannot be mistaken for the first frame.
+- Attachment control results use a connection-local monotonic command ID and
+  a dedicated result frame; they are not replayable Run events or durable
+  idempotency records.
 
 ## Alternatives
 
@@ -35,12 +38,24 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 ## Known constraints
 
-The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. Startup revalidation closes the known probe-to-unlink replacement schedule. The shutdown guard retains the bound path's device/inode and removes the pathname only while its current socket identity matches. That check still cannot make pathname recheck plus unlink atomic or rediscover an original socket renamed elsewhere, so a hostile writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
+The socket has no default discovery or activation policy, peer-credential
+check, short-request ID, timeout, cancellation, or Windows equivalent. JSON
+represents bytes as integer arrays. Attachment command IDs provide correlation
+only inside one live connection. Startup revalidation closes the known
+probe-to-unlink replacement schedule. The shutdown guard retains the bound
+path's device/inode and removes the pathname only while its current socket
+identity matches. That check still cannot make pathname recheck plus unlink
+atomic or rediscover an original socket renamed elsewhere, so a hostile
+writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
+oversized frames can terminate the connection at the codec layer without a
+structured `InvalidRequest` frame.
 
-Protocol generation 4 directly replaces generation 3 by requiring bounded
-creation operation keys on Start and Fork and adding a typed creation conflict.
-An older peer fails the exact generation handshake before request dispatch;
-ctxmux does not provide a generation-3 fallback, migration, alias, or dual encoding.
+Protocol generation 5 directly replaces generation 4. It adds correlated
+attachment controls, typed owner receipts and failure dispositions, applied
+PTY-size readback, and removes accepted-operation events. It retains the
+bounded creation keys introduced by generation 4. An older peer fails the
+exact generation handshake before request dispatch; ctxmux does not provide a
+generation-4 fallback, migration, alias, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
@@ -55,7 +70,7 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 ## Fixture mapping
 
-- Covered now: generation-3 mismatch before request dispatch, wrong lifecycle
+- Covered now: generation-4 mismatch before request dispatch, wrong lifecycle
   requests, socket mode, active-listener refusal, non-socket and symlink
   refusal.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.
@@ -80,7 +95,7 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 - Is filesystem mode sufficient, or must peer credentials be checked?
 - Which protocol changes require a generation bump?
 - How will Windows transport preserve the same public behavior?
-- When are request IDs, deadlines, and cancellation required?
+- When are short-request IDs, deadlines, and cancellation required?
 
 ## Repository evidence
 

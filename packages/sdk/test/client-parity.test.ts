@@ -75,7 +75,13 @@ test(
       lastSequence,
       "READY",
     ));
-    await step("first attachment input", firstAttachment.input("hello\n"));
+    assert.deepEqual(
+      await step("first attachment input", firstAttachment.input("hello\n")),
+      {
+        commandId: 1,
+        receipt: { type: "input", written_bytes: 6 },
+      },
+    );
     ({ observed, lastSequence } = await waitForOutput(
       firstAttachment,
       observed,
@@ -92,10 +98,15 @@ test(
     assert.equal(statusAfterSdkDisconnect.state.type, "running");
 
     const reconnectedClient = new CtxmuxClient({ socketPath });
-    await step(
+    const resized = await step(
       "resize through reconnected SDK client",
       reconnectedClient.resize(runId, { cols: 120, rows: 40 }),
     );
+    assert.deepEqual(resized.receipt, {
+      type: "resize",
+      applied_size: { cols: 120, rows: 40 },
+    });
+    assert.equal(resized.run.id, runId);
     const secondAttachment = await reconnectedClient.attach(
       runId,
       lastSequence,
@@ -104,9 +115,15 @@ test(
     assert.equal(secondAttachment.snapshot.replay.truncated, false);
     observed = replayBytes(secondAttachment.snapshot.replay.chunks);
     lastSequence = secondAttachment.snapshot.replay.head_seq;
-    await step(
-      "second attachment size input",
-      secondAttachment.input("size\n"),
+    assert.deepEqual(
+      await step(
+        "second attachment size input",
+        secondAttachment.input("size\n"),
+      ),
+      {
+        commandId: 1,
+        receipt: { type: "input", written_bytes: 5 },
+      },
     );
     ({ observed, lastSequence } = await waitForOutput(
       secondAttachment,
@@ -114,9 +131,15 @@ test(
       lastSequence,
       "SIZE:40 120",
     ));
-    await step(
-      "second attachment quit input",
-      secondAttachment.input("quit\n"),
+    assert.deepEqual(
+      await step(
+        "second attachment quit input",
+        secondAttachment.input("quit\n"),
+      ),
+      {
+        commandId: 2,
+        receipt: { type: "input", written_bytes: 5 },
+      },
     );
     ({ observed, lastSequence } = await waitForOutput(
       secondAttachment,
@@ -176,8 +199,16 @@ test(
       cliStatus.stdout,
       new RegExp(`^${sdkRun.id}\\trunning\\tpid=`),
     );
-    await step("stop SDK-forked Run", reconnectedClient.stop(sdkChild.id));
-    await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id));
+    assert.deepEqual(
+      (await step("stop SDK-forked Run", reconnectedClient.stop(sdkChild.id)))
+        .receipt,
+      { type: "stop" },
+    );
+    assert.deepEqual(
+      (await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id)))
+        .receipt,
+      { type: "stop" },
+    );
   },
 );
 

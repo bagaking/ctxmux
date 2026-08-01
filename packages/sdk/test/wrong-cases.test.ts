@@ -10,11 +10,13 @@ import test from "node:test";
 
 import {
   CtxmuxClient,
+  CtxmuxCommandError,
   CtxmuxInvalidFrameError,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   type ServerFrame,
 } from "../src/index.ts";
+import { runEventSource } from "../src/attachment.ts";
 import { validateServerFrame } from "../src/validation.ts";
 import { JsonLinesConnection, WireClosedError } from "../src/wire.ts";
 
@@ -190,10 +192,14 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     ],
     [
       {
-        type: "event",
-        event: { type: "accepted", run: { ...runInfo(), spec: {} } },
+        type: "command_result",
+        command_id: 1,
+        outcome: {
+          type: "accepted",
+          receipt: { type: "resize", applied_size: { cols: 0, rows: 24 } },
+        },
       },
-      "$frame.event.run.spec.program",
+      "$frame.outcome.receipt.applied_size.cols",
     ],
     [
       {
@@ -226,6 +232,42 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     ],
     [{ type: "event", event: { type: "invented" } }, "$frame.event.type"],
     [
+      {
+        type: "command_result",
+        command_id: 0,
+        outcome: { type: "accepted", receipt: { type: "stop" } },
+      },
+      "$frame.command_id",
+    ],
+    [
+      {
+        type: "command_result",
+        command_id: 1,
+        outcome: {
+          type: "accepted",
+          receipt: { type: "input", written_bytes: 0x1_0000_0000 },
+        },
+      },
+      "$frame.outcome.receipt.written_bytes",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "control_rejected",
+          failure: {
+            error: { code: "control_backpressure", message: "full" },
+            disposition: "unknown",
+          },
+        },
+      },
+      "$frame.response.failure.disposition",
+    ],
+    [
+      { type: "response", response: { type: "accepted", run: runInfo() } },
+      "$frame.response.type",
+    ],
+    [
       { type: "error", error: { code: "other", message: "no" } },
       "$frame.error.code",
     ],
@@ -257,7 +299,24 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
     },
     { type: "response", response: { type: "runs", runs: [runInfo()] } },
     { type: "response", response: { type: "status", run: runInfo() } },
-    { type: "response", response: { type: "accepted", run: runInfo() } },
+    {
+      type: "response",
+      response: {
+        type: "control_accepted",
+        run: runInfo(),
+        receipt: { type: "input", written_bytes: 3 },
+      },
+    },
+    {
+      type: "response",
+      response: {
+        type: "control_rejected",
+        failure: {
+          error: { code: "control_backpressure", message: "full" },
+          disposition: "not_applied",
+        },
+      },
+    },
     { type: "attached", snapshot: attachedHeader() },
     {
       type: "event",
@@ -279,7 +338,28 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
       event: { type: "interrupted", reason: "tmux_protocol_error" },
     },
     { type: "event", event: { type: "gap", head_seq: 1 } },
-    { type: "event", event: { type: "accepted", run: runInfo() } },
+    {
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: {
+          type: "resize",
+          applied_size: { cols: 100, rows: 30 },
+        },
+      },
+    },
+    {
+      type: "command_result",
+      command_id: 2,
+      outcome: {
+        type: "rejected",
+        failure: {
+          error: { code: "invalid_run_state", message: "terminal" },
+          disposition: "not_applied",
+        },
+      },
+    },
     { type: "detached" },
     {
       type: "error",
@@ -634,6 +714,410 @@ test("LP-03 fails closed after a malformed coalesced frame", async () => {
   }
 });
 
+test("T-013 correlates out-of-order attachment controls with typed receipts", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), {
+      type: "input",
+      command_id: 1,
+      data: [104, 105],
+    });
+    assert.deepEqual(await peer.receive(), {
+      type: "resize",
+      command_id: 2,
+      size: { cols: 100, rows: 30 },
+    });
+    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 3 });
+    peer.send({
+      type: "command_result",
+      command_id: 2,
+      outcome: {
+        type: "accepted",
+        receipt: {
+          type: "resize",
+          applied_size: { cols: 99, rows: 29 },
+        },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "input", written_bytes: 2 },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 3,
+      outcome: {
+        type: "rejected",
+        failure: {
+          error: { code: "io", message: "owner result lost" },
+          disposition: "unknown",
+        },
+      },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const input = attachment.input("hi");
+  const resize = attachment.resize({ cols: 100, rows: 30 });
+  const stop = attachment.stop();
+  assert.deepEqual(await resize, {
+    commandId: 2,
+    receipt: {
+      type: "resize",
+      applied_size: { cols: 99, rows: 29 },
+    },
+  });
+  assert.deepEqual(await input, {
+    commandId: 1,
+    receipt: { type: "input", written_bytes: 2 },
+  });
+  await assert.rejects(
+    stop,
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "io" &&
+      error.disposition === "unknown" &&
+      error.commandId === 3,
+  );
+  attachment.close();
+});
+
+test("T-013 makes every pending command unknown on a correlated receipt violation", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    await peer.receive();
+    await peer.receive();
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: { type: "accepted", receipt: { type: "stop" } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const input = attachment.input("x");
+  const resize = attachment.resize({ cols: 80, rows: 24 });
+  for (const [promise, commandId] of [
+    [input, 1],
+    [resize, 2],
+  ] as const) {
+    await assert.rejects(
+      promise,
+      (error: unknown) =>
+        error instanceof CtxmuxCommandError &&
+        error.disposition === "unknown" &&
+        error.commandId === commandId,
+    );
+  }
+  await assert.rejects(
+    attachment.nextEvent(),
+    (error: unknown) => error instanceof CtxmuxInvalidFrameError,
+  );
+});
+
+test("T-013 reserves attachment capacity for resize and stop after 32 pending inputs", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    for (let commandId = 1; commandId <= 32; commandId += 1) {
+      assert.deepEqual(await peer.receive(), {
+        type: "input",
+        command_id: commandId,
+        data: [65],
+      });
+    }
+    assert.deepEqual(await peer.receive(), {
+      type: "resize",
+      command_id: 33,
+      size: { cols: 90, rows: 25 },
+    });
+    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 34 });
+    for (let commandId = 1; commandId <= 32; commandId += 1) {
+      peer.send({
+        type: "command_result",
+        command_id: commandId,
+        outcome: {
+          type: "accepted",
+          receipt: { type: "input", written_bytes: 1 },
+        },
+      });
+    }
+    peer.send({
+      type: "command_result",
+      command_id: 33,
+      outcome: {
+        type: "accepted",
+        receipt: {
+          type: "resize",
+          applied_size: { cols: 90, rows: 25 },
+        },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 34,
+      outcome: { type: "accepted", receipt: { type: "stop" } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const inputs = Array.from({ length: 32 }, () => attachment.input("A"));
+  await assert.rejects(
+    attachment.input("rejected-before-id"),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "control_backpressure" &&
+      error.disposition === "not_applied" &&
+      error.commandId === undefined,
+  );
+  const resize = attachment.resize({ cols: 90, rows: 25 });
+  const stop = attachment.stop();
+  await Promise.all(inputs);
+  assert.equal((await resize).commandId, 33);
+  assert.equal((await stop).commandId, 34);
+  attachment.close();
+});
+
+test("T-013 bounds pending input bytes without consuming the rejected command ID", async (context) => {
+  const inputBytes = 350_000;
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    for (let commandId = 1; commandId <= 2; commandId += 1) {
+      const frame = await peer.receive();
+      assert.equal((frame as { command_id?: unknown }).command_id, commandId);
+      assert.equal((frame as { type?: unknown }).type, "input");
+      assert.equal(
+        (frame as { data?: { length?: unknown } }).data?.length,
+        inputBytes,
+      );
+    }
+    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 3 });
+    for (let commandId = 1; commandId <= 2; commandId += 1) {
+      peer.send({
+        type: "command_result",
+        command_id: commandId,
+        outcome: {
+          type: "accepted",
+          receipt: { type: "input", written_bytes: inputBytes },
+        },
+      });
+    }
+    peer.send({
+      type: "command_result",
+      command_id: 3,
+      outcome: { type: "accepted", receipt: { type: "stop" } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const payload = new Uint8Array(inputBytes);
+  const first = attachment.input(payload);
+  const second = attachment.input(payload);
+  await assert.rejects(
+    attachment.input(payload),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "control_backpressure" &&
+      error.disposition === "not_applied" &&
+      error.commandId === undefined,
+  );
+  const stop = attachment.stop();
+  await Promise.all([first, second]);
+  assert.equal((await stop).commandId, 3);
+  attachment.close();
+});
+
+test("T-013 treats a duplicate completed result as fatal to unresolved commands", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    await peer.receive();
+    await peer.receive();
+    const accepted = {
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "input", written_bytes: 1 },
+      },
+    } as const;
+    peer.send(accepted);
+    peer.send(accepted);
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const input = attachment.input("x");
+  const resize = attachment.resize({ cols: 80, rows: 24 });
+  assert.deepEqual(await input, {
+    commandId: 1,
+    receipt: { type: "input", written_bytes: 1 },
+  });
+  await assert.rejects(
+    resize,
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.commandId === 2 &&
+      error.disposition === "unknown",
+  );
+});
+
+test("T-013 rejects an oversize attachment frame before consuming its command ID", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 1 });
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: { type: "accepted", receipt: { type: "stop" } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  await assert.rejects(
+    attachment.input(new Uint8Array(300_000).fill(255)),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "invalid_request" &&
+      error.disposition === "not_applied" &&
+      error.commandId === undefined,
+  );
+  await assert.rejects(
+    attachment.input(new Uint8Array(MAX_FRAME_BYTES + 1)),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "invalid_request" &&
+      error.disposition === "not_applied" &&
+      error.commandId === undefined,
+  );
+  assert.equal((await attachment.stop()).commandId, 1);
+  attachment.close();
+});
+
+test("T-013 fences detach until pending controls have unique results", async (context) => {
+  const resultRelease = deferred<void>();
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), {
+      type: "input",
+      command_id: 1,
+      data: [120],
+    });
+    await resultRelease.promise;
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "input", written_bytes: 1 },
+      },
+    });
+    assert.deepEqual(await peer.receive(), { type: "detach" });
+    peer.send({ type: "detached" });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const input = attachment.input("x");
+  const detaching = attachment.detach();
+  await assert.rejects(attachment.stop(), /detaching/);
+  resultRelease.resolve();
+  await input;
+  await detaching;
+});
+
+test("T-013 preserves short-control receipts, rejections, and lost-response disposition", async (context) => {
+  let connection = 0;
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    const frame = await peer.receive();
+    connection += 1;
+    if (connection === 1) {
+      assert.deepEqual(frame, {
+        type: "request",
+        request: { type: "input", id: RUN_ID, data: [104, 105] },
+      });
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_accepted",
+          run: runInfo(),
+          receipt: { type: "input", written_bytes: 2 },
+        },
+      });
+    } else if (connection === 2) {
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_rejected",
+          failure: {
+            error: { code: "invalid_run_state", message: "terminal" },
+            disposition: "not_applied",
+          },
+        },
+      });
+    } else {
+      socket.destroy();
+    }
+  });
+  const client = new CtxmuxClient({ socketPath: daemon.socketPath });
+  assert.deepEqual(await client.input(RUN_ID, "hi"), {
+    run: runInfo(),
+    receipt: { type: "input", written_bytes: 2 },
+  });
+  await assert.rejects(
+    client.stop(RUN_ID),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "invalid_run_state" &&
+      error.disposition === "not_applied" &&
+      error.commandId === undefined,
+  );
+  await assert.rejects(
+    client.resize(RUN_ID, { cols: 100, rows: 30 }),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "io" &&
+      error.disposition === "unknown",
+  );
+});
+
 test(
   "SDK-01 settles FIN and close races and distinguishes acknowledged detach",
   { timeout: 5_000 },
@@ -734,46 +1218,262 @@ test("SDK-01 settles a pending receive on an RST-style socket error", async () =
 });
 
 test(
-  "SDK-02 applies bounded inbound backpressure to a slow attachment",
+  "SDK-02 keeps command results live while bounded output becomes an explicit Gap",
   { timeout: 10_000 },
   async (context) => {
     const frameCount = 20_000;
-    const floodStarted = deferred<void>();
-    const floodFinished = deferred<void>();
     const daemon = await mockDaemon(context, async (socket) => {
       const peer = new MockPeer(socket);
       await peer.handshake();
       await peer.receive();
       peer.send({ type: "attached", snapshot: attachedHeader() });
-      floodStarted.resolve();
       for (let sequence = 1; sequence <= frameCount; sequence += 1) {
         await peer.sendWithBackpressure({
           type: "event",
-          event: { type: "gap", head_seq: sequence },
+          event: { type: "output", chunk: { seq: sequence, data: [65] } },
         });
       }
-      floodFinished.resolve();
+      assert.deepEqual(await peer.receive(), {
+        type: "stop",
+        command_id: 1,
+      });
+      peer.send({
+        type: "command_result",
+        command_id: 1,
+        outcome: { type: "accepted", receipt: { type: "stop" } },
+      });
     });
 
     const attachment = await new CtxmuxClient({
       socketPath: daemon.socketPath,
     }).attach(RUN_ID);
-    await floodStarted.promise;
-    await delay(50);
-    assert.equal(
-      floodFinished.settled,
-      false,
-      "slow consumer was drained into an unbounded JavaScript queue",
-    );
-
-    for (let expected = 1; expected <= frameCount; expected += 1) {
-      const event = await attachment.nextEvent();
-      assert.deepEqual(event, { type: "gap", head_seq: expected });
+    assert.deepEqual(await attachment.stop(), {
+      commandId: 1,
+      receipt: { type: "stop" },
+    });
+    for (let expected = 1; expected <= 256; expected += 1) {
+      assert.deepEqual(await attachment.nextEvent(), {
+        type: "output",
+        chunk: { seq: expected, data: [65] },
+      });
     }
-    await floodFinished.promise;
+    const gap = await attachment.nextEvent();
+    assert.deepEqual(gap, {
+      type: "gap",
+      head_seq: frameCount,
+    });
+    assert.equal(
+      gap === undefined ? undefined : runEventSource(gap),
+      RUN_ID,
+      "an SDK-synthesized output Gap must retain its Attachment Run owner",
+    );
     attachment.close();
   },
 );
+
+test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturation", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      peer.send({
+        type: "event",
+        event: { type: "output", chunk: { seq: sequence, data: [65] } },
+      });
+    }
+    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 1 });
+    peer.send({
+      type: "event",
+      event: { type: "tmux", event: { type: "paused" } },
+    });
+    peer.send({
+      type: "event",
+      event: { type: "output", chunk: { seq: 258, data: [66] } },
+    });
+    peer.send({
+      type: "event",
+      event: {
+        type: "exited",
+        state: { type: "exited", code: 0, signal: null },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: { type: "accepted", receipt: { type: "stop" } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  await delay(50);
+  assert.equal((await attachment.nextEvent())?.type, "output");
+  assert.equal((await attachment.nextEvent())?.type, "output");
+  await attachment.stop();
+  for (let expected = 3; expected <= 256; expected += 1) {
+    assert.deepEqual(await attachment.nextEvent(), {
+      type: "output",
+      chunk: { seq: expected, data: [65] },
+    });
+  }
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "gap",
+    head_seq: 257,
+  });
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "tmux",
+    event: { type: "paused" },
+  });
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "gap",
+    head_seq: 258,
+  });
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "exited",
+    state: { type: "exited", code: 0, signal: null },
+  });
+  attachment.close();
+});
+
+test("SDK-02 treats daemon EOF after one terminal event as a clean event end", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    peer.send({
+      type: "event",
+      event: {
+        type: "exited",
+        state: { type: "exited", code: 0, signal: null },
+      },
+    });
+    socket.end();
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "exited",
+    state: { type: "exited", code: 0, signal: null },
+  });
+  await delay(20);
+  assert.equal(await attachment.nextEvent(), undefined);
+});
+
+test("SDK-02 permits only one pending attachment event consumer", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    await delay(50);
+    peer.send({ type: "event", event: { type: "gap", head_seq: 7 } });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  const first = attachment.nextEvent();
+  await assert.rejects(
+    attachment.nextEvent(),
+    /only one nextEvent\(\) call may be pending/,
+  );
+  assert.deepEqual(await first, { type: "gap", head_seq: 7 });
+  attachment.close();
+});
+
+test(
+  "SDK-02 counts near-1MiB tmux rename payloads against the event byte budget",
+  { timeout: 10_000 },
+  async (context) => {
+    const retainedNameBytes = 500_000;
+    const overflowNameBytes = 60_000;
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      await peer.receive();
+      peer.send({ type: "attached", snapshot: attachedHeader() });
+      const retainedName = Array<number>(retainedNameBytes).fill(0);
+      for (let index = 0; index < 2; index += 1) {
+        await peer.sendWithBackpressure({
+          type: "event",
+          event: {
+            type: "tmux",
+            event: { type: "session_renamed", name: retainedName },
+          },
+        });
+      }
+      await peer.sendWithBackpressure({
+        type: "event",
+        event: {
+          type: "tmux",
+          event: {
+            type: "session_renamed",
+            name: Array<number>(overflowNameBytes).fill(1),
+          },
+        },
+      });
+    });
+
+    const attachment = await new CtxmuxClient({
+      socketPath: daemon.socketPath,
+    }).attach(RUN_ID);
+    await assert.rejects(
+      settleWithin(attachment.stop(), 2_000),
+      (error: unknown) =>
+        error instanceof CtxmuxCommandError && error.disposition === "unknown",
+    );
+    for (let index = 0; index < 2; index += 1) {
+      const event = await attachment.nextEvent();
+      assert.equal(event?.type, "tmux");
+      if (event?.type === "tmux") {
+        assert.equal(event.event.type, "session_renamed");
+        if (event.event.type === "session_renamed") {
+          assert.equal(event.event.name.length, retainedNameBytes);
+        }
+      }
+    }
+    await assert.rejects(
+      attachment.nextEvent(),
+      (error: unknown) =>
+        error instanceof CtxmuxInvalidFrameError &&
+        error.path === "$frame.event",
+    );
+  },
+);
+
+test("SDK-02 fails closed rather than dropping saturated non-output events", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      peer.send({ type: "event", event: { type: "gap", head_seq: sequence } });
+    }
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  await delay(50);
+  for (let expected = 1; expected <= 256; expected += 1) {
+    assert.deepEqual(await attachment.nextEvent(), {
+      type: "gap",
+      head_seq: expected,
+    });
+  }
+  await assert.rejects(
+    attachment.nextEvent(),
+    (error: unknown) =>
+      error instanceof CtxmuxInvalidFrameError && error.path === "$frame.event",
+  );
+});
 
 async function testRequestClose(
   context: test.TestContext,

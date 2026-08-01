@@ -14,13 +14,14 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "unsupported_capability",
   "target_changed",
   "creation_conflict",
+  "control_backpressure",
   "internal",
 ]);
 
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-4 wire contract. */
+/** A daemon frame failed the runtime half of the generation-5 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -47,6 +48,10 @@ export function validateServerFrame(value: unknown): ServerFrame {
     case "event":
       runEvent(frame.event, "$frame.event");
       break;
+    case "command_result":
+      attachmentCommandId(frame.command_id, "$frame.command_id");
+      controlOutcome(frame.outcome, "$frame.outcome");
+      break;
     case "detached":
       break;
     case "error":
@@ -58,7 +63,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-4 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-5 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -72,8 +77,14 @@ function response(value: unknown, path: string): void {
     case "imported":
     case "forked":
     case "status":
-    case "accepted":
       runInfo(valueRecord.run, `${path}.run`);
+      return;
+    case "control_accepted":
+      runInfo(valueRecord.run, `${path}.run`);
+      controlReceipt(valueRecord.receipt, `${path}.receipt`);
+      return;
+    case "control_rejected":
+      controlFailure(valueRecord.failure, `${path}.failure`);
       return;
     case "tmux_panes":
       string(valueRecord.tmux_version, `${path}.tmux_version`);
@@ -116,9 +127,6 @@ function runEvent(value: unknown, path: string): void {
       return;
     case "gap":
       validateCursorValue(event.head_seq, `${path}.head_seq`);
-      return;
-    case "accepted":
-      runInfo(event.run, `${path}.run`);
       return;
     default:
       throw invalid(`${path}.type`, "a known Run-event discriminant");
@@ -320,10 +328,65 @@ function outputChunk(value: unknown, path: string): void {
   );
 }
 
-function terminalSize(value: unknown, path: string): void {
+function attachmentCommandId(value: unknown, path: string): void {
+  unsignedInteger(value, path, 0xffff_ffff, 1);
+}
+
+function controlOutcome(value: unknown, path: string): void {
+  const outcome = record(value, path);
+  switch (discriminant(outcome, path)) {
+    case "accepted":
+      controlReceipt(outcome.receipt, `${path}.receipt`);
+      return;
+    case "rejected":
+      controlFailure(outcome.failure, `${path}.failure`);
+      return;
+    default:
+      throw invalid(`${path}.type`, "a known control outcome");
+  }
+}
+
+function controlReceipt(value: unknown, path: string): void {
+  const receipt = record(value, path);
+  switch (discriminant(receipt, path)) {
+    case "input":
+      unsignedInteger(
+        receipt.written_bytes,
+        `${path}.written_bytes`,
+        0xffff_ffff,
+      );
+      return;
+    case "resize":
+      terminalSize(receipt.applied_size, `${path}.applied_size`, true);
+      return;
+    case "stop":
+      return;
+    default:
+      throw invalid(`${path}.type`, "a known control receipt");
+  }
+}
+
+function controlFailure(value: unknown, path: string): void {
+  const failure = record(value, path);
+  protocolError(failure.error, `${path}.error`);
+  const disposition = string(failure.disposition, `${path}.disposition`);
+  if (disposition !== "not_applied" && disposition !== "unknown") {
+    throw invalid(`${path}.disposition`, "a known command disposition");
+  }
+  const error = record(failure.error, `${path}.error`);
+  if (error.code === "control_backpressure" && disposition !== "not_applied") {
+    throw invalid(
+      `${path}.disposition`,
+      '"not_applied" for control backpressure',
+    );
+  }
+}
+
+function terminalSize(value: unknown, path: string, nonzero = false): void {
   const size = record(value, path);
-  unsignedInteger(size.cols, `${path}.cols`, 0xffff);
-  unsignedInteger(size.rows, `${path}.rows`, 0xffff);
+  const minimum = nonzero ? 1 : 0;
+  unsignedInteger(size.cols, `${path}.cols`, 0xffff, minimum);
+  unsignedInteger(size.rows, `${path}.rows`, 0xffff, minimum);
 }
 
 function protocolError(value: unknown, path: string): void {
@@ -394,14 +457,19 @@ function safeUnsignedInteger(value: unknown, path: string): void {
   }
 }
 
-function unsignedInteger(value: unknown, path: string, maximum: number): void {
+function unsignedInteger(
+  value: unknown,
+  path: string,
+  maximum: number,
+  minimum = 0,
+): void {
   if (
     typeof value !== "number" ||
     !Number.isInteger(value) ||
-    value < 0 ||
+    value < minimum ||
     value > maximum
   ) {
-    throw invalid(path, `an integer from 0 through ${maximum}`);
+    throw invalid(path, `an integer from ${minimum} through ${maximum}`);
   }
 }
 

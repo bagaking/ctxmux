@@ -176,7 +176,7 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
                 .expect("terminal event precedes attachment close")
             {
                 event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => return event,
-                RunEvent::Output { .. } | RunEvent::Accepted { .. } => {}
+                RunEvent::Output { .. } => {}
                 RunEvent::Gap { head_seq } => panic!("unexpected recovered gap at {head_seq}"),
                 RunEvent::Tmux { event } => panic!("unexpected recovered tmux event: {event:?}"),
             }
@@ -187,16 +187,15 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
 }
 
 fn assert_invalid_state<T: std::fmt::Debug>(result: &Result<T, ClientError>) {
-    assert!(
-        matches!(
-            result,
-            Err(ClientError::Protocol {
-                code: ErrorCode::InvalidRunState,
-                ..
-            })
-        ),
-        "expected invalid_run_state, got {result:?}"
-    );
+    match result {
+        Err(ClientError::Protocol {
+            code: ErrorCode::InvalidRunState,
+            ..
+        }) => {}
+        Err(ClientError::ControlRejected { failure })
+            if failure.error.code == ErrorCode::InvalidRunState => {}
+        _ => panic!("expected invalid_run_state, got {result:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

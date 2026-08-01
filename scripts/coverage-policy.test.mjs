@@ -843,9 +843,12 @@ test("checked-in policy fixes every current product owner and floor", () => {
         floor_class: "runtime",
         paths: [
           "crates/ctxmux-daemon/src/lib.rs",
+          "crates/ctxmux-daemon/src/attachment.rs",
           "crates/ctxmux-daemon/src/creation.rs",
+          "crates/ctxmux-daemon/src/native_control.rs",
           "crates/ctxmux-daemon/src/main.rs",
           "crates/ctxmux-client/src/lib.rs",
+          "crates/ctxmux-client/src/attachment.rs",
           "crates/ctxmux/src/main.rs",
         ],
       },
@@ -885,6 +888,8 @@ test("checked-in policy fixes every current product owner and floor", () => {
         floor_class: "runtime",
         paths: [
           "packages/sdk/src/client.ts",
+          "packages/sdk/src/attachment.ts",
+          "packages/sdk/src/control.ts",
           "packages/sdk/src/index.ts",
           "packages/sdk/src/integration.ts",
           "packages/sdk/src/integrations/codex.ts",
