@@ -1,28 +1,35 @@
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const MODES = ["idle", "active"];
-const COUNTS = ["1", "32", "128"];
-const BUDGET_FIELDS = [
-  "max_cpu_core_percent",
-  "max_peak_rss_kib",
-  "max_steady_rss_kib",
-  "max_retained_output_bytes_per_run",
-  "max_rss_kib_per_run",
-  "max_threads_per_run",
-  "max_fds_per_run",
-  "max_cleanup_threads_delta",
-  "max_cleanup_live_children",
-  "max_cleanup_attachments",
-];
+import {
+  canonicalFixturePath,
+  EXPECTED_RECEIPT_PATHS,
+  HASH_PATTERN,
+  isObject,
+  POLICY_SOURCE_PATHS,
+  sameMembers,
+  SNAPSHOT_FILE_PATHS,
+  validateSourceBoundBaseline,
+} from "./reliability-baseline-policy.mjs";
+import {
+  BUDGET_FIELDS,
+  COUNTS,
+  MODES,
+} from "./reliability-budget-contract.mjs";
 
-function sameMembers(left, right) {
-  return (
-    left.length === right.length &&
-    [...left].sort().every((value, index) => value === [...right].sort()[index])
-  );
+export { deriveBudgetCeiling } from "./reliability-budget-contract.mjs";
+
+const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
+
+function validTimestamp(value) {
+  return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+function finiteNonNegative(value) {
+  return Number.isFinite(value) && value >= 0;
 }
 
 function jobBlock(workflow, id) {
@@ -41,42 +48,63 @@ function jobBlock(workflow, id) {
 export function validateReliabilityPolicy({
   budgets,
   baselineReceipts,
+  sourceSnapshots = [],
+  currentPolicyHashes,
   workflow,
   checkScript,
   harnessSource,
 }) {
   const errors = [];
+  validateBudgetShape(budgets, errors);
+  const references = validateReceiptReferences(budgets, errors);
+  const receipts = resolveReceipts(references, baselineReceipts, errors);
+  if (receipts.length === 3) {
+    const schemas = new Set(receipts.map(({ value }) => value?.schema));
+    if (schemas.size !== 1) {
+      errors.push("observation baseline must not mix v1 and v2 receipts");
+    } else if (schemas.has("ctxmux.reliability-qualification.v1")) {
+      validateLegacyBaseline(budgets, receipts, errors);
+    } else if (schemas.has("ctxmux.reliability-qualification.v2")) {
+      validateSourceBoundBaseline({
+        budgets,
+        receipts,
+        sourceSnapshots,
+        currentPolicyHashes,
+        errors,
+      });
+    } else {
+      errors.push(`unsupported observation receipt schema ${[...schemas][0]}`);
+    }
+  }
+  validateReachability({ workflow, checkScript, harnessSource }, errors);
+  return errors;
+}
+
+function validateBudgetShape(budgets, errors) {
   if (budgets.schema !== "ctxmux.reliability-budgets.v1") {
     errors.push(`unsupported reliability budget schema ${budgets.schema}`);
   }
   if (budgets.frozen_before_optimization !== true) {
     errors.push("resource budgets must be frozen before optimization");
   }
-  if (!Number.isFinite(Date.parse(budgets.frozen_at))) {
+  if (!validTimestamp(budgets.frozen_at)) {
     errors.push("resource budgets need a valid frozen_at timestamp");
   }
   const baseline = budgets.observation_baseline;
-  if (!baseline || baseline.profile !== "observe" || baseline.rounds < 3) {
-    errors.push("resource budgets need at least three clean observe rounds");
+  if (!isObject(baseline) || baseline.profile !== "observe") {
+    errors.push("resource budgets need an observe baseline");
   }
-  const rawReceiptRefs = baseline?.raw_receipts;
+  if (baseline?.rounds !== 3) {
+    errors.push("resource budgets require exactly three observe rounds");
+  }
   if (
-    !Array.isArray(rawReceiptRefs) ||
-    rawReceiptRefs.length !== baseline.rounds
+    baseline?.resource_start_concurrency !== 8 ||
+    baseline?.peak_rss_sample_interval_ms !== 25
   ) {
     errors.push(
-      "observation baseline must retain one raw receipt ref per round",
+      "observation baseline must use concurrency 8 and 25 ms RSS samples",
     );
   }
-  if (!Number.isInteger(baseline?.resource_start_concurrency)) {
-    errors.push("observation baseline must record resource start concurrency");
-  }
-  if (!Number.isInteger(baseline?.peak_rss_sample_interval_ms)) {
-    errors.push(
-      "observation baseline must record the peak RSS sample interval",
-    );
-  }
-
   if (!sameMembers(Object.keys(budgets.budgets ?? {}), MODES)) {
     errors.push("resource budgets must cover exactly idle and active modes");
   }
@@ -87,15 +115,17 @@ export function validateReliabilityPolicy({
     }
     for (const count of COUNTS) {
       const budget = byCount[count];
-      if (!budget) continue;
+      if (!isObject(budget)) {
+        errors.push(`${mode}/${count} budget must be an object`);
+        continue;
+      }
       if (!sameMembers(Object.keys(budget), BUDGET_FIELDS)) {
         errors.push(
           `${mode}/${count} has an incomplete or unknown budget field`,
         );
       }
       for (const field of BUDGET_FIELDS) {
-        const value = budget[field];
-        if (!Number.isFinite(value) || value < 0) {
+        if (!finiteNonNegative(budget[field])) {
           errors.push(
             `${mode}/${count} ${field} must be finite and non-negative`,
           );
@@ -103,112 +133,174 @@ export function validateReliabilityPolicy({
       }
     }
   }
-  for (const field of ["cpu", "rss", "slopes", "cleanup"]) {
-    if (!budgets.measurement_contract?.[field]) {
-      errors.push(`measurement contract is missing ${field}`);
-    }
+  const contract = budgets.measurement_contract;
+  if (
+    !isObject(contract) ||
+    !sameMembers(Object.keys(contract), ["cpu", "rss", "slopes", "cleanup"]) ||
+    !Object.values(contract).every(
+      (value) => typeof value === "string" && value.trim().length > 0,
+    )
+  ) {
+    errors.push(
+      "measurement contract must contain non-empty cpu/rss/slopes/cleanup",
+    );
   }
+}
 
-  const receiptsByPath = new Map(
-    (baselineReceipts ?? []).map((receipt) => [receipt.path, receipt]),
-  );
-  const observedReceipts = [];
-  for (const reference of rawReceiptRefs ?? []) {
+function validateReceiptReferences(budgets, errors) {
+  const references = budgets.observation_baseline?.raw_receipts;
+  if (!Array.isArray(references) || references.length !== 3) {
+    errors.push(
+      "observation baseline must retain exactly three raw receipt refs",
+    );
+    return [];
+  }
+  const paths = [];
+  const hashes = [];
+  for (const [index, reference] of references.entries()) {
+    if (!isObject(reference)) {
+      errors.push(`raw observation receipt ref ${index + 1} must be an object`);
+      continue;
+    }
     if (
-      typeof reference?.path !== "string" ||
-      !reference.path.startsWith("fixtures/reliability/") ||
-      typeof reference.sha256 !== "string"
+      !canonicalFixturePath(reference.path) ||
+      reference.path !== EXPECTED_RECEIPT_PATHS[index]
     ) {
       errors.push(
-        "raw observation receipt refs must be durable fixture paths with SHA-256",
+        `raw observation receipt path is not canonical: ${reference.path}`,
+      );
+    }
+    if (!HASH_PATTERN.test(reference.sha256 ?? "")) {
+      errors.push(
+        `raw observation receipt ${reference.path} needs exact SHA-256`,
+      );
+    }
+    paths.push(reference.path);
+    hashes.push(reference.sha256);
+  }
+  if (new Set(paths).size !== paths.length) {
+    errors.push("raw observation receipt paths must be unique");
+  }
+  if (new Set(hashes).size !== hashes.length) {
+    errors.push("raw observation receipt hashes must be unique");
+  }
+  return references.filter(isObject);
+}
+
+function resolveReceipts(references, receipts, errors) {
+  if (
+    !Array.isArray(receipts) ||
+    receipts.some((receipt) => !isObject(receipt))
+  ) {
+    errors.push("loaded raw observation receipts must be objects");
+    return [];
+  }
+  const paths = receipts.map(({ path: receiptPath }) => receiptPath);
+  if (new Set(paths).size !== paths.length) {
+    errors.push("loaded raw observation receipts contain a duplicate receipt");
+  }
+  const ordered = [];
+  for (const reference of references) {
+    const matches = receipts.filter(
+      (receipt) => receipt.path === reference.path,
+    );
+    if (matches.length !== 1) {
+      errors.push(
+        `raw observation receipt is missing or duplicated: ${reference.path}`,
       );
       continue;
     }
-    const receipt = receiptsByPath.get(reference.path);
-    if (!receipt) {
-      errors.push(`raw observation receipt is missing: ${reference.path}`);
-      continue;
-    }
-    if (receipt.sha256 !== reference.sha256) {
+    if (matches[0].sha256 !== reference.sha256) {
       errors.push(`raw observation receipt hash drifted: ${reference.path}`);
     }
-    if (
-      receipt.value.status !== "pass" ||
-      receipt.value.profile !== "observe"
-    ) {
-      errors.push(
-        `raw observation receipt did not pass observe: ${reference.path}`,
-      );
-    }
-    const resourceStage = receipt.value.stages?.find(
-      (stage) => stage.id === "resource-census" && stage.status === "pass",
-    );
-    if (
-      !Array.isArray(resourceStage?.result) ||
-      resourceStage.result.length !== 6
-    ) {
-      errors.push(
-        `raw observation receipt lacks six resource cells: ${reference.path}`,
-      );
-      continue;
-    }
-    observedReceipts.push(resourceStage.result);
+    ordered.push(matches[0]);
   }
-  if (observedReceipts.length === baseline?.rounds) {
-    const maximaFields = [
-      "cpu_core_percent",
-      "peak_rss_kib",
-      "rss_kib_per_run",
-    ];
-    for (const mode of MODES) {
-      for (const count of COUNTS) {
-        const cells = observedReceipts.map((measurements) =>
-          measurements.find(
-            (measurement) =>
-              measurement.mode === mode && String(measurement.runs) === count,
-          ),
-        );
-        if (cells.some((cell) => cell === undefined)) {
-          errors.push(`raw observation receipts are missing ${mode}/${count}`);
-          continue;
-        }
-        const recorded = baseline.observed_maxima?.[mode]?.[count];
-        for (const field of maximaFields) {
-          const derived = Math.max(...cells.map((cell) => cell[field]));
-          if (recorded?.[field] !== derived) {
-            errors.push(
-              `recorded ${mode}/${count} ${field}=${recorded?.[field]} does not match raw maximum ${derived}`,
-            );
-          }
-        }
-        const steady = Math.max(...cells.map((cell) => cell.steady.rss_kib));
-        if (recorded?.steady_rss_kib !== steady) {
+  if (receipts.length !== references.length) {
+    errors.push("loaded raw observation receipts must match the declared refs");
+  }
+  return ordered;
+}
+
+// Temporary transition only: an all-v1 baseline keeps the existing Gate
+// operational, but never satisfies T-021 and cannot mix with v2.
+function validateLegacyBaseline(budgets, receipts, errors) {
+  const rounds = [];
+  for (const receipt of receipts) {
+    if (
+      receipt.value?.status !== "pass" ||
+      receipt.value?.profile !== "observe"
+    ) {
+      errors.push(`legacy observation receipt did not pass: ${receipt.path}`);
+    }
+    const resources = receipt.value?.stages?.find(
+      (stage) => stage.id === "resource-census" && stage.status === "pass",
+    )?.result;
+    if (!Array.isArray(resources) || resources.length !== 6) {
+      errors.push(
+        `legacy observation receipt lacks six cells: ${receipt.path}`,
+      );
+    } else {
+      rounds.push(resources);
+    }
+  }
+  if (rounds.length !== 3) return;
+  for (const mode of MODES) {
+    for (const count of COUNTS) {
+      const cells = rounds.map((measurements) =>
+        measurements.find(
+          (cell) => cell.mode === mode && String(cell.runs) === count,
+        ),
+      );
+      if (cells.some((cell) => cell === undefined)) {
+        errors.push(`legacy observation receipts are missing ${mode}/${count}`);
+        continue;
+      }
+      const recorded =
+        budgets.observation_baseline?.observed_maxima?.[mode]?.[count];
+      const maxima = {
+        cpu_core_percent: Math.max(
+          ...cells.map((cell) => cell.cpu_core_percent),
+        ),
+        peak_rss_kib: Math.max(...cells.map((cell) => cell.peak_rss_kib)),
+        steady_rss_kib: Math.max(...cells.map((cell) => cell.steady?.rss_kib)),
+        rss_kib_per_run: Math.max(...cells.map((cell) => cell.rss_kib_per_run)),
+      };
+      for (const [field, maximum] of Object.entries(maxima)) {
+        if (recorded?.[field] !== maximum) {
           errors.push(
-            `recorded ${mode}/${count} steady_rss_kib=${recorded?.steady_rss_kib} does not match raw maximum ${steady}`,
+            `recorded ${mode}/${count} ${field} does not match raw maximum`,
           );
         }
       }
     }
   }
+}
 
+function validateReachability(
+  { workflow, checkScript, harnessSource },
+  errors,
+) {
   if (!checkScript.includes("scripts/check-reliability.sh --profile smoke")) {
     errors.push("the required check does not reach reliability smoke");
   }
-  const lanes = [
+  for (const lane of [
     {
       id: "reliability-nightly",
-      command: "scripts/check-reliability.sh --profile nightly",
-      timeout: "timeout-minutes: 60",
-      artifact: "path: target/reliability/nightly",
+      tokens: [
+        "scripts/check-reliability.sh --profile nightly",
+        "timeout-minutes: 60",
+        "path: target/reliability/nightly",
+      ],
     },
     {
       id: "release-soak",
-      command: "scripts/check-reliability.sh --profile release",
-      timeout: "timeout-minutes: 210",
-      artifact: "path: target/reliability/release",
+      tokens: [
+        "scripts/check-reliability.sh --profile release",
+        "timeout-minutes: 210",
+        "path: target/reliability/release",
+      ],
     },
-  ];
-  for (const lane of lanes) {
+  ]) {
     const block = jobBlock(workflow, lane.id);
     if (!block) {
       errors.push(`reliability workflow is missing ${lane.id}`);
@@ -217,14 +309,10 @@ export function validateReliabilityPolicy({
     for (const token of [
       "ubuntu-latest",
       "macos-latest",
-      lane.command,
-      lane.timeout,
-      lane.artifact,
       "if: always()",
+      ...lane.tokens,
     ]) {
-      if (!block.includes(token)) {
-        errors.push(`${lane.id} is missing ${token}`);
-      }
+      if (!block.includes(token)) errors.push(`${lane.id} is missing ${token}`);
     }
   }
   if (!workflow.includes('cron: "17 3 * * *"')) {
@@ -253,7 +341,112 @@ export function validateReliabilityPolicy({
       );
     }
   }
-  return errors;
+}
+
+export function loadBaselineReceipts(root, budgets) {
+  return (budgets.observation_baseline?.raw_receipts ?? []).map(
+    (reference, index) => {
+      if (
+        !canonicalFixturePath(reference?.path) ||
+        reference.path !== EXPECTED_RECEIPT_PATHS[index] ||
+        !HASH_PATTERN.test(reference?.sha256 ?? "")
+      ) {
+        throw new Error(
+          `refusing to read non-canonical receipt ${reference?.path}`,
+        );
+      }
+      const bytes = fs.readFileSync(path.join(root, reference.path));
+      return {
+        path: reference.path,
+        sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+        value: JSON.parse(bytes.toString("utf8")),
+      };
+    },
+  );
+}
+
+export function loadSourceSnapshots(root, receipts) {
+  return receipts
+    .filter(
+      ({ value }) => value?.schema === "ctxmux.reliability-qualification.v2",
+    )
+    .map((receipt) => loadSourceSnapshot(root, receipt));
+}
+
+function loadSourceSnapshot(root, receipt) {
+  const commit = receipt.value?.provenance?.source?.commit;
+  if (!GIT_OBJECT_PATTERN.test(commit ?? "")) {
+    return { path: receipt.path, commit, error: "invalid source commit" };
+  }
+  const existence = git(root, ["cat-file", "-e", `${commit}^{commit}`]);
+  if (existence.status !== 0) {
+    return { path: receipt.path, commit, error: existence.error };
+  }
+  const reachability = git(
+    root,
+    ["merge-base", "--is-ancestor", commit, "HEAD"],
+    [0, 1],
+  );
+  if (reachability.status !== 0) {
+    return {
+      path: receipt.path,
+      commit,
+      reachableFromHead: false,
+      error: reachability.status === 1 ? undefined : reachability.error,
+    };
+  }
+  const tree = git(root, ["rev-parse", `${commit}^{tree}`]);
+  if (tree.status !== 0) {
+    return { path: receipt.path, commit, error: tree.error };
+  }
+  const fileHashes = {};
+  for (const filePath of SNAPSHOT_FILE_PATHS) {
+    const result = git(root, ["show", `${commit}:${filePath}`]);
+    if (result.status !== 0) {
+      return { path: receipt.path, commit, error: result.error };
+    }
+    fileHashes[filePath] = crypto
+      .createHash("sha256")
+      .update(result.stdout)
+      .digest("hex");
+  }
+  return {
+    path: receipt.path,
+    commit,
+    reachableFromHead: true,
+    tree: tree.stdout.toString("utf8").trim(),
+    fileHashes,
+  };
+}
+
+function git(root, args, acceptedStatuses = [0]) {
+  const result = spawnSync("git", args, {
+    cwd: root,
+    encoding: null,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  const status = result.status ?? -1;
+  return {
+    status,
+    stdout: result.stdout ?? Buffer.alloc(0),
+    error: acceptedStatuses.includes(status)
+      ? undefined
+      : result.stderr?.toString("utf8").trim() ||
+        result.error?.message ||
+        `git ${args[0]} failed`,
+  };
+}
+
+function currentPolicyHashes(root) {
+  return Object.fromEntries(
+    POLICY_SOURCE_PATHS.map((filePath) => [
+      filePath,
+      crypto
+        .createHash("sha256")
+        .update(fs.readFileSync(path.join(root, filePath)))
+        .digest("hex"),
+    ]),
+  );
 }
 
 function main() {
@@ -261,9 +454,12 @@ function main() {
   const budgets = JSON.parse(
     fs.readFileSync(path.join(root, "reliability-budgets.json"), "utf8"),
   );
-  const inputs = {
+  const baselineReceipts = loadBaselineReceipts(root, budgets);
+  const errors = validateReliabilityPolicy({
     budgets,
-    baselineReceipts: loadBaselineReceipts(root, budgets),
+    baselineReceipts,
+    sourceSnapshots: loadSourceSnapshots(root, baselineReceipts),
+    currentPolicyHashes: currentPolicyHashes(root),
     workflow: fs.readFileSync(
       path.join(root, ".github", "workflows", "reliability.yml"),
       "utf8",
@@ -276,27 +472,23 @@ function main() {
       path.join(root, "scripts", "reliability-qualification.ts"),
       "utf8",
     ),
-  };
-  const errors = validateReliabilityPolicy(inputs);
+  });
   if (errors.length > 0) {
     for (const error of errors) console.error(`Reliability policy: ${error}`);
     process.exitCode = 1;
+  } else if (
+    baselineReceipts.every(
+      ({ value }) => value.schema === "ctxmux.reliability-qualification.v1",
+    )
+  ) {
+    console.log(
+      "Reliability policy: legacy v1 baseline accepted for transition; only a complete source-bound v2 baseline satisfies T-021",
+    );
   } else {
     console.log(
-      "Reliability policy: smoke, nightly, release, and 1/32/128 budgets are reachable",
+      "Reliability policy: source-bound v2 observations and deterministic ceilings are valid",
     );
   }
-}
-
-export function loadBaselineReceipts(root, budgets) {
-  return (budgets.observation_baseline?.raw_receipts ?? []).map((reference) => {
-    const bytes = fs.readFileSync(path.join(root, reference.path));
-    return {
-      path: reference.path,
-      sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
-      value: JSON.parse(bytes.toString("utf8")),
-    };
-  });
 }
 
 if (

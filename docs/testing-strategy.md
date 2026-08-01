@@ -270,9 +270,68 @@ concurrency 1/4/8, while concurrency 16 reproduced Darwin `openpty -6` after
 123 successful responses. This is recorded as burst-start pressure rather than
 misreported as a 128-Run steady-state limit. A separate 32-Run/concurrency-16
 oracle preserves concurrent-start stress without weakening the 128 census.
-The three complete observation receipts live under `fixtures/reliability/`.
-The policy gate verifies each SHA-256 and recomputes every recorded maximum
-from those durable raw receipts before accepting the budget file.
+
+T-021 upgrades that baseline to source-bound receipt generation 2. The only
+accepted fixture references are, in order,
+`fixtures/reliability/observe-darwin-arm64-r1.json`,
+`fixtures/reliability/observe-darwin-arm64-r2.json`, and
+`fixtures/reliability/observe-darwin-arm64-r3.json`;
+their paths and SHA-256 values must be canonical and unique. Each receipt must
+be a passing complete `observe` run for round 1, 2, or 3. The rounds share one
+clean source commit and tree, harness, launcher, daemon binary, locked build,
+lockfiles, toolchain, host, seed, time budget, workload, and measurement
+contract. Every round contains the four complete qualification stages and the
+six unique resource cells. Provenance capture and verification precede the
+first stage, and a second verification follows the last stage.
+
+The policy independently reads Git objects for each generation-2 receipt. The
+recorded 40-hex commit must be an ancestor of the policy runner's current
+`HEAD`; its tree must match, and the policy recomputes SHA-256 for
+`scripts/reliability-qualification.ts`, `scripts/check-reliability.sh`,
+`Cargo.lock`, and `package-lock.json` from that commit. It does not reconstruct
+the daemon binary. `claim_scope: locally_observed` and
+`binary_source_attestation: false` are therefore mandatory: the receipt binds
+the exact binary bytes used by all three local runs without promoting that hash
+to a reproducible-build or remote-attestation claim. Nightly, release, and
+other platform evidence remains pending until those lanes produce their own
+artifacts.
+
+The baseline also records the SHA-256 of the stable
+`scripts/reliability-budget-contract.mjs` owner. The Git loader reads that blob
+from the observation commit, and the validator requires the currently executed
+contract bytes to match. The entrypoint, Git loader, and receipt validator are
+not frozen as budget policy. This binds only the ten field mappings, rational
+formula, and table below before observation values exist; changing a multiplier
+or quantum after seeing results invalidates the baseline instead of allowing
+budgets and formulas to move together. Receipt start must precede receipt
+completion, and all three completions must precede `frozen_at`; these timestamps
+exclude internally contradictory evidence but are not an external clock
+attestation.
+
+For each cell, the policy recomputes maxima for all ten governed values: CPU,
+peak RSS, steady RSS, retained bytes per Run, RSS/thread/fd per Run, cleanup
+thread delta, cleanup live children, and cleanup attachments. Cleanup thread
+delta is `max(0, cleanup.threads - baseline.threads)`. Budget ceilings are not
+editable margins. They are derived exactly as
+`ceil_to_quantum(max(minimum, observed × multiplier + additive))` using rational
+arithmetic and this pre-observation table:
+
+| Observed value                        | Multiplier | Additive | Minimum | Quantum |
+| ------------------------------------- | ---------: | -------: | ------: | ------: |
+| CPU core percent                      |        1.5 |        0 |       5 |       5 |
+| Peak and steady RSS KiB               |        1.5 |        0 |    8192 |    4096 |
+| Retained output bytes per Run         |       1.25 |        0 |       0 |    4096 |
+| RSS KiB per Run                       |        1.5 |        0 |     256 |     256 |
+| Threads and file descriptors per Run  |          1 |     0.25 |       0 |    0.25 |
+| Cleanup thread delta                  |          1 |        1 |       1 |       1 |
+| Cleanup live children and attachments |          1 |        0 |       0 |       1 |
+
+The checked-in generation-1 receipts remain a temporary Gate-preserving
+transition while T-021 is in progress; they do not satisfy its source-bound
+acceptance. An all-generation-1 set may pass the legacy policy, but a mixed
+generation set fails. Consequently the first checked-in generation-2 fixture
+requires all three source-bound rounds, ten-field maxima, and exact derived
+ceilings to land together.
 
 The PR profile runs the full named matrix with the one-Run resource cells and
 no time soak. Nightly uses the complete resource matrix plus a real 30-minute
