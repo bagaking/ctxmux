@@ -33,6 +33,12 @@ const coverageGateRun = gateRun("scripts/check.sh --coverage");
 const criticalRunLine = `      - run: ${criticalGateRun}`;
 const coverageRunLine = `      - run: ${coverageGateRun}`;
 
+function replaceLast(source, before, after) {
+  const index = source.lastIndexOf(before);
+  assert.notEqual(index, -1, `missing replacement anchor: ${before}`);
+  return `${source.slice(0, index)}${after}${source.slice(index + before.length)}`;
+}
+
 function createFixture(t) {
   const root = fs.mkdtempSync(
     path.join(os.tmpdir(), "ctxmux-ci-reachability-"),
@@ -131,6 +137,8 @@ jobs:
       CTXMUX_TMUX_QUALIFICATION: \${{ matrix.tmux_lane }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - run: ${criticalGateRun}
         env:
           BASH_ENV: /dev/null
@@ -493,7 +501,8 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
     {
       label: "coverage checkout cannot select another ref",
       mutate(fixture) {
-        fixture.workflow = fixture.workflow.replace(
+        fixture.workflow = replaceLast(
+          fixture.workflow,
           "          fetch-depth: 0",
           "          fetch-depth: 0\n          ref: ${{ github.event.pull_request.base.sha }}",
         );
@@ -503,7 +512,8 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
     {
       label: "coverage checkout cannot select another repository",
       mutate(fixture) {
-        fixture.workflow = fixture.workflow.replace(
+        fixture.workflow = replaceLast(
+          fixture.workflow,
           "          fetch-depth: 0",
           "          fetch-depth: 0\n          repository: owner/decoy",
         );
@@ -513,7 +523,8 @@ test("rejects unreachable or weakened coverage comparison reach", (t) => {
     {
       label: "coverage checkout cannot move the source root",
       mutate(fixture) {
-        fixture.workflow = fixture.workflow.replace(
+        fixture.workflow = replaceLast(
+          fixture.workflow,
           "          fetch-depth: 0",
           "          fetch-depth: 0\n          path: decoy",
         );
@@ -983,7 +994,8 @@ ${stepEnvironment.replaceAll("          ", "      ")}    steps:`,
     {
       label: "full-history checkout after the command is only a decoy",
       mutate(fixture) {
-        fixture.workflow = fixture.workflow.replace(
+        fixture.workflow = replaceLast(
+          fixture.workflow,
           "fetch-depth: 0",
           "fetch-depth: 1",
         );

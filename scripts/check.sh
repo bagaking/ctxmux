@@ -4,6 +4,39 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+ctxmux_check_completed=false
+ctxmux_check_state_dir=
+ctxmux_check_completion_marker=
+ctxmux_check_completion_nonce=
+ctxmux_check_cleanup() {
+  if [[ -n $ctxmux_check_completion_marker ]]
+  then
+    rm -f -- "$ctxmux_check_completion_marker"
+    ctxmux_check_completion_marker=
+  fi
+  if [[ -n $ctxmux_check_state_dir ]]
+  then
+    rmdir -- "$ctxmux_check_state_dir" 2>/dev/null || true
+    ctxmux_check_state_dir=
+  fi
+}
+ctxmux_check_completion_guard() {
+  ctxmux_check_exit_status=$?
+  trap - EXIT
+  ctxmux_check_cleanup
+  if [[ $ctxmux_check_completed != true && $ctxmux_check_exit_status -eq 0 ]]
+  then
+    echo "repository check exited before its final reliability smoke" >&2
+    exit 1
+  fi
+  exit "$ctxmux_check_exit_status"
+}
+trap ctxmux_check_completion_guard EXIT
+
+ctxmux_check_core() (
+set -euo pipefail
+trap - EXIT
+
 ctxmux_check_coverage=false
 if [[ ${1:-} == "--coverage" ]]
 then
@@ -81,4 +114,29 @@ then
 npm test
 fi
 
+printf '%s\n' "$ctxmux_check_completion_nonce" > "$ctxmux_check_completion_marker"
+)
+
+ctxmux_check_state_dir=$(mktemp -d "${TMPDIR:-/tmp}/ctxmux-check.XXXXXX")
+ctxmux_check_completion_marker=$ctxmux_check_state_dir/completed
+ctxmux_check_completion_nonce="$$-$RANDOM-$RANDOM"
+set +e
+ctxmux_check_core "$@"
+ctxmux_check_core_status=$?
+set -e
+if [[ $ctxmux_check_core_status -ne 0 ]]
+then
+  echo "repository check core did not reach its completion boundary" >&2
+  ctxmux_check_cleanup
+  exit "$ctxmux_check_core_status"
+fi
+if [[ ! -f $ctxmux_check_completion_marker || $(< "$ctxmux_check_completion_marker") != "$ctxmux_check_completion_nonce" ]]
+then
+  echo "repository check core did not publish its completion token" >&2
+  ctxmux_check_cleanup
+  exit 1
+fi
+ctxmux_check_cleanup
+
 scripts/check-reliability.sh --profile smoke
+ctxmux_check_completed=true

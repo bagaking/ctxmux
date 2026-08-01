@@ -331,13 +331,51 @@ was frozen. Current policy accepts only generation 2; an all-generation-1 set,
 mixed generations, or an unknown generation fails closed. All three
 generation-2 fixtures, ten-field maxima, and exact derived ceilings must remain
 valid together.
+The canonical `scripts/check-reliability.sh` command validates this policy
+before it builds or starts any qualification workload.
+Critical, nightly, and release checkouts fetch full Git history because policy
+verifies the frozen source commit and its exact harness and contract blobs.
+Hosted qualification also binds the exact checkout, Node, Rust, dependency,
+workload, and artifact-upload step sequence. Dependency installation disables
+lifecycle scripts, the workload step neutralizes Bash startup files before
+policy admission, and the closed sequence prevents an unregistered earlier
+step from changing its inherited environment or executable search path. The
+harness and validator share one structured profile contract for soak, time,
+resource, and seed defaults instead of treating source tokens as execution
+evidence. After the harness returns, the launcher independently requires a
+passing source-bound receipt with the expected profile, stages, workload,
+provenance, and retained daemon logs. Preflight admits only the canonical
+profile-owned result path, enters its owner one component at a time through
+no-follow directory descriptors, and records that owner's device/inode, a
+not-before timestamp, an invocation nonce, and the prior receipt identity or
+absence. It never deletes or rewrites the old receipt. Before starting a timer
+or worker, the supervisor re-enters that exact owner; the worker inherits the
+held cwd identity. Receipt publication, timeout annotation, and uniquely named
+exclusive daemon logs then use owner-relative basenames only, so replacing a
+parent pathname or planting a log symlink cannot make writes follow a different
+victim inode; writes remain bound to the preflight owner inode. Moving that
+owner inode elsewhere or directly mutating its files from another same-UID
+process remains outside this local evidence boundary. Every profile, including
+observation, must produce a receipt whose trace echoes the invocation nonce,
+whose start is no earlier than preflight, and whose completion is no later than
+verification; a pre-existing receipt must also have been atomically replaced.
+Passing receipts reject failure actions and require monotonic trace and stage
+chronology inside the receipt interval. The final verifier re-enters the
+preflight owner before any artifact read, opens the receipt and every declared
+log no-follow relative to that owner, and rechecks the receipt identity and
+bytes after semantic validation. An empty artifact directory is also an upload
+failure. The required repository Gate
+separately binds its normalized core, the complete normalized reliability
+launcher, and exact adjacency between their supervised boundaries; it accepts
+the final smoke only after that core publishes a private completion token.
 
 The PR profile runs the full named matrix with the one-Run resource cells and
 no time soak. Nightly uses the complete resource matrix plus a real 30-minute
 active soak inside a 45-minute harness budget. Explicit release dispatch uses a
 two-hour soak inside a three-hour harness budget. Both scheduled profiles run
-on Ubuntu and macOS and upload the structured receipt plus every daemon log even
-when the gate fails.
+on Ubuntu and macOS and attempt to upload any produced receipt and daemon logs
+even when the workload step fails; missing artifacts are themselves an upload
+failure rather than evidence of a completed run.
 
 ### Concurrency and race testing
 

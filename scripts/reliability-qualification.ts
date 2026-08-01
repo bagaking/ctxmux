@@ -6,11 +6,9 @@ import { createHash } from "node:crypto";
 import {
   createWriteStream,
   existsSync,
-  mkdirSync,
   readFileSync,
   readdirSync,
   type WriteStream,
-  writeFileSync,
 } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
@@ -30,10 +28,50 @@ import {
   type RunSpec,
 } from "../packages/sdk/src/index.ts";
 import { shellIntegration } from "../packages/sdk/src/integrations/shell.ts";
+import {
+  assertInheritedArtifactOwner,
+  enterCanonicalArtifactOwner,
+  openFreshOwnedFile,
+  parseQualificationPreflight,
+  readOwnedJson,
+  type QualificationPreflight,
+  writeOwnedJsonAtomically,
+} from "./reliability-artifact-owner.mts";
 
 type QualificationProfile = "smoke" | "nightly" | "release" | "observe";
 type QualificationStage = "all" | "resource-census";
 type WorkloadMode = "idle" | "active";
+
+interface QualificationPolicy {
+  readonly schema: "ctxmux.reliability-qualification-policy.v1";
+  readonly profiles: Readonly<
+    Record<
+      QualificationProfile,
+      {
+        readonly time_budget_seconds: number;
+        readonly soak_seconds: number;
+        readonly resource_counts: readonly number[];
+      }
+    >
+  >;
+  readonly resource_start_concurrency: number;
+  readonly seed_controls: readonly string[];
+}
+
+export const QUALIFICATION_POLICY_SOURCE = String.raw`{
+  "schema": "ctxmux.reliability-qualification-policy.v1",
+  "profiles": {
+    "smoke": { "time_budget_seconds": 60, "soak_seconds": 0, "resource_counts": [1] },
+    "nightly": { "time_budget_seconds": 2700, "soak_seconds": 1800, "resource_counts": [1, 32, 128] },
+    "release": { "time_budget_seconds": 10800, "soak_seconds": 7200, "resource_counts": [1, 32, 128] },
+    "observe": { "time_budget_seconds": 2700, "soak_seconds": 0, "resource_counts": [1, 32, 128] }
+  },
+  "resource_start_concurrency": 8,
+  "seed_controls": ["fanout payload byte", "secret marker"]
+}`;
+const QUALIFICATION_POLICY = JSON.parse(
+  QUALIFICATION_POLICY_SOURCE,
+) as QualificationPolicy;
 
 interface ProcessSample {
   readonly rss_kib: number;
@@ -172,8 +210,8 @@ interface QualificationOptions {
   readonly observationRound: number | null;
   readonly stage: QualificationStage;
   readonly seed: number;
-  readonly evidencePath: string;
   readonly artifactDirectory: string;
+  readonly preflight: QualificationPreflight;
   readonly timeBudgetSeconds: number;
   readonly resourceCounts: readonly number[];
   readonly resourceModes: readonly WorkloadMode[];
@@ -222,9 +260,8 @@ async function superviseQualification(
 ): Promise<void> {
   const worker = spawn(
     process.execPath,
-    ["--import", "tsx", process.argv[1]!, ...process.argv.slice(2)],
+    ["--import", "tsx", harnessPath, ...process.argv.slice(2)],
     {
-      cwd: root,
       detached: true,
       stdio: "inherit",
       env: { ...process.env, CTXMUX_RELIABILITY_WORKER: "1" },
@@ -274,9 +311,20 @@ function recordSupervisorTimeout(options: QualificationOptions): void {
   const message = `qualification exceeded its hard ${options.timeBudgetSeconds}s time budget`;
   let receipt: QualificationReceipt;
   try {
-    receipt = JSON.parse(
-      readFileSync(options.evidencePath, "utf8"),
-    ) as QualificationReceipt;
+    const current = readOwnedJson<QualificationReceipt>("result.json");
+    const captured = current.value.action_trace.find(
+      (entry) => entry.action === "provenance.captured",
+    );
+    const preexistingIdentity = options.preflight.preexisting_receipt_identity;
+    if (
+      captured?.invocation_nonce !== options.preflight.invocation_nonce ||
+      (preexistingIdentity !== null &&
+        current.identity.dev === preexistingIdentity.dev &&
+        current.identity.ino === preexistingIdentity.ino)
+    ) {
+      return;
+    }
+    receipt = current.value;
   } catch {
     return;
   }
@@ -307,11 +355,10 @@ function recordSupervisorTimeout(options: QualificationOptions): void {
     action: "supervisor.timeout",
     time_budget_seconds: options.timeBudgetSeconds,
   });
-  writeFileSync(options.evidencePath, `${JSON.stringify(receipt, null, 2)}\n`);
+  writeOwnedJsonAtomically("result.json", receipt);
 }
 
 async function qualify(options: QualificationOptions): Promise<void> {
-  mkdirSync(options.artifactDirectory, { recursive: true });
   const provenance = captureProvenance();
   const cpu = cpus();
   const receipt: QualificationReceipt = {
@@ -344,7 +391,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
       resource_start_concurrency: options.resourceStartConcurrency,
       peak_rss_sample_interval_ms: 25,
       soak_seconds: options.soakSeconds,
-      seed_controls: ["fanout payload byte", "secret marker"],
+      seed_controls: [...QUALIFICATION_POLICY.seed_controls],
       note: "Absent global quotas and GC remain visible; the harness bounds are qualification workloads, not product limits.",
     },
     action_trace: [],
@@ -354,11 +401,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
   };
   const deadline = Date.now() + options.timeBudgetSeconds * 1000;
   const writeReceipt = (): void => {
-    mkdirSync(dirname(options.evidencePath), { recursive: true });
-    writeFileSync(
-      options.evidencePath,
-      `${JSON.stringify(receipt, null, 2)}\n`,
-    );
+    writeOwnedJsonAtomically("result.json", receipt);
   };
   const trace = (
     action: string,
@@ -411,6 +454,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
     launcher_sha256: provenance.launcher.sha256,
     daemon_sha256: provenance.daemon.sha256,
     measurement_contract_sha256: provenance.measurement_contract_sha256,
+    invocation_nonce: options.preflight.invocation_nonce,
   });
   try {
     assertQualificationProvenance(options, provenance);
@@ -1159,11 +1203,11 @@ class DaemonFixture {
     );
     const directory = await mkdtemp(join(tmpdir(), `ctxmux-${label}-`));
     const socketPath = join(directory, "ctxmux.sock");
-    const logPath = join(
-      options.artifactDirectory,
-      `${sanitize(label)}-daemon.log`,
-    );
-    const log = createWriteStream(logPath, { flags: "a" });
+    const logName = `${options.preflight.invocation_nonce}-${sanitize(label)}-daemon.log`;
+    const log = createWriteStream(logName, {
+      fd: openFreshOwnedFile(logName),
+      autoClose: true,
+    });
     const child = spawn(daemonBinary, ["--socket", socketPath], {
       cwd: root,
       stdio: ["ignore", "pipe", "pipe"],
@@ -1174,11 +1218,13 @@ class DaemonFixture {
       label,
       directory,
       socketPath,
-      logPath,
+      logName,
       child,
       log,
     );
-    receipt.daemon_logs.push(portablePath(logPath));
+    receipt.daemon_logs.push(
+      portablePath(join(options.artifactDirectory, logName)),
+    );
     try {
       await withDeadline(
         poll(async () => {
@@ -1285,16 +1331,11 @@ function parseOptions(): QualificationOptions {
     "CTXMUX_RELIABILITY_SEED",
     process.env.CTXMUX_RELIABILITY_SEED ?? "226004",
   );
-  const defaults: Record<QualificationProfile, number> = {
-    smoke: 60,
-    nightly: 45 * 60,
-    release: 3 * 60 * 60,
-    observe: 45 * 60,
-  };
+  const profilePolicy = QUALIFICATION_POLICY.profiles[profile];
   const timeBudgetSeconds = positiveInteger(
     "CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS",
     process.env.CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS ??
-      String(defaults[profile]),
+      String(profilePolicy.time_budget_seconds),
   );
   const artifactDirectory = resolve(
     root,
@@ -1306,30 +1347,52 @@ function parseOptions(): QualificationOptions {
     process.env.CTXMUX_RELIABILITY_EVIDENCE ??
       join(artifactDirectory, "result.json"),
   );
-  const defaultCounts = profile === "smoke" ? [1] : [1, 32, 128];
+  const canonicalArtifactDirectory = resolve(
+    root,
+    `target/reliability/${profile}`,
+  );
+  assert.equal(
+    artifactDirectory,
+    canonicalArtifactDirectory,
+    "CTXMUX_RELIABILITY_ARTIFACT_DIR must resolve to the canonical profile directory",
+  );
+  assert.equal(
+    evidencePath,
+    join(canonicalArtifactDirectory, "result.json"),
+    "CTXMUX_RELIABILITY_EVIDENCE must resolve to the canonical profile receipt",
+  );
+  const preflight = parseQualificationPreflight(
+    process.env.CTXMUX_RELIABILITY_PREFLIGHT,
+    profile,
+  );
+  if (process.env.CTXMUX_RELIABILITY_WORKER === "1") {
+    assertInheritedArtifactOwner(preflight.artifact_owner_identity);
+  } else {
+    enterCanonicalArtifactOwner({
+      root,
+      profile,
+      expectedIdentity: preflight.artifact_owner_identity,
+      create: false,
+    });
+  }
   const resourceCounts = positiveIntegerList(
     "--resource-counts",
     optionValue("--resource-counts"),
-    defaultCounts,
+    profilePolicy.resource_counts,
   );
   const resourceModes = workloadModeList(optionValue("--resource-modes"));
   const resourceStartConcurrency = positiveInteger(
     "--resource-start-concurrency",
-    optionValue("--resource-start-concurrency") ?? "8",
+    optionValue("--resource-start-concurrency") ??
+      String(QUALIFICATION_POLICY.resource_start_concurrency),
   );
   assert.ok(
     resourceStartConcurrency <= 128,
     "--resource-start-concurrency must be at most 128",
   );
-  const soakDefaults: Record<QualificationProfile, number> = {
-    smoke: 0,
-    nightly: 30 * 60,
-    release: 2 * 60 * 60,
-    observe: 0,
-  };
   const soakSeconds = nonNegativeInteger(
     "--soak-seconds",
-    optionValue("--soak-seconds") ?? String(soakDefaults[profile]),
+    optionValue("--soak-seconds") ?? String(profilePolicy.soak_seconds),
   );
   assert.ok(
     soakSeconds === 0 || soakSeconds + 10 * 60 < timeBudgetSeconds,
@@ -1340,8 +1403,8 @@ function parseOptions(): QualificationOptions {
     observationRound,
     stage,
     seed,
-    evidencePath,
     artifactDirectory,
+    preflight,
     timeBudgetSeconds,
     resourceCounts,
     resourceModes,

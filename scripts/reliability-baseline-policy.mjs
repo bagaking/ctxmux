@@ -33,6 +33,26 @@ const EXPECTED_STAGE_IDS =
   "chaos-owner-matrix security-negative-space stress-and-soak resource-census".split(
     " ",
   );
+const QUALIFICATION_STAGE_IDS = [
+  ...EXPECTED_STAGE_IDS,
+  "frozen-resource-budgets",
+];
+const PASSING_TRACE_ACTIONS = new Set([
+  "provenance.captured",
+  "provenance.verified",
+  "provenance.reverified",
+  "stage.start",
+  "stage.pass",
+  "chaos.integration_host.spawn",
+  "chaos.integration_host.survived",
+  "chaos.child.kill",
+  "chaos.daemon.kill",
+  "security.negative_space",
+  "stress.concurrent_start",
+  "stress.soak",
+  "stress.fanout",
+  "resource.measurement",
+]);
 const FIXED_BUILD_TARGET = "target/reliability/provenance-build";
 const FIXED_DAEMON_PATH = `${FIXED_BUILD_TARGET}/debug/ctxmuxd`;
 const FIXED_BUILD_ARGV = [
@@ -289,47 +309,15 @@ function validateV2Receipt(
   budgets,
   policyContracts,
   errors,
+  invocationNonce,
 ) {
   const { path: receiptPath, value } = receipt;
-  if (
-    !exactObject(value, RECEIPT_FIELDS, `v2 receipt ${receiptPath}`, errors)
-  ) {
+  if (!validateReceiptEnvelope(value, receiptPath, "observe", errors))
     return undefined;
-  }
-  expect(
-    errors,
-    value.schema === "ctxmux.reliability-qualification.v2" &&
-      value.status === "pass" &&
-      value.profile === "observe",
-    `v2 receipt must use the v2 schema and pass observe: ${receiptPath}`,
-  );
   expect(
     errors,
     [1, 2, 3].includes(value.observation_round),
     `v2 receipt has invalid observation round: ${receiptPath}`,
-  );
-  expect(
-    errors,
-    positiveInteger(value.seed) && positiveInteger(value.time_budget_seconds),
-    `v2 receipt needs a positive seed and time budget: ${receiptPath}`,
-  );
-  expect(
-    errors,
-    validTimestamp(value.recorded_at) && validTimestamp(value.completed_at),
-    `v2 receipt needs valid start and completion timestamps: ${receiptPath}`,
-  );
-  expect(
-    errors,
-    value.error === null,
-    `passing v2 receipt has an error: ${receiptPath}`,
-  );
-  expect(
-    errors,
-    Array.isArray(value.action_trace) &&
-      Array.isArray(value.daemon_logs) &&
-      value.daemon_logs.length > 0 &&
-      value.daemon_logs.every(nonEmptyString),
-    `v2 receipt needs action trace and non-empty daemon logs: ${receiptPath}`,
   );
   validateHost(value.environment, receiptPath, errors);
   validateWorkload(value.declared_limits, receiptPath, errors);
@@ -347,11 +335,169 @@ function validateV2Receipt(
     value.observation_round,
     receiptPath,
     errors,
+    EXPECTED_STAGE_IDS,
+    invocationNonce,
   );
-  return validateStages(value.stages, receiptPath, errors);
+  const measurements = validateStages(value.stages, receiptPath, errors);
+  validatePassingChronology(value, receiptPath, EXPECTED_STAGE_IDS, errors);
+  return measurements;
 }
 
-function validateTrace(trace, provenance, round, receiptPath, errors) {
+export function validatePassingObservationReceipt({
+  receiptPath,
+  value,
+  snapshot,
+  budgets,
+  policyContracts,
+  notBefore,
+  verifiedAt,
+  invocationNonce,
+}) {
+  const errors = [];
+  validateV2Receipt(
+    { path: receiptPath, value },
+    snapshot,
+    budgets,
+    policyContracts,
+    errors,
+    invocationNonce,
+  );
+  validateReceiptFreshness(value, notBefore, verifiedAt, receiptPath, errors);
+  return errors;
+}
+
+export function validatePassingQualificationReceipt({
+  receiptPath,
+  value,
+  expectedProfile,
+  qualificationPolicy,
+  snapshot,
+  budgets,
+  policyContracts,
+  notBefore,
+  verifiedAt,
+  invocationNonce,
+}) {
+  const errors = [];
+  if (!validateReceiptEnvelope(value, receiptPath, expectedProfile, errors))
+    return errors;
+  const profilePolicy = qualificationPolicy?.profiles?.[expectedProfile];
+  expect(
+    errors,
+    value.observation_round === null &&
+      value.time_budget_seconds === profilePolicy?.time_budget_seconds,
+    `v2 ${expectedProfile} receipt must use its canonical time budget without an observation round: ${receiptPath}`,
+  );
+  validateHost(value.environment, receiptPath, errors);
+  validateWorkload(value.declared_limits, receiptPath, errors, {
+    resource_counts: profilePolicy?.resource_counts,
+    soak_seconds: profilePolicy?.soak_seconds,
+    resource_start_concurrency: qualificationPolicy?.resource_start_concurrency,
+    seed_controls: qualificationPolicy?.seed_controls,
+  });
+  validateProvenance(
+    value.provenance,
+    snapshot,
+    budgets,
+    policyContracts,
+    receiptPath,
+    errors,
+  );
+  validateTrace(
+    value.action_trace,
+    value.provenance,
+    value.observation_round,
+    receiptPath,
+    errors,
+    QUALIFICATION_STAGE_IDS,
+    invocationNonce,
+  );
+  validateStages(
+    value.stages,
+    receiptPath,
+    errors,
+    QUALIFICATION_STAGE_IDS,
+    profilePolicy?.resource_counts,
+  );
+  validatePassingChronology(
+    value,
+    receiptPath,
+    QUALIFICATION_STAGE_IDS,
+    errors,
+  );
+  validateReceiptFreshness(value, notBefore, verifiedAt, receiptPath, errors);
+  return errors;
+}
+
+function validateReceiptFreshness(
+  value,
+  notBefore,
+  verifiedAt,
+  receiptPath,
+  errors,
+) {
+  expect(
+    errors,
+    validTimestamp(notBefore) &&
+      validTimestamp(verifiedAt) &&
+      validTimestamp(value?.recorded_at) &&
+      validTimestamp(value?.completed_at) &&
+      Date.parse(value.recorded_at) >= Date.parse(notBefore) &&
+      Date.parse(value.completed_at) <= Date.parse(verifiedAt),
+    `v2 receipt must be produced by the current invocation: ${receiptPath}`,
+  );
+}
+
+function validateReceiptEnvelope(value, receiptPath, expectedProfile, errors) {
+  if (
+    !exactObject(value, RECEIPT_FIELDS, `v2 receipt ${receiptPath}`, errors)
+  ) {
+    return false;
+  }
+  expect(
+    errors,
+    value.schema === "ctxmux.reliability-qualification.v2" &&
+      value.status === "pass" &&
+      value.profile === expectedProfile,
+    `v2 receipt must use the v2 schema and pass ${expectedProfile}: ${receiptPath}`,
+  );
+  expect(
+    errors,
+    positiveInteger(value.seed) && positiveInteger(value.time_budget_seconds),
+    `v2 receipt needs a positive seed and time budget: ${receiptPath}`,
+  );
+  expect(
+    errors,
+    validTimestamp(value.recorded_at) &&
+      validTimestamp(value.completed_at) &&
+      Date.parse(value.recorded_at) <= Date.parse(value.completed_at),
+    `v2 receipt needs valid start and completion timestamps: ${receiptPath}`,
+  );
+  expect(
+    errors,
+    value.error === null,
+    `passing v2 receipt has an error: ${receiptPath}`,
+  );
+  expect(
+    errors,
+    Array.isArray(value.action_trace) &&
+      Array.isArray(value.daemon_logs) &&
+      value.daemon_logs.length > 0 &&
+      value.daemon_logs.every(nonEmptyString),
+    `v2 receipt needs action trace and non-empty daemon logs: ${receiptPath}`,
+  );
+  return true;
+}
+
+function validateTrace(
+  trace,
+  provenance,
+  round,
+  receiptPath,
+  errors,
+  expectedStageIds = EXPECTED_STAGE_IDS,
+  invocationNonce,
+) {
   if (!Array.isArray(trace)) return;
   if (
     trace.some(
@@ -364,6 +510,11 @@ function validateTrace(trace, provenance, round, receiptPath, errors) {
     errors.push(`v2 action trace entries are malformed: ${receiptPath}`);
     return;
   }
+  expect(
+    errors,
+    trace.every((entry) => PASSING_TRACE_ACTIONS.has(entry.action)),
+    `v2 passing receipt action trace contains a failure action or unknown action: ${receiptPath}`,
+  );
   const indexes = (action) =>
     trace.flatMap((entry, index) => (entry.action === action ? [index] : []));
   const captured = indexes("provenance.captured");
@@ -375,14 +526,16 @@ function validateTrace(trace, provenance, round, receiptPath, errors) {
     captured.length === 1 &&
     verified.length === 1 &&
     reverified.length === 1 &&
-    starts.length === 4 &&
-    passes.length === 4 &&
+    starts.length === expectedStageIds.length &&
+    passes.length === expectedStageIds.length &&
     captured[0] < verified[0] &&
     verified[0] < Math.min(...starts) &&
     reverified[0] > Math.max(...passes);
   if (!fenced) {
     errors.push(
-      `v2 action trace does not fence all four stages: ${receiptPath}`,
+      expectedStageIds === EXPECTED_STAGE_IDS
+        ? `v2 action trace does not fence all four stages: ${receiptPath}`
+        : `v2 action trace does not fence every expected stage: ${receiptPath}`,
     );
     return;
   }
@@ -394,13 +547,96 @@ function validateTrace(trace, provenance, round, receiptPath, errors) {
       trace[reverified[0]].daemon_sha256 === provenance?.daemon?.sha256 &&
       isDeepStrictEqual(
         starts.map((index) => trace[index].id),
-        EXPECTED_STAGE_IDS,
+        expectedStageIds,
       ) &&
       isDeepStrictEqual(
         passes.map((index) => trace[index].id),
-        EXPECTED_STAGE_IDS,
+        expectedStageIds,
       ),
     `v2 action trace provenance or stage order drifted: ${receiptPath}`,
+  );
+  if (invocationNonce !== undefined) {
+    expect(
+      errors,
+      trace[captured[0]].invocation_nonce === invocationNonce,
+      `v2 action trace must bind the current invocation nonce: ${receiptPath}`,
+    );
+  }
+}
+
+function validatePassingChronology(
+  value,
+  receiptPath,
+  expectedStageIds,
+  errors,
+) {
+  const receiptStart = Date.parse(value?.recorded_at);
+  const receiptEnd = Date.parse(value?.completed_at);
+  const trace = value?.action_trace;
+  const stages = value?.stages;
+  if (
+    !Number.isFinite(receiptStart) ||
+    !Number.isFinite(receiptEnd) ||
+    !Array.isArray(trace) ||
+    trace.some((entry) => !validTimestamp(entry?.timestamp)) ||
+    !Array.isArray(stages) ||
+    stages.length !== expectedStageIds.length ||
+    stages.some(
+      (stage) =>
+        !validTimestamp(stage?.started_at) ||
+        !validTimestamp(stage?.completed_at),
+    )
+  ) {
+    return;
+  }
+  const traceTimes = trace.map((entry) => Date.parse(entry.timestamp));
+  expect(
+    errors,
+    traceTimes.every(
+      (timestamp, index) =>
+        timestamp >= receiptStart &&
+        timestamp <= receiptEnd &&
+        (index === 0 || timestamp >= traceTimes[index - 1]),
+    ),
+    `v2 action trace chronology must be monotonic inside the receipt interval: ${receiptPath}`,
+  );
+
+  let previousStageCompletion = receiptStart;
+  let stageChronologyIsValid = true;
+  for (const stageId of expectedStageIds) {
+    const stage = stages.find(({ id }) => id === stageId);
+    const startTrace = trace.find(
+      (entry) => entry.action === "stage.start" && entry.id === stageId,
+    );
+    const passTrace = trace.find(
+      (entry) => entry.action === "stage.pass" && entry.id === stageId,
+    );
+    if (
+      stage === undefined ||
+      startTrace === undefined ||
+      passTrace === undefined
+    ) {
+      stageChronologyIsValid = false;
+      continue;
+    }
+    const stageStart = Date.parse(stage.started_at);
+    const stageCompletion = Date.parse(stage.completed_at);
+    const traceStart = Date.parse(startTrace.timestamp);
+    const tracePass = Date.parse(passTrace.timestamp);
+    stageChronologyIsValid =
+      stageChronologyIsValid &&
+      stageStart >= receiptStart &&
+      stageStart >= previousStageCompletion &&
+      stageStart <= traceStart &&
+      traceStart <= stageCompletion &&
+      stageCompletion <= tracePass &&
+      tracePass <= receiptEnd;
+    previousStageCompletion = stageCompletion;
+  }
+  expect(
+    errors,
+    stageChronologyIsValid,
+    `v2 stage chronology must stay inside the receipt interval and its trace fence: ${receiptPath}`,
   );
 }
 
@@ -423,7 +659,7 @@ function validateHost(environment, receiptPath, errors) {
   );
 }
 
-function validateWorkload(limits, receiptPath, errors) {
+function validateWorkload(limits, receiptPath, errors, overrides = {}) {
   if (
     !exactObject(limits, WORKLOAD_FIELDS, `v2 workload ${receiptPath}`, errors)
   ) {
@@ -443,13 +679,14 @@ function validateWorkload(limits, receiptPath, errors) {
     peak_rss_sample_interval_ms: 25,
     soak_seconds: 0,
     seed_controls: ["fanout payload byte", "secret marker"],
+    ...overrides,
   };
   expect(
     errors,
     Object.entries(expected).every(([field, value]) =>
       isDeepStrictEqual(limits[field], value),
     ) && nonEmptyString(limits.note),
-    `v2 workload is not the pre-registered complete observe matrix: ${receiptPath}`,
+    `v2 workload is not the canonical qualification matrix: ${receiptPath}`,
   );
 }
 
@@ -656,16 +893,26 @@ function validateSourceSnapshot(
   }
 }
 
-function validateStages(stages, receiptPath, errors) {
-  if (!Array.isArray(stages) || stages.length !== 4) {
-    errors.push(`v2 receipt must contain exactly four stages: ${receiptPath}`);
+function validateStages(
+  stages,
+  receiptPath,
+  errors,
+  expectedStageIds = EXPECTED_STAGE_IDS,
+  expectedResourceCounts = COUNTS.map(Number),
+) {
+  if (!Array.isArray(stages) || stages.length !== expectedStageIds.length) {
+    errors.push(
+      expectedStageIds === EXPECTED_STAGE_IDS
+        ? `v2 receipt must contain exactly four stages: ${receiptPath}`
+        : `v2 receipt must contain exactly ${expectedStageIds.length} stages: ${receiptPath}`,
+    );
     return undefined;
   }
   expect(
     errors,
     isDeepStrictEqual(
       stages.map((stage) => stage?.id),
-      EXPECTED_STAGE_IDS,
+      expectedStageIds,
     ),
     `v2 receipt stages are incomplete or out of order: ${receiptPath}`,
   );
@@ -684,7 +931,8 @@ function validateStages(stages, receiptPath, errors) {
       errors,
       stage.status === "pass" &&
         validTimestamp(stage.started_at) &&
-        validTimestamp(stage.completed_at),
+        validTimestamp(stage.completed_at) &&
+        Date.parse(stage.started_at) <= Date.parse(stage.completed_at),
       `v2 stage ${stage.id} must pass with timestamps: ${receiptPath}`,
     );
   }
@@ -692,32 +940,53 @@ function validateStages(stages, receiptPath, errors) {
     (stage) => stage?.id === "resource-census",
   );
   return resourceStages.length === 1
-    ? validateResourceCells(resourceStages[0].result, receiptPath, errors)
+    ? validateResourceCells(
+        resourceStages[0].result,
+        receiptPath,
+        errors,
+        expectedResourceCounts,
+      )
     : undefined;
 }
 
-function validateResourceCells(cells, receiptPath, errors) {
-  if (!Array.isArray(cells) || cells.length !== 6) {
+function validateResourceCells(
+  cells,
+  receiptPath,
+  errors,
+  expectedResourceCounts,
+) {
+  const expectedLength = MODES.length * expectedResourceCounts.length;
+  if (!Array.isArray(cells) || cells.length !== expectedLength) {
     errors.push(
-      `v2 resource census must contain exactly six cells: ${receiptPath}`,
+      expectedLength === 6
+        ? `v2 resource census must contain exactly six cells: ${receiptPath}`
+        : `v2 resource census must contain exactly ${expectedLength} cells: ${receiptPath}`,
     );
     return undefined;
   }
   const identities = cells.map((cell) => `${cell?.mode}/${cell?.runs}`);
   const expected = MODES.flatMap((mode) =>
-    COUNTS.map((count) => `${mode}/${count}`),
+    expectedResourceCounts.map((count) => `${mode}/${count}`),
   );
   let valid = expect(
     errors,
-    sameMembers(identities, expected) && new Set(identities).size === 6,
-    `v2 resource cells must be unique idle/active x 1/32/128: ${receiptPath}`,
+    sameMembers(identities, expected) &&
+      new Set(identities).size === expectedLength,
+    `v2 resource cells must be unique and match the canonical mode/count matrix: ${receiptPath}`,
   );
   for (const cell of cells)
-    valid = validateResourceCell(cell, receiptPath, errors) && valid;
+    valid =
+      validateResourceCell(cell, receiptPath, errors, expectedResourceCounts) &&
+      valid;
   return valid ? cells : undefined;
 }
 
-function validateResourceCell(cell, receiptPath, errors) {
+function validateResourceCell(
+  cell,
+  receiptPath,
+  errors,
+  expectedResourceCounts,
+) {
   const label = `${cell?.mode}/${cell?.runs} in ${receiptPath}`;
   if (
     !exactObject(cell, RESOURCE_FIELDS, `v2 resource cell ${label}`, errors)
@@ -726,7 +995,7 @@ function validateResourceCell(cell, receiptPath, errors) {
   }
   let valid = expect(
     errors,
-    MODES.includes(cell.mode) && COUNTS.includes(String(cell.runs)),
+    MODES.includes(cell.mode) && expectedResourceCounts.includes(cell.runs),
     `v2 resource cell has an unknown identity: ${label}`,
   );
   for (const name of ["baseline", "steady", "cleanup"]) {

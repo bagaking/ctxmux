@@ -156,7 +156,7 @@ function inspectYamlNode(node, errors) {
   }
 }
 
-function parseWorkflow(workflow, errors) {
+export function parseWorkflow(workflow, errors) {
   let document;
   try {
     document = parseDocument(workflow, {
@@ -201,7 +201,7 @@ function commandSteps(job, command) {
   return jobSteps(job).filter((step) => step.run === run);
 }
 
-function canonicalCheckoutPrecedesCommand(job, commandStep, fetchDepth) {
+export function canonicalCheckoutPrecedesCommand(job, commandStep, fetchDepth) {
   const steps = jobSteps(job);
   const checkouts = steps.filter(
     (step) =>
@@ -497,7 +497,8 @@ export function validateCiReachability({ root, map, workflow }) {
           `required workflow job ${job.id} must not exclude matrix lanes`,
         );
       }
-      const checkoutDepth = job.id === "coverage" ? 0 : undefined;
+      const checkoutDepth =
+        job.id === "critical" || job.id === "coverage" ? 0 : undefined;
       if (
         unconditionalSteps.length !== 1 ||
         !canonicalCheckoutPrecedesCommand(
@@ -507,7 +508,7 @@ export function validateCiReachability({ root, map, workflow }) {
         )
       ) {
         errors.push(
-          `required workflow job ${job.id} must use one prior canonical source checkout`,
+          `required workflow job ${job.id} must have one prior unconditional full-history checkout`,
         );
       }
       if (

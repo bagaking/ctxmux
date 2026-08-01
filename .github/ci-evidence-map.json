@@ -55,7 +55,7 @@
       "path": "scripts/ci-reachability.test.mjs",
       "invariants": [
         "every critical suite has explicit job and platform reach",
-        "required critical and coverage reach binds pull-request and main-push triggers, one unconditional final startup-neutralized source-fence-and-Gate step, default outer-shell execution, exact clean event source identity, and one prior canonical checkout",
+        "required critical and coverage reach binds pull-request and main-push triggers, one unconditional final startup-neutralized source-fence-and-Gate step, default outer-shell execution, exact clean event source identity, and one prior full-history canonical checkout",
         "required critical and coverage commands bind canonical tmux lanes plus fuzz and model case counts"
       ],
       "selection_ref": "scripts/check.sh",

@@ -33,6 +33,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -43,9 +45,12 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Install JavaScript dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run 30-minute chaos, stress, resource, and leak qualification
+        env:
+          BASH_ENV: /dev/null
+          ENV: /dev/null
         run: scripts/check-reliability.sh --profile nightly
 
       - name: Preserve nightly receipt and daemon logs
@@ -54,7 +59,7 @@ jobs:
         with:
           name: reliability-nightly-${{ matrix.os }}-${{ github.run_id }}
           path: target/reliability/nightly
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 30
 
   release-soak:
@@ -72,6 +77,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -82,9 +89,12 @@ jobs:
         run: rustup show active-toolchain
 
       - name: Install JavaScript dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Run two-hour release soak inside a three-hour qualification budget
+        env:
+          BASH_ENV: /dev/null
+          ENV: /dev/null
         run: scripts/check-reliability.sh --profile release
 
       - name: Preserve release receipt and daemon logs
@@ -93,7 +103,7 @@ jobs:
         with:
           name: reliability-release-${{ matrix.os }}-${{ github.run_id }}
           path: target/reliability/release
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
 
   seeded-parser-and-model:

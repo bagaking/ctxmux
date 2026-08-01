@@ -18,6 +18,15 @@ case "$ctxmux_reliability_profile" in
     ;;
 esac
 
+ctxmux_reliability_artifact_dir=${CTXMUX_RELIABILITY_ARTIFACT_DIR:-target/reliability/$ctxmux_reliability_profile}
+ctxmux_reliability_evidence=${CTXMUX_RELIABILITY_EVIDENCE:-$ctxmux_reliability_artifact_dir/result.json}
+node scripts/reliability-policy.mjs
+ctxmux_reliability_preflight=$(
+  node scripts/reliability-policy.mjs \
+    --prepare-qualification-evidence "$ctxmux_reliability_evidence" \
+    --profile "$ctxmux_reliability_profile"
+)
+
 ctxmux_reliability_build_target_dir=target/reliability/provenance-build
 ctxmux_reliability_daemon_bin=$ctxmux_reliability_build_target_dir/debug/ctxmuxd
 ctxmux_reliability_build_argv=(
@@ -59,6 +68,11 @@ CTXMUX_RELIABILITY_BUILD_SOURCE_COMMIT="$ctxmux_reliability_build_source_commit"
 CTXMUX_RELIABILITY_BUILD_SOURCE_TREE="$ctxmux_reliability_build_source_tree" \
 CTXMUX_RELIABILITY_BUILD_WORKTREE_CLEAN="$ctxmux_reliability_build_worktree_clean" \
 CTXMUX_RELIABILITY_BUILD_TARGET_DIR="$ctxmux_reliability_build_target_dir" \
+CTXMUX_RELIABILITY_PREFLIGHT="$ctxmux_reliability_preflight" \
   node --import tsx scripts/reliability-qualification.ts \
   --profile "$ctxmux_reliability_profile" \
   "$@"
+node scripts/reliability-policy.mjs \
+  --qualification-receipt "$ctxmux_reliability_evidence" \
+  --profile "$ctxmux_reliability_profile" \
+  --preflight "$ctxmux_reliability_preflight"
