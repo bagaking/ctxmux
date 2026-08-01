@@ -4,9 +4,9 @@ use std::{
     collections::VecDeque,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex, Weak, mpsc},
+    sync::{Arc, Condvar, Mutex, Weak, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ctxmux_protocol::{
@@ -39,6 +39,7 @@ pub(crate) struct PendingStop {
 /// One direct-child command handled by the existing waiter thread.
 pub(crate) enum ChildCommand {
     Stop(oneshot::Sender<Result<(), String>>),
+    CleanupUnpublished,
 }
 
 /// Daemon-wide admission for lazy blocking PTY input drains.
@@ -171,7 +172,17 @@ struct NativeControlInner {
     pty: Mutex<Box<dyn PtyControl>>,
     writer: Mutex<Box<dyn Write + Send>>,
     state: Mutex<NativeControlState>,
+    reap: Mutex<ChildReapState>,
+    reap_changed: Condvar,
     input_drains: InputDrainGate,
+}
+
+enum ChildReapState {
+    Pending {
+        cleanup_error: Option<String>,
+        wait_error: Option<String>,
+    },
+    Reaped,
 }
 
 struct NativeControlState {
@@ -250,6 +261,11 @@ impl NativeControlOwner {
                         input_scheduled: false,
                         child_sender: Some(child_sender),
                     }),
+                    reap: Mutex::new(ChildReapState::Pending {
+                        cleanup_error: None,
+                        wait_error: None,
+                    }),
+                    reap_changed: Condvar::new(),
                     input_drains,
                 }),
             },
@@ -312,13 +328,42 @@ impl NativeControlOwner {
         })
     }
 
-    /// Stop an unpublished child from the synchronous creation rollback path.
-    /// The caller waits for terminal publication rather than blocking for this
-    /// receipt, so it still uses the same stop admission and waiter lane.
-    pub(crate) fn stop_detached(&self) -> Result<(), ControlFailure> {
-        let reply = self.begin_stop_inner()?;
-        drop(reply);
-        Ok(())
+    /// Ask the child-handle waiter to clean up a Run rejected before durable
+    /// publication. Completion remains a separate waiter-owned reap receipt.
+    pub(crate) fn cleanup_unpublished(&self) -> Result<(), String> {
+        let (sender, rejected) = {
+            let mut state = mutex_lock(&self.inner.state);
+            match state.phase {
+                ControlPhase::Open => state.phase = ControlPhase::Stopping,
+                ControlPhase::Stopping => return Ok(()),
+                ControlPhase::Closed => return self.reap_result(),
+            }
+            let Some(sender) = state.child_sender.clone() else {
+                let error = format!(
+                    "Run {} child owner channel closed before unpublished cleanup",
+                    self.inner.run_id
+                );
+                self.record_cleanup_error(error.clone());
+                return Err(error);
+            };
+            let rejected = reject_queued_inputs(
+                &mut state,
+                &ProtocolError::new(
+                    ErrorCode::InvalidRunState,
+                    format!("cannot write to stopping Run {}", self.inner.run_id),
+                ),
+            );
+            (sender, rejected)
+        };
+        send_rejections(rejected);
+        sender.send(ChildCommand::CleanupUnpublished).map_err(|_| {
+            let error = format!(
+                "Run {} child owner channel closed before unpublished cleanup",
+                self.inner.run_id
+            );
+            self.record_cleanup_error(error.clone());
+            error
+        })
     }
 
     fn begin_stop_inner(&self) -> Result<oneshot::Receiver<Result<(), String>>, ControlFailure> {
@@ -380,6 +425,75 @@ impl NativeControlOwner {
 
     pub(crate) fn has_continuation_authority(&self) -> bool {
         mutex_lock(&self.inner.state).phase == ControlPhase::Open
+    }
+
+    /// Record the only successful terminal-and-reaped proof: the waiter that
+    /// exclusively owns the child handle observed `try_wait(Some(_))`.
+    pub(crate) fn mark_reaped(&self) {
+        *mutex_lock(&self.inner.reap) = ChildReapState::Reaped;
+        self.inner.reap_changed.notify_all();
+    }
+
+    pub(crate) fn record_cleanup_error(&self, error: String) {
+        let mut reap = mutex_lock(&self.inner.reap);
+        if let ChildReapState::Pending { cleanup_error, .. } = &mut *reap {
+            cleanup_error.get_or_insert(error);
+            self.inner.reap_changed.notify_all();
+        }
+    }
+
+    pub(crate) fn record_wait_error(&self, error: String) {
+        let mut reap = mutex_lock(&self.inner.reap);
+        if let ChildReapState::Pending { wait_error, .. } = &mut *reap {
+            wait_error.get_or_insert(error);
+            self.inner.reap_changed.notify_all();
+        }
+    }
+
+    pub(crate) fn wait_until_reaped(&self, deadline: Instant) -> Result<(), String> {
+        let mut reap = mutex_lock(&self.inner.reap);
+        loop {
+            match &*reap {
+                ChildReapState::Reaped => return Ok(()),
+                ChildReapState::Pending { .. } if Instant::now() >= deadline => {
+                    drop(reap);
+                    return self.reap_result();
+                }
+                ChildReapState::Pending { .. } => {}
+            }
+            let now = Instant::now();
+            let (next, _) = self
+                .inner
+                .reap_changed
+                .wait_timeout(reap, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            reap = next;
+        }
+    }
+
+    pub(crate) fn reap_result(&self) -> Result<(), String> {
+        match &*mutex_lock(&self.inner.reap) {
+            ChildReapState::Reaped => Ok(()),
+            ChildReapState::Pending {
+                cleanup_error,
+                wait_error,
+            } => {
+                let mut errors = [cleanup_error.as_deref(), wait_error.as_deref()]
+                    .into_iter()
+                    .flatten();
+                let Some(first) = errors.next() else {
+                    return Err(format!(
+                        "Run {} child waiter has not yet proven reap",
+                        self.inner.run_id
+                    ));
+                };
+                Err(errors.fold(first.to_owned(), |mut combined, error| {
+                    combined.push_str("; ");
+                    combined.push_str(error);
+                    combined
+                }))
+            }
+        }
     }
 }
 
@@ -836,6 +950,23 @@ mod tests {
         wake.notify_all();
     }
 
+    #[test]
+    fn pending_reap_receipt_preserves_cleanup_and_wait_failures() {
+        let (owner, _child) = owner(
+            Box::new(RecordingWriter(Arc::new(Mutex::new(Vec::new())))),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        owner.record_cleanup_error("fixture kill failure".to_owned());
+        owner.record_wait_error("fixture wait failure".to_owned());
+        owner.record_wait_error("later wait failure".to_owned());
+
+        let error = owner.reap_result().expect_err("reap remains unproven");
+        assert!(error.contains("fixture kill failure"));
+        assert!(error.contains("fixture wait failure"));
+        assert!(!error.contains("later wait failure"));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn input_fifo_preserves_one_thousand_opaque_chunks_and_exact_receipts() {
         let written = Arc::new(Mutex::new(Vec::new()));
@@ -1092,7 +1223,10 @@ mod tests {
         let stop = owner.begin_stop().expect("stop uses independent lane");
         let super::ChildCommand::Stop(reply) = child
             .recv_timeout(Duration::from_secs(2))
-            .expect("waiter receives stop without writer release");
+            .expect("waiter receives stop without writer release")
+        else {
+            panic!("public stop sends the stop command variant");
+        };
         reply.send(Ok(())).expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))
@@ -1155,7 +1289,10 @@ mod tests {
         let stop = owner.begin_stop().expect("stop remains available");
         let super::ChildCommand::Stop(reply) = child
             .recv_timeout(Duration::from_secs(2))
-            .expect("stop reaches child waiter");
+            .expect("stop reaches child waiter")
+        else {
+            panic!("public stop sends the stop command variant");
+        };
         reply.send(Ok(())).expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))

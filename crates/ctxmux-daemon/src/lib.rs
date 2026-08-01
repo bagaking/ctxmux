@@ -47,7 +47,10 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
-use crate::creation::{CreationFlightOwner, CreationRequest, RunRegistry};
+use crate::creation::{
+    CreationFlightOwner, CreationRequest, RunRegistry, UnpublishedCleanupOwner,
+    UnpublishedCleanupReservation,
+};
 use crate::native_control::{
     ChildCommand, ControlResult, InputDrainGate, NativeControlOwner, PendingInput, PendingStop,
 };
@@ -61,6 +64,7 @@ const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const LIVE_EVENT_CAPACITY: usize = 256;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const TMUX_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(4);
@@ -283,6 +287,7 @@ impl Drop for SocketGuard {
 struct RunManager {
     registry: RunRegistry,
     creation_flights: CreationFlightOwner,
+    unpublished_cleanups: UnpublishedCleanupOwner,
     native_input_drains: InputDrainGate,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
@@ -312,10 +317,18 @@ struct AttachmentTestHook {
 
 #[cfg(test)]
 struct CreationTestHook {
+    point: CreationHookPoint,
     armed: AtomicBool,
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     released: Mutex<bool>,
     release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreationHookPoint {
+    AfterSpawn,
+    AfterPublication,
 }
 
 #[cfg(test)]
@@ -331,8 +344,8 @@ impl AttachmentTestHook {
 
 #[cfg(test)]
 impl CreationTestHook {
-    fn pause_after_publication_while_locked_once(&self) {
-        if !self.armed.swap(false, Ordering::AcqRel) {
+    fn pause_once(&self, point: CreationHookPoint) {
+        if self.point != point || !self.armed.swap(false, Ordering::AcqRel) {
             return;
         }
         let _ = self.reached.send(());
@@ -349,6 +362,11 @@ impl CreationTestHook {
         *mutex_lock(&self.released) = true;
         self.release.notify_one();
     }
+
+    fn arm(&self) {
+        *mutex_lock(&self.released) = false;
+        self.armed.store(true, Ordering::Release);
+    }
 }
 
 impl Default for RunManager {
@@ -356,6 +374,7 @@ impl Default for RunManager {
         Self {
             registry: RunRegistry::default(),
             creation_flights: CreationFlightOwner::default(),
+            unpublished_cleanups: UnpublishedCleanupOwner::default(),
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
@@ -390,6 +409,7 @@ impl RunManager {
         Self {
             registry: RunRegistry::recovered(runs),
             creation_flights: CreationFlightOwner::default(),
+            unpublished_cleanups: UnpublishedCleanupOwner::default(),
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
@@ -414,6 +434,8 @@ impl RunManager {
         if let Some(run) = self.registry.resolve_creation(&operation_key, &request)? {
             return Ok(run.info());
         }
+        self.unpublished_cleanups
+            .resolve_fence(&operation_key, &request)?;
         let admission = self
             .creation_flights
             .acquire_admission()
@@ -430,6 +452,7 @@ impl RunManager {
                 "ctxmux daemon is shutting down",
             )
         })?;
+        let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let manager = Arc::clone(self);
         thread::Builder::new()
@@ -437,7 +460,7 @@ impl RunManager {
             .spawn(move || {
                 let _flight = flight;
                 let _operation_guard = operation_guard;
-                let result = manager.create_unique(operation_key, request);
+                let result = manager.create_unique(operation_key, request, cleanup_reservation);
                 let _ = result_tx.send(result);
             })
             .map_err(|error| {
@@ -459,9 +482,10 @@ impl RunManager {
         &self,
         operation_key: CreateOperationKey,
         request: CreationRequest,
+        cleanup_reservation: UnpublishedCleanupReservation,
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
-        let run = match request {
+        let run = match request.clone() {
             CreationRequest::Start { spec } => Run::spawn(
                 spec,
                 None,
@@ -508,12 +532,31 @@ impl RunManager {
                 )?
             }
         };
-        let post_commit_error = self.prepare_publication(&operation_key, &run)?;
+        #[cfg(test)]
+        if let Some(hook) = &self.creation_hook {
+            hook.pause_once(CreationHookPoint::AfterSpawn);
+        }
+        let post_commit_error = match self.prepare_publication(&operation_key, &run) {
+            Ok(post_commit_error) => post_commit_error,
+            Err(error) => {
+                if let Err(cleanup_error) = run.terminate_unpublished() {
+                    cleanup_reservation.transfer(request, run, cleanup_error.clone());
+                    return Err(ProtocolError::new(
+                        error.code,
+                        format!(
+                            "{}; rollback pending: exact creation key remains fenced until the child waiter proves reap: {cleanup_error}",
+                            error.message
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
+        };
         let info = run.info();
         self.registry.publish_creation(operation_key, run);
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
-            hook.pause_after_publication_while_locked_once();
+            hook.pause_once(CreationHookPoint::AfterPublication);
         }
         match post_commit_error {
             Some(error) => Err(error),
@@ -523,18 +566,22 @@ impl RunManager {
 
     #[cfg(test)]
     fn start(&self, spec: RunSpec) -> Result<RunInfo, ProtocolError> {
-        self.create_unique(
-            CreateOperationKey::random(),
-            CreationRequest::Start { spec },
-        )
+        let operation_key = CreateOperationKey::random();
+        let request = CreationRequest::Start { spec };
+        self.unpublished_cleanups
+            .resolve_fence(&operation_key, &request)?;
+        let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
+        self.create_unique(operation_key, request, cleanup_reservation)
     }
 
     #[cfg(test)]
     fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ProtocolError> {
-        self.create_unique(
-            CreateOperationKey::random(),
-            CreationRequest::Fork { parent, plan },
-        )
+        let operation_key = CreateOperationKey::random();
+        let request = CreationRequest::Fork { parent, plan };
+        self.unpublished_cleanups
+            .resolve_fence(&operation_key, &request)?;
+        let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
+        self.create_unique(operation_key, request, cleanup_reservation)
     }
 
     fn with_tmux_operation<T>(
@@ -677,6 +724,12 @@ impl RunManager {
         if !self.creation_flights.wait_until(deadline) {
             failures.push("timed out waiting for in-flight Run creation to finish".to_owned());
         }
+        failures.extend(
+            self.unpublished_cleanups
+                .wait_until(deadline)
+                .into_iter()
+                .map(|failure| format!("unpublished child cleanup {failure}")),
+        );
 
         if failures.is_empty() {
             Ok(())
@@ -723,13 +776,10 @@ impl RunManager {
                     .post_commit_error
                     .map(|error| ProtocolError::new(ErrorCode::Persistence, error.to_string())))
             }
-            Err(error) => {
-                run.terminate_unpublished();
-                Err(ProtocolError::new(
-                    ErrorCode::Persistence,
-                    error.to_string(),
-                ))
-            }
+            Err(error) => Err(ProtocolError::new(
+                ErrorCode::Persistence,
+                error.to_string(),
+            )),
         }
     }
 
@@ -1142,6 +1192,10 @@ impl Run {
             .map_err(|error| spawn_error("start PTY reader", error))?;
 
         let wait_run = Arc::clone(&run);
+        let wait_control = run
+            .native_control()
+            .expect("spawned Run retains native control")
+            .clone();
         setup(LaunchSetupStep::StartWaiterThread, pid)?;
         let (child_tx, child_rx) = mpsc::channel::<PendingChild>();
         thread::Builder::new()
@@ -1151,12 +1205,9 @@ impl Run {
                     return;
                 };
                 let mut child = pending_child.into_child();
-                let state = wait_for_child(child.as_mut(), &child_command_rx);
+                let state = wait_for_child(child.as_mut(), &child_command_rx, &wait_control);
                 drop(child_command_rx);
-                wait_run
-                    .native_control()
-                    .expect("spawned Run retains native control")
-                    .mark_closed();
+                wait_control.mark_closed();
                 after_wait();
                 let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
                 wait_run.publish_terminal(state);
@@ -1560,36 +1611,50 @@ impl Run {
         let _ = self.events.send(RunEvent::Exited { state: terminal });
     }
 
-    fn terminate_unpublished(&self) {
-        if mutex_lock(&self.state).is_running()
-            && let Ok(control) = self.native_control()
-        {
-            let _ = control.stop_detached();
+    fn terminate_unpublished(&self) -> Result<(), String> {
+        let control = self
+            .native_control()
+            .map_err(|error| error.message.clone())?;
+        let request_error = control.cleanup_unpublished().err();
+        match control.wait_until_reaped(Instant::now() + UNPUBLISHED_REAP_INLINE_TIMEOUT) {
+            Ok(()) => Ok(()),
+            Err(wait_error) => Err(match request_error {
+                Some(request_error) => format!("{request_error}; {wait_error}"),
+                None => wait_error,
+            }),
         }
-        for _ in 0..1_000 {
-            if !mutex_lock(&self.state).is_running() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(5));
-        }
-        eprintln!(
-            "ctxmuxd child for rejected durable Run {} did not exit",
-            self.id
-        );
+    }
+
+    fn unpublished_reap_result(&self) -> Result<(), String> {
+        self.native_control()
+            .map_err(|error| error.message.clone())?
+            .reap_result()
     }
 }
 
-fn wait_for_child(child: &mut dyn Child, commands: &mpsc::Receiver<ChildCommand>) -> RunState {
+fn wait_for_child(
+    child: &mut dyn Child,
+    commands: &mpsc::Receiver<ChildCommand>,
+    control: &NativeControlOwner,
+) -> RunState {
     loop {
         match commands.recv_timeout(CHILD_CONTROL_POLL) {
             Ok(ChildCommand::Stop(reply)) => {
                 let result = child.kill().map_err(|error| error.to_string());
                 let _ = reply.send(result);
             }
+            Ok(ChildCommand::CleanupUnpublished) => {
+                if let Err(error) = child.kill() {
+                    control.record_cleanup_error(format!(
+                        "failed to kill unpublished Run child: {error}"
+                    ));
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
         }
         match child.try_wait() {
             Ok(Some(status)) => {
+                control.mark_reaped();
                 return RunState::Exited {
                     code: status.exit_code(),
                     signal: status.signal().map(str::to_owned),
@@ -1597,10 +1662,7 @@ fn wait_for_child(child: &mut dyn Child, commands: &mpsc::Receiver<ChildCommand>
             }
             Ok(None) => {}
             Err(error) => {
-                return RunState::Exited {
-                    code: 1,
-                    signal: Some(format!("wait failed: {error}")),
-                };
+                control.record_wait_error(format!("failed to wait for child: {error}"));
             }
         }
     }
@@ -2473,9 +2535,9 @@ mod tests {
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
-        AttachmentHookPoint, AttachmentTestHook, CreationRequest, CreationTestHook,
-        LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
-        Persistence, PersistenceMode, RecoveredRun, Run, RunManager, ServerError,
+        AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
+        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog,
+        OutputReplay, Persistence, PersistenceMode, RecoveredRun, Run, RunManager, ServerError,
         TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
         TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
         TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,

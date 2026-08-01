@@ -1,8 +1,9 @@
 use std::{
-    collections::{HashMap, hash_map::RandomState},
+    collections::{HashMap, hash_map::Entry, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
     sync::{Arc, Condvar, Mutex, RwLock},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 use ctxmux_protocol::{
@@ -15,7 +16,8 @@ use super::{Run, read_lock, write_lock};
 const CREATION_STRIPES: usize = 64;
 // Matches the pre-registered resource start concurrency while bounding only
 // transient physical launch owners; this is not a public Run quota.
-const MAX_CONCURRENT_CREATION_LAUNCHES: usize = 8;
+const MAX_CREATION_OWNER_SLOTS: usize = 8;
+const CLEANUP_POLL: Duration = Duration::from_millis(20);
 
 /// Bounded shutdown ownership for short-lived physical Run creation threads.
 ///
@@ -52,7 +54,7 @@ impl Default for CreationFlightOwner {
                     active: 0,
                 }),
                 drained: Condvar::new(),
-                admission: Arc::new(Semaphore::new(MAX_CONCURRENT_CREATION_LAUNCHES)),
+                admission: Arc::new(Semaphore::new(MAX_CREATION_OWNER_SLOTS)),
             }),
         }
     }
@@ -169,20 +171,283 @@ impl Drop for CreationFlight {
     }
 }
 
+/// Bounded daemon-private ownership for children rejected before publication.
+///
+/// A reservation is taken before physical launch. On ordinary completion it
+/// disappears with the creation thread; on unresolved rollback it becomes an
+/// exact-key fence that retains the Run until its child-handle waiter proves
+/// reap. This is neither a public pending Run nor durable transaction state.
+#[derive(Default)]
+pub(crate) struct UnpublishedCleanupOwner {
+    inner: Arc<UnpublishedCleanupInner>,
+}
+
+#[derive(Default)]
+struct UnpublishedCleanupInner {
+    state: Mutex<UnpublishedCleanupState>,
+}
+
+#[derive(Default)]
+struct UnpublishedCleanupState {
+    owned: usize,
+    entries: HashMap<CreateOperationKey, UnpublishedCleanupFence>,
+}
+
+struct UnpublishedCleanupFence {
+    request: CreationRequest,
+    owners: Vec<UnpublishedCleanupEntry>,
+}
+
+struct UnpublishedCleanupEntry {
+    run: Arc<Run>,
+    transfer_reason: String,
+}
+
+#[must_use = "dropping the reservation releases unpublished-cleanup capacity"]
+pub(crate) struct UnpublishedCleanupReservation {
+    inner: Arc<UnpublishedCleanupInner>,
+    operation_key: Option<CreateOperationKey>,
+}
+
+impl UnpublishedCleanupOwner {
+    /// Resolve an existing exact-key fence before launch admission can wait.
+    pub(crate) fn resolve_fence(
+        &self,
+        operation_key: &CreateOperationKey,
+        request: &CreationRequest,
+    ) -> Result<(), ProtocolError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_reaped(&mut state);
+        if let Some(fence) = state.entries.get(operation_key) {
+            return Err(if fence.request == *request {
+                ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "Run creation is fenced while an unpublished child remains unreaped",
+                )
+            } else {
+                ProtocolError::new(
+                    ErrorCode::CreationConflict,
+                    "Run creation operation key is fenced for a different request",
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// Reserve rollback ownership after the caller holds one physical-launch
+    /// permit but before it starts a child or creation thread.
+    pub(crate) fn reserve(
+        &self,
+        operation_key: &CreateOperationKey,
+    ) -> Result<UnpublishedCleanupReservation, ProtocolError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_reaped(&mut state);
+        if state.owned >= MAX_CREATION_OWNER_SLOTS {
+            return Err(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "unpublished child cleanup capacity is exhausted",
+            ));
+        }
+        state.owned += 1;
+        Ok(UnpublishedCleanupReservation {
+            inner: Arc::clone(&self.inner),
+            operation_key: Some(operation_key.clone()),
+        })
+    }
+
+    /// Wait for transferred waiters only; active creation threads remain owned
+    /// by `CreationFlightOwner` and must drain before this is called.
+    pub(crate) fn wait_until(&self, deadline: Instant) -> Vec<String> {
+        loop {
+            let pending = self.prune_and_report();
+            if pending.is_empty() || Instant::now() >= deadline {
+                return pending;
+            }
+            thread::sleep(CLEANUP_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
+
+    fn prune_and_report(&self) -> Vec<String> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reaped = 0;
+        let mut pending = Vec::new();
+        for fence in state.entries.values_mut() {
+            fence
+                .owners
+                .retain(|entry| match entry.run.unpublished_reap_result() {
+                    Ok(()) => {
+                        reaped += 1;
+                        false
+                    }
+                    Err(current) => {
+                        pending.push(format!(
+                            "unpublished Run {} exact-key fence: {}; {}",
+                            entry.run.id, entry.transfer_reason, current
+                        ));
+                        true
+                    }
+                });
+        }
+        state.entries.retain(|_, fence| !fence.owners.is_empty());
+        state.owned = state
+            .owned
+            .checked_sub(reaped)
+            .expect("proven cleanups release only owned slots");
+        pending.sort();
+        pending
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unresolved_count(&self) -> usize {
+        self.prune_and_report().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .owned
+    }
+}
+
+fn prune_reaped(state: &mut UnpublishedCleanupState) {
+    let mut reaped = 0;
+    for fence in state.entries.values_mut() {
+        let before = fence.owners.len();
+        fence
+            .owners
+            .retain(|entry| entry.run.unpublished_reap_result().is_err());
+        reaped += before - fence.owners.len();
+    }
+    state.entries.retain(|_, fence| !fence.owners.is_empty());
+    state.owned = state
+        .owned
+        .checked_sub(reaped)
+        .expect("proven cleanups release only owned slots");
+}
+
+impl UnpublishedCleanupReservation {
+    /// Install the exact-key fence before the creation stripe and launch permit
+    /// can be released by their outer guards.
+    pub(crate) fn transfer(
+        mut self,
+        request: CreationRequest,
+        run: Arc<Run>,
+        transfer_reason: String,
+    ) {
+        let operation_key = self
+            .operation_key
+            .take()
+            .expect("cleanup reservation transfers at most once");
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = UnpublishedCleanupEntry {
+            run,
+            transfer_reason,
+        };
+        match state.entries.entry(operation_key) {
+            Entry::Vacant(entry) => {
+                entry.insert(UnpublishedCleanupFence {
+                    request,
+                    owners: vec![owner],
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                // This cannot occur while the exact-key stripe invariant holds.
+                // Preserve both physical owners anyway: overwriting either one
+                // would make a later reap of the other reopen the key unsafely.
+                entry.get_mut().owners.push(owner);
+            }
+        }
+    }
+}
+
+impl Drop for UnpublishedCleanupReservation {
+    fn drop(&mut self) {
+        if self.operation_key.take().is_none() {
+            return;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.owned = state
+            .owned
+            .checked_sub(1)
+            .expect("cleanup reservation releases exactly one owner slot");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         sync::Arc,
         time::{Duration, Instant},
     };
 
-    use super::{CreationFlightOwner, MAX_CONCURRENT_CREATION_LAUNCHES};
+    use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunSpec, TerminalSize};
+
+    use super::{
+        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, UnpublishedCleanupOwner,
+    };
+
+    #[test]
+    fn cleanup_reservations_enforce_and_reclaim_the_shared_owner_bound() {
+        let owner = UnpublishedCleanupOwner::default();
+        let request = CreationRequest::Start {
+            spec: RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            },
+        };
+        let mut reservations = Vec::new();
+        for index in 0..MAX_CREATION_OWNER_SLOTS {
+            let key = CreateOperationKey::new(format!("cleanup-slot-{index}")).unwrap();
+            owner.resolve_fence(&key, &request).unwrap();
+            reservations.push(owner.reserve(&key).expect("reserve bounded cleanup slot"));
+        }
+        let ninth = CreateOperationKey::new("cleanup-slot-ninth").unwrap();
+        owner.resolve_fence(&ninth, &request).unwrap();
+        let error = owner
+            .reserve(&ninth)
+            .err()
+            .expect("ninth cleanup reservation exceeds the hard bound");
+        assert_eq!(error.code, ErrorCode::BackendUnavailable);
+        assert_eq!(owner.owned_count(), MAX_CREATION_OWNER_SLOTS);
+
+        drop(reservations.pop());
+        reservations.push(owner.reserve(&ninth).expect("released slot is reusable"));
+        assert_eq!(owner.owned_count(), MAX_CREATION_OWNER_SLOTS);
+    }
 
     #[tokio::test]
     async fn admission_caps_physical_launches_and_reclaims_released_permits() {
         let owner = Arc::new(CreationFlightOwner::default());
         let mut active = Vec::new();
-        for _ in 0..MAX_CONCURRENT_CREATION_LAUNCHES {
+        for _ in 0..MAX_CREATION_OWNER_SLOTS {
             let admission = owner
                 .acquire_admission()
                 .await
@@ -193,7 +458,7 @@ mod tests {
                     .expect("admitted launch becomes an active flight"),
             );
         }
-        assert_eq!(owner.active_count(), MAX_CONCURRENT_CREATION_LAUNCHES);
+        assert_eq!(owner.active_count(), MAX_CREATION_OWNER_SLOTS);
         assert_eq!(owner.available_admission(), 0);
 
         let waiting_owner = Arc::clone(&owner);
@@ -207,7 +472,7 @@ mod tests {
                 .is_err(),
             "the ninth launch waits without becoming a flight"
         );
-        assert_eq!(owner.active_count(), MAX_CONCURRENT_CREATION_LAUNCHES);
+        assert_eq!(owner.active_count(), MAX_CREATION_OWNER_SLOTS);
 
         drop(active.pop());
         let ninth = tokio::time::timeout(Duration::from_secs(1), ninth)
@@ -215,23 +480,20 @@ mod tests {
             .expect("a released permit wakes the ninth launch")
             .expect("admission waiter task remains live")
             .expect("open admission produces a flight");
-        assert_eq!(owner.active_count(), MAX_CONCURRENT_CREATION_LAUNCHES);
+        assert_eq!(owner.active_count(), MAX_CREATION_OWNER_SLOTS);
 
         drop(ninth);
         drop(active);
 
         assert_eq!(owner.active_count(), 0);
-        assert_eq!(
-            owner.available_admission(),
-            MAX_CONCURRENT_CREATION_LAUNCHES
-        );
+        assert_eq!(owner.available_admission(), MAX_CREATION_OWNER_SLOTS);
     }
 
     #[tokio::test]
     async fn shutdown_fence_wakes_admission_waiters_and_drains_active_owners() {
         let owner = Arc::new(CreationFlightOwner::default());
         let mut active = Vec::new();
-        for _ in 0..MAX_CONCURRENT_CREATION_LAUNCHES {
+        for _ in 0..MAX_CREATION_OWNER_SLOTS {
             let admission = owner
                 .acquire_admission()
                 .await

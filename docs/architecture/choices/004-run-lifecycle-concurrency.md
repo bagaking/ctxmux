@@ -34,14 +34,26 @@ The hook is not a public fault API and cannot change production scheduling.
   most eight unique launches: 64 stripes bound hash-collision state, not launch
   concurrency. The leader resolves a retained match or conflict before waiting
   for admission. Waiting is cancellable and creates no flight or OS thread;
-  after admission, the permit, stripe, and shutdown-flight guards stay with one
-  named short-lived thread, so request cancellation cannot abandon launch.
+  after admission, the leader reserves one of the same eight private
+  rollback-owner slots before spawn, and the permit, stripe, reservation, and
+  shutdown-flight guards stay with one named short-lived thread. Existing
+  cleanup fences may therefore reject a new leader before spawn without
+  changing the cancellable ninth-waiter behavior when no cleanup is retained.
+  Request cancellation cannot abandon launch.
+- A persistence rejection before `COMMIT` asks that same Run's child-handle
+  waiter to terminate the unpublished child. Only the waiter's
+  `try_wait(Some(_))` receipt reopens the key. If that proof is not immediately
+  available, the creation owner installs an exact-key fence in one private
+  globally eight-slot-bounded cleanup owner before releasing the random stripe
+  and launch permit. The fence owns no public or durable Run identity.
 - Shutdown fences new unbound creation flights before Backend cleanup, then
-  drains active creation threads and tmux control owners against one bounded
-  deadline. The fence closes semaphore admission and wakes queued waiters. This
-  narrow owner is not an executor, actor, custom queue, or native process-tree
-  shutdown policy; the bounded drain cannot hard-cancel or independently reap a
-  creation thread that exceeds its deadline.
+  drains active creation threads, transferred unpublished-child cleanup, and
+  tmux control owners against one bounded deadline. The fence closes semaphore
+  admission and wakes queued waiters. Unresolved cleanup reports each private
+  fence owner and waiter failure reason without echoing its caller-owned key.
+  This narrow owner is not an executor, actor, custom queue, or native
+  process-tree shutdown policy; the bounded drain cannot hard-cancel or
+  independently reap a creation thread that exceeds its deadline.
 
 ## Alternatives
 
@@ -92,6 +104,13 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   fixture proves the creation fence rejects new and pre-fence same-stripe
   unbound waiters while the bounded drain waits for the cancelled request's
   active flight guard to release.
+- Covered now: real Start and Level B Fork children cross a deterministic
+  post-spawn barrier before an oversized metadata record is rejected before
+  `COMMIT`. The waiter-owned reap receipt gates exact-key reuse; pending matching
+  and conflicting retries launch nothing, unrelated keys progress, one later
+  32-way retry elects one physical leader, shutdown reports an unresolved fence
+  owner without echoing its key, the persistence actor remains healthy, and an
+  unrelated-process sentinel is untouched.
 - Candidate: exited-Run collection and attachment during collection.
 
 ## Open questions

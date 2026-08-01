@@ -120,19 +120,26 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    simultaneous physical launches. The 64 key stripes bound collision state;
    they are not a 64-thread launch limit. Cancellation while awaiting admission
    releases the key stripe and creates no flight or thread.
-5. An admitted leader claims a creation flight and starts one named, short-lived
-   OS thread that owns the semaphore permit, key stripe, request, manager, and
-   flight guard through launch and publication. The result returns over a Tokio
-   one-shot channel; cancellation after dispatch drops only the receiver, so it
-   cannot release the key or abandon a physical launch. No persistent
-   blocking-worker pool or custom execution queue is retained for this path.
+5. An admitted leader claims a creation flight, reserves one of the same eight
+   private rollback-owner slots, and then starts one named, short-lived OS thread
+   that owns the semaphore permit, key stripe, request, manager, reservation,
+   and flight guard through launch and publication. Existing cleanup fences can
+   exhaust rollback ownership and reject here before spawn. The result returns
+   over a Tokio one-shot channel; cancellation after dispatch drops only the
+   receiver, so it cannot release the key or abandon a physical launch. No
+   persistent blocking-worker pool or custom execution queue is retained for
+   this path.
 6. The daemon validates the spec, opens a PTY, spawns the child, retains one
    private native-control facade, and transfers the owned child handle to the
    waiter thread behind one narrow stop-command channel; it also starts the
    blocking output reader.
 7. In persistent mode the single store actor commits the complete running row
    and byte-exact operation key in one transaction. Failure before `COMMIT`
-   terminates the unpublished child. Successful `COMMIT` is the point of no
+   requests cleanup from the waiter that exclusively owns the child handle.
+   The key becomes reusable only after that waiter observes terminal-and-reaped;
+   otherwise one daemon-private, globally eight-slot-bounded cleanup owner
+   retains the unpublished Run and an exact-key fence without retaining its
+   random stripe or launch permit. Successful `COMMIT` is the point of no
    return: even if vacuum or physical-file postchecks then latch persistence,
    the manager binds persistence and stores `Arc<Run>` plus the key mapping
    under one `RunRegistry` write before returning that error. A retry therefore
@@ -267,15 +274,23 @@ The important guarantees are behavioral, not implied by lock types.
   Unbound leaders then wait asynchronously for one of eight physical-launch
   permits; these Tokio semaphore waiters are not a product-level actor or custom
   queue. The retained Run and successful key mapping share one registry lock;
-  failed unpublished launches retain neither. A matching Fork retry is resolved
-  before current parent capability or lifecycle checks.
+  a failed unpublished launch retains neither only after its child-handle waiter
+  proves reap. Until then, its exact key is independently fenced: a matching
+  retry reports temporary Backend unavailability, conflicting reuse reports
+  `creation_conflict`, and unrelated keys can use released stripes and launch
+  permits. A matching published Fork retry is resolved before current parent
+  capability or lifecycle checks.
 - Daemon shutdown first fences new unbound creation flights, then cleans up tmux
   control owners and drains already-started creation threads within one shared
   deadline. Fencing closes launch admission and wakes queued unbound waiters;
-  matching retained-key lookups remain resolvable. A creation thread has no
-  hard-cancellation mechanism: if it exceeds the shutdown deadline, shutdown
-  reports failure but cannot reap that detached thread independently. This does
-  not turn shutdown into a general native process-tree policy.
+  matching retained-key lookups remain resolvable. After creation flights
+  drain, shutdown also waits for transferred unpublished-child cleanup and
+  reports every exact-key fence owner and waiter-owned failure reason without
+  echoing the caller-owned key. A
+  creation thread has no hard-cancellation mechanism: if it exceeds the
+  shutdown deadline, shutdown reports failure but cannot reap that detached
+  thread independently. This does not turn shutdown into a general native
+  process-tree policy.
 - Malformed or oversized transport frames can close the connection before a structured protocol error is sent. Explicit error categories cover validly decoded requests and lifecycle failures.
 - Native stop owns only the direct child handle; process-group, descendant, and orphan policy is not declared. Daemon `Ctrl-C` stops the listener and drops in-memory ownership.
 

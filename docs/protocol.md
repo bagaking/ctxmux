@@ -116,16 +116,26 @@ response. Reusing the key for another Start or Fork returns
 capability validation, so retrying an already-created Fork still converges
 after its parent becomes historical or is no longer retained.
 
-A spawn or publication failure before durable `COMMIT` does not consume its
-key; a later attempt may reuse it. Durable `COMMIT` is the point of no return.
-If a post-commit vacuum or physical-file check fails, persistence is latched and
-the first request reports `persistence`, but the daemon still publishes the
-committed Run and key in its registry; a same-key retry returns that Run rather
-than launching another process. Likewise, failure to deliver a response does
-not roll back the Run or mapping. In persistent mode the key is one required,
-byte-exact unique column in the same Run row, so commit, recovery, retention
-eviction, and collection bind or remove them together. Memory-only mappings
-last for the retained Run in the current daemon epoch.
+A spawn failure before a child exists does not consume its key. If persistence
+rejects after physical launch but before durable `COMMIT`, the child-handle
+waiter owns rollback and only `try_wait(Some(_))` proves terminal-and-reaped.
+The key is reusable after that proof. Until then the first request reports
+`persistence` with an explicit rollback-pending detail, and a bounded
+daemon-private cleanup owner retains the unpublished Run plus an exact-key
+fence. A matching retry reports `backend_unavailable`; different canonical
+reuse reports `creation_conflict`. The fence publishes no Run, retains neither
+the random key stripe nor a launch permit, and is reported by bounded shutdown.
+It is not a durable tombstone and cannot survive daemon crash.
+
+Durable `COMMIT` is the point of no return. If a post-commit vacuum or
+physical-file check fails, persistence is latched and the first request reports
+`persistence`, but the daemon still publishes the committed Run and key in its
+registry; a same-key retry returns that Run rather than launching another
+process. Likewise, failure to deliver a response does not roll back the Run or
+mapping. In persistent mode the key is one required, byte-exact unique column
+in the same Run row, so commit, recovery, retention eviction, and collection
+bind or remove them together. Memory-only mappings last for the retained Run in
+the current daemon epoch.
 
 This is bounded retry convergence, not global exactly-once execution. After a
 Run and its mapping are collected, the key may create a new Run. A daemon crash

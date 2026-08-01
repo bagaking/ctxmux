@@ -686,18 +686,27 @@ fn creation_hooked_server() -> (
     Arc<CreationTestHook>,
     mpsc::UnboundedReceiver<()>,
 ) {
-    let (reached_tx, reached_rx) = mpsc::unbounded_channel();
-    let hook = Arc::new(CreationTestHook {
-        armed: AtomicBool::new(true),
-        reached: reached_tx,
-        released: Mutex::new(false),
-        release: std::sync::Condvar::new(),
-    });
+    let (hook, reached_rx) = creation_hook(CreationHookPoint::AfterPublication, true);
     let manager = Arc::new(RunManager {
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::default()
     });
     (InProcessServer::start(manager), hook, reached_rx)
+}
+
+fn creation_hook(
+    point: CreationHookPoint,
+    armed: bool,
+) -> (Arc<CreationTestHook>, mpsc::UnboundedReceiver<()>) {
+    let (reached_tx, reached_rx) = mpsc::unbounded_channel();
+    let hook = Arc::new(CreationTestHook {
+        point,
+        armed: AtomicBool::new(armed),
+        reached: reached_tx,
+        released: Mutex::new(false),
+        release: std::sync::Condvar::new(),
+    });
+    (hook, reached_rx)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -913,6 +922,337 @@ async fn failed_unpublished_creation_does_not_consume_the_key() {
         .expect("stop retry Run");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_persistent_start_fences_exact_key_until_waiter_reaps() {
+    let temp = tempfile::tempdir().expect("create rollback fixture");
+    let marker = temp.path().join("rejected-starts.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
+            .expect("open metadata-bounded persistence");
+    assert!(recovered.is_empty());
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+    let manager = Arc::new(RunManager {
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::persistent(persistence.clone(), recovered)
+    });
+    let sentinel = UnrelatedProcess::spawn();
+    let operation_key = CreateOperationKey::new("rejected-start-owner").unwrap();
+    let spec = oversized_hup_ignoring_marker_spec(&marker);
+
+    let first_manager = Arc::clone(&manager);
+    let first_key = operation_key.clone();
+    let first_spec = spec.clone();
+    let first = tokio::spawn(async move {
+        first_manager
+            .create(first_key, CreationRequest::Start { spec: first_spec })
+            .await
+    });
+    wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    hook.release();
+    let error = first
+        .await
+        .expect("creation owner task remains live")
+        .expect_err("oversized metadata rejects before COMMIT");
+    assert_pending_rollback(&error);
+    assert!(manager.list().is_empty());
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 1);
+
+    let retry = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
+        .await
+        .expect_err("same request remains fenced while cleanup is pending");
+    assert_eq!(retry.code, ErrorCode::BackendUnavailable);
+    let mut conflicting = spec.clone();
+    conflicting.args.push("different".to_owned());
+    let conflict = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: conflicting },
+        )
+        .await
+        .expect_err("different request conflicts with the cleanup fence");
+    assert_eq!(conflict.code, ErrorCode::CreationConflict);
+    assert_eq!(read_marker_pids(&marker).len(), 1);
+    assert!(process_exists(sentinel.pid()));
+
+    let unrelated = manager
+        .create(
+            CreateOperationKey::new("rollback-unrelated-progress").unwrap(),
+            CreationRequest::Start {
+                spec: short_lived_spec(),
+            },
+        )
+        .await
+        .expect("an unrelated key keeps launch progress");
+    wait_for_run_terminal_async(&manager.get(unrelated.id).unwrap()).await;
+    assert!(!persistence.is_failed());
+    assert!(process_exists(sentinel.pid()));
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+
+    hook.arm();
+    let barrier = Arc::new(Barrier::new(33));
+    let mut attempts = Vec::new();
+    for _ in 0..32 {
+        let manager = Arc::clone(&manager);
+        let key = operation_key.clone();
+        let request = CreationRequest::Start { spec: spec.clone() };
+        let barrier = Arc::clone(&barrier);
+        attempts.push(tokio::spawn(async move {
+            barrier.wait().await;
+            manager.create(key, request).await
+        }));
+    }
+    barrier.wait().await;
+    wait_for_spawned_marker(&mut reached, &marker, 2).await;
+    hook.release();
+    let mut persistence_errors = 0;
+    for attempt in attempts {
+        let error = attempt
+            .await
+            .expect("retry task remains live")
+            .expect_err("oversized retry cannot publish");
+        match error.code {
+            ErrorCode::Persistence => persistence_errors += 1,
+            ErrorCode::BackendUnavailable => {}
+            code => panic!("unexpected same-key retry error: {code:?}"),
+        }
+    }
+    assert_eq!(persistence_errors, 1, "exactly one retry became leader");
+    assert_eq!(read_marker_pids(&marker).len(), 2);
+    assert_eq!(manager.list().len(), 1, "rejected Runs stay unpublished");
+    assert!(!persistence.is_failed());
+    assert!(process_exists(sentinel.pid()));
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
+    let temp = tempfile::tempdir().expect("create rejected fork fixture");
+    let marker = temp.path().join("rejected-forks.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
+            .expect("open metadata-bounded persistence");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+    let manager = Arc::new(RunManager {
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::persistent(persistence.clone(), recovered)
+    });
+    let parent = manager
+        .create(
+            CreateOperationKey::new("fork-parent").unwrap(),
+            CreationRequest::Start {
+                spec: long_running_spec(),
+            },
+        )
+        .await
+        .expect("publish a small live parent");
+    let sentinel = UnrelatedProcess::spawn();
+    let operation_key = CreateOperationKey::new("rejected-fork-owner").unwrap();
+    let spec = oversized_hup_ignoring_marker_spec(&marker);
+    hook.arm();
+    let fork_manager = Arc::clone(&manager);
+    let fork_key = operation_key.clone();
+    let fork_spec = spec.clone();
+    let fork = tokio::spawn(async move {
+        fork_manager
+            .create(
+                fork_key,
+                CreationRequest::Fork {
+                    parent: parent.id,
+                    plan: ForkPlan::LevelB { spec: fork_spec },
+                },
+            )
+            .await
+    });
+    wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    hook.release();
+    let error = fork
+        .await
+        .expect("fork owner task remains live")
+        .expect_err("oversized fork metadata rejects before COMMIT");
+    assert_pending_rollback(&error);
+    assert_eq!(
+        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        vec![parent.id]
+    );
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
+    assert!(manager.get(parent.id).unwrap().has_continuation_authority());
+    assert!(process_exists(parent.pid.unwrap()));
+    assert!(process_exists(sentinel.pid()));
+    assert!(!persistence.is_failed());
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+    manager
+        .get(parent.id)
+        .unwrap()
+        .stop()
+        .await
+        .expect("stop retained parent");
+    assert!(process_exists(sentinel.pid()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_reports_an_exact_unresolved_cleanup_fence() {
+    let temp = tempfile::tempdir().expect("create cleanup shutdown fixture");
+    let marker = temp.path().join("shutdown-cleanup.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
+            .expect("open metadata-bounded persistence");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+    let manager = Arc::new(RunManager {
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::persistent(persistence, recovered)
+    });
+    let operation_key = CreateOperationKey::new("shutdown-unresolved-owner").unwrap();
+    let request_manager = Arc::clone(&manager);
+    let request_key = operation_key.clone();
+    let request_marker = marker.clone();
+    let request = tokio::spawn(async move {
+        request_manager
+            .create(
+                request_key,
+                CreationRequest::Start {
+                    spec: oversized_hup_ignoring_marker_spec(&request_marker),
+                },
+            )
+            .await
+    });
+    wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    hook.release();
+    request
+        .await
+        .expect("creation task remains live")
+        .expect_err("oversized start rejects");
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
+    let error = manager
+        .shutdown_owned_controls(Duration::ZERO)
+        .expect_err("zero-budget shutdown reports the unresolved cleanup");
+    let ServerError::Shutdown { failures } = error else {
+        panic!("cleanup failure uses the shutdown aggregate");
+    };
+    assert!(!failures.contains(operation_key.as_str()));
+    assert!(failures.contains("unpublished Run"));
+    assert!(failures.contains("exact-key fence"));
+    assert!(failures.contains("child waiter has not yet proven reap"));
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
+    let temp = tempfile::tempdir().expect("create cross-key cleanup fixture");
+    let marker = temp.path().join("cross-key-cleanups.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
+            .expect("open metadata-bounded persistence");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+    let manager = Arc::new(RunManager {
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::persistent(persistence.clone(), recovered)
+    });
+
+    for index in 0..8 {
+        if index != 0 {
+            hook.arm();
+        }
+        let request_manager = Arc::clone(&manager);
+        let request_marker = marker.clone();
+        let request = tokio::spawn(async move {
+            request_manager
+                .create(
+                    CreateOperationKey::new(format!("stale-cleanup-{index}")).unwrap(),
+                    CreationRequest::Start {
+                        spec: oversized_hup_ignoring_marker_spec(&request_marker),
+                    },
+                )
+                .await
+        });
+        wait_for_spawned_marker(&mut reached, &marker, index + 1).await;
+        hook.release();
+        let error = request
+            .await
+            .expect("creation task remains live")
+            .expect_err("oversized start rejects before COMMIT");
+        assert_pending_rollback(&error);
+    }
+    assert_eq!(read_marker_pids(&marker).len(), 8);
+    wait_for_marker_pids_gone(&marker).await;
+
+    let ninth = manager
+        .create(
+            CreateOperationKey::new("new-key-after-eight-reaps").unwrap(),
+            CreationRequest::Start {
+                spec: short_lived_spec(),
+            },
+        )
+        .await
+        .expect("new-key admission prunes completed old-key fences");
+    wait_for_run_terminal_async(&manager.get(ninth.id).unwrap()).await;
+    assert!(!persistence.is_failed());
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn eight_pending_cleanup_owners_reject_a_ninth_key_before_spawn() {
+    let temp = tempfile::tempdir().expect("create pending cleanup bound fixture");
+    let marker = temp.path().join("ninth-cleanup-launch.log");
+    let manager = Arc::new(RunManager::default());
+    let request = CreationRequest::Start {
+        spec: long_running_spec(),
+    };
+    let mut pending = Vec::new();
+    for index in 0..8 {
+        let key = CreateOperationKey::new(format!("pending-cleanup-{index}")).unwrap();
+        manager
+            .unpublished_cleanups
+            .resolve_fence(&key, &request)
+            .unwrap();
+        let reservation = manager.unpublished_cleanups.reserve(&key).unwrap();
+        let run = Run::spawn(
+            long_running_spec(),
+            None,
+            PersistenceMode::MemoryOnly,
+            LIVE_EVENT_CAPACITY,
+            manager.native_input_drains.clone(),
+        )
+        .expect("spawn real pending cleanup child");
+        reservation.transfer(
+            request.clone(),
+            Arc::clone(&run),
+            "fixture pending cleanup".to_owned(),
+        );
+        pending.push(run);
+    }
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 8);
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 8);
+
+    let error = manager
+        .create(
+            CreateOperationKey::new("ninth-pending-cleanup").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, true),
+            },
+        )
+        .await
+        .expect_err("ninth key is rejected before physical launch");
+    assert_eq!(error.code, ErrorCode::BackendUnavailable);
+    assert!(read_marker_pids(&marker).is_empty());
+    assert!(manager.list().is_empty());
+
+    for run in &pending {
+        run.stop()
+            .await
+            .expect("stop pending cleanup fixture child");
+        wait_for_run_terminal_async(run).await;
+    }
+    wait_for_unpublished_cleanups(&manager, 0).await;
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+}
+
 fn marker_spec(marker: &std::path::Path, keep_running: bool) -> RunSpec {
     let script = if keep_running {
         "printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; exec /bin/cat"
@@ -930,6 +1270,91 @@ fn marker_spec(marker: &std::path::Path, keep_running: bool) -> RunSpec {
         size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
+}
+
+fn oversized_hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "trap '' HUP; printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; exec /bin/sleep 30"
+                .to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([
+            (
+                "CTXMUX_CREATION_MARKER".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ),
+            ("CTXMUX_OVERSIZED_METADATA".to_owned(), "x".repeat(8 * 1024)),
+        ]),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn assert_pending_rollback(error: &ProtocolError) {
+    assert_eq!(error.code, ErrorCode::Persistence);
+    assert!(error.message.contains("rollback pending"));
+    assert!(error.message.contains("exact creation key remains fenced"));
+}
+
+async fn wait_for_spawned_marker(
+    reached: &mut mpsc::UnboundedReceiver<()>,
+    marker: &std::path::Path,
+    expected: usize,
+) {
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("creation reaches the post-spawn barrier")
+        .expect("creation barrier remains connected");
+    let _ = wait_for_marker_pids(marker, expected).await;
+}
+
+fn read_marker_pids(marker: &std::path::Path) -> Vec<u32> {
+    fs::read_to_string(marker)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| line.parse::<u32>().expect("marker records a child PID"))
+        .collect()
+}
+
+fn assert_marker_pids_gone(marker: &std::path::Path) {
+    for pid in read_marker_pids(marker) {
+        assert!(
+            !process_exists(pid),
+            "rejected unpublished child PID {pid} remains live after waiter reap"
+        );
+    }
+}
+
+async fn wait_for_marker_pids_gone(marker: &std::path::Path) {
+    let pids = read_marker_pids(marker);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pids.iter().copied().any(process_exists) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rejected unpublished child PIDs stop without pruning cleanup state");
+}
+
+async fn wait_for_unpublished_cleanups(manager: &RunManager, expected: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if manager.unpublished_cleanups.unresolved_count() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unpublished cleanup accounting reaches the expected count");
+}
+
+async fn wait_for_rejected_children_reaped(manager: &RunManager, marker: &std::path::Path) {
+    wait_for_unpublished_cleanups(manager, 0).await;
+    assert_marker_pids_gone(marker);
 }
 
 async fn wait_for_marker_pids(marker: &std::path::Path, expected: usize) -> Vec<u32> {

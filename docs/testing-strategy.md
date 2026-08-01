@@ -678,8 +678,16 @@ The current clean-consumer audit admits four bounded gaps:
   key/index fixtures own the proof. Atomic PID markers and unrelated sentinels
   make exact process count and identity observable. Private barriers also cover
   a held key stripe, both fast-terminal/persistence activation orders, and an
-  after-commit postcheck failure. Key retention follows Run retention and
-  recovery; this does not grow into mutable tags, metadata CRUD, a second
+  after-commit postcheck failure. A published key follows Run retention and
+  recovery. When persistence rejects an already-started child before `COMMIT`,
+  the waiter-owned reap receipt and an external dead-PID oracle gate key reuse;
+  until then one globally eight-slot-bounded private cleanup owner retains the
+  unpublished Run and exact-key fence without holding its random stripe or
+  launch permit. Real Start and Level B Fork fixtures cover pending matching and
+  conflicting retry, 32-way reuse after reap, unrelated-key progress, cross-key
+  cleanup reclamation, hard pre-spawn capacity rejection, shutdown reporting,
+  persistence health, and an untouched unrelated-process sentinel. This does
+  not grow into mutable tags, metadata CRUD, a durable tombstone, a second
   Session identity, or silent attach-or-create.
 - **Observable attachment controls (implemented):** persistent input, resize,
   and stop use bounded connection-local command correlation and exact typed
