@@ -14,6 +14,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "unsupported_capability",
   "target_changed",
   "creation_conflict",
+  "run_capacity",
   "control_backpressure",
   "internal",
 ]);
@@ -21,7 +22,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-5 wire contract. */
+/** A daemon frame failed the runtime half of the generation-6 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -63,7 +64,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-5 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-6 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");

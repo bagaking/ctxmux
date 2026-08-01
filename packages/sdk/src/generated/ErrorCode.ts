@@ -16,5 +16,6 @@ export type ErrorCode =
   | "unsupported_capability"
   | "target_changed"
   | "creation_conflict"
+  | "run_capacity"
   | "control_backpressure"
   | "internal";

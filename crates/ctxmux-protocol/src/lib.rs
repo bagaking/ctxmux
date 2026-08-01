@@ -11,7 +11,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -449,7 +449,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 5.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 6.
     pub data: Vec<u8>,
 }
 
@@ -694,6 +694,8 @@ pub enum ErrorCode {
     TargetChanged,
     /// A retained Run creation key names a different canonical request.
     CreationConflict,
+    /// The daemon cannot reserve a retained Run record before mutation.
+    RunCapacity,
     /// The bounded live-control path has no capacity for this command.
     ControlBackpressure,
     /// An unexpected daemon failure occurred.
@@ -937,6 +939,31 @@ mod tests {
         };
         let encoded = encode_frame(&frame).expect("encode handshake");
         assert_eq!(decode_frame::<ClientFrame>(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn run_capacity_error_has_the_exact_generation_6_wire_name() {
+        let frame = ServerFrame::Error {
+            error: ProtocolError::new(
+                ErrorCode::RunCapacity,
+                "retained Run capacity is unavailable",
+            ),
+        };
+        let encoded = encode_frame(&frame).expect("encode run-capacity error");
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encoded).expect("decode run-capacity error"),
+            frame
+        );
+        assert_eq!(
+            serde_json::to_value(&frame).unwrap(),
+            serde_json::json!({
+                "type": "error",
+                "error": {
+                    "code": "run_capacity",
+                    "message": "retained Run capacity is unavailable"
+                }
+            })
+        );
     }
 
     #[test]

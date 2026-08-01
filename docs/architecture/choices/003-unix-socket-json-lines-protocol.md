@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 5
+# 003 — Unix socket and NDJSON protocol generation 6
 
-- Status: accepted for generation 5; pre-stable
+- Status: accepted for generation 6; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -50,12 +50,14 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 5 directly replaces generation 4. It adds correlated
-attachment controls, typed owner receipts and failure dispositions, applied
-PTY-size readback, and removes accepted-operation events. It retains the
-bounded creation keys introduced by generation 4. An older peer fails the
-exact generation handshake before request dispatch; ctxmux does not provide a
-generation-4 fallback, migration, alias, or dual encoding.
+Protocol generation 6 directly replaces generation 5. It adds the narrow
+`run_capacity` error for retained-Run admission that fails before a Backend
+mutation boundary. It retains the correlated attachment controls, typed owner
+receipts, failure dispositions, and applied PTY-size readback introduced by
+generation 5, plus the bounded creation keys introduced by generation 4. An
+older peer fails the exact generation handshake before request dispatch;
+ctxmux does not provide a generation-5 fallback, migration, alias, or dual
+encoding.
 Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
@@ -70,7 +72,7 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 ## Fixture mapping
 
-- Covered now: generation-4 mismatch before request dispatch, wrong lifecycle
+- Covered now: generation-5 mismatch before request dispatch, wrong lifecycle
   requests, socket mode, active-listener refusal, non-socket and symlink
   refusal.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.

@@ -63,7 +63,7 @@ Short reads do not preserve application write boundaries. The core promise is by
 
 ## Open questions
 
-- Is the public cursor a chunk sequence, byte offset, or opaque token after generation 5?
+- Is the public cursor a chunk sequence, byte offset, or opaque token after generation 6?
 - What drain guarantee can be proved across PTY implementations?
 - When does a client request screen reconstruction instead of raw replay?
 - How are retention limits configured or capability-reported without adding premature configuration layers?

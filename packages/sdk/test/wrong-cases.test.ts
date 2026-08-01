@@ -365,6 +365,10 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
       type: "error",
       error: { code: "invalid_request", message: "invalid fixture" },
     },
+    {
+      type: "error",
+      error: { code: "run_capacity", message: "retained Run capacity" },
+    },
   ];
 
   for (const frame of frames) {

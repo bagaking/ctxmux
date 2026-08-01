@@ -58,7 +58,7 @@ start and fork, allowed lifecycle values, non-self lineage, byte totals,
 strictly contiguous retained chunk sequences, matching durable oldest/head
 cursors, and quota accounting. Epoch creation and all prior-epoch
 running-to-interrupted changes commit in one transaction before socket
-publication. Protocol generation 5 and persistence schema 2 are pre-stable, so
+publication. Protocol generation 6 and persistence schema 2 are pre-stable, so
 the current schema has no migration, downgrade, reset, salvage, or
 compatibility fallback. An unknown version, failed integrity check, or invalid
 application invariant is a typed startup failure. Ctxmux performs no repair,

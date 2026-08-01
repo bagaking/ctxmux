@@ -1284,19 +1284,19 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_4_before_request_dispatch() {
+async fn daemon_rejects_generation_5_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 5,
+        PROTOCOL_VERSION, 6,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_4_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 4 },
+    let generation_5_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 5 },
     })
-    .expect("encode generation-4 hello");
+    .expect("encode generation-5 hello");
     let start = encode_frame(&ClientFrame::Request {
         request: ctxmux_protocol::Request::Start {
             operation_key: CreateOperationKey::new("old-generation-must-not-run").unwrap(),
@@ -1312,7 +1312,7 @@ async fn daemon_rejects_generation_4_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_4_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_5_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));

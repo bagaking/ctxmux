@@ -30,7 +30,7 @@ The SDK exposes byte input as string or `Uint8Array`; strings are UTF-8 encoded 
 
 Node 24 or newer and Unix sockets are required. There is no timeout, `AbortSignal`, reconnection helper, request ID, or packaging release. Concurrent `receive()` semantics are not documented.
 
-The SDK validates full nested generation-5 frames, rejects unsafe cursors, and
+The SDK validates full nested generation-6 frames, rejects unsafe cursors, and
 bounds the JSON-lines transport before pausing the socket. Each Attachment has
 one receive pump, a 64-command pending map with separate 32-command/1 MiB input
 bounds, and a 256-event/1 MiB delivery inbox. `input()`, `resize()`, and
