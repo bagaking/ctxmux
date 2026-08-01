@@ -696,11 +696,11 @@ function validateReachability(
   for (const lane of [
     {
       id: "reliability-nightly",
-      name: "Run 30-minute chaos, stress, resource, and leak qualification",
+      name: "Run nightly reliability and GC qualification",
       command: "scripts/check-reliability.sh --profile nightly",
       condition:
         "github.event_name == 'schedule' || inputs.qualification == 'nightly'",
-      timeoutMinutes: 60,
+      timeoutMinutes: 90,
       environment: {
         CTXMUX_RELIABILITY_SEED: "${{ github.run_id }}",
         CTXMUX_RELIABILITY_ARTIFACT_DIR:

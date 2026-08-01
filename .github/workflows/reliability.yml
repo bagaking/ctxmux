@@ -25,7 +25,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
       CTXMUX_RELIABILITY_ARTIFACT_DIR: ${{ github.workspace }}/target/reliability/nightly
@@ -47,7 +47,7 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci --ignore-scripts
 
-      - name: Run 30-minute chaos, stress, resource, and leak qualification
+      - name: Run nightly reliability and GC qualification
         env:
           BASH_ENV: /dev/null
           ENV: /dev/null

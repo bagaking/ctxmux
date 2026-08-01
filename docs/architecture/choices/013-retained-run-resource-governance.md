@@ -1,0 +1,534 @@
+# 013 — Retained Run resource governance
+
+- Status: accepted design; implementation pending under T-027
+- Scope: global retained Run admission, operation-key lifetime, collection,
+  persistence replacement, and sustained-churn qualification
+
+## Context
+
+The daemon currently retains every published Run and creation-key mapping for
+its whole epoch. Persistent SQLite storage bounds its own rows, metadata, and
+replay, but the live Registry does not remove the corresponding in-memory Run.
+Memory-only mode has no global Run bound at all. A long-lived daemon can
+therefore accumulate terminal Run objects, replay, PTY descriptors, and keys
+without limit even though each individual Run is bounded.
+
+The correction must preserve the stronger owner rules already established by
+creation idempotency, unpublished-child rollback, attachment replay, native
+child ownership, tmux target fencing, and persistence COMMIT. It must not turn
+collection into a public Session, lease service, scheduler, TTL policy, or
+general Backend framework.
+
+## Decision
+
+### One operational Run-record ceiling
+
+The production daemon admits at most 128 retained or projected publication
+records across native and tmux Runs. This is the one operational Registry
+ceiling in memory-only and persistent modes. A publication reservation counts
+before native spawn or tmux Control child startup. Its own exact candidate
+replacement can make that ticket's projected burden zero, but an uncommitted
+net release never becomes global slack. Concurrent reservations therefore
+cannot publish a 129th Run. This is a retained-record bound, not a claim that no
+transient owner can coexist with those records.
+
+The value 128 preserves the already qualified 1/32/128 live-Run matrix while
+avoiding the false safety of reusing SQLite's historical 4,096-row format
+envelope. The existing 4 MiB per-Run retention contract therefore derives a
+512 MiB live in-memory `OutputLog` payload ceiling in both modes without
+another hot-path byte quota. Up to 128 live native readers separately hold one
+8 KiB read buffer each. Persistent mode additionally retains its stricter
+existing 256 MiB durable SQLite logical replay limit; that durable limit does
+not reduce the same-epoch in-memory ceiling.
+
+One daemon-private eight-slot overlap owner is shared by native Start/Fork,
+tmux import, and transferred T-026 unpublished-child cleanup. A slot is held
+from immediately before the physical child or Control client starts until
+publication, complete rollback, or transferred cleanup proves reap. Thus at
+most eight not-yet-published or private-cleanup Runs can overlap the 128
+Registry records. Their additional `OutputLog` payload is bounded by 32 MiB,
+for a 544 MiB retained-plus-overlap payload bound. Native readers use an 8 KiB
+buffer. A tmux reader separately bounds both its Control line and command-block
+output at 1 MiB, and may briefly hold decoded notification or output clones;
+those independent allocations must not be collapsed into one false per-Run
+number. The 128-plus-eight owner bounds multiply each existing local bound,
+while parser containers, transient clones, Run metadata, and allocator overhead
+remain measured RSS rather than being misrepresented as replay bytes.
+
+SQLite may accept an older schema-2 store containing up to 4,096 structurally
+valid rows during fail-closed startup validation. Before socket publication,
+the new epoch reconciles prior running rows to interrupted and deterministically
+normalizes terminal history to 128. The 4,096 value is therefore a legacy
+format-validation envelope, not a second live capacity promise. The existing
+64 MiB metadata, 256 MiB replay, database, WAL, SHM, and state-directory limits
+remain unchanged.
+
+T-026 unpublished-child cleanup is not a published Run record. It keeps its
+exact-key fence while retaining one of the shared eight overlap slots above.
+Collection neither counts that fence as reusable Registry capacity nor removes,
+rewrites, or adopts it. A pre-COMMIT creation failure restores any collection
+candidates even when the unpublished child transfers into that private cleanup
+owner.
+
+### Registry entry and lookup linearization
+
+The Registry remains the single residency owner. Each entry contains the
+`Arc<Run>`, its optional creation key, the persistence-SSOT logical
+`metadata_bytes` value or no persistent bytes in memory-only mode, its terminal
+collection order, and one state:
+
+```text
+Retained
+  └─ Registry write lock ─> Collecting(ticket)
+                               ├─ abort or pre-COMMIT failure -> Retained
+                               └─ memory replace or COMMIT    -> Removed
+```
+
+The same `RegistryState` is the SSOT for a bounded reservation table. Each
+ticket records the preallocated new `RunId`, keyed request identity or unkeyed
+import kind, the new record and logical metadata bytes, exact candidate tickets
+with their persistence-SSOT metadata-byte snapshots, and
+`reserved | physical_started | committed` disposition; each
+`Collecting(ticket)` entry points back to that table. Candidates are exclusive
+to one ticket. For each uncommitted ticket, the projected record burden is
+`max(0, 1 - own_candidate_count)` and the projected persistent-metadata burden
+is `max(0, new_metadata_bytes - own_candidate_metadata_bytes)`. Global
+projection is the current Registry count or metadata, which still includes
+every fenced candidate, plus the sum of those non-negative per-ticket burdens.
+An uncommitted ticket's net release is therefore never credited to another
+ticket. When that ticket publishes or COMMITs, the same Registry write replaces
+its exact candidates, moves the real delta into current state, and removes its
+projected burden, so every possible ticket completion order remains within both
+ceilings without serializing ordinary launches. An optional multi-candidate
+ticket marks the one allowed metadata-pressure prefix. Abort, publication,
+persistent COMMIT, and shutdown mutate this table under the same Registry write
+lock; no atomic counter, SQLite query, or publication thread maintains parallel
+reservation truth.
+
+A long-lived lookup pins the Run by cloning its `Arc` while the Registry lock
+still observes `Retained`. The collector acquires the Registry write lock,
+requires both that the Registry is the Run's only strong owner and that
+Backend-local quiescence below has no independent strong owner, then changes
+the exact entry to `Collecting(ticket)` in the same critical section. Native
+eligibility therefore checks both `Arc<Run>` and `Arc<NativeControlInner>`:
+the latter catches a blocked input worker that no longer owns the Run itself.
+A lookup either clones first and makes the Run ineligible, or observes the
+fence and cannot obtain a new owner. After the fence, closed native control
+admits no new input worker; an already scheduled worker keeps the independent
+strong count non-quiescent. Attachment count alone is not a pin because lookup
+occurs before the attachment guard increments that count.
+
+One-shot `list`, `status`, and matching creation-key resolution may copy
+`RunInfo` under the Registry lock without retaining an `Arc`. A matching key
+that observes a collection fence receives temporary unavailability; a
+conflicting request remains `creation_conflict`. After exact removal, List
+omits the Run, Status and Attach return `run_not_found`, a fresh-key Fork of the
+old parent returns `run_not_found`, and the collected operation key may elect a
+new physical Run.
+
+Candidates are ordered by earliest terminal publication with `RunId` as the
+tie-break. `RunManager` owns one daemon-private monotonic terminal ordinal and a
+Run claims its value immediately before terminal state publication. Persistent
+recovery sorts rows canonically by `terminal_at_ms`, `created_at_ms`, and
+`RunId`, assigns fresh ordinals in that order, and starts later ordinals after
+them; equal timestamps recover a canonical order, not an unknowable original
+same-millisecond order. Lineage is immutable: collecting a parent never
+cascades to a child or rewrites the child's dangling historical parent
+reference. A retained child's matching Fork retry still resolves before any
+current parent lookup.
+
+### Admission and eligibility
+
+Start validates and materializes its request, resolves its operation key, and
+reserves publication capacity before physical spawn. A fresh Fork resolves a
+matching child first, then pins and materializes its parent before reservation
+and spawn. tmux import reserves before starting the Control child. When no
+eligible candidate can satisfy record and persistent-metadata projections, the
+request fails with `run_capacity` before either mutation boundary.
+
+No Registry reservation or Collecting fence is held while waiting for the
+physical-overlap owner. An ordinary Start/Fork or import first resolves and
+materializes enough immutable request state to release any parent pin, then
+waits cancellably for overlap admission. Active publication slots retain the
+existing bounded wait; if all eight slots are retained by long-lived private
+cleanup, an unrelated key/import fails `backend_unavailable` before spawn
+instead of waiting behind owners with no completion deadline. Only an admitted
+request creates its Registry reservation. Capacity rejection then releases the
+unused overlap permit. Shutdown fences this admission, wakes cancellable
+waiters, and reports retained cleanup permits through their existing owner
+receipts.
+
+The publication reservation is an RAII owner of its projected slot, every
+candidate ticket, and the exact metadata delta. Its Drop path restores all
+candidates on validation, spawn/setup, thread-start, tmux readiness, panic, or
+other exit that has not received a persistence COMMIT disposition. A memory
+publication consumes the reservation in the same Registry write that removes
+its exact candidates and inserts the new entry. A persistent COMMIT consumes
+it through the equivalent exact replace even when the request later reports a
+post-COMMIT error. No error path may forget, clone, or partially consume the
+reservation.
+
+The Registry reservation and physical-overlap permit are separate owners. It is
+safe to restore a candidate and its projected slot after a pre-COMMIT failure;
+it is not safe to release an overlap permit merely because stack unwinding or a
+request error began. Before physical start, Drop releases the unused permit.
+After a native child or tmux Control child starts, publication releases the
+permit only after the new Registry entry consumes the projection. A rejected
+launch releases it only after the Backend-local child, reader, and waiter
+cleanup receipt completes; otherwise the Run and permit transfer together to
+the bounded private cleanup owner and remain visible to shutdown. Native uses
+the T-026 waiter-owned reap receipt, while tmux uses its Control-child and
+reader/waiter completion receipt. Neither path grows into descendant or
+process-tree ownership.
+
+A candidate must be exited or interrupted, unfenced, and owned only by the
+Registry. Terminal state is necessary but not sufficient:
+
+- native child wait has proven reap, the control phase is closed, queued input
+  and byte accounting are zero, no input drain owns `NativeControlInner`, and
+  the output reader and waiter have exited;
+- tmux writer, output reader, waiter, and Control child have all closed;
+- the terminal event and any persistence finalize have completed;
+- no attachment, control, fresh Fork, or other lookup pin remains;
+- a recovered historical Run has no local incarnation control.
+
+After those checks and the Registry fence linearize, a native candidate may
+irreversibly compact its closed PTY master and writer before the replacement
+spawn. The waiter has already proved reap, no input worker remains, and every
+public terminal operation already rejects, so these descriptors have no
+remaining public semantics and are not restored if the reservation later
+aborts. The candidate's RunInfo, replay, lineage, key, persistence binding, and
+Retained eligibility remain fully restorable. Tmux eligibility likewise
+requires its Control descriptors and child to be closed before reservation.
+This compaction prevents the first replacement from temporarily adding a new
+PTY on top of 128 retained closed PTY owners and is part of the FD oracle; it
+does not move or reconstruct an active control owner.
+
+The 64 MiB persistent metadata limit may require more than one candidate even
+when record count needs only one replacement. Each candidate still receives
+one exact `Collecting(ticket)` fence; one publication reservation may own the
+deterministic eligible prefix required by its own projected count and metadata
+totals. Extra candidate bytes can make that ticket self-funding, but do not
+become global slack until its exact COMMIT removes them. This preserves the
+task's exact-candidate fence invariant without pretending a single small row
+can always free enough metadata. At most one multi-candidate metadata-pressure
+reservation exists at a time; other metadata-pressure requests fail
+temporarily instead of introducing a second reservation actor or serializing
+all ordinary launches.
+
+### Persistent exact replacement
+
+SQLite no longer chooses a live eviction candidate independently. The Registry
+passes the persistence actor an exact terminal candidate list containing each
+`RunId` and byte-exact BINARY creation key. One SQLite transaction:
+
+1. verifies every exact candidate and terminal state;
+2. deletes those rows and their cascading replay;
+3. inserts the new running Run and creation key;
+4. verifies record, metadata, replay, and file admission accounting; and
+5. commits.
+
+The reply distinguishes `NotCommitted(error)` from
+`Committed { post_commit_error }`. Before COMMIT, SQLite rollback and Registry
+fence restoration leave every candidate present; ordinary capacity rejection
+does not poison the actor. After COMMIT, including a later vacuum or physical
+file postcheck failure, the Registry performs one exact in-memory replacement
+with no I/O, await, or fallible result. A retry therefore resolves the newly
+committed Run rather than launching again.
+
+A daemon crash before COMMIT recovers all old candidates and no new row. A
+crash after COMMIT but before in-memory replacement recovers only the new
+Run/key. No collecting ticket, pending lease, or tombstone is durable.
+
+Once implemented, this decision supersedes decision 009 only for live Registry
+capacity, operational startup normalization, and who selects rows for new-Run
+replacement. Decision 009 remains authoritative for schema-2 validation up to
+the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
+limits, file ceilings, recovery class, and SQLite durability assumptions.
+
+### Public error and protocol generation
+
+Global Registry admission with no eligible projected slot uses the narrow
+public error `run_capacity`. `backend_unavailable` remains correct for an
+existing T-026 exact-key cleanup fence, a candidate already fenced by another
+reservation, daemon shutdown, a failed worker boundary, or an unavailable
+external Backend; those cases have an owner but cannot currently serve the
+request. `control_backpressure` remains limited to a live control queue. Adding
+`run_capacity` is an incompatible schema change, so the implementation advances
+the protocol to generation 6 and updates Rust schema/codegen, TypeScript
+runtime validation, first-party clients, wrong-case tests, and protocol
+documentation together.
+
+The exact error matrix is:
+
+| Situation                                                              | Result                                           |
+| ---------------------------------------------------------------------- | ------------------------------------------------ |
+| retained key, matching Start/Fork request                              | original `RunInfo`; no admission                 |
+| retained or Collecting key, conflicting request                        | `creation_conflict`                              |
+| Collecting key, matching request                                       | `backend_unavailable`                            |
+| Collecting Run, List or Status                                         | included/current `RunInfo`, copied without a pin |
+| Collecting Run, Attach/Input/Resize/Stop/fresh Fork                    | `backend_unavailable` before mutation            |
+| no eligible candidate for the projected count or bytes                 | `run_capacity`                                   |
+| another multi-candidate metadata reservation owns the exclusive prefix | `backend_unavailable`                            |
+| T-026 exact-key fence or daemon shutdown                               | `backend_unavailable`                            |
+| committed/removed Run through List                                     | omitted                                          |
+| committed/removed Run through Status/Attach/control/fresh Fork         | `run_not_found`                                  |
+| old operation key after its prior Run is fully absent                  | unbound; ordinary creation election              |
+
+Copy-only List and Status linearize before exact removal and may be followed by
+`run_not_found`; they neither delay collection nor create a hidden owner. Every
+operation that needs the Run after releasing the Registry lock must pin and
+therefore fails while Collecting.
+
+## Qualification contract frozen before implementation
+
+PR tests use a lower private ceiling to cross at least three collection windows
+without claiming production-scale evidence. The tracked
+`reliability-gc-contract.json` is the machine-readable SSOT for the canonical
+seed, helper identity, payloads, concurrency, replay-pressure phase, sampling,
+owner and resource ceilings, and profile time budgets. It is frozen before GC
+implementation or observation; the harness and policy must consume and validate
+it instead of maintaining another numeric table. The contract keeps the 1,800
+second nightly soak and reserves separate non-pressure headroom while raising
+the nightly supervisor budget to contain the new pressure phase. A timeout may
+not be repaired by shrinking the workload or changing a ceiling.
+
+In both memory-only and persistent modes the bounded-churn phase first fills
+128 Runs, then completes three full 128-Run turnover windows: at least 512
+successful lifecycles per mode. The persistent daemon restarts immediately
+after the second turnover window, then proves the third window against
+recovered state.
+
+Canonical nightly fixes seed `226004`; the canonical command rejects a seed
+override. Every lifecycle uses concurrency eight and one exact `RunSpec`:
+`program = process.execPath`, args name the checked-in
+`scripts/reliability-gc-child.mjs` plus seed, mode, and lifecycle index, cwd is
+the clean repository root, env additions and declared inputs are empty, and
+size is 80 columns by 24 rows. Provenance records the helper SHA-256. The helper
+computes the lowercase ASCII hex encoding of
+`SHA-256(utf8("226004:<mode>:<index>"))` and writes that 64-byte string 64
+times, with no newline, for exactly 4,096 PTY-stable bytes before exiting zero.
+Bounded phase mode is exactly `memory_only` or `persistent`. Indices are
+0..127 for fill, 128..255, 256..383, and 384..511 for the three turnover
+windows. The retained key is `gc:<mode>:<index>:<digest-hex>` under the public
+length and character rules.
+
+A lifecycle is complete only after public terminal state, no direct child,
+exact 4,096-byte replay and sequence, and, in persistent mode,
+`durable_head_seq == head_seq`. Each window uses the fixed seed and schedule;
+failures retain the first failing index.
+
+The restart oracle hashes a canonically RunId-sorted array of correlated tuples,
+not separately permutable sets. Each tuple contains RunId, exact key or unkeyed
+marker, terminal state, lineage, oldest/head/durable-head/truncated cursors, and
+the ordered `(sequence, length, SHA-256(data))` replay digest. The same tuple
+digest must appear before shutdown and after restart. Before shutdown and again
+after restart, all 128 exact keys are retried with their canonical requests;
+every retry returns the tuple's same RunId and changes neither process count nor
+record count. The daemon-private qualification sink also exposes one monotonic
+`physical_starts_total` from the creation owner; every retry wave must leave it
+unchanged, so a duplicate that starts and exits between process samples cannot
+escape the oracle. The harness-owned key field is not accepted as durable proof
+without this public retry and cumulative-start evidence.
+The counter starts at zero for each recorded daemon incarnation. Fresh fill and
+replacement waves must advance it by their exact admitted physical-start count;
+retry waves advance it by zero. Restart may reset the counter only while the
+receipt records the new daemon epoch, after which recovered-key retries again
+leave it at zero.
+
+Creation latency covers request dispatch through the Start response. Window p95
+uses the nearest-rank definition: sort all 128 successful samples and select
+index `ceil(0.95 * 128) - 1`. Each turnover performs exactly 128 replacements
+and leaves exactly 128 retained records. Every window's core-normalized CPU and
+peak RSS stay within the existing frozen active-128 ceilings of 400 percent and
+32,768 KiB; each five-second quiescent dwell stays within the frozen idle-128
+ceilings of 15 percent CPU and 24,576 KiB steady RSS. A later quiescent RSS may
+not exceed the first turnover checkpoint by both 25 percent and 2,048 KiB, and
+a later p95 may not exceed the first turnover p95 by both 25 percent and 5
+milliseconds. Thread, descriptor, replay, child, and attachment values must
+remain inside their existing 128-Run frozen ceilings at every checkpoint.
+Later turnover-window average CPU may not exceed the first turnover window by
+both 25 percent and 5 core-percentage points. For this one-small-record
+workload, each turnover has exactly 128 collection attempts, 128 single
+candidate fences, and 128 exact replacements, with no multi-candidate or failed
+reservation. Memory-only turnover windows compact 128 terminal-control owners
+each. Persistent windows one and two also compact 128 each; the fixed restart
+then makes all third-window candidates recovered historical Runs with no local
+incarnation control, so that window compacts exactly zero. The private receipt
+records candidate evaluations per replacement; a later-window p95 may not
+exceed the first by both 25 percent and one evaluation.
+
+The supplemental replay-pressure phase does not masquerade as another complete
+turnover. In each mode it fills 128 terminal native Runs with the contract's
+exact 4 MiB ASCII payload, proves the 512 MiB Registry-owned live replay total,
+and verifies all public replay bytes and correlated digests in fixed batches of
+eight. It then publishes exactly one eight-wide replacement wave, settles every
+owner, and repeats the count, byte, digest, and resource oracles. This combines
+the maximum retained payload with the maximum physical publication concurrency;
+the three-window small-record phase remains the full turnover proof.
+
+Persistent pressure has two explicit domains. Before restart, same-epoch live
+`OutputLog` payload is exactly 512 MiB and `durable_head_seq == head_seq` even
+though SQLite globally retains at most 256 MiB. After restart, the recovered
+durable aggregate must lie in the exact native-chunk interval frozen by the
+machine contract, every replay is the expected suffix, and a moved oldest
+cursor is truncated. Live and recovered tuple digests are intentionally
+different domains; the harness must not demand an impossible restart-stable
+512 MiB durable set.
+
+The pressure receipt enforces the machine contract's absolute RSS ceilings,
+25 ms sampling with bounded gaps, CPU limits, descriptor/thread deltas, queued
+persistence bytes, attachment batches, and owner counts. The RSS formula reuses
+the pre-observation 3/2 multiplier and 4 MiB quantum from the frozen resource
+policy without modifying `reliability-budgets.json`. These are canonical
+workload ceilings over Registry-owned payload and named transient owners, not a
+hard bound on every daemon allocation: arbitrary attachment fan-out remains
+unbounded, and byte retention alone does not provide a small chunk-cardinality
+bound. Those broader admission decisions remain release risks outside T-027.
+Memory peak accounts for retained payload plus the larger of publication
+overlap or the fixed replay-clone batch. Persistent peak conservatively accounts
+for retained payload, publication overlap, full catch-up/finalize snapshots,
+the ordinary append queue, and actor working clones at once. Recovered peak
+accounts for durable payload plus the replay-clone batch. No undocumented
+ordering assumption subtracts a named owner from those formulas.
+
+The source-bound receipt preserves raw 25 ms RSS samples, one-second CPU
+samples, every latency, and five-second plus window-boundary process, thread, descriptor,
+attachment, Run/key, replay, cumulative physical starts, queued persistence
+bytes, and owner samples. Exact internal counts come from
+one daemon-private qualification sink backed directly by the owning Registry,
+publication-overlap, T-026 cleanup, reader, waiter, input-drain, and tmux state;
+it is enabled only by an inherited harness-owned descriptor, emits counts and
+no keys or metadata, and is not a socket request or public admin API. The daemon
+marks the descriptor close-on-exec before any Run spawn, uses bounded
+non-blocking writes, and never lets a disconnected or backpressured sink block
+or alter runtime ownership. The harness drains continuously and fails
+qualification on any missing, dropped, disconnected, or malformed snapshot. At
+each quiescent boundary Collecting tickets, publication reservations, creation
+flights, T-026 cleanups, readers, waiters, input drains, tmux owners, direct
+children, and attachments are all zero.
+Every owner transition also updates daemon-private high-water and cumulative
+counters. Periodic samples prove boundary state and external process census;
+they are not used as evidence that a subsecond owner maximum was absent.
+
+The ordinary 1,800 second memory-only soak is not shortened after these bounded
+workloads. It retains exactly eight live Runs and its one-second input cycle,
+16-cycle resize, and 64-cycle attach behavior. On every even-numbered cycle it
+stops and fully settles one Run, starts its deterministic successor, and
+returns to eight live Runs. Each 60-second bin therefore has exactly 30
+replacements; after capacity is first reached, the first complete 60-second bin
+is the plateau baseline and every later bin applies the same CPU, RSS, owner,
+and collection-work non-growth rules above. Soak helper mode is the literal
+`memory_only_soak`; it uses the same no-newline ASCII-hex payload and its index
+increases once per replacement. Per-bin p95 uses
+the same nearest-rank algorithm with 30 samples, selecting index
+`ceil(0.95 * 30) - 1 = 28`, before applying the latency growth rule. Final T-027
+completion evidence runs
+`scripts/check-reliability.sh --profile nightly`; the default smoke command is
+not canonical evidence. Historical observe receipts, hashes, measurement
+identities, and the numeric ceilings in `reliability-budgets.json` are never
+rewritten or rebaselined. The new pressure ceilings and raised nightly time
+budget live only in the separately source-bound GC contract.
+
+## Quality attributes and invariants
+
+- Admission, not later rollback, prevents an over-capacity physical launch.
+- Lookup-to-pin and Retained-to-Collecting share one Registry linearization
+  boundary.
+- Registry, key mapping, and persistence remove one exact ownership unit.
+- COMMIT is the only durable point of no return and cannot be reclassified by a
+  later check.
+- Running, pinned, attached, incompletely finalized, or locally controlled Runs
+  are never collected.
+- Output stays on the existing per-Run hot path; no second live byte quota or
+  byte-accounting lock is added.
+- The policy adds no Agent/session metadata, scheduler, public delete API,
+  Backend hierarchy, TTL compatibility layer, or process-tree promise.
+
+## Alternatives
+
+- Keeping every exited Run preserves history but leaves CPU, RSS, descriptor,
+  replay, and key state unbounded.
+- Reusing 4,096 as the Registry ceiling yields a theoretical 16 GiB memory
+  replay bound and thousands of retained descriptors; it is not a credible
+  runtime budget.
+- Using attachment count as the only pin leaves a collection race between
+  Registry lookup and attachment-guard construction.
+- Letting SQLite choose eviction independently can delete a row whose live Run
+  is pinned or leave Registry and durable key truth divergent.
+- A background TTL/LRU actor, public delete API, durable lease, or generic
+  Backend collector adds policy and state not required by admission-triggered
+  exact replacement.
+- Rejecting metadata only after spawn is made rollback-safe by T-026 but fails
+  the stronger pre-mutation resource admission goal.
+
+## Known constraints
+
+Collection is admission-triggered; history below 128 is retained and no age or
+wall-clock expiration is promised. The 128 ceiling bounds Registry records and
+their 512 MiB replay payload; the shared eight-slot overlap owner produces the
+separate 544 MiB retained-plus-overlap payload bound above. Neither value bounds
+descendant processes because native stop still owns only the direct child.
+The payload ceiling is not a universal daemon RSS claim: extreme short reads
+can amplify chunk/Vec metadata, and public attachments clone replay without a
+global attachment quota. The canonical pressure workload measures and caps its
+declared chunking and eight-wide replay surface only. General attachment
+admission, chunk-cardinality policy, manual history deletion, secure erasure,
+and arbitrary Backend event replay remain separate decisions.
+
+## Wrong-case corpus
+
+- `GC-02`: treating a pre-COMMIT delete as complete loses history when the
+  transaction rolls back; treating a post-COMMIT error as rollback permits a
+  duplicate child.
+
+`GC-02` is the source-backed transfer retained in the normalized wrong-case
+corpus. The review-derived obligations below come from the accepted T-027 owner
+contract rather than an external source; they remain in the task and fixture
+mapping without masquerading as additional normalized corpus cases.
+
+## Implementation race matrix
+
+- Checking terminal state without an atomic pin boundary removes a Run after
+  `get` but before attachment count increments.
+- SQLite-selected eviction removes a different row than the Registry fence and
+  leaves an immortal or misbound creation key.
+- Counting only published entries, or lending one uncommitted ticket's net
+  candidate release to another ticket, lets concurrent reservations cross a
+  ceiling under an adverse publication order.
+- Terminal state can precede output-reader, input-drain, tmux Control, or
+  persistence-owner quiescence; dropping the Run then hides a live owner.
+
+These obligations become active only with the implementation and mapped public
+or deterministic-owner fixtures.
+
+## Fixture mapping
+
+- Future/T-027: concurrent 127-to-129 admission, multi-candidate A plus ordinary
+  B in reverse publication order, lookup-versus-fence, attachment construction,
+  same-key retry, and exact memory removal.
+- Future/T-027: delayed native reader, blocked input drain, tmux cleanup,
+  persistence finalize, and recovered-history eligibility.
+- Future/T-027: exact multi-candidate SQLite replacement, wrong candidate
+  identity, pre/post-COMMIT injection, and real restart around COMMIT.
+- Future/T-027: parent collection, dangling lineage, retained child retry, and
+  stable public `run_not_found` behavior.
+- Future/T-027: source-bound memory and persistent three-window churn with raw
+  CPU, RSS, latency, record/key, thread, descriptor, process, replay, and owner
+  evidence.
+
+## Repository evidence
+
+- `crates/ctxmux-daemon/src/creation.rs`: Registry, creation keys, publication,
+  and T-026 private cleanup owner
+- `crates/ctxmux-daemon/src/lib.rs`: Start, Fork, import, Run lifecycle, and
+  attachment lookup paths
+- `crates/ctxmux-daemon/src/native_control.rs`: native child, reap, PTY, and
+  input-drain ownership
+- `crates/ctxmux-daemon/src/persistence.rs`: schema-2 validation, SQLite actor,
+  retention, and COMMIT disposition
+- `scripts/reliability-qualification.ts`: source-bound resource and soak
+  receipts
+- `reliability-gc-contract.json`: frozen T-027 workload, helper identity,
+  resource ceilings, and time budgets
+- `scripts/reliability-gc-child.mjs`: PTY-stable deterministic payload producer

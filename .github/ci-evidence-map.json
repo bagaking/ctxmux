@@ -80,6 +80,34 @@
       ]
     },
     {
+      "id": "reliability-gc-contracts",
+      "kind": "test",
+      "path": "scripts/reliability-gc-contract.test.mjs",
+      "invariants": [
+        "T-027 payload, replay-pressure, resource, owner, time-budget, and PTY-stable helper contracts are source-bound before implementation"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "reliability-gc-policy",
+      "kind": "contract_check",
+      "path": "reliability-gc-contract.json",
+      "invariants": [
+        "T-027 canonical GC and maximum replay-pressure freeze surface has machine-checked arithmetic and helper source parity before implementation"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "reliability-budget-policy",
       "kind": "contract_check",
       "path": "reliability-budgets.json",

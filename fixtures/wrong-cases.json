@@ -886,6 +886,22 @@
           "anchor": "oversized_discovery_output_fails_explicitly_without_publication"
         }
       ]
+    },
+    {
+      "id": "GC-02",
+      "choice": "013-retained-run-resource-governance",
+      "source_ids": ["i03"],
+      "source_refs": ["https://www.sqlite.org/atomiccommit.html"],
+      "failure_mechanism": "A crash or a failure discovered after COMMIT makes the live Registry and SQLite disagree about which exact retained Run and creation key won replacement.",
+      "invariant": "Recovery and same-epoch publication expose exactly the committed old or new Run/key set, never a mixed replacement or reusable committed key.",
+      "preconditions": "T-027 has fenced an exact terminal candidate and the persistence actor can pause or fail before and after the replacement transaction COMMIT.",
+      "action": "Replace one exact retained Run/key, interrupt or fail on each side of COMMIT, and reopen the durable store or retry through the live daemon.",
+      "oracle": "Before COMMIT the old candidate is fully restored and the new child is unpublished; after COMMIT only the new Run/key is published or recovered and its retry launches nothing.",
+      "platform": ["unix"],
+      "tags": ["gc", "persistence", "atomicity", "creation-key"],
+      "disposition": "future",
+      "activation_task": "future:retained-run-resource-governance",
+      "reason": "The exact Registry fence and SQLite replacement transaction are accepted design but not implemented yet."
     }
   ]
 }

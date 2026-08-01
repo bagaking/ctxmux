@@ -334,6 +334,12 @@ The Unix socket is created with mode `0600`. Startup refuses to replace an ordin
 
 Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Exited Runs, total Run count, attachment count, and total daemon memory still have no global quotas or GC.
 
+[Decision 013](architecture/choices/013-retained-run-resource-governance.md)
+accepts a 128-record Registry ceiling and ownership-safe collection contract for
+T-027. It remains target design until the generation-6 public error, Registry,
+persistence, and sustained-churn gates land; the current no-GC behavior above
+remains the shipped truth in the meantime.
+
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
 workloads. Cleanup requires no live direct child or attachment and no transient
@@ -375,6 +381,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | Explicit TypeScript Integrations      | accepted                                        | [010](architecture/choices/010-explicit-typescript-integrations.md) |
 | Context, artifacts, lineage, and fork | accepted                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
 | tmux Control Mode Backend             | accepted and implemented; version lanes pending | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Retained Run resource governance      | accepted design; implementation pending         | [013](architecture/choices/013-retained-run-resource-governance.md) |
 
 ## Risk-to-fixture traceability
 

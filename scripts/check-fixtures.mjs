@@ -194,9 +194,9 @@ const sourceRegistry = new Map();
 const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
-  if (corpus.cases.length !== 36) {
+  if (corpus.cases.length !== 37) {
     fail(
-      `corpus must contain all 36 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 37 retained cases, got ${corpus.cases.length}`,
     );
   }
 

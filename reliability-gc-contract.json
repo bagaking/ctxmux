@@ -1,0 +1,182 @@
+{
+  "schema": "ctxmux.reliability-gc-contract.v1",
+  "frozen_before_implementation": true,
+  "claim_scope": "registry_output_payload_and_canonical_workload_resources",
+  "seed": "226004",
+  "helper": {
+    "path": "scripts/reliability-gc-child.mjs",
+    "sha256": "468e9e63cbee05eb9ba82f80a242580c9bc206e089e21e280b90a1cac8d4a54e",
+    "encoding": "lowercase_ascii_sha256_hex",
+    "writes_newline": false
+  },
+  "run_spec": {
+    "program": "process.execPath",
+    "args": ["scripts/reliability-gc-child.mjs", "<seed>", "<mode>", "<index>"],
+    "cwd": "clean_repository_root",
+    "env": {},
+    "size": { "cols": 80, "rows": 24 },
+    "declared_inputs": []
+  },
+  "payload_modes": {
+    "memory_only": {
+      "phase": "bounded_churn",
+      "payload_bytes": 4096,
+      "hex_repetitions": 64
+    },
+    "persistent": {
+      "phase": "bounded_churn",
+      "payload_bytes": 4096,
+      "hex_repetitions": 64
+    },
+    "memory_only_soak": {
+      "phase": "soak",
+      "payload_bytes": 4096,
+      "hex_repetitions": 64
+    },
+    "memory_replay_pressure": {
+      "phase": "replay_pressure",
+      "payload_bytes": 4194304,
+      "hex_repetitions": 65536
+    },
+    "persistent_replay_pressure": {
+      "phase": "replay_pressure",
+      "payload_bytes": 4194304,
+      "hex_repetitions": 65536
+    }
+  },
+  "bounded_churn": {
+    "run_ceiling": 128,
+    "fill_runs": 128,
+    "turnover_windows": 3,
+    "replacements_per_window": 128,
+    "successful_lifecycles_per_mode": 512,
+    "concurrency": 8,
+    "persistent_restart_after_window": 2,
+    "physical_start_deltas": {
+      "fill": 128,
+      "each_turnover_window": 128,
+      "retry_wave": 0,
+      "new_daemon_incarnation_initial": 0
+    }
+  },
+  "replay_pressure": {
+    "profiles": ["nightly", "release"],
+    "fill_runs": 128,
+    "replacement_runs": 8,
+    "concurrency": 8,
+    "public_replay_batch_size": 8,
+    "public_replay_verification_runs_before_replacement": 128,
+    "public_replay_verification_runs_after_replacement": 128,
+    "require_exact_replay_digest": true,
+    "require_exact_retained_run_and_key_count": 128,
+    "require_retry_without_physical_start": true,
+    "quiescent_seconds": 5,
+    "fill_indices": { "first": 0, "last": 127 },
+    "replacement_indices": { "first": 128, "last": 135 },
+    "operation_key_template": "gc-pressure:<mode>:<index>:<digest-hex>",
+    "retry_wave_keys_before_restart": 128,
+    "retry_wave_keys_after_restart": 128,
+    "require_live_durable_head_equals_head": true,
+    "live_retained_payload_bytes": 536870912,
+    "max_overlap_or_replay_clone_bytes": 33554432,
+    "retained_plus_overlap_payload_bytes": 570425344,
+    "persistent_durable_replay_max_bytes": 268435456,
+    "persistent_recovered_replay_min_bytes": 268427265,
+    "persistent_native_chunk_max_bytes": 8192,
+    "persistent_transient": {
+      "catchup_and_finalize_snapshot_bytes": 67108864,
+      "ordinary_append_queue_bytes": 8388608,
+      "actor_working_bytes": 8388608,
+      "total_bytes": 83886080
+    },
+    "rss_formula": {
+      "description": "ceil_to_4096_kib(base_kib + 3/2 * governed_logical_kib)",
+      "idle_128_base_kib": 24576,
+      "active_128_base_kib": 32768,
+      "quantum_kib": 4096
+    },
+    "resource_budgets": {
+      "live_steady_rss_kib": 811008,
+      "memory_peak_rss_kib": 868352,
+      "persistent_peak_rss_kib": 991232,
+      "persistent_recovered_steady_rss_kib": 417792,
+      "persistent_recovered_peak_rss_kib": 475136,
+      "memory_average_cpu_core_percent": 800,
+      "persistent_average_cpu_core_percent": 900,
+      "quiescent_cpu_core_percent": 15,
+      "peak_thread_delta": 24,
+      "quiescent_thread_delta": 1,
+      "peak_fd_delta": 424,
+      "quiescent_fd_delta": 416
+    },
+    "owner_budgets": {
+      "physical_starts_total_is_monotonic": true,
+      "physical_starts_total_scope": "daemon_incarnation",
+      "physical_starts_total_epoch_changes_on_restart": true,
+      "physical_starts_fill_delta": 128,
+      "physical_starts_replacement_delta": 8,
+      "physical_starts_retry_delta": 0,
+      "physical_starts_new_incarnation_initial": 0,
+      "require_transition_high_water_counters": true,
+      "max_children": 8,
+      "max_readers": 8,
+      "max_waiters": 8,
+      "max_publication_reservations": 8,
+      "max_collecting_tickets": 8,
+      "max_overlap_owners": 8,
+      "max_attachments_during_replay": 8,
+      "boundary_children": 0,
+      "boundary_readers": 0,
+      "boundary_waiters": 0,
+      "boundary_publication_reservations": 0,
+      "boundary_collecting_tickets": 0,
+      "boundary_overlap_owners": 0,
+      "boundary_attachments": 0,
+      "boundary_cleanup_owners": 0,
+      "boundary_input_drains": 0,
+      "boundary_tmux_owners": 0
+    },
+    "sampling": {
+      "rss_interval_ms": 25,
+      "max_rss_sample_gap_ms": 100,
+      "owner_interval_ms": 1000,
+      "max_owner_sample_gap_ms": 5000,
+      "owner_maxima_source": "daemon_transition_high_water_counters",
+      "periodic_owner_samples_prove_only_boundaries_and_external_census": true
+    },
+    "time_budgets_seconds": {
+      "total": 1500,
+      "memory_only": 300,
+      "persistent": 1200
+    },
+    "persistent_restart": {
+      "after_replacement_wave": true,
+      "measure_from_daemon_spawn": true,
+      "require_exact_suffix_replay": true,
+      "require_truncated_when_oldest_moves": true,
+      "live_and_recovered_tuple_domains_are_distinct": true
+    },
+    "measurement_semantics": {
+      "rss": "absolute_daemon_only_from_spawn_through_shutdown",
+      "stage_cpu": "daemon_only_core_normalized_delta_from_before_first_dispatch_through_final_post_replacement_boundary",
+      "quiescent_cpu": "daemon_only_core_normalized_over_each_five_second_dwell",
+      "threads_and_fds": "daemon_process_delta_from_post_readiness_baseline",
+      "owner_counts": "absolute_daemon_transition_high_water_and_boundary_counts",
+      "excludes": ["client", "helper_children", "sqlite_file_bytes"]
+    }
+  },
+  "profile_time_budgets_seconds": {
+    "smoke": 60,
+    "nightly": 4200,
+    "release": 10800,
+    "observe": 2700,
+    "nightly_soak": 1800,
+    "release_soak": 7200,
+    "minimum_non_pressure_headroom": 600
+  },
+  "ci_job_timeout_minutes": {
+    "nightly": 90,
+    "release": 210
+  },
+  "implementation_policy_requires_git_blob_fence": true
+}
