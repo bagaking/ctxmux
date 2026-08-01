@@ -9,9 +9,10 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, ClientHello, ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk,
-    OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo,
-    RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
+    AttachedSnapshot, ClientFrame, ClientHello, CreateOperationKey, ForkPlan, FrameError,
+    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response,
+    RunEvent, RunId, RunInfo, RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame,
+    encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -101,7 +102,32 @@ impl Client {
     /// Returns [`ClientError`] when transport, framing, or process creation
     /// fails.
     pub async fn start(&self, spec: RunSpec) -> Result<RunInfo, ClientError> {
-        match self.request(Request::Start { spec }).await? {
+        self.start_with_operation_key(spec, CreateOperationKey::random())
+            .await
+    }
+
+    /// Start one daemon-owned native Run with a caller-retained retry key.
+    ///
+    /// Reusing the key with the same specification converges on the original
+    /// Run while that Run is retained. Reusing it with another request returns
+    /// a typed creation conflict.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when transport, framing, key validation, or
+    /// process creation fails.
+    pub async fn start_with_operation_key(
+        &self,
+        spec: RunSpec,
+        operation_key: CreateOperationKey,
+    ) -> Result<RunInfo, ClientError> {
+        match self
+            .request(Request::Start {
+                operation_key,
+                spec,
+            })
+            .await?
+        {
             Response::Started { run } => Ok(run),
             _ => Err(ClientError::UnexpectedFrame("expected started response")),
         }
@@ -161,7 +187,30 @@ impl Client {
     /// Returns [`ClientError`] when the parent does not exist or the selected
     /// plan cannot create a child.
     pub async fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ClientError> {
-        match self.request(Request::Fork { parent, plan }).await? {
+        self.fork_with_operation_key(parent, plan, CreateOperationKey::random())
+            .await
+    }
+
+    /// Create one child Run with a caller-retained retry key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the parent, plan, key, transport, or
+    /// process creation boundary rejects the operation.
+    pub async fn fork_with_operation_key(
+        &self,
+        parent: RunId,
+        plan: ForkPlan,
+        operation_key: CreateOperationKey,
+    ) -> Result<RunInfo, ClientError> {
+        match self
+            .request(Request::Fork {
+                operation_key,
+                parent,
+                plan,
+            })
+            .await?
+        {
             Response::Forked { run } => Ok(run),
             _ => Err(ClientError::UnexpectedFrame("expected forked response")),
         }

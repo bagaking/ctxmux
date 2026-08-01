@@ -107,10 +107,14 @@ ctxmux_cli_sized_output=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" attach
 expect_contains "$ctxmux_cli_sized_output" "PWD:$ctxmux_cli_tmp"
 expect_contains "$ctxmux_cli_sized_output" "SIZE:40 100"
 
-ctxmux_cli_parent=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c "printf parent")
-ctxmux_cli_fork_line=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" fork "$ctxmux_cli_parent")
+ctxmux_cli_parent=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --operation-key smoke-parent -- /bin/sh -c "printf parent")
+ctxmux_cli_parent_retry=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --operation-key smoke-parent -- /bin/sh -c "printf parent")
+[[ $ctxmux_cli_parent_retry == "$ctxmux_cli_parent" ]] || fail "Start retry returned a different Run"
+ctxmux_cli_fork_line=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" fork --operation-key smoke-fork "$ctxmux_cli_parent")
 ctxmux_cli_child=${ctxmux_cli_fork_line%%$'\t'*}
 expect_contains "$ctxmux_cli_fork_line" "lineage=$ctxmux_cli_parent:level_a"
+ctxmux_cli_fork_retry=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" fork --operation-key smoke-fork "$ctxmux_cli_parent")
+[[ ${ctxmux_cli_fork_retry%%$'\t'*} == "$ctxmux_cli_child" ]] || fail "Fork retry returned a different Run"
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status "$ctxmux_cli_child" >/dev/null
 
 ctxmux_cli_stop_run=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c "sleep 30")
@@ -131,13 +135,14 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 3"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 3"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 4"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 4"
 
 expect_failure "--socket or CTXMUX_SOCKET is required" env -u CTXMUX_SOCKET "$ctxmux_cli_bin" list
 expect_failure "unknown command" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" unknown
 expect_failure "invalid columns" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --cols invalid -- /bin/sh
 expect_failure "missing program" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --
+expect_failure "must not be empty" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --operation-key "" -- /bin/true
 expect_failure "invalid Run id" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status invalid
 expect_failure "unexpected arguments" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" list extra
 expect_failure "invalid output sequence" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" attach "$ctxmux_cli_run" invalid

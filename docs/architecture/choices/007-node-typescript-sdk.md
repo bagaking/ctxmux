@@ -30,7 +30,7 @@ The SDK exposes byte input as string or `Uint8Array`; strings are UTF-8 encoded 
 
 Node 24 or newer and Unix sockets are required. There is no timeout, `AbortSignal`, reconnection helper, request ID, or packaging release. Concurrent `receive()` semantics are not documented.
 
-The SDK now validates full nested generation-3 frames, rejects unsafe cursors, bounds queued input to 256 frames or 1 MiB before pausing the socket, and waits for `Detached` on clean detach. Short request methods wait for `Response` or `Error`. `Attachment.input()`, `resize()`, and `stop()` currently resolve after their frame's socket-write callback; remote `Accepted` or `Error` remains a separate attachment event because generation 3 has no command correlation ID.
+The SDK now validates full nested generation-4 frames, rejects unsafe cursors, bounds queued input to 256 frames or 1 MiB before pausing the socket, and waits for `Detached` on clean detach. Short request methods wait for `Response` or `Error`. `Attachment.input()`, `resize()`, and `stop()` currently resolve after their frame's socket-write callback; remote `Accepted` or `Error` remains a separate attachment event because generation 4 has no command correlation ID.
 
 ## Wrong-case corpus
 

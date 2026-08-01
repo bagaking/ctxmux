@@ -24,6 +24,14 @@
         "glob": "packages/sdk/src/generated/**",
         "reason": "Rust-authored declarations are generated output, not a second hand-written implementation.",
         "evidence": "scripts/check-protocol-types.sh"
+      },
+      {
+        "id": "rust-daemon-private-test-modules",
+        "category": "test_only",
+        "language": "rust",
+        "glob": "crates/ctxmux-daemon/src/tests/**",
+        "reason": "Private owner tests are compiled only beneath cfg(test) and are behavioral evidence rather than shipped daemon product code.",
+        "evidence": ".github/ci-evidence-map.json#creation-owner-contracts"
       }
     ]
   },
@@ -34,6 +42,7 @@
       "floor_class": "runtime",
       "paths": [
         "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/creation.rs",
         "crates/ctxmux-daemon/src/main.rs",
         "crates/ctxmux-client/src/lib.rs",
         "crates/ctxmux/src/main.rs"
@@ -97,7 +106,7 @@
         "crates/ctxmux-client/src/lib.rs:cfg(not(unix))",
         "crates/ctxmux-daemon/src/lib.rs:cfg(not(unix))"
       ],
-      "reason": "Generation 3 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
+      "reason": "Generation 4 declares a Unix-domain-socket transport and fails compilation on unsupported platforms.",
       "evidence": "docs/protocol.md#transport"
     }
   ]

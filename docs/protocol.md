@@ -1,4 +1,4 @@
-# Local Protocol Generation 3
+# Local Protocol Generation 4
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 3.
+- Raw PTY bytes are represented as integer arrays in generation 4.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -38,13 +38,15 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 
 ## Run operations
 
-- `start`: create a PTY, spawn the declared command, and return Run metadata.
+- `start`: create a PTY and spawn the declared command through one required
+  creation operation key, then return Run metadata.
 - `discover_tmux`: list live panes from one explicit tmux server socket after
   separately validating the client executable and selected server version.
 - `import_tmux`: bind one discovered pane identity and publish a read-only,
   memory-only Run observed through public Control Mode.
-- `fork`: create a child through an explicit Level A or Level B plan and return
-  metadata containing its immediate parent and actual fidelity.
+- `fork`: create a child through one required creation operation key and an
+  explicit Level A or Level B plan, then return metadata containing its
+  immediate parent and actual fidelity.
 - `list`: return all Runs retained by this daemon.
 - `status`: return current metadata for one Run.
 - `input`: write raw bytes to a live Run's PTY.
@@ -64,14 +66,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 3.
+ownership in generation 4.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Every generation-3 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-4 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -82,6 +84,46 @@ Level A fork resolves the retained parent and clones its complete immutable
 publish the child only after native launch succeeds. A Level B tag is not by
 itself proof that an external Integration preserved richer state; the
 Integration capability gate and its behavioral evidence own that claim.
+
+### Retry-safe Run creation
+
+Every `start` and `fork` request carries one caller-owned
+`CreateOperationKey`. It is a non-empty opaque UTF-8 string of at most 128
+bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
+the key in an error. The key is not a `RunId`, Session identity, mutable tag,
+owner credential, or attach target.
+
+The daemon compares canonical typed requests after generation-4 decoding and
+default application, not raw JSON member order. A canonical Start is its exact
+`RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
+therefore compares the parent and `level_a`, while Level B also compares its
+materialized `RunSpec`. Ordered arguments and declared inputs remain ordered;
+environment member order does not create a different request.
+
+While the resulting Run remains retained, the same key and canonical request
+return the current `RunInfo` for that original physical Run. Dynamic state,
+output cursors, and attachment counts may have advanced since the first
+response. Reusing the key for another Start or Fork returns
+`creation_conflict` and creates no child. Lookup precedes current parent and
+capability validation, so retrying an already-created Fork still converges
+after its parent becomes historical or is no longer retained.
+
+A spawn or publication failure before durable `COMMIT` does not consume its
+key; a later attempt may reuse it. Durable `COMMIT` is the point of no return.
+If a post-commit vacuum or physical-file check fails, persistence is latched and
+the first request reports `persistence`, but the daemon still publishes the
+committed Run and key in its registry; a same-key retry returns that Run rather
+than launching another process. Likewise, failure to deliver a response does
+not roll back the Run or mapping. In persistent mode the key is one required,
+byte-exact unique column in the same Run row, so commit, recovery, retention
+eviction, and collection bind or remove them together. Memory-only mappings
+last for the retained Run in the current daemon epoch.
+
+This is bounded retry convergence, not global exactly-once execution. After a
+Run and its mapping are collected, the key may create a new Run. A daemon crash
+before atomic persistent publication is still outside live process recovery;
+ctxmux does not preserve a pending tombstone, adopt an unrecorded process, or
+claim that such a process cannot have survived.
 
 Every `RunInfo` declares a Backend and its generic capabilities. Native Runs
 have a `RunSpec` and daemon-owned child authority. Imported tmux Runs have no
@@ -116,7 +158,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 3 import accepts only socket path plus pane ID, so it
+associations. Generation 4 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -131,7 +173,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 3 does not claim general command correlation beyond those bounded
+Generation 4 does not claim general command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -171,7 +213,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-3 peer that puts `chunks` back into the header is invalid.
+generation-4 peer that puts `chunks` back into the header is invalid.
 
 `Gap { head_seq }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -220,6 +262,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-3 frame at runtime, rejects duplicate
+validates the complete nested generation-4 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

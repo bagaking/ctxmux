@@ -15,4 +15,5 @@ export type ErrorCode =
   | "unsupported_backend_version"
   | "unsupported_capability"
   | "target_changed"
+  | "creation_conflict"
   | "internal";

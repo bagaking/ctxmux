@@ -10,8 +10,10 @@ import {
 } from "../src/index.ts";
 import type {
   Integration,
+  IntegrationDetectionOptions,
   IntegrationSemanticEvent,
   LevelBForkPlan,
+  CreateOperationKey,
   RunInfo,
   RunSpec,
 } from "../src/index.ts";
@@ -22,9 +24,15 @@ interface TestEvent extends IntegrationSemanticEvent {
 
 test("registerIntegration binds explicit tool semantics to the raw client", async () => {
   let startedSpec: RunSpec | undefined;
+  let startedKey: CreateOperationKey | undefined;
+  let detectionOptions: IntegrationDetectionOptions | undefined;
   const client = {
-    async start(spec: RunSpec): Promise<RunInfo> {
+    async start(
+      spec: RunSpec,
+      operationKey?: CreateOperationKey,
+    ): Promise<RunInfo> {
       startedSpec = spec;
+      startedKey = operationKey;
       return {
         id: "00000000-0000-0000-0000-000000000001",
         spec,
@@ -57,7 +65,8 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
   > = {
     id: "test",
     apiVersion: INTEGRATION_API_VERSION,
-    async detect() {
+    async detect(options) {
+      detectionOptions = options;
       return {
         status: "available",
         executable: "/bin/echo",
@@ -81,9 +90,20 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
   };
 
   const registered = registerIntegration(client, integration);
-  const run = await registered.start({ message: "hello" });
+  const run = await registered.start(
+    { message: "hello" },
+    {
+      detection: { executable: "/explicit/echo", timeoutMs: 250 },
+      operationKey: "integration-operation-key",
+    },
+  );
 
   assert.equal(run.spec, startedSpec);
+  assert.equal(startedKey, "integration-operation-key");
+  assert.deepEqual(detectionOptions, {
+    executable: "/explicit/echo",
+    timeoutMs: 250,
+  });
   assert.deepEqual(startedSpec, {
     program: "/bin/echo",
     args: ["hello"],

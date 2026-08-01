@@ -18,6 +18,8 @@ Terminals, editors, CLIs, and automations are replaceable clients.
 The current runtime provides one embeddable local boundary that can:
 
 - start and stop local Runs;
+- retry uncertain Start and Fork responses through bounded caller-owned keys
+  without creating a second Run identity;
 - attach, detach, observe, and reconnect;
 - stream input, output, status, and lifecycle events;
 - fork declared portable inputs with explicit parentage and Level A fidelity;
@@ -83,7 +85,7 @@ In another terminal:
 
 ```bash
 export CTXMUX_SOCKET=target/ctxmux.sock
-run_id=$(target/debug/ctxmux start -- /bin/sh)
+run_id=$(target/debug/ctxmux start --operation-key shell-demo -- /bin/sh)
 printf 'echo hello\n' | target/debug/ctxmux input "$run_id" --stdin
 target/debug/ctxmux attach "$run_id"
 ```
@@ -127,10 +129,11 @@ locally with `Ctrl-b d`.
 The TypeScript SDK speaks the same generated protocol as the Rust CLI:
 
 ```ts
-import { CtxmuxClient, defineRun } from "@ctxmux/sdk";
+import { CtxmuxClient, createOperationKey, defineRun } from "@ctxmux/sdk";
 
 const client = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
-const run = await client.start(defineRun("/bin/sh"));
+const operationKey = createOperationKey();
+const run = await client.start(defineRun("/bin/sh"), operationKey);
 const attachment = await client.attach(run.id);
 
 await attachment.input("echo hello\n");

@@ -843,6 +843,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
         floor_class: "runtime",
         paths: [
           "crates/ctxmux-daemon/src/lib.rs",
+          "crates/ctxmux-daemon/src/creation.rs",
           "crates/ctxmux-daemon/src/main.rs",
           "crates/ctxmux-client/src/lib.rs",
           "crates/ctxmux/src/main.rs",
@@ -918,6 +919,12 @@ test("checked-in policy fixes every current product owner and floor", () => {
         category: "generated",
         language: "typescript",
         glob: "packages/sdk/src/generated/**",
+      },
+      {
+        id: "rust-daemon-private-test-modules",
+        category: "test_only",
+        language: "rust",
+        glob: "crates/ctxmux-daemon/src/tests/**",
       },
     ],
   );

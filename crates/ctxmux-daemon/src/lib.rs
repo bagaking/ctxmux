@@ -4,7 +4,7 @@
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::VecDeque,
     fs,
     io::{self, Read, Write},
     os::unix::{
@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod creation;
 mod persistence;
 mod run_spec;
 mod tmux;
@@ -28,8 +29,8 @@ mod tmux;
 pub use persistence::PersistenceError;
 
 use ctxmux_protocol::{
-    AttachedHeader, AttachedSnapshot, ClientFrame, ErrorCode, ForkFidelity, ForkPlan,
-    InterruptionReason, MAX_FRAME_BYTES, OutputChunk, OutputReplay, OutputReplayHeader,
+    AttachedHeader, AttachedSnapshot, ClientFrame, CreateOperationKey, ErrorCode, ForkFidelity,
+    ForkPlan, InterruptionReason, MAX_FRAME_BYTES, OutputChunk, OutputReplay, OutputReplayHeader,
     PROTOCOL_VERSION, ProtocolError, Request, Response, RunBackend, RunCapabilities, RunEvent,
     RunId, RunInfo, RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, TmuxRunEvent,
     decode_frame, encode_frame,
@@ -44,6 +45,7 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
+use crate::creation::{CreationFlightOwner, CreationRequest, RunRegistry};
 use crate::persistence::{Persistence, PersistentRun, RecoveredRun};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
@@ -86,10 +88,10 @@ pub enum ServerError {
     /// Optional durable state could not be safely opened or reconciled.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
-    /// One or more ctxmux-owned Backend control processes failed cleanup.
+    /// One or more owned runtime operations or Backend controls failed cleanup.
     #[error("ctxmux daemon shutdown failed: {failures}")]
     Shutdown {
-        /// Aggregated cleanup failures for ctxmux-owned control processes.
+        /// Aggregated drain and cleanup failures for ctxmux-owned work.
         failures: String,
     },
 }
@@ -109,7 +111,8 @@ impl ServerError {
 ///
 /// Returns [`ServerError`] when the socket path is unsafe, another daemon is
 /// already listening, the local listener cannot be created or operated, or a
-/// ctxmux-owned Backend control process cannot be cleaned up during shutdown.
+/// ctxmux-owned runtime work cannot be drained or Backend control processes
+/// cannot be cleaned up during shutdown.
 pub async fn serve(socket_path: impl Into<PathBuf>) -> Result<(), ServerError> {
     serve_with_persistence(socket_path.into(), None).await
 }
@@ -120,7 +123,7 @@ pub async fn serve(socket_path: impl Into<PathBuf>) -> Result<(), ServerError> {
 ///
 /// Returns [`ServerError`] when the state directory cannot be exclusively and
 /// safely opened, its exact schema or invariants fail validation, the socket
-/// cannot be published, or Backend control cleanup fails during shutdown.
+/// cannot be published, or owned runtime cleanup fails during shutdown.
 pub async fn serve_with_state_dir(
     socket_path: impl Into<PathBuf>,
     state_dir: impl Into<PathBuf>,
@@ -173,7 +176,7 @@ async fn serve_with_manager(
             }
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|source| ServerError::io(&socket_path, source))?;
-                manager.shutdown_tmux_controls(TMUX_SHUTDOWN_TIMEOUT)?;
+                manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
                 return Ok(());
             }
         }
@@ -273,13 +276,16 @@ impl Drop for SocketGuard {
 }
 
 struct RunManager {
-    runs: RwLock<HashMap<RunId, Arc<Run>>>,
+    registry: RunRegistry,
+    creation_flights: CreationFlightOwner,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
     tmux_shutting_down: AtomicBool,
     tmux_operation_gate: RwLock<()>,
     #[cfg(test)]
     attachment_hook: Option<Arc<AttachmentTestHook>>,
+    #[cfg(test)]
+    creation_hook: Option<Arc<CreationTestHook>>,
 }
 
 #[cfg(test)]
@@ -299,6 +305,14 @@ struct AttachmentTestHook {
 }
 
 #[cfg(test)]
+struct CreationTestHook {
+    armed: AtomicBool,
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    released: Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
 impl AttachmentTestHook {
     async fn pause_once(&self, point: AttachmentHookPoint) {
         if self.point != point || !self.armed.swap(false, Ordering::AcqRel) {
@@ -309,16 +323,41 @@ impl AttachmentTestHook {
     }
 }
 
+#[cfg(test)]
+impl CreationTestHook {
+    fn pause_after_publication_while_locked_once(&self) {
+        if !self.armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.reached.send(());
+        let mut released = mutex_lock(&self.released);
+        while !*released {
+            released = self
+                .release
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn release(&self) {
+        *mutex_lock(&self.released) = true;
+        self.release.notify_one();
+    }
+}
+
 impl Default for RunManager {
     fn default() -> Self {
         Self {
-            runs: RwLock::default(),
+            registry: RunRegistry::default(),
+            creation_flights: CreationFlightOwner::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
             attachment_hook: None,
+            #[cfg(test)]
+            creation_hook: None,
         }
     }
 }
@@ -328,33 +367,159 @@ impl RunManager {
         let runs = recovered
             .into_iter()
             .map(|recovered| {
-                let id = recovered.info.id;
+                let operation_key = recovered.operation_key.clone();
                 let durable = persistence.recovered_run(
                     recovered
                         .info
                         .durable_head_seq
                         .unwrap_or(recovered.info.head_seq),
                 );
-                (id, Run::recover(recovered, durable, LIVE_EVENT_CAPACITY))
+                (
+                    operation_key,
+                    Run::recover(recovered, durable, LIVE_EVENT_CAPACITY),
+                )
             })
             .collect();
         Self {
-            runs: RwLock::new(runs),
+            registry: RunRegistry::recovered(runs),
+            creation_flights: CreationFlightOwner::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
             attachment_hook: None,
+            #[cfg(test)]
+            creation_hook: None,
         }
     }
 
-    fn start(&self, spec: RunSpec) -> Result<RunInfo, ProtocolError> {
-        let run = Run::spawn(spec, None, self.live_event_capacity)?;
-        self.prepare_publication(&run)?;
-        let info = run.info();
-        write_lock(&self.runs).insert(info.id, run);
+    async fn create(
+        self: &Arc<Self>,
+        operation_key: CreateOperationKey,
+        request: CreationRequest,
+    ) -> Result<RunInfo, ProtocolError> {
+        operation_key
+            .validate()
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?;
+        let operation_guard = self.registry.lock_creation(&operation_key).await;
+        if let Some(run) = self.registry.resolve_creation(&operation_key, &request)? {
+            return Ok(run.info());
+        }
+        let admission = self
+            .creation_flights
+            .acquire_admission()
+            .await
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "ctxmux daemon is shutting down",
+                )
+            })?;
+        let flight = self.creation_flights.try_begin(admission).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "ctxmux daemon is shutting down",
+            )
+        })?;
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let manager = Arc::clone(self);
+        thread::Builder::new()
+            .name("ctxmux-create".to_owned())
+            .spawn(move || {
+                let _flight = flight;
+                let _operation_guard = operation_guard;
+                let result = manager.create_unique(operation_key, request);
+                let _ = result_tx.send(result);
+            })
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to start Run creation owner: {error}"),
+                )
+            })?;
+        let info = result_rx.await.map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("Run creation owner ended without a result: {error}"),
+            )
+        })??;
         Ok(info)
+    }
+
+    fn create_unique(
+        &self,
+        operation_key: CreateOperationKey,
+        request: CreationRequest,
+    ) -> Result<RunInfo, ProtocolError> {
+        let persistence_mode = self.persistence_mode();
+        let run = match request {
+            CreationRequest::Start { spec } => {
+                Run::spawn(spec, None, persistence_mode, self.live_event_capacity)?
+            }
+            CreationRequest::Fork { parent, plan } => {
+                let parent_run = self.get(parent)?;
+                let (spec, fidelity) = match plan {
+                    ForkPlan::LevelA if parent_run.capabilities.fork_level_a => (
+                        parent_run.spec.clone().ok_or_else(|| {
+                            ProtocolError::new(
+                                ErrorCode::UnsupportedCapability,
+                                format!("Run {parent} has no portable launch specification"),
+                            )
+                        })?,
+                        ForkFidelity::LevelA,
+                    ),
+                    ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
+                        if parent_run.live.is_none() {
+                            return Err(ProtocolError::new(
+                                ErrorCode::InvalidRunState,
+                                format!("cannot Level B fork historical Run {parent}"),
+                            ));
+                        }
+                        (spec, ForkFidelity::LevelB)
+                    }
+                    ForkPlan::LevelA | ForkPlan::LevelB { .. } => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::UnsupportedCapability,
+                            format!("Run {parent} backend does not support the requested fork"),
+                        ));
+                    }
+                };
+                Run::spawn(
+                    spec,
+                    Some(RunLineage { parent, fidelity }),
+                    persistence_mode,
+                    self.live_event_capacity,
+                )?
+            }
+        };
+        let post_commit_error = self.prepare_publication(&operation_key, &run)?;
+        let info = run.info();
+        self.registry.publish_creation(operation_key, run);
+        #[cfg(test)]
+        if let Some(hook) = &self.creation_hook {
+            hook.pause_after_publication_while_locked_once();
+        }
+        match post_commit_error {
+            Some(error) => Err(error),
+            None => Ok(info),
+        }
+    }
+
+    #[cfg(test)]
+    fn start(&self, spec: RunSpec) -> Result<RunInfo, ProtocolError> {
+        self.create_unique(
+            CreateOperationKey::random(),
+            CreationRequest::Start { spec },
+        )
+    }
+
+    #[cfg(test)]
+    fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ProtocolError> {
+        self.create_unique(
+            CreateOperationKey::random(),
+            CreationRequest::Fork { parent, plan },
+        )
     }
 
     fn with_tmux_operation<T>(
@@ -401,13 +566,14 @@ impl RunManager {
                 started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
             )?;
             let info = run.info();
-            write_lock(&self.runs).insert(info.id, run);
+            self.registry.publish_unkeyed(run);
             Ok(info)
         })
     }
 
-    fn shutdown_tmux_controls(&self, timeout: Duration) -> Result<(), ServerError> {
+    fn shutdown_owned_controls(&self, timeout: Duration) -> Result<(), ServerError> {
         let deadline = Instant::now() + timeout;
+        self.creation_flights.fence();
         self.tmux_shutting_down.store(true, Ordering::Release);
 
         let mut failures = Vec::new();
@@ -431,10 +597,11 @@ impl RunManager {
             }
         };
 
-        let mut pending = read_lock(&self.runs)
-            .values()
+        let mut pending = self
+            .registry
+            .snapshot()
+            .into_iter()
             .filter(|run| matches!(run.live, Some(RunControl::Tmux(_))))
-            .cloned()
             .collect::<Vec<_>>();
 
         for run in &pending {
@@ -492,6 +659,10 @@ impl RunManager {
             thread::sleep(CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(now)));
         }
 
+        if !self.creation_flights.wait_until(deadline) {
+            failures.push("timed out waiting for in-flight Run creation to finish".to_owned());
+        }
+
         if failures.is_empty() {
             Ok(())
         } else {
@@ -502,68 +673,40 @@ impl RunManager {
         }
     }
 
-    fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ProtocolError> {
-        let parent_run = self.get(parent)?;
-        let (spec, fidelity) = match plan {
-            ForkPlan::LevelA if parent_run.capabilities.fork_level_a => (
-                parent_run.spec.clone().ok_or_else(|| {
-                    ProtocolError::new(
-                        ErrorCode::UnsupportedCapability,
-                        format!("Run {parent} has no portable launch specification"),
-                    )
-                })?,
-                ForkFidelity::LevelA,
-            ),
-            ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
-                if parent_run.live.is_none() {
-                    return Err(ProtocolError::new(
-                        ErrorCode::InvalidRunState,
-                        format!("cannot Level B fork historical Run {parent}"),
-                    ));
-                }
-                (spec, ForkFidelity::LevelB)
-            }
-            ForkPlan::LevelA | ForkPlan::LevelB { .. } => {
-                return Err(ProtocolError::new(
-                    ErrorCode::UnsupportedCapability,
-                    format!("Run {parent} backend does not support the requested fork"),
-                ));
-            }
-        };
-        let run = Run::spawn(
-            spec,
-            Some(RunLineage { parent, fidelity }),
-            self.live_event_capacity,
-        )?;
-        self.prepare_publication(&run)?;
-        let info = run.info();
-        write_lock(&self.runs).insert(info.id, run);
-        Ok(info)
-    }
-
     fn get(&self, id: RunId) -> Result<Arc<Run>, ProtocolError> {
-        read_lock(&self.runs).get(&id).cloned().ok_or_else(|| {
+        self.registry.get(id).ok_or_else(|| {
             ProtocolError::new(ErrorCode::RunNotFound, format!("Run {id} does not exist"))
         })
     }
 
     fn list(&self) -> Vec<RunInfo> {
-        let mut runs = read_lock(&self.runs)
-            .values()
-            .map(|run| run.info())
-            .collect::<Vec<_>>();
+        let mut runs = self.registry.list();
         runs.sort_by_key(|run| run.id.to_string());
         runs
     }
 
-    fn prepare_publication(&self, run: &Arc<Run>) -> Result<(), ProtocolError> {
+    const fn persistence_mode(&self) -> PersistenceMode {
+        if self.persistence.is_some() {
+            PersistenceMode::PersistentCapable
+        } else {
+            PersistenceMode::MemoryOnly
+        }
+    }
+
+    fn prepare_publication(
+        &self,
+        operation_key: &CreateOperationKey,
+        run: &Arc<Run>,
+    ) -> Result<Option<ProtocolError>, ProtocolError> {
         let Some(persistence) = &self.persistence else {
-            return Ok(());
+            return Ok(None);
         };
-        match persistence.insert_start(&run.info()) {
-            Ok(durable) => {
-                run.enable_persistence(&durable);
-                Ok(())
+        match persistence.insert_start(operation_key, &run.persistence_start_info()) {
+            Ok(committed) => {
+                run.enable_persistence(&committed.durable);
+                Ok(committed
+                    .post_commit_error
+                    .map(|error| ProtocolError::new(ErrorCode::Persistence, error.to_string())))
             }
             Err(error) => {
                 run.terminate_unpublished();
@@ -580,9 +723,9 @@ impl RunManager {
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
-        let run = Run::spawn_with_setup(spec, None, setup)?;
+        let run = Run::spawn_with_setup(spec, None, self.persistence_mode(), setup)?;
         let info = run.info();
-        write_lock(&self.runs).insert(info.id, run);
+        self.registry.publish_unkeyed(run);
         Ok(info)
     }
 
@@ -595,9 +738,9 @@ impl RunManager {
     where
         G: FnOnce() + Send + 'static,
     {
-        let run = Run::spawn_with_wait_hook(spec, after_wait)?;
+        let run = Run::spawn_with_wait_hook(spec, self.persistence_mode(), after_wait)?;
         let info = run.info();
-        write_lock(&self.runs).insert(info.id, run);
+        self.registry.publish_unkeyed(run);
         Ok(info)
     }
 }
@@ -608,6 +751,12 @@ enum LaunchSetupStep {
     TakeWriter,
     StartOutputThread,
     StartWaiterThread,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistenceMode {
+    MemoryOnly,
+    PersistentCapable,
 }
 
 struct PendingChild {
@@ -661,6 +810,8 @@ struct Run {
     state: Mutex<RunState>,
     output: Mutex<OutputLog>,
     live: Option<RunControl>,
+    persistence_mode: PersistenceMode,
+    persistence_transition: Mutex<()>,
     persistence: Mutex<Option<PersistentRun>>,
     attachments: AtomicUsize,
     events: broadcast::Sender<RunEvent>,
@@ -859,34 +1010,62 @@ impl Run {
     fn spawn(
         spec: RunSpec,
         lineage: Option<RunLineage>,
+        persistence_mode: PersistenceMode,
         live_event_capacity: usize,
     ) -> Result<Arc<Self>, ProtocolError> {
-        Self::spawn_with_hooks(spec, lineage, live_event_capacity, |_, _| Ok(()), || {})
+        Self::spawn_with_hooks(
+            spec,
+            lineage,
+            persistence_mode,
+            live_event_capacity,
+            |_, _| Ok(()),
+            || {},
+        )
     }
 
     #[cfg(test)]
     fn spawn_with_setup<F>(
         spec: RunSpec,
         lineage: Option<RunLineage>,
+        persistence_mode: PersistenceMode,
         setup: F,
     ) -> Result<Arc<Self>, ProtocolError>
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
-        Self::spawn_with_hooks(spec, lineage, LIVE_EVENT_CAPACITY, setup, || {})
+        Self::spawn_with_hooks(
+            spec,
+            lineage,
+            persistence_mode,
+            LIVE_EVENT_CAPACITY,
+            setup,
+            || {},
+        )
     }
 
     #[cfg(test)]
-    fn spawn_with_wait_hook<G>(spec: RunSpec, after_wait: G) -> Result<Arc<Self>, ProtocolError>
+    fn spawn_with_wait_hook<G>(
+        spec: RunSpec,
+        persistence_mode: PersistenceMode,
+        after_wait: G,
+    ) -> Result<Arc<Self>, ProtocolError>
     where
         G: FnOnce() + Send + 'static,
     {
-        Self::spawn_with_hooks(spec, None, LIVE_EVENT_CAPACITY, |_, _| Ok(()), after_wait)
+        Self::spawn_with_hooks(
+            spec,
+            None,
+            persistence_mode,
+            LIVE_EVENT_CAPACITY,
+            |_, _| Ok(()),
+            after_wait,
+        )
     }
 
     fn spawn_with_hooks<F, G>(
         spec: RunSpec,
         lineage: Option<RunLineage>,
+        persistence_mode: PersistenceMode,
         live_event_capacity: usize,
         mut setup: F,
         after_wait: G,
@@ -944,6 +1123,8 @@ impl Run {
                     stop_requested: false,
                 }),
             })),
+            persistence_mode,
+            persistence_transition: Mutex::new(()),
             persistence: Mutex::new(None),
             attachments: AtomicUsize::new(0),
             events,
@@ -980,9 +1161,7 @@ impl Run {
                 .sender = None;
                 after_wait();
                 let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
-                wait_run.persist_terminal(&state);
-                *mutex_lock(&wait_run.state) = state.clone();
-                let _ = wait_run.events.send(RunEvent::Exited { state });
+                wait_run.publish_terminal(state);
             })
             .map_err(|error| spawn_error("start child waiter", error))?;
         child_tx.send(pending_child).map_err(|_| {
@@ -1034,6 +1213,8 @@ impl Run {
                 commands: commands_tx,
                 completion: Mutex::new(completion_rx),
             })),
+            persistence_mode: PersistenceMode::MemoryOnly,
+            persistence_transition: Mutex::new(()),
             persistence: Mutex::new(None),
             attachments: AtomicUsize::new(0),
             events,
@@ -1139,6 +1320,8 @@ impl Run {
             state: Mutex::new(recovered.info.state),
             output: Mutex::new(OutputLog::from_replay(recovered.replay)),
             live: None,
+            persistence_mode: PersistenceMode::PersistentCapable,
+            persistence_transition: Mutex::new(()),
             persistence: Mutex::new(Some(persistence)),
             attachments: AtomicUsize::new(0),
             events,
@@ -1162,6 +1345,12 @@ impl Run {
             oldest_seq: output.oldest_seq(),
             attachments: self.attachments.load(Ordering::Acquire),
         }
+    }
+
+    fn persistence_start_info(&self) -> RunInfo {
+        let mut info = self.info();
+        info.state = RunState::Running;
+        info
     }
 
     fn ensure_running(&self, operation: &str) -> Result<(), ProtocolError> {
@@ -1243,15 +1432,24 @@ impl Run {
     }
 
     fn record_output(&self, data: Vec<u8>) {
-        let (chunk, replay) = {
-            let mut output = mutex_lock(&self.output);
-            let chunk = output.push(data);
-            let replay = output.replay(chunk.seq.saturating_sub(1));
-            (chunk, replay)
+        let chunk = match self.persistence_mode {
+            PersistenceMode::MemoryOnly => mutex_lock(&self.output).push(data),
+            PersistenceMode::PersistentCapable => {
+                let _transition = mutex_lock(&self.persistence_transition);
+                let (chunk, replay, running, persistence) = {
+                    let mut output = mutex_lock(&self.output);
+                    let chunk = output.push(data);
+                    let replay = output.replay(chunk.seq.saturating_sub(1));
+                    let running = mutex_lock(&self.state).is_running();
+                    let persistence = mutex_lock(&self.persistence).as_ref().cloned();
+                    (chunk, replay, running, persistence)
+                };
+                if running && let Some(persistence) = persistence {
+                    persistence.append(self.id, replay);
+                }
+                chunk
+            }
         };
-        if let Some(persistence) = mutex_lock(&self.persistence).as_ref() {
-            persistence.append(self.id, replay);
-        }
         let _ = self.events.send(RunEvent::Output { chunk });
     }
 
@@ -1358,23 +1556,51 @@ impl Run {
     }
 
     fn enable_persistence(&self, persistence: &PersistentRun) {
-        let output = mutex_lock(&self.output);
-        let state = mutex_lock(&self.state).clone();
-        *mutex_lock(&self.persistence) = Some(persistence.clone());
-        let replay = output.replay(0);
-        drop(output);
+        assert_eq!(
+            self.persistence_mode,
+            PersistenceMode::PersistentCapable,
+            "only persistence-capable Runs can bind durable state"
+        );
+        let _transition = mutex_lock(&self.persistence_transition);
+        let (replay, state) = {
+            let output = mutex_lock(&self.output);
+            let state = mutex_lock(&self.state).clone();
+            let persistence_guard = mutex_lock(&self.persistence);
+            debug_assert!(persistence_guard.is_none());
+            (output.replay(0), state)
+        };
         if state.is_running() {
             persistence.append(self.id, replay);
         } else {
             persistence.finalize(self.id, replay, state);
         }
+        let _output = mutex_lock(&self.output);
+        let _state = mutex_lock(&self.state);
+        *mutex_lock(&self.persistence) = Some(persistence.clone());
     }
 
-    fn persist_terminal(&self, state: &RunState) {
-        let replay = mutex_lock(&self.output).replay(0);
-        if let Some(persistence) = mutex_lock(&self.persistence).as_ref().cloned() {
-            persistence.finalize(self.id, replay, state.clone());
+    fn publish_terminal(&self, terminal: RunState) {
+        if self.persistence_mode == PersistenceMode::MemoryOnly {
+            *mutex_lock(&self.state) = terminal.clone();
+            let _ = self.events.send(RunEvent::Exited { state: terminal });
+            return;
         }
+        let _transition = mutex_lock(&self.persistence_transition);
+        let (replay, persistence) = {
+            let output = mutex_lock(&self.output);
+            let mut state = mutex_lock(&self.state);
+            let persistence = mutex_lock(&self.persistence).as_ref().cloned();
+            if persistence.is_none() {
+                *state = terminal.clone();
+            }
+            (output.replay(0), persistence)
+        };
+        if let Some(persistence) = persistence {
+            persistence.finalize(self.id, replay, terminal.clone());
+            let _output = mutex_lock(&self.output);
+            *mutex_lock(&self.state) = terminal.clone();
+        }
+        let _ = self.events.send(RunEvent::Exited { state: terminal });
     }
 
     fn terminate_unpublished(&self) {
@@ -2099,8 +2325,13 @@ async fn execute_request(
     request: Request,
 ) -> Result<Response, ProtocolError> {
     match request {
-        Request::Start { spec } => Ok(Response::Started {
-            run: manager.start(spec)?,
+        Request::Start {
+            operation_key,
+            spec,
+        } => Ok(Response::Started {
+            run: manager
+                .create(operation_key, CreationRequest::Start { spec })
+                .await?,
         }),
         Request::DiscoverTmux { socket_path } => {
             let operation_manager = Arc::clone(manager);
@@ -2123,8 +2354,14 @@ async fn execute_request(
             .await?;
             Ok(Response::Imported { run })
         }
-        Request::Fork { parent, plan } => Ok(Response::Forked {
-            run: manager.fork(parent, plan)?,
+        Request::Fork {
+            operation_key,
+            parent,
+            plan,
+        } => Ok(Response::Forked {
+            run: manager
+                .create(operation_key, CreationRequest::Fork { parent, plan })
+                .await?,
         }),
         Request::List => Ok(Response::Runs {
             runs: manager.list(),
@@ -2369,33 +2606,37 @@ use std::fmt;
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, BTreeSet},
         fs,
         os::unix::{
             fs::{PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
         },
         process::{Command, Stdio},
-        sync::{Arc, atomic::AtomicBool},
+        sync::{Arc, Mutex, atomic::AtomicBool},
         time::{Duration, Instant},
     };
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
-        ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunEvent, RunSpec, TerminalSize,
+        CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunEvent,
+        RunSpec, RunState, TerminalSize,
     };
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
-        AttachmentHookPoint, AttachmentTestHook, LaunchSetupStep, OUTPUT_RETENTION_BYTES,
-        OutputLog, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
-        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
+        AttachmentHookPoint, AttachmentTestHook, CreationRequest, CreationTestHook,
+        LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
+        Persistence, PersistenceMode, RecoveredRun, Run, RunManager, ServerError,
+        TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
         TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
         TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
         TmuxReaderTermination, TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock,
         prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
         serve_with_manager, spawn_error,
     };
+
+    mod creation;
 
     #[test]
     fn tmux_import_stages_share_one_shutdown_bounded_budget() {
@@ -2748,6 +2989,7 @@ mod tests {
                 size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             },
+            PersistenceMode::MemoryOnly,
             move || {
                 wait_reached_tx.send(()).expect("publish wait barrier");
                 release_rx.recv().expect("release wait barrier");
@@ -2792,7 +3034,7 @@ mod tests {
     }
 
     struct InProcessServer {
-        _directory: tempfile::TempDir,
+        directory: tempfile::TempDir,
         client: Client,
         manager: Arc<RunManager>,
         task: tokio::task::JoinHandle<Result<(), ServerError>>,
@@ -2810,7 +3052,7 @@ mod tests {
                 Arc::clone(&manager),
             ));
             Self {
-                _directory: directory,
+                directory,
                 client: Client::new(socket),
                 manager,
                 task,

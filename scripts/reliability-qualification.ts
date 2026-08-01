@@ -1297,7 +1297,7 @@ async function integrationHost(
   const shell = registerIntegration(client, shellIntegration);
   const run = await shell.start(
     { args: ["-c", "exec /bin/cat"] },
-    { executable: "/bin/sh" },
+    { detection: { executable: "/bin/sh" } },
   );
   await writeFile(
     outputPath,

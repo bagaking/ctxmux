@@ -17,7 +17,7 @@ The target contract has two supported fidelity levels and one non-goal:
 
 The caller requests a level. The runtime never silently substitutes a lower one.
 
-In generation 3, `RunSpec.declared_inputs` is the sole immutable truth for
+In generation 4, `RunSpec.declared_inputs` is the sole immutable truth for
 ordered workspace, artifact, and context references. Values are non-empty and
 opaque; the daemon records them but does not dereference, normalize, copy, or
 infer ownership. `RunInfo.lineage` records derivation only: the immediate parent
@@ -47,8 +47,11 @@ capability evidence.
 
 ## Known constraints
 
-References and lineage are daemon-memory-only. There is no workspace snapshot
-strategy, artifact store, idempotency key, cleanup protocol, or persistence.
+References and lineage follow the Run's configured memory or historical
+persistence class. There is no workspace snapshot strategy, artifact store, or
+cleanup protocol. A bounded creation operation key makes process creation
+retry-safe only while its Run is retained; it does not make referenced
+workspaces or artifacts idempotent, immutable, or owned.
 Opaque references do not prove existence, immutability, ownership, portability,
 inclusion policy, or secret safety.
 
@@ -93,7 +96,8 @@ Omission is valid when the declared policy excludes that class, and borrowing is
   and unrelated-source regressions keep planner/raw fork count zero and create
   no child Run.
 - Candidate activation fixture: partial fork failure removes provisional artifacts and lineage.
-- Candidate activation fixture: concurrent retry is idempotent.
+- Covered: concurrent and abandoned-response Start, Level A, and Level B retries
+  converge on one physical child while conflicting key reuse creates none.
 - Candidate activation fixture: secret and machine-local path policy fails closed.
 
 ## Open questions

@@ -9,7 +9,12 @@ A Run must survive the client that started or viewed it. An in-process library c
 
 ## Decision
 
-One Rust daemon owns every live native Run. Tokio owns the Unix listener, connection tasks, signals, and bounded broadcast delivery. Blocking PTY reads and child waits run on named operating-system threads because the selected PTY interfaces are blocking.
+One Rust daemon owns every live native Run. Tokio owns the Unix listener,
+connection tasks, signals, bounded broadcast delivery, and cancellable launch
+admission. Blocking PTY reads and child waits run on named operating-system
+threads because the selected PTY interfaces are blocking. Unique Run creation
+uses a separate maximum of eight admitted short-lived threads; this bounds
+simultaneous launch work, not the steady-state two-thread-per-native-Run model.
 
 The protocol is the stable client boundary. Rust ABI, N-API, and editor-process lifetime are not product boundaries.
 
@@ -29,7 +34,13 @@ The protocol is the stable client boundary. Rust ABI, N-API, and editor-process 
 
 ## Known constraints
 
-Daemon shutdown is abrupt from the Run model's perspective: there is no graceful Run policy, persistent state, restart handoff, resource quota, or panic isolation contract. One reader thread and one waiter thread are created per native Run.
+Daemon shutdown remains abrupt for live native children: there is no graceful
+native Run policy, live restart handoff, global retained-Run/resource quota, or
+panic isolation contract. Optional persistence recovers declared historical
+metadata and replay, but not live PTY authority. One reader thread and one
+waiter thread are created per native Run. Creation admission limits concurrent
+launches to eight, while its bounded shutdown drain cannot hard-cancel a launch
+thread that exceeds the deadline.
 
 ## Wrong-case corpus
 
@@ -46,7 +57,10 @@ The Tokio pool regression and Rust child-drop contract constrain ownership and b
 - Active: rejected post-spawn reader, writer, output-thread, and waiter-thread setup transitions terminate and reap the child before returning an error in `lib.rs`.
 - Covered now: client disconnect and reconnect preserve the same child PID in `native_lifecycle.rs` and `client-parity.test.ts`.
 - Candidate: daemon signal, crash, and orphan behavior.
-- Candidate: many-Run thread and memory pressure.
+- Covered now: frozen 1/32/128 idle and active resource censuses measure
+  per-Run CPU, RSS, thread, and descriptor slopes; creation launch admission is
+  independently capped at eight.
+- Candidate: enforce global live/retained Run budgets and GC under pressure.
 
 ## Open questions
 

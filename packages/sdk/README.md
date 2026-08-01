@@ -6,20 +6,34 @@ on Electron, React, an editor, or the Rust implementation.
 ## Connect and start a Run
 
 ```ts
-import { CtxmuxClient, defineRun } from "@ctxmux/sdk";
+import { CtxmuxClient, createOperationKey, defineRun } from "@ctxmux/sdk";
 
 const client = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const operationKey = createOperationKey(); // retain until disposition is known
 const run = await client.start(
   defineRun("/bin/sh", {
     cwd: process.cwd(),
     size: { cols: 120, rows: 40 },
   }),
+  operationKey,
 );
 ```
 
 `CtxmuxClient` is a stateless connector. Calls such as `start`, `list`,
 `status`, `fork`, `input`, `resize`, and `stop` use short-lived protocol connections.
 Closing the SDK process does not stop a daemon-owned Run.
+
+`start` and `fork` accept an optional caller-retained creation operation key.
+When a connection closes before its response is known, retry the exact request
+with that same key: while the Run is retained, ctxmux returns that Run's current
+`RunInfo` instead of spawning another process. Different semantics return
+`creation_conflict`. Keys are byte-exact, non-empty, well-formed JavaScript
+strings whose UTF-8 encoding is at most 128 bytes. Lone UTF-16 surrogates are
+rejected instead of being silently replaced during UTF-8 encoding. Keys last
+only with the Run in its memory or persistent retention class; they are not
+Session IDs, tags, credentials, or a global exactly-once claim. A call that
+omits the key gets a fresh UUID and therefore cannot be manually retried after
+an uncertain response.
 
 ## Discover and observe a tmux-owned pane
 
@@ -49,7 +63,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 3 imports by socket path plus pane ID, an ambiguous linked
+because generation 4 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -83,6 +97,10 @@ Registration binds one imported module to the existing raw client. It performs
 no package discovery and owns no Run state. The returned Run remains available
 through `client.status`, `client.attach`, and the rest of the raw SDK even if
 the Integration observer or its host disappears.
+Registered `start` and `forkLevelB` accept one narrow optional object containing
+`detection` inputs and `operationKey`. They pass the key unchanged to the
+generic Run client; the Integration does not own or reinterpret creation
+identity.
 
 The same subpath exports `codexIntegration`. It plans `codex exec --json` only
 after bounded version and help probes confirm JSONL support. The default probe
@@ -161,13 +179,13 @@ running. `stop()` explicitly terminates it.
 
 On a live attachment, `input()`, `resize()`, and `stop()` resolve when Node's
 socket write callback completes. The daemon reports remote acceptance or error
-through the attachment event stream. Generation 3 has no command correlation
+through the attachment event stream. Generation 4 has no command correlation
 ID, so these promises must not be treated as remote acknowledgements. Short
 `CtxmuxClient` request methods do wait for their protocol response.
 
 `attach(id, afterSeq)` resumes ordered output after the last observed sequence.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 3 represents cursors as
+4 MiB replay contains the complete history. Generation 4 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

@@ -74,7 +74,7 @@ global quotas, and Run GC remain absent.
 | Protocol generation and malformed frames         | Shared corpus reaches Rust decode, real daemon, and Node validation; exact frame cap plus seeded Rust and TypeScript byte targets are checked                                                          | Strong for retained and seeded cases                        | No coverage-guided continuous fuzzer, sanitizer, or Rust-produced all-variant golden matrix                           |
 | Socket path safety and mode `0600`               | Sequential targets plus forced startup and shutdown replacement prove identity recheck, live-listener preservation, and mode                                                                           | Strong for checked owner-controlled schedules               | Hostile writable-parent atomicity, renamed-original cleanup, and peer identity remain open                            |
 | SDK backpressure and close races                 | Deterministic mock socket tests, including 20,000 queued frames, plus real 8/32-way fast/slow fan-out with explicit `Gap`                                                                              | Strong for SDK queue and real lag behavior                  | Silent-peer cancellation and request deadlines are absent                                                             |
-| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-3 matrix           | Hostile writable-parent atomicity, fd/thread exhaustion injection, global quotas, and exited-Run GC are open          |
+| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-4 matrix           | Hostile writable-parent atomicity, fd/thread exhaustion injection, global quotas, and exited-Run GC are open          |
 | Level A fork                                     | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control                                                                                                   | Strong                                                      | Post-spawn fork failure is not forced through the public boundary                                                     |
 | Codex Level B                                    | Source-bound receipt negatives, unrelated-Run public E2E, minimized JSONL corpus, seeded observer target, and a redacted real-Codex continuation artifact                                              | Strong supported-API owner, parser, and semantic proof      | Host-local provenance is not authentication; scheduled hosted evidence remains separate                               |
 | Interactive CLI attach                           | Checked-in controlling-PTY E2E proves raw input, `SIGWINCH`, detach, exact restoration, and same-PID survival                                                                                          | Strong for ordinary detach on Unix                          | Daemon-loss, error, unwind, and catchable-signal restoration remain open                                              |
@@ -475,8 +475,9 @@ initial floors are:
 - at least 90% changed-line coverage;
 - at least 85% line coverage for hand-written runtime/client/SDK code;
 - at least 95% line coverage for pure protocol codecs and runtime validators;
-- generated declarations, fixtures, and platform-impossible branches are
-  reported separately rather than silently diluting the denominator.
+- generated declarations, private test modules, fixtures, and
+  platform-impossible branches are reported separately rather than silently
+  diluting the product denominator.
 
 Exceptions require a linked owner-boundary test or a documented unreachable
 branch. The invariant matrix still blocks a release when the percentage passes
@@ -507,7 +508,7 @@ one repository aggregate.
 
 Generated TypeScript protocol declarations are excluded from the denominator
 and remain protected by the Rust-owner drift check. The `cfg(not(unix))`
-compile failures are reported as platform-impossible because generation 3
+compile failures are reported as platform-impossible because generation 4
 declares a Unix transport. No test fixture or hand-written runtime file is
 silently excluded. Changed-line mode is explicit:
 
@@ -670,11 +671,16 @@ order:
 
 The current clean-consumer audit admits four bounded gaps:
 
-- **Retry-safe Run creation:** a caller-supplied operation key may make `start`
-  and `fork` converge after response loss, but `RunId` remains the physical
-  incarnation. The same key with a different canonical request conflicts. Key
-  retention follows Run retention and recovery; this must not grow into mutable
-  tags, metadata CRUD, a second Session identity, or silent attach-or-create.
+- **Retry-safe Run creation (implemented):** a caller-supplied operation key
+  makes `start` and `fork` converge after response loss, while `RunId` remains
+  the physical incarnation. Public abandoned-response, concurrent duplicate,
+  conflict, failed-spawn, SDK/CLI, persistence restart, retention, and corrupt
+  key/index fixtures own the proof. Atomic PID markers and unrelated sentinels
+  make exact process count and identity observable. Private barriers also cover
+  a held key stripe, both fast-terminal/persistence activation orders, and an
+  after-commit postcheck failure. Key retention follows Run retention and
+  recovery; this does not grow into mutable tags, metadata CRUD, a second
+  Session identity, or silent attach-or-create.
 - **Observable attachment controls:** persistent input, resize, and stop need
   bounded command correlation and exact accepted/error results. Acceptance
   proves only what the PTY owner completed; it does not claim a child consumed
@@ -686,7 +692,7 @@ The current clean-consumer audit admits four bounded gaps:
   semantics. It must not silently download a binary, mutate global state, bind
   ctxmux lifetime to Electron, or imply SSH/remote support.
 - **Earned streaming optimization:** freeze an incremental raw-byte consumer
-  workload before changing generation-3 integer-array encoding. Adopt a new
+  workload before changing generation-4 integer-array encoding. Adopt a new
   versioned representation only when the measured end-to-end gain exceeds its
   protocol and validation cost while exact bytes, sequence, replay, `Gap`, frame
   limits, backpressure, security, and resource bounds remain green. A measured

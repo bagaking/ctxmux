@@ -13,9 +13,12 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+
 use ctxmux_protocol::{
-    InterruptionReason, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo,
-    RunLineage, RunSpec, RunState,
+    CreateOperationKey, InterruptionReason, OutputChunk, OutputReplay, RunBackend, RunCapabilities,
+    RunId, RunInfo, RunLineage, RunSpec, RunState,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -23,7 +26,7 @@ use uuid::Uuid;
 
 use crate::run_spec::validate_run_spec;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
 const PAGE_SIZE_BYTES: u64 = 4 * 1024;
@@ -101,6 +104,7 @@ impl PersistenceError {
 enum InsertStartError {
     AdmissionRejected(String),
     Fatal(PersistenceError),
+    Committed(PersistenceError),
 }
 
 impl From<PersistenceError> for InsertStartError {
@@ -110,6 +114,7 @@ impl From<PersistenceError> for InsertStartError {
 }
 
 pub(crate) struct RecoveredRun {
+    pub(crate) operation_key: CreateOperationKey,
     pub(crate) info: RunInfo,
     pub(crate) replay: OutputReplay,
 }
@@ -123,6 +128,21 @@ struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
     failure: Arc<Mutex<Option<String>>>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
+    #[cfg(test)]
+    test_hooks: Arc<PersistenceTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PersistenceTestHooks {
+    fail_next_insert_after_commit: AtomicBool,
+    finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
+}
+
+#[cfg(test)]
+struct FinalizeTestBarrier {
+    reached: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
 }
 
 impl Drop for PersistenceInner {
@@ -138,6 +158,19 @@ impl Drop for PersistenceInner {
 pub(crate) struct PersistentRun {
     persistence: Persistence,
     durable_head: Arc<AtomicU64>,
+}
+
+pub(crate) struct CommittedStart {
+    pub(crate) durable: PersistentRun,
+    pub(crate) post_commit_error: Option<PersistenceError>,
+}
+
+impl std::ops::Deref for CommittedStart {
+    type Target = PersistentRun;
+
+    fn deref(&self) -> &Self::Target {
+        &self.durable
+    }
 }
 
 impl PersistentRun {
@@ -195,6 +228,10 @@ impl Persistence {
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
+        #[cfg(test)]
+        let test_hooks = Arc::new(PersistenceTestHooks::default());
+        #[cfg(test)]
+        let actor_test_hooks = Arc::clone(&test_hooks);
         let join = thread::Builder::new()
             .name("ctxmux-persistence".to_owned())
             .spawn(move || {
@@ -204,6 +241,8 @@ impl Persistence {
                     &command_rx,
                     &init_tx,
                     &actor_failure,
+                    #[cfg(test)]
+                    &actor_test_hooks,
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
@@ -223,12 +262,18 @@ impl Persistence {
                 sender: command_tx,
                 failure,
                 join: Mutex::new(Some(join)),
+                #[cfg(test)]
+                test_hooks,
             }),
         };
         Ok((persistence, recovered))
     }
 
-    pub(crate) fn insert_start(&self, info: &RunInfo) -> Result<PersistentRun, PersistenceError> {
+    pub(crate) fn insert_start(
+        &self,
+        operation_key: &CreateOperationKey,
+        info: &RunInfo,
+    ) -> Result<CommittedStart, PersistenceError> {
         if let Some(message) = mutex_lock(&self.inner.failure).clone() {
             return Err(PersistenceError::Mutation(message));
         }
@@ -237,17 +282,71 @@ impl Persistence {
         self.inner
             .sender
             .send(Command::InsertStart {
+                operation_key: operation_key.clone(),
                 info: Box::new(info.clone()),
                 reply: reply_tx,
             })
             .map_err(|_| PersistenceError::ActorStopped)?;
-        reply_rx
+        let post_commit_error = reply_rx
             .recv()
             .map_err(|_| PersistenceError::ActorStopped)??;
-        Ok(PersistentRun {
-            persistence: self.clone(),
-            durable_head,
+        Ok(CommittedStart {
+            durable: PersistentRun {
+                persistence: self.clone(),
+                durable_head,
+            },
+            post_commit_error,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_insert_after_commit(&self) {
+        self.inner
+            .test_hooks
+            .fail_next_insert_after_commit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_finalize(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let previous =
+            mutex_lock(&self.inner.test_hooks.finalize_barrier).replace(FinalizeTestBarrier {
+                reached: reached_tx,
+                release: release_rx,
+            });
+        assert!(previous.is_none(), "only one finalize barrier may be armed");
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_failed(&self) -> bool {
+        mutex_lock(&self.inner.failure).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn assert_exclusive_owner(&self) {
+        assert_eq!(
+            Arc::strong_count(&self.inner),
+            1,
+            "test must release every durable Run before reopening its state directory"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_test_limits(
+        state_dir: PathBuf,
+        run_records: u64,
+        metadata_bytes: u64,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        Self::open_with_admission_limits(
+            state_dir,
+            AdmissionLimits {
+                run_records,
+                metadata_bytes,
+            },
+        )
     }
 
     pub(crate) fn recovered_run(&self, durable_head: u64) -> PersistentRun {
@@ -260,8 +359,9 @@ impl Persistence {
 
 enum Command {
     InsertStart {
+        operation_key: CreateOperationKey,
         info: Box<RunInfo>,
-        reply: mpsc::SyncSender<Result<(), PersistenceError>>,
+        reply: mpsc::SyncSender<Result<Option<PersistenceError>, PersistenceError>>,
     },
     Append {
         id: RunId,
@@ -284,8 +384,16 @@ fn actor_main(
     receiver: &mpsc::Receiver<Command>,
     init: &mpsc::SyncSender<Result<Vec<RecoveredRun>, PersistenceError>>,
     failure: &Mutex<Option<String>>,
+    #[cfg(test)] test_hooks: &Arc<PersistenceTestHooks>,
 ) {
-    let (mut store, recovered) = match StateStore::open(state_dir, admission_limits) {
+    #[cfg(test)]
+    let store_test_hooks = Arc::clone(test_hooks);
+    let (mut store, recovered) = match StateStore::open(
+        state_dir,
+        admission_limits,
+        #[cfg(test)]
+        store_test_hooks,
+    ) {
         Ok(value) => value,
         Err(error) => {
             let _ = init.send(Err(error));
@@ -306,23 +414,12 @@ fn actor_main(
             },
         };
         match command {
-            Command::InsertStart { info, reply } => {
-                if let Some(message) = mutex_lock(failure).clone() {
-                    let _ = reply.send(Err(PersistenceError::Mutation(message)));
-                    continue;
-                }
-                match store.insert_start(&info) {
-                    Ok(()) => {
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(InsertStartError::AdmissionRejected(message)) => {
-                        let _ = reply.send(Err(PersistenceError::Mutation(message)));
-                    }
-                    Err(InsertStartError::Fatal(error)) => {
-                        remember_failure(failure, &error);
-                        let _ = reply.send(Err(error));
-                    }
-                }
+            Command::InsertStart {
+                operation_key,
+                info,
+                reply,
+            } => {
+                handle_insert_start(&mut store, &operation_key, &info, &reply, failure);
             }
             Command::Append {
                 id,
@@ -363,6 +460,8 @@ fn actor_main(
                 durable_head,
                 reply,
             } => {
+                #[cfg(test)]
+                pause_before_finalize(test_hooks);
                 let result = if let Some(message) = mutex_lock(failure).clone() {
                     Err(PersistenceError::Mutation(message))
                 } else {
@@ -374,6 +473,44 @@ fn actor_main(
                 let _ = reply.send(result);
             }
             Command::Shutdown => return,
+        }
+    }
+}
+
+#[cfg(test)]
+fn pause_before_finalize(test_hooks: &PersistenceTestHooks) {
+    let barrier = mutex_lock(&test_hooks.finalize_barrier).take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached.send(());
+        let _ = barrier.release.recv();
+    }
+}
+
+fn handle_insert_start(
+    store: &mut StateStore,
+    operation_key: &CreateOperationKey,
+    info: &RunInfo,
+    reply: &mpsc::SyncSender<Result<Option<PersistenceError>, PersistenceError>>,
+    failure: &Mutex<Option<String>>,
+) {
+    if let Some(message) = mutex_lock(failure).clone() {
+        let _ = reply.send(Err(PersistenceError::Mutation(message)));
+        return;
+    }
+    match store.insert_start(operation_key, info) {
+        Ok(()) => {
+            let _ = reply.send(Ok(None));
+        }
+        Err(InsertStartError::AdmissionRejected(message)) => {
+            let _ = reply.send(Err(PersistenceError::Mutation(message)));
+        }
+        Err(InsertStartError::Fatal(error)) => {
+            remember_failure(failure, &error);
+            let _ = reply.send(Err(error));
+        }
+        Err(InsertStartError::Committed(error)) => {
+            remember_failure(failure, &error);
+            let _ = reply.send(Ok(Some(error)));
         }
     }
 }
@@ -397,13 +534,39 @@ struct StateStore {
     connection: Connection,
     epoch: String,
     admission_limits: AdmissionLimits,
-    _lock: File,
+    // Fields drop in declaration order: close SQLite before releasing ownership.
+    _state_lock: StateLockGuard,
+    #[cfg(test)]
+    test_hooks: Arc<PersistenceTestHooks>,
+}
+
+struct StateLockGuard(File);
+
+impl StateLockGuard {
+    fn acquire(lock: File, state_dir: &Path, lock_path: &Path) -> Result<Self, PersistenceError> {
+        match lock.try_lock() {
+            Ok(()) => Ok(Self(lock)),
+            Err(fs::TryLockError::WouldBlock) => {
+                Err(PersistenceError::StateInUse(state_dir.to_path_buf()))
+            }
+            Err(fs::TryLockError::Error(source)) => Err(PersistenceError::io(lock_path, source)),
+        }
+    }
+}
+
+impl Drop for StateLockGuard {
+    fn drop(&mut self) {
+        if let Err(error) = File::unlock(&self.0) {
+            eprintln!("ctxmuxd failed to release its state lock: {error}");
+        }
+    }
 }
 
 impl StateStore {
     fn open(
         state_dir: &Path,
         admission_limits: AdmissionLimits,
+        #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         prepare_state_dir(state_dir)?;
         let lock_path = state_dir.join(LOCK_FILE);
@@ -419,15 +582,7 @@ impl StateStore {
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
             .map_err(|source| PersistenceError::io(&lock_path, source))?;
         validate_state_file(&lock_path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(fs::TryLockError::WouldBlock) => {
-                return Err(PersistenceError::StateInUse(state_dir.to_path_buf()));
-            }
-            Err(fs::TryLockError::Error(source)) => {
-                return Err(PersistenceError::io(&lock_path, source));
-            }
-        }
+        let state_lock = StateLockGuard::acquire(lock, state_dir, &lock_path)?;
 
         let database_path = state_dir.join(DATABASE_FILE);
         let wal_path = state_dir.join(format!("{DATABASE_FILE}-wal"));
@@ -498,13 +653,22 @@ impl StateStore {
             connection,
             epoch,
             admission_limits,
-            _lock: lock,
+            _state_lock: state_lock,
+            #[cfg(test)]
+            test_hooks,
         };
         store.validate_files()?;
         Ok((store, recovered))
     }
 
-    fn insert_start(&mut self, info: &RunInfo) -> Result<(), InsertStartError> {
+    fn insert_start(
+        &mut self,
+        operation_key: &CreateOperationKey,
+        info: &RunInfo,
+    ) -> Result<(), InsertStartError> {
+        operation_key.validate().map_err(|error| {
+            PersistenceError::Mutation(format!("invalid Run creation operation key: {error}"))
+        })?;
         let spec = validate_persistent_start(info)?;
         self.admit_transaction(1024 * 1024)?;
         let spec_json = serde_json::to_string(spec).map_err(PersistenceError::serialization)?;
@@ -518,6 +682,7 @@ impl StateStore {
             serde_json::to_string(&RunState::Running).map_err(PersistenceError::serialization)?;
         let metadata_bytes = metadata_size(
             &info.id.to_string(),
+            operation_key.as_str(),
             &spec_json,
             lineage_json.as_deref(),
             &state_json,
@@ -543,12 +708,13 @@ impl StateStore {
         transaction
             .execute(
                 "INSERT INTO runs (
-                    id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+                    id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
                     durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
                     metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
-                 ) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6, 0, 0, 0, 0, ?7, ?8, ?8, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, 0, 0, 0, 0, ?8, ?9, ?9, NULL)",
                 params![
                     info.id.to_string(),
+                    operation_key.as_str(),
                     spec_json,
                     lineage_json,
                     state_json,
@@ -560,7 +726,18 @@ impl StateStore {
             )
             .map_err(PersistenceError::database)?;
         transaction.commit().map_err(PersistenceError::database)?;
-        self.finish_transaction(evicted)?;
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .fail_next_insert_after_commit
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(InsertStartError::Committed(PersistenceError::Mutation(
+                "injected failure after durable Run creation commit".to_owned(),
+            )));
+        }
+        self.finish_transaction(evicted)
+            .map_err(InsertStartError::Committed)?;
         Ok(())
     }
 
@@ -691,20 +868,31 @@ impl StateStore {
         evicted |= prune_global_replay(&transaction)?;
         if let Some((id, state)) = terminal {
             let (kind, state_json) = encoded_state(state)?;
-            let (id_text, spec_json, lineage_json, source_epoch): (
+            let (id_text, creation_key, spec_json, lineage_json, source_epoch): (
+                String,
                 String,
                 String,
                 Option<String>,
                 String,
             ) = transaction
                 .query_row(
-                    "SELECT id, spec_json, lineage_json, source_epoch FROM runs WHERE id = ?1",
+                    "SELECT id, creation_key, spec_json, lineage_json, source_epoch
+                     FROM runs WHERE id = ?1",
                     [id.to_string()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .map_err(PersistenceError::database)?;
             let metadata_bytes = metadata_size(
                 &id_text,
+                &creation_key,
                 &spec_json,
                 lineage_json.as_deref(),
                 &state_json,
@@ -877,6 +1065,7 @@ fn create_schema(connection: &Connection) -> Result<(), PersistenceError> {
              );
              CREATE TABLE runs (
                 id TEXT PRIMARY KEY NOT NULL,
+                creation_key TEXT NOT NULL COLLATE BINARY,
                 spec_json TEXT NOT NULL,
                 lineage_json TEXT,
                 state_kind TEXT NOT NULL CHECK (state_kind IN ('running', 'exited', 'interrupted')),
@@ -892,6 +1081,7 @@ fn create_schema(connection: &Connection) -> Result<(), PersistenceError> {
                 updated_at_ms INTEGER NOT NULL,
                 terminal_at_ms INTEGER
              );
+             CREATE UNIQUE INDEX runs_creation_key ON runs(creation_key);
              CREATE TABLE replay_chunks (
                 ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -948,6 +1138,7 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
         .map_err(PersistenceError::database)?;
     let expected = BTreeSet::from([
         ("index".to_owned(), "replay_chunks_run_seq".to_owned()),
+        ("index".to_owned(), "runs_creation_key".to_owned()),
         ("table".to_owned(), "replay_chunks".to_owned()),
         ("table".to_owned(), "runs".to_owned()),
         ("table".to_owned(), "runtime_meta".to_owned()),
@@ -967,6 +1158,7 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
         "runs",
         &[
             "id",
+            "creation_key",
             "spec_json",
             "lineage_json",
             "state_kind",
@@ -988,6 +1180,11 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
         "replay_chunks",
         &["ordinal", "run_id", "seq", "data"],
     )?;
+    validate_creation_key_index(connection)?;
+    validate_database_format_pragmas(connection)
+}
+
+fn validate_database_format_pragmas(connection: &Connection) -> Result<(), PersistenceError> {
     let page_size: i64 = connection
         .pragma_query_value(None, "page_size", |row| row.get(0))
         .map_err(PersistenceError::database)?;
@@ -1029,6 +1226,61 @@ fn validate_table_columns(
     Ok(())
 }
 
+fn validate_creation_key_index(connection: &Connection) -> Result<(), PersistenceError> {
+    let descriptor: Option<(i64, String, i64)> = connection
+        .query_row(
+            "SELECT [unique], origin, partial FROM pragma_index_list('runs')
+             WHERE name = 'runs_creation_key'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(PersistenceError::database)?;
+    if descriptor
+        .as_ref()
+        .map(|(unique, origin, partial)| (*unique, origin.as_str(), *partial))
+        != Some((1, "c", 0))
+    {
+        return Err(PersistenceError::Corrupt(
+            "runs_creation_key must be an explicit non-partial unique index".to_owned(),
+        ));
+    }
+
+    let mut statement = connection
+        .prepare("PRAGMA index_xinfo(runs_creation_key)")
+        .map_err(PersistenceError::database)?;
+    let key_columns = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(PersistenceError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PersistenceError::database)?
+        .into_iter()
+        .filter(|(_, _, _, _, key)| *key != 0)
+        .collect::<Vec<_>>();
+    if key_columns
+        != vec![(
+            1,
+            Some("creation_key".to_owned()),
+            0,
+            "BINARY".to_owned(),
+            1,
+        )]
+    {
+        return Err(PersistenceError::Corrupt(
+            "runs_creation_key must index creation_key byte-exactly in ascending order".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_quick_check(connection: &Connection) -> Result<(), PersistenceError> {
     let result: String = connection
         .query_row("PRAGMA quick_check", [], |row| row.get(0))
@@ -1054,7 +1306,8 @@ fn reconcile_epoch(connection: &Connection, epoch: &str) -> Result<(), Persisten
     let running = {
         let mut statement = transaction
             .prepare(
-                "SELECT id, spec_json, lineage_json, source_epoch FROM runs WHERE state_kind = 'running'",
+                "SELECT id, creation_key, spec_json, lineage_json, source_epoch
+                 FROM runs WHERE state_kind = 'running'",
             )
             .map_err(PersistenceError::database)?;
         statement
@@ -1062,17 +1315,19 @@ fn reconcile_epoch(connection: &Connection, epoch: &str) -> Result<(), Persisten
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(PersistenceError::database)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(PersistenceError::database)?
     };
-    for (id, spec_json, lineage_json, source_epoch) in running {
+    for (id, creation_key, spec_json, lineage_json, source_epoch) in running {
         let metadata_bytes = metadata_size(
             &id,
+            &creation_key,
             &spec_json,
             lineage_json.as_deref(),
             &state_json,
@@ -1138,7 +1393,7 @@ fn evict_terminal_overflow(transaction: &Transaction<'_>) -> Result<(), Persiste
 fn validate_application_state(connection: &Connection) -> Result<(), PersistenceError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+            "SELECT id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
                     durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
                     metadata_bytes FROM runs ORDER BY id",
         )
@@ -1147,15 +1402,18 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
     let mut record_count = 0_u64;
     let mut metadata_total = 0_u64;
     let mut replay_total = 0_u64;
+    let mut creation_keys = BTreeSet::new();
     while let Some(row) = rows.next().map_err(PersistenceError::database)? {
         record_count += 1;
         let id_text: String = row.get(0).map_err(PersistenceError::database)?;
         let id: RunId = id_text
             .parse()
             .map_err(|_| PersistenceError::Corrupt(format!("invalid Run id {id_text:?}")))?;
-        let spec_json: String = row.get(1).map_err(PersistenceError::database)?;
+        let creation_key_text: String = row.get(1).map_err(PersistenceError::database)?;
+        let creation_key = decode_unique_creation_key(id, creation_key_text, &mut creation_keys)?;
+        let spec_json: String = row.get(2).map_err(PersistenceError::database)?;
         let _ = decode_native_spec(id, &spec_json)?;
-        let lineage_json: Option<String> = row.get(2).map_err(PersistenceError::database)?;
+        let lineage_json: Option<String> = row.get(3).map_err(PersistenceError::database)?;
         if let Some(lineage_json) = &lineage_json {
             let lineage: RunLineage = serde_json::from_str(lineage_json).map_err(|error| {
                 PersistenceError::Corrupt(format!("invalid lineage for {id}: {error}"))
@@ -1166,8 +1424,8 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
                 )));
             }
         }
-        let state_kind: String = row.get(3).map_err(PersistenceError::database)?;
-        let state_json: String = row.get(4).map_err(PersistenceError::database)?;
+        let state_kind: String = row.get(4).map_err(PersistenceError::database)?;
+        let state_json: String = row.get(5).map_err(PersistenceError::database)?;
         let state: RunState = serde_json::from_str(&state_json).map_err(|error| {
             PersistenceError::Corrupt(format!("invalid state for {id}: {error}"))
         })?;
@@ -1176,10 +1434,10 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
                 "Run {id} state kind does not match its JSON"
             )));
         }
-        let source_epoch: String = row.get(5).map_err(PersistenceError::database)?;
+        let source_epoch: String = row.get(6).map_err(PersistenceError::database)?;
         Uuid::parse_str(&source_epoch)
             .map_err(|_| PersistenceError::Corrupt(format!("Run {id} has invalid source epoch")))?;
-        let pid: Option<i64> = row.get(6).map_err(PersistenceError::database)?;
+        let pid: Option<i64> = row.get(7).map_err(PersistenceError::database)?;
         if pid.is_some_and(|pid| u32::try_from(pid).is_err()) {
             return Err(PersistenceError::Corrupt(format!(
                 "Run {id} has invalid PID"
@@ -1190,24 +1448,25 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
                 "interrupted Run {id} retains a PID"
             )));
         }
-        let oldest = nonnegative_u64(row.get(7).map_err(PersistenceError::database)?, "oldest")?;
-        let head = nonnegative_u64(row.get(8).map_err(PersistenceError::database)?, "head")?;
+        let oldest = nonnegative_u64(row.get(8).map_err(PersistenceError::database)?, "oldest")?;
+        let head = nonnegative_u64(row.get(9).map_err(PersistenceError::database)?, "head")?;
         let replay_bytes = nonnegative_u64(
-            row.get(9).map_err(PersistenceError::database)?,
+            row.get(10).map_err(PersistenceError::database)?,
             "replay bytes",
         )?;
-        let truncated: i64 = row.get(10).map_err(PersistenceError::database)?;
+        let truncated: i64 = row.get(11).map_err(PersistenceError::database)?;
         if !matches!(truncated, 0 | 1) {
             return Err(PersistenceError::Corrupt(format!(
                 "Run {id} has invalid replay truncation flag"
             )));
         }
         let stored_metadata = nonnegative_u64(
-            row.get(11).map_err(PersistenceError::database)?,
+            row.get(12).map_err(PersistenceError::database)?,
             "metadata bytes",
         )?;
         let actual_metadata = metadata_size(
             &id_text,
+            creation_key.as_str(),
             &spec_json,
             lineage_json.as_deref(),
             &state_json,
@@ -1231,6 +1490,24 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
         ));
     }
     Ok(())
+}
+
+fn decode_unique_creation_key(
+    id: RunId,
+    value: String,
+    seen: &mut BTreeSet<String>,
+) -> Result<CreateOperationKey, PersistenceError> {
+    let creation_key = value.parse().map_err(|error| {
+        PersistenceError::Corrupt(format!(
+            "invalid creation operation key for Run {id}: {error}"
+        ))
+    })?;
+    if !seen.insert(value) {
+        return Err(PersistenceError::Corrupt(format!(
+            "creation operation key is bound to more than one Run including {id}"
+        )));
+    }
+    Ok(creation_key)
 }
 
 fn validate_replay_window(
@@ -1293,7 +1570,7 @@ fn validate_replay_window(
 fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, PersistenceError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, spec_json, lineage_json, state_json, pid, durable_oldest_seq,
+            "SELECT id, creation_key, spec_json, lineage_json, state_json, pid, durable_oldest_seq,
                     durable_head_seq, replay_truncated FROM runs ORDER BY created_at_ms, id",
         )
         .map_err(PersistenceError::database)?;
@@ -1304,36 +1581,45 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
         let id: RunId = id_text
             .parse()
             .map_err(|_| PersistenceError::Corrupt("invalid recovered Run id".to_owned()))?;
-        let spec_json = row
+        let operation_key = row
             .get::<_, String>(1)
+            .map_err(PersistenceError::database)?
+            .parse()
+            .map_err(|error| {
+                PersistenceError::Corrupt(format!(
+                    "invalid creation operation key for recovered Run {id}: {error}"
+                ))
+            })?;
+        let spec_json = row
+            .get::<_, String>(2)
             .map_err(PersistenceError::database)?;
         let spec = decode_native_spec(id, &spec_json)?;
         let lineage = row
-            .get::<_, Option<String>>(2)
+            .get::<_, Option<String>>(3)
             .map_err(PersistenceError::database)?
             .map(|value| serde_json::from_str(&value))
             .transpose()
             .map_err(PersistenceError::database)?;
         let state: RunState = serde_json::from_str(
-            &row.get::<_, String>(3)
+            &row.get::<_, String>(4)
                 .map_err(PersistenceError::database)?,
         )
         .map_err(PersistenceError::database)?;
         let pid = row
-            .get::<_, Option<i64>>(4)
+            .get::<_, Option<i64>>(5)
             .map_err(PersistenceError::database)?
             .map(u32::try_from)
             .transpose()
             .map_err(|_| PersistenceError::Corrupt("invalid recovered PID".to_owned()))?;
         let oldest_seq = nonnegative_u64(
-            row.get(5).map_err(PersistenceError::database)?,
+            row.get(6).map_err(PersistenceError::database)?,
             "recovered oldest",
         )?;
         let head_seq = nonnegative_u64(
-            row.get(6).map_err(PersistenceError::database)?,
+            row.get(7).map_err(PersistenceError::database)?,
             "recovered head",
         )?;
-        let truncated = row.get::<_, i64>(7).map_err(PersistenceError::database)? != 0;
+        let truncated = row.get::<_, i64>(8).map_err(PersistenceError::database)? != 0;
         let mut chunk_statement = connection
             .prepare("SELECT seq, data FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
             .map_err(PersistenceError::database)?;
@@ -1354,6 +1640,7 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
             .collect::<Result<Vec<_>, _>>()
             .map_err(PersistenceError::database)?;
         recovered.push(RecoveredRun {
+            operation_key,
             info: RunInfo {
                 id,
                 spec: Some(spec),
@@ -1692,6 +1979,7 @@ const fn state_kind_for(state: &RunState) -> &'static str {
 
 fn metadata_size(
     id: &str,
+    creation_key: &str,
     spec: &str,
     lineage: Option<&str>,
     state: &str,
@@ -1699,6 +1987,7 @@ fn metadata_size(
 ) -> Result<u64, PersistenceError> {
     u64::try_from(
         id.len()
+            .saturating_add(creation_key.len())
             .saturating_add(spec.len())
             .saturating_add(lineage.map_or(0, str::len))
             .saturating_add(state.len().max(LIFECYCLE_METADATA_RESERVE_BYTES))
@@ -1793,11 +2082,12 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::fs::OpenOptions;
 
     use ctxmux_protocol::{
-        OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState,
-        TerminalSize,
+        CreateOperationKey, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo,
+        RunSpec, RunState, TerminalSize,
     };
     use rusqlite::{Connection, OptionalExtension, params};
     use tempfile::TempDir;
@@ -1806,9 +2096,51 @@ mod tests {
         AdmissionLimits, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, InsertStartError,
         MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, RUN_RECORDS, SHM_MAX_BYTES,
-        STATE_FILES_MAX_BYTES, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay, create_schema,
-        metadata_size, prune_global_replay_to, reserve_run_capacity_to,
+        STATE_FILES_MAX_BYTES, StateLockGuard, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay,
+        create_schema, metadata_size, prune_global_replay_to, reserve_run_capacity_to,
+        validate_existing_schema,
     };
+
+    #[test]
+    fn state_lock_release_does_not_wait_for_an_inherited_file_description() {
+        let temp = TempDir::new().expect("create state-lock inheritance fixture");
+        let lock_path = temp.path().join("state.lock");
+        let owner_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open owner lock file");
+        let owner = StateLockGuard::acquire(owner_file, temp.path(), &lock_path)
+            .expect("acquire owner state lock");
+        let inherited_file = owner
+            .0
+            .try_clone()
+            .expect("model a fork-inherited file description");
+        let live_contender_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open live contender lock file");
+        let Err(live_error) = StateLockGuard::acquire(live_contender_file, temp.path(), &lock_path)
+        else {
+            panic!("a second live owner acquired the state lock");
+        };
+        assert!(matches!(live_error, PersistenceError::StateInUse(_)));
+
+        drop(owner);
+
+        let contender_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open contender lock file");
+        let contender = StateLockGuard::acquire(contender_file, temp.path(), &lock_path)
+            .expect("explicit owner release is not extended by an inherited descriptor");
+        drop(inherited_file);
+        drop(contender);
+    }
 
     #[test]
     fn format_limits_match_the_accepted_physical_and_logical_budgets() {
@@ -1829,6 +2161,117 @@ mod tests {
             u64::try_from(MAX_TRANSACTION_PAYLOAD_BYTES).expect("payload limit fits u64") * 4
                 + 1024 * 1024;
         assert!(worst_admitted_output <= WAL_CHECKPOINT_BYTES);
+    }
+
+    #[test]
+    fn creation_key_index_is_unique_binary_and_exactly_validated() {
+        let connection = test_connection();
+        validate_existing_schema(&connection).expect("accept canonical schema 2 index");
+
+        connection
+            .execute_batch(
+                "DROP INDEX runs_creation_key;
+                 CREATE UNIQUE INDEX runs_creation_key
+                 ON runs(creation_key COLLATE NOCASE);",
+            )
+            .expect("replace creation index with wrong collation");
+        let error = validate_existing_schema(&connection)
+            .expect_err("NOCASE creation identity must fail exact schema validation");
+        assert!(matches!(error, PersistenceError::Corrupt(_)));
+        assert!(error.to_string().contains("byte-exactly"));
+    }
+
+    #[test]
+    fn binary_creation_keys_keep_case_distinct_and_store_conflicts_are_fatal() {
+        let temp = TempDir::new().expect("create byte-exact key fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let upper = running_info(RunId::new());
+        let lower = running_info(RunId::new());
+        persistence
+            .insert_start(&CreateOperationKey::new("Case").unwrap(), &upper)
+            .expect("insert uppercase opaque key");
+        persistence
+            .insert_start(&CreateOperationKey::new("case").unwrap(), &lower)
+            .expect("insert lowercase opaque key");
+
+        let conflicting = running_info(RunId::new());
+        let Err(error) =
+            persistence.insert_start(&CreateOperationKey::new("Case").unwrap(), &conflicting)
+        else {
+            panic!("store-level duplicate must be a fatal owner invariant breach");
+        };
+        assert!(matches!(error, PersistenceError::Database(_)));
+        let later = running_info(RunId::new());
+        let Err(latched) =
+            persistence.insert_start(&CreateOperationKey::new("later").unwrap(), &later)
+        else {
+            panic!("fatal store conflict must latch the actor");
+        };
+        assert!(matches!(latched, PersistenceError::Mutation(_)));
+
+        drop(persistence);
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen prior unit");
+        assert_eq!(recovered.len(), 2);
+        drop(reopened);
+    }
+
+    #[test]
+    fn unique_failure_rolls_back_a_terminal_eviction_in_the_same_transaction() {
+        let temp = TempDir::new().expect("create eviction rollback fixture");
+        let state_dir = temp.path().join("state");
+        let limits = AdmissionLimits {
+            run_records: 2,
+            metadata_bytes: METADATA_BYTES,
+        };
+        let (persistence, recovered) =
+            Persistence::open_with_admission_limits(state_dir.clone(), limits)
+                .expect("open eviction rollback store");
+        assert!(recovered.is_empty());
+
+        let terminal = running_info(RunId::new());
+        let terminal_key = CreateOperationKey::new("rollback-terminal").unwrap();
+        let terminal_durable = persistence
+            .insert_start(&terminal_key, &terminal)
+            .expect("insert terminal eviction candidate");
+        terminal_durable.finalize(terminal.id, replay(Vec::new()), exited_state());
+
+        let retained = running_info(RunId::new());
+        let conflicting_key = CreateOperationKey::new("rollback-conflict").unwrap();
+        let retained_durable = persistence
+            .insert_start(&conflicting_key, &retained)
+            .expect("insert retained conflicting owner");
+        let rejected = running_info(RunId::new());
+        let Err(error) = persistence.insert_start(&conflicting_key, &rejected) else {
+            panic!("unique conflict admitted after tentative eviction");
+        };
+        assert!(matches!(error, PersistenceError::Database(_)));
+
+        drop(retained_durable);
+        drop(terminal_durable);
+        drop(persistence);
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen rolled-back store");
+        assert_eq!(recovered.len(), 2);
+        let recovered_pairs = recovered
+            .iter()
+            .map(|run| {
+                (
+                    run.info.id.to_string(),
+                    run.operation_key.as_str().to_owned(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            recovered_pairs,
+            BTreeSet::from([
+                (terminal.id.to_string(), terminal_key.as_str().to_owned()),
+                (retained.id.to_string(), conflicting_key.as_str().to_owned()),
+            ])
+        );
+        assert!(!recovered.iter().any(|run| run.info.id == rejected.id));
+        drop(reopened);
     }
 
     #[test]
@@ -1910,10 +2353,11 @@ mod tests {
 
         let first = running_info(RunId::new());
         let first_durable = persistence
-            .insert_start(&first)
+            .insert_start(&test_operation_key(first.id), &first)
             .expect("insert first running record");
         let second = running_info(RunId::new());
-        let Err(rejection) = persistence.insert_start(&second) else {
+        let Err(rejection) = persistence.insert_start(&test_operation_key(second.id), &second)
+        else {
             panic!("running-only capacity admitted a second record");
         };
         assert!(matches!(rejection, PersistenceError::Mutation(_)));
@@ -1929,11 +2373,12 @@ mod tests {
         assert_eq!(first_durable.durable_head(), 1);
 
         let second_durable = persistence
-            .insert_start(&second)
+            .insert_start(&test_operation_key(second.id), &second)
             .expect("same actor admits a Run after terminal eviction");
         second_durable.finalize(second.id, replay(Vec::new()), exited_state());
         drop(second_durable);
         drop(first_durable);
+        persistence.assert_exclusive_owner();
         drop(persistence);
 
         let (reopened, recovered) = Persistence::open(state_dir).expect("reopen admitted state");
@@ -1952,13 +2397,13 @@ mod tests {
 
         let first = running_info(RunId::new());
         let durable = persistence
-            .insert_start(&first)
+            .insert_start(&test_operation_key(first.id), &first)
             .expect("insert fatal fixture record");
         durable.append(first.id, replay(vec![chunk(1, b"committed")]));
         durable.append(first.id, replay(vec![chunk(1, b"conflict")]));
 
         let later = running_info(RunId::new());
-        let Err(error) = persistence.insert_start(&later) else {
+        let Err(error) = persistence.insert_start(&test_operation_key(later.id), &later) else {
             panic!("fatal replay conflict admitted a later mutation");
         };
         assert!(matches!(error, PersistenceError::Mutation(_)));
@@ -2027,10 +2472,11 @@ mod tests {
             let (persistence, recovered) =
                 Persistence::open(&state_dir).expect("open insert invariant actor");
             assert!(recovered.is_empty());
-            let Err(error) = persistence.insert_start(&info) else {
+            let Err(error) = persistence.insert_start(&test_operation_key(info.id), &info) else {
                 panic!("invalid persistent insert {label} succeeded");
             };
             assert!(error.to_string().contains(expected));
+            persistence.assert_exclusive_owner();
             drop(persistence);
 
             let (reopened, recovered) =
@@ -2080,18 +2526,26 @@ mod tests {
         };
         let state_json = serde_json::to_string(&state).expect("encode test state");
         let epoch = uuid::Uuid::new_v4().to_string();
-        let _actual_metadata =
-            metadata_size(&id.to_string(), &spec_json, None, &state_json, &epoch)
-                .expect("measure test metadata");
+        let operation_key = test_operation_key(id);
+        let _actual_metadata = metadata_size(
+            &id.to_string(),
+            operation_key.as_str(),
+            &spec_json,
+            None,
+            &state_json,
+            &epoch,
+        )
+        .expect("measure test metadata");
         transaction
             .execute(
                 "INSERT INTO runs (
-                    id, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
+                    id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
                     durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
                     metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL, 0, 0, 0, 0, ?6, 1, 1, ?7)",
+                 ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, 0, 0, 0, 0, ?7, 1, 1, ?8)",
                 params![
                     id.to_string(),
+                    operation_key.as_str(),
                     spec_json,
                     state_kind,
                     state_json,
@@ -2124,6 +2578,10 @@ mod tests {
             oldest_seq: 0,
             attachments: 0,
         }
+    }
+
+    fn test_operation_key(id: RunId) -> CreateOperationKey {
+        CreateOperationKey::new(format!("test-{id}")).expect("valid test operation key")
     }
 
     const fn exited_state() -> RunState {

@@ -108,7 +108,9 @@ test("shell Integration rejects Level B before a raw fork request", async () => 
   };
 
   await assert.rejects(
-    registered.forkLevelB(parent, undefined, { executable: "/bin/sh" }),
+    registered.forkLevelB(parent, undefined, {
+      detection: { executable: "/bin/sh" },
+    }),
     (error: unknown) =>
       error instanceof IntegrationCapabilityError &&
       error.capability === "level_b_fork",

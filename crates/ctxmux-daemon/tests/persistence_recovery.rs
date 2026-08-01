@@ -10,8 +10,8 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, RunEvent, RunId, RunInfo, RunSpec,
-    RunState, TerminalSize,
+    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, RunEvent, RunId,
+    RunInfo, RunSpec, RunState, TerminalSize,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,6 +20,68 @@ use tokio::time::{sleep, timeout};
 struct Daemon {
     child: Child,
     socket: PathBuf,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovered_creation_keys_resolve_before_current_fork_state_checks() {
+    let temp = TempDir::new().expect("create creation recovery fixture");
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let parent_key = CreateOperationKey::new("persistent-parent-start").unwrap();
+    let child_key = CreateOperationKey::new("persistent-level-b-child").unwrap();
+    let parent_spec = shell_spec("exec /bin/sleep 60");
+    let child_spec = shell_spec("printf 'persistent-child'");
+
+    let mut first = Daemon::start(socket.clone(), &state_dir).await;
+    let first_client = first.client();
+    let parent = first_client
+        .start_with_operation_key(parent_spec.clone(), parent_key.clone())
+        .await
+        .expect("start persistent parent");
+    let child = first_client
+        .fork_with_operation_key(
+            parent.id,
+            ForkPlan::LevelB {
+                spec: child_spec.clone(),
+            },
+            child_key.clone(),
+        )
+        .await
+        .expect("create persistent Level B child");
+    wait_terminal(&first_client, child.id).await;
+    first.kill_and_wait();
+
+    let second = Daemon::start(socket, &state_dir).await;
+    let client = second.client();
+    let retried_parent = client
+        .start_with_operation_key(parent_spec, parent_key)
+        .await
+        .expect("recovered Start key returns original Run");
+    assert_eq!(retried_parent.id, parent.id);
+    assert!(matches!(
+        retried_parent.state,
+        RunState::Interrupted {
+            reason: InterruptionReason::DaemonRestart
+        }
+    ));
+
+    let retried_child = client
+        .fork_with_operation_key(parent.id, ForkPlan::LevelB { spec: child_spec }, child_key)
+        .await
+        .expect("existing child resolves before historical parent rejection");
+    assert_eq!(retried_child.id, child.id);
+    assert_invalid_state(
+        &client
+            .fork_with_operation_key(
+                parent.id,
+                ForkPlan::LevelB {
+                    spec: shell_spec("exit 0"),
+                },
+                CreateOperationKey::new("fresh-level-b-after-restart").unwrap(),
+            )
+            .await,
+    );
+    assert_eq!(client.list().await.expect("list recovered Runs").len(), 2);
 }
 
 impl Daemon {
@@ -394,8 +456,8 @@ async fn state_lock_and_unknown_schema_fail_before_socket_publication() {
     let database = state_dir.join("state.sqlite3");
     let connection = rusqlite::Connection::open(&database).expect("open stopped state database");
     connection
-        .pragma_update(None, "user_version", 99_i64)
-        .expect("write unsupported schema version");
+        .pragma_update(None, "user_version", 1_i64)
+        .expect("write prior unsupported schema version");
     drop(connection);
     let version_socket = temp.path().join("version.sock");
     let version = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
@@ -404,10 +466,38 @@ async fn state_lock_and_unknown_schema_fail_before_socket_publication() {
         .arg("--state-dir")
         .arg(&state_dir)
         .output()
-        .expect("run daemon against unknown schema");
+        .expect("run daemon against prior schema");
     assert!(!version.status.success());
     assert!(String::from_utf8_lossy(&version.stderr).contains("unsupported ctxmux state schema"));
     assert!(!version_socket.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_persisted_creation_key_fails_before_socket_publication() {
+    let temp = TempDir::new().expect("create creation-key corruption fixture");
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let mut first = Daemon::start(socket, &state_dir).await;
+    let run = first
+        .client()
+        .start(shell_spec("exit 0"))
+        .await
+        .expect("create corruption source Run");
+    wait_terminal(&first.client(), run.id).await;
+    first.kill_and_wait();
+
+    let database = state_dir.join("state.sqlite3");
+    rusqlite::Connection::open(database)
+        .expect("open creation-key state")
+        .execute(
+            "UPDATE runs SET creation_key = '' WHERE id = ?1",
+            [run.id.to_string()],
+        )
+        .expect("write empty creation key");
+    let failed_socket = temp.path().join("failed.sock");
+    let output = rejected_persistent_daemon(&failed_socket, &state_dir);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("corrupt"));
+    assert!(!failed_socket.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

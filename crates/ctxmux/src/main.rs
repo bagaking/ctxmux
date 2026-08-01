@@ -12,8 +12,8 @@ use std::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{
-    ForkFidelity, ForkPlan, PROTOCOL_VERSION, RunEvent, RunId, RunInfo, RunSpec, RunState,
-    TerminalSize,
+    CreateOperationKey, ForkFidelity, ForkPlan, PROTOCOL_VERSION, RunEvent, RunId, RunInfo,
+    RunSpec, RunState, TerminalSize,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -26,10 +26,10 @@ fn usage() -> &'static str {
 usage:
   ctxmux --version
   ctxmux --socket <path> ping
-  ctxmux --socket <path> start [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
+  ctxmux --socket <path> start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux --socket <path> tmux-list <tmux-socket>
   ctxmux --socket <path> tmux-import <tmux-socket> <pane-id>
-  ctxmux --socket <path> fork <run-id>
+  ctxmux --socket <path> fork [--operation-key <key>] <run-id>
   ctxmux --socket <path> list
   ctxmux --socket <path> status <run-id>
   ctxmux --socket <path> input <run-id> <text>
@@ -75,15 +75,7 @@ async fn run() -> Result<(), String> {
         "start" => start(&client, args).await?,
         "tmux-list" => tmux_list(&client, args).await?,
         "tmux-import" => tmux_import(&client, args).await?,
-        "fork" => {
-            let parent = take_run_id(&mut args)?;
-            ensure_empty(&args)?;
-            let run = client
-                .fork(parent, ForkPlan::LevelA)
-                .await
-                .map_err(|error| error.to_string())?;
-            print_run(&run);
-        }
+        "fork" => fork(&client, args).await?,
         "list" => {
             ensure_empty(&args)?;
             for run in client.list().await.map_err(|error| error.to_string())? {
@@ -131,12 +123,17 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         .to_string_lossy()
         .into_owned();
     let mut size = TerminalSize::default();
+    let mut operation_key = None;
     while let Some(flag) = args.first() {
         if flag == "--" {
             args.remove(0);
             break;
         }
         match flag.to_str() {
+            Some("--operation-key") => {
+                args.remove(0);
+                set_operation_key(&mut operation_key, &mut args)?;
+            }
             Some("--cwd") => {
                 args.remove(0);
                 cwd = take_string(&mut args, "working directory")?;
@@ -158,17 +155,55 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         .map(|value| os_string(value, "program argument"))
         .collect::<Result<Vec<_>, _>>()?;
     let run = client
-        .start(RunSpec {
-            program,
-            args: command_args,
-            cwd: Some(cwd),
-            env: BTreeMap::default(),
-            size,
-            declared_inputs: Vec::new(),
-        })
+        .start_with_operation_key(
+            RunSpec {
+                program,
+                args: command_args,
+                cwd: Some(cwd),
+                env: BTreeMap::default(),
+                size,
+                declared_inputs: Vec::new(),
+            },
+            operation_key.unwrap_or_else(CreateOperationKey::random),
+        )
         .await
         .map_err(|error| error.to_string())?;
     println!("{}", run.id);
+    Ok(())
+}
+
+async fn fork(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let mut operation_key = None;
+    if args
+        .first()
+        .is_some_and(|argument| argument == "--operation-key")
+    {
+        args.remove(0);
+        set_operation_key(&mut operation_key, &mut args)?;
+    }
+    let parent = take_run_id(&mut args)?;
+    ensure_empty(&args)?;
+    let run = client
+        .fork_with_operation_key(
+            parent,
+            ForkPlan::LevelA,
+            operation_key.unwrap_or_else(CreateOperationKey::random),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    print_run(&run);
+    Ok(())
+}
+
+fn set_operation_key(
+    operation_key: &mut Option<CreateOperationKey>,
+    args: &mut Vec<OsString>,
+) -> Result<(), String> {
+    if operation_key.is_some() {
+        return Err("--operation-key may be supplied only once".to_owned());
+    }
+    let value = take_string(args, "Run creation operation key")?;
+    *operation_key = Some(CreateOperationKey::new(value).map_err(|error| error.to_string())?);
     Ok(())
 }
 

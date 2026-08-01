@@ -22,10 +22,26 @@ The hook is not a public fault API and cannot change production scheduling.
 - A connection task never owns the Run's last strong reference.
 - Attach snapshot and live delivery do not have an uncovered subscribe gap.
 - Output sequence allocation and log insertion are one locked operation.
+- Memory-only output does not enter the durable transition/state/persistence
+  lock path; persistence-capable Runs retain that ordering before binding.
 - A dropped attachment eventually decrements the observable count.
 - Lifecycle errors are explicit after a Run reaches `exited`.
 - A stop after child wait cannot signal by stale numeric identity, even while
   public state publication is deliberately paused.
+- One bounded creation key has one async stripe owner; only its unique leader
+  can seek physical-launch admission, and successful mapping plus Run
+  publication share one registry write. A separate Tokio semaphore admits at
+  most eight unique launches: 64 stripes bound hash-collision state, not launch
+  concurrency. The leader resolves a retained match or conflict before waiting
+  for admission. Waiting is cancellable and creates no flight or OS thread;
+  after admission, the permit, stripe, and shutdown-flight guards stay with one
+  named short-lived thread, so request cancellation cannot abandon launch.
+- Shutdown fences new unbound creation flights before Backend cleanup, then
+  drains active creation threads and tmux control owners against one bounded
+  deadline. The fence closes semaphore admission and wakes queued waiters. This
+  narrow owner is not an executor, actor, custom queue, or native process-tree
+  shutdown policy; the bounded drain cannot hard-cancel or independently reap a
+  creation thread that exceeds its deadline.
 
 ## Alternatives
 
@@ -35,7 +51,7 @@ The hook is not a public fault API and cannot change production scheduling.
 
 ## Known constraints
 
-`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Exited Runs are never collected, and daemon shutdown semantics are unspecified.
+`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Exited Runs are never collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
 
 Poisoned locks recover their inner value; this prevents secondary panics but is not a declared consistency-recovery strategy.
 
@@ -67,6 +83,15 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   controllable process/PTY seam under sustained load.
 - Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous sequences and exact raw bytes.
 - Covered now: a child-wait barrier pauses public state publication after signalling authority is removed and proves concurrent stop cannot affect an unrelated process identity.
+- Covered now: 32 concurrent duplicate Start requests, abandoned public Start
+  and Fork responses, conflicting reuse, failed spawn, and a post-publication
+  cancellation barrier converge on one physical Run without making queued
+  duplicates occupy worker threads. Deterministic admission fixtures prove an
+  eight-launch ceiling, cancellable ninth waiter, permit recovery, and shutdown
+  wakeup without counting the waiter as active. An actual-worker shutdown
+  fixture proves the creation fence rejects new and pre-fence same-stripe
+  unbound waiters while the bounded drain waits for the cancelled request's
+  active flight guard to release.
 - Candidate: exited-Run collection and attachment during collection.
 
 ## Open questions

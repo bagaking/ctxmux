@@ -1,8 +1,14 @@
+import { randomUUID } from "node:crypto";
+
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 import type { ClientFrame } from "./generated/ClientFrame.js";
+import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
-import { PROTOCOL_VERSION } from "./generated/constants.js";
+import {
+  MAX_CREATE_OPERATION_KEY_BYTES,
+  PROTOCOL_VERSION,
+} from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
 import type { RunEvent } from "./generated/RunEvent.js";
@@ -42,6 +48,46 @@ export interface CtxmuxClientOptions {
 
 export type ByteInput = string | Uint8Array;
 
+/** Validate or generate one caller-retained Run creation operation key. */
+export function createOperationKey(
+  value: string = randomUUID(),
+): CreateOperationKey {
+  if (typeof value !== "string") {
+    throw new TypeError("Run creation operation key must be a string");
+  }
+  if (!isWellFormedUtf16(value)) {
+    throw new TypeError(
+      "Run creation operation key must be well-formed UTF-16",
+    );
+  }
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes === 0) {
+    throw new TypeError("Run creation operation key must not be empty");
+  }
+  if (bytes > MAX_CREATE_OPERATION_KEY_BYTES) {
+    throw new TypeError(
+      `Run creation operation key is ${String(bytes)} bytes; maximum is ${String(MAX_CREATE_OPERATION_KEY_BYTES)}`,
+    );
+  }
+  return value;
+}
+
+function isWellFormedUtf16(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (index + 1 >= value.length || next < 0xdc00 || next > 0xdfff) {
+        return false;
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export class CtxmuxProtocolError extends Error {
   public readonly code: ErrorCode;
 
@@ -68,8 +114,15 @@ export class CtxmuxClient {
     wire.close();
   }
 
-  public async start(spec: RunSpec): Promise<RunInfo> {
-    const response = await this.#request({ type: "start", spec });
+  public async start(
+    spec: RunSpec,
+    operationKey: CreateOperationKey = createOperationKey(),
+  ): Promise<RunInfo> {
+    const response = await this.#request({
+      type: "start",
+      operation_key: createOperationKey(operationKey),
+      spec,
+    });
     if (response.type !== "started") {
       throw unexpected("started response", response.type);
     }
@@ -111,8 +164,17 @@ export class CtxmuxClient {
     return response.run;
   }
 
-  public async fork(parent: RunId, plan: ForkPlan): Promise<RunInfo> {
-    const response = await this.#request({ type: "fork", parent, plan });
+  public async fork(
+    parent: RunId,
+    plan: ForkPlan,
+    operationKey: CreateOperationKey = createOperationKey(),
+  ): Promise<RunInfo> {
+    const response = await this.#request({
+      type: "fork",
+      operation_key: createOperationKey(operationKey),
+      parent,
+      plan,
+    });
     if (response.type !== "forked") {
       throw unexpected("forked response", response.type);
     }

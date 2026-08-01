@@ -3,6 +3,7 @@ export {
   CtxmuxClient,
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
+  createOperationKey,
 } from "./client.js";
 export type { ByteInput, CtxmuxClientOptions } from "./client.js";
 export {
@@ -19,16 +20,22 @@ export type {
   IntegrationDetection,
   IntegrationDetectionOptions,
   IntegrationObserver,
+  IntegrationOperationOptions,
   IntegrationSemanticEvent,
   IntegrationUnavailableReason,
   LevelBForkPlan,
   RegisteredIntegration,
   UnavailableIntegrationDetection,
 } from "./integration.js";
-export { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./generated/constants.js";
+export {
+  MAX_CREATE_OPERATION_KEY_BYTES,
+  MAX_FRAME_BYTES,
+  PROTOCOL_VERSION,
+} from "./generated/constants.js";
 export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 export type { ClientFrame } from "./generated/ClientFrame.js";
+export type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 export type { ErrorCode } from "./generated/ErrorCode.js";
 export type { ForkFidelity } from "./generated/ForkFidelity.js";
 export type { ForkPlan } from "./generated/ForkPlan.js";
@@ -75,7 +82,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 3. */
+/** Fill the portable defaults required by protocol generation 4. */
 export function defineRun(
   program: string,
   options: {

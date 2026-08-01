@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 3
+# 003 — Unix socket and NDJSON protocol generation 4
 
-- Status: accepted for generation 3; pre-stable
+- Status: accepted for generation 4; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -37,10 +37,10 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. Startup revalidation closes the known probe-to-unlink replacement schedule. The shutdown guard retains the bound path's device/inode and removes the pathname only while its current socket identity matches. That check still cannot make pathname recheck plus unlink atomic or rediscover an original socket renamed elsewhere, so a hostile writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
 
-Protocol generation 3 directly replaces the incompatible generation-2 Run,
-Backend, interruption, persistence-cursor, and streamed-replay shapes. An older
-peer fails the exact generation handshake before request dispatch; ctxmux does
-not provide a generation-2 fallback, migration, alias, or dual encoding.
+Protocol generation 4 directly replaces generation 3 by requiring bounded
+creation operation keys on Start and Fork and adding a typed creation conflict.
+An older peer fails the exact generation handshake before request dispatch;
+ctxmux does not provide a generation-3 fallback, migration, alias, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
@@ -55,7 +55,9 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 ## Fixture mapping
 
-- Covered now: version mismatch, wrong lifecycle requests, socket mode, active-listener refusal, non-socket and symlink refusal.
+- Covered now: generation-3 mismatch before request dispatch, wrong lifecycle
+  requests, socket mode, active-listener refusal, non-socket and symlink
+  refusal.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.
 - Covered now: retained replay larger than one frame is sent as bounded ordered
   output events and reassembled exactly by both public clients.

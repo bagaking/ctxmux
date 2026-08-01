@@ -11,10 +11,92 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Maximum UTF-8 byte length of one caller-owned Run creation operation key.
+pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
+
+/// Caller-owned idempotency key for one bounded Run creation operation.
+///
+/// Equality is exact over the UTF-8 bytes. The key identifies no Session and
+/// carries no mutable metadata; it is retained only with the Run it created.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct CreateOperationKey(String);
+
+impl CreateOperationKey {
+    /// Validate and retain one opaque operation key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateOperationKeyError`] when the key is empty or exceeds
+    /// [`MAX_CREATE_OPERATION_KEY_BYTES`] UTF-8 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, CreateOperationKeyError> {
+        let key = Self(value.into());
+        key.validate()?;
+        Ok(key)
+    }
+
+    /// Generate a fresh opaque operation key for one creation attempt.
+    #[must_use]
+    pub fn random() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Return the exact opaque value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validate a key received through an untrusted protocol decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CreateOperationKeyError`] for an empty or oversized value.
+    pub fn validate(&self) -> Result<(), CreateOperationKeyError> {
+        let bytes = self.0.len();
+        if bytes == 0 {
+            return Err(CreateOperationKeyError::Empty);
+        }
+        if bytes > MAX_CREATE_OPERATION_KEY_BYTES {
+            return Err(CreateOperationKeyError::TooLong {
+                actual: bytes,
+                maximum: MAX_CREATE_OPERATION_KEY_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for CreateOperationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for CreateOperationKey {
+    type Err = CreateOperationKeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Invalid caller-owned Run creation operation key.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CreateOperationKeyError {
+    /// The key has no bytes.
+    #[error("Run creation operation key must not be empty")]
+    Empty,
+    /// The UTF-8 representation exceeds the public bound.
+    #[error("Run creation operation key is {actual} bytes; maximum is {maximum}")]
+    TooLong { actual: usize, maximum: usize },
+}
 
 /// Stable identity of a Run for the lifetime of its owning daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -302,7 +384,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 3.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 4.
     pub data: Vec<u8>,
 }
 
@@ -342,7 +424,10 @@ pub struct ClientHello {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     /// Start a new daemon-owned Run.
-    Start { spec: RunSpec },
+    Start {
+        operation_key: CreateOperationKey,
+        spec: RunSpec,
+    },
     /// Discover panes from one explicitly selected tmux server socket.
     DiscoverTmux { socket_path: String },
     /// Import one existing tmux pane as a read-only observable Run.
@@ -351,7 +436,11 @@ pub enum Request {
         pane_id: String,
     },
     /// Create one child Run from an explicit fidelity plan.
-    Fork { parent: RunId, plan: ForkPlan },
+    Fork {
+        operation_key: CreateOperationKey,
+        parent: RunId,
+        plan: ForkPlan,
+    },
     /// List all Runs retained by this daemon.
     List,
     /// Read current metadata for one Run.
@@ -487,6 +576,8 @@ pub enum ErrorCode {
     UnsupportedCapability,
     /// The selected external Backend target changed or disappeared.
     TargetChanged,
+    /// A retained Run creation key names a different canonical request.
+    CreationConflict,
     /// An unexpected daemon failure occurred.
     Internal,
 }
@@ -656,8 +747,8 @@ impl<'de> Visitor<'de> for RejectDuplicateObjectMembers {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientFrame, ClientHello, FrameError, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId,
-        decode_frame, encode_frame,
+        ClientFrame, ClientHello, CreateOperationKey, FrameError, MAX_CREATE_OPERATION_KEY_BYTES,
+        MAX_FRAME_BYTES, PROTOCOL_VERSION, RunId, decode_frame, encode_frame,
     };
 
     fn malformed_protocol_frames() -> Vec<(String, Vec<u8>)> {
@@ -704,6 +795,24 @@ mod tests {
         let id = RunId::new();
         let encoded = encode_frame(&id).expect("encode Run id");
         assert_eq!(decode_frame::<RunId>(&encoded).unwrap(), id);
+    }
+
+    #[test]
+    fn creation_operation_keys_are_bounded_by_exact_utf8_bytes() {
+        let exact = "x".repeat(MAX_CREATE_OPERATION_KEY_BYTES);
+        let key = CreateOperationKey::new(exact.clone()).expect("accept exact key ceiling");
+        assert_eq!(key.as_str(), exact);
+        assert_eq!(
+            decode_frame::<CreateOperationKey>(&encode_frame(&key).unwrap()).unwrap(),
+            key
+        );
+
+        assert!(CreateOperationKey::new("").is_err());
+        assert!(CreateOperationKey::new("x".repeat(MAX_CREATE_OPERATION_KEY_BYTES + 1)).is_err());
+        assert!(CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3)).is_ok());
+        assert!(
+            CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3 + 1)).is_err()
+        );
     }
 
     #[test]

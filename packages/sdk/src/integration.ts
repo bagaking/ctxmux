@@ -1,4 +1,5 @@
 import { runEventSource, type CtxmuxClient } from "./client.js";
+import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
 import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunInfo } from "./generated/RunInfo.js";
@@ -25,6 +26,12 @@ export type IntegrationUnavailableReason =
 export interface IntegrationDetectionOptions {
   readonly executable?: string;
   readonly timeoutMs?: number;
+}
+
+/** Optional host inputs and retry identity for one Integration operation. */
+export interface IntegrationOperationOptions {
+  readonly detection?: IntegrationDetectionOptions;
+  readonly operationKey?: CreateOperationKey;
 }
 
 /** A probe established the executable and its declared capabilities. */
@@ -89,12 +96,12 @@ export interface RegisteredIntegration<
   detect(options?: IntegrationDetectionOptions): Promise<IntegrationDetection>;
   start(
     config: LaunchConfig,
-    options?: IntegrationDetectionOptions,
+    options?: IntegrationOperationOptions,
   ): Promise<RunInfo>;
   forkLevelB(
     parent: RunInfo,
     config: ForkConfig,
-    options?: IntegrationDetectionOptions,
+    options?: IntegrationOperationOptions,
   ): Promise<RunInfo>;
   createObserver(parent?: RunInfo): IntegrationObserver<Event>;
 }
@@ -171,14 +178,17 @@ export function registerIntegration<
     integration,
     detect,
     async start(config, options) {
-      const detection = await detect(options);
+      const detection = await detect(options?.detection);
       if (detection.status === "unavailable") {
         throw new IntegrationUnavailableError(integration.id, detection);
       }
-      return client.start(integration.planLaunch(config, detection));
+      return client.start(
+        integration.planLaunch(config, detection),
+        options?.operationKey,
+      );
     },
     async forkLevelB(parent, config, options) {
-      const detection = await detect(options);
+      const detection = await detect(options?.detection);
       if (detection.status === "unavailable") {
         throw new IntegrationUnavailableError(integration.id, detection);
       }
@@ -212,7 +222,11 @@ export function registerIntegration<
           `Integration ${integration.id} returned a non-Level-B fork plan`,
         );
       }
-      return client.fork(parent.id, plan as LevelBForkPlan);
+      return client.fork(
+        parent.id,
+        plan as LevelBForkPlan,
+        options?.operationKey,
+      );
     },
     createObserver(parent) {
       const observer = integration.createObserver();

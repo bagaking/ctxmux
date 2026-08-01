@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     path::Path,
     process::{Child, Command, Stdio},
@@ -8,9 +8,9 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    ClientFrame, ClientHello, ErrorCode, ForkFidelity, ForkPlan, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    RunEvent, RunId, RunInputKind, RunInputReference, RunLineage, RunSpec, RunState, ServerFrame,
-    TerminalSize, decode_frame, encode_frame,
+    ClientFrame, ClientHello, CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan,
+    MAX_FRAME_BYTES, PROTOCOL_VERSION, Request, RunEvent, RunId, RunInputKind, RunInputReference,
+    RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
@@ -23,7 +23,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 struct TestDaemon {
     child: Child,
-    _directory: TempDir,
+    directory: TempDir,
     client: Client,
 }
 
@@ -70,7 +70,7 @@ impl TestDaemon {
         let client = Client::new(socket);
         let mut daemon = Self {
             child,
-            _directory: directory,
+            directory,
             client,
         };
 
@@ -135,6 +135,114 @@ fn interactive_shell() -> RunSpec {
         size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
+}
+
+fn marker_shell(marker: &Path) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; exec /bin/cat".to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([(
+            "CTXMUX_CREATION_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+async fn wait_for_marker_pids(marker: &Path, expected: usize) -> Vec<u32> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let pids = std::fs::read_to_string(marker)
+                .unwrap_or_default()
+                .lines()
+                .map(|line| line.parse::<u32>().expect("marker records a child PID"))
+                .collect::<Vec<_>>();
+            if pids.len() == expected {
+                return pids;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("marker reaches the expected execution count")
+}
+
+struct UnrelatedProcess(Child);
+
+impl UnrelatedProcess {
+    fn spawn() -> Self {
+        Self(
+            Command::new("/bin/sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn unrelated process sentinel"),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for UnrelatedProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+async fn send_request_without_reading_response(client: &Client, request: Request) {
+    let stream = UnixStream::connect(client.socket_path())
+        .await
+        .expect("connect response-loss client");
+    let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
+    wire.send(
+        encode_frame(&ClientFrame::Hello {
+            hello: ClientHello {
+                protocol: PROTOCOL_VERSION,
+            },
+        })
+        .expect("encode response-loss hello"),
+    )
+    .await
+    .expect("send response-loss hello");
+    let hello = wire
+        .next()
+        .await
+        .expect("daemon sends hello")
+        .expect("read daemon hello");
+    assert!(matches!(
+        decode_frame::<ServerFrame>(&hello).expect("decode daemon hello"),
+        ServerFrame::Hello {
+            protocol: PROTOCOL_VERSION
+        }
+    ));
+    wire.send(encode_frame(&ClientFrame::Request { request }).expect("encode abandoned request"))
+        .await
+        .expect("send abandoned request completely");
+    drop(wire);
+}
+
+async fn wait_for_run_count(client: &Client, expected: usize) -> Vec<ctxmux_protocol::RunInfo> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let runs = client.list().await.expect("list response-loss Runs");
+            if runs.len() == expected {
+                return runs;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("abandoned request reaches Run publication")
 }
 
 fn fork_inputs() -> Vec<RunInputReference> {
@@ -495,6 +603,88 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_start_and_fork_recover_after_the_response_is_abandoned() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("creation-processes.log");
+    let spec = marker_shell(&marker);
+    let unrelated = UnrelatedProcess::spawn();
+    let start_key = CreateOperationKey::new("public-abandoned-start").unwrap();
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::Start {
+            operation_key: start_key.clone(),
+            spec: spec.clone(),
+        },
+    )
+    .await;
+    let published = wait_for_run_count(&daemon.client, 1).await;
+    let parent = published[0].clone();
+    let parent_pid = parent.pid.expect("abandoned Start has one child PID");
+    assert_eq!(wait_for_marker_pids(&marker, 1).await, vec![parent_pid]);
+    let retried_parent = daemon
+        .client
+        .start_with_operation_key(spec, start_key)
+        .await
+        .expect("Start retry returns the abandoned response Run");
+    assert_eq!(retried_parent.id, parent.id);
+    assert_eq!(retried_parent.pid, parent.pid);
+    assert_eq!(wait_for_marker_pids(&marker, 1).await, vec![parent_pid]);
+    assert!(process_exists(unrelated.pid()));
+
+    let fork_key = CreateOperationKey::new("public-abandoned-fork").unwrap();
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::Fork {
+            operation_key: fork_key.clone(),
+            parent: parent.id,
+            plan: ForkPlan::LevelA,
+        },
+    )
+    .await;
+    let published = wait_for_run_count(&daemon.client, 2).await;
+    let child = published
+        .iter()
+        .find(|run| run.id != parent.id)
+        .expect("abandoned Fork published one child")
+        .clone();
+    let child_pid = child.pid.expect("abandoned Fork has one child PID");
+    assert_eq!(
+        wait_for_marker_pids(&marker, 2)
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([parent_pid, child_pid])
+    );
+    let retried_child = daemon
+        .client
+        .fork_with_operation_key(parent.id, ForkPlan::LevelA, fork_key)
+        .await
+        .expect("Fork retry returns the abandoned response Run");
+    assert_eq!(retried_child.id, child.id);
+    assert_eq!(retried_child.pid, child.pid);
+    let final_runs = wait_for_run_count(&daemon.client, 2).await;
+    assert_eq!(
+        final_runs
+            .into_iter()
+            .map(|run| run.id.to_string())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([parent.id.to_string(), child.id.to_string()])
+    );
+    assert_eq!(
+        wait_for_marker_pids(&marker, 2)
+            .await
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([parent_pid, child_pid])
+    );
+    assert!(process_exists(unrelated.pid()));
+
+    daemon.client.stop(child.id).await.expect("stop child");
+    daemon.client.stop(parent.id).await.expect("stop parent");
+    assert!(process_exists(unrelated.pid()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
     let daemon = TestDaemon::start().await;
     let mut spec = interactive_shell();
@@ -599,21 +789,22 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_2_before_request_dispatch() {
+async fn daemon_rejects_generation_3_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 3,
+        PROTOCOL_VERSION, 4,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_2_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 2 },
+    let generation_3_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 3 },
     })
     .expect("encode generation-2 hello");
     let start = encode_frame(&ClientFrame::Request {
         request: ctxmux_protocol::Request::Start {
+            operation_key: CreateOperationKey::new("old-generation-must-not-run").unwrap(),
             spec: RunSpec {
                 program: "/bin/sh".to_owned(),
                 args: vec!["-c".to_owned(), "printf must-not-run".to_owned()],
@@ -626,7 +817,7 @@ async fn daemon_rejects_generation_2_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_2_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_3_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));

@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 3.                                                                                                                                                                                                                                    | Other SDKs appear only for a real client requirement.                                        |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 4.                                                                                                                                                                                                                                    | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
@@ -37,10 +37,10 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v3)
+                    Unix domain socket (v4)
                               |
                     long-lived ctxmux daemon
-                    - RunManager / Run identity
+                    - RunManager / RunRegistry / Run identity
                     - PTY / child / input writer
                     - lifecycle / output / replay
                     - attachment event delivery
@@ -110,14 +110,31 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 
 ### Start a native Run
 
-1. The CLI or SDK constructs a `RunSpec` and opens a Unix-socket connection.
+1. The CLI or SDK constructs a `RunSpec`, retains or generates one bounded
+   creation operation key, and opens a Unix-socket connection.
 2. The connection exchanges an exact protocol-generation handshake.
-3. `Request::Start` reaches `RunManager::start` and `Run::spawn`.
-4. The daemon validates the spec, opens a PTY, spawns the child, retains the master and writer, and transfers the owned child handle to the waiter thread behind one narrow stop-command channel; it also starts the blocking output reader.
-5. In persistent mode the single store actor commits the complete running row;
-   a failed commit terminates the unpublished child. The manager then stores
-   `Arc<Run>` before returning metadata. Closing the request connection cannot
-   drop the Run.
+3. `Request::Start` reaches the daemon-private creation owner. A fixed,
+   asynchronously acquired key stripe serializes only possible key collisions;
+   a retained matching mapping returns the original Run before launch.
+4. Only an unbound leader waits on a Tokio semaphore admitting at most eight
+   simultaneous physical launches. The 64 key stripes bound collision state;
+   they are not a 64-thread launch limit. Cancellation while awaiting admission
+   releases the key stripe and creates no flight or thread.
+5. An admitted leader claims a creation flight and starts one named, short-lived
+   OS thread that owns the semaphore permit, key stripe, request, manager, and
+   flight guard through launch and publication. The result returns over a Tokio
+   one-shot channel; cancellation after dispatch drops only the receiver, so it
+   cannot release the key or abandon a physical launch. No persistent
+   blocking-worker pool or custom execution queue is retained for this path.
+6. The daemon validates the spec, opens a PTY, spawns the child, retains the master and writer, and transfers the owned child handle to the waiter thread behind one narrow stop-command channel; it also starts the blocking output reader.
+7. In persistent mode the single store actor commits the complete running row
+   and byte-exact operation key in one transaction. Failure before `COMMIT`
+   terminates the unpublished child. Successful `COMMIT` is the point of no
+   return: even if vacuum or physical-file postchecks then latch persistence,
+   the manager binds persistence and stores `Arc<Run>` plus the key mapping
+   under one `RunRegistry` write before returning that error. A retry therefore
+   resolves the committed Run instead of spawning again. Closing the request
+   connection cannot drop the Run or roll back a published mapping.
 
 ### Import a tmux-owned pane
 
@@ -171,7 +188,7 @@ daemon-loss, and unwind restoration paths remain broader qualification work.
 
 ### Cross-language client parity
 
-The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-3 server variant before exposing it. The cross-client test creates a Run with one client, disconnects, reconnects with the other, verifies the same PID, and controls the shared Run.
+The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-4 server variant before exposing it. Cross-client tests create and retry Runs with retained keys, reconnect through another client, verify the same identity and PID, and control the shared Run.
 
 Generated TypeScript types prevent a second handwritten wire schema. Current `u64` fields are still emitted as JavaScript `number`, so the SDK rejects values outside the safe-integer range rather than exposing a rounded cursor. A future exact large-integer representation remains a protocol decision.
 
@@ -185,7 +202,34 @@ The important guarantees are behavioral, not implied by lock types.
 - `RunInfo` reads output and lifecycle under separate locks, so it is useful metadata rather than a transactional snapshot of every field.
 - In persistent mode `durable_head_seq` advances only after the store actor
   commits a contiguous replay batch. Live `head_seq` may be ahead.
+- Persistence-capable activation, output recording, and native terminal
+  publication serialize through one daemon-private per-Run transition gate,
+  then acquire output, state, and persistence in that order for short snapshots.
+  Memory-only output takes only its output-log lock before broadcast. Durable
+  append/finalize waits hold the transition gate but no public read-path lock.
+  The initial append is queued before the binding becomes observable; during a
+  durable finalize, status/list/attach continue to see `Running` until the
+  receipt returns. Whether a fast child exits before or after activation,
+  exactly one owner finalizes the committed running row as terminal. Output
+  observed after terminal publication may enter incarnation-local replay and
+  the internal broadcast channel, but it is not durable and is not guaranteed
+  to an attachment after that attachment receives its terminal event.
 - Input, resize, and stop from multiple clients are accepted concurrently and serialize only at their owned resources. A product-level multi-writer or resize arbitration policy is not defined.
+- Start and Fork keys use fixed random-hashed async stripes. A leader resolves
+  an existing match or conflict before dispatch, so duplicates occupy neither
+  Tokio workers nor creation threads while the unique unbound request launches.
+  Unbound leaders then wait asynchronously for one of eight physical-launch
+  permits; these Tokio semaphore waiters are not a product-level actor or custom
+  queue. The retained Run and successful key mapping share one registry lock;
+  failed unpublished launches retain neither. A matching Fork retry is resolved
+  before current parent capability or lifecycle checks.
+- Daemon shutdown first fences new unbound creation flights, then cleans up tmux
+  control owners and drains already-started creation threads within one shared
+  deadline. Fencing closes launch admission and wakes queued unbound waiters;
+  matching retained-key lookups remain resolvable. A creation thread has no
+  hard-cancellation mechanism: if it exceeds the shutdown deadline, shutdown
+  reports failure but cannot reap that detached thread independently. This does
+  not turn shutdown into a general native process-tree policy.
 - Malformed or oversized transport frames can close the connection before a structured protocol error is sent. Explicit error categories cover validly decoded requests and lifecycle failures.
 - Native stop owns only the direct child handle; process-group, descendant, and orphan policy is not declared. Daemon `Ctrl-C` stops the listener and drops in-memory ownership.
 
@@ -260,7 +304,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 3                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 4                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |

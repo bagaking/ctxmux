@@ -20,8 +20,9 @@ a whole retained replay on every PTY read.
 
 The accepted recovery class is historical Run recovery:
 
-- Durable metadata includes `RunId`, immutable `RunSpec`, lineage, lifecycle
-  state, source daemon epoch, output cursors, and persistence timestamps.
+- Durable metadata includes `RunId`, its byte-exact creation operation key,
+  immutable `RunSpec`, lineage, lifecycle state, source daemon epoch, output
+  cursors, and persistence timestamps.
 - Durable replay is the newest bounded, contiguous window committed by the
   persistence actor. `RunInfo.durable_head_seq` is `None` in memory-only mode
   and the highest committed sequence in persistent mode; durable oldest/head
@@ -42,20 +43,23 @@ Before opening SQLite or publishing its socket, a persistent daemon validates
 that the state directory is not a symlink, is owned by the effective user, and
 has mode `0700`; a newly created directory receives that mode before any secret
 write. It opens an owner-only companion lock file and holds a non-blocking
-exclusive standard-library file lock for the daemon lifetime. A second opener
-fails with typed `state_in_use`; it cannot allocate an epoch or reconcile Runs
-still owned by the first daemon.
+exclusive standard-library file lock for the daemon lifetime. Shutdown
+explicitly unlocks it after closing SQLite, so a Run child caught between
+`fork` and `exec` cannot extend state ownership through its inherited file
+description. A second opener fails with typed `state_in_use`; it cannot allocate
+an epoch or reconcile Runs still owned by the first daemon.
 
 While that lock is held, each daemon allocates a fresh UUID epoch. Startup lets
 SQLite perform its documented journal recovery, then validates exact schema
-version, `PRAGMA quick_check`, and application invariants: typed IDs and JSON,
-a required native `RunSpec` accepted by the same semantic validator as live
+version, `PRAGMA quick_check`, and application invariants: typed IDs, bounded
+creation keys, an exact BINARY unique-key index, and typed JSON, a required
+native `RunSpec` accepted by the same semantic validator as live
 start and fork, allowed lifecycle values, non-self lineage, byte totals,
 strictly contiguous retained chunk sequences, matching durable oldest/head
 cursors, and quota accounting. Epoch creation and all prior-epoch
 running-to-interrupted changes commit in one transaction before socket
-publication. Protocol generation 3 is
-pre-stable, so the first schema has no migration, downgrade, reset, salvage, or
+publication. Protocol generation 4 and persistence schema 2 are pre-stable, so
+the current schema has no migration, downgrade, reset, salvage, or
 compatibility fallback. An unknown version, failed integrity check, or invalid
 application invariant is a typed startup failure. Ctxmux performs no repair,
 reset, migration, or partial exposure; SQLite recovery writes allowed by its
@@ -66,7 +70,9 @@ Its bounded 1,024-command queue applies backpressure to the PTY reader instead
 of allowing durable-output backlog memory to grow without limit. SQLite WAL
 mode and transactions define four indivisible application units:
 
-- start inserts the complete Run row before child publication;
+- start or fork inserts the complete creation-time `Running` row and creation
+  key before registry publication; successful `COMMIT` is its point of no
+  return even when a later file postcheck fails;
 - one output batch inserts its chunks, prunes replay, and advances durable
   oldest/head cursors and byte accounting together;
 - a terminal transition commits the final replay batch and exited state in the
@@ -82,9 +88,12 @@ unpublished Run; because no row was written, the actor continues serving
 existing Runs and later admissible starts. Every append or finalize error, and
 every serialization, database, I/O, commit, integrity, or owner-invariant
 failure still latches the actor, freezes the durable cursor, and rejects later
-mutations with a typed persistence error. Already-owned live Runs may still be
-explicitly controlled so storage failure does not strand a child behind a false
-success.
+mutations with a typed persistence error. A post-commit start check also
+latches the actor, but its reply carries the committed outcome so the daemon
+must publish that Run and key before returning the error; treating it as an
+uncommitted rollback would permit a second physical child. Already-owned live
+Runs may still be explicitly controlled so storage failure does not strand a
+child behind a false success.
 
 Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
 replay tail remains. Persistent replay has a 256 MiB global logical byte budget;
@@ -92,8 +101,10 @@ serialized metadata has a separate 64 MiB logical byte budget; and at most 4,096
 Run records are retained. The oldest chunks are pruned across Runs while keeping
 each retained replay window contiguous and its truncation cursors exact. The
 oldest terminal or interrupted records are removed when either metadata limit is
-reached. Running records are not deleted; a start that cannot reserve its full
-metadata fails before child publication.
+reached. Because the creation key is a required column of that same row,
+retention removes the durable mapping in the same transaction. Running records
+are not deleted; a start that cannot reserve its full metadata fails before
+child publication.
 
 The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main
 database). One transaction may append at most 8 MiB of WAL frames; output is
@@ -104,8 +115,12 @@ reader and rechecks a zero-length WAL. It therefore admits a write only when
 `current WAL + worst-case transaction <= 16 MiB`, rather than detecting excess
 afterward. The shared-memory file has a 4 MiB ceiling. The complete state
 directory has a 404 MiB hard file budget plus the small lock file. Incremental
-vacuum is part of retention after eviction; inability to return below a logical
-or physical limit fails admission rather than widening the budget.
+vacuum is part of retention after eviction. A failure discovered before the
+transaction commits rejects admission without publishing a Run. Once eviction
+and the new Run/key row commit, a vacuum or physical-file postcheck failure is
+instead a committed error: it latches the actor, the daemon still publishes the
+committed Run/key mapping for retry convergence, and later mutations fail
+closed rather than widening the budget.
 
 Before SQLite open, existing database, WAL, SHM, and lock paths must be regular
 owner-matching files, never symlinks, with no group/other permissions. Newly
@@ -119,6 +134,18 @@ and output may contain secrets.
 - Corrupt or stale state fails closed and never attaches to the wrong process.
 - Process identity cannot rely on PID alone.
 - Cleanup, retention, and recovery use one ownership model.
+- A recovered Run and its creation key are one atomic retention unit; no
+  pending reservation or immortal idempotency tombstone exists.
+- Persistence-capable native Run activation, output recording, and terminal
+  publication use one per-Run transition gate before the
+  output-to-state-to-persistence lock order. Creation persists a `Running`
+  snapshot even when the child
+  already exited, and whichever side observes the other second owns the single
+  terminal finalize. Store waits never retain the public read-path locks;
+  durable state remains `Running` until finalize returns. A byte observed only
+  after terminal publication may enter the current incarnation's memory replay
+  and internal broadcast channel, but it is not durable and is not guaranteed
+  to an attachment after that attachment receives its terminal event.
 - A new persistence layer must not move live Run ownership into a client.
 - A returned durable cursor names committed replay, not merely queued storage
   work.

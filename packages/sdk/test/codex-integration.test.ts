@@ -324,14 +324,16 @@ test("Codex Level B rejects unrelated and unverifiable provenance before raw for
   const config = { session, prompt: "continue", cwd: "/workspace" };
 
   await assert.rejects(
-    registered.forkLevelB(unrelated, config, { executable: executablePath }),
+    registered.forkLevelB(unrelated, config, {
+      detection: { executable: executablePath },
+    }),
     (error: unknown) => error instanceof IntegrationProvenanceError,
   );
   await assert.rejects(
     registered.forkLevelB(
       parent,
       { ...config, session: { ...session } },
-      { executable: executablePath },
+      { detection: { executable: executablePath } },
     ),
     (error: unknown) => error instanceof IntegrationProvenanceError,
   );
@@ -350,13 +352,13 @@ test("Codex Level B rejects unrelated and unverifiable provenance before raw for
     registered.forkLevelB(
       parent,
       { ...config, session: unboundSession as CodexSessionProvenance },
-      { executable: executablePath },
+      { detection: { executable: executablePath } },
     ),
     (error: unknown) => error instanceof IntegrationProvenanceError,
   );
   await assert.rejects(
     registerIntegration(client, codexIntegration).forkLevelB(parent, config, {
-      executable: executablePath,
+      detection: { executable: executablePath },
     }),
     (error: unknown) => error instanceof IntegrationProvenanceError,
   );

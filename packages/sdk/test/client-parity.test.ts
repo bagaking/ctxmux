@@ -15,6 +15,7 @@ import {
   CtxmuxClient,
   CtxmuxProtocolError,
   IntegrationProvenanceError,
+  createOperationKey,
   defineRun,
   registerIntegration,
   type IntegrationObserver,
@@ -133,9 +134,35 @@ test(
         error.code === "invalid_run_state",
     );
 
-    const sdkRun = await reconnectedClient.start(
-      defineRun("/bin/sh", { args: ["-c", "sleep 30"] }),
+    const sdkSpec = defineRun("/bin/sh", { args: ["-c", "sleep 30"] });
+    const sdkStartKey = createOperationKey("sdk-retry-safe-start");
+    const sdkRun = await reconnectedClient.start(sdkSpec, sdkStartKey);
+    const retriedSdkRun = await reconnectedClient.start(sdkSpec, sdkStartKey);
+    assert.equal(retriedSdkRun.id, sdkRun.id);
+    assert.equal(retriedSdkRun.pid, sdkRun.pid);
+    await assert.rejects(
+      reconnectedClient.start(
+        defineRun("/bin/sh", { args: ["-c", "exit 9"] }),
+        sdkStartKey,
+      ),
+      (error: unknown) =>
+        error instanceof CtxmuxProtocolError &&
+        error.code === "creation_conflict",
     );
+
+    const sdkForkKey = createOperationKey("sdk-retry-safe-fork");
+    const sdkChild = await reconnectedClient.fork(
+      sdkRun.id,
+      { type: "level_a" },
+      sdkForkKey,
+    );
+    const retriedSdkChild = await reconnectedClient.fork(
+      sdkRun.id,
+      { type: "level_a" },
+      sdkForkKey,
+    );
+    assert.equal(retriedSdkChild.id, sdkChild.id);
+    assert.equal(retriedSdkChild.pid, sdkChild.pid);
     const sdkAttachment = await reconnectedClient.attach(sdkRun.id);
     await sdkAttachment.detach();
     await waitForNoAttachments(reconnectedClient, sdkRun.id);
@@ -149,6 +176,7 @@ test(
       cliStatus.stdout,
       new RegExp(`^${sdkRun.id}\\trunning\\tpid=`),
     );
+    await step("stop SDK-forked Run", reconnectedClient.stop(sdkChild.id));
     await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id));
   },
 );
@@ -184,10 +212,22 @@ if (args[0] === "--version") {
     const prompt = "review 'quoted'; $(touch never)\nthen explain";
 
     const registered = registerIntegration(client, codexIntegration);
+    const integrationStartKey = createOperationKey("codex-integration-start");
     const run = await registered.start(
       { prompt, cwd: directory },
-      { executable },
+      {
+        detection: { executable },
+        operationKey: integrationStartKey,
+      },
     );
+    const retriedRun = await registered.start(
+      { prompt, cwd: directory },
+      {
+        detection: { executable },
+        operationKey: integrationStartKey,
+      },
+    );
+    assert.equal(retriedRun.id, run.id);
     assert.ok(run.spec);
     assert.deepEqual(run.spec.args, ["exec", "--json", "--", prompt]);
     assert.deepEqual(run.spec.declared_inputs, [
@@ -244,14 +284,16 @@ if (args[0] === "--version") {
       cwd: directory,
     };
     await assert.rejects(
-      registered.forkLevelB(unrelated, rejectedConfig, { executable }),
+      registered.forkLevelB(unrelated, rejectedConfig, {
+        detection: { executable },
+      }),
       (error: unknown) => error instanceof IntegrationProvenanceError,
     );
     await assert.rejects(
       registered.forkLevelB(
         run,
         { ...rejectedConfig, session: { ...session } },
-        { executable },
+        { detection: { executable } },
       ),
       (error: unknown) => error instanceof IntegrationProvenanceError,
     );
@@ -269,6 +311,7 @@ if (args[0] === "--version") {
     assert.equal(rawStatus.state.type, "running");
     const continuation = "compare the two candidates";
     const artifactReference = "artifact://review-plan.json";
+    const levelBKey = createOperationKey("codex-integration-level-b-fork");
     const child = await registered.forkLevelB(
       run,
       {
@@ -277,8 +320,25 @@ if (args[0] === "--version") {
         cwd: directory,
         artifactReferences: [artifactReference],
       },
-      { executable },
+      {
+        detection: { executable },
+        operationKey: levelBKey,
+      },
     );
+    const retriedChild = await registered.forkLevelB(
+      run,
+      {
+        session,
+        prompt: continuation,
+        cwd: directory,
+        artifactReferences: [artifactReference],
+      },
+      {
+        detection: { executable },
+        operationKey: levelBKey,
+      },
+    );
+    assert.equal(retriedChild.id, child.id);
     assert.notEqual(child.id, run.id);
     assert.notEqual(child.pid, pid);
     assert.deepEqual(child.lineage, {
