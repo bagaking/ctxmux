@@ -326,12 +326,11 @@ arithmetic and this pre-observation table:
 | Cleanup thread delta                  |          1 |        1 |       1 |       1 |
 | Cleanup live children and attachments |          1 |        0 |       0 |       1 |
 
-The checked-in generation-1 receipts remain a temporary Gate-preserving
-transition while T-021 is in progress; they do not satisfy its source-bound
-acceptance. An all-generation-1 set may pass the legacy policy, but a mixed
-generation set fails. Consequently the first checked-in generation-2 fixture
-requires all three source-bound rounds, ten-field maxima, and exact derived
-ceilings to land together.
+The generation-1 transition ended when the first complete source-bound baseline
+was frozen. Current policy accepts only generation 2; an all-generation-1 set,
+mixed generations, or an unknown generation fails closed. All three
+generation-2 fixtures, ten-field maxima, and exact derived ceilings must remain
+valid together.
 
 The PR profile runs the full named matrix with the one-Run resource cells and
 no time soak. Nightly uses the complete resource matrix plus a real 30-minute

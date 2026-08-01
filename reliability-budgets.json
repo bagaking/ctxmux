@@ -1,74 +1,119 @@
 {
   "schema": "ctxmux.reliability-budgets.v1",
   "frozen_before_optimization": true,
-  "frozen_at": "2026-08-10T04:02:00.000Z",
+  "frozen_at": "2026-08-10T19:34:40.000Z",
   "observation_baseline": {
     "profile": "observe",
     "rounds": 3,
     "environment": {
       "os": "darwin",
+      "os_release": "25.3.0",
       "architecture": "arm64",
-      "logical_cpus": 14
+      "logical_cpus": 14,
+      "cpu_model": "Apple M4 Pro"
     },
+    "evidence_scope": "This local baseline binds clean source commit 24e32a53605d22739b98cfe86c5ad0b214006bd4 and tree 62aee545d8f5af7781b9d77c8ad3fa46a595a89b; each receipt carries the exact harness, launcher, daemon binary, lockfiles, build, toolchain, workload, and measurement identities. Remote nightly, release, and other-platform qualification remain pending until their own artifacts exist.",
     "resource_start_concurrency": 8,
     "peak_rss_sample_interval_ms": 25,
+    "policy_contracts": [
+      {
+        "path": "scripts/reliability-budget-contract.mjs",
+        "sha256": "27b6daba1103f7a49e138d437969f8860ec3eb488e23c1f97aa677877071d6b5"
+      }
+    ],
     "raw_receipts": [
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r1.json",
-        "sha256": "875e7aa7b021098287e0b229d5f41b12d17c028d68fa9da57a2a7cca336162db"
+        "sha256": "5307aca98b2ed5889f363d6b99cc22b64e3ca562ddcf5f9a02d3275b8c6f5ad4"
       },
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r2.json",
-        "sha256": "59a39f382f359e9a7825b49d258c76fc39740b27d517bf23832d261950dcd841"
+        "sha256": "55d030503b69bba00460a1aff8a06e2400905fe1530d243ab20fec9e14e903c0"
       },
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r3.json",
-        "sha256": "c0ec6a5d88719ece0a9ba10db9db0d611e60639583d598cf025740b6b7bab697"
+        "sha256": "ebb64d7c55a2c1b9aae963d58ce3e1b0a2a6cf59448037b90f5a0bb0bdaf7997"
       }
     ],
     "observed_maxima": {
       "idle": {
         "1": {
-          "cpu_core_percent": 1.153,
-          "peak_rss_kib": 4416,
-          "steady_rss_kib": 4400,
-          "rss_kib_per_run": 800
+          "cpu_core_percent": 0,
+          "peak_rss_kib": 5248,
+          "steady_rss_kib": 5168,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 992,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         },
         "32": {
-          "cpu_core_percent": 1.158,
-          "peak_rss_kib": 10000,
-          "steady_rss_kib": 9840,
-          "rss_kib_per_run": 194.5
+          "cpu_core_percent": 1.162,
+          "peak_rss_kib": 9008,
+          "steady_rss_kib": 8800,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 145,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         },
         "128": {
-          "cpu_core_percent": 10.275,
-          "peak_rss_kib": 22240,
-          "steady_rss_kib": 22160,
-          "rss_kib_per_run": 145
+          "cpu_core_percent": 6.946,
+          "peak_rss_kib": 15776,
+          "steady_rss_kib": 15376,
+          "retained_output_bytes_per_run": 0,
+          "rss_kib_per_run": 87.875,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         }
       },
       "active": {
         "1": {
           "cpu_core_percent": 0,
-          "peak_rss_kib": 4832,
-          "steady_rss_kib": 4816,
-          "rss_kib_per_run": 1232
+          "peak_rss_kib": 5696,
+          "steady_rss_kib": 5616,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 1456,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         },
         "32": {
-          "cpu_core_percent": 84.28,
-          "peak_rss_kib": 12736,
-          "steady_rss_kib": 12608,
-          "rss_kib_per_run": 282
+          "cpu_core_percent": 90.382,
+          "peak_rss_kib": 12176,
+          "steady_rss_kib": 12000,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 245,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         },
         "128": {
-          "cpu_core_percent": 272.692,
-          "peak_rss_kib": 26640,
-          "steady_rss_kib": 26480,
-          "rss_kib_per_run": 179
+          "cpu_core_percent": 265.673,
+          "peak_rss_kib": 19648,
+          "steady_rss_kib": 19392,
+          "retained_output_bytes_per_run": 8197,
+          "rss_kib_per_run": 119,
+          "threads_per_run": 2,
+          "fds_per_run": 3,
+          "cleanup_threads_delta": 0,
+          "cleanup_live_children": 0,
+          "cleanup_attachments": 0
         }
       }
     },
-    "margin_policy": "RSS ceilings preserve roughly 1.5-2x the observed maxima; slope ceilings preserve smaller owner-local margins. CPU ceilings cover sample quantization and supported-platform variance without weakening the fixed workload. CI failures revise workload or budgets only through a new clean observation receipt, never from optimized candidate results."
+    "margin_policy": "Every ceiling is machine-derived exactly by the committed scripts/reliability-budget-contract.mjs rational rule from the three raw-round maxima. Manual margins and post-observation edits are forbidden; changing the contract or inputs requires a new clean observation baseline."
   },
   "measurement_contract": {
     "cpu": "Daemon CPU time divided by wall time and reported as percent of one logical core; 100 means one fully occupied core.",
@@ -95,7 +140,7 @@
         "max_peak_rss_kib": 16384,
         "max_steady_rss_kib": 16384,
         "max_retained_output_bytes_per_run": 0,
-        "max_rss_kib_per_run": 384,
+        "max_rss_kib_per_run": 256,
         "max_threads_per_run": 2.25,
         "max_fds_per_run": 3.25,
         "max_cleanup_threads_delta": 1,
@@ -103,11 +148,11 @@
         "max_cleanup_attachments": 0
       },
       "128": {
-        "max_cpu_core_percent": 20,
-        "max_peak_rss_kib": 32768,
-        "max_steady_rss_kib": 32768,
+        "max_cpu_core_percent": 15,
+        "max_peak_rss_kib": 24576,
+        "max_steady_rss_kib": 24576,
         "max_retained_output_bytes_per_run": 0,
-        "max_rss_kib_per_run": 512,
+        "max_rss_kib_per_run": 256,
         "max_threads_per_run": 2.25,
         "max_fds_per_run": 3.25,
         "max_cleanup_threads_delta": 1,
@@ -117,11 +162,11 @@
     },
     "active": {
       "1": {
-        "max_cpu_core_percent": 10,
-        "max_peak_rss_kib": 8192,
-        "max_steady_rss_kib": 8192,
+        "max_cpu_core_percent": 5,
+        "max_peak_rss_kib": 12288,
+        "max_steady_rss_kib": 12288,
         "max_retained_output_bytes_per_run": 12288,
-        "max_rss_kib_per_run": 2048,
+        "max_rss_kib_per_run": 2304,
         "max_threads_per_run": 2.25,
         "max_fds_per_run": 3.25,
         "max_cleanup_threads_delta": 1,
@@ -129,9 +174,9 @@
         "max_cleanup_attachments": 0
       },
       "32": {
-        "max_cpu_core_percent": 125,
-        "max_peak_rss_kib": 24576,
-        "max_steady_rss_kib": 24576,
+        "max_cpu_core_percent": 140,
+        "max_peak_rss_kib": 20480,
+        "max_steady_rss_kib": 20480,
         "max_retained_output_bytes_per_run": 12288,
         "max_rss_kib_per_run": 512,
         "max_threads_per_run": 2.25,
@@ -142,10 +187,10 @@
       },
       "128": {
         "max_cpu_core_percent": 400,
-        "max_peak_rss_kib": 49152,
-        "max_steady_rss_kib": 49152,
+        "max_peak_rss_kib": 32768,
+        "max_steady_rss_kib": 32768,
         "max_retained_output_bytes_per_run": 12288,
-        "max_rss_kib_per_run": 512,
+        "max_rss_kib_per_run": 256,
         "max_threads_per_run": 2.25,
         "max_fds_per_run": 3.25,
         "max_cleanup_threads_delta": 1,

@@ -61,9 +61,7 @@ export function validateReliabilityPolicy({
   if (receipts.length === 3) {
     const schemas = new Set(receipts.map(({ value }) => value?.schema));
     if (schemas.size !== 1) {
-      errors.push("observation baseline must not mix v1 and v2 receipts");
-    } else if (schemas.has("ctxmux.reliability-qualification.v1")) {
-      validateLegacyBaseline(budgets, receipts, errors);
+      errors.push("observation baseline must not mix receipt generations");
     } else if (schemas.has("ctxmux.reliability-qualification.v2")) {
       validateSourceBoundBaseline({
         budgets,
@@ -73,7 +71,9 @@ export function validateReliabilityPolicy({
         errors,
       });
     } else {
-      errors.push(`unsupported observation receipt schema ${[...schemas][0]}`);
+      errors.push(
+        `unsupported observation receipt schema ${[...schemas][0]}; the frozen baseline requires source-bound v2 receipts`,
+      );
     }
   }
   validateReachability({ workflow, checkScript, harnessSource }, errors);
@@ -219,61 +219,6 @@ function resolveReceipts(references, receipts, errors) {
     errors.push("loaded raw observation receipts must match the declared refs");
   }
   return ordered;
-}
-
-// Temporary transition only: an all-v1 baseline keeps the existing Gate
-// operational, but never satisfies T-021 and cannot mix with v2.
-function validateLegacyBaseline(budgets, receipts, errors) {
-  const rounds = [];
-  for (const receipt of receipts) {
-    if (
-      receipt.value?.status !== "pass" ||
-      receipt.value?.profile !== "observe"
-    ) {
-      errors.push(`legacy observation receipt did not pass: ${receipt.path}`);
-    }
-    const resources = receipt.value?.stages?.find(
-      (stage) => stage.id === "resource-census" && stage.status === "pass",
-    )?.result;
-    if (!Array.isArray(resources) || resources.length !== 6) {
-      errors.push(
-        `legacy observation receipt lacks six cells: ${receipt.path}`,
-      );
-    } else {
-      rounds.push(resources);
-    }
-  }
-  if (rounds.length !== 3) return;
-  for (const mode of MODES) {
-    for (const count of COUNTS) {
-      const cells = rounds.map((measurements) =>
-        measurements.find(
-          (cell) => cell.mode === mode && String(cell.runs) === count,
-        ),
-      );
-      if (cells.some((cell) => cell === undefined)) {
-        errors.push(`legacy observation receipts are missing ${mode}/${count}`);
-        continue;
-      }
-      const recorded =
-        budgets.observation_baseline?.observed_maxima?.[mode]?.[count];
-      const maxima = {
-        cpu_core_percent: Math.max(
-          ...cells.map((cell) => cell.cpu_core_percent),
-        ),
-        peak_rss_kib: Math.max(...cells.map((cell) => cell.peak_rss_kib)),
-        steady_rss_kib: Math.max(...cells.map((cell) => cell.steady?.rss_kib)),
-        rss_kib_per_run: Math.max(...cells.map((cell) => cell.rss_kib_per_run)),
-      };
-      for (const [field, maximum] of Object.entries(maxima)) {
-        if (recorded?.[field] !== maximum) {
-          errors.push(
-            `recorded ${mode}/${count} ${field} does not match raw maximum`,
-          );
-        }
-      }
-    }
-  }
 }
 
 function validateReachability(
@@ -476,14 +421,6 @@ function main() {
   if (errors.length > 0) {
     for (const error of errors) console.error(`Reliability policy: ${error}`);
     process.exitCode = 1;
-  } else if (
-    baselineReceipts.every(
-      ({ value }) => value.schema === "ctxmux.reliability-qualification.v1",
-    )
-  ) {
-    console.log(
-      "Reliability policy: legacy v1 baseline accepted for transition; only a complete source-bound v2 baseline satisfies T-021",
-    );
   } else {
     console.log(
       "Reliability policy: source-bound v2 observations and deterministic ceilings are valid",

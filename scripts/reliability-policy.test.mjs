@@ -51,6 +51,15 @@ function actualInputs() {
     budgets,
     baselineReceipts,
     sourceSnapshots: loadSourceSnapshots(root, baselineReceipts),
+    currentPolicyHashes: Object.fromEntries(
+      POLICY_SOURCE_PATHS.map((filePath) => [
+        filePath,
+        crypto
+          .createHash("sha256")
+          .update(fs.readFileSync(path.join(root, filePath)))
+          .digest("hex"),
+      ]),
+    ),
     workflow: fs.readFileSync(
       path.join(root, ".github", "workflows", "reliability.yml"),
       "utf8",
@@ -387,8 +396,16 @@ const errorsFor = (mutate) => {
   return validateReliabilityPolicy(inputs);
 };
 
-test("accepts the frozen legacy baseline only as a transition", () => {
-  assert.deepEqual(validateReliabilityPolicy(actualInputs()), []);
+test("accepts the checked-in source-bound v2 baseline", () => {
+  const inputs = actualInputs();
+  assert.deepEqual(validateReliabilityPolicy(inputs), []);
+  assert.ok(
+    inputs.baselineReceipts.every(
+      ({ value }) => value.schema === "ctxmux.reliability-qualification.v2",
+    ),
+  );
+  assert.equal(inputs.sourceSnapshots.length, 3);
+  assert.ok(inputs.sourceSnapshots.every(({ error }) => error === undefined));
 });
 
 test("accepts a complete synthetic source-bound v2 baseline", () => {
@@ -459,7 +476,7 @@ test("rejects a present but malformed budget cell", () => {
   assert.ok(errors.some((error) => error.includes("budget must be an object")));
 });
 
-test("rejects changed or misreported legacy observation evidence", () => {
+test("rejects changed or misreported source-bound v2 evidence", () => {
   const inputs = actualInputs();
   inputs.baselineReceipts[0].sha256 = "0".repeat(64);
   inputs.budgets.observation_baseline.observed_maxima.active[
@@ -493,9 +510,27 @@ test("rejects unreachable smoke, nightly, release, and duration policy", () => {
 test("rejects mixed v1/v2 baseline receipts", () => {
   const inputs = actualInputs();
   inputs.baselineReceipts[0].value.schema =
-    "ctxmux.reliability-qualification.v2";
+    "ctxmux.reliability-qualification.v1";
   const errors = validateReliabilityPolicy(inputs);
   assert.ok(errors.some((error) => error.includes("must not mix")));
+});
+
+test("rejects an all-v1 observation baseline", () => {
+  const inputs = actualInputs();
+  for (const receipt of inputs.baselineReceipts) {
+    receipt.value.schema = "ctxmux.reliability-qualification.v1";
+  }
+  const errors = validateReliabilityPolicy(inputs);
+  assert.ok(errors.some((error) => error.includes("requires source-bound v2")));
+});
+
+test("rejects an unknown observation receipt generation", () => {
+  const inputs = actualInputs();
+  for (const receipt of inputs.baselineReceipts) {
+    receipt.value.schema = "ctxmux.reliability-qualification.v3";
+  }
+  const errors = validateReliabilityPolicy(inputs);
+  assert.ok(errors.some((error) => error.includes("requires source-bound v2")));
 });
 
 test("rejects missing, dirty, unreachable, and hash-drifted v2 provenance", async (t) => {
