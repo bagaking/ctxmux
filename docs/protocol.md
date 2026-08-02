@@ -123,16 +123,21 @@ response. Reusing the key for another Start or Fork returns
 capability validation, so retrying an already-created Fork still converges
 after its parent becomes historical or is no longer retained.
 
-A spawn failure before a child exists does not consume its key. If persistence
-rejects after physical launch but before durable `COMMIT`, the child-handle
-waiter owns rollback and only `try_wait(Some(_))` proves terminal-and-reaped.
-The key is reusable after that proof. Until then the first request reports
-`persistence` with an explicit rollback-pending detail, and a bounded
-daemon-private cleanup owner retains the unpublished Run plus an exact-key
-fence. A matching retry reports `backend_unavailable`; different canonical
-reuse reports `creation_conflict`. The fence publishes no Run, retains neither
-the random key stripe nor a launch permit, and is reported by bounded shutdown.
-It is not a durable tombstone and cannot survive daemon crash.
+A spawn failure before a child exists does not consume its key. The daemon
+prepares every fallible PTY reader and writer view before physical launch.
+Immediately after launch it constructs native control and arms one private
+publication owner before waiter or output-reader worker setup can fail or
+unwind. Persistence rejection before durable `COMMIT` asks the child-handle
+waiter to clean up; only `try_wait(Some(_))` proves child reap, and the key
+becomes reusable only after the reader, waiter, control, input, and Run owners
+are also quiescent. Until then the first request reports `persistence` with an
+explicit rollback-pending detail, while setup failure or creation-owner unwind
+reports its original error, and one bounded daemon-private cleanup owner
+retains the unpublished Run plus an exact-key fence. A matching retry reports
+`backend_unavailable`; different canonical reuse reports `creation_conflict`.
+The fence publishes no Run, retains neither the random key stripe nor a launch
+permit, and is reported by bounded shutdown. It is not a durable tombstone and
+cannot survive daemon crash.
 
 Durable `COMMIT` is the point of no return. If a post-commit vacuum or
 physical-file check fails, persistence is latched and the first request reports

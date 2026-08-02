@@ -495,6 +495,36 @@ impl NativeControlOwner {
             }
         }
     }
+
+    /// Prove that unpublished cleanup owns no child, control, or input worker.
+    ///
+    /// Reap alone is insufficient: the waiter may still be closing control and
+    /// an input drain owns `NativeControlInner` independently of the Run.
+    pub(crate) fn unpublished_cleanup_result(&self) -> Result<(), String> {
+        self.reap_result()?;
+        let state = mutex_lock(&self.inner.state);
+        if state.phase != ControlPhase::Closed
+            || state.child_sender.is_some()
+            || state.input_scheduled
+            || state.input_commands != 0
+            || state.input_bytes != 0
+            || !state.input_queue.is_empty()
+        {
+            return Err(format!(
+                "Run {} native control cleanup is not quiescent",
+                self.inner.run_id
+            ));
+        }
+        drop(state);
+        let owners = Arc::strong_count(&self.inner);
+        if owners != 1 {
+            return Err(format!(
+                "Run {} native control cleanup retains {owners} owners",
+                self.inner.run_id
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl PendingInput {

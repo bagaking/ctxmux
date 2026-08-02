@@ -705,6 +705,7 @@ fn creation_hook(
         reached: reached_tx,
         released: Mutex::new(false),
         release: std::sync::Condvar::new(),
+        captured_run: Mutex::new(None),
     });
     (hook, reached_rx)
 }
@@ -920,6 +921,93 @@ async fn failed_unpublished_creation_does_not_consume_the_key() {
         .stop(retried.id)
         .await
         .expect("stop retry Run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn creation_owner_panic_after_spawn_transfers_cleanup_and_preserves_key_safety() {
+    let temp = tempfile::tempdir().expect("create panic rollback fixture");
+    let marker = temp.path().join("panic-after-spawn.log");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::PanicAfterSpawn, true);
+    let manager = Arc::new(RunManager {
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::default()
+    });
+    let unrelated = UnrelatedProcess::spawn();
+    let operation_key = CreateOperationKey::new("panic-after-spawn-owner").unwrap();
+    let spec = marker_spec(&marker, true);
+    let request_manager = Arc::clone(&manager);
+    let request_key = operation_key.clone();
+    let request_spec = spec.clone();
+    let request = tokio::spawn(async move {
+        request_manager
+            .create(request_key, CreationRequest::Start { spec: request_spec })
+            .await
+    });
+
+    wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    let rejected_pid = read_marker_pids(&marker)[0];
+    assert!(process_exists(rejected_pid));
+    hook.release();
+
+    let error = request
+        .await
+        .expect("request task observes the creation owner result")
+        .expect_err("panicked creation owner cannot publish a Run");
+    assert_eq!(error.code, ErrorCode::Internal);
+    assert!(manager.list().is_empty());
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 1);
+    let retry = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
+        .await
+        .expect_err("matching retry remains fenced by the captured cleanup owner");
+    assert_eq!(retry.code, ErrorCode::BackendUnavailable);
+    let mut conflicting = spec.clone();
+    conflicting.args.push("different".to_owned());
+    let conflict = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: conflicting },
+        )
+        .await
+        .expect_err("conflicting retry observes the same exact-key fence");
+    assert_eq!(conflict.code, ErrorCode::CreationConflict);
+    assert_eq!(read_marker_pids(&marker), vec![rejected_pid]);
+    hook.release_captured_run();
+    wait_for_rejected_children_reaped(&manager, &marker).await;
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+    assert!(process_exists(unrelated.pid()));
+
+    let retried = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
+        .await
+        .expect("same key is reusable only after the panicked child is reaped");
+    let pids = wait_for_marker_pids(&marker, 2).await;
+    assert_eq!(pids[0], rejected_pid);
+    assert_eq!(pids[1], retried.pid.expect("retried Run has a child PID"));
+    assert!(!process_exists(rejected_pid));
+    assert!(process_exists(pids[1]));
+    let converged = manager
+        .create(operation_key, CreationRequest::Start { spec })
+        .await
+        .expect("matching retry converges on the one replacement process");
+    assert_eq!(converged.id, retried.id);
+    assert_eq!(wait_for_marker_pids(&marker, 2).await, pids);
+
+    manager
+        .get(retried.id)
+        .expect("resolve replacement Run")
+        .stop()
+        .await
+        .expect("stop replacement Run");
+    wait_for_run_terminal_async(&manager.get(retried.id).unwrap()).await;
+    assert!(process_exists(unrelated.pid()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1249,6 +1337,7 @@ async fn eight_pending_cleanup_owners_reject_a_ninth_key_before_spawn() {
             .expect("stop pending cleanup fixture child");
         wait_for_run_terminal_async(run).await;
     }
+    drop(pending);
     wait_for_unpublished_cleanups(&manager, 0).await;
     assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
 }

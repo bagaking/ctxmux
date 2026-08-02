@@ -61,10 +61,12 @@ impl Default for CreationFlightOwner {
 }
 
 impl CreationFlightOwner {
-    /// Wait asynchronously for one physical launch slot.
+    /// Wait asynchronously for one creation-thread admission slot.
     ///
     /// Cancellation while waiting releases no flight because none exists yet.
-    /// Closing admission during shutdown wakes queued waiters with `None`.
+    /// Closing admission during shutdown wakes queued waiters with `None`. The
+    /// separate cleanup reservation is the physical-overlap SSOT across active
+    /// native launch and transferred cleanup.
     pub(crate) async fn acquire_admission(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.inner.admission).acquire_owned().await.ok()
     }
@@ -171,12 +173,14 @@ impl Drop for CreationFlight {
     }
 }
 
-/// Bounded daemon-private ownership for children rejected before publication.
+/// Bounded daemon-private ownership for native physical overlap.
 ///
-/// A reservation is taken before physical launch. On ordinary completion it
-/// disappears with the creation thread; on unresolved rollback it becomes an
-/// exact-key fence that retains the Run until its child-handle waiter proves
-/// reap. This is neither a public pending Run nor durable transaction state.
+/// A reservation is taken before physical launch and counts active publication
+/// work as well as transferred cleanup under one `owned` ceiling. On ordinary
+/// completion it disappears with the creation thread; on unresolved rollback
+/// it becomes an exact-key fence that retains the Run until child, reader,
+/// waiter, and control cleanup are all proven. This is neither a public pending
+/// Run nor durable transaction state.
 #[derive(Default)]
 pub(crate) struct UnpublishedCleanupOwner {
     inner: Arc<UnpublishedCleanupInner>,
@@ -209,6 +213,21 @@ pub(crate) struct UnpublishedCleanupReservation {
     operation_key: Option<CreateOperationKey>,
 }
 
+/// Armed ownership for one native Run that has started but is not published.
+///
+/// Creation arms this owner immediately after spawn and native-control
+/// construction. Persistent pre-COMMIT and commit-unknown separation belongs
+/// to the later exact-replacement owner. Panic and owner-unwind paths request
+/// cleanup and transfer the exact Run, request, key, and physical-overlap
+/// reservation until full cleanup is proven. `Drop` never waits for cleanup or
+/// reap completion.
+#[must_use = "a started Run must be published or transferred for cleanup"]
+pub(crate) struct PendingPublication {
+    request: Option<CreationRequest>,
+    run: Option<Arc<Run>>,
+    cleanup_reservation: Option<UnpublishedCleanupReservation>,
+}
+
 impl UnpublishedCleanupOwner {
     /// Resolve an existing exact-key fence before launch admission can wait.
     pub(crate) fn resolve_fence(
@@ -226,7 +245,7 @@ impl UnpublishedCleanupOwner {
             return Err(if fence.request == *request {
                 ProtocolError::new(
                     ErrorCode::BackendUnavailable,
-                    "Run creation is fenced while an unpublished child remains unreaped",
+                    "Run creation is fenced while unpublished native owners remain active",
                 )
             } else {
                 ProtocolError::new(
@@ -238,8 +257,8 @@ impl UnpublishedCleanupOwner {
         Ok(())
     }
 
-    /// Reserve rollback ownership after the caller holds one physical-launch
-    /// permit but before it starts a child or creation thread.
+    /// Reserve physical-overlap and rollback ownership after creation-flight
+    /// admission but before a child or creation thread starts.
     pub(crate) fn reserve(
         &self,
         operation_key: &CreateOperationKey,
@@ -286,7 +305,7 @@ impl UnpublishedCleanupOwner {
         for fence in state.entries.values_mut() {
             fence
                 .owners
-                .retain(|entry| match entry.run.unpublished_reap_result() {
+                .retain(|entry| match entry.run.unpublished_cleanup_result() {
                     Ok(()) => {
                         reaped += 1;
                         false
@@ -330,7 +349,7 @@ fn prune_reaped(state: &mut UnpublishedCleanupState) {
         let before = fence.owners.len();
         fence
             .owners
-            .retain(|entry| entry.run.unpublished_reap_result().is_err());
+            .retain(|entry| entry.run.unpublished_cleanup_result().is_err());
         reaped += before - fence.owners.len();
     }
     state.entries.retain(|_, fence| !fence.owners.is_empty());
@@ -393,6 +412,86 @@ impl Drop for UnpublishedCleanupReservation {
             .owned
             .checked_sub(1)
             .expect("cleanup reservation releases exactly one owner slot");
+    }
+}
+
+impl PendingPublication {
+    pub(crate) fn new(
+        request: CreationRequest,
+        run: Arc<Run>,
+        cleanup_reservation: UnpublishedCleanupReservation,
+    ) -> Self {
+        Self {
+            request: Some(request),
+            run: Some(run),
+            cleanup_reservation: Some(cleanup_reservation),
+        }
+    }
+
+    pub(crate) fn run(&self) -> &Arc<Run> {
+        self.run
+            .as_ref()
+            .expect("pending publication retains its Run until disposition")
+    }
+
+    /// Complete explicit rollback or transfer the still-owned publication.
+    ///
+    /// The caller receives the original cleanup failure while this owner keeps
+    /// the exact request, key, Run, and overlap reservation fenced until every
+    /// native owner is quiescent.
+    pub(crate) fn cleanup_unpublished(mut self) -> Result<(), String> {
+        match self.run().terminate_unpublished() {
+            Ok(()) => {
+                self.request.take();
+                self.run.take();
+                self.cleanup_reservation.take();
+                Ok(())
+            }
+            Err(error) => {
+                self.transfer(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Mark Registry publication while its exact write lock still owns truth.
+    ///
+    /// The returned reservation must be dropped after the Registry lock, so
+    /// cleanup-owner accounting never nests under Registry ownership.
+    fn into_published_reservation(mut self) -> UnpublishedCleanupReservation {
+        self.request.take();
+        self.run.take();
+        self.cleanup_reservation
+            .take()
+            .expect("published Run releases one overlap reservation")
+    }
+
+    fn transfer(&mut self, transfer_reason: String) {
+        let request = self
+            .request
+            .take()
+            .expect("pending publication transfers its request at most once");
+        let run = self
+            .run
+            .take()
+            .expect("pending publication transfers its Run at most once");
+        self.cleanup_reservation
+            .take()
+            .expect("pending publication transfers its overlap reservation at most once")
+            .transfer(request, run, transfer_reason);
+    }
+}
+
+impl Drop for PendingPublication {
+    fn drop(&mut self) {
+        if self.run.is_none() {
+            return;
+        }
+        let cleanup_request = self.run().request_unpublished_cleanup().err().map_or_else(
+            || "creation owner unwound after requesting unpublished child cleanup".to_owned(),
+            |error| format!("creation owner unwound; cleanup request failed: {error}"),
+        );
+        self.transfer(cleanup_request);
     }
 }
 
@@ -672,14 +771,24 @@ impl RunRegistry {
         }
     }
 
-    /// Atomically publish one Run and its successful creation mapping.
-    pub(crate) fn publish_creation(&self, operation_key: CreateOperationKey, run: Arc<Run>) {
+    /// Atomically publish one Run, its key, and the rollback-owner disposition.
+    pub(crate) fn publish_creation(
+        &self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+    ) -> RunInfo {
+        let run = Arc::clone(pending.run());
+        let info = run.info();
         let id = run.id;
         let mut state = write_lock(&self.state);
         debug_assert!(!state.creation_runs.contains_key(&operation_key));
         debug_assert!(!state.runs.contains_key(&id));
         state.runs.insert(id, run);
         state.creation_runs.insert(operation_key, id);
+        let cleanup_reservation = pending.into_published_reservation();
+        drop(state);
+        drop(cleanup_reservation);
+        info
     }
 
     /// Publish one non-creation-backed Run, currently only a tmux import or test seam.

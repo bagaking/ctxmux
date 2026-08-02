@@ -40,12 +40,17 @@ The hook is not a public fault API and cannot change production scheduling.
   cleanup fences may therefore reject a new leader before spawn without
   changing the cancellable ninth-waiter behavior when no cleanup is retained.
   Request cancellation cannot abandon launch.
-- A persistence rejection before `COMMIT` asks that same Run's child-handle
-  waiter to terminate the unpublished child. Only the waiter's
-  `try_wait(Some(_))` receipt reopens the key. If that proof is not immediately
-  available, the creation owner installs an exact-key fence in one private
-  globally eight-slot-bounded cleanup owner before releasing the random stripe
-  and launch permit. The fence owns no public or durable Run identity.
+- Creation prepares every fallible PTY reader and writer view before physical
+  launch. Immediately after launch it constructs native control and arms one
+  private publication owner before waiter or output-reader worker setup can
+  fail or unwind. A persistence rejection before `COMMIT` asks that same Run's
+  child-handle waiter to terminate the unpublished child. The waiter's
+  `try_wait(Some(_))` receipt proves reap, but the key reopens only after
+  reader, waiter, control, input, and Run owners are also quiescent. Until then
+  the publication owner transfers an exact-key fence to one private globally
+  eight-slot-bounded cleanup owner before releasing the random stripe and
+  launch permit. The same transfer covers worker-setup failure and
+  creation-owner unwind. The fence owns no public or durable Run identity.
 - Shutdown fences new unbound creation flights before Backend cleanup, then
   drains active creation threads, transferred unpublished-child cleanup, and
   tmux control owners against one bounded deadline. The fence closes semaphore
@@ -106,11 +111,12 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   active flight guard to release.
 - Covered now: real Start and Level B Fork children cross a deterministic
   post-spawn barrier before an oversized metadata record is rejected before
-  `COMMIT`. The waiter-owned reap receipt gates exact-key reuse; pending matching
-  and conflicting retries launch nothing, unrelated keys progress, one later
-  32-way retry elects one physical leader, shutdown reports an unresolved fence
-  owner without echoing its key, the persistence actor remains healthy, and an
-  unrelated-process sentinel is untouched.
+  `COMMIT`. The waiter-owned reap receipt plus full native-owner quiescence gate
+  exact-key reuse; pending matching and conflicting retries launch nothing,
+  unrelated keys progress, one later 32-way retry elects one physical leader,
+  shutdown reports an unresolved fence owner without echoing its key, the
+  persistence actor remains healthy, and an unrelated-process sentinel is
+  untouched.
 - Candidate: exited-Run collection and attachment during collection.
 
 ## Open questions

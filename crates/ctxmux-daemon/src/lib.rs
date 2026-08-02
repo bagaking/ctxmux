@@ -48,7 +48,7 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{
-    CreationFlightOwner, CreationRequest, RunRegistry, UnpublishedCleanupOwner,
+    CreationFlightOwner, CreationRequest, PendingPublication, RunRegistry, UnpublishedCleanupOwner,
     UnpublishedCleanupReservation,
 };
 use crate::native_control::{
@@ -322,12 +322,14 @@ struct CreationTestHook {
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     released: Mutex<bool>,
     release: std::sync::Condvar,
+    captured_run: Mutex<Option<Arc<Run>>>,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreationHookPoint {
     AfterSpawn,
+    PanicAfterSpawn,
     AfterPublication,
 }
 
@@ -344,6 +346,13 @@ impl AttachmentTestHook {
 
 #[cfg(test)]
 impl CreationTestHook {
+    fn capture_run(&self, point: CreationHookPoint, run: Arc<Run>) {
+        if self.point == point && self.armed.load(Ordering::Acquire) {
+            let previous = mutex_lock(&self.captured_run).replace(run);
+            assert!(previous.is_none(), "test hook captures one Run owner");
+        }
+    }
+
     fn pause_once(&self, point: CreationHookPoint) {
         if self.point != point || !self.armed.swap(false, Ordering::AcqRel) {
             return;
@@ -356,6 +365,11 @@ impl CreationTestHook {
                 .wait(released)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        assert_ne!(
+            point,
+            CreationHookPoint::PanicAfterSpawn,
+            "injected creation owner panic after physical spawn"
+        );
     }
 
     fn release(&self) {
@@ -366,6 +380,10 @@ impl CreationTestHook {
     fn arm(&self) {
         *mutex_lock(&self.released) = false;
         self.armed.store(true, Ordering::Release);
+    }
+
+    fn release_captured_run(&self) {
+        mutex_lock(&self.captured_run).take();
     }
 }
 
@@ -485,14 +503,8 @@ impl RunManager {
         cleanup_reservation: UnpublishedCleanupReservation,
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
-        let run = match request.clone() {
-            CreationRequest::Start { spec } => Run::spawn(
-                spec,
-                None,
-                persistence_mode,
-                self.live_event_capacity,
-                self.native_input_drains.clone(),
-            )?,
+        let (spec, lineage) = match request.clone() {
+            CreationRequest::Start { spec } => (spec, None),
             CreationRequest::Fork { parent, plan } => {
                 let parent_run = self.get(parent)?;
                 let (spec, fidelity) = match plan {
@@ -523,37 +535,54 @@ impl RunManager {
                         ));
                     }
                 };
-                Run::spawn(
-                    spec,
-                    Some(RunLineage { parent, fidelity }),
-                    persistence_mode,
-                    self.live_event_capacity,
-                    self.native_input_drains.clone(),
-                )?
+                (spec, Some(RunLineage { parent, fidelity }))
             }
         };
-        #[cfg(test)]
-        if let Some(hook) = &self.creation_hook {
-            hook.pause_once(CreationHookPoint::AfterSpawn);
-        }
-        let post_commit_error = match self.prepare_publication(&operation_key, &run) {
-            Ok(post_commit_error) => post_commit_error,
-            Err(error) => {
-                if let Err(cleanup_error) = run.terminate_unpublished() {
-                    cleanup_reservation.transfer(request, run, cleanup_error.clone());
-                    return Err(ProtocolError::new(
-                        error.code,
-                        format!(
-                            "{}; rollback pending: exact creation key remains fenced until the child waiter proves reap: {cleanup_error}",
-                            error.message
-                        ),
-                    ));
+        let pending = Run::spawn_pending(
+            spec,
+            lineage,
+            persistence_mode,
+            self.live_event_capacity,
+            self.native_input_drains.clone(),
+            request,
+            cleanup_reservation,
+        )?;
+        let (info, post_commit_error) = if persistence_mode == PersistenceMode::MemoryOnly {
+            #[cfg(test)]
+            if let Some(hook) = &self.creation_hook {
+                hook.pause_once(CreationHookPoint::AfterSpawn);
+                hook.capture_run(
+                    CreationHookPoint::PanicAfterSpawn,
+                    Arc::clone(pending.run()),
+                );
+                hook.pause_once(CreationHookPoint::PanicAfterSpawn);
+            }
+            (self.registry.publish_creation(operation_key, pending), None)
+        } else {
+            #[cfg(test)]
+            if let Some(hook) = &self.creation_hook {
+                hook.pause_once(CreationHookPoint::AfterSpawn);
+            }
+            let post_commit_error = match self.prepare_publication(&operation_key, pending.run()) {
+                Ok(post_commit_error) => post_commit_error,
+                Err(error) => {
+                    if let Err(cleanup_error) = pending.cleanup_unpublished() {
+                        return Err(ProtocolError::new(
+                            error.code,
+                            format!(
+                                "{}; rollback pending: exact creation key remains fenced until all unpublished native owners are quiescent: {cleanup_error}",
+                                error.message
+                            ),
+                        ));
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
+            };
+            (
+                self.registry.publish_creation(operation_key, pending),
+                post_commit_error,
+            )
         };
-        let info = run.info();
-        self.registry.publish_creation(operation_key, run);
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
             hook.pause_once(CreationHookPoint::AfterPublication);
@@ -784,14 +813,28 @@ impl RunManager {
     }
 
     #[cfg(test)]
-    fn start_with_setup<F>(&self, spec: RunSpec, setup: F) -> Result<RunInfo, ProtocolError>
+    fn start_with_setup<F>(
+        &self,
+        operation_key: CreateOperationKey,
+        spec: RunSpec,
+        captured_run: &Arc<Mutex<Option<Arc<Run>>>>,
+        setup: F,
+    ) -> Result<RunInfo, ProtocolError>
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
-        let run = Run::spawn_with_setup(spec, None, self.persistence_mode(), setup)?;
-        let info = run.info();
-        self.registry.publish_unkeyed(run);
-        Ok(info)
+        let request = CreationRequest::Start { spec: spec.clone() };
+        let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
+        let pending = Run::spawn_pending_with_setup(
+            spec,
+            None,
+            self.persistence_mode(),
+            request,
+            cleanup_reservation,
+            captured_run,
+            setup,
+        )?;
+        Ok(self.registry.publish_creation(operation_key, pending))
     }
 
     #[cfg(test)]
@@ -824,20 +867,52 @@ enum PersistenceMode {
     PersistentCapable,
 }
 
+struct NativeSpawnConfig {
+    spec: RunSpec,
+    lineage: Option<RunLineage>,
+    persistence_mode: PersistenceMode,
+    live_event_capacity: usize,
+    input_drains: InputDrainGate,
+}
+
+impl NativeSpawnConfig {
+    fn command(&self) -> CommandBuilder {
+        let mut command = CommandBuilder::new(&self.spec.program);
+        command.args(&self.spec.args);
+        if let Some(cwd) = &self.spec.cwd {
+            command.cwd(cwd);
+        }
+        for (name, value) in &self.spec.env {
+            command.env(name, value);
+        }
+        command
+    }
+}
+
 struct PendingChild {
     child: Option<Box<dyn Child + Send + Sync>>,
+    reap_control: Option<NativeControlOwner>,
 }
 
 impl PendingChild {
     const fn new(child: Box<dyn Child + Send + Sync>) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            reap_control: None,
+        }
     }
 
     fn child(&self) -> &(dyn Child + Send + Sync) {
         self.child.as_deref().expect("pending child is present")
     }
 
+    fn bind_reap_control(&mut self, control: NativeControlOwner) {
+        debug_assert!(self.reap_control.is_none());
+        self.reap_control = Some(control);
+    }
+
     fn into_child(mut self) -> Box<dyn Child + Send + Sync> {
+        self.reap_control.take();
         self.child.take().expect("pending child is present")
     }
 }
@@ -849,9 +924,26 @@ impl Drop for PendingChild {
         };
         if let Err(error) = child.kill() {
             eprintln!("ctxmuxd failed to terminate rejected child: {error}");
+            if let Some(control) = &self.reap_control {
+                control.record_cleanup_error(format!(
+                    "failed to terminate rejected unpublished child: {error}"
+                ));
+            }
         }
-        if let Err(error) = child.wait() {
-            eprintln!("ctxmuxd failed to reap rejected child: {error}");
+        match child.wait() {
+            Ok(_) => {
+                if let Some(control) = &self.reap_control {
+                    control.mark_reaped();
+                }
+            }
+            Err(error) => {
+                eprintln!("ctxmuxd failed to reap rejected child: {error}");
+                if let Some(control) = &self.reap_control {
+                    control.record_wait_error(format!(
+                        "failed to reap rejected unpublished child: {error}"
+                    ));
+                }
+            }
         }
     }
 }
@@ -871,6 +963,26 @@ struct Run {
     persistence: Mutex<Option<PersistentRun>>,
     attachments: AtomicUsize,
     events: broadcast::Sender<RunEvent>,
+}
+
+/// Private owner shape used while native setup can still fail or unwind.
+///
+/// Production creation supplies `PendingPublication`; the plain `Arc` owner is
+/// retained only by test seams that never carry a public operation key.
+trait NativeRunOwner {
+    fn run(&self) -> &Arc<Run>;
+}
+
+impl NativeRunOwner for Arc<Run> {
+    fn run(&self) -> &Arc<Run> {
+        self
+    }
+}
+
+impl NativeRunOwner for PendingPublication {
+    fn run(&self) -> &Arc<Run> {
+        self.run()
+    }
 }
 
 enum RunControl {
@@ -1057,6 +1169,7 @@ struct TmuxWaitOutcome {
 }
 
 impl Run {
+    #[cfg(test)]
     fn spawn(
         spec: RunSpec,
         lineage: Option<RunLineage>,
@@ -1065,32 +1178,45 @@ impl Run {
         input_drains: InputDrainGate,
     ) -> Result<Arc<Self>, ProtocolError> {
         Self::spawn_with_hooks(
-            spec,
-            lineage,
-            persistence_mode,
-            live_event_capacity,
-            input_drains,
+            NativeSpawnConfig {
+                spec,
+                lineage,
+                persistence_mode,
+                live_event_capacity,
+                input_drains,
+            },
+            |run| run,
             |_, _| Ok(()),
             || {},
         )
     }
 
     #[cfg(test)]
-    fn spawn_with_setup<F>(
+    fn spawn_pending_with_setup<F>(
         spec: RunSpec,
         lineage: Option<RunLineage>,
         persistence_mode: PersistenceMode,
+        request: CreationRequest,
+        cleanup_reservation: UnpublishedCleanupReservation,
+        captured_run: &Arc<Mutex<Option<Arc<Run>>>>,
         setup: F,
-    ) -> Result<Arc<Self>, ProtocolError>
+    ) -> Result<PendingPublication, ProtocolError>
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
         Self::spawn_with_hooks(
-            spec,
-            lineage,
-            persistence_mode,
-            LIVE_EVENT_CAPACITY,
-            InputDrainGate::default(),
+            NativeSpawnConfig {
+                spec,
+                lineage,
+                persistence_mode,
+                live_event_capacity: LIVE_EVENT_CAPACITY,
+                input_drains: InputDrainGate::default(),
+            },
+            |run| {
+                let previous = mutex_lock(captured_run).replace(Arc::clone(&run));
+                assert!(previous.is_none(), "setup fixture captures one Run owner");
+                PendingPublication::new(request, run, cleanup_reservation)
+            },
             setup,
             || {},
         )
@@ -1106,64 +1232,91 @@ impl Run {
         G: FnOnce() + Send + 'static,
     {
         Self::spawn_with_hooks(
-            spec,
-            None,
-            persistence_mode,
-            LIVE_EVENT_CAPACITY,
-            InputDrainGate::default(),
+            NativeSpawnConfig {
+                spec,
+                lineage: None,
+                persistence_mode,
+                live_event_capacity: LIVE_EVENT_CAPACITY,
+                input_drains: InputDrainGate::default(),
+            },
+            |run| run,
             |_, _| Ok(()),
             after_wait,
         )
     }
 
-    fn spawn_with_hooks<F, G>(
+    fn spawn_pending(
         spec: RunSpec,
         lineage: Option<RunLineage>,
         persistence_mode: PersistenceMode,
         live_event_capacity: usize,
         input_drains: InputDrainGate,
+        request: CreationRequest,
+        cleanup_reservation: UnpublishedCleanupReservation,
+    ) -> Result<PendingPublication, ProtocolError> {
+        Self::spawn_with_hooks(
+            NativeSpawnConfig {
+                spec,
+                lineage,
+                persistence_mode,
+                live_event_capacity,
+                input_drains,
+            },
+            |run| PendingPublication::new(request, run, cleanup_reservation),
+            |_, _| Ok(()),
+            || {},
+        )
+    }
+
+    fn spawn_with_hooks<O, H, F, G>(
+        config: NativeSpawnConfig,
+        make_owner: H,
         mut setup: F,
         after_wait: G,
-    ) -> Result<Arc<Self>, ProtocolError>
+    ) -> Result<O, ProtocolError>
     where
+        O: NativeRunOwner,
+        H: FnOnce(Arc<Self>) -> O,
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
         G: FnOnce() + Send + 'static,
     {
-        validate_run_spec(&spec).map_err(invalid_run_spec)?;
+        validate_run_spec(&config.spec).map_err(invalid_run_spec)?;
         let pair = native_pty_system()
-            .openpty(to_pty_size(spec.size))
+            .openpty(to_pty_size(config.spec.size))
             .map_err(|error| spawn_error("open PTY", error))?;
-        let mut command = CommandBuilder::new(&spec.program);
-        command.args(&spec.args);
-        if let Some(cwd) = &spec.cwd {
-            command.cwd(cwd);
-        }
-        for (name, value) in &spec.env {
-            command.env(name, value);
-        }
-
-        let child = pair
-            .slave
-            .spawn_command(command)
-            .map_err(|error| spawn_error("spawn child", error))?;
-        drop(pair.slave);
-        let pending_child = PendingChild::new(child);
-        let pid = pending_child.child().process_id();
-        setup(LaunchSetupStep::CloneReader, pid)?;
+        // Prepare every fallible PTY view before physical launch. Once a child
+        // exists, native control and PendingPublication can be built without a
+        // setup error window that lacks exact-key cleanup ownership.
+        setup(LaunchSetupStep::CloneReader, None)?;
         let reader = pair
             .master
             .try_clone_reader()
             .map_err(|error| spawn_error("clone PTY reader", error))?;
-        setup(LaunchSetupStep::TakeWriter, pid)?;
+        setup(LaunchSetupStep::TakeWriter, None)?;
         let writer = pair
             .master
             .take_writer()
             .map_err(|error| spawn_error("take PTY writer", error))?;
+        let child = pair
+            .slave
+            .spawn_command(config.command())
+            .map_err(|error| spawn_error("spawn child", error))?;
+        drop(pair.slave);
+        let mut pending_child = PendingChild::new(child);
+        let pid = pending_child.child().process_id();
+        let NativeSpawnConfig {
+            spec,
+            lineage,
+            persistence_mode,
+            live_event_capacity,
+            input_drains,
+        } = config;
         let (events, _) = broadcast::channel(live_event_capacity);
         let id = RunId::new();
         let (native_control, child_command_rx) =
             NativeControlOwner::new(id, pair.master, writer, input_drains);
-        let run = Arc::new(Self {
+        pending_child.bind_reap_control(native_control.clone());
+        let owner = make_owner(Arc::new(Self {
             id,
             spec: Some(spec),
             lineage,
@@ -1178,30 +1331,31 @@ impl Run {
             persistence: Mutex::new(None),
             attachments: AtomicUsize::new(0),
             events,
-        });
+        }));
+        let run = Arc::clone(owner.run());
 
+        // Start the waiter first, but do not hand it the child until the output
+        // reader also exists. A reader setup failure therefore drops the child
+        // sender, lets the empty waiter exit, and leaves `PendingChild` to
+        // synchronously kill/reap without an orphaned output owner.
         let (output_done_tx, output_done_rx) = mpsc::channel();
-        let output_run = Arc::clone(&run);
-        setup(LaunchSetupStep::StartOutputThread, pid)?;
-        thread::Builder::new()
-            .name(format!("ctxmux-output-{}", run.id))
-            .spawn(move || {
-                read_output(&output_run, reader);
-                let _ = output_done_tx.send(());
-            })
-            .map_err(|error| spawn_error("start PTY reader", error))?;
-
         let wait_run = Arc::clone(&run);
         let wait_control = run
             .native_control()
             .expect("spawned Run retains native control")
             .clone();
-        setup(LaunchSetupStep::StartWaiterThread, pid)?;
+        if let Err(error) = setup(LaunchSetupStep::StartWaiterThread, pid) {
+            run.native_control()
+                .expect("spawned Run retains native control")
+                .mark_closed();
+            return Err(error);
+        }
         let (child_tx, child_rx) = mpsc::channel::<PendingChild>();
         thread::Builder::new()
             .name(format!("ctxmux-wait-{}", run.id))
             .spawn(move || {
                 let Ok(pending_child) = child_rx.recv() else {
+                    wait_control.mark_closed();
                     return;
                 };
                 let mut child = pending_child.into_child();
@@ -1212,7 +1366,23 @@ impl Run {
                 let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
                 wait_run.publish_terminal(state);
             })
-            .map_err(|error| spawn_error("start child waiter", error))?;
+            .map_err(|error| {
+                run.native_control()
+                    .expect("spawned Run retains native control")
+                    .mark_closed();
+                spawn_error("start child waiter", error)
+            })?;
+
+        let output_run = Arc::clone(&run);
+        setup(LaunchSetupStep::StartOutputThread, pid)?;
+        thread::Builder::new()
+            .name(format!("ctxmux-output-{}", run.id))
+            .spawn(move || {
+                read_output(&output_run, reader);
+                let _ = output_done_tx.send(());
+            })
+            .map_err(|error| spawn_error("start PTY reader", error))?;
+
         child_tx.send(pending_child).map_err(|_| {
             spawn_error(
                 "handoff child to waiter",
@@ -1220,7 +1390,7 @@ impl Run {
             )
         })?;
 
-        Ok(run)
+        Ok(owner)
     }
 
     fn import_tmux(
@@ -1611,24 +1781,52 @@ impl Run {
         let _ = self.events.send(RunEvent::Exited { state: terminal });
     }
 
-    fn terminate_unpublished(&self) -> Result<(), String> {
+    fn terminate_unpublished(self: &Arc<Self>) -> Result<(), String> {
+        let request_error = self.request_unpublished_cleanup().err();
         let control = self
             .native_control()
             .map_err(|error| error.message.clone())?;
-        let request_error = control.cleanup_unpublished().err();
-        match control.wait_until_reaped(Instant::now() + UNPUBLISHED_REAP_INLINE_TIMEOUT) {
-            Ok(()) => Ok(()),
-            Err(wait_error) => Err(match request_error {
+        let deadline = Instant::now() + UNPUBLISHED_REAP_INLINE_TIMEOUT;
+        if let Err(wait_error) = control.wait_until_reaped(deadline) {
+            return Err(match request_error {
                 Some(request_error) => format!("{request_error}; {wait_error}"),
                 None => wait_error,
-            }),
+            });
+        }
+        loop {
+            match self.unpublished_cleanup_result() {
+                Ok(()) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => {
+                    return Err(match request_error {
+                        Some(request_error) => format!("{request_error}; {error}"),
+                        None => error,
+                    });
+                }
+                Err(_) => thread::sleep(
+                    CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                ),
+            }
         }
     }
 
-    fn unpublished_reap_result(&self) -> Result<(), String> {
+    fn request_unpublished_cleanup(&self) -> Result<(), String> {
         self.native_control()
             .map_err(|error| error.message.clone())?
-            .reap_result()
+            .cleanup_unpublished()
+    }
+
+    fn unpublished_cleanup_result(self: &Arc<Self>) -> Result<(), String> {
+        self.native_control()
+            .map_err(|error| error.message.clone())?
+            .unpublished_cleanup_result()?;
+        let owners = Arc::strong_count(self);
+        if owners != 1 {
+            return Err(format!(
+                "unpublished Run {} retains {owners} reader, waiter, or external owners",
+                self.id
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2808,26 +3006,84 @@ mod tests {
             LaunchSetupStep::StartWaiterThread,
         ] {
             let manager = RunManager::default();
+            let operation_key =
+                CreateOperationKey::new(format!("post-spawn-setup-{}", failed_step as u8))
+                    .expect("fixture operation key");
+            let spec = long_running_spec();
+            let request = CreationRequest::Start { spec: spec.clone() };
+            let captured_run = Arc::new(Mutex::new(None));
             let mut failed_pid = None;
             let error = manager
-                .start_with_setup(long_running_spec(), |step, pid| {
-                    if step == failed_step {
-                        let pid = pid.expect("native child exposes its pid");
-                        assert!(process_exists(pid), "fixture child must start live");
-                        failed_pid = Some(pid);
-                        return Err(spawn_error("complete injected setup step", "fixture"));
-                    }
-                    Ok(())
-                })
+                .start_with_setup(
+                    operation_key.clone(),
+                    spec.clone(),
+                    &captured_run,
+                    |step, pid| {
+                        if step == failed_step {
+                            if matches!(
+                                step,
+                                LaunchSetupStep::CloneReader | LaunchSetupStep::TakeWriter
+                            ) {
+                                assert!(pid.is_none(), "PTY views are prepared before spawn");
+                            } else {
+                                let pid = pid.expect("post-spawn setup exposes its child pid");
+                                assert!(process_exists(pid), "fixture child must start live");
+                                failed_pid = Some(pid);
+                            }
+                            return Err(spawn_error("complete injected setup step", "fixture"));
+                        }
+                        Ok(())
+                    },
+                )
                 .expect_err("injected setup failure rejects start");
 
             assert_eq!(error.code, ErrorCode::SpawnFailed);
             assert!(manager.list().is_empty(), "failed start published a Run");
-            let pid = failed_pid.expect("fixture records the rejected child pid");
-            assert!(
-                !process_exists(pid),
-                "{failed_step:?} left child {pid} live or unreaped"
-            );
+            if matches!(
+                failed_step,
+                LaunchSetupStep::StartOutputThread | LaunchSetupStep::StartWaiterThread
+            ) {
+                let pid = failed_pid.expect("post-spawn fixture records the rejected child pid");
+                assert!(
+                    !process_exists(pid),
+                    "{failed_step:?} left child {pid} live or unreaped"
+                );
+                assert!(
+                    mutex_lock(&captured_run).is_some(),
+                    "post-construction failure retains the injected Run owner"
+                );
+                assert_eq!(manager.unpublished_cleanups.owned_count(), 1);
+                assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
+                let matching = manager
+                    .unpublished_cleanups
+                    .resolve_fence(&operation_key, &request)
+                    .expect_err("matching setup retry remains fenced");
+                assert_eq!(matching.code, ErrorCode::BackendUnavailable);
+                let mut conflicting_spec = spec.clone();
+                conflicting_spec.args.push("different".to_owned());
+                let conflicting = manager
+                    .unpublished_cleanups
+                    .resolve_fence(
+                        &operation_key,
+                        &CreationRequest::Start {
+                            spec: conflicting_spec,
+                        },
+                    )
+                    .expect_err("conflicting setup retry sees the same fence");
+                assert_eq!(conflicting.code, ErrorCode::CreationConflict);
+                mutex_lock(&captured_run).take();
+                let pending = manager
+                    .unpublished_cleanups
+                    .wait_until(Instant::now() + Duration::from_secs(2));
+                assert!(
+                    pending.is_empty(),
+                    "{failed_step:?} released setup owner did not reach full native quiescence: {pending:?}"
+                );
+            } else {
+                assert!(failed_pid.is_none(), "pre-spawn setup launches no child");
+                assert!(mutex_lock(&captured_run).is_none());
+                assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+            }
         }
     }
 

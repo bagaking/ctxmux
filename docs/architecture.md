@@ -129,22 +129,27 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    receiver, so it cannot release the key or abandon a physical launch. No
    persistent blocking-worker pool or custom execution queue is retained for
    this path.
-6. The daemon validates the spec, opens a PTY, spawns the child, retains one
-   private native-control facade, and transfers the owned child handle to the
-   waiter thread behind one narrow stop-command channel; it also starts the
-   blocking output reader.
-7. In persistent mode the single store actor commits the complete running row
-   and byte-exact operation key in one transaction. Failure before `COMMIT`
-   requests cleanup from the waiter that exclusively owns the child handle.
-   The key becomes reusable only after that waiter observes terminal-and-reaped;
-   otherwise one daemon-private, globally eight-slot-bounded cleanup owner
-   retains the unpublished Run and an exact-key fence without retaining its
-   random stripe or launch permit. Successful `COMMIT` is the point of no
-   return: even if vacuum or physical-file postchecks then latch persistence,
-   the manager binds persistence and stores `Arc<Run>` plus the key mapping
-   under one `RunRegistry` write before returning that error. A retry therefore
-   resolves the committed Run instead of spawning again. Closing the request
-   connection cannot drop the Run or roll back a published mapping.
+6. The daemon validates the spec, opens a PTY, prepares every fallible reader
+   and writer view, and only then spawns the child. It constructs one private
+   native-control facade and publication owner before starting the waiter and
+   blocking output-reader workers, then transfers the owned child handle to the
+   waiter behind one narrow stop-command channel.
+7. Native creation therefore has no post-spawn, pre-owner fallible setup
+   boundary. In persistent mode the single store actor commits the complete
+   running row and byte-exact operation key in one transaction. Failure before
+   `COMMIT` requests cleanup from the waiter that exclusively owns the child
+   handle. Child
+   terminal-and-reaped is necessary but does not reopen the key: reader,
+   waiter, control, input, and Run owners must also be quiescent. Otherwise one
+   daemon-private, globally eight-slot-bounded cleanup owner retains the
+   unpublished Run and an exact-key fence without retaining its random stripe
+   or launch permit. The same transfer covers worker-setup failure and creation
+   owner unwind. Successful `COMMIT` is the point of no return: even if vacuum
+   or physical-file postchecks then latch persistence, the manager binds
+   persistence and stores `Arc<Run>` plus the key mapping under one
+   `RunRegistry` write before returning that error. A retry therefore resolves
+   the committed Run instead of spawning again. Closing the request connection
+   cannot drop the Run or roll back a published mapping.
 
 ### Import a tmux-owned pane
 
@@ -274,9 +279,10 @@ The important guarantees are behavioral, not implied by lock types.
   Unbound leaders then wait asynchronously for one of eight physical-launch
   permits; these Tokio semaphore waiters are not a product-level actor or custom
   queue. The retained Run and successful key mapping share one registry lock;
-  a failed unpublished launch retains neither only after its child-handle waiter
-  proves reap. Until then, its exact key is independently fenced: a matching
-  retry reports temporary Backend unavailability, conflicting reuse reports
+  a failed unpublished launch releases its private Run and exact-key fence only
+  after the child-handle waiter proves reap and all reader, waiter, control,
+  input, and Run owners are quiescent. Until then, a matching retry reports
+  temporary Backend unavailability, conflicting reuse reports
   `creation_conflict`, and unrelated keys can use released stripes and launch
   permits. A matching published Fork retry is resolved before current parent
   capability or lifecycle checks.
