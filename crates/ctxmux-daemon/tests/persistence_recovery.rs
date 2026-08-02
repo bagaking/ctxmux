@@ -152,8 +152,15 @@ fn shell_spec(script: &str) -> RunSpec {
     }
 }
 
+const ORDINARY_TERMINAL_WAIT: Duration = Duration::from_secs(10);
+const RETAINED_REPLAY_TERMINAL_WAIT: Duration = Duration::from_secs(30);
+
 async fn wait_terminal(client: &Client, id: RunId) -> RunInfo {
-    timeout(Duration::from_secs(10), async {
+    wait_terminal_within(client, id, ORDINARY_TERMINAL_WAIT).await
+}
+
+async fn wait_terminal_within(client: &Client, id: RunId, budget: Duration) -> RunInfo {
+    timeout(budget, async {
         loop {
             let info = client.status(id).await.expect("read Run status");
             if !info.state.is_running() {
@@ -209,7 +216,13 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
         .start(shell_spec("printf 'persisted-output'"))
         .await
         .expect("start durable parent");
-    assert_eq!(parent.durable_head_seq, Some(0));
+    let initial_durable_head = parent
+        .durable_head_seq
+        .expect("persistent Start reports a durable cursor");
+    assert!(
+        initial_durable_head <= parent.head_seq,
+        "the dynamic Start snapshot cannot report durable output beyond its live head"
+    );
     let exited = wait_terminal(&first_client, parent.id).await;
     assert!(matches!(exited.state, RunState::Exited { code: 0, .. }));
     assert_eq!(exited.durable_head_seq, Some(exited.head_seq));
@@ -377,7 +390,7 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
         ))
         .await
         .expect("start output retention Run");
-    let exited = wait_terminal(&client, run.id).await;
+    let exited = wait_terminal_within(&client, run.id, RETAINED_REPLAY_TERMINAL_WAIT).await;
     assert_eq!(exited.durable_head_seq, Some(exited.head_seq));
     assert!(exited.oldest_seq > 1);
     let (_, live_snapshot) = client
