@@ -1,6 +1,7 @@
 # 013 — Retained Run resource governance
 
-- Status: accepted design; implementation pending under T-027
+- Status: accepted memory-only owner design; persistent exact-replacement WAL
+  admission unresolved under T-027
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -44,16 +45,22 @@ not reduce the same-epoch in-memory ceiling.
 One daemon-private eight-slot overlap owner is shared by native Start/Fork,
 tmux import, and transferred T-026 unpublished-child cleanup. A slot is held
 from immediately before the physical child or Control client starts until
-publication, complete rollback, or transferred cleanup proves reap. Thus at
-most eight not-yet-published or private-cleanup Runs can overlap the 128
-Registry records. Their additional `OutputLog` payload is bounded by 32 MiB,
-for a 544 MiB retained-plus-overlap payload bound. Native readers use an 8 KiB
-buffer. A tmux reader separately bounds both its Control line and command-block
-output at 1 MiB, and may briefly hold decoded notification or output clones;
-those independent allocations must not be collapsed into one false per-Run
-number. The 128-plus-eight owner bounds multiply each existing local bound,
-while parser containers, transient clones, Run metadata, and allocator overhead
-remain measured RSS rather than being misrepresented as replay bytes.
+publication, complete rollback, or transferred cleanup proves full
+Backend-local quiescence. Native cleanup requires child reap, closed control,
+empty input accounting, and no additional reader, waiter, input-drain, control,
+or Run owner. The exact cleanup-held `Arc<Run>` and its Run-held
+`Arc<NativeControlInner>` each retain a base strong count of one. Tmux requires
+its corresponding Control child, reader, waiter, and writer completion
+receipts. Thus at most eight not-yet-published or private-cleanup Runs can
+overlap the 128 Registry records. Their additional `OutputLog` payload is
+bounded by 32 MiB, for a 544 MiB retained-plus-overlap payload bound. Native
+readers use an 8 KiB buffer. A tmux reader separately bounds both its Control
+line and command-block output at 1 MiB, and may briefly hold decoded
+notification or output clones; those independent allocations must not be
+collapsed into one false per-Run number. The 128-plus-eight owner bounds
+multiply each existing local bound, while parser containers, transient clones,
+Run metadata, and allocator overhead remain measured RSS rather than being
+misrepresented as replay bytes.
 
 SQLite may accept an older schema-2 store containing up to 4,096 structurally
 valid rows during fail-closed startup validation. Before socket publication,
@@ -174,12 +181,14 @@ it is not safe to release an overlap permit merely because stack unwinding or a
 request error began. Before physical start, Drop releases the unused permit.
 After a native child or tmux Control child starts, publication releases the
 permit only after the new Registry entry consumes the projection. A rejected
-launch releases it only after the Backend-local child, reader, and waiter
-cleanup receipt completes; otherwise the Run and permit transfer together to
-the bounded private cleanup owner and remain visible to shutdown. Native uses
-the T-026 waiter-owned reap receipt, while tmux uses its Control-child and
-reader/waiter completion receipt. Neither path grows into descendant or
-process-tree ownership.
+launch releases it only after full Backend-local quiescence; otherwise the Run
+and permit transfer together to the bounded private cleanup owner and remain
+visible to shutdown. Native combines the T-026 waiter-owned reap receipt with
+closed control, empty input accounting, and no additional reader, waiter,
+input-drain, control, or Run owners beyond the cleanup-held Run and its
+Run-held native control. Tmux uses its Control-child, reader, waiter, and writer
+completion receipts. Neither path grows into descendant or process-tree
+ownership.
 
 A candidate must be exited or interrupted, unfenced, and owned only by the
 Registry. Terminal state is necessary but not sufficient:
@@ -218,6 +227,19 @@ all ordinary launches.
 
 ### Persistent exact replacement
 
+The logical old-or-new contract in this section is accepted, but its physical
+WAL admission is not yet resolved. Decision 009 freezes an 8 MiB per-transaction
+WAL estimate and a 16 MiB total WAL ceiling; it proves only the existing
+single-record eviction shape against the 4 MiB per-Run replay bound. A
+multi-candidate cascade delete can exceed that estimate, and logical replay
+bytes alone do not strictly bound modified SQLite pages under high chunk
+cardinality. Registry candidate snapshots currently carry no defensible
+page-cost oracle. Memory-only Registry implementation may proceed, but no
+persistent exact-replacement code or capability claim may land until a reviewed
+amendment supplies a pre-spawn, persistence-owned admission proof or replaces
+the WAL contract. Detecting excess after child launch or splitting exact
+candidate deletion across transactions is not an acceptable workaround.
+
 SQLite no longer chooses a live eviction candidate independently. The Registry
 passes the persistence actor an exact terminal candidate list containing each
 `RunId` and byte-exact BINARY creation key. One SQLite transaction:
@@ -228,13 +250,29 @@ passes the persistence actor an exact terminal candidate list containing each
 4. verifies record, metadata, replay, and file admission accounting; and
 5. commits.
 
-The reply distinguishes `NotCommitted(error)` from
-`Committed { post_commit_error }`. Before COMMIT, SQLite rollback and Registry
-fence restoration leave every candidate present; ordinary capacity rejection
-does not poison the actor. After COMMIT, including a later vacuum or physical
-file postcheck failure, the Registry performs one exact in-memory replacement
-with no I/O, await, or fallible result. A retry therefore resolves the newly
-committed Run rather than launching again.
+The durable disposition must distinguish `NotCommitted(error)`,
+`Committed { post_commit_error }`, and `CommitUnknown(error)`. A monotonic
+receipt is created as `Pending` before actor enqueue. The actor may decide it
+only once as `NotCommitted` or `Committed` and records that decision before
+reply delivery; actor or reply-owner loss while it remains `Pending` resolves
+to `CommitUnknown`, never to rollback by default. Before COMMIT, SQLite rollback
+and Registry fence restoration leave every candidate present; ordinary capacity
+rejection does not poison the actor. After COMMIT, including a later vacuum,
+physical-file postcheck, or reply-delivery failure, the Registry performs one
+exact in-memory replacement with no I/O, await, or fallible result. A retry
+therefore resolves the newly committed Run rather than launching again.
+
+A `COMMIT` call error is not automatically pre-COMMIT. After rollback handling,
+the persistence owner probes the exact old-or-new unit: all old candidates and
+no new row is `NotCommitted`; all exact candidates absent and the new row
+present is `Committed`; a hybrid result, failed rollback, or failed probe is
+`CommitUnknown`. Unknown disposition restores neither candidates nor creation
+admission. The Registry reservation and its candidate/new-key fences transfer
+to a daemon fail-stop owner for the rest of the incarnation, while the pending
+physical Run and overlap slot use the existing full-quiescence cleanup transfer.
+The daemon then stops socket admission so SQLite recovery after restart is the
+only durable authority. Unknown disposition must never reopen a key or launch a
+replacement child in the same epoch.
 
 A daemon crash before COMMIT recovers all old candidates and no new row. A
 crash after COMMIT but before in-memory replacement recovers only the new

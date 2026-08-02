@@ -341,10 +341,12 @@ The Unix socket is created with mode `0600`. Startup refuses to replace an ordin
 Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Exited Runs, total Run count, attachment count, and total daemon memory still have no global quotas or GC.
 
 [Decision 013](architecture/choices/013-retained-run-resource-governance.md)
-accepts a 128-record Registry ceiling and ownership-safe collection contract for
-T-027. It remains target design until the generation-6 public error, Registry,
-persistence, and sustained-churn gates land; the current no-GC behavior above
-remains the shipped truth in the meantime.
+accepts the memory-only 128-record Registry ceiling and ownership-safe
+collection contract for T-027. Persistent exact-replacement semantics are
+specified, but physical admission remains unresolved because multi-candidate
+cascade deletion has not been reconciled with the frozen SQLite WAL ceilings.
+The design remains unshipped until its Registry and sustained-churn gates land;
+the current no-GC behavior above remains runtime truth in the meantime.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
@@ -373,21 +375,21 @@ a PID from durable metadata.
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
 
-| Decision                              | Status                                          | Record                                                              |
-| ------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------- |
-| Rust and Tokio long-lived daemon      | accepted                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
-| `portable-pty` native Backend         | accepted                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 6                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
-| Run lifecycle concurrency             | accepted, incomplete policy                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
-| Ordered bounded raw-output replay     | accepted                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
-| Rust schema and TypeScript codegen    | accepted                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
-| Node TypeScript SDK                   | accepted                                        | [007](architecture/choices/007-node-typescript-sdk.md)              |
-| `crossterm` interactive CLI           | accepted                                        | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
-| Runtime persistence and recovery      | accepted and implemented                        | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
-| Explicit TypeScript Integrations      | accepted                                        | [010](architecture/choices/010-explicit-typescript-integrations.md) |
-| Context, artifacts, lineage, and fork | accepted                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
-| tmux Control Mode Backend             | accepted and implemented; version lanes pending | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
-| Retained Run resource governance      | accepted design; implementation pending         | [013](architecture/choices/013-retained-run-resource-governance.md) |
+| Decision                              | Status                                           | Record                                                              |
+| ------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------- |
+| Rust and Tokio long-lived daemon      | accepted                                         | [001](architecture/choices/001-rust-tokio-daemon.md)                |
+| `portable-pty` native Backend         | accepted                                         | [002](architecture/choices/002-portable-pty-native-backend.md)      |
+| Unix socket and NDJSON protocol       | accepted for generation 6                        | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Run lifecycle concurrency             | accepted, incomplete policy                      | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
+| Ordered bounded raw-output replay     | accepted                                         | [005](architecture/choices/005-ordered-output-replay.md)            |
+| Rust schema and TypeScript codegen    | accepted                                         | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
+| Node TypeScript SDK                   | accepted                                         | [007](architecture/choices/007-node-typescript-sdk.md)              |
+| `crossterm` interactive CLI           | accepted                                         | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
+| Runtime persistence and recovery      | accepted and implemented                         | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
+| Explicit TypeScript Integrations      | accepted                                         | [010](architecture/choices/010-explicit-typescript-integrations.md) |
+| Context, artifacts, lineage, and fork | accepted                                         | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
+| tmux Control Mode Backend             | accepted and implemented; version lanes pending  | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Retained Run resource governance      | memory owner accepted; persistent WAL unresolved | [013](architecture/choices/013-retained-run-resource-governance.md) |
 
 ## Risk-to-fixture traceability
 
