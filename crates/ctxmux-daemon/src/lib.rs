@@ -1892,7 +1892,11 @@ impl Run {
         }
         loop {
             match self.unpublished_cleanup_result() {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    let descriptors = control.detach_closed_descriptors_after_owner_fence()?;
+                    drop(descriptors);
+                    return Ok(());
+                }
                 Err(error) if Instant::now() >= deadline => {
                     return Err(match request_error {
                         Some(request_error) => format!("{request_error}; {error}"),
@@ -1913,9 +1917,10 @@ impl Run {
     }
 
     fn unpublished_cleanup_result(self: &Arc<Self>) -> Result<(), String> {
-        self.native_control()
-            .map_err(|error| error.message.clone())?
-            .unpublished_cleanup_result()?;
+        let control = self
+            .native_control()
+            .map_err(|error| error.message.clone())?;
+        control.unpublished_cleanup_result()?;
         let owners = Arc::strong_count(self);
         if owners != 1 {
             return Err(format!(

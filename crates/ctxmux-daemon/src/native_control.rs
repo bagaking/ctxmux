@@ -2,6 +2,7 @@
 
 use std::{
     collections::VecDeque,
+    fmt,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Condvar, Mutex, Weak, mpsc},
@@ -169,12 +170,31 @@ pub(crate) struct NativeControlOwner {
 
 struct NativeControlInner {
     run_id: RunId,
-    pty: Mutex<Box<dyn PtyControl>>,
-    writer: Mutex<Box<dyn Write + Send>>,
+    pty: Mutex<Option<Box<dyn PtyControl>>>,
+    writer: Mutex<Option<Box<dyn Write + Send>>>,
     state: Mutex<NativeControlState>,
     reap: Mutex<ChildReapState>,
     reap_changed: Condvar,
     input_drains: InputDrainGate,
+}
+
+/// Descriptor handles detached from a closed native incarnation after the
+/// caller has fenced every Run lookup owner. Dropping this value closes the
+/// descriptors outside the native-control and Registry locks.
+#[must_use = "detached native descriptors must be dropped outside owner locks"]
+pub(crate) struct DetachedNativeDescriptors {
+    pty: Option<Box<dyn PtyControl>>,
+    writer: Option<Box<dyn Write + Send>>,
+}
+
+impl fmt::Debug for DetachedNativeDescriptors {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DetachedNativeDescriptors")
+            .field("pty", &self.pty.is_some())
+            .field("writer", &self.writer.is_some())
+            .finish()
+    }
 }
 
 enum ChildReapState {
@@ -250,8 +270,8 @@ impl NativeControlOwner {
             Self {
                 inner: Arc::new(NativeControlInner {
                     run_id,
-                    pty: Mutex::new(pty),
-                    writer: Mutex::new(writer),
+                    pty: Mutex::new(Some(pty)),
+                    writer: Mutex::new(Some(writer)),
                     state: Mutex::new(NativeControlState {
                         phase: ControlPhase::Open,
                         input_failure: None,
@@ -496,11 +516,10 @@ impl NativeControlOwner {
         }
     }
 
-    /// Prove that unpublished cleanup owns no child, control, or input worker.
-    ///
-    /// Reap alone is insufficient: the waiter may still be closing control and
-    /// an input drain owns `NativeControlInner` independently of the Run.
-    pub(crate) fn unpublished_cleanup_result(&self) -> Result<(), String> {
+    /// Prove that a closed native owner retains no child, control, or input
+    /// worker. This is only the Backend-local part of collection eligibility;
+    /// the Registry must separately fence Run lookup pins and terminal state.
+    pub(crate) fn closed_quiescence_result(&self) -> Result<(), String> {
         self.reap_result()?;
         let state = mutex_lock(&self.inner.state);
         if state.phase != ControlPhase::Closed
@@ -524,6 +543,25 @@ impl NativeControlOwner {
             ));
         }
         Ok(())
+    }
+
+    /// Detach descriptors whose public semantics ended with the closed native
+    /// incarnation. The caller must already own the Registry or unpublished
+    /// Run fence; this method revalidates Backend-local quiescence before the
+    /// irreversible take. A later reservation abort restores Run history, not
+    /// these already-closed descriptors.
+    pub(crate) fn detach_closed_descriptors_after_owner_fence(
+        &self,
+    ) -> Result<DetachedNativeDescriptors, String> {
+        self.closed_quiescence_result()?;
+        let pty = mutex_lock(&self.inner.pty).take();
+        let writer = mutex_lock(&self.inner.writer).take();
+        Ok(DetachedNativeDescriptors { pty, writer })
+    }
+
+    /// Keep the T-026 cleanup contract named at its original owner boundary.
+    pub(crate) fn unpublished_cleanup_result(&self) -> Result<(), String> {
+        self.closed_quiescence_result()
     }
 }
 
@@ -575,6 +613,12 @@ impl NativeControlOwner {
             )));
         }
         let pty = mutex_lock(&self.inner.pty);
+        let pty = pty.as_ref().ok_or_else(|| {
+            unknown(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("Run {} PTY control descriptor is closed", self.inner.run_id),
+            ))
+        })?;
         pty.resize(to_pty_size(size)).map_err(|error| {
             unknown(ProtocolError::new(
                 ErrorCode::Io,
@@ -643,6 +687,9 @@ impl NativeControlInner {
         let written_bytes = command.data.len();
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut writer = mutex_lock(&self.writer);
+            let writer = writer.as_mut().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "PTY input writer is closed")
+            })?;
             writer
                 .write_all(&command.data)
                 .and_then(|()| writer.flush())
@@ -810,8 +857,12 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use std::{
         io,
-        sync::{Arc, Condvar, Mutex, mpsc},
-        time::Duration,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
     };
 
     use ctxmux_protocol::{CommandDisposition, ControlReceipt, ErrorCode, RunId, TerminalSize};
@@ -850,6 +901,42 @@ mod tests {
     impl io::Write for RecordingWriter {
         fn write(&mut self, data: &[u8]) -> io::Result<usize> {
             mutex_lock(&self.0).extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct DropCountingPty(Arc<AtomicUsize>);
+
+    impl Drop for DropCountingPty {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl PtyControl for DropCountingPty {
+        fn resize(&self, _size: PtySize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> io::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+    }
+
+    struct DropCountingWriter(Arc<AtomicUsize>);
+
+    impl Drop for DropCountingWriter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl io::Write for DropCountingWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
             Ok(data.len())
         }
 
@@ -995,6 +1082,123 @@ mod tests {
         assert!(error.contains("fixture kill failure"));
         assert!(error.contains("fixture wait failure"));
         assert!(!error.contains("later wait failure"));
+    }
+
+    #[test]
+    fn closed_descriptors_require_full_quiescence_and_drop_once() {
+        let pty_drops = Arc::new(AtomicUsize::new(0));
+        let writer_drops = Arc::new(AtomicUsize::new(0));
+        let (owner, child) = owner(
+            Box::new(DropCountingWriter(Arc::clone(&writer_drops))),
+            Box::new(DropCountingPty(Arc::clone(&pty_drops))),
+            InputDrainGate::default(),
+        );
+
+        owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect_err("pending child cannot lose descriptors");
+        owner.mark_reaped();
+        owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect_err("open control cannot lose descriptors");
+
+        let stop = owner.begin_stop().expect("enter stopping phase");
+        owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect_err("stopping control cannot lose descriptors");
+        let super::ChildCommand::Stop(reply) = child
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fixture receives stop")
+        else {
+            panic!("public stop sends the stop command variant");
+        };
+        reply.send(Ok(())).expect("acknowledge fixture stop");
+        drop(stop);
+
+        owner.mark_closed();
+        let extra_owner = owner.clone();
+        owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect_err("an independent control owner blocks compaction");
+        assert_eq!(pty_drops.load(Ordering::Acquire), 0);
+        assert_eq!(writer_drops.load(Ordering::Acquire), 0);
+
+        drop(extra_owner);
+        let descriptors = owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect("closed quiescent descriptors detach");
+        assert_eq!(pty_drops.load(Ordering::Acquire), 0);
+        assert_eq!(writer_drops.load(Ordering::Acquire), 0);
+        drop(descriptors);
+        assert_eq!(pty_drops.load(Ordering::Acquire), 1);
+        assert_eq!(writer_drops.load(Ordering::Acquire), 1);
+
+        let already_compacted = owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect("descriptor compaction is idempotent");
+        drop(already_compacted);
+        assert_eq!(pty_drops.load(Ordering::Acquire), 1);
+        assert_eq!(writer_drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            owner
+                .begin_input(vec![1])
+                .expect_err("compacted closed control rejects input")
+                .error
+                .code,
+            ErrorCode::InvalidRunState
+        );
+        assert_eq!(
+            owner
+                .resize(TerminalSize { rows: 24, cols: 80 })
+                .expect_err("compacted closed control rejects resize")
+                .error
+                .code,
+            ErrorCode::InvalidRunState
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_input_owner_prevents_closed_descriptor_compaction() {
+        let pty_drops = Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (owner, _child) = owner(
+            Box::new(BlockingWriter {
+                started: Some(started_tx),
+                release: Arc::clone(&release),
+                written: Arc::new(Mutex::new(0)),
+            }),
+            Box::new(DropCountingPty(Arc::clone(&pty_drops))),
+            InputDrainGate::default(),
+        );
+
+        let pending = owner.begin_input(vec![1]).expect("admit blocking input");
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("input worker blocks inside the writer");
+        owner.mark_reaped();
+        owner.mark_closed();
+        owner
+            .detach_closed_descriptors_after_owner_fence()
+            .expect_err("active input owner blocks descriptor compaction");
+        assert_eq!(pty_drops.load(Ordering::Acquire), 0);
+
+        release_writer(&release);
+        pending
+            .resolve()
+            .await
+            .expect("already-started input retains its outcome");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let descriptors = loop {
+            match owner.detach_closed_descriptors_after_owner_fence() {
+                Ok(descriptors) => break descriptors,
+                Err(_) if Instant::now() < deadline => tokio::task::yield_now().await,
+                Err(error) => panic!("input owner did not quiesce: {error}"),
+            }
+        };
+        assert_eq!(pty_drops.load(Ordering::Acquire), 0);
+        drop(descriptors);
+        assert_eq!(pty_drops.load(Ordering::Acquire), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
