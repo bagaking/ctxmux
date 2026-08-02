@@ -24,7 +24,7 @@ pub(super) async fn handle(
     id: RunId,
     after_seq: u64,
 ) -> Result<(), ConnectionError> {
-    let run = match manager.get(id) {
+    let run = match manager.pin(id) {
         Ok(run) => run,
         Err(error) => {
             send(&mut wire, &ServerFrame::Error { error }).await?;

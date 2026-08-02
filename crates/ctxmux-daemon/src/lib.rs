@@ -449,8 +449,11 @@ impl RunManager {
             .validate()
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?;
         let operation_guard = self.registry.lock_creation(&operation_key).await;
-        if let Some(run) = self.registry.resolve_creation(&operation_key, &request)? {
-            return Ok(run.info());
+        if let Some(info) = self
+            .registry
+            .resolve_creation_info(&operation_key, &request)?
+        {
+            return Ok(info);
         }
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
@@ -506,7 +509,7 @@ impl RunManager {
         let (spec, lineage) = match request.clone() {
             CreationRequest::Start { spec } => (spec, None),
             CreationRequest::Fork { parent, plan } => {
-                let parent_run = self.get(parent)?;
+                let parent_run = self.pin(parent)?;
                 let (spec, fidelity) = match plan {
                     ForkPlan::LevelA if parent_run.capabilities.fork_level_a => (
                         parent_run.spec.clone().ok_or_else(|| {
@@ -688,12 +691,7 @@ impl RunManager {
             }
         };
 
-        let mut pending = self
-            .registry
-            .snapshot()
-            .into_iter()
-            .filter(|run| matches!(run.incarnation_control, Some(RunControl::Tmux(_))))
-            .collect::<Vec<_>>();
+        let mut pending = self.registry.pin_tmux_for_shutdown();
 
         for run in &pending {
             if let Some(RunControl::Tmux(control)) = &run.incarnation_control {
@@ -770,14 +768,25 @@ impl RunManager {
         }
     }
 
-    fn get(&self, id: RunId) -> Result<Arc<Run>, ProtocolError> {
-        self.registry.get(id).ok_or_else(|| {
+    fn pin(&self, id: RunId) -> Result<Arc<Run>, ProtocolError> {
+        self.registry.pin(id).ok_or_else(|| {
             ProtocolError::new(ErrorCode::RunNotFound, format!("Run {id} does not exist"))
         })
     }
 
+    fn info(&self, id: RunId) -> Result<RunInfo, ProtocolError> {
+        self.registry.info(id).ok_or_else(|| {
+            ProtocolError::new(ErrorCode::RunNotFound, format!("Run {id} does not exist"))
+        })
+    }
+
+    #[cfg(test)]
+    fn get(&self, id: RunId) -> Result<Arc<Run>, ProtocolError> {
+        self.pin(id)
+    }
+
     fn list(&self) -> Vec<RunInfo> {
-        let mut runs = self.registry.list();
+        let mut runs = self.registry.list_infos();
         runs.sort_by_key(|run| run.id.to_string());
         runs
     }
@@ -2589,10 +2598,10 @@ async fn execute_request(
             runs: manager.list(),
         }),
         Request::Status { id } => Ok(Response::Status {
-            run: manager.get(id)?.info(),
+            run: manager.info(id)?,
         }),
         Request::Input { id, data } => {
-            let run = match manager.get(id) {
+            let run = match manager.pin(id) {
                 Ok(run) => run,
                 Err(error) => {
                     return Ok(Response::ControlRejected {
@@ -2603,7 +2612,7 @@ async fn execute_request(
             Ok(short_control_response(&run, run.input(data).await))
         }
         Request::Resize { id, size } => {
-            let run = match manager.get(id) {
+            let run = match manager.pin(id) {
                 Ok(run) => run,
                 Err(error) => {
                     return Ok(Response::ControlRejected {
@@ -2614,7 +2623,7 @@ async fn execute_request(
             Ok(short_control_response(&run, run.resize(size)))
         }
         Request::Stop { id } => {
-            let run = match manager.get(id) {
+            let run = match manager.pin(id) {
                 Ok(run) => run,
                 Err(error) => {
                     return Ok(Response::ControlRejected {

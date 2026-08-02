@@ -11,7 +11,7 @@ use ctxmux_protocol::{
 };
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
-use super::{Run, read_lock, write_lock};
+use super::{Run, RunControl, read_lock, write_lock};
 
 const CREATION_STRIPES: usize = 64;
 // Matches the pre-registered resource start concurrency while bounding only
@@ -681,8 +681,18 @@ impl CreationRequest {
 
 #[derive(Default)]
 struct RegistryState {
-    runs: HashMap<RunId, Arc<Run>>,
+    runs: HashMap<RunId, RegistryEntry>,
     creation_runs: HashMap<CreateOperationKey, RunId>,
+}
+
+/// One Registry-owned Run identity and its optional exact creation mapping.
+///
+/// Residency and publication reservations extend this owner in the next
+/// T-027 slice; callers already use copy versus pin APIs so that transition
+/// does not require another lookup semantic migration.
+struct RegistryEntry {
+    run: Arc<Run>,
+    operation_key: Option<CreateOperationKey>,
 }
 
 /// Single owner of retained Runs and their bounded creation-key mappings.
@@ -709,7 +719,13 @@ impl RunRegistry {
             let mut state = write_lock(&registry.state);
             for (operation_key, run) in runs {
                 let id = run.id;
-                let previous_run = state.runs.insert(id, Arc::clone(&run));
+                let previous_run = state.runs.insert(
+                    id,
+                    RegistryEntry {
+                        run,
+                        operation_key: Some(operation_key.clone()),
+                    },
+                );
                 let previous_key = state.creation_runs.insert(operation_key, id);
                 debug_assert!(previous_run.is_none());
                 debug_assert!(previous_key.is_none());
@@ -746,23 +762,29 @@ impl RunRegistry {
     }
 
     /// Resolve a completed creation while its key stripe is exclusively held.
-    pub(crate) fn resolve_creation(
+    pub(crate) fn resolve_creation_info(
         &self,
         operation_key: &CreateOperationKey,
         request: &CreationRequest,
-    ) -> Result<Option<Arc<Run>>, ProtocolError> {
+    ) -> Result<Option<RunInfo>, ProtocolError> {
         let state = read_lock(&self.state);
         let Some(id) = state.creation_runs.get(operation_key) else {
             return Ok(None);
         };
-        let run = state.runs.get(id).cloned().ok_or_else(|| {
+        let entry = state.runs.get(id).ok_or_else(|| {
             ProtocolError::new(
                 ErrorCode::Internal,
                 "Run creation registry lost its retained Run",
             )
         })?;
-        if request.matches_run(&run) {
-            Ok(Some(run))
+        if entry.operation_key.as_ref() != Some(operation_key) {
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "Run creation registry lost its exact key owner",
+            ));
+        }
+        if request.matches_run(&entry.run) {
+            Ok(Some(entry.run.info()))
         } else {
             Err(ProtocolError::new(
                 ErrorCode::CreationConflict,
@@ -783,7 +805,13 @@ impl RunRegistry {
         let mut state = write_lock(&self.state);
         debug_assert!(!state.creation_runs.contains_key(&operation_key));
         debug_assert!(!state.runs.contains_key(&id));
-        state.runs.insert(id, run);
+        state.runs.insert(
+            id,
+            RegistryEntry {
+                run,
+                operation_key: Some(operation_key.clone()),
+            },
+        );
         state.creation_runs.insert(operation_key, id);
         let cleanup_reservation = pending.into_published_reservation();
         drop(state);
@@ -794,23 +822,60 @@ impl RunRegistry {
     /// Publish one non-creation-backed Run, currently only a tmux import or test seam.
     pub(crate) fn publish_unkeyed(&self, run: Arc<Run>) {
         let id = run.id;
-        let previous = write_lock(&self.state).runs.insert(id, run);
+        let previous = write_lock(&self.state).runs.insert(
+            id,
+            RegistryEntry {
+                run,
+                operation_key: None,
+            },
+        );
         debug_assert!(previous.is_none());
     }
 
-    pub(crate) fn get(&self, id: RunId) -> Option<Arc<Run>> {
-        read_lock(&self.state).runs.get(&id).cloned()
+    /// Atomically clone a long-lived owner while the Registry still owns it.
+    pub(crate) fn pin(&self, id: RunId) -> Option<Arc<Run>> {
+        read_lock(&self.state)
+            .runs
+            .get(&id)
+            .map(|entry| Arc::clone(&entry.run))
     }
 
-    pub(crate) fn list(&self) -> Vec<RunInfo> {
+    /// Copy current public state without creating a long-lived Run owner.
+    pub(crate) fn info(&self, id: RunId) -> Option<RunInfo> {
+        read_lock(&self.state)
+            .runs
+            .get(&id)
+            .map(|entry| entry.run.info())
+    }
+
+    /// Copy the public list without pinning every retained Run.
+    pub(crate) fn list_infos(&self) -> Vec<RunInfo> {
         read_lock(&self.state)
             .runs
             .values()
-            .map(|run| run.info())
+            .map(|entry| entry.run.info())
             .collect()
     }
 
+    /// Pin only tmux Runs that still belong to ordinary Registry shutdown.
+    ///
+    /// The later Collecting state will be filtered under this same lock rather
+    /// than cloning the whole Registry before testing Backend ownership.
+    pub(crate) fn pin_tmux_for_shutdown(&self) -> Vec<Arc<Run>> {
+        read_lock(&self.state)
+            .runs
+            .values()
+            .filter(|entry| matches!(&entry.run.incarnation_control, Some(RunControl::Tmux(_))))
+            .map(|entry| Arc::clone(&entry.run))
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<Arc<Run>> {
-        read_lock(&self.state).runs.values().cloned().collect()
+        read_lock(&self.state)
+            .runs
+            .values()
+            .map(|entry| Arc::clone(&entry.run))
+            .collect()
     }
 }
