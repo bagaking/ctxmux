@@ -19,6 +19,31 @@ Research and the wrong-case corpus are closed baseline work. New cases are
 added only when a real implementation decision or observed failure creates a
 new invariant; future cases are not expanded speculatively.
 
+## Program ownership and convergence
+
+Reviewed on 2026-08-12 after the reliability program grew beyond one finite
+Feature boundary. Correctness, release qualification, and peer performance are
+independently closable; one result must not keep an unrelated owner open.
+
+| Owner                                   | Finite closure                                                                                                                                                                                  | Reviewed task topology                                                                                                                         |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Run-Kernel correctness (`f-22bczhydf`)  | Bound memory-only and persistent retained state, dispose of unclassified native waiter failure without inventing exit truth, close Kernel P0/P1 findings, and prove the retained-state plateau. | memory-only Registry GC; bounded waiter-failure disposition; persistent exact replacement; bounded Kernel review; retained-state qualification |
+| tmux adapter (`f-224czneed`)            | Prove the declared public Control Mode adapter and preserve non-output observation truth across attachment lag.                                                                                 | tmux capability tasks only; no release or Kernel GC work                                                                                       |
+| Composition and release (`f-225cz7943`) | Prove public composition, activation, installation, packaging, independent release review, supported platforms, and local release gates.                                                        | composition example; package/release preparation; daemon activation; release qualification                                                     |
+| Peer performance (`f-22aczwza9`)        | Run one pre-registered, budget-bounded measure/optimize/remeasure cycle and record honest wins, ties, and losses.                                                                               | comparable harness; measured raw-byte ROI decision; bounded-cycle result                                                                       |
+
+The earlier reliability-and-performance umbrella `f-226cz5zdq` is superseded
+only after these successor plans and their dependency edges are materialized.
+Completed evidence remains historical truth; unfinished work is not marked
+done during the transfer. Competitive dominance is an aspiration, not a
+correctness or release completion condition.
+
+Each owner writes its own Feature-local `verification.md`. A release summary
+may cite already closed successor evidence, but no shared mutable qualification
+report is task truth for multiple Features. The performance Feature remains
+`proposal_only` until explicitly scheduled, and no planning transition grants
+authority to publish packages, Git refs, hosted releases, or benchmark results.
+
 ## M0 — Repository foundation
 
 Establish the smallest Rust and TypeScript workspaces, shared quality commands,
