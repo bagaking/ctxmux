@@ -13,7 +13,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -48,8 +48,8 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{
-    CreationFlightOwner, CreationRequest, PendingPublication, RunRegistry, UnpublishedCleanupOwner,
-    UnpublishedCleanupReservation,
+    CreationFlightOwner, CreationRequest, PendingPublication, RunRegistry, TerminalOrdinal,
+    TerminalPublicationOwner, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
 };
 use crate::native_control::{
     ChildCommand, ControlResult, InputDrainGate, NativeControlOwner, PendingInput, PendingStop,
@@ -288,6 +288,7 @@ struct RunManager {
     registry: RunRegistry,
     creation_flights: CreationFlightOwner,
     unpublished_cleanups: UnpublishedCleanupOwner,
+    terminal_publications: TerminalPublicationOwner,
     native_input_drains: InputDrainGate,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
@@ -393,6 +394,7 @@ impl Default for RunManager {
             registry: RunRegistry::default(),
             creation_flights: CreationFlightOwner::default(),
             unpublished_cleanups: UnpublishedCleanupOwner::default(),
+            terminal_publications: TerminalPublicationOwner::default(),
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
@@ -408,6 +410,7 @@ impl Default for RunManager {
 
 impl RunManager {
     fn persistent(persistence: Persistence, recovered: Vec<RecoveredRun>) -> Self {
+        let terminal_publications = TerminalPublicationOwner::default();
         let runs = recovered
             .into_iter()
             .map(|recovered| {
@@ -420,7 +423,12 @@ impl RunManager {
                 );
                 (
                     operation_key,
-                    Run::recover(recovered, durable, LIVE_EVENT_CAPACITY),
+                    Run::recover(
+                        recovered,
+                        durable,
+                        LIVE_EVENT_CAPACITY,
+                        terminal_publications.clone(),
+                    ),
                 )
             })
             .collect();
@@ -428,6 +436,7 @@ impl RunManager {
             registry: RunRegistry::recovered(runs),
             creation_flights: CreationFlightOwner::default(),
             unpublished_cleanups: UnpublishedCleanupOwner::default(),
+            terminal_publications,
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
@@ -542,11 +551,14 @@ impl RunManager {
             }
         };
         let pending = Run::spawn_pending(
-            spec,
-            lineage,
-            persistence_mode,
-            self.live_event_capacity,
-            self.native_input_drains.clone(),
+            NativeSpawnConfig {
+                spec,
+                lineage,
+                persistence_mode,
+                live_event_capacity: self.live_event_capacity,
+                input_drains: self.native_input_drains.clone(),
+                terminal_publications: self.terminal_publications.clone(),
+            },
             request,
             cleanup_reservation,
         )?;
@@ -655,6 +667,7 @@ impl RunManager {
                 socket_path,
                 pane_id,
                 self.live_event_capacity,
+                self.terminal_publications.clone(),
                 started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
                 started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
                 started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
@@ -835,9 +848,14 @@ impl RunManager {
         let request = CreationRequest::Start { spec: spec.clone() };
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let pending = Run::spawn_pending_with_setup(
-            spec,
-            None,
-            self.persistence_mode(),
+            NativeSpawnConfig {
+                spec,
+                lineage: None,
+                persistence_mode: self.persistence_mode(),
+                live_event_capacity: LIVE_EVENT_CAPACITY,
+                input_drains: InputDrainGate::default(),
+                terminal_publications: self.terminal_publications.clone(),
+            },
             request,
             cleanup_reservation,
             captured_run,
@@ -855,7 +873,12 @@ impl RunManager {
     where
         G: FnOnce() + Send + 'static,
     {
-        let run = Run::spawn_with_wait_hook(spec, self.persistence_mode(), after_wait)?;
+        let run = Run::spawn_with_wait_hook_owner(
+            spec,
+            self.persistence_mode(),
+            self.terminal_publications.clone(),
+            after_wait,
+        )?;
         let info = run.info();
         self.registry.publish_unkeyed(run);
         Ok(info)
@@ -882,6 +905,7 @@ struct NativeSpawnConfig {
     persistence_mode: PersistenceMode,
     live_event_capacity: usize,
     input_drains: InputDrainGate,
+    terminal_publications: TerminalPublicationOwner,
 }
 
 impl NativeSpawnConfig {
@@ -971,6 +995,8 @@ struct Run {
     persistence_transition: Mutex<()>,
     persistence: Mutex<Option<PersistentRun>>,
     attachments: AtomicUsize,
+    terminal_publications: TerminalPublicationOwner,
+    terminal_ordinal: OnceLock<TerminalOrdinal>,
     events: broadcast::Sender<RunEvent>,
 }
 
@@ -1193,6 +1219,7 @@ impl Run {
                 persistence_mode,
                 live_event_capacity,
                 input_drains,
+                terminal_publications: TerminalPublicationOwner::default(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -1202,9 +1229,7 @@ impl Run {
 
     #[cfg(test)]
     fn spawn_pending_with_setup<F>(
-        spec: RunSpec,
-        lineage: Option<RunLineage>,
-        persistence_mode: PersistenceMode,
+        config: NativeSpawnConfig,
         request: CreationRequest,
         cleanup_reservation: UnpublishedCleanupReservation,
         captured_run: &Arc<Mutex<Option<Arc<Run>>>>,
@@ -1214,13 +1239,7 @@ impl Run {
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
         Self::spawn_with_hooks(
-            NativeSpawnConfig {
-                spec,
-                lineage,
-                persistence_mode,
-                live_event_capacity: LIVE_EVENT_CAPACITY,
-                input_drains: InputDrainGate::default(),
-            },
+            config,
             |run| {
                 let previous = mutex_lock(captured_run).replace(Arc::clone(&run));
                 assert!(previous.is_none(), "setup fixture captures one Run owner");
@@ -1240,6 +1259,24 @@ impl Run {
     where
         G: FnOnce() + Send + 'static,
     {
+        Self::spawn_with_wait_hook_owner(
+            spec,
+            persistence_mode,
+            TerminalPublicationOwner::default(),
+            after_wait,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_with_wait_hook_owner<G>(
+        spec: RunSpec,
+        persistence_mode: PersistenceMode,
+        terminal_publications: TerminalPublicationOwner,
+        after_wait: G,
+    ) -> Result<Arc<Self>, ProtocolError>
+    where
+        G: FnOnce() + Send + 'static,
+    {
         Self::spawn_with_hooks(
             NativeSpawnConfig {
                 spec,
@@ -1247,6 +1284,7 @@ impl Run {
                 persistence_mode,
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
+                terminal_publications,
             },
             |run| run,
             |_, _| Ok(()),
@@ -1255,22 +1293,12 @@ impl Run {
     }
 
     fn spawn_pending(
-        spec: RunSpec,
-        lineage: Option<RunLineage>,
-        persistence_mode: PersistenceMode,
-        live_event_capacity: usize,
-        input_drains: InputDrainGate,
+        config: NativeSpawnConfig,
         request: CreationRequest,
         cleanup_reservation: UnpublishedCleanupReservation,
     ) -> Result<PendingPublication, ProtocolError> {
         Self::spawn_with_hooks(
-            NativeSpawnConfig {
-                spec,
-                lineage,
-                persistence_mode,
-                live_event_capacity,
-                input_drains,
-            },
+            config,
             |run| PendingPublication::new(request, run, cleanup_reservation),
             |_, _| Ok(()),
             || {},
@@ -1313,34 +1341,12 @@ impl Run {
         drop(pair.slave);
         let mut pending_child = PendingChild::new(child);
         let pid = pending_child.child().process_id();
-        let NativeSpawnConfig {
-            spec,
-            lineage,
-            persistence_mode,
-            live_event_capacity,
-            input_drains,
-        } = config;
-        let (events, _) = broadcast::channel(live_event_capacity);
+        let (events, _) = broadcast::channel(config.live_event_capacity);
         let id = RunId::new();
         let (native_control, child_command_rx) =
-            NativeControlOwner::new(id, pair.master, writer, input_drains);
+            NativeControlOwner::new(id, pair.master, writer, config.input_drains.clone());
         pending_child.bind_reap_control(native_control.clone());
-        let owner = make_owner(Arc::new(Self {
-            id,
-            spec: Some(spec),
-            lineage,
-            backend: RunBackend::Native,
-            capabilities: RunCapabilities::NATIVE,
-            pid,
-            state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::default()),
-            incarnation_control: Some(RunControl::Native(native_control)),
-            persistence_mode,
-            persistence_transition: Mutex::new(()),
-            persistence: Mutex::new(None),
-            attachments: AtomicUsize::new(0),
-            events,
-        }));
+        let owner = make_owner(Self::new_native(config, id, pid, native_control, events));
         let run = Arc::clone(owner.run());
 
         // Start the waiter first, but do not hand it the child until the output
@@ -1402,10 +1408,38 @@ impl Run {
         Ok(owner)
     }
 
+    fn new_native(
+        config: NativeSpawnConfig,
+        id: RunId,
+        pid: Option<u32>,
+        native_control: NativeControlOwner,
+        events: broadcast::Sender<RunEvent>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            spec: Some(config.spec),
+            lineage: config.lineage,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid,
+            state: Mutex::new(RunState::Running),
+            output: Mutex::new(OutputLog::default()),
+            incarnation_control: Some(RunControl::Native(native_control)),
+            persistence_mode: config.persistence_mode,
+            persistence_transition: Mutex::new(()),
+            persistence: Mutex::new(None),
+            attachments: AtomicUsize::new(0),
+            terminal_publications: config.terminal_publications,
+            terminal_ordinal: OnceLock::new(),
+            events,
+        })
+    }
+
     fn import_tmux(
         socket_path: &str,
         pane_id: &str,
         live_event_capacity: usize,
+        terminal_publications: TerminalPublicationOwner,
         discovery_deadline: Instant,
         prepare_deadline: Instant,
         total_deadline: Instant,
@@ -1445,6 +1479,8 @@ impl Run {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(None),
             attachments: AtomicUsize::new(0),
+            terminal_publications,
+            terminal_ordinal: OnceLock::new(),
             events,
         });
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -1536,6 +1572,7 @@ impl Run {
         recovered: RecoveredRun,
         persistence: PersistentRun,
         live_event_capacity: usize,
+        terminal_publications: TerminalPublicationOwner,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(live_event_capacity);
         Arc::new(Self {
@@ -1552,6 +1589,8 @@ impl Run {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(Some(persistence)),
             attachments: AtomicUsize::new(0),
+            terminal_publications,
+            terminal_ordinal: OnceLock::new(),
             events,
         })
     }
@@ -1768,26 +1807,36 @@ impl Run {
 
     fn publish_terminal(&self, terminal: RunState) {
         if self.persistence_mode == PersistenceMode::MemoryOnly {
-            *mutex_lock(&self.state) = terminal.clone();
+            self.publish_terminal_state(terminal.clone());
             let _ = self.events.send(RunEvent::Exited { state: terminal });
             return;
         }
         let _transition = mutex_lock(&self.persistence_transition);
         let (replay, persistence) = {
             let output = mutex_lock(&self.output);
-            let mut state = mutex_lock(&self.state);
             let persistence = mutex_lock(&self.persistence).as_ref().cloned();
-            if persistence.is_none() {
-                *state = terminal.clone();
-            }
             (output.replay(0), persistence)
         };
         if let Some(persistence) = persistence {
             persistence.finalize(self.id, replay, terminal.clone());
             let _output = mutex_lock(&self.output);
-            *mutex_lock(&self.state) = terminal.clone();
+            self.publish_terminal_state(terminal.clone());
+        } else {
+            self.publish_terminal_state(terminal.clone());
         }
         let _ = self.events.send(RunEvent::Exited { state: terminal });
+    }
+
+    fn publish_interrupted(&self, reason: InterruptionReason) {
+        self.publish_terminal_state(RunState::Interrupted { reason });
+        let _ = self.events.send(RunEvent::Interrupted { reason });
+    }
+
+    fn publish_terminal_state(&self, terminal: RunState) {
+        self.terminal_publications
+            .publish(&self.terminal_ordinal, || {
+                *mutex_lock(&self.state) = terminal;
+            });
     }
 
     fn terminate_unpublished(self: &Arc<Self>) -> Result<(), String> {
@@ -1979,12 +2028,7 @@ fn complete_tmux_control(
         control.close_writer();
     }
     let _ = ready.try_send(Err(termination.error));
-    *mutex_lock(&run.state) = RunState::Interrupted {
-        reason: termination.reason,
-    };
-    let _ = run.events.send(RunEvent::Interrupted {
-        reason: termination.reason,
-    });
+    run.publish_interrupted(termination.reason);
     let _ = completion.send(cleanup);
 }
 

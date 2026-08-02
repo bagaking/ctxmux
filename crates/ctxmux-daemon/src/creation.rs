@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
-    sync::{Arc, Condvar, Mutex, RwLock},
+    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -18,6 +18,41 @@ const CREATION_STRIPES: usize = 64;
 // transient physical launch owners; this is not a public Run quota.
 const MAX_CREATION_OWNER_SLOTS: usize = 8;
 const CLEANUP_POLL: Duration = Duration::from_millis(20);
+
+/// Total order of terminal state publication within one daemon incarnation.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct TerminalOrdinal(u64);
+
+/// One short critical section that binds collection order to visible state.
+///
+/// A bare atomic counter is insufficient because a claimant can be descheduled
+/// before it writes terminal `RunState`, allowing a later ordinal to publish
+/// first. This owner never enters the Registry and therefore adds no
+/// Run/control -> Registry lock edge.
+#[derive(Clone, Default)]
+pub(crate) struct TerminalPublicationOwner {
+    next: Arc<Mutex<u64>>,
+}
+
+impl TerminalPublicationOwner {
+    pub(crate) fn publish(
+        &self,
+        ordinal: &OnceLock<TerminalOrdinal>,
+        publish_state: impl FnOnce(),
+    ) {
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *next = next
+            .checked_add(1)
+            .expect("terminal ordinal does not overflow");
+        ordinal
+            .set(TerminalOrdinal(*next))
+            .expect("one Run publishes terminal state once");
+        publish_state();
+    }
+}
 
 /// Bounded shutdown ownership for short-lived physical Run creation threads.
 ///
@@ -499,15 +534,55 @@ impl Drop for PendingPublication {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::Arc,
+        sync::{Arc, Mutex, OnceLock, TryLockError, mpsc},
+        thread,
         time::{Duration, Instant},
     };
 
     use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunSpec, TerminalSize};
 
     use super::{
-        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, UnpublishedCleanupOwner,
+        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, TerminalPublicationOwner,
+        UnpublishedCleanupOwner,
     };
+
+    #[test]
+    fn terminal_ordinal_matches_visible_publication_order() {
+        let owner = TerminalPublicationOwner::default();
+        let first_ordinal = Arc::new(OnceLock::new());
+        let second_ordinal = Arc::new(OnceLock::new());
+        let visible = Arc::new(Mutex::new(Vec::new()));
+        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(0);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(0);
+
+        let first_owner = owner.clone();
+        let first_cell = Arc::clone(&first_ordinal);
+        let first_visible = Arc::clone(&visible);
+        let first = thread::spawn(move || {
+            first_owner.publish(&first_cell, || {
+                first_entered_tx.send(()).expect("report first claimant");
+                release_first_rx.recv().expect("release first claimant");
+                first_visible.lock().unwrap().push("first");
+            });
+        });
+        first_entered_rx.recv().expect("first claimant owns order");
+
+        let publication_is_locked = matches!(owner.next.try_lock(), Err(TryLockError::WouldBlock));
+        assert!(
+            publication_is_locked,
+            "the terminal owner remains locked through visible state publication"
+        );
+
+        release_first_tx
+            .send(())
+            .expect("release first publication");
+        first.join().expect("first publisher remains live");
+        owner.publish(&second_ordinal, || {
+            visible.lock().unwrap().push("second");
+        });
+        assert_eq!(*visible.lock().unwrap(), ["first", "second"]);
+        assert!(first_ordinal.get() < second_ordinal.get());
+    }
 
     #[test]
     fn cleanup_reservations_enforce_and_reclaim_the_shared_owner_bound() {
