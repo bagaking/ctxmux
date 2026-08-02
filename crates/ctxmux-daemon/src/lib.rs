@@ -723,23 +723,15 @@ impl RunManager {
                     pending.swap_remove(index);
                     continue;
                 };
-                let completion = mutex_lock(&control.completion).try_recv();
-                match completion {
-                    Ok(Ok(())) => {
+                match control.observe_completion() {
+                    TmuxCompletionObservation::Complete(Ok(())) => {
                         pending.swap_remove(index);
                     }
-                    Ok(Err(error)) => {
+                    TmuxCompletionObservation::Complete(Err(error)) => {
                         failures.push(format!("Run {}: {error}", run.id));
                         pending.swap_remove(index);
                     }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        failures.push(format!(
-                            "Run {}: tmux control waiter ended without a completion receipt",
-                            run.id
-                        ));
-                        pending.swap_remove(index);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
+                    TmuxCompletionObservation::Pending => {
                         index += 1;
                     }
                 }
@@ -1028,7 +1020,17 @@ enum RunControl {
 struct TmuxRunControl {
     writer: Mutex<Option<TmuxCommandWriter>>,
     commands: mpsc::Sender<TmuxControlCommand>,
-    completion: Mutex<mpsc::Receiver<Result<(), String>>>,
+    completion: Mutex<TmuxCompletion>,
+}
+
+enum TmuxCompletion {
+    Pending(mpsc::Receiver<Result<(), String>>),
+    Complete(Result<(), String>),
+}
+
+enum TmuxCompletionObservation {
+    Pending,
+    Complete(Result<(), String>),
 }
 
 struct TmuxCommandWriter {
@@ -1064,6 +1066,51 @@ impl TmuxRunControl {
 
     fn close_writer(&self) -> bool {
         mutex_lock(&self.writer).take().is_some()
+    }
+
+    fn observe_completion(&self) -> TmuxCompletionObservation {
+        mutex_lock(&self.completion).observe()
+    }
+
+    fn wait_for_completion(&self, timeout: Duration) -> Result<(), String> {
+        mutex_lock(&self.completion).wait(timeout)
+    }
+}
+
+impl TmuxCompletion {
+    fn observe(&mut self) -> TmuxCompletionObservation {
+        let observed = match self {
+            Self::Pending(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "tmux control waiter ended without a completion receipt".to_owned(),
+                )),
+            },
+            Self::Complete(result) => return TmuxCompletionObservation::Complete(result.clone()),
+        };
+        let Some(result) = observed else {
+            return TmuxCompletionObservation::Pending;
+        };
+        *self = Self::Complete(result.clone());
+        TmuxCompletionObservation::Complete(result)
+    }
+
+    fn wait(&mut self, timeout: Duration) -> Result<(), String> {
+        let received = match self {
+            Self::Pending(receiver) => match receiver.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("timed out waiting for tmux control cleanup".to_owned());
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err("tmux control waiter ended without a completion receipt".to_owned())
+                }
+            },
+            Self::Complete(result) => return result.clone(),
+        };
+        *self = Self::Complete(received.clone());
+        received
     }
 }
 
@@ -1473,7 +1520,7 @@ impl Run {
             incarnation_control: Some(RunControl::Tmux(TmuxRunControl {
                 writer: Mutex::new(Some(TmuxCommandWriter::new(stdin))),
                 commands: commands_tx,
-                completion: Mutex::new(completion_rx),
+                completion: Mutex::new(TmuxCompletion::Pending(completion_rx)),
             })),
             persistence_mode: PersistenceMode::MemoryOnly,
             persistence_transition: Mutex::new(()),
@@ -1770,15 +1817,7 @@ impl Run {
         let Some(RunControl::Tmux(control)) = &self.incarnation_control else {
             return Ok(());
         };
-        match mutex_lock(&control.completion).recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                Err("timed out waiting for tmux control cleanup".to_owned())
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err("tmux control waiter ended without a completion receipt".to_owned())
-            }
-        }
+        control.wait_for_completion(timeout)
     }
 
     fn enable_persistence(&self, persistence: &PersistentRun) {
@@ -2792,9 +2831,9 @@ mod tests {
         TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
         TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
         TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
-        TmuxReaderTermination, TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock,
-        prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
-        serve_with_manager, spawn_error,
+        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
+        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
+        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
     };
 
     mod creation;
@@ -2808,6 +2847,80 @@ mod tests {
         );
         assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
         assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn tmux_completion_receipt_is_reusable_and_timeout_preserves_pending() {
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+        let mut observed = TmuxCompletion::Pending(observed_rx);
+        assert!(matches!(
+            observed.observe(),
+            TmuxCompletionObservation::Pending
+        ));
+        observed_tx.send(Ok(())).expect("publish tmux completion");
+        assert!(matches!(
+            observed.observe(),
+            TmuxCompletionObservation::Complete(Ok(()))
+        ));
+        assert!(matches!(
+            observed.observe(),
+            TmuxCompletionObservation::Complete(Ok(()))
+        ));
+        assert_eq!(observed.wait(Duration::ZERO), Ok(()));
+
+        let (waited_tx, waited_rx) = std::sync::mpsc::sync_channel(1);
+        let mut waited = TmuxCompletion::Pending(waited_rx);
+        waited_tx.send(Ok(())).expect("publish tmux completion");
+        assert_eq!(waited.wait(Duration::ZERO), Ok(()));
+        assert_eq!(waited.wait(Duration::ZERO), Ok(()));
+        assert!(matches!(
+            waited.observe(),
+            TmuxCompletionObservation::Complete(Ok(()))
+        ));
+
+        let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
+        let mut pending = TmuxCompletion::Pending(pending_rx);
+        assert_eq!(
+            pending.wait(Duration::ZERO),
+            Err("timed out waiting for tmux control cleanup".to_owned())
+        );
+        assert!(matches!(
+            pending.observe(),
+            TmuxCompletionObservation::Pending
+        ));
+
+        let explicit_failure = "tmux control failed".to_owned();
+        pending_tx
+            .send(Err(explicit_failure.clone()))
+            .expect("publish tmux failure");
+        let TmuxCompletionObservation::Complete(Err(first)) = pending.observe() else {
+            panic!("explicit completion failure is retained");
+        };
+        let TmuxCompletionObservation::Complete(Err(second)) = pending.observe() else {
+            panic!("cached completion failure remains observable");
+        };
+        assert_eq!(first, explicit_failure);
+        assert_eq!(second, explicit_failure);
+        assert_eq!(pending.wait(Duration::ZERO), Err(explicit_failure));
+
+        let (disconnected_tx, disconnected_rx) = std::sync::mpsc::sync_channel(1);
+        let mut disconnected = TmuxCompletion::Pending(disconnected_rx);
+        drop(disconnected_tx);
+        let expected_disconnect =
+            "tmux control waiter ended without a completion receipt".to_owned();
+        assert_eq!(
+            disconnected.wait(Duration::ZERO),
+            Err(expected_disconnect.clone())
+        );
+        assert_eq!(
+            disconnected.wait(Duration::ZERO),
+            Err(expected_disconnect.clone())
+        );
+        let TmuxCompletionObservation::Complete(Err(observed_disconnect)) = disconnected.observe()
+        else {
+            panic!("disconnected completion fails closed");
+        };
+        assert_eq!(observed_disconnect, expected_disconnect);
     }
 
     #[test]
@@ -2825,7 +2938,7 @@ mod tests {
         let control = TmuxRunControl {
             writer: std::sync::Mutex::new(Some(TmuxCommandWriter::new(stdin))),
             commands,
-            completion: std::sync::Mutex::new(completion),
+            completion: std::sync::Mutex::new(TmuxCompletion::Pending(completion)),
         };
 
         control
