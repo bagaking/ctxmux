@@ -79,11 +79,12 @@ Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
 Generation 6 declares `run_capacity` for the global retained-Run admission
-boundary accepted by Decision 013. It means no exact eligible replacement can
-satisfy projected record or persistent-metadata capacity and must be returned
-before native spawn or tmux Control startup. The Registry implementation that
-emits this error remains pending under T-027; no current no-GC path may
-manufacture it as a substitute for Backend or persistence failure.
+boundary owned by Decision 013. In memory-only mode it means no exact eligible
+terminal replacement can satisfy projected record capacity and is returned
+before native spawn or tmux Control startup. The same error is declared for
+persistent record or metadata admission, but persistent exact replacement is
+not implemented yet; the current persistent path must not manufacture it as a
+substitute for Backend or persistence failure.
 
 Every generation-6 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these

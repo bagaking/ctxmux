@@ -48,11 +48,13 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{
-    CreationFlightOwner, CreationRequest, PendingPublication, RunRegistry, TerminalOrdinal,
-    TerminalPublicationOwner, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
+    CreationFlightOwner, CreationRequest, MemoryPublicationReservation, PendingPublication,
+    RunRegistry, TerminalOrdinal, TerminalPublicationOwner, UnpublishedCleanupOwner,
+    UnpublishedCleanupReservation,
 };
 use crate::native_control::{
-    ChildCommand, ControlResult, InputDrainGate, NativeControlOwner, PendingInput, PendingStop,
+    ChildCommand, ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner,
+    PendingInput, PendingStop,
 };
 use crate::persistence::{Persistence, PersistentRun, RecoveredRun};
 use crate::tmux::{
@@ -466,6 +468,7 @@ impl RunManager {
         }
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
+        let materialized = self.materialize_creation(request)?;
         let admission = self
             .creation_flights
             .acquire_admission()
@@ -483,6 +486,9 @@ impl RunManager {
             )
         })?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
+        let new_run_id = RunId::new();
+        let registry_reservation =
+            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let manager = Arc::clone(self);
         thread::Builder::new()
@@ -490,7 +496,13 @@ impl RunManager {
             .spawn(move || {
                 let _flight = flight;
                 let _operation_guard = operation_guard;
-                let result = manager.create_unique(operation_key, request, cleanup_reservation);
+                let result = manager.create_unique(
+                    operation_key,
+                    materialized,
+                    cleanup_reservation,
+                    registry_reservation,
+                    new_run_id,
+                );
                 let _ = result_tx.send(result);
             })
             .map_err(|error| {
@@ -511,47 +523,20 @@ impl RunManager {
     fn create_unique(
         &self,
         operation_key: CreateOperationKey,
-        request: CreationRequest,
+        materialized: MaterializedCreation,
         cleanup_reservation: UnpublishedCleanupReservation,
+        registry_reservation: Option<MemoryPublicationReservation>,
+        new_run_id: RunId,
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
-        let (spec, lineage) = match request.clone() {
-            CreationRequest::Start { spec } => (spec, None),
-            CreationRequest::Fork { parent, plan } => {
-                let parent_run = self.pin(parent)?;
-                let (spec, fidelity) = match plan {
-                    ForkPlan::LevelA if parent_run.capabilities.fork_level_a => (
-                        parent_run.spec.clone().ok_or_else(|| {
-                            ProtocolError::new(
-                                ErrorCode::UnsupportedCapability,
-                                format!("Run {parent} has no portable launch specification"),
-                            )
-                        })?,
-                        ForkFidelity::LevelA,
-                    ),
-                    ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
-                        if !parent_run.has_continuation_authority() {
-                            return Err(ProtocolError::new(
-                                ErrorCode::InvalidRunState,
-                                format!(
-                                    "cannot Level B fork Run {parent} without live continuation authority"
-                                ),
-                            ));
-                        }
-                        (spec, ForkFidelity::LevelB)
-                    }
-                    ForkPlan::LevelA | ForkPlan::LevelB { .. } => {
-                        return Err(ProtocolError::new(
-                            ErrorCode::UnsupportedCapability,
-                            format!("Run {parent} backend does not support the requested fork"),
-                        ));
-                    }
-                };
-                (spec, Some(RunLineage { parent, fidelity }))
-            }
-        };
+        let MaterializedCreation {
+            request,
+            spec,
+            lineage,
+        } = materialized;
         let pending = Run::spawn_pending(
             NativeSpawnConfig {
+                id: new_run_id,
                 spec,
                 lineage,
                 persistence_mode,
@@ -572,7 +557,11 @@ impl RunManager {
                 );
                 hook.pause_once(CreationHookPoint::PanicAfterSpawn);
             }
-            (self.registry.publish_creation(operation_key, pending), None)
+            (
+                self.registry
+                    .publish_creation(operation_key, pending, registry_reservation),
+                None,
+            )
         } else {
             #[cfg(test)]
             if let Some(hook) = &self.creation_hook {
@@ -594,7 +583,8 @@ impl RunManager {
                 }
             };
             (
-                self.registry.publish_creation(operation_key, pending),
+                self.registry
+                    .publish_creation(operation_key, pending, registry_reservation),
                 post_commit_error,
             )
         };
@@ -614,8 +604,18 @@ impl RunManager {
         let request = CreationRequest::Start { spec };
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
+        let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
-        self.create_unique(operation_key, request, cleanup_reservation)
+        let new_run_id = RunId::new();
+        let registry_reservation =
+            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
+        self.create_unique(
+            operation_key,
+            materialized,
+            cleanup_reservation,
+            registry_reservation,
+            new_run_id,
+        )
     }
 
     #[cfg(test)]
@@ -624,8 +624,84 @@ impl RunManager {
         let request = CreationRequest::Fork { parent, plan };
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
+        let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
-        self.create_unique(operation_key, request, cleanup_reservation)
+        let new_run_id = RunId::new();
+        let registry_reservation =
+            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
+        self.create_unique(
+            operation_key,
+            materialized,
+            cleanup_reservation,
+            registry_reservation,
+            new_run_id,
+        )
+    }
+
+    fn materialize_creation(
+        &self,
+        request: CreationRequest,
+    ) -> Result<MaterializedCreation, ProtocolError> {
+        let (spec, lineage) = match &request {
+            CreationRequest::Start { spec } => (spec.clone(), None),
+            CreationRequest::Fork { parent, plan } => {
+                let parent_run = self.pin(*parent)?;
+                let (spec, fidelity) = match plan {
+                    ForkPlan::LevelA if parent_run.capabilities.fork_level_a => (
+                        parent_run.spec.clone().ok_or_else(|| {
+                            ProtocolError::new(
+                                ErrorCode::UnsupportedCapability,
+                                format!("Run {parent} has no portable launch specification"),
+                            )
+                        })?,
+                        ForkFidelity::LevelA,
+                    ),
+                    ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
+                        if !parent_run.has_continuation_authority() {
+                            return Err(ProtocolError::new(
+                                ErrorCode::InvalidRunState,
+                                format!(
+                                    "cannot Level B fork Run {parent} without live continuation authority"
+                                ),
+                            ));
+                        }
+                        (spec.clone(), ForkFidelity::LevelB)
+                    }
+                    ForkPlan::LevelA | ForkPlan::LevelB { .. } => {
+                        return Err(ProtocolError::new(
+                            ErrorCode::UnsupportedCapability,
+                            format!("Run {parent} backend does not support the requested fork"),
+                        ));
+                    }
+                };
+                (
+                    spec,
+                    Some(RunLineage {
+                        parent: *parent,
+                        fidelity,
+                    }),
+                )
+            }
+        };
+        Ok(MaterializedCreation {
+            request,
+            spec,
+            lineage,
+        })
+    }
+
+    fn reserve_memory_publication(
+        &self,
+        new_run_id: RunId,
+        operation_key: Option<CreateOperationKey>,
+    ) -> Result<Option<MemoryPublicationReservation>, ProtocolError> {
+        if self.persistence_mode() == PersistenceMode::MemoryOnly {
+            self.registry
+                .reserve_memory_publication(new_run_id, operation_key)
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn with_tmux_operation<T>(
@@ -661,19 +737,24 @@ impl RunManager {
                 "tmux pane import is not persisted; use a memory-only ctxmux daemon",
             ));
         }
+        let new_run_id = RunId::new();
+        let reservation = self.registry.reserve_memory_publication(new_run_id, None)?;
         self.with_tmux_operation(|| {
             let started_at = Instant::now();
             let run = Run::import_tmux(
                 socket_path,
                 pane_id,
-                self.live_event_capacity,
-                self.terminal_publications.clone(),
-                started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
-                started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
-                started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
+                TmuxImportConfig {
+                    id: new_run_id,
+                    live_event_capacity: self.live_event_capacity,
+                    terminal_publications: self.terminal_publications.clone(),
+                    discovery_deadline: started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
+                    prepare_deadline: started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
+                    total_deadline: started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
+                },
             )?;
             let info = run.info();
-            self.registry.publish_unkeyed(run);
+            self.registry.publish_unkeyed(run, reservation);
             Ok(info)
         })
     }
@@ -774,7 +855,7 @@ impl RunManager {
     }
 
     fn pin(&self, id: RunId) -> Result<Arc<Run>, ProtocolError> {
-        self.registry.pin(id).ok_or_else(|| {
+        self.registry.pin(id)?.ok_or_else(|| {
             ProtocolError::new(ErrorCode::RunNotFound, format!("Run {id} does not exist"))
         })
     }
@@ -839,8 +920,12 @@ impl RunManager {
     {
         let request = CreationRequest::Start { spec: spec.clone() };
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
+        let new_run_id = RunId::new();
+        let registry_reservation =
+            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
         let pending = Run::spawn_pending_with_setup(
             NativeSpawnConfig {
+                id: new_run_id,
                 spec,
                 lineage: None,
                 persistence_mode: self.persistence_mode(),
@@ -853,7 +938,9 @@ impl RunManager {
             captured_run,
             setup,
         )?;
-        Ok(self.registry.publish_creation(operation_key, pending))
+        Ok(self
+            .registry
+            .publish_creation(operation_key, pending, registry_reservation))
     }
 
     #[cfg(test)]
@@ -865,14 +952,17 @@ impl RunManager {
     where
         G: FnOnce() + Send + 'static,
     {
+        let new_run_id = RunId::new();
+        let reservation = self.registry.reserve_memory_publication(new_run_id, None)?;
         let run = Run::spawn_with_wait_hook_owner(
+            new_run_id,
             spec,
             self.persistence_mode(),
             self.terminal_publications.clone(),
             after_wait,
         )?;
         let info = run.info();
-        self.registry.publish_unkeyed(run);
+        self.registry.publish_unkeyed(run, reservation);
         Ok(info)
     }
 }
@@ -892,12 +982,28 @@ enum PersistenceMode {
 }
 
 struct NativeSpawnConfig {
+    id: RunId,
     spec: RunSpec,
     lineage: Option<RunLineage>,
     persistence_mode: PersistenceMode,
     live_event_capacity: usize,
     input_drains: InputDrainGate,
     terminal_publications: TerminalPublicationOwner,
+}
+
+struct MaterializedCreation {
+    request: CreationRequest,
+    spec: RunSpec,
+    lineage: Option<RunLineage>,
+}
+
+struct TmuxImportConfig {
+    id: RunId,
+    live_event_capacity: usize,
+    terminal_publications: TerminalPublicationOwner,
+    discovery_deadline: Instant,
+    prepare_deadline: Instant,
+    total_deadline: Instant,
 }
 
 impl NativeSpawnConfig {
@@ -1074,6 +1180,19 @@ impl TmuxRunControl {
 
     fn wait_for_completion(&self, timeout: Duration) -> Result<(), String> {
         mutex_lock(&self.completion).wait(timeout)
+    }
+
+    fn closed_quiescence_result(&self) -> Result<(), String> {
+        if mutex_lock(&self.writer).is_some() {
+            return Err("tmux control writer is still open".to_owned());
+        }
+        match self.observe_completion() {
+            TmuxCompletionObservation::Complete(Ok(())) => Ok(()),
+            TmuxCompletionObservation::Complete(Err(error)) => Err(error),
+            TmuxCompletionObservation::Pending => {
+                Err("tmux control cleanup is still pending".to_owned())
+            }
+        }
     }
 }
 
@@ -1261,6 +1380,7 @@ impl Run {
     ) -> Result<Arc<Self>, ProtocolError> {
         Self::spawn_with_hooks(
             NativeSpawnConfig {
+                id: RunId::new(),
                 spec,
                 lineage,
                 persistence_mode,
@@ -1307,6 +1427,7 @@ impl Run {
         G: FnOnce() + Send + 'static,
     {
         Self::spawn_with_wait_hook_owner(
+            RunId::new(),
             spec,
             persistence_mode,
             TerminalPublicationOwner::default(),
@@ -1316,6 +1437,7 @@ impl Run {
 
     #[cfg(test)]
     fn spawn_with_wait_hook_owner<G>(
+        id: RunId,
         spec: RunSpec,
         persistence_mode: PersistenceMode,
         terminal_publications: TerminalPublicationOwner,
@@ -1326,6 +1448,7 @@ impl Run {
     {
         Self::spawn_with_hooks(
             NativeSpawnConfig {
+                id,
                 spec,
                 lineage: None,
                 persistence_mode,
@@ -1389,7 +1512,7 @@ impl Run {
         let mut pending_child = PendingChild::new(child);
         let pid = pending_child.child().process_id();
         let (events, _) = broadcast::channel(config.live_event_capacity);
-        let id = RunId::new();
+        let id = config.id;
         let (native_control, child_command_rx) =
             NativeControlOwner::new(id, pair.master, writer, config.input_drains.clone());
         pending_child.bind_reap_control(native_control.clone());
@@ -1485,13 +1608,9 @@ impl Run {
     fn import_tmux(
         socket_path: &str,
         pane_id: &str,
-        live_event_capacity: usize,
-        terminal_publications: TerminalPublicationOwner,
-        discovery_deadline: Instant,
-        prepare_deadline: Instant,
-        total_deadline: Instant,
+        config: TmuxImportConfig,
     ) -> Result<Arc<Self>, ProtocolError> {
-        let mut pending = tmux::spawn_control(socket_path, pane_id, discovery_deadline)?;
+        let mut pending = tmux::spawn_control(socket_path, pane_id, config.discovery_deadline)?;
         let target = pending.target.clone();
         let socket_identity = pending.socket_identity;
         let control_pid = pending.child_id();
@@ -1499,9 +1618,9 @@ impl Run {
         let stdout = pending.take_stdout();
         let (commands_tx, commands_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
-        let (events, _) = broadcast::channel(live_event_capacity);
+        let (events, _) = broadcast::channel(config.live_event_capacity);
         let run = Arc::new(Self {
-            id: RunId::new(),
+            id: config.id,
             spec: None,
             lineage: None,
             backend: RunBackend::Tmux {
@@ -1526,7 +1645,7 @@ impl Run {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(None),
             attachments: AtomicUsize::new(0),
-            terminal_publications,
+            terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
             events,
         });
@@ -1584,7 +1703,12 @@ impl Run {
             ));
         }
 
-        Self::finish_tmux_import(run, &ready_rx, prepare_deadline, total_deadline)
+        Self::finish_tmux_import(
+            run,
+            &ready_rx,
+            config.prepare_deadline,
+            config.total_deadline,
+        )
     }
 
     fn finish_tmux_import(
@@ -1818,6 +1942,40 @@ impl Run {
             return Ok(());
         };
         control.wait_for_completion(timeout)
+    }
+
+    fn memory_collection_ordinal(&self) -> Option<TerminalOrdinal> {
+        if self.persistence_mode != PersistenceMode::MemoryOnly
+            || mutex_lock(&self.state).is_running()
+            || self.attachments.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        let ordinal = *self.terminal_ordinal.get()?;
+        let backend_is_quiescent = match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control.closed_quiescence_result().is_ok(),
+            Some(RunControl::Tmux(control)) => control.closed_quiescence_result().is_ok(),
+            None => false,
+        };
+        backend_is_quiescent.then_some(ordinal)
+    }
+
+    fn detach_memory_collection_descriptors(
+        &self,
+    ) -> Result<Option<DetachedNativeDescriptors>, String> {
+        match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control
+                .detach_closed_descriptors_after_owner_fence()
+                .map(Some),
+            Some(RunControl::Tmux(control)) => {
+                control.closed_quiescence_result()?;
+                Ok(None)
+            }
+            None => Err(format!(
+                "Run {} has no memory-only incarnation owner to collect",
+                self.id
+            )),
+        }
     }
 
     fn enable_persistence(&self, persistence: &PersistentRun) {

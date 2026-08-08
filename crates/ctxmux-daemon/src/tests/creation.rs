@@ -1,5 +1,7 @@
 use super::*;
+use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
+use ctxmux_protocol::{ForkFidelity, RunLineage};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
@@ -132,6 +134,357 @@ async fn memory_only_output_does_not_take_durable_transition_locks() {
     wait_for_direct_run_workers(&run);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_terminal_run() {
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create memory capacity fixture");
+    let first_marker = temp.path().join("first.log");
+    let rejected_marker = temp.path().join("rejected.log");
+    let replacement_marker = temp.path().join("replacement.log");
+    let first_key = CreateOperationKey::new("memory-capacity-first").unwrap();
+    let first_spec = marker_spec(&first_marker, true);
+    let first = manager
+        .create(
+            first_key.clone(),
+            CreationRequest::Start {
+                spec: first_spec.clone(),
+            },
+        )
+        .await
+        .expect("fill the one-record Registry");
+    assert_eq!(wait_for_marker_pids(&first_marker, 1).await.len(), 1);
+
+    let rejected = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-rejected").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&rejected_marker, false),
+            },
+        )
+        .await
+        .expect_err("a live retained Run cannot fund replacement");
+    assert_eq!(rejected.code, ErrorCode::RunCapacity);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
+    assert_eq!(manager.list().len(), 1);
+
+    manager
+        .get(first.id)
+        .expect("pin the live capacity owner")
+        .stop()
+        .await
+        .expect("stop the capacity owner");
+    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let terminal_pin = manager
+        .get(first.id)
+        .expect("pin the terminal candidate across admission");
+    let pinned_rejection = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-pinned").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&rejected_marker, false),
+            },
+        )
+        .await
+        .expect_err("a pinned terminal Run cannot be collected");
+    assert_eq!(pinned_rejection.code, ErrorCode::RunCapacity);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
+    drop(terminal_pin);
+
+    let replacement = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-replacement").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&replacement_marker, false),
+            },
+        )
+        .await
+        .expect("replace the exact quiescent terminal Run");
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list()[0].id, replacement.id);
+    assert_eq!(
+        manager.info(first.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
+    wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let recreated = manager
+        .create(first_key, CreationRequest::Start { spec: first_spec })
+        .await
+        .expect("the removed exact key may elect one new Run");
+    assert_ne!(recreated.id, first.id);
+    assert_eq!(manager.list().len(), 1);
+    assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
+    manager
+        .get(recreated.id)
+        .expect("pin recreated live Run")
+        .stop()
+        .await
+        .expect("stop recreated Run");
+    wait_for_run_terminal_async(&manager.get(recreated.id).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn projected_memory_record_blocks_a_second_physical_start_before_publication() {
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create projected capacity fixture");
+    let first_marker = temp.path().join("first.log");
+    let rejected_marker = temp.path().join("rejected.log");
+    let first_manager = Arc::clone(&manager);
+    let first = tokio::spawn(async move {
+        first_manager
+            .create(
+                CreateOperationKey::new("projected-first").unwrap(),
+                CreationRequest::Start {
+                    spec: marker_spec(&first_marker, true),
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("first creation reaches post-spawn barrier")
+        .expect("first creation barrier remains connected");
+    assert!(manager.list().is_empty());
+
+    let rejected = manager
+        .create(
+            CreateOperationKey::new("projected-second").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&rejected_marker, false),
+            },
+        )
+        .await
+        .expect_err("the first projected record consumes the only capacity");
+    assert_eq!(rejected.code, ErrorCode::RunCapacity);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
+
+    hook.release();
+    let first = first
+        .await
+        .expect("first creation owner task remains live")
+        .expect("first projected Run publishes");
+    assert_eq!(manager.list().len(), 1);
+    manager
+        .get(first.id)
+        .unwrap()
+        .stop()
+        .await
+        .expect("stop projected capacity fixture");
+    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn collecting_fence_preserves_copy_reads_and_fails_long_lived_lookups_closed() {
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create collection fence fixture");
+    let first_marker = temp.path().join("first.log");
+    let replacement_marker = temp.path().join("replacement.log");
+    let (first_key, replacement_key) = distinct_operation_keys(&manager);
+    let first_spec = marker_spec(&first_marker, false);
+    let first = manager
+        .create(
+            first_key.clone(),
+            CreationRequest::Start {
+                spec: first_spec.clone(),
+            },
+        )
+        .await
+        .expect("publish collection candidate");
+    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    hook.arm();
+    let replacement_manager = Arc::clone(&manager);
+    let replacement_spec = marker_spec(&replacement_marker, false);
+    let replacement_request = replacement_spec.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_manager
+            .create(
+                replacement_key,
+                CreationRequest::Start {
+                    spec: replacement_request,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("replacement reaches post-spawn barrier")
+        .expect("replacement barrier remains connected");
+
+    assert_eq!(manager.info(first.id).unwrap().id, first.id);
+    assert_eq!(manager.list()[0].id, first.id);
+    let Err(pin_error) = manager.pin(first.id) else {
+        panic!("Collecting Run cannot grant a long-lived owner");
+    };
+    assert_eq!(pin_error.code, ErrorCode::BackendUnavailable);
+    assert_eq!(
+        manager
+            .registry
+            .resolve_creation_info(
+                &first_key,
+                &CreationRequest::Start {
+                    spec: first_spec.clone(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ErrorCode::BackendUnavailable
+    );
+    assert_eq!(
+        manager
+            .registry
+            .resolve_creation_info(
+                &first_key,
+                &CreationRequest::Start {
+                    spec: long_running_spec(),
+                },
+            )
+            .unwrap_err()
+            .code,
+        ErrorCode::CreationConflict
+    );
+
+    hook.release();
+    let replacement = replacement
+        .await
+        .expect("replacement owner task remains live")
+        .expect("replacement publishes");
+    assert_eq!(
+        manager.info(first.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_eq!(manager.list()[0].id, replacement.id);
+    assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacity_first() {
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::default()
+    });
+    let first_key = CreateOperationKey::new("restored-candidate").unwrap();
+    let first_spec = short_lived_spec();
+    let first = manager
+        .create(
+            first_key.clone(),
+            CreationRequest::Start {
+                spec: first_spec.clone(),
+            },
+        )
+        .await
+        .expect("publish candidate restored after abort");
+    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let failed = manager
+        .create(
+            CreateOperationKey::new("failed-replacement").unwrap(),
+            CreationRequest::Start {
+                spec: RunSpec {
+                    program: "/ctxmux/definitely/missing".to_owned(),
+                    ..short_lived_spec()
+                },
+            },
+        )
+        .await
+        .expect_err("spawn failure aborts the publication reservation");
+    assert_eq!(failed.code, ErrorCode::SpawnFailed);
+    assert_eq!(manager.info(first.id).unwrap().id, first.id);
+    assert_eq!(
+        manager
+            .create(first_key, CreationRequest::Start { spec: first_spec })
+            .await
+            .expect("candidate key remains bound after abort")
+            .id,
+        first.id
+    );
+
+    let live = manager
+        .create(
+            CreateOperationKey::new("live-after-restored-candidate").unwrap(),
+            CreationRequest::Start {
+                spec: long_running_spec(),
+            },
+        )
+        .await
+        .expect("replace the restored terminal candidate with a live Run");
+    let tmux_error = manager
+        .import_tmux("/ctxmux/definitely/missing.sock", "%0")
+        .expect_err("tmux import reserves capacity before Control startup");
+    assert_eq!(tmux_error.code, ErrorCode::RunCapacity);
+    manager
+        .get(live.id)
+        .unwrap()
+        .stop()
+        .await
+        .expect("stop live capacity fixture");
+    wait_for_run_terminal_async(&manager.get(live.id).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_level_a_fork_materializes_then_releases_its_parent_before_reservation() {
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::default()
+    });
+    let parent = manager
+        .create(
+            CreateOperationKey::new("collectible-fork-parent").unwrap(),
+            CreationRequest::Start {
+                spec: short_lived_spec(),
+            },
+        )
+        .await
+        .expect("publish fork parent");
+    wait_for_run_terminal_async(&manager.get(parent.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let child = manager
+        .create(
+            CreateOperationKey::new("child-replacing-parent").unwrap(),
+            CreationRequest::Fork {
+                parent: parent.id,
+                plan: ForkPlan::LevelA,
+            },
+        )
+        .await
+        .expect("fork materialization does not pin its parent through admission");
+    assert_eq!(
+        child.lineage,
+        Some(RunLineage {
+            parent: parent.id,
+            fidelity: ForkFidelity::LevelA,
+        })
+    );
+    assert_eq!(
+        manager.info(parent.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list()[0].id, child.id);
+    wait_for_run_terminal_async(&manager.get(child.id).unwrap()).await;
+}
+
 fn colliding_operation_keys(manager: &RunManager) -> (CreateOperationKey, CreateOperationKey) {
     // 65 distinct keys guarantee a pair across the production owner's 64 stripes.
     let keys = (0..65)
@@ -146,6 +499,18 @@ fn colliding_operation_keys(manager: &RunManager) -> (CreateOperationKey, Create
         }
     }
     unreachable!("pigeonhole principle guarantees a collision pair")
+}
+
+fn distinct_operation_keys(manager: &RunManager) -> (CreateOperationKey, CreateOperationKey) {
+    let first = CreateOperationKey::new("collection-fence-first").unwrap();
+    for index in 0..64 {
+        let candidate =
+            CreateOperationKey::new(format!("collection-fence-replacement-{index}")).unwrap();
+        if !manager.registry.shares_creation_stripe(&first, &candidate) {
+            return (first, candidate);
+        }
+    }
+    unreachable!("64 random-hash stripes include a distinct candidate")
 }
 
 #[test]

@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls and typed owner receipts; the retained-Run capacity error is declared while its T-027 Registry implementation remains pending.                                                            | Other SDKs appear only for a real client requirement.                                        |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the memory-only retained-Run capacity boundary. Persistent exact replacement remains pending.                                                                  | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
@@ -77,7 +77,7 @@ start accepted
      +-- later daemon epoch --> interrupted(daemon_restart)
 ```
 
-`stop` sends one termination command to the waiter that owns the direct child handle. On Unix that handle gives `SIGHUP` a short grace period and escalates to a forced kill when the child remains alive. Acknowledgement still precedes public terminal-state publication, so the returned `RunInfo` may say `running`; repeated stop is rejected. The waiter disables further signalling as soon as wait observes exit, before it publishes `Exited`, so a concurrent stop cannot fall back to a cached numeric PID. Descendant or process-tree termination is not promised. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted { daemon_restart }`, clears their PID, and exposes no live control. Memory-only exited Runs remain in the current daemon map indefinitely; persistent history uses the bounded retention policy from decision 009.
+`stop` sends one termination command to the waiter that owns the direct child handle. On Unix that handle gives `SIGHUP` a short grace period and escalates to a forced kill when the child remains alive. Acknowledgement still precedes public terminal-state publication, so the returned `RunInfo` may say `running`; repeated stop is rejected. The waiter disables further signalling as soon as wait observes exit, before it publishes `Exited`, so a concurrent stop cannot fall back to a cached numeric PID. Descendant or process-tree termination is not promised. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted { daemon_restart }`, clears their PID, and exposes no live control. Memory-only terminal Runs remain retained until admission reaches the 128-record ceiling, then one exact fully quiescent candidate is replaced; persistent history uses the bounded durable retention policy from decision 009 but does not yet remove its same-epoch Registry owner.
 
 ### Ownership split
 
@@ -120,9 +120,12 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    simultaneous physical launches. The 64 key stripes bound collision state;
    they are not a 64-thread launch limit. Cancellation while awaiting admission
    releases the key stripe and creates no flight or thread.
-5. An admitted leader claims a creation flight, reserves one of the same eight
-   private rollback-owner slots, and then starts one named, short-lived OS thread
-   that owns the semaphore permit, key stripe, request, manager, reservation,
+5. An admitted leader claims a creation flight and reserves one of the same
+   eight private rollback-owner slots. In memory-only mode it also preallocates
+   the new `RunId` and reserves one Registry publication; at capacity that
+   reservation fences and compacts one exact quiescent terminal candidate or
+   returns `run_capacity`. It then starts one named, short-lived OS thread that
+   owns the semaphore permit, key stripe, request, manager, both reservations,
    and flight guard through launch and publication. Existing cleanup fences can
    exhaust rollback ownership and reject here before spawn. The result returns
    over a Tokio one-shot channel; cancellation after dispatch drops only the
@@ -154,6 +157,8 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 ### Import a tmux-owned pane
 
 1. A public client selects one explicit tmux socket and discovers live panes.
+   Import preallocates its `RunId` and reserves the same memory-only Registry
+   capacity before starting a Control Mode child.
 2. The daemon separately validates the tmux client executable and the selected
    server version, then starts a public read-only Control Mode client.
 3. Before publication, the Control connection binds the complete import tuple:
@@ -278,7 +283,13 @@ The important guarantees are behavioral, not implied by lock types.
   Tokio workers nor creation threads while the unique unbound request launches.
   Unbound leaders then wait asynchronously for one of eight physical-launch
   permits; these Tokio semaphore waiters are not a product-level actor or custom
-  queue. The retained Run and successful key mapping share one registry lock;
+  queue. In memory-only mode an admitted leader then reserves one projected
+  Registry record before spawn. At the 128-record ceiling the same Registry
+  write fences the earliest fully quiescent terminal candidate; a missing
+  eligible candidate returns `run_capacity` before Backend mutation. A fresh
+  Fork materializes its immutable parent input before this reservation and
+  releases the parent pin, so admission never carries a hidden long-lived
+  lookup owner. The retained Run and successful key mapping share one registry lock;
   a failed unpublished launch releases its private Run and exact-key fence only
   after the child-handle waiter proves reap and all reader, waiter, control,
   input, and Run owners are quiescent. Until then, a matching retry reports
@@ -338,22 +349,23 @@ promise that an unmodified tmux client can attach to ctxmux.
 
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
-Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Exited Runs, total Run count, attachment count, and total daemon memory still have no global quotas or GC.
+Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Memory-only mode admits at most 128 retained or projected Run records and replaces only a fenced, terminal, fully quiescent candidate. Persistent same-epoch Registry collection, attachment admission, and a total daemon RSS quota remain open.
 
 [Decision 013](architecture/choices/013-retained-run-resource-governance.md)
-accepts the memory-only 128-record Registry ceiling and ownership-safe
-collection contract for T-027. Persistent exact-replacement semantics are
+owns the shipped memory-only 128-record Registry ceiling and ownership-safe
+collection contract. Persistent exact-replacement semantics are
 specified, but physical admission remains unresolved because multi-candidate
 cascade deletion has not been reconciled with the frozen SQLite WAL ceilings.
-The design remains unshipped until its Registry and sustained-churn gates land;
-the current no-GC behavior above remains runtime truth in the meantime.
+The sustained-churn qualification remains pending and persistent mode therefore
+retains its current same-epoch no-GC behavior.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
 workloads. Cleanup requires no live direct child or attachment and no transient
-thread growth. RSS and two daemon-owned descriptors per stopped native Run
-remain visible because the retained Run map has no GC; qualification does not
-subtract that intentional state or mislabel it as cleanup-owned leakage. On the
+thread growth. Below memory-only capacity, retained terminal state remains
+intentional; at capacity, replacement compacts the exact candidate's already
+closed native descriptors before starting the successor. Qualification does not
+subtract retained history or mislabel it as cleanup-owned leakage. On the
 EOF-driven successful-Control path qualified below, an imported tmux Run instead
 releases its incarnation-local Control stdin and stdout reader descriptors and
 reaps its Control process before `Interrupted` becomes observable. Retaining its

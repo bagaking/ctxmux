@@ -1,7 +1,7 @@
 # 013 — Retained Run resource governance
 
-- Status: accepted memory-only owner design; persistent exact-replacement WAL
-  admission unresolved under T-027
+- Status: implemented memory-only owner; persistent exact-replacement WAL
+  admission unresolved under T-029
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -234,7 +234,8 @@ single-record eviction shape against the 4 MiB per-Run replay bound. A
 multi-candidate cascade delete can exceed that estimate, and logical replay
 bytes alone do not strictly bound modified SQLite pages under high chunk
 cardinality. Registry candidate snapshots currently carry no defensible
-page-cost oracle. Memory-only Registry implementation may proceed, but no
+page-cost oracle. Memory-only Registry admission and exact single-candidate
+replacement are implemented, but no
 persistent exact-replacement code or capability claim may land until a reviewed
 amendment supplies a pre-spawn, persistence-owned admission proof or replaces
 the WAL contract. Detecting excess after child launch or splitting exact
@@ -422,7 +423,7 @@ policy without modifying `reliability-budgets.json`. These are canonical
 workload ceilings over Registry-owned payload and named transient owners, not a
 hard bound on every daemon allocation: arbitrary attachment fan-out remains
 unbounded, and byte retention alone does not provide a small chunk-cardinality
-bound. Those broader admission decisions remain release risks outside T-027.
+bound. Those broader admission decisions remain release risks outside T-030.
 Memory peak accounts for retained payload plus the larger of publication
 overlap or the fixed replay-clone batch. Persistent peak conservatively accounts
 for retained payload, publication overlap, full catch-up/finalize snapshots,
@@ -460,7 +461,7 @@ and collection-work non-growth rules above. Soak helper mode is the literal
 `memory_only_soak`; it uses the same no-newline ASCII-hex payload and its index
 increases once per replacement. Per-bin p95 uses
 the same nearest-rank algorithm with 30 samples, selecting index
-`ceil(0.95 * 30) - 1 = 28`, before applying the latency growth rule. Final T-027
+`ceil(0.95 * 30) - 1 = 28`, before applying the latency growth rule. Final T-030
 completion evidence runs
 `scripts/check-reliability.sh --profile nightly`; the default smoke command is
 not canonical evidence. Historical observe receipts, hashes, measurement
@@ -521,7 +522,7 @@ and arbitrary Backend event replay remain separate decisions.
   duplicate child.
 
 `GC-02` is the source-backed transfer retained in the normalized wrong-case
-corpus. The review-derived obligations below come from the accepted T-027 owner
+corpus. The review-derived obligations below come from this accepted owner
 contract rather than an external source; they remain in the task and fixture
 mapping without masquerading as additional normalized corpus cases.
 
@@ -542,18 +543,19 @@ or deterministic-owner fixtures.
 
 ## Fixture mapping
 
-- Future/T-027: concurrent 127-to-129 admission, multi-candidate A plus ordinary
-  B in reverse publication order, lookup-versus-fence, attachment construction,
-  same-key retry, and exact memory removal.
-- Future/T-027: delayed native reader, blocked input drain, tmux cleanup,
-  persistence finalize, and recovered-history eligibility.
-- Future/T-027: exact multi-candidate SQLite replacement, wrong candidate
-  identity, pre/post-COMMIT injection, and real restart around COMMIT.
-- Future/T-027: parent collection, dangling lineage, retained child retry, and
-  stable public `run_not_found` behavior.
-- Future/T-027: source-bound memory and persistent three-window churn with raw
-  CPU, RSS, latency, record/key, thread, descriptor, process, replay, and owner
-  evidence.
+- Shipped/T-028: memory-only pre-spawn admission, live and pinned rejection,
+  lookup-versus-fence, exact key removal and reuse, abort restoration, parent
+  materialization, dangling lineage, `run_not_found`, and tmux pre-Control
+  admission fixtures.
+- Existing native-control and tmux completion fixtures prove the Backend-local
+  quiescence oracles reused by memory-only eligibility; source-bound race and
+  sustained-churn pressure remain T-030 qualification work.
+- Future/T-029: exact multi-candidate SQLite replacement, wrong candidate
+  identity, pre/post-COMMIT injection, persistence-finalize eligibility, and
+  real restart around COMMIT.
+- Future/T-030: concurrent 127-to-129 admission and source-bound memory and
+  persistent three-window churn with raw CPU, RSS, latency, record/key, thread,
+  descriptor, process, replay, and owner evidence.
 
 ## Repository evidence
 
@@ -567,6 +569,6 @@ or deterministic-owner fixtures.
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts
-- `reliability-gc-contract.json`: frozen T-027 workload, helper identity,
+- `reliability-gc-contract.json`: frozen T-030 workload, helper identity,
   resource ceilings, and time budgets
 - `scripts/reliability-gc-child.mjs`: PTY-stable deterministic payload producer
