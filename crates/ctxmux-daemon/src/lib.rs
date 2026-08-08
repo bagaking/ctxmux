@@ -1058,11 +1058,6 @@ impl PendingTmuxPublication {
         (run, cleanup_reservation)
     }
 
-    fn release_after_cleanup(mut self) {
-        self.run.take();
-        self.cleanup_reservation.take();
-    }
-
     fn transfer(&mut self, transfer_reason: String) {
         let run = self
             .run
@@ -1813,7 +1808,10 @@ impl Run {
             .min(total_deadline.saturating_duration_since(Instant::now()));
         match pending.run().wait_for_tmux_completion(cleanup_timeout) {
             Ok(()) => {
-                pending.release_after_cleanup();
+                pending.transfer(
+                    "tmux import cleanup completed; waiting for worker-owned Run references to settle"
+                        .to_owned(),
+                );
                 Err(readiness)
             }
             Err(cleanup_error) => {
@@ -3214,6 +3212,9 @@ mod tests {
         completion_tx
             .send(Ok(()))
             .expect("publish exact tmux cleanup completion");
+        assert_eq!(cleanup_owner.unresolved_count(), 1);
+        assert_eq!(cleanup_owner.owned_count(), 1);
+        drop(run);
         assert_eq!(cleanup_owner.unresolved_count(), 0);
         assert_eq!(cleanup_owner.owned_count(), 0);
 

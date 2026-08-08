@@ -392,7 +392,7 @@ impl UnpublishedCleanupOwner {
         state.entries.retain(|_, fence| !fence.owners.is_empty());
         state
             .tmux_entries
-            .retain(|entry| match entry.run.tmux_unpublished_cleanup_result() {
+            .retain(|entry| match tmux_cleanup_result(entry) {
                 Ok(()) => {
                     reaped += 1;
                     false
@@ -441,12 +441,24 @@ fn prune_reaped(state: &mut UnpublishedCleanupState) {
     let before = state.tmux_entries.len();
     state
         .tmux_entries
-        .retain(|entry| entry.run.tmux_unpublished_cleanup_result().is_err());
+        .retain(|entry| tmux_cleanup_result(entry).is_err());
     reaped += before - state.tmux_entries.len();
     state.owned = state
         .owned
         .checked_sub(reaped)
         .expect("proven cleanups release only owned slots");
+}
+
+fn tmux_cleanup_result(entry: &TmuxCleanupEntry) -> Result<(), String> {
+    entry.run.tmux_unpublished_cleanup_result()?;
+    let owners = Arc::strong_count(&entry.run);
+    if owners == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "tmux cleanup completion is recorded but {owners} Run owners remain"
+        ))
+    }
 }
 
 impl UnpublishedCleanupReservation {
