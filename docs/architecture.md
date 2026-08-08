@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the memory-only retained-Run capacity boundary. Persistent exact replacement remains pending.                                                                  | Other SDKs appear only for a real client requirement.                                        |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the memory-only retained-Run capacity boundary. Persistent exact replacement remains under implementation.                                                     | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
@@ -147,8 +147,8 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    daemon-private, globally eight-slot-bounded cleanup owner retains the
    unpublished Run and an exact-key fence without retaining its random stripe
    or launch permit. The same transfer covers worker-setup failure and creation
-   owner unwind. Successful `COMMIT` is the point of no return: even if vacuum
-   or physical-file postchecks then latch persistence, the manager binds
+   owner unwind. Successful `COMMIT` is the point of no return: even if a
+   physical-file postcheck then latches persistence, the manager binds
    persistence and stores `Arc<Run>` plus the key mapping under one
    `RunRegistry` write before returning that error. A retry therefore resolves
    the committed Run instead of spawning again. Closing the request connection
@@ -353,15 +353,15 @@ promise that an unmodified tmux client can attach to ctxmux.
 
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
-Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Memory-only mode admits at most 128 retained or projected Run records and replaces only a fenced, terminal, fully quiescent candidate. Persistent same-epoch Registry collection, attachment admission, and a total daemon RSS quota remain open.
+Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Memory-only mode admits at most 128 retained or projected Run records and replaces only a fenced, terminal, fully quiescent candidate. Persistent same-epoch Registry collection is under implementation; attachment admission and a total daemon RSS quota remain open.
 
 [Decision 013](architecture/choices/013-retained-run-resource-governance.md)
 owns the shipped memory-only 128-record Registry ceiling and ownership-safe
-collection contract. Persistent exact-replacement semantics are
-specified, but physical admission remains unresolved because multi-candidate
-cascade deletion has not been reconciled with the frozen SQLite WAL ceilings.
-The sustained-churn qualification remains pending and persistent mode therefore
-retains its current same-epoch no-GC behavior.
+collection contract. Persistent exact-replacement semantics and the
+spill-disabled cache-resident page proof are accepted, while their production
+integration remains in progress. The sustained-churn qualification remains
+pending and persistent mode therefore retains its current same-epoch no-GC
+behavior until T-029 closes.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
@@ -405,7 +405,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | Explicit TypeScript Integrations      | accepted                                         | [010](architecture/choices/010-explicit-typescript-integrations.md) |
 | Context, artifacts, lineage, and fork | accepted                                         | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
 | tmux Control Mode Backend             | accepted and implemented; version lanes pending  | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
-| Retained Run resource governance      | memory owner accepted; persistent WAL unresolved | [013](architecture/choices/013-retained-run-resource-governance.md) |
+| Retained Run resource governance      | memory owner implemented; persistent owner in progress | [013](architecture/choices/013-retained-run-resource-governance.md) |
 
 ## Risk-to-fixture traceability
 

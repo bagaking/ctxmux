@@ -72,6 +72,8 @@ The Tokio pool regression and Rust child-drop contract constrain ownership and b
 ## Repository evidence
 
 - `crates/ctxmux-daemon/src/lib.rs`: `serve`, `RunManager`, `Run::spawn`
-- `Cargo.toml`: Tokio features, `unsafe_code = "forbid"`
+- `Cargo.toml`: product crates, including the daemon, inherit
+  `unsafe_code = "forbid"`; the private `ctxmux-sqlite-status` FFI leaf is the
+  audited exception required by Decision 013 and exposes no raw handle
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`
 - `packages/sdk/test/client-parity.test.ts`

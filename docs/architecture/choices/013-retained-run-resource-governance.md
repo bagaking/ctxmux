@@ -244,8 +244,10 @@ pointer-map updates can all change the number of dirty SQLite pages. T-029
 therefore admits a live replacement from the actual exact transaction's
 cache-resident page set, not from a payload estimate.
 
-The single persistence connection runs with `cache_spill=OFF`. Immediately
-before an exact replacement it releases unpinned clean cache memory, requires
+The single persistence connection uses a scoped `cache_spill=OFF` guard only
+while staging this transaction and restores the prior setting on every commit,
+rollback, and error path. Immediately before an exact replacement it releases
+unpinned clean cache memory, requires
 a successful `TRUNCATE` checkpoint and a zero-length WAL, resets the connection
 cache-write and cache-spill counters, and begins one write transaction. It
 validates and deletes the Registry-selected exact candidates, including
@@ -278,16 +280,18 @@ cached pages. Every dirty page is one of those cached pages. With spill off and
 no SQL after admission, COMMIT appends at most one frame for each dirty page;
 the commit marker is carried by the final page frame. Clean/schema pages and
 allocator overhead only make the charge more conservative. At 4 KiB pages the
-8 MiB ceiling admits at most 2,036 frames including the WAL header. Because
+8 MiB ceiling admits the WAL header plus at most 2,036 frames. Because
 every staged replacement starts from a zero-length WAL, the separate 16 MiB
 total ceiling is also preserved.
 
 A changed WAL, an unsupported status counter, a nonzero write or spill count,
-an over-budget charge, or any other unprovable condition rolls the transaction
-back and returns `run_capacity` before durable mutation or physical launch. It
-does not poison the persistence actor. An early logical lower-bound check may
-reject obviously oversized work before constructing its page cache, but it
-cannot admit a request by itself.
+an over-budget charge, or another pre-COMMIT condition returns `run_capacity`
+before durable mutation or physical launch only after rollback is proven. It
+does not poison the persistence actor. Failed rollback, unknown connection
+state, or failed old-or-new probing is `CommitUnknown`: it retains every
+Registry fence, stops current-incarnation admission, and never resumes the
+actor. An early logical lower-bound check may reject obviously oversized work
+before constructing its page cache, but it cannot admit a request by itself.
 
 Admission returns one affine staged-start owner while the persistence actor
 keeps that exact transaction open. The owner either aborts and proves rollback,
@@ -347,7 +351,16 @@ Deleted pages remain reusable inside the already frozen 384 MiB main-database
 ceiling. WAL and SHM remain under their independent ceilings, and physical
 validation after COMMIT cannot reclassify the durable old-or-new decision.
 Startup normalization uses the same spill-disabled page admission in bounded,
-restartable transactions before socket publication.
+restartable transactions before socket publication. An over-budget batch is
+reduced deterministically; an individually unprovable replacement fails startup
+closed rather than exposing a partially normalized store or returning a public
+`run_capacity`.
+
+The proof is source-bound to bundled SQLite 3.53.2 through rusqlite 0.40.2. The
+daemon crate remains `unsafe_code = "forbid"`; one private, audited FFI leaf may
+expose only the safe connection-status observation needed here. A SQLite or
+rusqlite upgrade must re-run the cache-accounting, no-spill, rollback, and final
+WAL-frame fixture before the dependency can change.
 
 Once implemented, this decision supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run

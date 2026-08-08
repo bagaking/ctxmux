@@ -120,6 +120,7 @@ version = "0.1.0"
 dependencies = [
  "ctxmux-client",
  "ctxmux-protocol",
+ "ctxmux-sqlite-status",
  "futures-util",
  "portable-pty",
  "rusqlite",
@@ -141,6 +142,14 @@ dependencies = [
  "thiserror 2.0.20",
  "ts-rs",
  "uuid",
+]
+
+[[package]]
+name = "ctxmux-sqlite-status"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
 ]
 
 [[package]]

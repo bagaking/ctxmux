@@ -1,0 +1,21 @@
+[package]
+name = "ctxmux-sqlite-status"
+description = "Audited safe SQLite connection-status leaf for ctxmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+rusqlite.workspace = true
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[dev-dependencies]
+tempfile.workspace = true

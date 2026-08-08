@@ -5,6 +5,7 @@ members = [
   "crates/ctxmux-client",
   "crates/ctxmux-daemon",
   "crates/ctxmux-protocol",
+  "crates/ctxmux-sqlite-status",
 ]
 
 [workspace.package]
