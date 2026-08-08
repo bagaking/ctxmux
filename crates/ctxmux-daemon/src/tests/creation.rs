@@ -1,7 +1,7 @@
 use super::*;
 use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
-use ctxmux_protocol::{ForkFidelity, RunLineage};
+use ctxmux_protocol::{ForkFidelity, RunId, RunLineage};
 use std::collections::HashSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -196,13 +196,7 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
     assert!(read_marker_pids(&rejected_marker).is_empty());
     assert_eq!(manager.list().len(), 1);
 
-    manager
-        .get(first.id)
-        .expect("pin the live capacity owner")
-        .stop()
-        .await
-        .expect("stop the capacity owner");
-    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+    stop_run_and_wait(&manager, first.id).await;
     wait_for_run_workers(&manager).await;
 
     let terminal_pin = manager
@@ -248,13 +242,7 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
     assert_ne!(recreated.id, first.id);
     assert_eq!(manager.list().len(), 1);
     assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
-    manager
-        .get(recreated.id)
-        .expect("pin recreated live Run")
-        .stop()
-        .await
-        .expect("stop recreated Run");
-    wait_for_run_terminal_async(&manager.get(recreated.id).unwrap()).await;
+    stop_run_and_wait(&manager, recreated.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1184,6 +1172,16 @@ async fn wait_for_run_terminal_async(run: &Arc<Run>) {
     })
     .await
     .expect("Run publishes terminal state");
+}
+
+async fn stop_run_and_wait(manager: &RunManager, id: RunId) {
+    manager
+        .get(id)
+        .expect("pin live Run for stop")
+        .stop()
+        .await
+        .expect("stop live Run");
+    wait_for_run_terminal_async(&manager.get(id).unwrap()).await;
 }
 
 async fn wait_for_run_workers(manager: &RunManager) {
