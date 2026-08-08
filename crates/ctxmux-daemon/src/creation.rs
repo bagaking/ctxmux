@@ -642,12 +642,35 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunSpec, TerminalSize};
+    use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunId, RunSpec, TerminalSize};
 
     use super::{
-        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, TerminalPublicationOwner,
-        UnpublishedCleanupOwner,
+        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, TerminalOrdinal,
+        TerminalPublicationOwner, UnpublishedCleanupOwner, compare_memory_collection_candidates,
     };
+
+    #[test]
+    fn memory_collection_order_prefers_ordinal_then_run_id() {
+        let lower: RunId =
+            serde_json::from_str(r#""00000000-0000-0000-0000-000000000001""#).unwrap();
+        let higher: RunId =
+            serde_json::from_str(r#""00000000-0000-0000-0000-000000000002""#).unwrap();
+        let ordinal = TerminalOrdinal(7);
+        let lower_candidate = (ordinal, lower.to_string(), lower);
+        let higher_candidate = (ordinal, higher.to_string(), higher);
+
+        assert_eq!(
+            compare_memory_collection_candidates(&lower_candidate, &higher_candidate),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_memory_collection_candidates(
+                &(TerminalOrdinal(6), higher.to_string(), higher),
+                &lower_candidate,
+            ),
+            std::cmp::Ordering::Less
+        );
+    }
 
     #[test]
     fn terminal_ordinal_matches_visible_publication_order() {
@@ -902,6 +925,13 @@ struct RegistryReservation {
     candidate: Option<RunId>,
 }
 
+fn compare_memory_collection_candidates(
+    left: &(TerminalOrdinal, String, RunId),
+    right: &(TerminalOrdinal, String, RunId),
+) -> std::cmp::Ordering {
+    left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
+}
+
 /// RAII ownership for one projected memory-only Registry publication.
 ///
 /// Dropping an unconsumed reservation restores its exact collection fence.
@@ -1064,7 +1094,7 @@ impl RunRegistry {
                             .memory_collection_ordinal()
                             .map(|ordinal| (ordinal, id.to_string(), *id))
                     })
-                    .min_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)))
+                    .min_by(compare_memory_collection_candidates)
                     .map(|(_, _, id)| id)
                     .ok_or_else(|| {
                         ProtocolError::new(

@@ -301,18 +301,96 @@ async fn projected_memory_record_blocks_a_second_physical_start_before_publicati
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn collecting_fence_preserves_copy_reads_and_fails_long_lived_lookups_closed() {
+async fn public_client_observes_collecting_and_removed_matrix_and_reuses_exact_key() {
     let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
     let manager = Arc::new(RunManager {
         registry: RunRegistry::with_record_capacity(1),
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::default()
     });
+    let server = InProcessServer::start(Arc::clone(&manager));
     let temp = tempfile::tempdir().expect("create collection fence fixture");
     let first_marker = temp.path().join("first.log");
     let replacement_marker = temp.path().join("replacement.log");
+    let rejected_marker = temp.path().join("rejected.log");
     let (first_key, replacement_key) = distinct_operation_keys(&manager);
+    let fork_key = operation_key_on_other_stripe(&manager, &replacement_key, "collecting-fork");
+    let rejected_key =
+        operation_key_on_other_stripe(&manager, &replacement_key, "collecting-start");
     let first_spec = marker_spec(&first_marker, false);
+    let first = server
+        .client
+        .start_with_operation_key(first_spec.clone(), first_key.clone())
+        .await
+        .expect("publish collection candidate");
+    wait_for_exit(&server.client, first.id).await;
+    wait_for_run_workers(&manager).await;
+
+    hook.arm();
+    let replacement_client = server.client.clone();
+    let replacement_spec = marker_spec(&replacement_marker, false);
+    let replacement_request = replacement_spec.clone();
+    let replacement = tokio::spawn(async move {
+        replacement_client
+            .start_with_operation_key(replacement_request, replacement_key)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("replacement reaches post-spawn barrier")
+        .expect("replacement barrier remains connected");
+
+    assert_collecting_public_matrix(
+        &server,
+        first.id,
+        &first_spec,
+        &first_key,
+        fork_key,
+        &rejected_marker,
+        rejected_key,
+    )
+    .await;
+
+    hook.release();
+    let replacement = replacement
+        .await
+        .expect("replacement owner task remains live")
+        .expect("replacement publishes");
+    let retained = server.client.list().await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, replacement.id);
+    assert_removed_public_matrix(&server, first.id).await;
+    assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
+    wait_for_exit(&server.client, replacement.id).await;
+    wait_for_run_workers(&manager).await;
+
+    let recreated = server
+        .client
+        .start_with_operation_key(first_spec, first_key)
+        .await
+        .expect("removed exact key may elect one new physical Run");
+    assert_ne!(recreated.id, first.id);
+    let retained = server.client.list().await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, recreated.id);
+    assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
+    wait_for_exit(&server.client, recreated.id).await;
+    wait_for_run_workers(&manager).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiple_terminal_candidates_replace_earliest_run_and_its_exact_key() {
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(2),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create ordered collection fixture");
+    let first_spec = marker_spec(&temp.path().join("first.log"), false);
+    let second_spec = marker_spec(&temp.path().join("second.log"), false);
+    let replacement_spec = marker_spec(&temp.path().join("replacement.log"), false);
+    let first_key = CreateOperationKey::new("ordered-candidate-first").unwrap();
+    let second_key = CreateOperationKey::new("ordered-candidate-second").unwrap();
+
     let first = manager
         .create(
             first_key.clone(),
@@ -321,73 +399,62 @@ async fn collecting_fence_preserves_copy_reads_and_fails_long_lived_lookups_clos
             },
         )
         .await
-        .expect("publish collection candidate");
+        .expect("publish first terminal candidate");
     wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
     wait_for_run_workers(&manager).await;
-
-    hook.arm();
-    let replacement_manager = Arc::clone(&manager);
-    let replacement_spec = marker_spec(&replacement_marker, false);
-    let replacement_request = replacement_spec.clone();
-    let replacement = tokio::spawn(async move {
-        replacement_manager
-            .create(
-                replacement_key,
-                CreationRequest::Start {
-                    spec: replacement_request,
-                },
-            )
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+    let second = manager
+        .create(
+            second_key.clone(),
+            CreationRequest::Start {
+                spec: second_spec.clone(),
+            },
+        )
         .await
-        .expect("replacement reaches post-spawn barrier")
-        .expect("replacement barrier remains connected");
+        .expect("publish second terminal candidate");
+    wait_for_run_terminal_async(&manager.get(second.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
 
-    assert_eq!(manager.info(first.id).unwrap().id, first.id);
-    assert_eq!(manager.list()[0].id, first.id);
-    let Err(pin_error) = manager.pin(first.id) else {
-        panic!("Collecting Run cannot grant a long-lived owner");
-    };
-    assert_eq!(pin_error.code, ErrorCode::BackendUnavailable);
-    assert_eq!(
-        manager
-            .registry
-            .resolve_creation_info(
-                &first_key,
-                &CreationRequest::Start {
-                    spec: first_spec.clone(),
-                },
-            )
-            .unwrap_err()
-            .code,
-        ErrorCode::BackendUnavailable
-    );
-    assert_eq!(
-        manager
-            .registry
-            .resolve_creation_info(
-                &first_key,
-                &CreationRequest::Start {
-                    spec: long_running_spec(),
-                },
-            )
-            .unwrap_err()
-            .code,
-        ErrorCode::CreationConflict
-    );
-
-    hook.release();
-    let replacement = replacement
+    let replacement = manager
+        .create(
+            CreateOperationKey::new("ordered-candidate-replacement").unwrap(),
+            CreationRequest::Start {
+                spec: replacement_spec,
+            },
+        )
         .await
-        .expect("replacement owner task remains live")
-        .expect("replacement publishes");
+        .expect("replace the earliest terminal candidate");
+
     assert_eq!(
         manager.info(first.id).unwrap_err().code,
         ErrorCode::RunNotFound
     );
-    assert_eq!(manager.list()[0].id, replacement.id);
-    assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
+    assert_eq!(manager.info(second.id).unwrap().id, second.id);
+    assert!(
+        manager
+            .registry
+            .resolve_creation_info(&first_key, &CreationRequest::Start { spec: first_spec },)
+            .expect("resolve removed exact key")
+            .is_none()
+    );
+    assert_eq!(
+        manager
+            .registry
+            .resolve_creation_info(&second_key, &CreationRequest::Start { spec: second_spec },)
+            .expect("resolve later candidate exact key")
+            .expect("later candidate key remains bound")
+            .id,
+        second.id
+    );
+    assert_eq!(
+        manager
+            .list()
+            .into_iter()
+            .map(|run| run.id)
+            .collect::<HashSet<_>>(),
+        HashSet::from([second.id, replacement.id])
+    );
+    wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1204,6 +1271,149 @@ const fn clean_exit() -> RunState {
         code: 0,
         signal: None,
     }
+}
+
+fn assert_protocol_code(error: ClientError, expected: ErrorCode) {
+    match error {
+        ClientError::Protocol { code, .. } => assert_eq!(code, expected),
+        other => panic!("expected {expected:?} protocol error, got {other:?}"),
+    }
+}
+
+fn assert_control_not_applied(error: ClientError, expected: ErrorCode) {
+    match error {
+        ClientError::ControlRejected { failure } => {
+            assert_eq!(failure.error.code, expected);
+            assert_eq!(failure.disposition, CommandDisposition::NotApplied);
+        }
+        other => panic!("expected {expected:?} not-applied control rejection, got {other:?}"),
+    }
+}
+
+async fn assert_collecting_public_matrix(
+    server: &InProcessServer,
+    id: RunId,
+    spec: &RunSpec,
+    operation_key: &CreateOperationKey,
+    fork_key: CreateOperationKey,
+    rejected_marker: &std::path::Path,
+    rejected_key: CreateOperationKey,
+) {
+    assert_eq!(server.client.status(id).await.unwrap().id, id);
+    let retained = server.client.list().await.unwrap();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].id, id);
+    let Err(attach_error) = server.client.attach(id, 0).await else {
+        panic!("Collecting Run must reject Attach");
+    };
+    assert_protocol_code(attach_error, ErrorCode::BackendUnavailable);
+    assert_control_not_applied(
+        server
+            .client
+            .input(id, b"x".to_vec())
+            .await
+            .expect_err("Collecting Run rejects short control"),
+        ErrorCode::BackendUnavailable,
+    );
+    assert_control_not_applied(
+        server
+            .client
+            .resize(id, TerminalSize { cols: 81, rows: 25 })
+            .await
+            .expect_err("Collecting Run rejects Resize"),
+        ErrorCode::BackendUnavailable,
+    );
+    assert_control_not_applied(
+        server
+            .client
+            .stop(id)
+            .await
+            .expect_err("Collecting Run rejects Stop"),
+        ErrorCode::BackendUnavailable,
+    );
+    assert_protocol_code(
+        server
+            .client
+            .fork_with_operation_key(id, ForkPlan::LevelA, fork_key)
+            .await
+            .expect_err("Collecting Run rejects a fresh Fork"),
+        ErrorCode::BackendUnavailable,
+    );
+    assert_protocol_code(
+        server
+            .client
+            .start_with_operation_key(spec.clone(), operation_key.clone())
+            .await
+            .expect_err("Collecting key rejects its matching Start"),
+        ErrorCode::BackendUnavailable,
+    );
+    assert_protocol_code(
+        server
+            .client
+            .start_with_operation_key(long_running_spec(), operation_key.clone())
+            .await
+            .expect_err("Collecting key rejects a conflicting Start"),
+        ErrorCode::CreationConflict,
+    );
+    assert_protocol_code(
+        server
+            .client
+            .start_with_operation_key(marker_spec(rejected_marker, false), rejected_key)
+            .await
+            .expect_err("projected replacement leaves no second capacity slot"),
+        ErrorCode::RunCapacity,
+    );
+    assert!(
+        read_marker_pids(rejected_marker).is_empty(),
+        "capacity rejection happens before physical spawn"
+    );
+}
+
+async fn assert_removed_public_matrix(server: &InProcessServer, id: RunId) {
+    assert_protocol_code(
+        server
+            .client
+            .status(id)
+            .await
+            .expect_err("removed Run rejects Status"),
+        ErrorCode::RunNotFound,
+    );
+    let Err(attach_error) = server.client.attach(id, 0).await else {
+        panic!("removed Run must reject Attach");
+    };
+    assert_protocol_code(attach_error, ErrorCode::RunNotFound);
+    assert_control_not_applied(
+        server
+            .client
+            .input(id, b"x".to_vec())
+            .await
+            .expect_err("removed Run rejects short control"),
+        ErrorCode::RunNotFound,
+    );
+    assert_control_not_applied(
+        server
+            .client
+            .resize(id, TerminalSize { cols: 81, rows: 25 })
+            .await
+            .expect_err("removed Run rejects Resize"),
+        ErrorCode::RunNotFound,
+    );
+    assert_control_not_applied(
+        server
+            .client
+            .stop(id)
+            .await
+            .expect_err("removed Run rejects Stop"),
+        ErrorCode::RunNotFound,
+    );
+    assert_protocol_code(
+        server
+            .client
+            .fork(id, ForkPlan::LevelA)
+            .await
+            .expect_err("removed Run rejects a fresh Fork"),
+        ErrorCode::RunNotFound,
+    );
 }
 
 fn creation_hooked_server() -> (

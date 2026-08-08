@@ -50,9 +50,10 @@ Backend-local quiescence. Native cleanup requires child reap, closed control,
 empty input accounting, and no additional reader, waiter, input-drain, control,
 or Run owner. The exact cleanup-held `Arc<Run>` and its Run-held
 `Arc<NativeControlInner>` each retain a base strong count of one. Tmux requires
-its corresponding Control child, reader, waiter, and writer completion
-receipts. Thus at most eight not-yet-published or private-cleanup Runs can
-overlap the 128 Registry records. Their additional `OutputLog` payload is
+its corresponding Control child, reader, waiter, and writer completion receipt
+to succeed and the cleanup entry to become the sole remaining `Arc<Run>` owner.
+Thus at most eight not-yet-published or private-cleanup Runs can overlap the 128
+Registry records. Their additional `OutputLog` payload is
 bounded by 32 MiB, for a 544 MiB retained-plus-overlap payload bound. Native
 readers use an 8 KiB buffer. A tmux reader separately bounds both its Control
 line and command-block output at 1 MiB, and may briefly hold decoded
@@ -78,11 +79,13 @@ owner.
 
 Tmux import takes the same eight-slot physical-overlap owner before its Registry
 reservation and Control startup. A failed import releases the slot only after
-its Control completion receipt proves cleanup. Timeout, explicit cleanup
-failure, or a worker-setup path with no completion receipt transfers the hidden
-Run and slot to the same bounded shutdown-visible owner. The last case may
-conservatively retain that slot until daemon exit; bounded fail-stop is
-preferred to inventing cleanup success or adding a worker supervisor.
+its Control completion receipt succeeds and the cleanup entry is the sole
+remaining `Arc<Run>` owner. Timeout, explicit cleanup failure, a still-held
+worker Run owner, or a worker-setup path with no completion receipt transfers
+the hidden Run and slot to the same bounded shutdown-visible owner. A failed or
+missing receipt may conservatively retain that slot until daemon exit; bounded
+fail-stop is preferred to inventing cleanup success or adding a worker
+supervisor.
 
 ### Registry entry and lookup linearization
 

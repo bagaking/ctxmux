@@ -3082,8 +3082,9 @@ mod tests {
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
-        CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunBackend,
-        RunCapabilities, RunEvent, RunId, RunSpec, RunState, TerminalSize,
+        CommandDisposition, CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason,
+        ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunSpec, RunState,
+        TerminalSize,
     };
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
@@ -3251,6 +3252,51 @@ mod tests {
         );
         drop(remaining);
         assert_eq!(cleanup_owner.owned_count(), 1);
+    }
+
+    #[test]
+    fn failed_tmux_readiness_keeps_overlap_until_worker_run_owner_settles() {
+        let cleanup_owner = UnpublishedCleanupOwner::default();
+        let cleanup_reservation = cleanup_owner
+            .reserve_tmux()
+            .expect("reserve one tmux physical-overlap owner");
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        let (run, command_rx) = tmux_cleanup_test_run(completion_rx);
+        let worker_run = Arc::clone(&run);
+        let pending = PendingTmuxPublication::new(run, cleanup_reservation);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        ready_tx
+            .send(Err(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "injected tmux readiness failure",
+            )))
+            .expect("publish tmux readiness failure");
+        completion_tx
+            .send(Ok(()))
+            .expect("publish exact tmux cleanup completion");
+
+        let Err(error) = Run::finish_tmux_import(
+            pending,
+            &ready_rx,
+            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(2),
+        ) else {
+            panic!("readiness failure must reject tmux publication");
+        };
+        assert_eq!(error.code, ErrorCode::BackendUnavailable);
+        assert_eq!(error.message, "injected tmux readiness failure");
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(super::TmuxControlCommand::Interrupt(
+                InterruptionReason::TmuxServerUnavailable
+            ))
+        ));
+        assert_eq!(cleanup_owner.unresolved_count(), 1);
+        assert_eq!(cleanup_owner.owned_count(), 1);
+
+        drop(worker_run);
+        assert_eq!(cleanup_owner.unresolved_count(), 0);
+        assert_eq!(cleanup_owner.owned_count(), 0);
     }
 
     fn tmux_cleanup_test_run(
