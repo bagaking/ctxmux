@@ -48,9 +48,9 @@ use tokio::{
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{
-    CreationFlightOwner, CreationRequest, MemoryPublicationReservation, PendingPublication,
-    RunRegistry, TerminalOrdinal, TerminalPublicationOwner, UnpublishedCleanupOwner,
-    UnpublishedCleanupReservation,
+    CreationFlight, CreationFlightOwner, CreationRequest, MemoryPublicationReservation,
+    PendingPublication, RunRegistry, TerminalOrdinal, TerminalPublicationOwner,
+    TmuxCleanupReservation, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
 };
 use crate::native_control::{
     ChildCommand, ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner,
@@ -469,22 +469,7 @@ impl RunManager {
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
         let materialized = self.materialize_creation(request)?;
-        let admission = self
-            .creation_flights
-            .acquire_admission()
-            .await
-            .ok_or_else(|| {
-                ProtocolError::new(
-                    ErrorCode::BackendUnavailable,
-                    "ctxmux daemon is shutting down",
-                )
-            })?;
-        let flight = self.creation_flights.try_begin(admission).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::BackendUnavailable,
-                "ctxmux daemon is shutting down",
-            )
-        })?;
+        let flight = self.begin_creation_flight().await?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
         let registry_reservation =
@@ -518,6 +503,25 @@ impl RunManager {
             )
         })??;
         Ok(info)
+    }
+
+    async fn begin_creation_flight(&self) -> Result<CreationFlight, ProtocolError> {
+        let admission = self
+            .creation_flights
+            .acquire_admission()
+            .await
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "ctxmux daemon is shutting down",
+                )
+            })?;
+        self.creation_flights.try_begin(admission).ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "ctxmux daemon is shutting down",
+            )
+        })
     }
 
     fn create_unique(
@@ -731,18 +735,20 @@ impl RunManager {
         })
     }
 
-    fn import_tmux(&self, socket_path: &str, pane_id: &str) -> Result<RunInfo, ProtocolError> {
-        if self.persistence.is_some() {
-            return Err(ProtocolError::new(
-                ErrorCode::UnsupportedCapability,
-                "tmux pane import is not persisted; use a memory-only ctxmux daemon",
-            ));
-        }
-        let new_run_id = RunId::new();
-        let reservation = self.registry.reserve_memory_publication(new_run_id, None)?;
+    fn import_tmux(
+        &self,
+        socket_path: &str,
+        pane_id: &str,
+        _flight: CreationFlight,
+    ) -> Result<RunInfo, ProtocolError> {
+        self.ensure_tmux_import_supported()?;
         self.with_tmux_operation(|| {
+            let cleanup_reservation = self.unpublished_cleanups.reserve_tmux()?;
+            let new_run_id = RunId::new();
+            let registry_reservation =
+                self.registry.reserve_memory_publication(new_run_id, None)?;
             let started_at = Instant::now();
-            let run = Run::import_tmux(
+            let pending = Run::import_tmux(
                 socket_path,
                 pane_id,
                 TmuxImportConfig {
@@ -753,11 +759,24 @@ impl RunManager {
                     prepare_deadline: started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
                     total_deadline: started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
                 },
+                cleanup_reservation,
             )?;
-            let info = run.info();
-            self.registry.publish_unkeyed(run, reservation);
+            let info = pending.run().info();
+            let (run, cleanup_reservation) = pending.into_published();
+            self.registry.publish_unkeyed(run, registry_reservation);
+            drop(cleanup_reservation);
             Ok(info)
         })
+    }
+
+    fn ensure_tmux_import_supported(&self) -> Result<(), ProtocolError> {
+        if self.persistence.is_none() {
+            return Ok(());
+        }
+        Err(ProtocolError::new(
+            ErrorCode::UnsupportedCapability,
+            "tmux pane import is not persisted; use a memory-only ctxmux daemon",
+        ))
     }
 
     fn shutdown_owned_controls(&self, timeout: Duration) -> Result<(), ServerError> {
@@ -842,7 +861,7 @@ impl RunManager {
             self.unpublished_cleanups
                 .wait_until(deadline)
                 .into_iter()
-                .map(|failure| format!("unpublished child cleanup {failure}")),
+                .map(|failure| format!("unpublished Run cleanup {failure}")),
         );
 
         if failures.is_empty() {
@@ -1005,6 +1024,65 @@ struct TmuxImportConfig {
     discovery_deadline: Instant,
     prepare_deadline: Instant,
     total_deadline: Instant,
+}
+
+#[must_use = "a started tmux Control owner must be published or transferred for cleanup"]
+struct PendingTmuxPublication {
+    run: Option<Arc<Run>>,
+    cleanup_reservation: Option<TmuxCleanupReservation>,
+}
+
+impl PendingTmuxPublication {
+    fn new(run: Arc<Run>, cleanup_reservation: TmuxCleanupReservation) -> Self {
+        Self {
+            run: Some(run),
+            cleanup_reservation: Some(cleanup_reservation),
+        }
+    }
+
+    fn run(&self) -> &Arc<Run> {
+        self.run
+            .as_ref()
+            .expect("pending tmux publication retains its Run")
+    }
+
+    fn into_published(mut self) -> (Arc<Run>, TmuxCleanupReservation) {
+        let run = self
+            .run
+            .take()
+            .expect("tmux publication consumes one pending Run");
+        let cleanup_reservation = self
+            .cleanup_reservation
+            .take()
+            .expect("tmux publication consumes one cleanup reservation");
+        (run, cleanup_reservation)
+    }
+
+    fn release_after_cleanup(mut self) {
+        self.run.take();
+        self.cleanup_reservation.take();
+    }
+
+    fn transfer(&mut self, transfer_reason: String) {
+        let run = self
+            .run
+            .take()
+            .expect("tmux publication transfers its Run at most once");
+        self.cleanup_reservation
+            .take()
+            .expect("tmux publication transfers its cleanup reservation at most once")
+            .transfer(run, transfer_reason);
+    }
+}
+
+impl Drop for PendingTmuxPublication {
+    fn drop(&mut self) {
+        let Some(run) = self.run.as_ref() else {
+            return;
+        };
+        run.request_tmux_import_cleanup();
+        self.transfer("tmux import owner unwound before publication".to_owned());
+    }
 }
 
 impl NativeSpawnConfig {
@@ -1610,7 +1688,8 @@ impl Run {
         socket_path: &str,
         pane_id: &str,
         config: TmuxImportConfig,
-    ) -> Result<Arc<Self>, ProtocolError> {
+        cleanup_reservation: TmuxCleanupReservation,
+    ) -> Result<PendingTmuxPublication, ProtocolError> {
         let mut pending = tmux::spawn_control(socket_path, pane_id, config.discovery_deadline)?;
         let target = pending.target.clone();
         let socket_identity = pending.socket_identity;
@@ -1650,13 +1729,14 @@ impl Run {
             terminal_ordinal: OnceLock::new(),
             events,
         });
+        let pending_publication = PendingTmuxPublication::new(run, cleanup_reservation);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (output_done_tx, output_done_rx) = mpsc::channel();
-        let output_run = Arc::clone(&run);
+        let output_run = Arc::clone(pending_publication.run());
         let output_target = target.clone();
         let output_ready = ready_tx.clone();
         thread::Builder::new()
-            .name(format!("ctxmux-tmux-output-{}", run.id))
+            .name(format!("ctxmux-tmux-output-{}", config.id))
             .spawn(move || {
                 let termination =
                     read_tmux_output(&output_run, stdout, &output_target, &output_ready);
@@ -1666,12 +1746,12 @@ impl Run {
             })
             .map_err(|error| backend_protocol_error("start tmux output reader", error))?;
 
-        let wait_run = Arc::clone(&run);
+        let wait_run = Arc::clone(pending_publication.run());
         let wait_target = target;
         let wait_ready = ready_tx;
         let (child_tx, child_rx) = mpsc::sync_channel(0);
         thread::Builder::new()
-            .name(format!("ctxmux-tmux-wait-{}", run.id))
+            .name(format!("ctxmux-tmux-wait-{}", config.id))
             .spawn(move || {
                 let Ok(mut child) = child_rx.recv() else {
                     return;
@@ -1705,7 +1785,7 @@ impl Run {
         }
 
         Self::finish_tmux_import(
-            run,
+            pending_publication,
             &ready_rx,
             config.prepare_deadline,
             config.total_deadline,
@@ -1713,14 +1793,14 @@ impl Run {
     }
 
     fn finish_tmux_import(
-        run: Arc<Self>,
+        mut pending: PendingTmuxPublication,
         ready: &mpsc::Receiver<Result<(), ProtocolError>>,
         prepare_deadline: Instant,
         total_deadline: Instant,
-    ) -> Result<Arc<Self>, ProtocolError> {
+    ) -> Result<PendingTmuxPublication, ProtocolError> {
         let readiness =
             match ready.recv_timeout(prepare_deadline.saturating_duration_since(Instant::now())) {
-                Ok(Ok(())) if Instant::now() < prepare_deadline => return Ok(run),
+                Ok(Ok(())) if Instant::now() < prepare_deadline => return Ok(pending),
                 Ok(Ok(())) => ProtocolError::new(
                     ErrorCode::BackendUnavailable,
                     "tmux Control Mode readiness exceeded the import preparation deadline",
@@ -1728,15 +1808,21 @@ impl Run {
                 Ok(Err(error)) => error,
                 Err(error) => backend_protocol_error("wait for tmux Control Mode readiness", error),
             };
-        run.interrupt_tmux(InterruptionReason::TmuxServerUnavailable);
+        pending.run().request_tmux_import_cleanup();
         let cleanup_timeout = TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT
             .min(total_deadline.saturating_duration_since(Instant::now()));
-        match run.wait_for_tmux_completion(cleanup_timeout) {
-            Ok(()) => Err(readiness),
-            Err(cleanup_error) => Err(ProtocolError::new(
-                readiness.code,
-                format!("{}; cleanup failed: {cleanup_error}", readiness.message),
-            )),
+        match pending.run().wait_for_tmux_completion(cleanup_timeout) {
+            Ok(()) => {
+                pending.release_after_cleanup();
+                Err(readiness)
+            }
+            Err(cleanup_error) => {
+                pending.transfer(format!("tmux import cleanup failed: {cleanup_error}"));
+                Err(ProtocolError::new(
+                    readiness.code,
+                    format!("{}; cleanup failed: {cleanup_error}", readiness.message),
+                ))
+            }
         }
     }
 
@@ -1926,9 +2012,22 @@ impl Run {
         control.correlate_result(number)
     }
 
-    fn interrupt_tmux(&self, reason: InterruptionReason) {
+    fn request_tmux_import_cleanup(&self) {
         if let Some(RunControl::Tmux(control)) = &self.incarnation_control {
-            let _ = control.commands.send(TmuxControlCommand::Interrupt(reason));
+            let _ = control.commands.send(TmuxControlCommand::Interrupt(
+                InterruptionReason::TmuxServerUnavailable,
+            ));
+            control.close_writer();
+        }
+    }
+
+    fn tmux_unpublished_cleanup_result(&self) -> Result<(), String> {
+        match &self.incarnation_control {
+            Some(RunControl::Tmux(control)) => control.closed_quiescence_result(),
+            Some(RunControl::Native(_)) => {
+                Err("unpublished tmux cleanup references a native Run".to_owned())
+            }
+            None => Err("unpublished tmux cleanup has no incarnation owner".to_owned()),
         }
     }
 
@@ -2825,9 +2924,11 @@ async fn execute_request(
             socket_path,
             pane_id,
         } => {
+            manager.ensure_tmux_import_supported()?;
+            let flight = manager.begin_creation_flight().await?;
             let operation_manager = Arc::clone(manager);
             let run = run_blocking_tmux_operation(move || {
-                operation_manager.import_tmux(&socket_path, &pane_id)
+                operation_manager.import_tmux(&socket_path, &pane_id, flight)
             })
             .await?;
             Ok(Response::Imported { run })
@@ -2983,22 +3084,23 @@ mod tests {
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
-        CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunEvent,
-        RunSpec, RunState, TerminalSize,
+        CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason, ProtocolError, RunBackend,
+        RunCapabilities, RunEvent, RunId, RunSpec, RunState, TerminalSize,
     };
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
         CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog,
-        OutputReplay, Persistence, PersistenceMode, RecoveredRun, Run, RunManager, ServerError,
-        TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
-        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
-        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
-        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
-        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
+        OutputReplay, PendingTmuxPublication, Persistence, PersistenceMode, RecoveredRun, Run,
+        RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
+        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
+        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
+        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
+        TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
         prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
     };
+    use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
 
     mod creation;
 
@@ -3085,6 +3187,110 @@ mod tests {
             panic!("disconnected completion fails closed");
         };
         assert_eq!(observed_disconnect, expected_disconnect);
+    }
+
+    #[test]
+    fn pending_tmux_publication_transfers_overlap_until_cleanup_is_proven() {
+        let cleanup_owner = UnpublishedCleanupOwner::default();
+        let cleanup_reservation = cleanup_owner
+            .reserve_tmux()
+            .expect("reserve one tmux physical-overlap owner");
+        let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+        let (run, command_rx) = tmux_cleanup_test_run(completion_rx);
+
+        drop(PendingTmuxPublication::new(
+            Arc::clone(&run),
+            cleanup_reservation,
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Ok(super::TmuxControlCommand::Interrupt(
+                InterruptionReason::TmuxServerUnavailable
+            ))
+        ));
+        assert_eq!(cleanup_owner.owned_count(), 1);
+        assert_eq!(cleanup_owner.unresolved_count(), 1);
+
+        completion_tx
+            .send(Ok(()))
+            .expect("publish exact tmux cleanup completion");
+        assert_eq!(cleanup_owner.unresolved_count(), 0);
+        assert_eq!(cleanup_owner.owned_count(), 0);
+
+        let fail_stop_reservation = cleanup_owner
+            .reserve_tmux()
+            .expect("reserve fail-stop tmux overlap owner");
+        let (disconnected_tx, disconnected_rx) = std::sync::mpsc::sync_channel(1);
+        drop(disconnected_tx);
+        let (fail_stop_run, _) = tmux_cleanup_test_run(disconnected_rx);
+        drop(PendingTmuxPublication::new(
+            fail_stop_run,
+            fail_stop_reservation,
+        ));
+        assert_eq!(cleanup_owner.unresolved_count(), 1);
+        let failures = cleanup_owner.wait_until(Instant::now());
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("without a completion receipt"));
+
+        let mut remaining = Vec::new();
+        for _ in 1..8 {
+            remaining.push(
+                cleanup_owner
+                    .reserve_tmux()
+                    .expect("a fail-stop owner leaves only the remaining bounded slots"),
+            );
+        }
+        assert_eq!(
+            cleanup_owner
+                .reserve_tmux()
+                .err()
+                .expect("ninth shared overlap owner is rejected")
+                .code,
+            ErrorCode::BackendUnavailable
+        );
+        drop(remaining);
+        assert_eq!(cleanup_owner.owned_count(), 1);
+    }
+
+    fn tmux_cleanup_test_run(
+        completion: std::sync::mpsc::Receiver<Result<(), String>>,
+    ) -> (
+        Arc<Run>,
+        std::sync::mpsc::Receiver<super::TmuxControlCommand>,
+    ) {
+        let (commands, command_rx) = std::sync::mpsc::channel();
+        let (events, _) = broadcast::channel(1);
+        let run = Arc::new(Run {
+            id: RunId::new(),
+            spec: None,
+            lineage: None,
+            backend: RunBackend::Tmux {
+                socket_path: "/tmp/ctxmux-test-tmux.sock".to_owned(),
+                server_pid: 1,
+                server_started_at: 1,
+                session_id: "$1".to_owned(),
+                window_id: "@1".to_owned(),
+                pane_id: "%1".to_owned(),
+                tmux_version: "3.4".to_owned(),
+            },
+            capabilities: RunCapabilities::TMUX_READ_ONLY,
+            pid: Some(1),
+            state: Mutex::new(RunState::Running),
+            output: Mutex::new(OutputLog::with_initial_truncation()),
+            incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
+                writer: Mutex::new(None),
+                commands,
+                completion: Mutex::new(TmuxCompletion::Pending(completion)),
+            })),
+            persistence_mode: PersistenceMode::MemoryOnly,
+            persistence_transition: Mutex::new(()),
+            persistence: Mutex::new(None),
+            attachments: std::sync::atomic::AtomicUsize::new(0),
+            terminal_publications: TerminalPublicationOwner::default(),
+            terminal_ordinal: std::sync::OnceLock::new(),
+            events,
+        });
+        (run, command_rx)
     }
 
     #[test]

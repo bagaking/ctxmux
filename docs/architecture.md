@@ -157,8 +157,12 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 ### Import a tmux-owned pane
 
 1. A public client selects one explicit tmux socket and discovers live panes.
-   Import preallocates its `RunId` and reserves the same memory-only Registry
-   capacity before starting a Control Mode child.
+   Import first acquires the same eight-wide physical-publication flight and
+   cleanup owner used by native creation, then preallocates its `RunId` and
+   reserves memory-only Registry capacity before starting a Control Mode child.
+   A failed import releases the slot only after Control child, reader, waiter,
+   and writer cleanup completes; otherwise bounded shutdown reports the
+   transferred cleanup owner.
 2. The daemon separately validates the tmux client executable and the selected
    server version, then starts a public read-only Control Mode client.
 3. Before publication, the Control connection binds the complete import tuple:

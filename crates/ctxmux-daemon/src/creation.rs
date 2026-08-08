@@ -102,7 +102,7 @@ impl CreationFlightOwner {
     /// Cancellation while waiting releases no flight because none exists yet.
     /// Closing admission during shutdown wakes queued waiters with `None`. The
     /// separate cleanup reservation is the physical-overlap SSOT across active
-    /// native launch and transferred cleanup.
+    /// native or tmux publication and transferred cleanup.
     pub(crate) async fn acquire_admission(&self) -> Option<OwnedSemaphorePermit> {
         Arc::clone(&self.inner.admission).acquire_owned().await.ok()
     }
@@ -209,14 +209,15 @@ impl Drop for CreationFlight {
     }
 }
 
-/// Bounded daemon-private ownership for native physical overlap.
+/// Bounded daemon-private ownership for native and tmux physical overlap.
 ///
 /// A reservation is taken before physical launch and counts active publication
 /// work as well as transferred cleanup under one `owned` ceiling. On ordinary
-/// completion it disappears with the creation thread; on unresolved rollback
-/// it becomes an exact-key fence that retains the Run until child, reader,
-/// waiter, and control cleanup are all proven. This is neither a public pending
-/// Run nor durable transaction state.
+/// completion it disappears with the publication owner; on unresolved native
+/// rollback it becomes an exact-key fence, while unresolved tmux import keeps
+/// an unkeyed cleanup entry. Both retain the Run until their Backend-local
+/// child, reader, waiter, writer, and control cleanup are proven. This is
+/// neither a public pending Run nor durable transaction state.
 #[derive(Default)]
 pub(crate) struct UnpublishedCleanupOwner {
     inner: Arc<UnpublishedCleanupInner>,
@@ -231,6 +232,7 @@ struct UnpublishedCleanupInner {
 struct UnpublishedCleanupState {
     owned: usize,
     entries: HashMap<CreateOperationKey, UnpublishedCleanupFence>,
+    tmux_entries: Vec<TmuxCleanupEntry>,
 }
 
 struct UnpublishedCleanupFence {
@@ -243,10 +245,21 @@ struct UnpublishedCleanupEntry {
     transfer_reason: String,
 }
 
+struct TmuxCleanupEntry {
+    run: Arc<Run>,
+    transfer_reason: String,
+}
+
 #[must_use = "dropping the reservation releases unpublished-cleanup capacity"]
 pub(crate) struct UnpublishedCleanupReservation {
     inner: Arc<UnpublishedCleanupInner>,
     operation_key: Option<CreateOperationKey>,
+}
+
+#[must_use = "dropping the reservation releases tmux cleanup capacity"]
+pub(crate) struct TmuxCleanupReservation {
+    inner: Arc<UnpublishedCleanupInner>,
+    active: bool,
 }
 
 /// Armed ownership for one native Run that has started but is not published.
@@ -308,13 +321,34 @@ impl UnpublishedCleanupOwner {
         if state.owned >= MAX_CREATION_OWNER_SLOTS {
             return Err(ProtocolError::new(
                 ErrorCode::BackendUnavailable,
-                "unpublished child cleanup capacity is exhausted",
+                "Run publication cleanup capacity is exhausted",
             ));
         }
         state.owned += 1;
         Ok(UnpublishedCleanupReservation {
             inner: Arc::clone(&self.inner),
             operation_key: Some(operation_key.clone()),
+        })
+    }
+
+    /// Reserve the same physical-overlap budget for an unkeyed tmux import.
+    pub(crate) fn reserve_tmux(&self) -> Result<TmuxCleanupReservation, ProtocolError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        prune_reaped(&mut state);
+        if state.owned >= MAX_CREATION_OWNER_SLOTS {
+            return Err(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Run publication cleanup capacity is exhausted",
+            ));
+        }
+        state.owned += 1;
+        Ok(TmuxCleanupReservation {
+            inner: Arc::clone(&self.inner),
+            active: true,
         })
     }
 
@@ -356,6 +390,21 @@ impl UnpublishedCleanupOwner {
                 });
         }
         state.entries.retain(|_, fence| !fence.owners.is_empty());
+        state
+            .tmux_entries
+            .retain(|entry| match entry.run.tmux_unpublished_cleanup_result() {
+                Ok(()) => {
+                    reaped += 1;
+                    false
+                }
+                Err(current) => {
+                    pending.push(format!(
+                        "unpublished tmux Run {} cleanup: {}; {}",
+                        entry.run.id, entry.transfer_reason, current
+                    ));
+                    true
+                }
+            });
         state.owned = state
             .owned
             .checked_sub(reaped)
@@ -389,6 +438,11 @@ fn prune_reaped(state: &mut UnpublishedCleanupState) {
         reaped += before - fence.owners.len();
     }
     state.entries.retain(|_, fence| !fence.owners.is_empty());
+    let before = state.tmux_entries.len();
+    state
+        .tmux_entries
+        .retain(|entry| entry.run.tmux_unpublished_cleanup_result().is_err());
+    reaped += before - state.tmux_entries.len();
     state.owned = state
         .owned
         .checked_sub(reaped)
@@ -448,6 +502,42 @@ impl Drop for UnpublishedCleanupReservation {
             .owned
             .checked_sub(1)
             .expect("cleanup reservation releases exactly one owner slot");
+    }
+}
+
+impl TmuxCleanupReservation {
+    pub(crate) fn transfer(mut self, run: Arc<Run>, transfer_reason: String) {
+        debug_assert!(
+            self.active,
+            "tmux cleanup reservation transfers at most once"
+        );
+        self.active = false;
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tmux_entries
+            .push(TmuxCleanupEntry {
+                run,
+                transfer_reason,
+            });
+    }
+}
+
+impl Drop for TmuxCleanupReservation {
+    fn drop(&mut self) {
+        if !std::mem::take(&mut self.active) {
+            return;
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.owned = state
+            .owned
+            .checked_sub(1)
+            .expect("tmux cleanup reservation releases exactly one owner slot");
     }
 }
 
@@ -598,8 +688,11 @@ mod tests {
                 declared_inputs: Vec::new(),
             },
         };
+        let tmux_reservation = owner
+            .reserve_tmux()
+            .expect("tmux import shares one physical-overlap slot");
         let mut reservations = Vec::new();
-        for index in 0..MAX_CREATION_OWNER_SLOTS {
+        for index in 0..(MAX_CREATION_OWNER_SLOTS - 1) {
             let key = CreateOperationKey::new(format!("cleanup-slot-{index}")).unwrap();
             owner.resolve_fence(&key, &request).unwrap();
             reservations.push(owner.reserve(&key).expect("reserve bounded cleanup slot"));
@@ -613,7 +706,7 @@ mod tests {
         assert_eq!(error.code, ErrorCode::BackendUnavailable);
         assert_eq!(owner.owned_count(), MAX_CREATION_OWNER_SLOTS);
 
-        drop(reservations.pop());
+        drop(tmux_reservation);
         reservations.push(owner.reserve(&ninth).expect("released slot is reusable"));
         assert_eq!(owner.owned_count(), MAX_CREATION_OWNER_SLOTS);
     }

@@ -458,7 +458,8 @@ rather than normalize unbounded growth.
 
 T-030 pre-registers the pending production qualification before implementation
 or candidate measurements can influence it. The operational Registry ceiling
-is 128 in memory-only and persistent modes; SQLite's older 4,096-row validation
+is 128 in memory-only mode and becomes the persistent-mode ceiling only when
+T-029 closes exact durable replacement; SQLite's older 4,096-row validation
 envelope is not a live capacity claim. A PR-only reduced ceiling must cross at
 least three complete collection windows but cannot substitute for the canonical
 nightly workload. `reliability-gc-contract.json` is the executable SSOT for the

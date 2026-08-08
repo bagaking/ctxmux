@@ -7,12 +7,11 @@
 
 ## Context
 
-The daemon currently retains every published Run and creation-key mapping for
-its whole epoch. Persistent SQLite storage bounds its own rows, metadata, and
-replay, but the live Registry does not remove the corresponding in-memory Run.
-Memory-only mode has no global Run bound at all. A long-lived daemon can
-therefore accumulate terminal Run objects, replay, PTY descriptors, and keys
-without limit even though each individual Run is bounded.
+Before the memory-only owner in this decision, the daemon retained every
+published Run and creation-key mapping for its whole epoch. Memory-only mode
+now uses the bound below. Persistent SQLite storage bounds its own rows,
+metadata, and replay, but the live Registry still does not remove the
+corresponding same-epoch in-memory Run; that remaining path stays under T-029.
 
 The correction must preserve the stronger owner rules already established by
 creation idempotency, unpublished-child rollback, attachment replay, native
@@ -24,23 +23,24 @@ general Backend framework.
 
 ### One operational Run-record ceiling
 
-The production daemon admits at most 128 retained or projected publication
-records across native and tmux Runs. This is the one operational Registry
-ceiling in memory-only and persistent modes. A publication reservation counts
-before native spawn or tmux Control child startup. Its own exact candidate
-replacement can make that ticket's projected burden zero, but an uncommitted
-net release never becomes global slack. Concurrent reservations therefore
-cannot publish a 129th Run. This is a retained-record bound, not a claim that no
-transient owner can coexist with those records.
+The production memory-only daemon admits at most 128 retained or projected
+publication records across native and tmux Runs. Persistent mode adopts the
+same operational Registry ceiling only after T-029 closes exact durable
+replacement. A publication reservation counts before native spawn or tmux
+Control child startup. Its own exact candidate replacement can make that
+ticket's projected burden zero, but an uncommitted net release never becomes
+global slack. Concurrent reservations therefore cannot publish a 129th
+memory-only Run. This is a retained-record bound, not a claim that no transient
+owner can coexist with those records.
 
 The value 128 preserves the already qualified 1/32/128 live-Run matrix while
 avoiding the false safety of reusing SQLite's historical 4,096-row format
 envelope. The existing 4 MiB per-Run retention contract therefore derives a
-512 MiB live in-memory `OutputLog` payload ceiling in both modes without
-another hot-path byte quota. Up to 128 live native readers separately hold one
-8 KiB read buffer each. Persistent mode additionally retains its stricter
-existing 256 MiB durable SQLite logical replay limit; that durable limit does
-not reduce the same-epoch in-memory ceiling.
+512 MiB live memory-only `OutputLog` payload ceiling without another hot-path
+byte quota. Up to 128 live native readers separately hold one 8 KiB read buffer
+each. The same live bound becomes applicable to persistent mode only with
+T-029; its existing 256 MiB durable SQLite logical replay limit remains
+independently authoritative.
 
 One daemon-private eight-slot overlap owner is shared by native Start/Fork,
 tmux import, and transferred T-026 unpublished-child cleanup. A slot is held
@@ -63,12 +63,11 @@ Run metadata, and allocator overhead remain measured RSS rather than being
 misrepresented as replay bytes.
 
 SQLite may accept an older schema-2 store containing up to 4,096 structurally
-valid rows during fail-closed startup validation. Before socket publication,
-the new epoch reconciles prior running rows to interrupted and deterministically
-normalizes terminal history to 128. The 4,096 value is therefore a legacy
-format-validation envelope, not a second live capacity promise. The existing
-64 MiB metadata, 256 MiB replay, database, WAL, SHM, and state-directory limits
-remain unchanged.
+valid rows during fail-closed startup validation. T-029 must normalize terminal
+history to 128 before socket publication while reconciling prior running rows
+to interrupted. The 4,096 value is a legacy format-validation envelope, not a
+second live capacity promise. The existing 64 MiB metadata, 256 MiB replay,
+database, WAL, SHM, and state-directory limits remain unchanged.
 
 T-026 unpublished-child cleanup is not a published Run record. It keeps its
 exact-key fence while retaining one of the shared eight overlap slots above.
@@ -76,6 +75,14 @@ Collection neither counts that fence as reusable Registry capacity nor removes,
 rewrites, or adopts it. A pre-COMMIT creation failure restores any collection
 candidates even when the unpublished child transfers into that private cleanup
 owner.
+
+Tmux import takes the same eight-slot physical-overlap owner before its Registry
+reservation and Control startup. A failed import releases the slot only after
+its Control completion receipt proves cleanup. Timeout, explicit cleanup
+failure, or a worker-setup path with no completion receipt transfers the hidden
+Run and slot to the same bounded shutdown-visible owner. The last case may
+conservatively retain that slot until daemon exit; bounded fail-stop is
+preferred to inventing cleanup success or adding a worker supervisor.
 
 ### Registry entry and lookup linearization
 
@@ -553,9 +560,12 @@ or deterministic-owner fixtures.
 - Future/T-029: exact multi-candidate SQLite replacement, wrong candidate
   identity, pre/post-COMMIT injection, persistence-finalize eligibility, and
   real restart around COMMIT.
-- Future/T-030: concurrent 127-to-129 admission and source-bound memory and
-  persistent three-window churn with raw CPU, RSS, latency, record/key, thread,
-  descriptor, process, replay, and owner evidence.
+- T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
+  projection invariant under reverse publication order without a production
+  process census.
+- Future/T-030: source-bound production-scale 127-to-129 admission plus memory
+  and persistent three-window churn with raw CPU, RSS, latency, record/key,
+  thread, descriptor, process, replay, and owner evidence.
 
 ## Repository evidence
 

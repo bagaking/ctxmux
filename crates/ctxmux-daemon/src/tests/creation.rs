@@ -536,8 +536,12 @@ async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacit
         )
         .await
         .expect("replace the restored terminal candidate with a live Run");
+    let tmux_flight = manager
+        .begin_creation_flight()
+        .await
+        .expect("tmux fixture acquires shared physical admission");
     let tmux_error = manager
-        .import_tmux("/ctxmux/definitely/missing.sock", "%0")
+        .import_tmux("/ctxmux/definitely/missing.sock", "%0", tmux_flight)
         .expect_err("tmux import reserves capacity before Control startup");
     assert_eq!(tmux_error.code, ErrorCode::RunCapacity);
     manager
