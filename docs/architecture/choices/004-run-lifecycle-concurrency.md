@@ -68,9 +68,13 @@ The hook is not a public fault API and cannot change production scheduling.
 
 ## Known constraints
 
-`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Exited Runs are never collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
+`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Persistent same-epoch exited Runs are not yet collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
 
-Poisoned locks recover their inner value; this prevents secondary panics but is not a declared consistency-recovery strategy.
+Memory-only terminal Runs remain retained below the 128-record Registry ceiling
+and become eligible for exact admission-triggered replacement only after every
+incarnation-local owner is quiescent. Persistent same-epoch Registry collection
+remains open. Poisoned locks recover their inner value; this prevents secondary
+panics but is not a declared consistency-recovery strategy.
 
 ## Wrong-case corpus
 
@@ -117,7 +121,9 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   shutdown reports an unresolved fence owner without echoing its key, the
   persistence actor remains healthy, and an unrelated-process sentinel is
   untouched.
-- Candidate: exited-Run collection and attachment during collection.
+- Covered now: memory-only terminal replacement fences lookup-to-pin atomically,
+  keeps copy-only status/list available while Collecting, rejects long-lived
+  lookup before mutation, and removes the exact Run/key only with publication.
 
 ## Open questions
 

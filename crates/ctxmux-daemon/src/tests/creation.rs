@@ -2,6 +2,7 @@ use super::*;
 use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
 use ctxmux_protocol::{ForkFidelity, RunLineage};
+use std::collections::HashSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
@@ -156,6 +157,31 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
         .await
         .expect("fill the one-record Registry");
     assert_eq!(wait_for_marker_pids(&first_marker, 1).await.len(), 1);
+
+    let mut invalid_spec = marker_spec(&rejected_marker, false);
+    invalid_spec.program.clear();
+    let invalid_start = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-invalid-start").unwrap(),
+            CreationRequest::Start {
+                spec: invalid_spec.clone(),
+            },
+        )
+        .await
+        .expect_err("invalid Start is rejected before Registry capacity admission");
+    assert_eq!(invalid_start.code, ErrorCode::InvalidRequest);
+    let invalid_level_b = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-invalid-level-b").unwrap(),
+            CreationRequest::Fork {
+                parent: first.id,
+                plan: ForkPlan::LevelB { spec: invalid_spec },
+            },
+        )
+        .await
+        .expect_err("invalid Level B materialization precedes Registry capacity admission");
+    assert_eq!(invalid_level_b.code, ErrorCode::InvalidRequest);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
 
     let rejected = manager
         .create(
@@ -377,6 +403,100 @@ async fn collecting_fence_preserves_copy_reads_and_fails_long_lived_lookups_clos
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_reservations_stay_bounded_under_reverse_publication() {
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(2),
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create projected-capacity fixture");
+    let initial_marker = temp.path().join("initial.log");
+    let delayed_marker = temp.path().join("delayed.log");
+    let replacement_marker = temp.path().join("replacement.log");
+    let rejected_marker = temp.path().join("rejected.log");
+    let initial = manager
+        .create(
+            CreateOperationKey::new("projected-capacity-initial").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&initial_marker, false),
+            },
+        )
+        .await
+        .expect("publish the initial terminal candidate");
+    wait_for_run_terminal_async(&manager.get(initial.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let delayed_key = CreateOperationKey::new("projected-capacity-delayed").unwrap();
+    let replacement_key =
+        operation_key_on_other_stripe(&manager, &delayed_key, "projected-capacity-replacement");
+    let rejected_key =
+        operation_key_on_other_stripe(&manager, &delayed_key, "projected-capacity-rejected");
+    hook.arm();
+    let delayed_manager = Arc::clone(&manager);
+    let delayed = tokio::spawn(async move {
+        delayed_manager
+            .create(
+                delayed_key,
+                CreationRequest::Start {
+                    spec: marker_spec(&delayed_marker, true),
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), reached.recv())
+        .await
+        .expect("delayed publication reaches its post-spawn barrier")
+        .expect("delayed publication barrier remains connected");
+
+    let replacement = manager
+        .create(
+            replacement_key,
+            CreationRequest::Start {
+                spec: marker_spec(&replacement_marker, true),
+            },
+        )
+        .await
+        .expect("a self-funded reservation may publish before an older ticket");
+    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list()[0].id, replacement.id);
+    assert_eq!(
+        manager.info(initial.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+
+    let rejected = manager
+        .create(
+            rejected_key,
+            CreationRequest::Start {
+                spec: marker_spec(&rejected_marker, false),
+            },
+        )
+        .await
+        .expect_err("another ticket cannot borrow the delayed ticket's projection");
+    assert_eq!(rejected.code, ErrorCode::RunCapacity);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
+
+    hook.release();
+    let delayed = delayed
+        .await
+        .expect("delayed creation task remains live")
+        .expect("the older reservation publishes after its self-funded successor");
+    let retained: HashSet<_> = manager.list().into_iter().map(|run| run.id).collect();
+    assert_eq!(retained, HashSet::from([delayed.id, replacement.id]));
+
+    for id in [delayed.id, replacement.id] {
+        manager
+            .get(id)
+            .expect("pin retained live Run")
+            .stop()
+            .await
+            .expect("stop retained projected-capacity fixture");
+        wait_for_run_terminal_async(&manager.get(id).unwrap()).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacity_first() {
     let manager = Arc::new(RunManager {
         registry: RunRegistry::with_record_capacity(1),
@@ -459,14 +579,13 @@ async fn fresh_level_a_fork_materializes_then_releases_its_parent_before_reserva
     wait_for_run_terminal_async(&manager.get(parent.id).unwrap()).await;
     wait_for_run_workers(&manager).await;
 
+    let child_key = CreateOperationKey::new("child-replacing-parent").unwrap();
+    let child_request = CreationRequest::Fork {
+        parent: parent.id,
+        plan: ForkPlan::LevelA,
+    };
     let child = manager
-        .create(
-            CreateOperationKey::new("child-replacing-parent").unwrap(),
-            CreationRequest::Fork {
-                parent: parent.id,
-                plan: ForkPlan::LevelA,
-            },
-        )
+        .create(child_key.clone(), child_request.clone())
         .await
         .expect("fork materialization does not pin its parent through admission");
     assert_eq!(
@@ -482,6 +601,28 @@ async fn fresh_level_a_fork_materializes_then_releases_its_parent_before_reserva
     );
     assert_eq!(manager.list().len(), 1);
     assert_eq!(manager.list()[0].id, child.id);
+    assert_eq!(
+        manager
+            .create(child_key, child_request)
+            .await
+            .expect("matching child retry resolves before collected-parent lookup")
+            .id,
+        child.id
+    );
+    assert_eq!(
+        manager
+            .create(
+                CreateOperationKey::new("fresh-child-after-parent-removal").unwrap(),
+                CreationRequest::Fork {
+                    parent: parent.id,
+                    plan: ForkPlan::LevelA,
+                },
+            )
+            .await
+            .expect_err("a fresh Fork cannot resolve a collected parent")
+            .code,
+        ErrorCode::RunNotFound
+    );
     wait_for_run_terminal_async(&manager.get(child.id).unwrap()).await;
 }
 
@@ -511,6 +652,23 @@ fn distinct_operation_keys(manager: &RunManager) -> (CreateOperationKey, CreateO
         }
     }
     unreachable!("64 random-hash stripes include a distinct candidate")
+}
+
+fn operation_key_on_other_stripe(
+    manager: &RunManager,
+    reference: &CreateOperationKey,
+    prefix: &str,
+) -> CreateOperationKey {
+    for index in 0..64 {
+        let candidate = CreateOperationKey::new(format!("{prefix}-{index}")).unwrap();
+        if !manager
+            .registry
+            .shares_creation_stripe(reference, &candidate)
+        {
+            return candidate;
+        }
+    }
+    unreachable!("64 random-hash stripes include a key on another stripe")
 }
 
 #[test]

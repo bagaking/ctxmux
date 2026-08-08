@@ -1030,10 +1030,12 @@ impl RunRegistry {
         let mut state = write_lock(&self.state);
         debug_assert!(!state.creation_runs.contains_key(&operation_key));
         debug_assert!(!state.runs.contains_key(&id));
-        if let Some(mut reservation) = reservation {
+        let removed = if let Some(mut reservation) = reservation {
             debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
-            consume_reservation(&mut state, &mut reservation, id, Some(&operation_key));
-        }
+            consume_reservation(&mut state, &mut reservation, id, Some(&operation_key))
+        } else {
+            None
+        };
         state.runs.insert(
             id,
             RegistryEntry {
@@ -1045,6 +1047,7 @@ impl RunRegistry {
         state.creation_runs.insert(operation_key, id);
         let cleanup_reservation = pending.into_published_reservation();
         drop(state);
+        drop(removed);
         drop(cleanup_reservation);
         info
     }
@@ -1058,7 +1061,7 @@ impl RunRegistry {
         let id = run.id;
         let mut state = write_lock(&self.state);
         debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
-        consume_reservation(&mut state, &mut reservation, id, None);
+        let removed = consume_reservation(&mut state, &mut reservation, id, None);
         let previous = state.runs.insert(
             id,
             RegistryEntry {
@@ -1068,6 +1071,8 @@ impl RunRegistry {
             },
         );
         debug_assert!(previous.is_none());
+        drop(state);
+        drop(removed);
     }
 
     /// Atomically clone a long-lived owner while the Registry still owns it.
@@ -1166,7 +1171,7 @@ fn consume_reservation(
     reservation_owner: &mut MemoryPublicationReservation,
     new_run_id: RunId,
     operation_key: Option<&CreateOperationKey>,
-) {
+) -> Option<RegistryEntry> {
     let ticket = reservation_owner
         .ticket
         .take()
@@ -1177,15 +1182,16 @@ fn consume_reservation(
         .expect("publication ticket remains registered");
     debug_assert_eq!(reservation.new_run_id, new_run_id);
     debug_assert_eq!(reservation.operation_key.as_ref(), operation_key);
-    if let Some(candidate) = reservation.candidate {
+    reservation.candidate.map(|candidate| {
         let removed = state
             .runs
             .remove(&candidate)
             .expect("publication removes its exact fenced candidate");
         debug_assert_eq!(removed.residency, RegistryResidency::Collecting(ticket));
-        if let Some(candidate_key) = removed.operation_key {
-            let mapped = state.creation_runs.remove(&candidate_key);
+        if let Some(candidate_key) = &removed.operation_key {
+            let mapped = state.creation_runs.remove(candidate_key);
             debug_assert_eq!(mapped, Some(candidate));
         }
-    }
+        removed
+    })
 }

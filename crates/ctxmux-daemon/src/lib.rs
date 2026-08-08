@@ -683,6 +683,7 @@ impl RunManager {
                 )
             }
         };
+        validate_run_spec(&spec).map_err(invalid_run_spec)?;
         Ok(MaterializedCreation {
             request,
             spec,
