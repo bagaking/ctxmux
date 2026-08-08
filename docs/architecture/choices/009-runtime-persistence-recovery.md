@@ -70,13 +70,15 @@ Its bounded 1,024-command queue applies backpressure to the PTY reader instead
 of allowing durable-output backlog memory to grow without limit. SQLite WAL
 mode and transactions define four indivisible application units:
 
-- start or fork inserts the complete creation-time `Running` row and creation
-  key before registry publication; successful `COMMIT` is its point of no
-  return even when a later file postcheck fails;
+- start or fork stages the complete creation-time `Running` row and creation
+  key with `pid = NULL` before physical launch, then commits that already
+  page-admitted transaction after spawn and before registry publication;
+  successful `COMMIT` is its point of no return even when a later file
+  postcheck fails;
 - one output batch inserts its chunks, prunes replay, and advances durable
   oldest/head cursors and byte accounting together;
-- a terminal transition commits the final replay batch and exited state in the
-  same transaction;
+- a terminal transition commits the final replay batch, exited state, and the
+  actual historical child PID in the same transaction;
 - startup epoch/reconciliation and record eviction with dependent replay removal
   each commit as one transaction.
 
@@ -107,20 +109,21 @@ are not deleted; a start that cannot reserve its full metadata fails before
 child publication.
 
 The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main
-database). One transaction may append at most 8 MiB of WAL frames; output is
-split into smaller ordered batches, and one record eviction fits because per-Run
-replay is capped at 4 MiB. Before admitting a transaction when current WAL is
-above 8 MiB, the actor requires a successful `TRUNCATE` checkpoint with no busy
-reader and rechecks a zero-length WAL. It therefore admits a write only when
-`current WAL + worst-case transaction <= 16 MiB`, rather than detecting excess
-afterward. The shared-memory file has a 4 MiB ceiling. The complete state
-directory has a 404 MiB hard file budget plus the small lock file. Incremental
-vacuum is part of retention after eviction. A failure discovered before the
-transaction commits rejects admission without publishing a Run. Once eviction
-and the new Run/key row commit, a vacuum or physical-file postcheck failure is
-instead a committed error: it latches the actor, the daemon still publishes the
-committed Run/key mapping for retry convergence, and later mutations fail
-closed rather than widening the budget.
+database). One transaction may append at most 8 MiB of WAL frames. Output is
+split into smaller ordered batches. Decision 013 supersedes the old logical
+payload estimate for retained-Run replacement: the actor now requires a
+zero-length WAL and proves the exact spill-disabled transaction from its
+cache-resident page upper bound before physical launch. It therefore preserves
+both the 8 MiB transaction and 16 MiB total WAL ceilings without assuming that
+a 4 MiB replay payload maps to 4 MiB of modified pages. The shared-memory file
+has a 4 MiB ceiling. The complete state directory has a 404 MiB hard file
+budget plus the small lock file. Exact replacement leaves freed pages reusable
+inside the frozen main-database ceiling instead of running an uncharged
+post-COMMIT incremental vacuum. A failure discovered before COMMIT rejects
+admission without publishing a Run. Once replacement and the new Run/key row
+commit, a physical-file postcheck failure is a committed error: it latches the
+actor, the daemon still publishes the committed Run/key mapping for retry
+convergence, and later mutations fail closed rather than widening the budget.
 
 Before SQLite open, existing database, WAL, SHM, and lock paths must be regular
 owner-matching files, never symlinks, with no group/other permissions. Newly
@@ -139,9 +142,10 @@ and output may contain secrets.
 - Persistence-capable native Run activation, output recording, and terminal
   publication use one per-Run transition gate before the
   output-to-state-to-persistence lock order. Creation persists a `Running`
-  snapshot even when the child
-  already exited, and whichever side observes the other second owns the single
-  terminal finalize. Store waits never retain the public read-path locks;
+  snapshot with no durable PID even when the child already exited. The actual
+  PID is written only with a successful terminal finalize, and whichever side
+  observes the other second owns that single finalize. Store waits never retain
+  the public read-path locks;
   durable state remains `Running` until finalize returns. A byte observed only
   after terminal publication may enter the current incarnation's memory replay
   and internal broadcast channel, but it is not durable and is not guaranteed

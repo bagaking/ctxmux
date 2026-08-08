@@ -1,7 +1,7 @@
 # 013 — Retained Run resource governance
 
-- Status: implemented memory-only owner; persistent exact-replacement WAL
-  admission unresolved under T-029
+- Status: implemented memory-only owner; persistent exact-replacement page
+  admission accepted and implementation in progress under T-029
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -237,19 +237,72 @@ all ordinary launches.
 
 ### Persistent exact replacement
 
-The logical old-or-new contract in this section is accepted, but its physical
-WAL admission is not yet resolved. Decision 009 freezes an 8 MiB per-transaction
-WAL estimate and a 16 MiB total WAL ceiling; it proves only the existing
-single-record eviction shape against the 4 MiB per-Run replay bound. A
-multi-candidate cascade delete can exceed that estimate, and logical replay
-bytes alone do not strictly bound modified SQLite pages under high chunk
-cardinality. Registry candidate snapshots currently carry no defensible
-page-cost oracle. Memory-only Registry admission and exact single-candidate
-replacement are implemented, but no
-persistent exact-replacement code or capability claim may land until a reviewed
-amendment supplies a pre-spawn, persistence-owned admission proof or replaces
-the WAL contract. Detecting excess after child launch or splitting exact
-candidate deletion across transactions is not an acceptable workaround.
+Decision 009 freezes an 8 MiB per-transaction WAL ceiling and a 16 MiB total
+WAL ceiling. Logical replay bytes are not a page-cost proof: cascade deletes,
+chunk cardinality, overflow pages, indexes, B-tree rebalancing, freelist and
+pointer-map updates can all change the number of dirty SQLite pages. T-029
+therefore admits a live replacement from the actual exact transaction's
+cache-resident page set, not from a payload estimate.
+
+The single persistence connection runs with `cache_spill=OFF`. Immediately
+before an exact replacement it releases unpinned clean cache memory, requires
+a successful `TRUNCATE` checkpoint and a zero-length WAL, resets the connection
+cache-write and cache-spill counters, and begins one write transaction. It
+validates and deletes the Registry-selected exact candidates, including
+cascading replay, and inserts the new `Running` row with `pid = NULL`. The
+transaction remains uncommitted and the actor remains its sole owner. No child
+exists yet.
+
+With spill disabled, SQLite cannot write a dirty page in the middle of that
+transaction. After every statement and cursor is finalized, the actor requires
+all of the following before it grants physical-launch admission:
+
+- the WAL file remains zero length;
+- `SQLITE_DBSTATUS_CACHE_WRITE` and `SQLITE_DBSTATUS_CACHE_SPILL` remain zero;
+- `SQLITE_DBSTATUS_CACHE_USED` succeeds on the non-shared single connection;
+  and
+- the conservative charge below fits the 8 MiB transaction ceiling.
+
+For SQLite page size `P = 4096`, WAL frame header `H = 24`, WAL file header
+`W = 32`, and reported cache bytes `M`, the charge is:
+
+```text
+cached_page_upper = ceil(M / P)
+transaction_charge = W + cached_page_upper * (P + H)
+```
+
+This is deliberately an overestimate. In the pinned bundled SQLite, pager
+cache accounting is `cached_pages * (P + positive per-page overhead) +
+positive pager overhead`, so `ceil(M / P)` is no smaller than the number of
+cached pages. Every dirty page is one of those cached pages. With spill off and
+no SQL after admission, COMMIT appends at most one frame for each dirty page;
+the commit marker is carried by the final page frame. Clean/schema pages and
+allocator overhead only make the charge more conservative. At 4 KiB pages the
+8 MiB ceiling admits at most 2,036 frames including the WAL header. Because
+every staged replacement starts from a zero-length WAL, the separate 16 MiB
+total ceiling is also preserved.
+
+A changed WAL, an unsupported status counter, a nonzero write or spill count,
+an over-budget charge, or any other unprovable condition rolls the transaction
+back and returns `run_capacity` before durable mutation or physical launch. It
+does not poison the persistence actor. An early logical lower-bound check may
+reject obviously oversized work before constructing its page cache, but it
+cannot admit a request by itself.
+
+Admission returns one affine staged-start owner while the persistence actor
+keeps that exact transaction open. The owner either aborts and proves rollback,
+or, after native spawn succeeds, requests COMMIT without issuing further SQL.
+The actor is intentionally serialized for this short spawn boundary; ordinary
+append/finalize commands remain in the existing bounded queue. This avoids a
+parallel WAL-charge ledger, a durable reservation, and a general transaction
+API.
+
+The durable `Running` row intentionally stores no PID. The live PID remains a
+fact of the current child-handle owner. A successful terminal finalize writes
+the actual historical PID together with final replay and terminal state in one
+transaction. A crash while the row is still `Running` already reconciles it to
+`Interrupted` with `pid = NULL`, so no PID becomes restart or signalling
+authority.
 
 SQLite no longer chooses a live eviction candidate independently. The Registry
 passes the persistence actor an exact terminal candidate list containing each
@@ -258,7 +311,7 @@ passes the persistence actor an exact terminal candidate list containing each
 1. verifies every exact candidate and terminal state;
 2. deletes those rows and their cascading replay;
 3. inserts the new running Run and creation key;
-4. verifies record, metadata, replay, and file admission accounting; and
+4. verifies record, metadata, replay, and cache-resident page admission; and
 5. commits.
 
 The durable disposition must distinguish `NotCommitted(error)`,
@@ -268,8 +321,8 @@ only once as `NotCommitted` or `Committed` and records that decision before
 reply delivery; actor or reply-owner loss while it remains `Pending` resolves
 to `CommitUnknown`, never to rollback by default. Before COMMIT, SQLite rollback
 and Registry fence restoration leave every candidate present; ordinary capacity
-rejection does not poison the actor. After COMMIT, including a later vacuum,
-physical-file postcheck, or reply-delivery failure, the Registry performs one
+rejection does not poison the actor. After COMMIT, including a later
+physical-file postcheck or reply-delivery failure, the Registry performs one
 exact in-memory replacement with no I/O, await, or fallible result. A retry
 therefore resolves the newly committed Run rather than launching again.
 
@@ -288,6 +341,13 @@ replacement child in the same epoch.
 A daemon crash before COMMIT recovers all old candidates and no new row. A
 crash after COMMIT but before in-memory replacement recovers only the new
 Run/key. No collecting ticket, pending lease, or tombstone is durable.
+
+Exact replacement does not run an uncharged post-COMMIT incremental vacuum.
+Deleted pages remain reusable inside the already frozen 384 MiB main-database
+ceiling. WAL and SHM remain under their independent ceilings, and physical
+validation after COMMIT cannot reclassify the durable old-or-new decision.
+Startup normalization uses the same spill-disabled page admission in bounded,
+restartable transactions before socket publication.
 
 Once implemented, this decision supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
