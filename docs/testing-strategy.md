@@ -86,6 +86,33 @@ at the 128-record ceiling.
 Exact suite reach is machine-checked by `.github/ci-evidence-map.json`; test
 counts describe gate composition only and are not a maturity score.
 
+### Exact-commit local consumer gate
+
+The required critical and coverage jobs also run
+`npm run test:local-consumer`. The producer must begin and end on the same clean
+Git identity and emit the bounded manifest, SDK tarball, and two binary files
+described in [the local artifact contract](release.md). The oracle assembles the
+same source twice, recomputes every hash and mode, installs the SDK offline with
+no saved or path dependency, and runs from an isolated directory outside the
+checkout under Node's filesystem-read permission boundary. Only copied
+artifacts are readable. A real packaged daemon and the installed public SDK
+must then prove start, status, input, attach, replay, Interrupt, and Stop; the
+packaged CLI must agree on version/protocol and query that same daemon.
+
+This lane proves exact local consumption and catches checkout leakage. It does
+not publish, install globally, choose an application activation policy, or
+claim cross-toolchain binary reproducibility. The manifest records the current
+platform, architecture, Rust target and toolchain instead.
+
+The 2026-08-14 hosted-CI audit is intentionally separate from local Gate truth.
+The latest remote run, `31722805068` on `0f7f598`, failed only inside the three
+required check steps after dependency/tmux setup succeeded. Public annotations
+expose exit 1 on macOS and exit 101 on Ubuntu critical and coverage, but GitHub
+requires sign-in for their detailed logs. The run predates the current local
+Feature chain, so its cause is neither guessed nor hidden. The exact final
+commit remains unqualified until those same required jobs run green; see
+[Required hosted CI evidence](release.md#required-hosted-ci-evidence).
+
 ## Competitive evidence
 
 The comparison uses immutable upstream revisions:

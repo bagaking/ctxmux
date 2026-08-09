@@ -637,6 +637,34 @@
       ]
     },
     {
+      "id": "local-artifact-source-contracts",
+      "kind": "test",
+      "path": "scripts/build-local-artifacts.test.mjs",
+      "invariants": [
+        "the local artifact command binds one canonical clean Git identity and rejects dirty source before creating output"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "public-local-artifact-consumer",
+      "kind": "public_smoke",
+      "path": "scripts/check-local-consumer.mjs",
+      "invariants": [
+        "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "npm run test:local-consumer",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "public-cli-smoke",
       "kind": "public_smoke",
       "path": "scripts/smoke-cli.sh",

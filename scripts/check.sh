@@ -110,6 +110,7 @@ scripts/check-protocol-types.sh
 npm run format:check
 npm run typecheck
 npm run build
+npm run test:local-consumer
 if [[ $ctxmux_check_coverage == false ]]
 then
 npm test
