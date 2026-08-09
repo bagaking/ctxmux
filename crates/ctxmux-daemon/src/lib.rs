@@ -3688,8 +3688,8 @@ mod tests {
         TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
         TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
         TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
-        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
-        wait_for_child,
+        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager,
+        serve_with_persistence_manager, spawn_error, wait_for_child,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
     use crate::native_control::NativeControlOwner;
@@ -3855,6 +3855,96 @@ mod tests {
         drop(manager);
         drop(control);
         assert_eq!(counts.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_wait_failure_exits_daemon_without_a_terminal_event() {
+        let directory = tempfile::tempdir().expect("create daemon failure fixture directory");
+        let socket = directory.path().join("ctxmux.sock");
+        let manager = Arc::new(RunManager::default());
+        let run_id = RunId::new();
+        let counts = Arc::new(WaitFailureCounts::default());
+        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let wait_failure = NativeWaitFailure {
+            creation_flights: manager.creation_flights.clone(),
+            incarnation_failure: manager.incarnation_failure.clone(),
+        };
+        manager
+            .registry
+            .publish_unkeyed_for_test(Run::new_native_for_wait_test(run_id, control.clone()));
+
+        let server_manager = Arc::clone(&manager);
+        let server_socket = socket.clone();
+        let (server_result_tx, server_result_rx) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::Builder::new()
+            .name("ctxmux-wait-failure-server".to_owned())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("build dedicated daemon runtime");
+                let result = runtime.block_on(serve_with_persistence_manager(
+                    server_socket,
+                    server_manager,
+                ));
+                drop(runtime);
+                let _ = server_result_tx.send(result);
+            })
+            .expect("start dedicated daemon runtime");
+
+        let client = Client::new(&socket);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if client.ping().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("daemon publishes the fixture socket");
+        let (attachment, snapshot) = client
+            .attach(run_id, 0)
+            .await
+            .expect("attach through the public client before wait authority fails");
+        assert_eq!(snapshot.run.state, RunState::Running);
+
+        let waiter_counts = Arc::clone(&counts);
+        let waiter = std::thread::spawn(move || {
+            wait_for_child(
+                Box::new(WaitFailingChild(waiter_counts)),
+                commands,
+                &control,
+                &wait_failure,
+            )
+        });
+        let event = tokio::time::timeout(Duration::from_secs(2), attachment.next_event())
+            .await
+            .expect("daemon failure closes the public attachment");
+        assert!(
+            matches!(event, Err(ClientError::Closed)),
+            "pre-terminal daemon exit must not look like a clean terminal EOF: {event:?}"
+        );
+        assert!(matches!(
+            waiter.join().expect("join fixture child waiter"),
+            NativeWaitOutcome::AuthorityLost
+        ));
+        assert_eq!(counts.try_wait.load(Ordering::Acquire), 1);
+
+        let result = server_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("dedicated daemon runtime reports wait-authority failure");
+        let Err(ServerError::Shutdown { failures }) = result else {
+            panic!("daemon must fail its serving incarnation: {result:?}");
+        };
+        assert!(failures.contains(&run_id.to_string()));
+        assert!(failures.contains("fixture wait authority lost"));
+        assert!(
+            client.ping().await.is_err(),
+            "failed daemon incarnation must not leave a connectable socket"
+        );
+        server.join().expect("join dedicated daemon runtime");
     }
 
     #[test]

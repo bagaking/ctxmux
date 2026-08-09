@@ -1462,160 +1462,109 @@ test("qualification gates every profile through final harness dispatch", () => {
       artifact_owner_identity: { dev: "1", ino: "2" },
       preexisting_receipt_identity: null,
     });
-  const stubSource = `#!${process.execPath}
-const fs = require("node:fs");
-const path = require("node:path");
-const command = path.basename(process.argv[1]);
-const args = process.argv.slice(2);
-fs.appendFileSync(
-  process.env.CTXMUX_SENTINEL_LOG,
-  JSON.stringify({ command, args }) + "\\n",
-);
-const sameArgs = (expected) =>
-  JSON.stringify(args) === JSON.stringify(expected);
-if (process.env.CTXMUX_SENTINEL_PHASE === "failure") {
-  process.exit(
-    command === "node" && sameArgs(["scripts/reliability-policy.mjs"])
-      ? 73
-      : 99,
-  );
+  // Keep the real Bash launcher boundary while avoiding roughly 95 Node cold
+  // starts in this one policy-envelope fixture. NUL framing preserves argv
+  // exactly without making the stub responsible for JSON escaping.
+  const stubSource = String.raw`#!/bin/bash
+set -euo pipefail
+
+command=\${0##*/}
+args=("$@")
+{
+  printf '%s\0%s\0' "$command" "$#"
+  printf '%s\0' "$@"
+} >> "$CTXMUX_SENTINEL_LOG"
+
+valid_profile() {
+  case "$1" in
+    smoke|nightly|release|observe) return 0 ;;
+    *) return 1 ;;
+  esac
 }
-if (command === "node" && sameArgs(["scripts/reliability-policy.mjs"]))
-  process.exit(0);
-if (
-  command === "node" &&
-  args.length === 5 &&
-  args[0] === "scripts/reliability-policy.mjs" &&
-  args[1] === "--prepare-qualification-evidence" &&
-  path.resolve(args[2]) ===
-    path.resolve(\`target/reliability/\${args[4]}/result.json\`) &&
-  args[3] === "--profile" &&
-  ["smoke", "nightly", "release", "observe"].includes(args[4])
-) {
-  process.stdout.write(
-    JSON.stringify({
-      schema: "ctxmux.reliability-preflight.v2",
-      profile: args[4],
-      not_before: "2026-08-11T00:00:00.000Z",
-      invocation_nonce: "ab".repeat(32),
-      artifact_owner_identity: { dev: "1", ino: "2" },
-      preexisting_receipt_identity: null,
-    }) + "\\n",
-  );
-  process.exit(0);
+
+preflight_token() {
+  printf '{"schema":"ctxmux.reliability-preflight.v2","profile":"%s","not_before":"2026-08-11T00:00:00.000Z","invocation_nonce":"%s","artifact_owner_identity":{"dev":"1","ino":"2"},"preexisting_receipt_identity":null}' "$1" "$(printf 'ab%.0s' {1..32})"
 }
-if (
-  process.env.CTXMUX_SENTINEL_PHASE === "qualification" &&
-  command === "node" &&
-  args.length === 7 &&
-  args[0] === "scripts/reliability-policy.mjs" &&
-  args[1] === "--qualification-receipt" &&
-  args[2] ===
-    (process.env.CTXMUX_RELIABILITY_EVIDENCE ??
-      path.join(
-        process.env.CTXMUX_RELIABILITY_ARTIFACT_DIR ??
-          \`target/reliability/\${args[4]}\`,
-        "result.json",
-      )) &&
-  args[3] === "--profile" &&
-  ["smoke", "nightly", "release", "observe"].includes(args[4]) &&
-  args[5] === "--preflight" &&
-  args[6] ===
-    JSON.stringify({
-      schema: "ctxmux.reliability-preflight.v2",
-      profile: args[4],
-      not_before: "2026-08-11T00:00:00.000Z",
-      invocation_nonce: "ab".repeat(32),
-      artifact_owner_identity: { dev: "1", ino: "2" },
-      preexisting_receipt_identity: null,
-    })
-) {
-  process.exit(83);
+
+absolute_path() {
+  case "$1" in
+    /*) printf '%s' "$1" ;;
+    *) printf '%s/%s' "$CTXMUX_SENTINEL_ROOT" "$1" ;;
+  esac
 }
-if (command === "git" && sameArgs(["rev-parse", "HEAD"])) {
-  process.stdout.write("1".repeat(40) + "\\n");
-  process.exit(0);
-}
-if (command === "git" && sameArgs(["rev-parse", "HEAD^{tree}"])) {
-  process.stdout.write("2".repeat(40) + "\\n");
-  process.exit(0);
-}
-if (
-  command === "git" &&
-  sameArgs(["status", "--porcelain=v1", "--untracked-files=all"])
-) {
-  process.exit(0);
-}
-if (
-  command === "cargo" &&
-  sameArgs([
-    "build",
-    "--locked",
-    "--quiet",
-    "--package",
-    "ctxmux-daemon",
-    "--target-dir",
-    "target/reliability/provenance-build",
-  ])
-) {
-  if (process.env.CTXMUX_SENTINEL_PHASE === "build") process.exit(79);
-  if (process.env.CTXMUX_SENTINEL_PHASE === "qualification") {
-    const daemon = path.join(
-      "target",
-      "reliability",
-      "provenance-build",
-      "debug",
-      "ctxmuxd",
-    );
-    fs.mkdirSync(path.dirname(daemon), { recursive: true });
-    fs.writeFileSync(daemon, "", { mode: 0o755 });
-    process.exit(0);
-  }
-  process.exit(97);
-}
-if (process.env.CTXMUX_SENTINEL_PHASE === "qualification") {
-  if (command === "cargo" && args[0] === "test") process.exit(0);
-  if (
-    command === "node" &&
-    sameArgs([
-      "--import",
-      "tsx",
-      "--test",
-      "packages/sdk/test/wrong-cases.test.ts",
-    ])
-  ) {
-    process.exit(0);
-  }
-  if (command === "node" && args[0] === "-e") {
-    process.stdout.write(JSON.stringify(args.slice(1)));
-    process.exit(0);
-  }
-  if (
-    command === "node" &&
-    args.length === 5 &&
-    sameArgs([
-      "--import",
-      "tsx",
-      "scripts/reliability-qualification.ts",
-      "--profile",
-      args[4],
-    ]) &&
-    ["smoke", "nightly", "release", "observe"].includes(args[4]) &&
-    process.env.CTXMUX_RELIABILITY_PREFLIGHT ===
-      JSON.stringify({
-        schema: "ctxmux.reliability-preflight.v2",
-        profile: args[4],
-        not_before: "2026-08-11T00:00:00.000Z",
-        invocation_nonce: "ab".repeat(32),
-        artifact_owner_identity: { dev: "1", ino: "2" },
-        preexisting_receipt_identity: null,
-      })
-  ) {
-    process.exit(0);
-  }
-}
-process.exit(98);
-`;
+
+if [[ \${CTXMUX_SENTINEL_PHASE:-} == failure ]]; then
+  if [[ $command == node && $# -eq 1 && \${args[0]} == scripts/reliability-policy.mjs ]]; then
+    exit 73
+  fi
+  exit 99
+fi
+
+if [[ $command == node && $# -eq 1 && \${args[0]} == scripts/reliability-policy.mjs ]]; then
+  exit 0
+fi
+
+if [[ $command == node && $# -eq 5 && \${args[0]} == scripts/reliability-policy.mjs && \${args[1]} == --prepare-qualification-evidence && \${args[3]} == --profile ]] &&
+  valid_profile "\${args[4]}" &&
+  [[ $(absolute_path "\${args[2]}") == $(absolute_path "target/reliability/\${args[4]}/result.json") ]]; then
+  preflight_token "\${args[4]}"
+  printf '\n'
+  exit 0
+fi
+
+if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification && $command == node && $# -eq 7 && \${args[0]} == scripts/reliability-policy.mjs && \${args[1]} == --qualification-receipt && \${args[3]} == --profile && \${args[5]} == --preflight ]] &&
+  valid_profile "\${args[4]}"; then
+  expected_evidence=\${CTXMUX_RELIABILITY_EVIDENCE:-\${CTXMUX_RELIABILITY_ARTIFACT_DIR:-target/reliability/\${args[4]}}/result.json}
+  if [[ \${args[2]} == "$expected_evidence" && \${args[6]} == "$(preflight_token "\${args[4]}")" ]]; then
+    exit 83
+  fi
+fi
+
+if [[ $command == git && $# -eq 2 && \${args[0]} == rev-parse && \${args[1]} == HEAD ]]; then
+  printf '1111111111111111111111111111111111111111\n'
+  exit 0
+fi
+if [[ $command == git && $# -eq 2 && \${args[0]} == rev-parse && \${args[1]} == 'HEAD^{tree}' ]]; then
+  printf '2222222222222222222222222222222222222222\n'
+  exit 0
+fi
+if [[ $command == git && $# -eq 3 && \${args[0]} == status && \${args[1]} == --porcelain=v1 && \${args[2]} == --untracked-files=all ]]; then
+  exit 0
+fi
+
+if [[ $command == cargo && $# -eq 7 && \${args[0]} == build && \${args[1]} == --locked && \${args[2]} == --quiet && \${args[3]} == --package && \${args[4]} == ctxmux-daemon && \${args[5]} == --target-dir && \${args[6]} == target/reliability/provenance-build ]]; then
+  if [[ \${CTXMUX_SENTINEL_PHASE:-} == build ]]; then
+    exit 79
+  fi
+  if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
+    daemon=target/reliability/provenance-build/debug/ctxmuxd
+    mkdir -p "\${daemon%/*}"
+    : > "$daemon"
+    chmod 755 "$daemon"
+    exit 0
+  fi
+  exit 97
+fi
+
+if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
+  if [[ $command == cargo && \${args[0]:-} == test ]]; then
+    exit 0
+  fi
+  if [[ $command == node && $# -eq 4 && \${args[0]} == --import && \${args[1]} == tsx && \${args[2]} == --test && \${args[3]} == packages/sdk/test/wrong-cases.test.ts ]]; then
+    exit 0
+  fi
+  if [[ $command == node && \${args[0]:-} == -e ]]; then
+    printf '["cargo","build","--locked","--quiet","--package","ctxmux-daemon","--target-dir","target/reliability/provenance-build"]'
+    exit 0
+  fi
+  if [[ $command == node && $# -eq 5 && \${args[0]} == --import && \${args[1]} == tsx && \${args[2]} == scripts/reliability-qualification.ts && \${args[3]} == --profile ]] &&
+    valid_profile "\${args[4]}" &&
+    [[ \${CTXMUX_RELIABILITY_PREFLIGHT:-} == "$(preflight_token "\${args[4]}")" ]]; then
+    exit 0
+  fi
+fi
+exit 98
+`.replaceAll("\\${", "${");
   for (const command of ["node", "git", "cargo"]) {
     fs.writeFileSync(path.join(stubDirectory, command), stubSource, {
       mode: 0o755,
@@ -1637,6 +1586,7 @@ process.exit(98);
           BASH_ENV: "/dev/null",
           CTXMUX_SENTINEL_LOG: sentinelLog,
           CTXMUX_SENTINEL_PHASE: phase,
+          CTXMUX_SENTINEL_ROOT: fs.realpathSync(temporaryRoot),
           ENV: "/dev/null",
           PATH: `${stubDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
           ...environment,
@@ -1644,12 +1594,19 @@ process.exit(98);
         timeout: 5_000,
       },
     );
-  const readInvocations = () =>
-    fs
-      .readFileSync(sentinelLog, "utf8")
-      .trimEnd()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+  const readInvocations = () => {
+    const fields = fs.readFileSync(sentinelLog, "utf8").split("\0");
+    assert.equal(fields.pop(), "", "sentinel log ends at a record boundary");
+    const invocations = [];
+    for (let index = 0; index < fields.length;) {
+      const command = fields[index++];
+      const count = Number.parseInt(fields[index++], 10);
+      assert.ok(Number.isSafeInteger(count) && count >= 0);
+      invocations.push({ command, args: fields.slice(index, index + count) });
+      index += count;
+    }
+    return invocations;
+  };
   const profiles = ["smoke", "nightly", "release", "observe"];
   const policyInvocation = {
     command: "node",

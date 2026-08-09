@@ -45,12 +45,12 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
             args: vec![
                 "-c".to_owned(),
                 concat!(
-                    "trap '' WINCH; ",
+                    "trap '' WINCH; stty -echo; ",
                     "printf 'READY\\n'; ",
                     "while IFS= read -r line; do ",
                     "case \"$line\" in ",
                     "raw) printf 'INPUT:%s\\n' \"$line\" ;; ",
-                    "size) printf 'SIZE:'; stty size ;; ",
+                    "size) size=$(stty size); printf 'SIZE:%s\\n' \"$size\" ;; ",
                     "esac; done"
                 )
                 .to_owned(),
