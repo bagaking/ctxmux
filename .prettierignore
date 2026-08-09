@@ -1,0 +1,6 @@
+.bagakit
+.git
+dist
+node_modules
+target
+Cargo.lock

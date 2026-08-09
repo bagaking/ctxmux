@@ -1,0 +1,22 @@
+{
+  "name": "@ctxmux/sdk",
+  "version": "0.0.0",
+  "private": true,
+  "description": "TypeScript SDK for embedding ctxmux",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsx --test test/index.test.ts test/wrong-cases.test.ts",
+    "test:e2e": "tsx --test test/client-parity.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

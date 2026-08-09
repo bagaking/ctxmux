@@ -1,0 +1,18 @@
+[package]
+name = "ctxmux-client"
+description = "Rust client for the versioned ctxmux local protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+ctxmux-protocol = { path = "../ctxmux-protocol" }
+futures-util.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true

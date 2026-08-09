@@ -1,0 +1,17 @@
+[package]
+name = "ctxmux"
+description = "Command-line client for the ctxmux local Run multiplexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+crossterm.workspace = true
+ctxmux-client = { path = "../ctxmux-client" }
+ctxmux-protocol = { path = "../ctxmux-protocol" }
+tokio.workspace = true
+
+[lints]
+workspace = true

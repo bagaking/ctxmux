@@ -1,0 +1,28 @@
+[package]
+name = "ctxmux-daemon"
+description = "Long-lived local runtime daemon for ctxmux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "ctxmuxd"
+path = "src/main.rs"
+
+[dependencies]
+ctxmux-protocol = { path = "../ctxmux-protocol" }
+futures-util.workspace = true
+portable-pty.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ctxmux-client = { path = "../ctxmux-client" }
+serde_json.workspace = true
+tempfile.workspace = true

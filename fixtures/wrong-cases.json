@@ -1,0 +1,716 @@
+{
+  "schema": "ctxmux.wrong-case-corpus.v1",
+  "cases": [
+    {
+      "id": "DR-001",
+      "choice": "001-rust-tokio-daemon",
+      "source_ids": ["a01", "a03"],
+      "source_refs": [
+        "https://doc.rust-lang.org/std/process/struct.Child.html",
+        "https://github.com/tokio-rs/tokio/commit/56aaa43e91c4fbed88f0c2a5b65019ed9a0c3c61"
+      ],
+      "failure_mechanism": "Run setup fails after spawning the child and drops the handle without terminating or reaping it.",
+      "invariant": "A rejected start publishes no Run and leaves no live child or zombie.",
+      "preconditions": "A deterministic launch seam can fail after spawn but before Run publication.",
+      "action": "Inject each post-spawn setup failure and observe the daemon and process table.",
+      "oracle": "The request fails, the Run is absent, and the spawned process is terminated and reaped.",
+      "platform": ["unix"],
+      "tags": ["daemon", "ownership", "rollback", "process"],
+      "disposition": "future",
+      "activation_task": "future:daemon-launch-fault-injection",
+      "reason": "The native Backend has no deterministic post-spawn fault-injection seam yet."
+    },
+    {
+      "id": "DR-002",
+      "choice": "001-rust-tokio-daemon",
+      "source_ids": ["a02", "a03"],
+      "source_refs": [
+        "https://docs.rs/tokio/1.53.1/tokio/task/fn.spawn_blocking.html",
+        "https://github.com/tokio-rs/tokio/commit/56aaa43e91c4fbed88f0c2a5b65019ed9a0c3c61"
+      ],
+      "failure_mechanism": "A blocking PTY operation occupies async service capacity and stalls unrelated Runs or shutdown.",
+      "invariant": "One blocked Backend operation cannot indefinitely stall unrelated Runs or declared shutdown behavior.",
+      "preconditions": "A deterministic Backend seam can block a PTY operation without blocking the test driver.",
+      "action": "Block one Run operation while issuing control requests to another Run and initiating shutdown.",
+      "oracle": "Unrelated requests and shutdown settle within their declared bounds.",
+      "platform": ["unix"],
+      "tags": ["daemon", "tokio", "blocking", "shutdown"],
+      "disposition": "future",
+      "activation_task": "future:blocking-backend-seam",
+      "reason": "The current concrete PTY Backend does not expose a deterministic blocking seam."
+    },
+    {
+      "id": "DR-003",
+      "choice": "001-rust-tokio-daemon",
+      "source_ids": ["a01"],
+      "source_refs": [
+        "https://doc.rust-lang.org/std/process/struct.Child.html"
+      ],
+      "failure_mechanism": "Client-task cleanup accidentally controls the lifetime of the daemon-owned child.",
+      "invariant": "Client disconnect preserves Run identity, child PID, and later control.",
+      "preconditions": "A live Run is attached through a public client connection.",
+      "action": "Disconnect the attachment, reconnect through a new client, and query and control the Run.",
+      "oracle": "The same Run and PID remain live and accept input after reconnect.",
+      "platform": ["unix"],
+      "tags": ["daemon", "ownership", "disconnect", "lifecycle"],
+      "disposition": "covered",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "run_survives_attachment_disconnect_and_reconnects_to_the_same_child"
+        }
+      ]
+    },
+    {
+      "id": "PTY-001",
+      "choice": "002-portable-pty-native-backend",
+      "source_ids": ["b01"],
+      "source_refs": [
+        "https://github.com/wezterm/wezterm/commit/f2a2d099bb125a4a55a398e45aa6f08adffcf233"
+      ],
+      "failure_mechanism": "The daemon's blocked signal mask leaks through exec and disables terminal interrupts in the child.",
+      "invariant": "A child does not inherit launcher-blocked interactive signal masks.",
+      "preconditions": "The daemon is launched with an interactive signal blocked and starts a PTY child.",
+      "action": "Inspect the child's mask or generate the terminal signal through the Run.",
+      "oracle": "The child has the signal unblocked and terminal interrupt behavior remains functional.",
+      "platform": ["unix"],
+      "tags": ["pty", "signals", "exec", "dependency-contract", "p0"],
+      "disposition": "future",
+      "activation_task": "future:safe-signal-mask-launcher-seam",
+      "reason": "The upstream bug is fixed; reproducing it safely requires a checked-in launcher seam, not a test-only unsafe or native layer."
+    },
+    {
+      "id": "PTY-002",
+      "choice": "002-portable-pty-native-backend",
+      "source_ids": ["b02"],
+      "source_refs": [
+        "https://github.com/wezterm/wezterm/commit/44729a7e89aac006612e1361e115c4453e0ee1b3"
+      ],
+      "failure_mechanism": "An ambient descriptor without close-on-exec leaks authority or bytes into the child.",
+      "invariant": "A child sees only declared resources and PTY standard streams.",
+      "preconditions": "The daemon owns an inheritable sentinel descriptor before starting a Run.",
+      "action": "Start a child that enumerates its descriptors and attempts to read the sentinel.",
+      "oracle": "The sentinel descriptor is absent from the child.",
+      "platform": ["unix"],
+      "tags": ["pty", "file-descriptor", "exec", "dependency-contract", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "native_pty_child_does_not_inherit_an_ambient_daemon_descriptor"
+        }
+      ]
+    },
+    {
+      "id": "PTY-003",
+      "choice": "002-portable-pty-native-backend",
+      "source_ids": ["b03"],
+      "source_refs": [
+        "https://github.com/wezterm/wezterm/blob/portable-pty-0.9.0/pty/src/lib.rs#L316-L374"
+      ],
+      "failure_mechanism": "A HUP-only stop path acknowledges success while a HUP-ignoring child keeps running.",
+      "invariant": "The public meaning of stop and the eventual child state agree.",
+      "preconditions": "A Run child deliberately ignores SIGHUP.",
+      "action": "Request stop and observe acknowledgement, Run state, and child liveness.",
+      "oracle": "Characterize whether stop means signal delivery or eventual termination before fixing a stronger contract.",
+      "platform": ["unix"],
+      "tags": ["pty", "signals", "stop", "contract"],
+      "disposition": "characterization",
+      "activation_task": "future:stop-semantics-decision",
+      "reason": "The desired stop contract and escalation policy are not yet accepted."
+    },
+    {
+      "id": "LP-01",
+      "choice": "003-unix-socket-json-lines-protocol",
+      "source_ids": ["c01"],
+      "source_refs": ["https://man7.org/linux/man-pages/man7/unix.7.html"],
+      "failure_mechanism": "Unsafe socket-path permissions or stale cleanup replaces a protected path or live listener.",
+      "invariant": "Startup never replaces protected or live paths and leaves an owner-only socket.",
+      "preconditions": "The configured path is independently an ordinary file, symlink, active socket, and stale socket.",
+      "action": "Start the daemon against each path state and inspect the pathname and final mode.",
+      "oracle": "Protected and live targets are refused unchanged; only a stale socket is replaced; the new socket is owner-only.",
+      "platform": ["unix"],
+      "tags": ["protocol", "unix-socket", "security", "startup", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "socket_path_preparation_refuses_protected_and_live_targets"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "socket_path_preparation_removes_only_an_inactive_socket"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "published_socket_has_owner_only_permissions"
+        }
+      ]
+    },
+    {
+      "id": "LP-02",
+      "choice": "003-unix-socket-json-lines-protocol",
+      "source_ids": ["c02", "c03"],
+      "source_refs": [
+        "https://docs.rs/tokio-util/latest/tokio_util/codec/struct.LinesCodec.html",
+        "https://www.rfc-editor.org/rfc/rfc8259"
+      ],
+      "failure_mechanism": "Missing newline or an off-by-one frame limit causes unbounded buffering or Rust and Node disagreement.",
+      "invariant": "The exact byte ceiling is shared, oversize and unterminated input fail boundedly, and no request is dispatched.",
+      "preconditions": "A peer can send exact-limit, one-byte-oversize, and unterminated frames.",
+      "action": "Feed the frame matrix to the wire decoder and daemon boundary.",
+      "oracle": "Exact valid input is accepted; oversize or unterminated input is rejected without Run mutation or unbounded growth.",
+      "platform": ["unix", "node"],
+      "tags": ["protocol", "ndjson", "frame-limit", "bounds", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-protocol/src/lib.rs",
+          "anchor": "frame_byte_limit_accepts_exactly_the_ceiling_and_rejects_one_byte_more"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation"
+        },
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "LP-02 enforces the exact frame ceiling with and without a delimiter"
+        }
+      ]
+    },
+    {
+      "id": "LP-03",
+      "choice": "003-unix-socket-json-lines-protocol",
+      "source_ids": ["c03"],
+      "source_refs": ["https://www.rfc-editor.org/rfc/rfc8259"],
+      "failure_mechanism": "Rust and Node accept different invalid UTF-8, duplicate-name, or malformed nested JSON frames.",
+      "invariant": "Every client rejects the same malformed corpus before Run mutation.",
+      "preconditions": "The same malformed byte and JSON corpus is available to Rust and TypeScript boundaries.",
+      "action": "Decode each corpus entry in both implementations and attempt daemon dispatch where applicable.",
+      "oracle": "Both language boundaries reject every malformed entry and the daemon publishes no Run.",
+      "platform": ["unix", "node"],
+      "tags": ["protocol", "json", "utf8", "cross-language", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-protocol/src/lib.rs",
+          "anchor": "duplicate_json_names_are_rejected_instead_of_using_last_value"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation"
+        },
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "LP-03"
+        }
+      ]
+    },
+    {
+      "id": "LC-001",
+      "choice": "004-run-lifecycle-concurrency",
+      "source_ids": ["d01", "d02"],
+      "source_refs": [
+        "https://github.com/tokio-rs/tokio/commit/9fe3c5619dced7157fe46104641d2e1d0af44417",
+        "https://github.com/tokio-rs/tokio/commit/a81958484941ddcc2f1955fb6873c827f694ec9b"
+      ],
+      "failure_mechanism": "Lag recovery uses daemon head rather than the caller cursor and silently skips or duplicates replay.",
+      "invariant": "Continuation from the caller's last observed sequence is exact; unavailable history is explicit.",
+      "preconditions": "A small live-channel capacity and retained replay log can deterministically force receiver lag.",
+      "action": "Lag an attachment, record its cursor, then replay and resume live delivery.",
+      "oracle": "Retained chunks after the caller cursor appear exactly once and missing history is reported as a gap or truncation.",
+      "platform": ["unix"],
+      "tags": ["lifecycle", "concurrency", "lag", "cursor", "p0"],
+      "disposition": "future",
+      "activation_task": "future:deterministic-public-lag-replay-seam",
+      "reason": "The existing unit test composes a broadcast channel and replay log directly; it does not drive a real attachment through Gap and public cursor-based reattach."
+    },
+    {
+      "id": "LC-002",
+      "choice": "004-run-lifecycle-concurrency",
+      "source_ids": ["d02"],
+      "source_refs": [
+        "https://github.com/tokio-rs/tokio/commit/a81958484941ddcc2f1955fb6873c827f694ec9b"
+      ],
+      "failure_mechanism": "Exit closes live delivery before the final retained output is reachable.",
+      "invariant": "Final retained output is obtainable exactly once before or through replay when exit is observed.",
+      "preconditions": "A child writes a final marker and exits immediately.",
+      "action": "Wait for the child to exit, attach from cursor zero, and inspect retained bytes followed by the terminal event.",
+      "oracle": "Late attachment returns the exact final retained marker in replay and then reports one terminal event.",
+      "platform": ["unix"],
+      "tags": ["lifecycle", "exit", "ordering", "replay", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "already_exited_run_replays_exact_binary_bytes_before_one_exit_event"
+        }
+      ]
+    },
+    {
+      "id": "LC-003",
+      "choice": "004-run-lifecycle-concurrency",
+      "source_ids": ["d03"],
+      "source_refs": [
+        "https://man7.org/linux/man-pages/man2/pidfd_open.2.html"
+      ],
+      "failure_mechanism": "The waiter reaps a child before public state changes and a concurrent stop signals a recycled numeric PID.",
+      "invariant": "No signal is sent after owned-child termination is known.",
+      "preconditions": "A deterministic waiter and signaller model can pause at the reap and signal boundaries.",
+      "action": "Interleave child reap, state publication, PID reuse, and stop.",
+      "oracle": "The unrelated process with the recycled PID receives no signal.",
+      "platform": ["unix"],
+      "tags": ["lifecycle", "pid-reuse", "signal", "race"],
+      "disposition": "future",
+      "activation_task": "future:waiter-signaller-model",
+      "reason": "No deterministic process-identity and waiter/signaller seam exists."
+    },
+    {
+      "id": "OR-001",
+      "choice": "005-ordered-output-replay",
+      "source_ids": ["e02"],
+      "source_refs": ["https://man7.org/linux/man-pages/man2/read.2.html"],
+      "failure_mechanism": "PTY read boundaries split UTF-8, ANSI, NUL, or binary bytes and a layer decodes or rewrites chunks.",
+      "invariant": "Ordered chunk concatenation reproduces the exact PTY bytes.",
+      "preconditions": "A child emits a byte corpus containing NUL, invalid and split UTF-8, and split control sequences.",
+      "action": "After the child exits, attach from cursor zero and concatenate retained chunk payloads by sequence.",
+      "oracle": "The replay concatenation exactly equals the emitted byte corpus without per-chunk decoding.",
+      "platform": ["unix"],
+      "tags": ["output", "bytes", "replay", "pty", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "already_exited_run_replays_exact_binary_bytes_before_one_exit_event"
+        }
+      ]
+    },
+    {
+      "id": "OR-002",
+      "choice": "005-ordered-output-replay",
+      "source_ids": ["e01"],
+      "source_refs": [
+        "https://github.com/tokio-rs/tokio/commit/9fe3c5619dced7157fe46104641d2e1d0af44417"
+      ],
+      "failure_mechanism": "A slow live receiver loses data without a recovery cursor or an explicit loss signal.",
+      "invariant": "A gap plus the caller cursor yields exact replay or explicit truncation.",
+      "preconditions": "A bounded live channel and retained log can force deterministic lag.",
+      "action": "Pause one receiver, overflow the live channel, and recover from its last confirmed sequence.",
+      "oracle": "The client receives an explicit gap and recovered retained chunks contain no silent omission or duplicate.",
+      "platform": ["unix"],
+      "tags": ["output", "lag", "replay", "cursor", "p0"],
+      "disposition": "future",
+      "activation_task": "future:deterministic-public-lag-replay-seam",
+      "reason": "The existing unit test proves replay cursor arithmetic after channel lag but does not observe Gap and recover through a real attachment."
+    },
+    {
+      "id": "OR-003",
+      "choice": "005-ordered-output-replay",
+      "source_ids": ["e03"],
+      "source_refs": ["https://man7.org/linux/man-pages/man7/pty.7.html"],
+      "failure_mechanism": "A descendant keeps the slave open and writes after the direct child exits and the daemon's bounded drain ends.",
+      "invariant": "The contract distinguishes direct-child exit from PTY EOF and does not claim output completeness it cannot prove.",
+      "preconditions": "A direct child spawns a descendant that retains the PTY and writes after a delay.",
+      "action": "Observe direct-child exit, delayed descendant output, PTY EOF, and reconnect replay.",
+      "oracle": "Characterize which boundary ends the Run and whether delayed output is retained before accepting an oracle.",
+      "platform": ["unix"],
+      "tags": ["output", "descendant", "pty-eof", "exit", "contract"],
+      "disposition": "characterization",
+      "activation_task": "future:pty-eof-contract-decision",
+      "reason": "The direct-child-exit versus PTY-EOF product contract is unresolved."
+    },
+    {
+      "id": "OR-004",
+      "choice": "005-ordered-output-replay",
+      "source_ids": ["e04"],
+      "source_refs": [
+        "https://github.com/zellij-org/zellij/commit/23d2555543acfbffac897e0afca85aff0ea66044"
+      ],
+      "failure_mechanism": "A screen-diff oracle imports viewport and renderer failure modes into raw output replay.",
+      "invariant": "Core replay promises ordered raw bytes, not a reconstructed visible screen.",
+      "preconditions": "A client wants terminal-screen reconstruction from the raw output stream.",
+      "action": "Keep screen parsing outside the core replay oracle.",
+      "oracle": "Raw bytes and cursor continuity remain the only ctxmux core replay evidence.",
+      "platform": ["portable"],
+      "tags": ["output", "screen", "renderer", "scope"],
+      "disposition": "rejected",
+      "activation_task": null,
+      "reason": "Visible-screen reconstruction belongs to a rendering client, not the Run mux."
+    },
+    {
+      "id": "SC-01",
+      "choice": "006-rust-schema-ts-codegen",
+      "source_ids": ["f01", "f02", "f03"],
+      "source_refs": [
+        "https://www.rfc-editor.org/rfc/rfc8259",
+        "https://github.com/Aleph-Alpha/ts-rs/blob/main/README.md",
+        "https://github.com/Aleph-Alpha/ts-rs/issues/94"
+      ],
+      "failure_mechanism": "A Rust u64 cursor above Number.MAX_SAFE_INTEGER is rounded by JavaScript.",
+      "invariant": "A TypeScript-exposed cursor is exact or rejected before replay.",
+      "preconditions": "A mock daemon can encode safe-boundary and unsafe u64 cursor values.",
+      "action": "Feed the cursor matrix through the SDK runtime parser.",
+      "oracle": "Safe integers remain exact and unsafe integers are rejected rather than rounded.",
+      "platform": ["node"],
+      "tags": ["schema", "u64", "javascript", "runtime-validation", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "SC-01"
+        }
+      ]
+    },
+    {
+      "id": "SC-02",
+      "choice": "006-rust-schema-ts-codegen",
+      "source_ids": ["f02", "f04"],
+      "source_refs": [
+        "https://github.com/Aleph-Alpha/ts-rs/blob/main/README.md",
+        "https://github.com/microsoft/TypeScript-Website/blob/v2/packages/documentation/copy/en/handbook-v2/Basics.md"
+      ],
+      "failure_mechanism": "A top-level tag cast accepts a frame whose nested payload violates the generated declaration.",
+      "invariant": "The complete variant is runtime-validated before the SDK exposes it.",
+      "preconditions": "A mock daemon can mutate every required nested field and discriminant.",
+      "action": "Send the mutation corpus through handshake, request, snapshot, and event parsing.",
+      "oracle": "Every malformed nested variant is rejected before application exposure.",
+      "platform": ["node"],
+      "tags": [
+        "schema",
+        "typescript",
+        "nested-payload",
+        "runtime-validation",
+        "p0"
+      ],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "SC-02"
+        }
+      ]
+    },
+    {
+      "id": "SC-03",
+      "choice": "006-rust-schema-ts-codegen",
+      "source_ids": ["f02"],
+      "source_refs": [
+        "https://github.com/Aleph-Alpha/ts-rs/blob/main/README.md"
+      ],
+      "failure_mechanism": "Serde wire behavior and generated TypeScript declarations diverge without a visible generated-text diff.",
+      "invariant": "Rust-produced frames, generated declarations, and the SDK runtime parser agree.",
+      "preconditions": "Golden frames can be produced from authoritative Rust protocol variants.",
+      "action": "Regenerate declarations and parse the Rust-produced golden frame matrix in TypeScript.",
+      "oracle": "Generation is drift-free and every golden frame is accepted with exact field semantics.",
+      "platform": ["rust", "node"],
+      "tags": ["schema", "codegen", "serde", "golden-frame", "p0"],
+      "disposition": "future",
+      "activation_task": "future:rust-authored-golden-frames",
+      "reason": "Generated declaration drift and TypeScript-authored examples are covered separately, but no checked-in Rust-serialized frame matrix is consumed by Node yet."
+    },
+    {
+      "id": "SDK-01",
+      "choice": "007-node-typescript-sdk",
+      "source_ids": ["g01", "g02", "g04"],
+      "source_refs": [
+        "https://github.com/nodejs/node/blob/v24.x/doc/api/net.md",
+        "https://github.com/nodejs/node/blob/v24.x/doc/api/stream.md",
+        "https://github.com/nodejs/node/issues/53512"
+      ],
+      "failure_mechanism": "FIN, RST, and close races make an SDK operation hang or treat write progress as protocol success.",
+      "invariant": "Short requests and clean detach settle once from their protocol response, while transport writes settle once from callback success or a stable transport error.",
+      "preconditions": "A mock socket can respond, half-close, reset, or close at controlled request, detach, and write-callback boundaries.",
+      "action": "Run short requests, clean detach, abrupt close, pending receive, and raw write callbacks through the close-race matrix.",
+      "oracle": "Requests and clean detach succeed only after their expected server frame; every tested transport wait rejects or resolves once without hanging.",
+      "platform": ["node"],
+      "tags": ["sdk", "socket", "close-race", "promise", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "SDK-01"
+        },
+        {
+          "path": "packages/sdk/test/client-parity.test.ts",
+          "anchor": "CLI and TypeScript SDK share one daemon-owned Run across client exits"
+        }
+      ]
+    },
+    {
+      "id": "SDK-02",
+      "choice": "007-node-typescript-sdk",
+      "source_ids": ["g01", "g02", "g03"],
+      "source_refs": [
+        "https://github.com/nodejs/node/blob/v24.x/doc/api/net.md",
+        "https://github.com/nodejs/node/blob/v24.x/doc/api/stream.md",
+        "https://github.com/nodejs/node/issues/44290"
+      ],
+      "failure_mechanism": "A flowing data handler transfers bounded socket input into an unbounded in-memory line queue.",
+      "invariant": "A paused or slow attachment has a bounded queue and makes loss explicit.",
+      "preconditions": "A mock daemon can flood attachment events while the consumer remains paused.",
+      "action": "Exceed the declared queue bound and then resume consumption.",
+      "oracle": "The producer encounters socket backpressure before the flood completes, and resumed consumption yields every accepted frame in order without an unbounded JavaScript line queue.",
+      "platform": ["node"],
+      "tags": ["sdk", "backpressure", "memory", "slow-consumer", "p0"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/wrong-cases.test.ts",
+          "anchor": "SDK-02"
+        }
+      ]
+    },
+    {
+      "id": "SDK-03",
+      "choice": "007-node-typescript-sdk",
+      "source_ids": ["g01"],
+      "source_refs": [
+        "https://github.com/nodejs/node/blob/v24.x/doc/api/net.md"
+      ],
+      "failure_mechanism": "A silent peer holds handshake, request, or detach forever.",
+      "invariant": "The caller can bound operation lifetime and cleanup settles all waiters.",
+      "preconditions": "The SDK exposes a public abort or deadline contract.",
+      "action": "Leave each protocol phase silent and trigger cancellation or deadline expiry.",
+      "oracle": "The operation rejects, the socket closes deliberately, and every waiter settles once.",
+      "platform": ["node"],
+      "tags": ["sdk", "timeout", "cancellation", "cleanup"],
+      "disposition": "future",
+      "activation_task": "future:sdk-abort-deadline-api",
+      "reason": "The public SDK has no abort or deadline API to test."
+    },
+    {
+      "id": "CLI-01",
+      "choice": "008-crossterm-interactive-cli",
+      "source_ids": ["h01", "h02"],
+      "source_refs": [
+        "https://github.com/crossterm-rs/crossterm/issues/720",
+        "https://man7.org/linux/man-pages/man3/termios.3.html"
+      ],
+      "failure_mechanism": "A recoverable attach exit leaves the user's terminal in raw mode.",
+      "invariant": "The exact prior terminal state is restored on every recoverable exit.",
+      "preconditions": "The CLI runs under a real controlling PTY and can exit by detach, daemon loss, error, or unwind.",
+      "action": "Capture terminal attributes, exercise each recoverable exit, and capture attributes again.",
+      "oracle": "The complete terminal attribute snapshot after exit equals the snapshot before attach.",
+      "platform": ["unix"],
+      "tags": ["cli", "raw-mode", "termios", "cleanup", "p0"],
+      "disposition": "future",
+      "activation_task": "future:termios-restoration-contract",
+      "reason": "Exact restoration requires a reviewed termios owner and normalization decision; the real macOS PTY characterization changed PENDIN."
+    },
+    {
+      "id": "CLI-02",
+      "choice": "008-crossterm-interactive-cli",
+      "source_ids": ["h02"],
+      "source_refs": ["https://man7.org/linux/man-pages/man3/termios.3.html"],
+      "failure_mechanism": "Cleanup restores guessed defaults and destroys non-default user terminal settings.",
+      "invariant": "Interactive attach is observationally reversible at the termios boundary.",
+      "preconditions": "The controlling PTY starts with a deliberately non-default terminal mode.",
+      "action": "Attach and detach, then compare the full before and after terminal attributes.",
+      "oracle": "Every non-default bit and control character is restored exactly.",
+      "platform": ["unix"],
+      "tags": ["cli", "termios", "restoration", "non-default", "p0"],
+      "disposition": "future",
+      "activation_task": "future:termios-restoration-contract",
+      "reason": "Exact non-default restoration requires a reviewed termios owner and normalization decision; the real macOS PTY characterization changed PENDIN."
+    },
+    {
+      "id": "CLI-03",
+      "choice": "008-crossterm-interactive-cli",
+      "source_ids": ["h03"],
+      "source_refs": ["https://github.com/tmux/tmux/blob/master/tmux.1"],
+      "failure_mechanism": "Prefix routing changes with read partitioning or loses a trailing prefix byte.",
+      "invariant": "The same input bytes route identically under every partition and detach bytes never reach the child.",
+      "preconditions": "A byte stream contains detach, non-detach, repeated-prefix, and trailing-prefix sequences.",
+      "action": "Route the corpus under one-byte and multi-byte partitions and finish the stream.",
+      "oracle": "Forwarded bytes and detach decisions are partition-independent and lossless.",
+      "platform": ["portable"],
+      "tags": ["cli", "prefix", "partition", "input"],
+      "disposition": "covered",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux/src/main.rs",
+          "anchor": "terminal_prefix_routing_is_identical_across_every_read_partition_and_eof"
+        }
+      ]
+    },
+    {
+      "id": "PERSIST-01",
+      "choice": "009-runtime-persistence-recovery",
+      "source_ids": ["i01", "i02"],
+      "source_refs": [
+        "https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html",
+        "https://man7.org/linux/man-pages/man2/pidfd_open.2.html"
+      ],
+      "failure_mechanism": "A stale record adopts or signals an unrelated process after numeric PID reuse.",
+      "invariant": "Ambiguous recovered identity fails closed and leaves unrelated processes untouched.",
+      "preconditions": "Restart recovery and stable process-identity evidence exist.",
+      "action": "Recover a stale record whose PID now belongs to a different process and request control.",
+      "oracle": "Recovery rejects the record and sends no signal to the unrelated process.",
+      "platform": ["portable"],
+      "tags": ["persistence", "recovery", "pid-reuse", "identity"],
+      "disposition": "future",
+      "activation_task": "future:persistence-recovery",
+      "reason": "Run identity and control currently end with the owning daemon process."
+    },
+    {
+      "id": "PERSIST-02",
+      "choice": "009-runtime-persistence-recovery",
+      "source_ids": ["i03"],
+      "source_refs": ["https://www.sqlite.org/atomiccommit.html"],
+      "failure_mechanism": "A crash exposes a parseable mixture of two persistent generations.",
+      "invariant": "Recovery selects one complete generation or reports typed corruption.",
+      "preconditions": "A durable Run store with an atomic commit protocol exists.",
+      "action": "Crash at each write, sync, rename, and directory-sync boundary, then recover.",
+      "oracle": "Recovery observes the old or new complete generation, never a mixed state.",
+      "platform": ["portable"],
+      "tags": ["persistence", "atomicity", "crash", "corruption"],
+      "disposition": "future",
+      "activation_task": "future:durable-run-store",
+      "reason": "ctxmux has no durable Run store."
+    },
+    {
+      "id": "INTEGRATION-01",
+      "choice": "010-explicit-typescript-integrations",
+      "source_ids": ["j01"],
+      "source_refs": [
+        "https://github.com/nodejs/node/blob/d846ffd04fe1318a9193e5480d3e04eec3dade42/doc/api/child_process.md"
+      ],
+      "failure_mechanism": "Integration fields interpolated into shell text execute metacharacters or change argv boundaries.",
+      "invariant": "Structured executable and argv values are exact; shell use is explicit and bounded.",
+      "preconditions": "T-004 provides the Integration launch-plan builder.",
+      "action": "Build plans from metacharacter, whitespace, quote, and newline corpus values and launch a recording child.",
+      "oracle": "The child observes the exact declared argv with no implicit shell evaluation.",
+      "platform": ["node"],
+      "tags": ["integration", "argv", "shell-injection", "launch"],
+      "disposition": "future",
+      "activation_task": "future:integration-contract",
+      "reason": "The explicit Integration contract and launch builder are not implemented."
+    },
+    {
+      "id": "INTEGRATION-02",
+      "choice": "010-explicit-typescript-integrations",
+      "source_ids": ["j02"],
+      "source_refs": [
+        "https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle"
+      ],
+      "failure_mechanism": "Executable presence is treated as proof of compatible semantic capability.",
+      "invariant": "Version, malformed, and hanging probes fail closed and Level B never silently becomes Level A.",
+      "preconditions": "T-004 provides Integration detection and capability probing.",
+      "action": "Probe missing, incompatible, malformed, and silent tool implementations.",
+      "oracle": "Capabilities are declared only after a valid compatible probe and unsupported fidelity remains explicit.",
+      "platform": ["node"],
+      "tags": ["integration", "capability", "probe", "fail-closed"],
+      "disposition": "future",
+      "activation_task": "future:integration-contract",
+      "reason": "Integration capability probes do not exist."
+    },
+    {
+      "id": "FORK-01",
+      "choice": "011-context-artifact-lineage-fork",
+      "source_ids": ["k01"],
+      "source_refs": [
+        "https://github.com/git/git/blob/010afd3166ddc64c9863b1506f12cbcdda0d4ea1/Documentation/git-stash.adoc"
+      ],
+      "failure_mechanism": "A snapshot omits staged, dirty, untracked, ignored, or nested state while claiming fidelity.",
+      "invariant": "The fork manifest exactly matches its declared inclusion policy.",
+      "preconditions": "T-005 implements Level B workspace capture and manifests.",
+      "action": "Fork a workspace containing every Git state class and nested repository boundary.",
+      "oracle": "The manifest and captured files agree exactly with the declared inclusion and omission policy.",
+      "platform": ["portable"],
+      "tags": ["fork", "workspace", "manifest", "fidelity"],
+      "disposition": "future",
+      "activation_task": "future:context-fork",
+      "reason": "Context manifests and Level B workspace capture are not implemented."
+    },
+    {
+      "id": "FORK-02",
+      "choice": "011-context-artifact-lineage-fork",
+      "source_ids": ["k02"],
+      "source_refs": [
+        "https://github.com/git/git/blob/010afd3166ddc64c9863b1506f12cbcdda0d4ea1/Documentation/git-clone.adoc"
+      ],
+      "failure_mechanism": "An independent-looking child borrows objects later deleted by source cleanup.",
+      "invariant": "Fork artifact ownership or dependency is explicit and truthful.",
+      "preconditions": "T-005 selects a borrowed or owned artifact storage model.",
+      "action": "Create a fork, clean the source's storage, and resolve every child artifact.",
+      "oracle": "Owned artifacts survive; borrowed artifacts declare the dependency and fail explicitly if it is removed.",
+      "platform": ["portable"],
+      "tags": ["fork", "artifact", "ownership", "cleanup"],
+      "disposition": "future",
+      "activation_task": "future:context-fork",
+      "reason": "Fork artifact storage and ownership do not exist."
+    },
+    {
+      "id": "FORK-03",
+      "choice": "011-context-artifact-lineage-fork",
+      "source_ids": ["k03"],
+      "source_refs": ["https://docs.docker.com/build/building/secrets/"],
+      "failure_mechanism": "Ephemeral credentials become durable fork state.",
+      "invariant": "Secret canaries are absent or explicitly redacted in every durable artifact.",
+      "preconditions": "T-005 implements durable manifests, artifacts, and lineage.",
+      "action": "Fork context containing secret canaries in supported and excluded input locations.",
+      "oracle": "No canary appears in durable state except an explicit redaction record without the secret value.",
+      "platform": ["portable"],
+      "tags": ["fork", "secret", "redaction", "artifact"],
+      "disposition": "future",
+      "activation_task": "future:context-fork",
+      "reason": "Durable context artifacts and redaction policy are not implemented."
+    },
+    {
+      "id": "TMUX-01",
+      "choice": "012-tmux-control-mode-backend",
+      "source_ids": ["l01", "l02"],
+      "source_refs": [
+        "https://github.com/tmux/tmux/wiki/Control-Mode",
+        "https://github.com/tmux/tmux/blob/851c5a933d4838c32ad06c248b2ba975d106149c/tmux.1"
+      ],
+      "failure_mechanism": "A text parser corrupts octal-escaped bytes or mistakes payload for a Control Mode notification.",
+      "invariant": "Framing and byte payload decode exactly across supported tmux transcripts.",
+      "preconditions": "T-006 implements the Control Mode parser.",
+      "action": "Replay versioned transcripts with interleaving, octal escapes, invalid UTF-8, and quoted names.",
+      "oracle": "Commands, notifications, pane identities, and decoded payload bytes match the transcript oracle exactly.",
+      "platform": ["unix"],
+      "tags": ["tmux", "control-mode", "parser", "bytes"],
+      "disposition": "future",
+      "activation_task": "future:tmux-backend",
+      "reason": "The tmux Backend and Control Mode parser are not implemented."
+    },
+    {
+      "id": "TMUX-02",
+      "choice": "012-tmux-control-mode-backend",
+      "source_ids": ["l01", "l02"],
+      "source_refs": [
+        "https://github.com/tmux/tmux/wiki/Control-Mode",
+        "https://github.com/tmux/tmux/blob/851c5a933d4838c32ad06c248b2ba975d106149c/tmux.1"
+      ],
+      "failure_mechanism": "A slow Control Mode client pauses or disconnects and the adapter later claims a continuous raw stream.",
+      "invariant": "The tmux-owned Run stays live and resync exposes an explicit gap without fabricated history.",
+      "preconditions": "T-006 implements tmux flow control, reconnect, and resync semantics.",
+      "action": "Pause or disconnect under pane output load, then reconnect and request resync.",
+      "oracle": "The pane process survives and output continuity is either proven or represented by an explicit gap.",
+      "platform": ["unix"],
+      "tags": ["tmux", "flow-control", "resync", "gap"],
+      "disposition": "future",
+      "activation_task": "future:tmux-backend",
+      "reason": "The tmux Backend has no flow-control or resync contract."
+    },
+    {
+      "id": "TMUX-03",
+      "choice": "012-tmux-control-mode-backend",
+      "source_ids": ["l03"],
+      "source_refs": [
+        "https://github.com/tmux/tmux/commit/800837ff3f21799281525af3d8537f362e5cb43e"
+      ],
+      "failure_mechanism": "Queued pane output races teardown and leaves dangling adapter ownership or crashes detach.",
+      "invariant": "Detach under load is responsive and idempotent and preserves the tmux-owned pane PID.",
+      "preconditions": "T-006 implements attach and detach against a tmux version matrix.",
+      "action": "Detach repeatedly while pane output and Control Mode notifications remain queued.",
+      "oracle": "Every detach settles without crash, adapter resources close once, and the pane PID survives.",
+      "platform": ["unix"],
+      "tags": ["tmux", "detach", "teardown", "ownership"],
+      "disposition": "future",
+      "activation_task": "future:tmux-backend",
+      "reason": "The tmux Backend does not exist."
+    }
+  ]
+}
