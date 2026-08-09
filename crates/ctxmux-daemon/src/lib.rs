@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, RwLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -43,20 +43,24 @@ use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::broadcast,
+    sync::{Notify, broadcast},
 };
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::creation::{
-    CreationFlight, CreationFlightOwner, CreationRequest, MemoryPublicationReservation,
-    PendingPublication, RunRegistry, TerminalOrdinal, TerminalPublicationOwner,
-    TmuxCleanupReservation, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
+    CommitUnknownReservation, CreationFlight, CreationFlightOwner, CreationRequest,
+    PendingPublication, PersistentCollectionCandidate, PublicationReservation, RunRegistry,
+    TerminalOrdinal, TerminalPublicationOwner, TmuxCleanupReservation, UnpublishedCleanupOwner,
+    UnpublishedCleanupReservation,
 };
 use crate::native_control::{
     ChildCommand, ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner,
     PendingInput, PendingStop,
 };
-use crate::persistence::{Persistence, PersistentRun, RecoveredRun};
+use crate::persistence::{
+    CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
+    PersistentStartFailure, RecoveredRun, StagedPersistentStart, StartDisposition,
+};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
@@ -190,6 +194,14 @@ async fn serve_with_manager(
                 manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
                 return Ok(());
             }
+            failure = manager.incarnation_failure.wait() => {
+                let cleanup = manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT);
+                let failures = match cleanup {
+                    Ok(()) => failure,
+                    Err(error) => format!("{failure}; shutdown: {error}"),
+                };
+                return Err(ServerError::Shutdown { failures });
+            }
         }
     }
 }
@@ -294,12 +306,188 @@ struct RunManager {
     native_input_drains: InputDrainGate,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
+    commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
+    incarnation_failure: IncarnationFailure,
     tmux_shutting_down: AtomicBool,
     tmux_operation_gate: RwLock<()>,
     #[cfg(test)]
     attachment_hook: Option<Arc<AttachmentTestHook>>,
     #[cfg(test)]
     creation_hook: Option<Arc<CreationTestHook>>,
+}
+
+#[derive(Default)]
+struct IncarnationFailure {
+    message: Mutex<Option<String>>,
+    changed: Notify,
+}
+
+impl IncarnationFailure {
+    fn record(&self, message: String) {
+        let mut current = mutex_lock(&self.message);
+        if current.is_none() {
+            *current = Some(message);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn wait(&self) -> String {
+        loop {
+            let notified = self.changed.notified();
+            if let Some(message) = mutex_lock(&self.message).clone() {
+                return message;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Couples the exact Registry ticket to `SQLite`'s staged transaction across
+/// ordinary errors and thread unwind. Only a proven `NotCommitted` disposition
+/// may let Drop restore the Registry candidates.
+struct PersistentPublicationOwner<'a> {
+    manager: &'a RunManager,
+    reservation: Option<PublicationReservation>,
+    staged: Option<StagedPersistentStart>,
+    phase: PersistentPublicationPhase,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistentPublicationPhase {
+    Staged,
+    Deciding,
+    NotCommitted,
+    CommittedUnpublished,
+    Finished,
+}
+
+enum CreationPublication<'a> {
+    Memory(PublicationReservation),
+    Persistent(PersistentPublicationOwner<'a>),
+}
+
+impl CreationPublication<'_> {
+    fn abort(self) -> Result<(), PersistentStartFailure> {
+        match self {
+            Self::Memory(_) => Ok(()),
+            Self::Persistent(owner) => owner.abort(),
+        }
+    }
+}
+
+impl<'a> PersistentPublicationOwner<'a> {
+    fn new(
+        manager: &'a RunManager,
+        reservation: PublicationReservation,
+        staged: StagedPersistentStart,
+    ) -> Self {
+        Self {
+            manager,
+            reservation: Some(reservation),
+            staged: Some(staged),
+            phase: PersistentPublicationPhase::Staged,
+        }
+    }
+
+    fn commit(&mut self) -> PersistentStartCompletion {
+        self.phase = PersistentPublicationPhase::Deciding;
+        let completion = self
+            .staged
+            .take()
+            .expect("persistent publication commits one staged transaction")
+            .commit();
+        self.phase = match &completion {
+            PersistentStartCompletion::NotCommitted(_) => PersistentPublicationPhase::NotCommitted,
+            PersistentStartCompletion::Committed(_) => {
+                PersistentPublicationPhase::CommittedUnpublished
+            }
+            PersistentStartCompletion::CommitUnknown(_) => PersistentPublicationPhase::Deciding,
+        };
+        completion
+    }
+
+    fn abort(mut self) -> Result<(), PersistentStartFailure> {
+        self.phase = PersistentPublicationPhase::Deciding;
+        let result = self
+            .staged
+            .take()
+            .expect("persistent publication aborts one staged transaction")
+            .abort();
+        match &result {
+            Ok(()) => self.phase = PersistentPublicationPhase::NotCommitted,
+            Err(failure) if failure.disposition() == StartDisposition::NotCommitted => {
+                self.phase = PersistentPublicationPhase::NotCommitted;
+            }
+            Err(failure) => self.retain_unknown(&failure.to_string()),
+        }
+        result
+    }
+
+    fn publish_committed(
+        &mut self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+        committed: CommittedStart,
+    ) -> (RunInfo, Option<PersistenceError>) {
+        debug_assert_eq!(self.phase, PersistentPublicationPhase::CommittedUnpublished);
+        let post_commit_error = committed.post_commit_error;
+        #[cfg(test)]
+        if let Some(hook) = &self.manager.creation_hook {
+            hook.capture_run(
+                CreationHookPoint::PanicAfterPersistentCommit,
+                Arc::clone(pending.run()),
+            );
+            hook.pause_once(CreationHookPoint::PanicAfterPersistentCommit);
+        }
+        pending
+            .run()
+            .install_committed_persistence(committed.durable);
+        #[cfg(test)]
+        if let Some(hook) = &self.manager.creation_hook {
+            hook.capture_run(
+                CreationHookPoint::PanicBeforePersistentRegistryConsume,
+                Arc::clone(pending.run()),
+            );
+            hook.pause_once(CreationHookPoint::PanicBeforePersistentRegistryConsume);
+        }
+        let info = self.manager.registry.publish_creation(
+            operation_key,
+            pending,
+            self.reservation.as_mut(),
+        );
+        self.phase = PersistentPublicationPhase::Finished;
+        (info, post_commit_error)
+    }
+
+    fn retain_unknown(&mut self, message: &str) {
+        let reservation = self
+            .reservation
+            .take()
+            .and_then(PublicationReservation::into_commit_unknown);
+        self.phase = PersistentPublicationPhase::Finished;
+        self.manager.fail_stop_persistence(reservation, message);
+    }
+}
+
+impl Drop for PersistentPublicationOwner<'_> {
+    fn drop(&mut self) {
+        if let Some(staged) = self.staged.take() {
+            match staged.abort() {
+                Ok(()) => self.phase = PersistentPublicationPhase::NotCommitted,
+                Err(failure) if failure.disposition() == StartDisposition::NotCommitted => {
+                    self.phase = PersistentPublicationPhase::NotCommitted;
+                    eprintln!("ctxmuxd failed to finish staged persistence rollback: {failure}");
+                }
+                Err(failure) => self.retain_unknown(&failure.to_string()),
+            }
+        }
+        if matches!(
+            self.phase,
+            PersistentPublicationPhase::Deciding | PersistentPublicationPhase::CommittedUnpublished
+        ) {
+            self.retain_unknown("persistent publication unwound after durable disposition began");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -325,14 +513,17 @@ struct CreationTestHook {
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     released: Mutex<bool>,
     release: std::sync::Condvar,
-    captured_run: Mutex<Option<Arc<Run>>>,
+    captured_runs: Mutex<Vec<Arc<Run>>>,
 }
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CreationHookPoint {
     AfterSpawn,
+    AfterSpawnWithRunHold,
     PanicAfterSpawn,
+    PanicAfterPersistentCommit,
+    PanicBeforePersistentRegistryConsume,
     AfterPublication,
 }
 
@@ -351,8 +542,7 @@ impl AttachmentTestHook {
 impl CreationTestHook {
     fn capture_run(&self, point: CreationHookPoint, run: Arc<Run>) {
         if self.point == point && self.armed.load(Ordering::Acquire) {
-            let previous = mutex_lock(&self.captured_run).replace(run);
-            assert!(previous.is_none(), "test hook captures one Run owner");
+            mutex_lock(&self.captured_runs).push(run);
         }
     }
 
@@ -373,6 +563,16 @@ impl CreationTestHook {
             CreationHookPoint::PanicAfterSpawn,
             "injected creation owner panic after physical spawn"
         );
+        assert_ne!(
+            point,
+            CreationHookPoint::PanicAfterPersistentCommit,
+            "injected creation owner panic after persistent COMMIT"
+        );
+        assert_ne!(
+            point,
+            CreationHookPoint::PanicBeforePersistentRegistryConsume,
+            "injected creation owner panic before exact Registry replacement"
+        );
     }
 
     fn release(&self) {
@@ -385,8 +585,15 @@ impl CreationTestHook {
         self.armed.store(true, Ordering::Release);
     }
 
-    fn release_captured_run(&self) {
-        mutex_lock(&self.captured_run).take();
+    fn release_captured_runs(&self) {
+        mutex_lock(&self.captured_runs).clear();
+    }
+
+    fn captured_runs_are_backend_quiescent(&self) -> bool {
+        mutex_lock(&self.captured_runs).iter().all(|run| {
+            run.native_control()
+                .is_ok_and(|control| control.closed_quiescence_result().is_ok())
+        })
     }
 }
 
@@ -400,6 +607,8 @@ impl Default for RunManager {
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
+            commit_unknown_reservations: Mutex::new(Vec::new()),
+            incarnation_failure: IncarnationFailure::default(),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -417,12 +626,15 @@ impl RunManager {
             .into_iter()
             .map(|recovered| {
                 let operation_key = recovered.operation_key.clone();
+                let metadata_bytes = recovered.metadata_bytes;
                 let durable = persistence.recovered_run(
                     recovered
                         .info
                         .durable_head_seq
                         .unwrap_or(recovered.info.head_seq),
+                    metadata_bytes,
                 );
+                let metadata_owner = durable.metadata_bytes_owner();
                 (
                     operation_key,
                     Run::recover(
@@ -431,6 +643,7 @@ impl RunManager {
                         LIVE_EVENT_CAPACITY,
                         terminal_publications.clone(),
                     ),
+                    metadata_owner,
                 )
             })
             .collect();
@@ -442,6 +655,8 @@ impl RunManager {
             native_input_drains: InputDrainGate::default(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
+            commit_unknown_reservations: Mutex::new(Vec::new()),
+            incarnation_failure: IncarnationFailure::default(),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -472,8 +687,6 @@ impl RunManager {
         let flight = self.begin_creation_flight().await?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        let registry_reservation =
-            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let manager = Arc::clone(self);
         thread::Builder::new()
@@ -485,7 +698,6 @@ impl RunManager {
                     operation_key,
                     materialized,
                     cleanup_reservation,
-                    registry_reservation,
                     new_run_id,
                 );
                 let _ = result_tx.send(result);
@@ -524,21 +736,32 @@ impl RunManager {
         })
     }
 
+    fn fail_stop_persistence(&self, reservation: Option<CommitUnknownReservation>, message: &str) {
+        if let Some(reservation) = reservation {
+            mutex_lock(&self.commit_unknown_reservations).push(reservation);
+        }
+        self.creation_flights.fence();
+        self.incarnation_failure.record(format!(
+            "persistent start COMMIT outcome is unknown; restart is required: {message}"
+        ));
+    }
+
     fn create_unique(
         &self,
         operation_key: CreateOperationKey,
         materialized: MaterializedCreation,
         cleanup_reservation: UnpublishedCleanupReservation,
-        registry_reservation: Option<MemoryPublicationReservation>,
         new_run_id: RunId,
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
+        let publication =
+            self.prepare_creation_publication(&operation_key, &materialized, new_run_id)?;
         let MaterializedCreation {
             request,
             spec,
             lineage,
         } = materialized;
-        let pending = Run::spawn_pending(
+        let pending = match Run::spawn_pending(
             NativeSpawnConfig {
                 id: new_run_id,
                 spec,
@@ -550,56 +773,131 @@ impl RunManager {
             },
             request,
             cleanup_reservation,
-        )?;
-        let (info, post_commit_error) = if persistence_mode == PersistenceMode::MemoryOnly {
-            #[cfg(test)]
-            if let Some(hook) = &self.creation_hook {
-                hook.pause_once(CreationHookPoint::AfterSpawn);
-                hook.capture_run(
-                    CreationHookPoint::PanicAfterSpawn,
-                    Arc::clone(pending.run()),
-                );
-                hook.pause_once(CreationHookPoint::PanicAfterSpawn);
-            }
-            (
-                self.registry
-                    .publish_creation(operation_key, pending, registry_reservation),
-                None,
-            )
-        } else {
-            #[cfg(test)]
-            if let Some(hook) = &self.creation_hook {
-                hook.pause_once(CreationHookPoint::AfterSpawn);
-            }
-            let post_commit_error = match self.prepare_publication(&operation_key, pending.run()) {
-                Ok(post_commit_error) => post_commit_error,
-                Err(error) => {
-                    if let Err(cleanup_error) = pending.cleanup_unpublished() {
-                        return Err(ProtocolError::new(
-                            error.code,
-                            format!(
-                                "{}; rollback pending: exact creation key remains fenced until all unpublished native owners are quiescent: {cleanup_error}",
-                                error.message
-                            ),
-                        ));
-                    }
-                    return Err(error);
+        ) {
+            Ok(pending) => pending,
+            Err(spawn_error) => {
+                if let Err(failure) = publication.abort() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::Persistence,
+                        format!("{}; persistent rollback: {failure}", spawn_error.message),
+                    ));
                 }
-            };
-            (
-                self.registry
-                    .publish_creation(operation_key, pending, registry_reservation),
-                post_commit_error,
-            )
+                return Err(spawn_error);
+            }
+        };
+        let result = match publication {
+            CreationPublication::Memory(reservation) => {
+                Ok(self.publish_memory_creation(operation_key, pending, reservation))
+            }
+            CreationPublication::Persistent(publication) => {
+                self.publish_persistent_creation(operation_key, pending, publication)
+            }
         };
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
             hook.pause_once(CreationHookPoint::AfterPublication);
         }
-        match post_commit_error {
-            Some(error) => Err(error),
-            None => Ok(info),
+        result
+    }
+
+    fn prepare_creation_publication<'a>(
+        &'a self,
+        operation_key: &CreateOperationKey,
+        materialized: &MaterializedCreation,
+        new_run_id: RunId,
+    ) -> Result<CreationPublication<'a>, ProtocolError> {
+        let Some(persistence) = &self.persistence else {
+            let reservation = self
+                .registry
+                .reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
+            return Ok(CreationPublication::Memory(reservation));
+        };
+        let prospective = materialized.persistence_start_info(new_run_id);
+        let prepared = persistence
+            .prepare_start(operation_key, &prospective)
+            .map_err(|error| persistence_protocol_error(&error))?;
+        let reservation = self.registry.reserve_persistent_publication(
+            new_run_id,
+            operation_key.clone(),
+            materialized.request.clone(),
+            prepared.metadata_bytes(),
+        )?;
+        let candidates = reservation
+            .persistent_candidates()
+            .into_iter()
+            .map(PersistentCandidate::from)
+            .collect();
+        match persistence.stage_start(prepared, candidates) {
+            Ok(staged) => Ok(CreationPublication::Persistent(
+                PersistentPublicationOwner::new(self, reservation, staged),
+            )),
+            Err(failure) => {
+                let disposition = failure.disposition();
+                let code = if failure.is_capacity() {
+                    ErrorCode::RunCapacity
+                } else {
+                    ErrorCode::Persistence
+                };
+                let message = failure.into_error().to_string();
+                if disposition == StartDisposition::CommitUnknown {
+                    self.fail_stop_persistence(reservation.into_commit_unknown(), &message);
+                }
+                Err(ProtocolError::new(code, message))
+            }
         }
+    }
+
+    fn publish_memory_creation(
+        &self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+        mut reservation: PublicationReservation,
+    ) -> RunInfo {
+        #[cfg(test)]
+        if let Some(hook) = &self.creation_hook {
+            hook.pause_once(CreationHookPoint::AfterSpawn);
+            hook.capture_run(
+                CreationHookPoint::PanicAfterSpawn,
+                Arc::clone(pending.run()),
+            );
+            hook.pause_once(CreationHookPoint::PanicAfterSpawn);
+        }
+        self.registry
+            .publish_creation(operation_key, pending, Some(&mut reservation))
+    }
+
+    fn publish_persistent_creation(
+        &self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+        mut publication: PersistentPublicationOwner<'_>,
+    ) -> Result<RunInfo, ProtocolError> {
+        debug_assert!(std::ptr::eq(self, publication.manager));
+        #[cfg(test)]
+        if let Some(hook) = &self.creation_hook {
+            hook.capture_run(
+                CreationHookPoint::AfterSpawnWithRunHold,
+                Arc::clone(pending.run()),
+            );
+            hook.pause_once(CreationHookPoint::AfterSpawn);
+            hook.pause_once(CreationHookPoint::AfterSpawnWithRunHold);
+        }
+        let committed = match publication.commit() {
+            PersistentStartCompletion::Committed(committed) => committed,
+            PersistentStartCompletion::NotCommitted(failure) => {
+                return cleanup_failed_persistent_creation(pending, failure);
+            }
+            PersistentStartCompletion::CommitUnknown(failure) => {
+                let message = failure.into_error().to_string();
+                publication.retain_unknown(&message);
+                return cleanup_unknown_persistent_creation(pending, message);
+            }
+        };
+        let (info, post_commit_error) =
+            publication.publish_committed(operation_key, pending, committed);
+        let post_commit_error = post_commit_error
+            .map(|error| ProtocolError::new(ErrorCode::Persistence, error.to_string()));
+        post_commit_error.map_or(Ok(info), Err)
     }
 
     #[cfg(test)]
@@ -611,15 +909,7 @@ impl RunManager {
         let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        let registry_reservation =
-            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
-        self.create_unique(
-            operation_key,
-            materialized,
-            cleanup_reservation,
-            registry_reservation,
-            new_run_id,
-        )
+        self.create_unique(operation_key, materialized, cleanup_reservation, new_run_id)
     }
 
     #[cfg(test)]
@@ -631,15 +921,7 @@ impl RunManager {
         let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        let registry_reservation =
-            self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
-        self.create_unique(
-            operation_key,
-            materialized,
-            cleanup_reservation,
-            registry_reservation,
-            new_run_id,
-        )
+        self.create_unique(operation_key, materialized, cleanup_reservation, new_run_id)
     }
 
     fn materialize_creation(
@@ -695,11 +977,12 @@ impl RunManager {
         })
     }
 
+    #[cfg(test)]
     fn reserve_memory_publication(
         &self,
         new_run_id: RunId,
         operation_key: Option<CreateOperationKey>,
-    ) -> Result<Option<MemoryPublicationReservation>, ProtocolError> {
+    ) -> Result<Option<PublicationReservation>, ProtocolError> {
         if self.persistence_mode() == PersistenceMode::MemoryOnly {
             self.registry
                 .reserve_memory_publication(new_run_id, operation_key)
@@ -905,28 +1188,6 @@ impl RunManager {
         }
     }
 
-    fn prepare_publication(
-        &self,
-        operation_key: &CreateOperationKey,
-        run: &Arc<Run>,
-    ) -> Result<Option<ProtocolError>, ProtocolError> {
-        let Some(persistence) = &self.persistence else {
-            return Ok(None);
-        };
-        match persistence.insert_start(operation_key, &run.persistence_start_info()) {
-            Ok(committed) => {
-                run.enable_persistence(&committed.durable);
-                Ok(committed
-                    .post_commit_error
-                    .map(|error| ProtocolError::new(ErrorCode::Persistence, error.to_string())))
-            }
-            Err(error) => Err(ProtocolError::new(
-                ErrorCode::Persistence,
-                error.to_string(),
-            )),
-        }
-    }
-
     #[cfg(test)]
     fn start_with_setup<F>(
         &self,
@@ -941,7 +1202,7 @@ impl RunManager {
         let request = CreationRequest::Start { spec: spec.clone() };
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        let registry_reservation =
+        let mut registry_reservation =
             self.reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
         let pending = Run::spawn_pending_with_setup(
             NativeSpawnConfig {
@@ -960,7 +1221,7 @@ impl RunManager {
         )?;
         Ok(self
             .registry
-            .publish_creation(operation_key, pending, registry_reservation))
+            .publish_creation(operation_key, pending, registry_reservation.as_mut()))
     }
 
     #[cfg(test)]
@@ -1015,6 +1276,34 @@ struct MaterializedCreation {
     request: CreationRequest,
     spec: RunSpec,
     lineage: Option<RunLineage>,
+}
+
+impl MaterializedCreation {
+    fn persistence_start_info(&self, id: RunId) -> RunInfo {
+        RunInfo {
+            id,
+            spec: Some(self.spec.clone()),
+            lineage: self.lineage.clone(),
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: None,
+            state: RunState::Running,
+            head_seq: 0,
+            durable_head_seq: Some(0),
+            oldest_seq: 0,
+            attachments: 0,
+        }
+    }
+}
+
+impl From<PersistentCollectionCandidate> for PersistentCandidate {
+    fn from(candidate: PersistentCollectionCandidate) -> Self {
+        Self::new(
+            candidate.id,
+            candidate.operation_key,
+            candidate.metadata_bytes,
+        )
+    }
 }
 
 struct TmuxImportConfig {
@@ -1165,11 +1454,44 @@ struct Run {
     incarnation_control: Option<RunControl>,
     persistence_mode: PersistenceMode,
     persistence_transition: Mutex<()>,
-    persistence: Mutex<Option<PersistentRun>>,
+    persistence: Mutex<PersistenceBinding>,
     attachments: AtomicUsize,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
     events: broadcast::Sender<RunEvent>,
+}
+
+/// Native persistence publication stays private until both durable COMMIT and
+/// Registry publication have completed. A fast waiter deposits its terminal
+/// result here instead of making an unpublished Run externally terminal.
+enum PersistenceBinding {
+    Disabled,
+    Pending {
+        terminal: Option<RunState>,
+    },
+    CommittedPendingActivation {
+        durable: PersistentRun,
+        terminal: Option<RunState>,
+    },
+    Active(PersistentRun),
+}
+
+impl PersistenceBinding {
+    fn durable(&self) -> Option<&PersistentRun> {
+        match self {
+            Self::CommittedPendingActivation { durable, .. } | Self::Active(durable) => {
+                Some(durable)
+            }
+            Self::Disabled | Self::Pending { .. } => None,
+        }
+    }
+
+    fn active(&self) -> Option<&PersistentRun> {
+        match self {
+            Self::Active(durable) => Some(durable),
+            Self::Disabled | Self::Pending { .. } | Self::CommittedPendingActivation { .. } => None,
+        }
+    }
 }
 
 /// Private owner shape used while native setup can still fail or unwind.
@@ -1671,7 +1993,12 @@ impl Run {
             incarnation_control: Some(RunControl::Native(native_control)),
             persistence_mode: config.persistence_mode,
             persistence_transition: Mutex::new(()),
-            persistence: Mutex::new(None),
+            persistence: Mutex::new(match config.persistence_mode {
+                PersistenceMode::MemoryOnly => PersistenceBinding::Disabled,
+                PersistenceMode::PersistentCapable => {
+                    PersistenceBinding::Pending { terminal: None }
+                }
+            }),
             attachments: AtomicUsize::new(0),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
@@ -1718,7 +2045,7 @@ impl Run {
             })),
             persistence_mode: PersistenceMode::MemoryOnly,
             persistence_transition: Mutex::new(()),
-            persistence: Mutex::new(None),
+            persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
@@ -1831,6 +2158,8 @@ impl Run {
         terminal_publications: TerminalPublicationOwner,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(live_event_capacity);
+        let terminal_ordinal = OnceLock::new();
+        terminal_publications.recover(&terminal_ordinal);
         Arc::new(Self {
             id: recovered.info.id,
             spec: recovered.info.spec,
@@ -1843,10 +2172,10 @@ impl Run {
             incarnation_control: None,
             persistence_mode: PersistenceMode::PersistentCapable,
             persistence_transition: Mutex::new(()),
-            persistence: Mutex::new(Some(persistence)),
+            persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
             terminal_publications,
-            terminal_ordinal: OnceLock::new(),
+            terminal_ordinal,
             events,
         })
     }
@@ -1863,17 +2192,30 @@ impl Run {
             state: mutex_lock(&self.state).clone(),
             head_seq: output.head_seq(),
             durable_head_seq: mutex_lock(&self.persistence)
-                .as_ref()
+                .durable()
                 .map(PersistentRun::durable_head),
             oldest_seq: output.oldest_seq(),
             attachments: self.attachments.load(Ordering::Acquire),
         }
     }
 
+    #[cfg(test)]
     fn persistence_start_info(&self) -> RunInfo {
         let mut info = self.info();
         info.state = RunState::Running;
         info
+    }
+
+    #[cfg(test)]
+    fn persistence_terminal_is_pending(&self) -> bool {
+        matches!(
+            &*mutex_lock(&self.persistence),
+            PersistenceBinding::Pending { terminal: Some(_) }
+                | PersistenceBinding::CommittedPendingActivation {
+                    terminal: Some(_),
+                    ..
+                }
+        )
     }
 
     async fn input(&self, data: Vec<u8>) -> ControlResult {
@@ -1916,7 +2258,7 @@ impl Run {
                     let chunk = output.push(data);
                     let replay = output.replay(chunk.seq.saturating_sub(1));
                     let running = mutex_lock(&self.state).is_running();
-                    let persistence = mutex_lock(&self.persistence).as_ref().cloned();
+                    let persistence = mutex_lock(&self.persistence).active().cloned();
                     (chunk, replay, running, persistence)
                 };
                 if running && let Some(persistence) = persistence {
@@ -2042,25 +2384,20 @@ impl Run {
         control.wait_for_completion(timeout)
     }
 
-    fn memory_collection_ordinal(&self) -> Option<TerminalOrdinal> {
-        if self.persistence_mode != PersistenceMode::MemoryOnly
-            || mutex_lock(&self.state).is_running()
-            || self.attachments.load(Ordering::Acquire) != 0
-        {
+    fn collection_ordinal(&self) -> Option<TerminalOrdinal> {
+        if mutex_lock(&self.state).is_running() || self.attachments.load(Ordering::Acquire) != 0 {
             return None;
         }
         let ordinal = *self.terminal_ordinal.get()?;
         let backend_is_quiescent = match &self.incarnation_control {
             Some(RunControl::Native(control)) => control.closed_quiescence_result().is_ok(),
             Some(RunControl::Tmux(control)) => control.closed_quiescence_result().is_ok(),
-            None => false,
+            None => self.persistence_mode == PersistenceMode::PersistentCapable,
         };
         backend_is_quiescent.then_some(ordinal)
     }
 
-    fn detach_memory_collection_descriptors(
-        &self,
-    ) -> Result<Option<DetachedNativeDescriptors>, String> {
+    fn detach_collection_descriptors(&self) -> Result<Option<DetachedNativeDescriptors>, String> {
         match &self.incarnation_control {
             Some(RunControl::Native(control)) => control
                 .detach_closed_descriptors_after_owner_fence()
@@ -2069,35 +2406,78 @@ impl Run {
                 control.closed_quiescence_result()?;
                 Ok(None)
             }
+            None if self.persistence_mode == PersistenceMode::PersistentCapable => Ok(None),
             None => Err(format!(
-                "Run {} has no memory-only incarnation owner to collect",
+                "Run {} has no incarnation owner to collect",
                 self.id
             )),
         }
     }
 
-    fn enable_persistence(&self, persistence: &PersistentRun) {
+    fn persistent_metadata_owner(&self) -> Option<Arc<AtomicU64>> {
+        mutex_lock(&self.persistence)
+            .durable()
+            .map(PersistentRun::metadata_bytes_owner)
+    }
+
+    /// Install a durable COMMIT result without issuing persistence I/O.
+    ///
+    /// Registry exact replacement must run after this method and before
+    /// `activate_persistence_after_publication`.
+    fn install_committed_persistence(&self, persistence: PersistentRun) {
         assert_eq!(
             self.persistence_mode,
             PersistenceMode::PersistentCapable,
             "only persistence-capable Runs can bind durable state"
         );
         let _transition = mutex_lock(&self.persistence_transition);
-        let (replay, state) = {
-            let output = mutex_lock(&self.output);
-            let state = mutex_lock(&self.state).clone();
-            let persistence_guard = mutex_lock(&self.persistence);
-            debug_assert!(persistence_guard.is_none());
-            (output.replay(0), state)
+        let mut binding = mutex_lock(&self.persistence);
+        let terminal = match std::mem::replace(&mut *binding, PersistenceBinding::Disabled) {
+            PersistenceBinding::Pending { terminal } => terminal,
+            PersistenceBinding::Disabled
+            | PersistenceBinding::CommittedPendingActivation { .. }
+            | PersistenceBinding::Active(_) => {
+                panic!("persistent Run installs one committed binding")
+            }
         };
-        if state.is_running() {
-            persistence.append(self.id, replay);
+        *binding = PersistenceBinding::CommittedPendingActivation {
+            durable: persistence,
+            terminal,
+        };
+    }
+
+    /// Activate output durability only after the Run and exact key are public.
+    fn activate_persistence_after_publication(&self) {
+        let _transition = mutex_lock(&self.persistence_transition);
+        let replay = mutex_lock(&self.output).replay(0);
+        let (persistence, terminal) = {
+            let mut binding = mutex_lock(&self.persistence);
+            let (durable, terminal) =
+                match std::mem::replace(&mut *binding, PersistenceBinding::Disabled) {
+                    PersistenceBinding::CommittedPendingActivation { durable, terminal } => {
+                        (durable, terminal)
+                    }
+                    PersistenceBinding::Disabled
+                    | PersistenceBinding::Pending { .. }
+                    | PersistenceBinding::Active(_) => {
+                        panic!("committed persistence activates exactly once after publication")
+                    }
+                };
+            *binding = PersistenceBinding::Active(durable.clone());
+            (durable, terminal)
+        };
+        if let Some(terminal) = terminal {
+            persistence.finalize(
+                self.id,
+                self.pid.expect("native Run has a child PID"),
+                replay,
+                terminal.clone(),
+            );
+            self.publish_terminal_state(terminal.clone());
+            let _ = self.events.send(RunEvent::Exited { state: terminal });
         } else {
-            persistence.finalize(self.id, replay, state);
+            persistence.append(self.id, replay);
         }
-        let _output = mutex_lock(&self.output);
-        let _state = mutex_lock(&self.state);
-        *mutex_lock(&self.persistence) = Some(persistence.clone());
     }
 
     fn publish_terminal(&self, terminal: RunState) {
@@ -2107,18 +2487,32 @@ impl Run {
             return;
         }
         let _transition = mutex_lock(&self.persistence_transition);
-        let (replay, persistence) = {
-            let output = mutex_lock(&self.output);
-            let persistence = mutex_lock(&self.persistence).as_ref().cloned();
-            (output.replay(0), persistence)
+        let persistence = {
+            let mut binding = mutex_lock(&self.persistence);
+            match &mut *binding {
+                PersistenceBinding::Pending { terminal: pending }
+                | PersistenceBinding::CommittedPendingActivation {
+                    terminal: pending, ..
+                } => {
+                    debug_assert!(pending.is_none());
+                    *pending = Some(terminal);
+                    return;
+                }
+                PersistenceBinding::Active(persistence) => persistence.clone(),
+                PersistenceBinding::Disabled => {
+                    panic!("persistence-capable Run retains a persistence binding")
+                }
+            }
         };
-        if let Some(persistence) = persistence {
-            persistence.finalize(self.id, replay, terminal.clone());
-            let _output = mutex_lock(&self.output);
-            self.publish_terminal_state(terminal.clone());
-        } else {
-            self.publish_terminal_state(terminal.clone());
-        }
+        let replay = mutex_lock(&self.output).replay(0);
+        persistence.finalize(
+            self.id,
+            self.pid.expect("native Run has a child PID"),
+            replay,
+            terminal.clone(),
+        );
+        let _output = mutex_lock(&self.output);
+        self.publish_terminal_state(terminal.clone());
         let _ = self.events.send(RunEvent::Exited { state: terminal });
     }
 
@@ -2816,6 +3210,49 @@ fn invalid_run_spec(error: run_spec::RunSpecValidationError) -> ProtocolError {
     ProtocolError::new(ErrorCode::InvalidRequest, error.to_string())
 }
 
+fn persistence_protocol_error(error: &PersistenceError) -> ProtocolError {
+    ProtocolError::new(ErrorCode::Persistence, error.to_string())
+}
+
+fn cleanup_failed_persistent_creation(
+    pending: PendingPublication,
+    failure: PersistentStartFailure,
+) -> Result<RunInfo, ProtocolError> {
+    let code = if failure.is_capacity() {
+        ErrorCode::RunCapacity
+    } else {
+        ErrorCode::Persistence
+    };
+    let error = ProtocolError::new(code, failure.into_error().to_string());
+    if let Err(cleanup_error) = pending.cleanup_unpublished() {
+        return Err(ProtocolError::new(
+            error.code,
+            format!(
+                "{}; rollback pending: exact creation key remains fenced until all unpublished native owners are quiescent: {cleanup_error}",
+                error.message
+            ),
+        ));
+    }
+    Err(error)
+}
+
+fn cleanup_unknown_persistent_creation(
+    pending: PendingPublication,
+    message: String,
+) -> Result<RunInfo, ProtocolError> {
+    let error = ProtocolError::new(ErrorCode::Persistence, message);
+    if let Err(cleanup_error) = pending.cleanup_unpublished() {
+        return Err(ProtocolError::new(
+            error.code,
+            format!(
+                "{}; cleanup pending after unknown COMMIT: {cleanup_error}",
+                error.message
+            ),
+        ));
+    }
+    Err(error)
+}
+
 const fn to_pty_size(size: TerminalSize) -> PtySize {
     PtySize {
         rows: size.rows,
@@ -3091,12 +3528,13 @@ mod tests {
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
         CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog,
-        OutputReplay, PendingTmuxPublication, Persistence, PersistenceMode, RecoveredRun, Run,
-        RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
-        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
-        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
-        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
-        TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
+        OutputReplay, PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode,
+        RecoveredRun, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
+        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
+        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
+        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
+        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
         prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
@@ -3331,7 +3769,7 @@ mod tests {
             })),
             persistence_mode: PersistenceMode::MemoryOnly,
             persistence_transition: Mutex::new(()),
-            persistence: Mutex::new(None),
+            persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: std::sync::atomic::AtomicUsize::new(0),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),

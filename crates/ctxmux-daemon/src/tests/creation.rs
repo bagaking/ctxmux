@@ -1,7 +1,7 @@
 use super::*;
 use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
-use ctxmux_protocol::{ForkFidelity, RunId, RunLineage};
+use ctxmux_protocol::{ForkFidelity, RunId, RunInfo, RunLineage};
 use std::collections::HashSet;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -760,7 +760,8 @@ fn durable_terminal_handoff_finalizes_when_binding_precedes_publication() {
             &run.persistence_start_info(),
         )
         .expect("commit binding-first start");
-    run.enable_persistence(&committed.durable);
+    run.install_committed_persistence(committed.durable.clone());
+    run.activate_persistence_after_publication();
     assert!(run.info().state.is_running());
     release_tx.send(()).expect("release binding-first waiter");
     wait_for_run_terminal(&run);
@@ -805,15 +806,18 @@ fn durable_terminal_handoff_finalizes_when_publication_precedes_binding() {
         .expect("waiter reaches terminal-first barrier");
 
     release_tx.send(()).expect("release terminal-first waiter");
-    wait_for_run_terminal(&run);
-    assert_eq!(run.info().state, clean_exit());
+    wait_for_pending_persistence_terminal(&run);
+    assert!(run.info().state.is_running());
     let committed = persistence
         .insert_start(
             &CreateOperationKey::new("terminal-before-binding").unwrap(),
             &run.persistence_start_info(),
         )
         .expect("commit a creation-time Running row after fast exit");
-    run.enable_persistence(&committed.durable);
+    run.install_committed_persistence(committed.durable.clone());
+    run.activate_persistence_after_publication();
+    wait_for_run_terminal(&run);
+    assert_eq!(run.info().state, clean_exit());
     let sentinel = insert_persistence_sentinel(&persistence, &run, "terminal-first-sentinel");
     let run_id = run.id;
     wait_for_direct_run_workers(&run);
@@ -1074,7 +1078,7 @@ async fn committed_creation_survives_a_post_commit_failure_and_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn collected_creation_key_remains_incarnation_local_and_is_reusable_after_reopen() {
+async fn persistent_replacement_removes_exact_run_and_key_in_the_same_epoch() {
     let temp = tempfile::tempdir().expect("create collection fixture");
     let state_dir = temp.path().join("state");
     let marker = temp.path().join("starts.log");
@@ -1082,7 +1086,10 @@ async fn collected_creation_key_remains_incarnation_local_and_is_reusable_after_
         Persistence::open_with_test_limits(state_dir.clone(), 1, 64 * 1024 * 1024)
             .expect("open tiny persistence store");
     assert!(recovered.is_empty());
-    let manager = Arc::new(RunManager::persistent(persistence, recovered));
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::persistent(persistence, recovered)
+    });
     let operation_key = CreateOperationKey::new("collected-key").unwrap();
     let spec = marker_spec(&marker, false);
     let first = manager
@@ -1097,71 +1104,110 @@ async fn collected_creation_key_remains_incarnation_local_and_is_reusable_after_
         wait_for_marker_pids(&marker, 1).await,
         vec![first.pid.unwrap()]
     );
+    wait_for_run_workers(&manager).await;
 
+    let replacement_key = CreateOperationKey::new("retained-replacement").unwrap();
     let replacement = manager
         .create(
-            CreateOperationKey::new("retained-replacement").unwrap(),
+            replacement_key.clone(),
             CreationRequest::Start {
                 spec: short_lived_spec(),
             },
         )
         .await
-        .expect("evict terminal durable history");
+        .expect("replace exact terminal durable history");
     wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
-    let incarnation_retry = manager
-        .create(
-            operation_key.clone(),
-            CreationRequest::Start { spec: spec.clone() },
-        )
-        .await
-        .expect("current incarnation retains its in-memory key");
-    assert_eq!(incarnation_retry.id, first.id);
-    assert_eq!(
-        wait_for_marker_pids(&marker, 1).await,
-        vec![first.pid.unwrap()]
-    );
-    assert_eq!(
-        manager
-            .list()
-            .into_iter()
-            .map(|run| run.id.to_string())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([first.id.to_string(), replacement.id.to_string()])
-    );
     wait_for_run_workers(&manager).await;
-    drop(manager);
+    assert_eq!(
+        manager.info(first.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_eq!(
+        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        vec![replacement.id]
+    );
+    assert_persistent_run_key_absent(&state_dir, first.id, &operation_key);
+    assert_persistent_run_key_present(&state_dir, replacement.id, &replacement_key);
 
-    let (persistence, recovered) =
-        Persistence::open_with_test_limits(state_dir, 1, 64 * 1024 * 1024)
-            .expect("reopen tiny persistence store");
-    assert_eq!(recovered.len(), 1);
-    assert_eq!(recovered[0].info.id, replacement.id);
-    let restarted = Arc::new(RunManager::persistent(persistence, recovered));
-    assert!(restarted.get(first.id).is_err());
-    let recreated = restarted
+    let recreated = manager
         .create(
             operation_key.clone(),
             CreationRequest::Start { spec: spec.clone() },
         )
         .await
-        .expect("collected key creates one new physical Run after reopen");
+        .expect("the removed exact key elects a new same-epoch Run");
     assert_ne!(recreated.id, first.id);
-    wait_for_run_terminal_async(&restarted.get(recreated.id).unwrap()).await;
+    wait_for_run_terminal_async(&manager.get(recreated.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
     let pids = wait_for_marker_pids(&marker, 2).await;
     assert_eq!(pids, vec![first.pid.unwrap(), recreated.pid.unwrap()]);
-    let retried = restarted
-        .create(operation_key, CreationRequest::Start { spec })
+    let retried = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
         .await
-        .expect("recreated key converges without another process");
+        .expect("same-epoch retry converges without another process");
     assert_eq!(retried.id, recreated.id);
     assert_eq!(wait_for_marker_pids(&marker, 2).await, pids);
     assert_eq!(
+        manager.info(replacement.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_eq!(
+        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        vec![recreated.id]
+    );
+    assert_persistent_run_key_absent(&state_dir, replacement.id, &replacement_key);
+    assert_persistent_run_key_present(&state_dir, recreated.id, &operation_key);
+    drop(manager);
+    assert_persistent_replacement_restart(
+        &state_dir,
+        [first.id, replacement.id],
+        recreated.id,
+        &operation_key,
+        &spec,
+        &marker,
+        &pids,
+    )
+    .await;
+}
+
+async fn assert_persistent_replacement_restart(
+    state_dir: &std::path::Path,
+    removed: [RunId; 2],
+    retained: RunId,
+    operation_key: &CreateOperationKey,
+    spec: &RunSpec,
+    marker: &std::path::Path,
+    pids: &[u32],
+) {
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(state_dir.to_path_buf(), 1, 64 * 1024 * 1024)
+            .expect("reopen tiny persistence store");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].info.id, retained);
+    assert_eq!(&recovered[0].operation_key, operation_key);
+    let restarted = Arc::new(RunManager::persistent(persistence, recovered));
+    for id in removed {
+        assert!(restarted.get(id).is_err());
+    }
+    let recovered_retry = restarted
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
+        .await
+        .expect("restart retry resolves the exact recovered Run/key");
+    assert_eq!(recovered_retry.id, retained);
+    assert_eq!(wait_for_marker_pids(marker, 2).await, pids);
+    assert_eq!(
         restarted
             .list()
-            .into_iter()
-            .map(|run| run.id.to_string())
-            .collect::<BTreeSet<_>>(),
-        BTreeSet::from([replacement.id.to_string(), recreated.id.to_string()])
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
+        vec![retained]
     );
 }
 
@@ -1187,6 +1233,17 @@ fn wait_for_run_terminal(run: &Arc<Run>) {
     }
 }
 
+fn wait_for_pending_persistence_terminal(run: &Arc<Run>) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !run.persistence_terminal_is_pending() {
+        assert!(
+            Instant::now() < deadline,
+            "Run did not retain its unpublished terminal result"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn insert_persistence_sentinel(
     persistence: &Persistence,
     source: &Run,
@@ -1201,6 +1258,7 @@ fn insert_persistence_sentinel(
     assert!(committed.post_commit_error.is_none());
     committed.durable.finalize(
         info.id,
+        info.pid.expect("native sentinel retains a historical PID"),
         OutputReplay {
             chunks: Vec::new(),
             oldest_seq: 0,
@@ -1440,7 +1498,7 @@ fn creation_hook(
         reached: reached_tx,
         released: Mutex::new(false),
         release: std::sync::Condvar::new(),
-        captured_run: Mutex::new(None),
+        captured_runs: Mutex::new(Vec::new()),
     });
     (hook, reached_rx)
 }
@@ -1711,7 +1769,7 @@ async fn creation_owner_panic_after_spawn_transfers_cleanup_and_preserves_key_sa
         .expect_err("conflicting retry observes the same exact-key fence");
     assert_eq!(conflict.code, ErrorCode::CreationConflict);
     assert_eq!(read_marker_pids(&marker), vec![rejected_pid]);
-    hook.release_captured_run();
+    hook.release_captured_runs();
     wait_for_rejected_children_reaped(&manager, &marker).await;
     assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
     assert!(process_exists(unrelated.pid()));
@@ -1746,111 +1804,244 @@ async fn creation_owner_panic_after_spawn_transfers_cleanup_and_preserves_key_sa
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn rejected_persistent_start_fences_exact_key_until_waiter_reaps() {
-    let temp = tempfile::tempdir().expect("create rollback fixture");
-    let marker = temp.path().join("rejected-starts.log");
+async fn persistent_commit_unwind_never_restores_the_registry_reservation() {
+    for (index, point) in [
+        CreationHookPoint::PanicAfterPersistentCommit,
+        CreationHookPoint::PanicBeforePersistentRegistryConsume,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = trigger_persistent_commit_unwind(index, point).await;
+        assert_persistent_commit_unwind_converges(index, fixture).await;
+    }
+}
+
+struct PersistentCommitUnwindFixture {
+    _temp: tempfile::TempDir,
+    state_dir: std::path::PathBuf,
+    marker: std::path::PathBuf,
+    persistence: Persistence,
+    hook: Arc<CreationTestHook>,
+    manager: Arc<RunManager>,
+    old: RunInfo,
+    old_key: CreateOperationKey,
+    old_spec: RunSpec,
+    operation_key: CreateOperationKey,
+    spec: RunSpec,
+    committed_pid: u32,
+}
+
+async fn trigger_persistent_commit_unwind(
+    index: usize,
+    point: CreationHookPoint,
+) -> PersistentCommitUnwindFixture {
+    let temp = tempfile::tempdir().expect("create committed unwind fixture");
+    let state_dir = temp.path().join(format!("state-{index}"));
+    let marker = temp.path().join(format!("committed-unwind-{index}.log"));
     let (persistence, recovered) =
-        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
-            .expect("open metadata-bounded persistence");
+        Persistence::open_with_test_limits(state_dir.clone(), 1, 64 * 1024 * 1024)
+            .expect("open committed unwind persistence");
     assert!(recovered.is_empty());
-    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+    let (hook, mut reached) = creation_hook(point, false);
     let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::persistent(persistence.clone(), recovered)
     });
-    let sentinel = UnrelatedProcess::spawn();
-    let operation_key = CreateOperationKey::new("rejected-start-owner").unwrap();
-    let spec = oversized_hup_ignoring_marker_spec(&marker);
-
-    let first_manager = Arc::clone(&manager);
-    let first_key = operation_key.clone();
-    let first_spec = spec.clone();
-    let first = tokio::spawn(async move {
-        first_manager
-            .create(first_key, CreationRequest::Start { spec: first_spec })
+    let old_key = CreateOperationKey::new(format!("old-before-unwind-{index}")).unwrap();
+    let old_spec = short_lived_spec();
+    let old = manager
+        .create(
+            old_key.clone(),
+            CreationRequest::Start {
+                spec: old_spec.clone(),
+            },
+        )
+        .await
+        .expect("create one exact terminal replacement candidate");
+    wait_for_run_terminal_async(&manager.get(old.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+    hook.arm();
+    let operation_key = CreateOperationKey::new(format!("committed-unwind-{index}")).unwrap();
+    let spec = marker_spec(&marker, true);
+    let request_manager = Arc::clone(&manager);
+    let request_key = operation_key.clone();
+    let request_spec = spec.clone();
+    let request = tokio::spawn(async move {
+        request_manager
+            .create(request_key, CreationRequest::Start { spec: request_spec })
             .await
     });
     wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    let committed_pid = read_marker_pids(&marker)[0];
     hook.release();
-    let error = first
+    let error = request
         .await
-        .expect("creation owner task remains live")
-        .expect_err("oversized metadata rejects before COMMIT");
-    assert_pending_rollback(&error);
-    assert!(manager.list().is_empty());
-    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
-    assert_eq!(manager.unpublished_cleanups.owned_count(), 1);
+        .expect("request task observes committed owner unwind")
+        .expect_err("committed owner unwind cannot report publication success");
+    assert_eq!(error.code, ErrorCode::Internal);
+    PersistentCommitUnwindFixture {
+        _temp: temp,
+        state_dir,
+        marker,
+        persistence,
+        hook,
+        manager,
+        old,
+        old_key,
+        old_spec,
+        operation_key,
+        spec,
+        committed_pid,
+    }
+}
 
+async fn assert_persistent_commit_unwind_converges(
+    index: usize,
+    fixture: PersistentCommitUnwindFixture,
+) {
+    let PersistentCommitUnwindFixture {
+        _temp,
+        state_dir,
+        marker,
+        persistence,
+        hook,
+        manager,
+        old,
+        old_key,
+        old_spec,
+        operation_key,
+        spec,
+        committed_pid,
+    } = fixture;
+    assert_eq!(
+        manager
+            .list()
+            .iter()
+            .map(|info| info.id)
+            .collect::<Vec<_>>(),
+        vec![old.id]
+    );
+    assert_eq!(mutex_lock(&manager.commit_unknown_reservations).len(), 1);
+    assert!(mutex_lock(&manager.incarnation_failure.message).is_some());
+    let old_retry = manager
+        .create(old_key.clone(), CreationRequest::Start { spec: old_spec })
+        .await
+        .expect_err("durably removed old key remains fenced in this incarnation");
+    assert_eq!(old_retry.code, ErrorCode::BackendUnavailable);
     let retry = manager
         .create(
             operation_key.clone(),
             CreationRequest::Start { spec: spec.clone() },
         )
         .await
-        .expect_err("same request remains fenced while cleanup is pending");
+        .expect_err("known COMMIT unwind retains the exact new-key fence");
     assert_eq!(retry.code, ErrorCode::BackendUnavailable);
-    let mut conflicting = spec.clone();
-    conflicting.args.push("different".to_owned());
-    let conflict = manager
-        .create(
-            operation_key.clone(),
-            CreationRequest::Start { spec: conflicting },
-        )
-        .await
-        .expect_err("different request conflicts with the cleanup fence");
-    assert_eq!(conflict.code, ErrorCode::CreationConflict);
-    assert_eq!(read_marker_pids(&marker).len(), 1);
-    assert!(process_exists(sentinel.pid()));
-
     let unrelated = manager
         .create(
-            CreateOperationKey::new("rollback-unrelated-progress").unwrap(),
+            CreateOperationKey::new(format!("unrelated-after-commit-{index}")).unwrap(),
             CreationRequest::Start {
                 spec: short_lived_spec(),
             },
         )
         .await
-        .expect("an unrelated key keeps launch progress");
-    wait_for_run_terminal_async(&manager.get(unrelated.id).unwrap()).await;
-    assert!(!persistence.is_failed());
-    assert!(process_exists(sentinel.pid()));
+        .expect_err("known COMMIT unwind fences new creation admission");
+    assert_eq!(unrelated.code, ErrorCode::BackendUnavailable);
+    assert_eq!(read_marker_pids(&marker), vec![committed_pid]);
+    assert_persistent_run_key_absent(&state_dir, old.id, &old_key);
+    assert_eq!(persistent_key_count(&state_dir, &operation_key), 1);
+    hook.release_captured_runs();
     wait_for_rejected_children_reaped(&manager, &marker).await;
-    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+    assert!(!process_exists(committed_pid));
+    drop(manager);
+    persistence.assert_exclusive_owner();
+    drop(persistence);
 
-    hook.arm();
-    let barrier = Arc::new(Barrier::new(33));
-    let mut attempts = Vec::new();
-    for _ in 0..32 {
-        let manager = Arc::clone(&manager);
-        let key = operation_key.clone();
-        let request = CreationRequest::Start { spec: spec.clone() };
-        let barrier = Arc::clone(&barrier);
-        attempts.push(tokio::spawn(async move {
-            barrier.wait().await;
-            manager.create(key, request).await
-        }));
-    }
-    barrier.wait().await;
-    wait_for_spawned_marker(&mut reached, &marker, 2).await;
-    hook.release();
-    let mut persistence_errors = 0;
-    for attempt in attempts {
-        let error = attempt
-            .await
-            .expect("retry task remains live")
-            .expect_err("oversized retry cannot publish");
-        match error.code {
-            ErrorCode::Persistence => persistence_errors += 1,
-            ErrorCode::BackendUnavailable => {}
-            code => panic!("unexpected same-key retry error: {code:?}"),
+    let (persistence, recovered) =
+        Persistence::open(&state_dir).expect("restart resolves committed unwind from SQLite");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].operation_key, operation_key);
+    assert_ne!(recovered[0].info.id, old.id);
+    assert_eq!(
+        recovered[0].info.state,
+        RunState::Interrupted {
+            reason: InterruptionReason::DaemonRestart
         }
-    }
-    assert_eq!(persistence_errors, 1, "exactly one retry became leader");
-    assert_eq!(read_marker_pids(&marker).len(), 2);
-    assert_eq!(manager.list().len(), 1, "rejected Runs stay unpublished");
+    );
+    let recovered_id = recovered[0].info.id;
+    let restarted = Arc::new(RunManager::persistent(persistence, recovered));
+    let converged = restarted
+        .create(operation_key, CreationRequest::Start { spec })
+        .await
+        .expect("restart retry resolves the one durably committed Run");
+    assert_eq!(converged.id, recovered_id);
+    assert_eq!(read_marker_pids(&marker), vec![committed_pid]);
+}
+
+fn persistent_key_count(state_dir: &std::path::Path, key: &CreateOperationKey) -> i64 {
+    let connection = rusqlite::Connection::open(state_dir.join("state.sqlite3"))
+        .expect("inspect committed replacement row");
+    connection
+        .query_row(
+            "SELECT count(*) FROM runs WHERE creation_key = ?1 COLLATE BINARY",
+            [key.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count the committed replacement key")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_capacity_rejects_before_spawn_without_consuming_key() {
+    let temp = tempfile::tempdir().expect("create capacity fixture");
+    let marker = temp.path().join("capacity-starts.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
+            .expect("open metadata-bounded persistence");
+    assert!(recovered.is_empty());
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let sentinel = UnrelatedProcess::spawn();
+    let operation_key = CreateOperationKey::new("capacity-rejected-owner").unwrap();
+    let error = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start {
+                spec: oversized_hup_ignoring_marker_spec(&marker),
+            },
+        )
+        .await
+        .expect_err("oversized metadata rejects before physical spawn");
+    assert_eq!(error.code, ErrorCode::RunCapacity);
+    assert!(error.message.contains("metadata"));
+    assert!(read_marker_pids(&marker).is_empty());
+    assert!(manager.list().is_empty());
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 0);
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
     assert!(!persistence.is_failed());
     assert!(process_exists(sentinel.pid()));
-    wait_for_rejected_children_reaped(&manager, &marker).await;
+
+    let smaller_spec = marker_spec(&marker, false);
+    let admitted = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start {
+                spec: smaller_spec.clone(),
+            },
+        )
+        .await
+        .expect("a pre-spawn rejection leaves its exact key reusable");
+    wait_for_run_terminal_async(&manager.get(admitted.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+    let pids = wait_for_marker_pids(&marker, 1).await;
+    assert_eq!(pids, vec![admitted.pid.expect("admitted Run has a PID")]);
+    let retried = manager
+        .create(operation_key, CreationRequest::Start { spec: smaller_spec })
+        .await
+        .expect("matching retry converges on the one admitted physical Run");
+    assert_eq!(retried.id, admitted.id);
+    assert_eq!(wait_for_marker_pids(&marker, 1).await, pids);
+    assert!(!persistence.is_failed());
+    assert!(process_exists(sentinel.pid()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1858,9 +2049,9 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
     let temp = tempfile::tempdir().expect("create rejected fork fixture");
     let marker = temp.path().join("rejected-forks.log");
     let (persistence, recovered) =
-        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
-            .expect("open metadata-bounded persistence");
-    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 64 * 1024 * 1024)
+            .expect("open rollback fixture persistence");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawnWithRunHold, false);
     let manager = Arc::new(RunManager {
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::persistent(persistence.clone(), recovered)
@@ -1876,7 +2067,8 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
         .expect("publish a small live parent");
     let sentinel = UnrelatedProcess::spawn();
     let operation_key = CreateOperationKey::new("rejected-fork-owner").unwrap();
-    let spec = oversized_hup_ignoring_marker_spec(&marker);
+    let spec = hup_ignoring_marker_spec(&marker);
+    persistence.fail_next_start_before_commit();
     hook.arm();
     let fork_manager = Arc::clone(&manager);
     let fork_key = operation_key.clone();
@@ -1897,7 +2089,7 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
     let error = fork
         .await
         .expect("fork owner task remains live")
-        .expect_err("oversized fork metadata rejects before COMMIT");
+        .expect_err("injected pre-COMMIT failure rejects the unpublished fork");
     assert_pending_rollback(&error);
     assert_eq!(
         manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
@@ -1908,6 +2100,7 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
     assert!(process_exists(parent.pid.unwrap()));
     assert!(process_exists(sentinel.pid()));
     assert!(!persistence.is_failed());
+    hook.release_captured_runs();
     wait_for_rejected_children_reaped(&manager, &marker).await;
     manager
         .get(parent.id)
@@ -1923,9 +2116,10 @@ async fn shutdown_reports_an_exact_unresolved_cleanup_fence() {
     let temp = tempfile::tempdir().expect("create cleanup shutdown fixture");
     let marker = temp.path().join("shutdown-cleanup.log");
     let (persistence, recovered) =
-        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
-            .expect("open metadata-bounded persistence");
-    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 64 * 1024 * 1024)
+            .expect("open rollback fixture persistence");
+    persistence.fail_next_start_before_commit();
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawnWithRunHold, true);
     let manager = Arc::new(RunManager {
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::persistent(persistence, recovered)
@@ -1939,17 +2133,18 @@ async fn shutdown_reports_an_exact_unresolved_cleanup_fence() {
             .create(
                 request_key,
                 CreationRequest::Start {
-                    spec: oversized_hup_ignoring_marker_spec(&request_marker),
+                    spec: hup_ignoring_marker_spec(&request_marker),
                 },
             )
             .await
     });
     wait_for_spawned_marker(&mut reached, &marker, 1).await;
     hook.release();
-    request
+    let error = request
         .await
         .expect("creation task remains live")
-        .expect_err("oversized start rejects");
+        .expect_err("injected pre-COMMIT failure rejects the unpublished start");
+    assert_pending_rollback(&error);
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
     let error = manager
         .shutdown_owned_controls(Duration::ZERO)
@@ -1960,7 +2155,12 @@ async fn shutdown_reports_an_exact_unresolved_cleanup_fence() {
     assert!(!failures.contains(operation_key.as_str()));
     assert!(failures.contains("unpublished Run"));
     assert!(failures.contains("exact-key fence"));
-    assert!(failures.contains("child waiter has not yet proven reap"));
+    assert!(
+        failures.contains("child waiter has not yet proven reap")
+            || failures.contains("reader, waiter, or external owners"),
+        "shutdown reports the exact unresolved cleanup owner: {failures}"
+    );
+    hook.release_captured_runs();
     wait_for_rejected_children_reaped(&manager, &marker).await;
 }
 
@@ -1969,9 +2169,9 @@ async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
     let temp = tempfile::tempdir().expect("create cross-key cleanup fixture");
     let marker = temp.path().join("cross-key-cleanups.log");
     let (persistence, recovered) =
-        Persistence::open_with_test_limits(temp.path().join("state"), 16, 4 * 1024)
-            .expect("open metadata-bounded persistence");
-    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawn, true);
+        Persistence::open_with_test_limits(temp.path().join("state"), 16, 64 * 1024 * 1024)
+            .expect("open rollback fixture persistence");
+    let (hook, mut reached) = creation_hook(CreationHookPoint::AfterSpawnWithRunHold, true);
     let manager = Arc::new(RunManager {
         creation_hook: Some(Arc::clone(&hook)),
         ..RunManager::persistent(persistence.clone(), recovered)
@@ -1981,6 +2181,7 @@ async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
         if index != 0 {
             hook.arm();
         }
+        persistence.fail_next_start_before_commit();
         let request_manager = Arc::clone(&manager);
         let request_marker = marker.clone();
         let request = tokio::spawn(async move {
@@ -1988,7 +2189,7 @@ async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
                 .create(
                     CreateOperationKey::new(format!("stale-cleanup-{index}")).unwrap(),
                     CreationRequest::Start {
-                        spec: oversized_hup_ignoring_marker_spec(&request_marker),
+                        spec: hup_ignoring_marker_spec(&request_marker),
                     },
                 )
                 .await
@@ -1998,11 +2199,15 @@ async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
         let error = request
             .await
             .expect("creation task remains live")
-            .expect_err("oversized start rejects before COMMIT");
+            .expect_err("injected pre-COMMIT failure rejects the unpublished start");
         assert_pending_rollback(&error);
     }
     assert_eq!(read_marker_pids(&marker).len(), 8);
-    wait_for_marker_pids_gone(&marker).await;
+    assert_eq!(manager.unpublished_cleanups.unresolved_count(), 8);
+    assert_eq!(manager.unpublished_cleanups.owned_count(), 8);
+    wait_for_captured_runs_backend_quiescent(&hook).await;
+    assert_marker_pids_gone(&marker);
+    hook.release_captured_runs();
 
     let ninth = manager
         .create(
@@ -2017,6 +2222,16 @@ async fn new_key_admission_prunes_reaped_fences_across_all_old_keys() {
     assert!(!persistence.is_failed());
     wait_for_rejected_children_reaped(&manager, &marker).await;
     assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+}
+
+async fn wait_for_captured_runs_backend_quiescent(hook: &CreationTestHook) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !hook.captured_runs_are_backend_quiescent() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("captured unpublished Runs reach Backend-local quiescence");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2096,7 +2311,7 @@ fn marker_spec(marker: &std::path::Path, keep_running: bool) -> RunSpec {
     }
 }
 
-fn oversized_hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
+fn hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
     RunSpec {
         program: "/bin/sh".to_owned(),
         args: vec![
@@ -2105,16 +2320,61 @@ fn oversized_hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
                 .to_owned(),
         ],
         cwd: None,
-        env: BTreeMap::from([
-            (
-                "CTXMUX_CREATION_MARKER".to_owned(),
-                marker.to_string_lossy().into_owned(),
-            ),
-            ("CTXMUX_OVERSIZED_METADATA".to_owned(), "x".repeat(8 * 1024)),
-        ]),
+        env: BTreeMap::from([(
+            "CTXMUX_CREATION_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]),
         size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
+}
+
+fn oversized_hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
+    let mut spec = hup_ignoring_marker_spec(marker);
+    spec.env
+        .insert("CTXMUX_OVERSIZED_METADATA".to_owned(), "x".repeat(8 * 1024));
+    spec
+}
+
+fn assert_persistent_run_key_absent(
+    state_dir: &std::path::Path,
+    id: RunId,
+    operation_key: &CreateOperationKey,
+) {
+    let connection = rusqlite::Connection::open(state_dir.join("state.sqlite3"))
+        .expect("open persistent exact-replacement fixture");
+    let id_rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM runs WHERE id = ?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .expect("count persistent Run identity");
+    let key_rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM runs WHERE creation_key = ?1 COLLATE BINARY",
+            [operation_key.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count persistent creation key");
+    assert_eq!((id_rows, key_rows), (0, 0));
+}
+
+fn assert_persistent_run_key_present(
+    state_dir: &std::path::Path,
+    id: RunId,
+    operation_key: &CreateOperationKey,
+) {
+    let connection = rusqlite::Connection::open(state_dir.join("state.sqlite3"))
+        .expect("open persistent exact-replacement fixture");
+    let exact_rows: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM runs WHERE id = ?1 AND creation_key = ?2 COLLATE BINARY",
+            rusqlite::params![id.to_string(), operation_key.as_str()],
+            |row| row.get(0),
+        )
+        .expect("count exact persistent Run/key unit");
+    assert_eq!(exact_rows, 1);
 }
 
 fn assert_pending_rollback(error: &ProtocolError) {
@@ -2150,17 +2410,6 @@ fn assert_marker_pids_gone(marker: &std::path::Path) {
             "rejected unpublished child PID {pid} remains live after waiter reap"
         );
     }
-}
-
-async fn wait_for_marker_pids_gone(marker: &std::path::Path) {
-    let pids = read_marker_pids(marker);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while pids.iter().copied().any(process_exists) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("rejected unpublished child PIDs stop without pruning cleanup state");
 }
 
 async fn wait_for_unpublished_cleanups(manager: &RunManager, expected: usize) {

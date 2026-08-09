@@ -163,7 +163,10 @@ mod tests {
 
         connection.execute_batch("COMMIT;").unwrap();
         let actual = fs::metadata(&wal).unwrap().len();
-        assert_eq!((actual - WAL_HEADER_BYTES) % FRAME_BYTES, 0);
+        let frames = actual
+            .checked_sub(WAL_HEADER_BYTES)
+            .expect("committed WAL contains its 32-byte header");
+        assert_eq!(frames % FRAME_BYTES, 0);
         assert!(actual <= bound, "actual WAL {actual} exceeds bound {bound}");
     }
 }

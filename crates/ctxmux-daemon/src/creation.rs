@@ -1,7 +1,10 @@
 use std::{
     collections::{HashMap, hash_map::Entry, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
-    sync::{Arc, Condvar, Mutex, OnceLock, RwLock},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -36,6 +39,20 @@ pub(crate) struct TerminalPublicationOwner {
 }
 
 impl TerminalPublicationOwner {
+    /// Restore one canonical historical terminal order before live publication.
+    pub(crate) fn recover(&self, ordinal: &OnceLock<TerminalOrdinal>) {
+        let mut next = self
+            .next
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *next = next
+            .checked_add(1)
+            .expect("terminal ordinal does not overflow");
+        ordinal
+            .set(TerminalOrdinal(*next))
+            .expect("one recovered Run receives one terminal ordinal");
+    }
+
     pub(crate) fn publish(
         &self,
         ordinal: &OnceLock<TerminalOrdinal>,
@@ -907,6 +924,7 @@ impl Default for RegistryState {
 struct RegistryEntry {
     run: Arc<Run>,
     operation_key: Option<CreateOperationKey>,
+    metadata_bytes: Option<Arc<AtomicU64>>,
     residency: RegistryResidency,
 }
 
@@ -922,7 +940,9 @@ struct PublicationTicket(u64);
 struct RegistryReservation {
     new_run_id: RunId,
     operation_key: Option<CreateOperationKey>,
-    candidate: Option<RunId>,
+    request: Option<CreationRequest>,
+    new_metadata_bytes: Option<u64>,
+    candidates: Vec<RunId>,
 }
 
 fn compare_memory_collection_candidates(
@@ -932,15 +952,157 @@ fn compare_memory_collection_candidates(
     left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
 }
 
+fn select_publication_candidates(
+    state: &RegistryState,
+    new_metadata_bytes: Option<u64>,
+) -> Result<Vec<RunId>, ProtocolError> {
+    let projected_record_burden = state
+        .reservations
+        .values()
+        .map(|reservation| usize::from(reservation.candidates.is_empty()))
+        .sum::<usize>();
+    let projected_records = state
+        .runs
+        .len()
+        .checked_add(projected_record_burden)
+        .expect("projected Registry count does not overflow");
+    let projected_metadata = new_metadata_bytes.map(|_| projected_metadata_bytes(state));
+    let metadata_to_fund =
+        new_metadata_bytes
+            .zip(projected_metadata)
+            .map_or(0, |(new_bytes, projected)| {
+                projected
+                    .saturating_add(new_bytes)
+                    .saturating_sub(super::persistence::METADATA_BYTES)
+            });
+    let needs_record = projected_records >= state.record_capacity;
+    let mut ordered = state
+        .runs
+        .iter()
+        .filter_map(|(id, entry)| {
+            if entry.residency != RegistryResidency::Retained
+                || Arc::strong_count(&entry.run) != 1
+                || (new_metadata_bytes.is_some() && entry.metadata_bytes.is_none())
+            {
+                return None;
+            }
+            entry
+                .run
+                .collection_ordinal()
+                .map(|ordinal| (ordinal, id.to_string(), *id))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by(compare_memory_collection_candidates);
+
+    let mut candidates = Vec::new();
+    let mut candidate_metadata = 0_u64;
+    for (_, _, id) in ordered {
+        if (!needs_record || !candidates.is_empty()) && candidate_metadata >= metadata_to_fund {
+            break;
+        }
+        candidate_metadata = candidate_metadata.saturating_add(
+            state
+                .runs
+                .get(&id)
+                .and_then(|entry| entry.metadata_bytes.as_ref())
+                .map_or(0, |bytes| bytes.load(Ordering::Acquire)),
+        );
+        candidates.push(id);
+    }
+    if (needs_record && candidates.is_empty()) || candidate_metadata < metadata_to_fund {
+        return Err(ProtocolError::new(
+            ErrorCode::RunCapacity,
+            format!(
+                "retained Run capacity {} has no eligible exact replacement",
+                state.record_capacity
+            ),
+        ));
+    }
+    if candidates.len() > 1
+        && state
+            .reservations
+            .values()
+            .any(|reservation| reservation.candidates.len() > 1)
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            "persistent metadata replacement is already reserved",
+        ));
+    }
+    Ok(candidates)
+}
+
+fn projected_metadata_bytes(state: &RegistryState) -> u64 {
+    let retained = state
+        .runs
+        .values()
+        .filter_map(|entry| entry.metadata_bytes.as_ref())
+        .map(|bytes| bytes.load(Ordering::Acquire))
+        .sum::<u64>();
+    let reserved = state
+        .reservations
+        .values()
+        .filter_map(|reservation| {
+            reservation.new_metadata_bytes.map(|new_bytes| {
+                let candidates = reservation
+                    .candidates
+                    .iter()
+                    .filter_map(|id| state.runs.get(id))
+                    .filter_map(|entry| entry.metadata_bytes.as_ref())
+                    .map(|bytes| bytes.load(Ordering::Acquire))
+                    .sum::<u64>();
+                new_bytes.saturating_sub(candidates)
+            })
+        })
+        .sum::<u64>();
+    retained.saturating_add(reserved)
+}
+
+fn reserve_registry_insertion_capacity(state: &mut RegistryState) -> Result<(), ProtocolError> {
+    let pending_capacity = state.reservations.len().saturating_add(1);
+    state.runs.try_reserve(pending_capacity).map_err(|error| {
+        ProtocolError::new(
+            ErrorCode::Internal,
+            format!("failed to reserve Registry publication memory: {error}"),
+        )
+    })?;
+    state
+        .creation_runs
+        .try_reserve(pending_capacity)
+        .map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to reserve creation-key publication memory: {error}"),
+            )
+        })
+}
+
 /// RAII ownership for one projected memory-only Registry publication.
 ///
 /// Dropping an unconsumed reservation restores its exact collection fence.
 /// Publication consumes the ticket in the same Registry write that removes
 /// the candidate and inserts the new Run.
 #[must_use = "a Registry publication reservation must be published or restored"]
-pub(crate) struct MemoryPublicationReservation {
+pub(crate) struct PublicationReservation {
     state: Arc<RwLock<RegistryState>>,
     ticket: Option<PublicationTicket>,
+    removed: Vec<RegistryEntry>,
+}
+
+/// Incarnation-local owner for a durable outcome `SQLite` could not classify.
+/// Dropping this owner never restores candidates; daemon restart discards the
+/// entire Registry and lets `SQLite` recovery decide the exact old-or-new unit.
+pub(crate) struct CommitUnknownReservation {
+    _state: Arc<RwLock<RegistryState>>,
+    _ticket: PublicationTicket,
+}
+
+/// Byte-exact durable identity passed from the Registry fence to `SQLite`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistentCollectionCandidate {
+    pub(crate) id: RunId,
+    pub(crate) operation_key: CreateOperationKey,
+    pub(crate) metadata_bytes: u64,
 }
 
 /// Single owner of retained Runs and their bounded creation-key mappings.
@@ -961,17 +1123,18 @@ impl Default for RunRegistry {
 }
 
 impl RunRegistry {
-    pub(crate) fn recovered(runs: Vec<(CreateOperationKey, Arc<Run>)>) -> Self {
+    pub(crate) fn recovered(runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>) -> Self {
         let registry = Self::default();
         {
             let mut state = write_lock(&registry.state);
-            for (operation_key, run) in runs {
+            for (operation_key, run, metadata_bytes) in runs {
                 let id = run.id;
                 let previous_run = state.runs.insert(
                     id,
                     RegistryEntry {
                         run,
                         operation_key: Some(operation_key.clone()),
+                        metadata_bytes: Some(metadata_bytes),
                         residency: RegistryResidency::Retained,
                     },
                 );
@@ -1017,6 +1180,29 @@ impl RunRegistry {
         request: &CreationRequest,
     ) -> Result<Option<RunInfo>, ProtocolError> {
         let state = read_lock(&self.state);
+        if let Some(reservation) = state
+            .reservations
+            .values()
+            .find(|reservation| reservation.operation_key.as_ref() == Some(operation_key))
+        {
+            return Err(
+                if reservation
+                    .request
+                    .as_ref()
+                    .is_none_or(|owned| owned == request)
+                {
+                    ProtocolError::new(
+                        ErrorCode::BackendUnavailable,
+                        "Run creation is temporarily fenced by an unpublished Registry reservation",
+                    )
+                } else {
+                    ProtocolError::new(
+                        ErrorCode::CreationConflict,
+                        "Run creation operation key is reserved for a different request",
+                    )
+                },
+            );
+        }
         let Some(id) = state.creation_runs.get(operation_key) else {
             return Ok(None);
         };
@@ -1057,7 +1243,33 @@ impl RunRegistry {
         &self,
         new_run_id: RunId,
         operation_key: Option<CreateOperationKey>,
-    ) -> Result<MemoryPublicationReservation, ProtocolError> {
+    ) -> Result<PublicationReservation, ProtocolError> {
+        self.reserve_publication(new_run_id, operation_key, None, None)
+    }
+
+    /// Reserve persistent record and metadata capacity before `SQLite` or spawn.
+    pub(crate) fn reserve_persistent_publication(
+        &self,
+        new_run_id: RunId,
+        operation_key: CreateOperationKey,
+        request: CreationRequest,
+        new_metadata_bytes: u64,
+    ) -> Result<PublicationReservation, ProtocolError> {
+        self.reserve_publication(
+            new_run_id,
+            Some(operation_key),
+            Some(request),
+            Some(new_metadata_bytes),
+        )
+    }
+
+    fn reserve_publication(
+        &self,
+        new_run_id: RunId,
+        operation_key: Option<CreateOperationKey>,
+        request: Option<CreationRequest>,
+        new_metadata_bytes: Option<u64>,
+    ) -> Result<PublicationReservation, ProtocolError> {
         let mut state = write_lock(&self.state);
         debug_assert!(!state.runs.contains_key(&new_run_id));
         debug_assert!(
@@ -1066,57 +1278,27 @@ impl RunRegistry {
                 .is_none_or(|key| !state.creation_runs.contains_key(key))
         );
 
-        let projected_burden = state
-            .reservations
-            .values()
-            .filter(|reservation| reservation.candidate.is_none())
-            .count();
-        let projected_records = state
-            .runs
-            .len()
-            .checked_add(projected_burden)
-            .expect("projected Registry count does not overflow");
-        let candidate = if projected_records < state.record_capacity {
-            None
-        } else {
-            Some(
-                state
-                    .runs
-                    .iter()
-                    .filter_map(|(id, entry)| {
-                        if entry.residency != RegistryResidency::Retained
-                            || Arc::strong_count(&entry.run) != 1
-                        {
-                            return None;
-                        }
-                        entry
-                            .run
-                            .memory_collection_ordinal()
-                            .map(|ordinal| (ordinal, id.to_string(), *id))
-                    })
-                    .min_by(compare_memory_collection_candidates)
-                    .map(|(_, _, id)| id)
-                    .ok_or_else(|| {
-                        ProtocolError::new(
-                            ErrorCode::RunCapacity,
-                            format!(
-                                "retained Run capacity {} has no eligible terminal replacement",
-                                state.record_capacity
-                            ),
-                        )
-                    })?,
-            )
-        };
+        let candidates = select_publication_candidates(&state, new_metadata_bytes)?;
+        reserve_registry_insertion_capacity(&mut state)?;
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(candidates.len())
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to reserve Registry replacement memory: {error}"),
+                )
+            })?;
 
         state.next_ticket = state
             .next_ticket
             .checked_add(1)
             .expect("Registry publication ticket does not overflow");
         let ticket = PublicationTicket(state.next_ticket);
-        if let Some(candidate) = candidate {
+        for candidate in &candidates {
             let entry = state
                 .runs
-                .get_mut(&candidate)
+                .get_mut(candidate)
                 .expect("selected collection candidate remains retained");
             debug_assert_eq!(entry.residency, RegistryResidency::Retained);
             entry.residency = RegistryResidency::Collecting(ticket);
@@ -1126,29 +1308,32 @@ impl RunRegistry {
             RegistryReservation {
                 new_run_id,
                 operation_key,
-                candidate,
+                request,
+                new_metadata_bytes,
+                candidates: candidates.clone(),
             },
         );
         debug_assert!(previous.is_none());
 
-        let detached = candidate
-            .and_then(|candidate| state.runs.get(&candidate))
-            .map(|entry| entry.run.detach_memory_collection_descriptors())
-            .transpose()
+        let detached = candidates
+            .iter()
+            .filter_map(|candidate| state.runs.get(candidate))
+            .map(|entry| entry.run.detach_collection_descriptors())
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 restore_reservation(&mut state, ticket);
                 ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to fence retained Run replacement: {error}"),
                 )
-            })?
-            .flatten();
+            })?;
         drop(state);
         drop(detached);
 
-        Ok(MemoryPublicationReservation {
+        Ok(PublicationReservation {
             state: Arc::clone(&self.state),
             ticket: Some(ticket),
+            removed,
         })
     }
 
@@ -1157,25 +1342,28 @@ impl RunRegistry {
         &self,
         operation_key: CreateOperationKey,
         pending: PendingPublication,
-        reservation: Option<MemoryPublicationReservation>,
+        reservation: Option<&mut PublicationReservation>,
     ) -> RunInfo {
         let run = Arc::clone(pending.run());
-        let info = run.info();
         let id = run.id;
+        let activate_persistence =
+            run.persistence_mode == super::PersistenceMode::PersistentCapable;
+        let publication_run = Arc::clone(&run);
         let mut state = write_lock(&self.state);
         debug_assert!(!state.creation_runs.contains_key(&operation_key));
         debug_assert!(!state.runs.contains_key(&id));
-        let removed = if let Some(mut reservation) = reservation {
+        let (removed, entry_operation_key) = if let Some(reservation) = reservation {
             debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
-            consume_reservation(&mut state, &mut reservation, id, Some(&operation_key))
+            consume_reservation(&mut state, reservation, id, Some(&operation_key))
         } else {
-            None
+            (Vec::new(), Some(operation_key.clone()))
         };
         state.runs.insert(
             id,
             RegistryEntry {
                 run,
-                operation_key: Some(operation_key.clone()),
+                operation_key: entry_operation_key,
+                metadata_bytes: publication_run.persistent_metadata_owner(),
                 residency: RegistryResidency::Retained,
             },
         );
@@ -1184,24 +1372,26 @@ impl RunRegistry {
         drop(state);
         drop(removed);
         drop(cleanup_reservation);
-        info
+        if activate_persistence {
+            publication_run.activate_persistence_after_publication();
+        }
+        publication_run.info()
     }
 
     /// Publish one non-creation-backed Run, currently only a tmux import or test seam.
-    pub(crate) fn publish_unkeyed(
-        &self,
-        run: Arc<Run>,
-        mut reservation: MemoryPublicationReservation,
-    ) {
+    pub(crate) fn publish_unkeyed(&self, run: Arc<Run>, mut reservation: PublicationReservation) {
         let id = run.id;
         let mut state = write_lock(&self.state);
         debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
-        let removed = consume_reservation(&mut state, &mut reservation, id, None);
+        let (removed, entry_operation_key) =
+            consume_reservation(&mut state, &mut reservation, id, None);
+        debug_assert!(entry_operation_key.is_none());
         let previous = state.runs.insert(
             id,
             RegistryEntry {
                 run,
                 operation_key: None,
+                metadata_bytes: None,
                 residency: RegistryResidency::Retained,
             },
         );
@@ -1277,7 +1467,50 @@ impl RunRegistry {
     }
 }
 
-impl Drop for MemoryPublicationReservation {
+impl PublicationReservation {
+    pub(crate) fn persistent_candidates(&self) -> Vec<PersistentCollectionCandidate> {
+        let ticket = self
+            .ticket
+            .expect("active publication reservation owns one ticket");
+        let state = read_lock(&self.state);
+        let reservation = state
+            .reservations
+            .get(&ticket)
+            .expect("active publication ticket remains registered");
+        debug_assert!(reservation.new_metadata_bytes.is_some());
+        reservation
+            .candidates
+            .iter()
+            .map(|id| {
+                let entry = state
+                    .runs
+                    .get(id)
+                    .expect("persistent candidate remains Registry-owned");
+                PersistentCollectionCandidate {
+                    id: *id,
+                    operation_key: entry
+                        .operation_key
+                        .clone()
+                        .expect("persistent native Run has an exact creation key"),
+                    metadata_bytes: entry
+                        .metadata_bytes
+                        .as_ref()
+                        .expect("persistent candidate has metadata accounting")
+                        .load(Ordering::Acquire),
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn into_commit_unknown(mut self) -> Option<CommitUnknownReservation> {
+        self.ticket.take().map(|ticket| CommitUnknownReservation {
+            _state: Arc::clone(&self.state),
+            _ticket: ticket,
+        })
+    }
+}
+
+impl Drop for PublicationReservation {
     fn drop(&mut self) {
         let Some(ticket) = self.ticket.take() else {
             return;
@@ -1291,7 +1524,7 @@ fn restore_reservation(state: &mut RegistryState, ticket: PublicationTicket) {
         debug_assert!(false, "active publication ticket remains registered");
         return;
     };
-    if let Some(candidate) = reservation.candidate {
+    for candidate in reservation.candidates {
         let entry = state
             .runs
             .get_mut(&candidate)
@@ -1303,10 +1536,10 @@ fn restore_reservation(state: &mut RegistryState, ticket: PublicationTicket) {
 
 fn consume_reservation(
     state: &mut RegistryState,
-    reservation_owner: &mut MemoryPublicationReservation,
+    reservation_owner: &mut PublicationReservation,
     new_run_id: RunId,
     operation_key: Option<&CreateOperationKey>,
-) -> Option<RegistryEntry> {
+) -> (Vec<RegistryEntry>, Option<CreateOperationKey>) {
     let ticket = reservation_owner
         .ticket
         .take()
@@ -1317,7 +1550,9 @@ fn consume_reservation(
         .expect("publication ticket remains registered");
     debug_assert_eq!(reservation.new_run_id, new_run_id);
     debug_assert_eq!(reservation.operation_key.as_ref(), operation_key);
-    reservation.candidate.map(|candidate| {
+    debug_assert!(reservation_owner.removed.is_empty());
+    debug_assert!(reservation_owner.removed.capacity() >= reservation.candidates.len());
+    for candidate in reservation.candidates {
         let removed = state
             .runs
             .remove(&candidate)
@@ -1327,6 +1562,10 @@ fn consume_reservation(
             let mapped = state.creation_runs.remove(candidate_key);
             debug_assert_eq!(mapped, Some(candidate));
         }
-        removed
-    })
+        reservation_owner.removed.push(removed);
+    }
+    (
+        std::mem::take(&mut reservation_owner.removed),
+        reservation.operation_key,
+    )
 }

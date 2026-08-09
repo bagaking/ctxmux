@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -38,11 +38,13 @@ const SHM_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_FILES_MAX_BYTES: u64 = 404 * 1024 * 1024;
 const PER_RUN_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
 const GLOBAL_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
-const METADATA_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const METADATA_BYTES: u64 = 64 * 1024 * 1024;
 const RUN_RECORDS: u64 = 4_096;
 const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
+const WAL_HEADER_BYTES: u64 = 32;
+const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
 
 #[derive(Clone, Copy)]
 struct AdmissionLimits {
@@ -100,23 +102,11 @@ impl PersistenceError {
     }
 }
 
-#[derive(Debug)]
-enum InsertStartError {
-    AdmissionRejected(String),
-    Fatal(PersistenceError),
-    Committed(PersistenceError),
-}
-
-impl From<PersistenceError> for InsertStartError {
-    fn from(error: PersistenceError) -> Self {
-        Self::Fatal(error)
-    }
-}
-
 pub(crate) struct RecoveredRun {
     pub(crate) operation_key: CreateOperationKey,
     pub(crate) info: RunInfo,
     pub(crate) replay: OutputReplay,
+    pub(crate) metadata_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -128,6 +118,7 @@ struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
     failure: Arc<Mutex<Option<String>>>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
+    epoch: String,
     #[cfg(test)]
     test_hooks: Arc<PersistenceTestHooks>,
 }
@@ -136,7 +127,145 @@ struct PersistenceInner {
 #[derive(Default)]
 struct PersistenceTestHooks {
     fail_next_insert_after_commit: AtomicBool,
+    fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
+}
+
+/// Immutable persistence-owned encoding of one native Run before launch.
+///
+/// Only this module can construct the value, so Registry admission can use its
+/// metadata measurement without duplicating `SQLite` serialization rules.
+pub(crate) struct PreparedPersistentStart {
+    operation_key: CreateOperationKey,
+    id: RunId,
+    spec_json: String,
+    lineage_json: Option<String>,
+    state_json: String,
+    epoch: String,
+    metadata_bytes: u64,
+}
+
+impl PreparedPersistentStart {
+    pub(crate) const fn metadata_bytes(&self) -> u64 {
+        self.metadata_bytes
+    }
+}
+
+/// Registry-owned identity snapshot for one exact terminal replacement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistentCandidate {
+    id: RunId,
+    operation_key: CreateOperationKey,
+    metadata_bytes: u64,
+}
+
+impl PersistentCandidate {
+    pub(crate) const fn new(
+        id: RunId,
+        operation_key: CreateOperationKey,
+        metadata_bytes: u64,
+    ) -> Self {
+        Self {
+            id,
+            operation_key,
+            metadata_bytes,
+        }
+    }
+}
+
+/// Monotonic durable disposition of one staged Run start.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StartDisposition {
+    Pending,
+    NotCommitted,
+    Committed,
+    CommitUnknown,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StartReceipt {
+    disposition: Arc<Mutex<StartDisposition>>,
+}
+
+impl StartReceipt {
+    fn pending() -> Self {
+        Self {
+            disposition: Arc::new(Mutex::new(StartDisposition::Pending)),
+        }
+    }
+
+    pub(crate) fn disposition(&self) -> StartDisposition {
+        *mutex_lock(&self.disposition)
+    }
+
+    fn decide(&self, disposition: StartDisposition) -> bool {
+        debug_assert_ne!(disposition, StartDisposition::Pending);
+        let mut current = mutex_lock(&self.disposition);
+        if *current != StartDisposition::Pending {
+            return false;
+        }
+        *current = disposition;
+        true
+    }
+
+    fn unknown_if_pending(&self) -> StartDisposition {
+        let _ = self.decide(StartDisposition::CommitUnknown);
+        self.disposition()
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("persistent Run start is {disposition:?}: {error}")]
+pub(crate) struct PersistentStartFailure {
+    disposition: StartDisposition,
+    capacity: bool,
+    #[source]
+    error: PersistenceError,
+}
+
+impl PersistentStartFailure {
+    fn new(disposition: StartDisposition, error: PersistenceError) -> Self {
+        Self {
+            disposition,
+            capacity: false,
+            error,
+        }
+    }
+
+    fn from_stage(disposition: StartDisposition, stage_failure: StageFailure) -> Self {
+        Self {
+            disposition,
+            capacity: stage_failure.capacity,
+            error: stage_failure.error,
+        }
+    }
+
+    pub(crate) const fn disposition(&self) -> StartDisposition {
+        self.disposition
+    }
+
+    pub(crate) const fn is_capacity(&self) -> bool {
+        self.capacity
+    }
+
+    pub(crate) fn into_error(self) -> PersistenceError {
+        self.error
+    }
+}
+
+pub(crate) enum PersistentStartCompletion {
+    NotCommitted(PersistentStartFailure),
+    Committed(CommittedStart),
+    CommitUnknown(PersistentStartFailure),
+}
+
+/// Affine decision owner for one `SQLite` transaction already staged in memory.
+#[must_use = "a staged persistent start must be committed or aborted"]
+pub(crate) struct StagedPersistentStart {
+    durable: Option<PersistentRun>,
+    decision: Option<mpsc::SyncSender<StageDecision>>,
+    completion: mpsc::Receiver<StageCompletion>,
+    receipt: StartReceipt,
 }
 
 #[cfg(test)]
@@ -158,6 +287,7 @@ impl Drop for PersistenceInner {
 pub(crate) struct PersistentRun {
     persistence: Persistence,
     durable_head: Arc<AtomicU64>,
+    metadata_bytes: Arc<AtomicU64>,
 }
 
 pub(crate) struct CommittedStart {
@@ -178,6 +308,10 @@ impl PersistentRun {
         self.durable_head.load(Ordering::Acquire)
     }
 
+    pub(crate) fn metadata_bytes_owner(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.metadata_bytes)
+    }
+
     pub(crate) fn append(&self, id: RunId, replay: OutputReplay) {
         if mutex_lock(&self.persistence.inner.failure).is_some() {
             return;
@@ -189,7 +323,13 @@ impl PersistentRun {
         });
     }
 
-    pub(crate) fn finalize(&self, id: RunId, replay: OutputReplay, state: RunState) {
+    pub(crate) fn finalize(
+        &self,
+        id: RunId,
+        actual_pid: u32,
+        replay: OutputReplay,
+        state: RunState,
+    ) {
         if mutex_lock(&self.persistence.inner.failure).is_some() {
             return;
         }
@@ -200,9 +340,11 @@ impl PersistentRun {
             .sender
             .send(Command::Finalize {
                 id,
+                actual_pid,
                 replay,
                 state,
                 durable_head: Arc::clone(&self.durable_head),
+                metadata_bytes: Arc::clone(&self.metadata_bytes),
                 reply: reply_tx,
             })
             .is_err()
@@ -246,8 +388,8 @@ impl Persistence {
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
-        let recovered = match init_rx.recv() {
-            Ok(Ok(recovered)) => recovered,
+        let (epoch, recovered) = match init_rx.recv() {
+            Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 let _ = join.join();
                 return Err(error);
@@ -262,6 +404,7 @@ impl Persistence {
                 sender: command_tx,
                 failure,
                 join: Mutex::new(Some(join)),
+                epoch,
                 #[cfg(test)]
                 test_hooks,
             }),
@@ -269,34 +412,119 @@ impl Persistence {
         Ok((persistence, recovered))
     }
 
+    pub(crate) fn prepare_start(
+        &self,
+        operation_key: &CreateOperationKey,
+        info: &RunInfo,
+    ) -> Result<PreparedPersistentStart, PersistenceError> {
+        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
+            return Err(PersistenceError::Mutation(message));
+        }
+        operation_key.validate().map_err(|error| {
+            PersistenceError::Mutation(format!("invalid Run creation operation key: {error}"))
+        })?;
+        let spec = validate_persistent_start(info)?;
+        let spec_json = serde_json::to_string(spec).map_err(PersistenceError::serialization)?;
+        let lineage_json = info
+            .lineage
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(PersistenceError::serialization)?;
+        let state_json =
+            serde_json::to_string(&RunState::Running).map_err(PersistenceError::serialization)?;
+        let metadata_bytes = metadata_size(
+            &info.id.to_string(),
+            operation_key.as_str(),
+            &spec_json,
+            lineage_json.as_deref(),
+            &state_json,
+            &self.inner.epoch,
+        )?;
+        Ok(PreparedPersistentStart {
+            operation_key: operation_key.clone(),
+            id: info.id,
+            spec_json,
+            lineage_json,
+            state_json,
+            epoch: self.inner.epoch.clone(),
+            metadata_bytes,
+        })
+    }
+
+    pub(crate) fn stage_start(
+        &self,
+        prepared: PreparedPersistentStart,
+        candidates: Vec<PersistentCandidate>,
+    ) -> Result<StagedPersistentStart, PersistentStartFailure> {
+        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
+            return Err(PersistentStartFailure::new(
+                StartDisposition::NotCommitted,
+                PersistenceError::Mutation(message),
+            ));
+        }
+        let metadata_bytes = prepared.metadata_bytes;
+        let receipt = StartReceipt::pending();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (decision_tx, decision_rx) = mpsc::sync_channel(0);
+        let (completion_tx, completion_rx) = mpsc::sync_channel(0);
+        self.inner
+            .sender
+            .send(Command::StageStart(Box::new(StageRequest {
+                prepared: Box::new(prepared),
+                candidates,
+                receipt: receipt.clone(),
+                ready: ready_tx,
+                decision: decision_rx,
+                completion: completion_tx,
+            })))
+            .map_err(|_| {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                PersistentStartFailure::new(
+                    StartDisposition::NotCommitted,
+                    PersistenceError::ActorStopped,
+                )
+            })?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(StagedPersistentStart {
+                durable: Some(PersistentRun {
+                    persistence: self.clone(),
+                    durable_head: Arc::new(AtomicU64::new(0)),
+                    metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
+                }),
+                decision: Some(decision_tx),
+                completion: completion_rx,
+                receipt,
+            }),
+            Ok(Err(error)) => {
+                let disposition = receipt.disposition();
+                Err(PersistentStartFailure::from_stage(disposition, error))
+            }
+            Err(_) => {
+                let disposition = receipt.unknown_if_pending();
+                Err(PersistentStartFailure::new(
+                    disposition,
+                    PersistenceError::ActorStopped,
+                ))
+            }
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn insert_start(
         &self,
         operation_key: &CreateOperationKey,
         info: &RunInfo,
     ) -> Result<CommittedStart, PersistenceError> {
-        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
-            return Err(PersistenceError::Mutation(message));
+        let prepared = self.prepare_start(operation_key, info)?;
+        let staged = self
+            .stage_start(prepared, Vec::new())
+            .map_err(PersistentStartFailure::into_error)?;
+        match staged.commit() {
+            PersistentStartCompletion::Committed(start) => Ok(start),
+            PersistentStartCompletion::NotCommitted(failure)
+            | PersistentStartCompletion::CommitUnknown(failure) => Err(failure.into_error()),
         }
-        let durable_head = Arc::new(AtomicU64::new(0));
-        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        self.inner
-            .sender
-            .send(Command::InsertStart {
-                operation_key: operation_key.clone(),
-                info: Box::new(info.clone()),
-                reply: reply_tx,
-            })
-            .map_err(|_| PersistenceError::ActorStopped)?;
-        let post_commit_error = reply_rx
-            .recv()
-            .map_err(|_| PersistenceError::ActorStopped)??;
-        Ok(CommittedStart {
-            durable: PersistentRun {
-                persistence: self.clone(),
-                durable_head,
-            },
-            post_commit_error,
-        })
     }
 
     #[cfg(test)]
@@ -304,6 +532,14 @@ impl Persistence {
         self.inner
             .test_hooks
             .fail_next_insert_after_commit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_start_before_commit(&self) {
+        self.inner
+            .test_hooks
+            .fail_next_start_before_commit
             .store(true, Ordering::Release);
     }
 
@@ -349,20 +585,131 @@ impl Persistence {
         )
     }
 
-    pub(crate) fn recovered_run(&self, durable_head: u64) -> PersistentRun {
+    pub(crate) fn recovered_run(&self, durable_head: u64, metadata_bytes: u64) -> PersistentRun {
         PersistentRun {
             persistence: self.clone(),
             durable_head: Arc::new(AtomicU64::new(durable_head)),
+            metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
         }
     }
 }
 
+impl StagedPersistentStart {
+    pub(crate) fn commit(mut self) -> PersistentStartCompletion {
+        let result = match self.send_decision(StageDecision::Commit) {
+            Ok(()) => self.recv_completion(),
+            Err(failure) => self.completion_from_failure(failure),
+        };
+        self.decision = None;
+        result
+    }
+
+    pub(crate) fn abort(mut self) -> Result<(), PersistentStartFailure> {
+        self.send_decision(StageDecision::Abort)?;
+        let result = match self.completion.recv() {
+            Ok(StageCompletion::NotCommitted(stage_failure)) if stage_failure.fatal => Err(
+                PersistentStartFailure::new(StartDisposition::NotCommitted, stage_failure.error),
+            ),
+            Ok(StageCompletion::NotCommitted(_)) => Ok(()),
+            Ok(StageCompletion::Committed(post_commit_error)) => {
+                let error = post_commit_error.unwrap_or_else(|| {
+                    PersistenceError::Mutation(
+                        "persistent start committed after an abort decision".to_owned(),
+                    )
+                });
+                Err(PersistentStartFailure::new(
+                    StartDisposition::Committed,
+                    error,
+                ))
+            }
+            Ok(StageCompletion::CommitUnknown(error)) => Err(PersistentStartFailure::new(
+                StartDisposition::CommitUnknown,
+                error,
+            )),
+            Err(_) => {
+                let disposition = self.receipt.unknown_if_pending();
+                Err(PersistentStartFailure::new(
+                    disposition,
+                    PersistenceError::ActorStopped,
+                ))
+            }
+        };
+        self.decision = None;
+        result
+    }
+
+    fn send_decision(&mut self, decision: StageDecision) -> Result<(), PersistentStartFailure> {
+        let Some(sender) = self.decision.take() else {
+            return Err(PersistentStartFailure::new(
+                self.receipt.unknown_if_pending(),
+                PersistenceError::ActorStopped,
+            ));
+        };
+        sender.send(decision).map_err(|_| {
+            PersistentStartFailure::new(
+                self.receipt.unknown_if_pending(),
+                PersistenceError::ActorStopped,
+            )
+        })
+    }
+
+    fn recv_completion(&mut self) -> PersistentStartCompletion {
+        match self.completion.recv() {
+            Ok(StageCompletion::NotCommitted(stage_failure)) => {
+                PersistentStartCompletion::NotCommitted(PersistentStartFailure::from_stage(
+                    StartDisposition::NotCommitted,
+                    stage_failure,
+                ))
+            }
+            Ok(StageCompletion::Committed(post_commit_error)) => {
+                PersistentStartCompletion::Committed(CommittedStart {
+                    durable: self.take_durable(),
+                    post_commit_error,
+                })
+            }
+            Ok(StageCompletion::CommitUnknown(error)) => PersistentStartCompletion::CommitUnknown(
+                PersistentStartFailure::new(StartDisposition::CommitUnknown, error),
+            ),
+            Err(_) => {
+                let disposition = self.receipt.unknown_if_pending();
+                let failure =
+                    PersistentStartFailure::new(disposition, PersistenceError::ActorStopped);
+                self.completion_from_failure(failure)
+            }
+        }
+    }
+
+    fn completion_from_failure(
+        &mut self,
+        failure: PersistentStartFailure,
+    ) -> PersistentStartCompletion {
+        match failure.disposition() {
+            StartDisposition::Committed => PersistentStartCompletion::Committed(CommittedStart {
+                durable: self.take_durable(),
+                post_commit_error: Some(failure.into_error()),
+            }),
+            StartDisposition::NotCommitted => PersistentStartCompletion::NotCommitted(failure),
+            StartDisposition::Pending | StartDisposition::CommitUnknown => {
+                PersistentStartCompletion::CommitUnknown(failure)
+            }
+        }
+    }
+
+    fn take_durable(&mut self) -> PersistentRun {
+        self.durable
+            .take()
+            .expect("committed staged start retains one preallocated durable owner")
+    }
+}
+
+impl Drop for StagedPersistentStart {
+    fn drop(&mut self) {
+        drop(self.decision.take());
+    }
+}
+
 enum Command {
-    InsertStart {
-        operation_key: CreateOperationKey,
-        info: Box<RunInfo>,
-        reply: mpsc::SyncSender<Result<Option<PersistenceError>, PersistenceError>>,
-    },
+    StageStart(Box<StageRequest>),
     Append {
         id: RunId,
         replay: OutputReplay,
@@ -370,19 +717,42 @@ enum Command {
     },
     Finalize {
         id: RunId,
+        actual_pid: u32,
         replay: OutputReplay,
         state: RunState,
         durable_head: Arc<AtomicU64>,
+        metadata_bytes: Arc<AtomicU64>,
         reply: mpsc::SyncSender<Result<(), PersistenceError>>,
     },
     Shutdown,
+}
+
+struct StageRequest {
+    prepared: Box<PreparedPersistentStart>,
+    candidates: Vec<PersistentCandidate>,
+    receipt: StartReceipt,
+    ready: mpsc::SyncSender<Result<(), StageFailure>>,
+    decision: mpsc::Receiver<StageDecision>,
+    completion: mpsc::SyncSender<StageCompletion>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageDecision {
+    Commit,
+    Abort,
+}
+
+enum StageCompletion {
+    NotCommitted(StageFailure),
+    Committed(Option<PersistenceError>),
+    CommitUnknown(PersistenceError),
 }
 
 fn actor_main(
     state_dir: &Path,
     admission_limits: AdmissionLimits,
     receiver: &mpsc::Receiver<Command>,
-    init: &mpsc::SyncSender<Result<Vec<RecoveredRun>, PersistenceError>>,
+    init: &mpsc::SyncSender<Result<(String, Vec<RecoveredRun>), PersistenceError>>,
     failure: &Mutex<Option<String>>,
     #[cfg(test)] test_hooks: &Arc<PersistenceTestHooks>,
 ) {
@@ -400,7 +770,7 @@ fn actor_main(
             return;
         }
     };
-    if init.send(Ok(recovered)).is_err() {
+    if init.send(Ok((store.epoch.clone(), recovered))).is_err() {
         return;
     }
 
@@ -414,12 +784,8 @@ fn actor_main(
             },
         };
         match command {
-            Command::InsertStart {
-                operation_key,
-                info,
-                reply,
-            } => {
-                handle_insert_start(&mut store, &operation_key, &info, &reply, failure);
+            Command::StageStart(request) => {
+                handle_staged_start(&mut store, &request, failure);
             }
             Command::Append {
                 id,
@@ -455,9 +821,11 @@ fn actor_main(
             }
             Command::Finalize {
                 id,
+                actual_pid,
                 replay,
                 state,
                 durable_head,
+                metadata_bytes,
                 reply,
             } => {
                 #[cfg(test)]
@@ -465,7 +833,14 @@ fn actor_main(
                 let result = if let Some(message) = mutex_lock(failure).clone() {
                     Err(PersistenceError::Mutation(message))
                 } else {
-                    store.finalize(id, &replay, &state, &durable_head)
+                    store.finalize(
+                        id,
+                        actual_pid,
+                        &replay,
+                        &state,
+                        &durable_head,
+                        &metadata_bytes,
+                    )
                 };
                 if let Err(error) = &result {
                     remember_failure(failure, error);
@@ -486,33 +861,129 @@ fn pause_before_finalize(test_hooks: &PersistenceTestHooks) {
     }
 }
 
-fn handle_insert_start(
+fn handle_staged_start(
     store: &mut StateStore,
-    operation_key: &CreateOperationKey,
-    info: &RunInfo,
-    reply: &mpsc::SyncSender<Result<Option<PersistenceError>, PersistenceError>>,
+    request: &StageRequest,
     failure: &Mutex<Option<String>>,
 ) {
     if let Some(message) = mutex_lock(failure).clone() {
-        let _ = reply.send(Err(PersistenceError::Mutation(message)));
+        let _ = request.receipt.decide(StartDisposition::NotCommitted);
+        let _ = request.ready.send(Err(StageFailure {
+            error: PersistenceError::Mutation(message),
+            fatal: true,
+            capacity: false,
+        }));
         return;
     }
-    match store.insert_start(operation_key, info) {
-        Ok(()) => {
-            let _ = reply.send(Ok(None));
+    match store.drive_staged_start(
+        &request.prepared,
+        &request.candidates,
+        &request.receipt,
+        &request.ready,
+        &request.decision,
+    ) {
+        StageDriveResult::ReadyFailed(stage_failure) => {
+            if stage_failure.fatal {
+                remember_failure(failure, &stage_failure.error);
+            }
+            let _ = request.ready.send(Err(stage_failure));
         }
-        Err(InsertStartError::AdmissionRejected(message)) => {
-            let _ = reply.send(Err(PersistenceError::Mutation(message)));
-        }
-        Err(InsertStartError::Fatal(error)) => {
-            remember_failure(failure, &error);
-            let _ = reply.send(Err(error));
-        }
-        Err(InsertStartError::Committed(error)) => {
-            remember_failure(failure, &error);
-            let _ = reply.send(Ok(Some(error)));
+        StageDriveResult::Completed(result) => {
+            match &result {
+                StageCompletion::Committed(Some(error)) | StageCompletion::CommitUnknown(error) => {
+                    remember_failure(failure, error);
+                }
+                StageCompletion::NotCommitted(stage_failure) if stage_failure.fatal => {
+                    remember_failure(failure, &stage_failure.error);
+                }
+                StageCompletion::NotCommitted(_) | StageCompletion::Committed(None) => {}
+            }
+            let _ = request.completion.send(result);
         }
     }
+}
+
+struct StageFailure {
+    error: PersistenceError,
+    fatal: bool,
+    capacity: bool,
+}
+
+enum StageDriveResult {
+    ReadyFailed(StageFailure),
+    Completed(StageCompletion),
+}
+
+impl StageDriveResult {
+    fn with_restore_failure(self, restore_error: PersistenceError) -> Self {
+        match self {
+            Self::ReadyFailed(stage_failure) => Self::ReadyFailed(StageFailure {
+                error: combine_errors(&stage_failure.error, &restore_error),
+                fatal: true,
+                capacity: false,
+            }),
+            Self::Completed(StageCompletion::NotCommitted(stage_failure)) => {
+                Self::Completed(StageCompletion::NotCommitted(StageFailure {
+                    error: combine_errors(&stage_failure.error, &restore_error),
+                    fatal: true,
+                    capacity: false,
+                }))
+            }
+            Self::Completed(StageCompletion::Committed(post_commit_error)) => {
+                let post_commit_error = Some(match post_commit_error {
+                    Some(error) => combine_errors(&error, &restore_error),
+                    None => restore_error,
+                });
+                Self::Completed(StageCompletion::Committed(post_commit_error))
+            }
+            Self::Completed(StageCompletion::CommitUnknown(error)) => Self::Completed(
+                StageCompletion::CommitUnknown(combine_errors(&error, &restore_error)),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitProbe {
+    OldUnit,
+    NewUnit,
+    Hybrid,
+}
+
+struct StoredPreparedRow {
+    operation_key: String,
+    spec_json: String,
+    lineage_json: Option<String>,
+    state_kind: String,
+    state_json: String,
+    epoch: String,
+    pid: Option<i64>,
+    metadata_bytes: i64,
+}
+
+fn admission_failure(message: impl Into<String>) -> StageFailure {
+    StageFailure {
+        error: PersistenceError::Mutation(message.into()),
+        fatal: false,
+        capacity: true,
+    }
+}
+
+fn fatal_stage_failure(message: impl Into<String>) -> StageFailure {
+    StageFailure {
+        error: PersistenceError::Mutation(message.into()),
+        fatal: true,
+        capacity: false,
+    }
+}
+
+fn combine_errors(primary: &PersistenceError, secondary: &PersistenceError) -> PersistenceError {
+    PersistenceError::Mutation(format!("{primary}; additionally: {secondary}"))
+}
+
+fn wal_charge_for_cache(used_bytes: u64) -> Option<u64> {
+    let pages = used_bytes.checked_add(PAGE_SIZE_BYTES - 1)? / PAGE_SIZE_BYTES;
+    WAL_HEADER_BYTES.checked_add(pages.checked_mul(WAL_FRAME_BYTES)?)
 }
 
 fn remember_failure(failure: &Mutex<Option<String>>, error: &PersistenceError) {
@@ -661,84 +1132,667 @@ impl StateStore {
         Ok((store, recovered))
     }
 
-    fn insert_start(
+    fn drive_staged_start(
         &mut self,
-        operation_key: &CreateOperationKey,
-        info: &RunInfo,
-    ) -> Result<(), InsertStartError> {
-        operation_key.validate().map_err(|error| {
-            PersistenceError::Mutation(format!("invalid Run creation operation key: {error}"))
-        })?;
-        let spec = validate_persistent_start(info)?;
-        self.admit_transaction(1024 * 1024)?;
-        let spec_json = serde_json::to_string(spec).map_err(PersistenceError::serialization)?;
-        let lineage_json = info
-            .lineage
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(PersistenceError::serialization)?;
-        let state_json =
-            serde_json::to_string(&RunState::Running).map_err(PersistenceError::serialization)?;
-        let metadata_bytes = metadata_size(
-            &info.id.to_string(),
-            operation_key.as_str(),
-            &spec_json,
-            lineage_json.as_deref(),
-            &state_json,
-            &self.epoch,
-        )?;
-        if metadata_bytes > self.admission_limits.metadata_bytes {
-            return Err(InsertStartError::AdmissionRejected(format!(
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+        receipt: &StartReceipt,
+        ready: &mpsc::SyncSender<Result<(), StageFailure>>,
+        decision: &mpsc::Receiver<StageDecision>,
+    ) -> StageDriveResult {
+        if let Err(error) = self.validate_prepared_start(prepared) {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(StageFailure {
+                error,
+                fatal: true,
+                capacity: false,
+            });
+        }
+        if prepared.metadata_bytes > self.admission_limits.metadata_bytes {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(admission_failure(format!(
                 "one Run metadata record exceeds the {} byte budget",
                 self.admission_limits.metadata_bytes
             )));
         }
-        let now = now_millis();
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(PersistenceError::database)?;
-        let evicted = reserve_run_capacity_to(
-            &transaction,
-            metadata_bytes,
-            self.admission_limits.run_records,
-            self.admission_limits.metadata_bytes,
+
+        if let Err(error) = self.truncate_wal_to_zero() {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(admission_failure(format!(
+                "persistent WAL admission could not reach a zero baseline: {error}"
+            )));
+        }
+        if let Err(error) = self.connection.release_memory() {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(admission_failure(format!(
+                "persistent WAL admission could not release the connection cache: {error}"
+            )));
+        }
+
+        let previous_cache_spill = match self.disable_cache_spill() {
+            Ok(value) => value,
+            Err(stage_failure) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                return StageDriveResult::ReadyFailed(stage_failure);
+            }
+        };
+        let result = self
+            .drive_staged_start_with_spill_disabled(prepared, candidates, receipt, ready, decision);
+        match self.restore_cache_spill(previous_cache_spill) {
+            Ok(()) => result,
+            Err(error) => result.with_restore_failure(error),
+        }
+    }
+
+    fn drive_staged_start_with_spill_disabled(
+        &mut self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+        receipt: &StartReceipt,
+        ready: &mpsc::SyncSender<Result<(), StageFailure>>,
+        decision: &mpsc::Receiver<StageDecision>,
+    ) -> StageDriveResult {
+        if let Err(error) = ctxmux_sqlite_status::reset_cache_io(&self.connection) {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(admission_failure(format!(
+                "persistent WAL admission could not reset cache counters: {error}"
+            )));
+        }
+        if let Err(error) = self.connection.execute_batch("BEGIN IMMEDIATE") {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return StageDriveResult::ReadyFailed(StageFailure {
+                error: PersistenceError::database(error),
+                fatal: false,
+                capacity: false,
+            });
+        }
+        match file_len(&self.wal_path) {
+            Ok(0) => {}
+            Ok(_) => {
+                return self.rollback_before_ready(
+                    receipt,
+                    admission_failure("persistent WAL changed before exact staging"),
+                );
+            }
+            Err(error) => {
+                return self.rollback_before_ready(
+                    receipt,
+                    admission_failure(format!(
+                        "persistent WAL baseline could not be inspected: {error}"
+                    )),
+                );
+            }
+        }
+        if let Err(stage_failure) = self.stage_exact_replacement(prepared, candidates) {
+            return self.rollback_before_ready(receipt, stage_failure);
+        }
+
+        let snapshot = match ctxmux_sqlite_status::cache_admission_snapshot(&self.connection) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self.rollback_before_ready(
+                    receipt,
+                    admission_failure(format!(
+                        "persistent WAL admission could not observe cache status: {error}"
+                    )),
+                );
+            }
+        };
+        let wal_bytes = match file_len(&self.wal_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return self.rollback_before_ready(
+                    receipt,
+                    admission_failure(format!(
+                        "persistent WAL admission could not inspect its baseline: {error}"
+                    )),
+                );
+            }
+        };
+        let charge = wal_charge_for_cache(snapshot.used_bytes);
+        if wal_bytes != 0
+            || snapshot.writes != 0
+            || snapshot.spills != 0
+            || charge.is_none_or(|charge| charge > WAL_CHECKPOINT_BYTES)
+        {
+            return self.rollback_before_ready(
+                receipt,
+                admission_failure(format!(
+                    "persistent exact replacement exceeds or cannot prove its 8 MiB WAL charge: \
+                     cache={} bytes, writes={}, spills={}, wal={} bytes",
+                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes
+                )),
+            );
+        }
+
+        if ready.send(Ok(())).is_err() {
+            return self.rollback_after_ready_loss(receipt);
+        }
+        match decision.recv().unwrap_or(StageDecision::Abort) {
+            StageDecision::Abort => self.abort_staged_start(receipt),
+            StageDecision::Commit => self.commit_staged_start(prepared, candidates, receipt),
+        }
+    }
+
+    fn validate_prepared_start(
+        &self,
+        prepared: &PreparedPersistentStart,
+    ) -> Result<(), PersistenceError> {
+        prepared.operation_key.validate().map_err(|error| {
+            PersistenceError::Mutation(format!("invalid Run creation operation key: {error}"))
+        })?;
+        if prepared.epoch != self.epoch {
+            return Err(PersistenceError::Mutation(
+                "prepared Run start belongs to another daemon epoch".to_owned(),
+            ));
+        }
+        let _ = decode_native_spec(prepared.id, &prepared.spec_json)?;
+        let state: RunState =
+            serde_json::from_str(&prepared.state_json).map_err(PersistenceError::serialization)?;
+        if state != RunState::Running {
+            return Err(PersistenceError::Mutation(
+                "prepared persistent Run start is not running".to_owned(),
+            ));
+        }
+        if let Some(lineage_json) = &prepared.lineage_json {
+            let lineage: RunLineage =
+                serde_json::from_str(lineage_json).map_err(PersistenceError::serialization)?;
+            if lineage.parent == prepared.id {
+                return Err(PersistenceError::Mutation(
+                    "prepared persistent Run has self lineage".to_owned(),
+                ));
+            }
+        }
+        let measured = metadata_size(
+            &prepared.id.to_string(),
+            prepared.operation_key.as_str(),
+            &prepared.spec_json,
+            prepared.lineage_json.as_deref(),
+            &prepared.state_json,
+            &prepared.epoch,
         )?;
-        transaction
+        if measured != prepared.metadata_bytes {
+            return Err(PersistenceError::Mutation(
+                "prepared persistent Run metadata accounting changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn disable_cache_spill(&self) -> Result<i64, StageFailure> {
+        let previous = self
+            .connection
+            .pragma_query_value(None, "cache_spill", |row| row.get(0))
+            .map_err(|error| {
+                admission_failure(format!(
+                    "persistent WAL admission could not read cache spill state: {error}"
+                ))
+            })?;
+        self.connection
+            .pragma_update(None, "cache_spill", false)
+            .map_err(|error| {
+                admission_failure(format!(
+                    "persistent WAL admission could not disable cache spill: {error}"
+                ))
+            })?;
+        let disabled: Result<i64, PersistenceError> = self
+            .connection
+            .pragma_query_value(None, "cache_spill", |row| row.get(0))
+            .map_err(PersistenceError::database);
+        let disabled = match disabled {
+            Ok(value) => value,
+            Err(error) => {
+                return match self.restore_cache_spill(previous) {
+                    Ok(()) => Err(admission_failure(format!(
+                        "persistent WAL admission could not verify disabled cache spill: {error}"
+                    ))),
+                    Err(restore_error) => Err(StageFailure {
+                        error: combine_errors(&error, &restore_error),
+                        fatal: true,
+                        capacity: false,
+                    }),
+                };
+            }
+        };
+        if disabled != 0 {
+            let error =
+                PersistenceError::Mutation("SQLite cache spill remained enabled".to_owned());
+            return match self.restore_cache_spill(previous) {
+                Ok(()) => Err(admission_failure(error.to_string())),
+                Err(restore_error) => Err(StageFailure {
+                    error: combine_errors(&error, &restore_error),
+                    fatal: true,
+                    capacity: false,
+                }),
+            };
+        }
+        Ok(previous)
+    }
+
+    fn restore_cache_spill(&self, previous: i64) -> Result<(), PersistenceError> {
+        self.connection
+            .pragma_update(None, "cache_spill", previous)
+            .map_err(PersistenceError::database)?;
+        Ok(())
+    }
+
+    fn truncate_wal_to_zero(&self) -> Result<(), PersistenceError> {
+        let (busy, _, _): (i64, i64, i64) = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(PersistenceError::database)?;
+        if busy != 0 || file_len(&self.wal_path)? != 0 {
+            return Err(PersistenceError::Mutation(
+                "WAL truncate checkpoint could not reach zero bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn stage_exact_replacement(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+    ) -> Result<(), StageFailure> {
+        self.validate_exact_candidates(prepared, candidates)?;
+        self.validate_projected_capacity(prepared, candidates)?;
+        self.apply_exact_replacement(prepared, candidates)
+    }
+
+    fn validate_exact_candidates(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+    ) -> Result<(), StageFailure> {
+        let mut seen = HashSet::new();
+        for candidate in candidates {
+            if !seen.insert(candidate.id) {
+                return Err(fatal_stage_failure(format!(
+                    "persistent replacement repeats candidate {}",
+                    candidate.id
+                )));
+            }
+            if candidate.id == prepared.id
+                || candidate.operation_key.as_str().as_bytes()
+                    == prepared.operation_key.as_str().as_bytes()
+            {
+                return Err(fatal_stage_failure(
+                    "persistent replacement cannot reuse a candidate Run or creation identity",
+                ));
+            }
+            let stored: Option<(String, i64, String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT creation_key, metadata_bytes, state_kind, state_json
+                     FROM runs WHERE id = ?1",
+                    [candidate.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|error| fatal_stage_failure(error.to_string()))?;
+            let Some((stored_key, stored_metadata, state_kind, state_json)) = stored else {
+                return Err(fatal_stage_failure(format!(
+                    "persistent replacement candidate {} is missing",
+                    candidate.id
+                )));
+            };
+            let stored_metadata = nonnegative_u64(stored_metadata, "candidate metadata")
+                .map_err(|error| fatal_stage_failure(error.to_string()))?;
+            let state: RunState = serde_json::from_str(&state_json)
+                .map_err(|error| fatal_stage_failure(error.to_string()))?;
+            if stored_key.as_bytes() != candidate.operation_key.as_str().as_bytes()
+                || stored_metadata != candidate.metadata_bytes
+                || state_kind != state_kind_for(&state)
+                || state.is_running()
+            {
+                return Err(fatal_stage_failure(format!(
+                    "persistent replacement candidate {} does not match its exact terminal snapshot",
+                    candidate.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_projected_capacity(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+    ) -> Result<(), StageFailure> {
+        let (records, metadata): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| fatal_stage_failure(error.to_string()))?;
+        let records = nonnegative_u64(records, "record count")
+            .map_err(|error| fatal_stage_failure(error.to_string()))?;
+        let metadata = nonnegative_u64(metadata, "metadata total")
+            .map_err(|error| fatal_stage_failure(error.to_string()))?;
+        let candidate_metadata = candidates.iter().try_fold(0_u64, |total, candidate| {
+            total
+                .checked_add(candidate.metadata_bytes)
+                .ok_or_else(|| fatal_stage_failure("candidate metadata accounting overflowed"))
+        })?;
+        let candidate_records = u64::try_from(candidates.len())
+            .map_err(|_| fatal_stage_failure("candidate record count does not fit u64"))?;
+        let projected_records = records
+            .checked_sub(candidate_records)
+            .and_then(|records| records.checked_add(1))
+            .ok_or_else(|| fatal_stage_failure("projected record count is inconsistent"))?;
+        let projected_metadata = metadata
+            .checked_sub(candidate_metadata)
+            .and_then(|metadata| metadata.checked_add(prepared.metadata_bytes))
+            .ok_or_else(|| fatal_stage_failure("projected metadata is inconsistent"))?;
+        if projected_records > self.admission_limits.run_records
+            || projected_metadata > self.admission_limits.metadata_bytes
+        {
+            return Err(admission_failure(
+                "exact persistent candidates do not fund the retained Run capacity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn apply_exact_replacement(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+    ) -> Result<(), StageFailure> {
+        for candidate in candidates {
+            let deleted = self
+                .connection
+                .execute(
+                    "DELETE FROM runs WHERE id = ?1 AND creation_key = ?2 COLLATE BINARY
+                     AND metadata_bytes = ?3 AND state_kind != 'running'",
+                    params![
+                        candidate.id.to_string(),
+                        candidate.operation_key.as_str(),
+                        i64::try_from(candidate.metadata_bytes)
+                            .expect("metadata budget fits SQLite")
+                    ],
+                )
+                .map_err(|error| fatal_stage_failure(error.to_string()))?;
+            if deleted != 1 {
+                return Err(fatal_stage_failure(format!(
+                    "persistent replacement candidate {} changed while staged",
+                    candidate.id
+                )));
+            }
+        }
+        let now = now_millis();
+        self.connection
             .execute(
                 "INSERT INTO runs (
                     id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
                     durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
                     metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, 0, 0, 0, 0, ?8, ?9, ?9, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, NULL, 0, 0, 0, 0, ?7, ?8, ?8, NULL)",
                 params![
-                    info.id.to_string(),
-                    operation_key.as_str(),
-                    spec_json,
-                    lineage_json,
-                    state_json,
-                    self.epoch,
-                    info.pid,
-                    i64::try_from(metadata_bytes).expect("metadata budget fits SQLite"),
+                    prepared.id.to_string(),
+                    prepared.operation_key.as_str(),
+                    &prepared.spec_json,
+                    &prepared.lineage_json,
+                    &prepared.state_json,
+                    &prepared.epoch,
+                    i64::try_from(prepared.metadata_bytes).expect("metadata budget fits SQLite"),
                     now,
                 ],
             )
-            .map_err(PersistenceError::database)?;
-        transaction.commit().map_err(PersistenceError::database)?;
+            .map_err(|error| fatal_stage_failure(error.to_string()))?;
+        Ok(())
+    }
+
+    fn rollback_before_ready(
+        &self,
+        receipt: &StartReceipt,
+        stage_failure: StageFailure,
+    ) -> StageDriveResult {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                StageDriveResult::ReadyFailed(stage_failure)
+            }
+            Err(rollback_error) => {
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::ReadyFailed(StageFailure {
+                    error: PersistenceError::Mutation(format!(
+                        "{}; staged rollback failed: {rollback_error}",
+                        stage_failure.error
+                    )),
+                    fatal: true,
+                    capacity: false,
+                })
+            }
+        }
+    }
+
+    fn rollback_after_ready_loss(&self, receipt: &StartReceipt) -> StageDriveResult {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
+                    error: PersistenceError::ActorStopped,
+                    fatal: false,
+                    capacity: false,
+                }))
+            }
+            Err(error) => {
+                let error = PersistenceError::Mutation(format!(
+                    "staged reply owner disappeared and rollback failed: {error}"
+                ));
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::Completed(StageCompletion::CommitUnknown(error))
+            }
+        }
+    }
+
+    fn abort_staged_start(&self, receipt: &StartReceipt) -> StageDriveResult {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
+                    error: PersistenceError::Mutation(
+                        "persistent Run start was aborted".to_owned(),
+                    ),
+                    fatal: false,
+                    capacity: false,
+                }))
+            }
+            Err(error) => {
+                let error = PersistenceError::Mutation(format!(
+                    "persistent Run start abort could not prove rollback: {error}"
+                ));
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::Completed(StageCompletion::CommitUnknown(error))
+            }
+        }
+    }
+
+    fn commit_staged_start(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+        receipt: &StartReceipt,
+    ) -> StageDriveResult {
         #[cfg(test)]
         if self
             .test_hooks
-            .fail_next_insert_after_commit
+            .fail_next_start_before_commit
             .swap(false, Ordering::AcqRel)
         {
-            return Err(InsertStartError::Committed(PersistenceError::Mutation(
-                "injected failure after durable Run creation commit".to_owned(),
-            )));
+            return match self.connection.execute_batch("ROLLBACK") {
+                Ok(()) => {
+                    let _ = receipt.decide(StartDisposition::NotCommitted);
+                    StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
+                        error: PersistenceError::Mutation(
+                            "injected failure before durable Run creation COMMIT".to_owned(),
+                        ),
+                        fatal: false,
+                        capacity: false,
+                    }))
+                }
+                Err(rollback_error) => {
+                    let error = PersistenceError::Mutation(format!(
+                        "injected failure before durable Run creation COMMIT and rollback failed: \
+                         {rollback_error}"
+                    ));
+                    let _ = receipt.decide(StartDisposition::CommitUnknown);
+                    StageDriveResult::Completed(StageCompletion::CommitUnknown(error))
+                }
+            };
         }
-        self.finish_transaction(evicted)
-            .map_err(InsertStartError::Committed)?;
-        Ok(())
+        match self.connection.execute_batch("COMMIT") {
+            Ok(()) => {
+                let _ = receipt.decide(StartDisposition::Committed);
+                let mut post_commit_error = None;
+                #[cfg(test)]
+                if self
+                    .test_hooks
+                    .fail_next_insert_after_commit
+                    .swap(false, Ordering::AcqRel)
+                {
+                    post_commit_error = Some(PersistenceError::Mutation(
+                        "injected failure after durable Run creation commit".to_owned(),
+                    ));
+                }
+                if post_commit_error.is_none() {
+                    post_commit_error = self.validate_files().err();
+                }
+                StageDriveResult::Completed(StageCompletion::Committed(post_commit_error))
+            }
+            Err(commit_error) => {
+                self.classify_failed_commit(prepared, candidates, receipt, commit_error)
+            }
+        }
+    }
+
+    fn classify_failed_commit(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+        receipt: &StartReceipt,
+        commit_error: rusqlite::Error,
+    ) -> StageDriveResult {
+        if !self.connection.is_autocommit()
+            && let Err(rollback_error) = self.connection.execute_batch("ROLLBACK")
+        {
+            let _ = receipt.decide(StartDisposition::CommitUnknown);
+            return StageDriveResult::Completed(StageCompletion::CommitUnknown(
+                PersistenceError::Mutation(format!(
+                    "persistent COMMIT failed ({commit_error}) and rollback failed ({rollback_error})"
+                )),
+            ));
+        }
+        match self.probe_exact_replacement(prepared, candidates) {
+            Ok(CommitProbe::OldUnit) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
+                    error: PersistenceError::database(commit_error),
+                    fatal: false,
+                    capacity: false,
+                }))
+            }
+            Ok(CommitProbe::NewUnit) => {
+                let _ = receipt.decide(StartDisposition::Committed);
+                StageDriveResult::Completed(StageCompletion::Committed(Some(
+                    PersistenceError::database(commit_error),
+                )))
+            }
+            Ok(CommitProbe::Hybrid) => {
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::Completed(StageCompletion::CommitUnknown(
+                    PersistenceError::Mutation(format!(
+                        "persistent COMMIT failed ({commit_error}) and durable rows are hybrid"
+                    )),
+                ))
+            }
+            Err(probe_error) => {
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::Completed(StageCompletion::CommitUnknown(
+                    PersistenceError::Mutation(format!(
+                        "persistent COMMIT failed ({commit_error}) and exact probe failed: {probe_error}"
+                    )),
+                ))
+            }
+        }
+    }
+
+    fn probe_exact_replacement(
+        &self,
+        prepared: &PreparedPersistentStart,
+        candidates: &[PersistentCandidate],
+    ) -> Result<CommitProbe, PersistenceError> {
+        let mut old_present = 0_usize;
+        for candidate in candidates {
+            let stored: Option<(String, i64, String, String)> = self
+                .connection
+                .query_row(
+                    "SELECT creation_key, metadata_bytes, state_kind, state_json
+                     FROM runs WHERE id = ?1",
+                    [candidate.id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(PersistenceError::database)?;
+            if let Some((key, metadata, state_kind, state_json)) = stored {
+                let state: RunState = match serde_json::from_str(&state_json) {
+                    Ok(state) => state,
+                    Err(_) => return Ok(CommitProbe::Hybrid),
+                };
+                if key.as_bytes() != candidate.operation_key.as_str().as_bytes()
+                    || nonnegative_u64(metadata, "candidate metadata")? != candidate.metadata_bytes
+                    || state_kind != state_kind_for(&state)
+                    || state.is_running()
+                {
+                    return Ok(CommitProbe::Hybrid);
+                }
+                old_present += 1;
+            }
+        }
+        let new: Option<StoredPreparedRow> = self
+            .connection
+            .query_row(
+                "SELECT creation_key, spec_json, lineage_json, state_kind, state_json,
+                            source_epoch, pid, metadata_bytes FROM runs WHERE id = ?1",
+                [prepared.id.to_string()],
+                |row| {
+                    Ok(StoredPreparedRow {
+                        operation_key: row.get(0)?,
+                        spec_json: row.get(1)?,
+                        lineage_json: row.get(2)?,
+                        state_kind: row.get(3)?,
+                        state_json: row.get(4)?,
+                        epoch: row.get(5)?,
+                        pid: row.get(6)?,
+                        metadata_bytes: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let new_exact = new.as_ref().is_some_and(|row| {
+            row.operation_key.as_bytes() == prepared.operation_key.as_str().as_bytes()
+                && row.spec_json == prepared.spec_json
+                && row.lineage_json == prepared.lineage_json
+                && row.state_kind == "running"
+                && row.state_json == prepared.state_json
+                && row.epoch == prepared.epoch
+                && row.pid.is_none()
+                && u64::try_from(row.metadata_bytes).ok() == Some(prepared.metadata_bytes)
+        });
+        if new.is_some() && !new_exact {
+            return Ok(CommitProbe::Hybrid);
+        }
+        match (old_present, candidates.len(), new_exact) {
+            (present, expected, false) if present == expected => Ok(CommitProbe::OldUnit),
+            (0, _, true) => Ok(CommitProbe::NewUnit),
+            _ => Ok(CommitProbe::Hybrid),
+        }
     }
 
     fn append_batch(
@@ -772,9 +1826,11 @@ impl StateStore {
     fn finalize(
         &mut self,
         id: RunId,
+        actual_pid: u32,
         replay: &OutputReplay,
         state: &RunState,
         durable_head: &Arc<AtomicU64>,
+        metadata_owner: &Arc<AtomicU64>,
     ) -> Result<(), PersistenceError> {
         if state.is_running() {
             return Err(PersistenceError::Mutation(
@@ -812,7 +1868,7 @@ impl StateStore {
         };
         self.append_transaction(
             &[(id, terminal_replay, Arc::clone(durable_head))],
-            Some((id, state)),
+            Some((id, actual_pid, state, metadata_owner)),
         )
     }
 
@@ -842,7 +1898,7 @@ impl StateStore {
     fn append_transaction(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
-        terminal: Option<(RunId, &RunState)>,
+        terminal: Option<(RunId, u32, &RunState, &Arc<AtomicU64>)>,
     ) -> Result<(), PersistenceError> {
         let payload = batch
             .iter()
@@ -859,14 +1915,14 @@ impl StateStore {
             .transaction()
             .map_err(PersistenceError::database)?;
         let mut cursor_updates = HashMap::new();
-        let mut evicted = false;
         for (id, replay, _) in batch {
-            evicted |= append_replay(&transaction, *id, replay)?;
+            let _ = append_replay(&transaction, *id, replay)?;
             let head = read_run_head(&transaction, *id)?;
             cursor_updates.insert(*id, head);
         }
-        evicted |= prune_global_replay(&transaction)?;
-        if let Some((id, state)) = terminal {
+        let _ = prune_global_replay(&transaction)?;
+        let mut terminal_metadata = None;
+        if let Some((id, actual_pid, state, metadata_owner)) = terminal {
             let (kind, state_json) = encoded_state(state)?;
             let (id_text, creation_key, spec_json, lineage_json, source_epoch): (
                 String,
@@ -902,14 +1958,15 @@ impl StateStore {
             let updated = transaction
                 .execute(
                     "UPDATE runs SET state_kind = ?2, state_json = ?3, updated_at_ms = ?4,
-                     terminal_at_ms = ?4, metadata_bytes = ?5
+                     terminal_at_ms = ?4, metadata_bytes = ?5, pid = ?6
                      WHERE id = ?1 AND state_kind = 'running'",
                     params![
                         id.to_string(),
                         kind,
                         state_json,
                         now,
-                        i64::try_from(metadata_bytes).expect("metadata budget fits SQLite")
+                        i64::try_from(metadata_bytes).expect("metadata budget fits SQLite"),
+                        i64::from(actual_pid),
                     ],
                 )
                 .map_err(PersistenceError::database)?;
@@ -918,6 +1975,7 @@ impl StateStore {
                     "Run {id} is not durable running state"
                 )));
             }
+            terminal_metadata = Some((Arc::clone(metadata_owner), metadata_bytes));
         }
         transaction.commit().map_err(PersistenceError::database)?;
         for (id, _, durable_head) in batch {
@@ -925,7 +1983,10 @@ impl StateStore {
                 durable_head.store(*head, Ordering::Release);
             }
         }
-        self.finish_transaction(evicted)
+        if let Some((metadata_owner, metadata_bytes)) = terminal_metadata {
+            metadata_owner.store(metadata_bytes, Ordering::Release);
+        }
+        self.finish_transaction()
     }
 
     fn admit_transaction(&mut self, worst_case_bytes: u64) -> Result<(), PersistenceError> {
@@ -957,12 +2018,7 @@ impl StateStore {
         Ok(())
     }
 
-    fn finish_transaction(&self, evicted: bool) -> Result<(), PersistenceError> {
-        if evicted {
-            self.connection
-                .execute_batch("PRAGMA incremental_vacuum(1024);")
-                .map_err(PersistenceError::database)?;
-        }
+    fn finish_transaction(&self) -> Result<(), PersistenceError> {
         self.validate_files()
     }
 
@@ -1571,98 +2627,118 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
     let mut statement = connection
         .prepare(
             "SELECT id, creation_key, spec_json, lineage_json, state_json, pid, durable_oldest_seq,
-                    durable_head_seq, replay_truncated FROM runs ORDER BY created_at_ms, id",
+                    durable_head_seq, replay_truncated, metadata_bytes
+             FROM runs
+             ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id",
         )
         .map_err(PersistenceError::database)?;
     let mut rows = statement.query([]).map_err(PersistenceError::database)?;
     let mut recovered = Vec::new();
     while let Some(row) = rows.next().map_err(PersistenceError::database)? {
-        let id_text: String = row.get(0).map_err(PersistenceError::database)?;
-        let id: RunId = id_text
-            .parse()
-            .map_err(|_| PersistenceError::Corrupt("invalid recovered Run id".to_owned()))?;
-        let operation_key = row
-            .get::<_, String>(1)
-            .map_err(PersistenceError::database)?
-            .parse()
-            .map_err(|error| {
-                PersistenceError::Corrupt(format!(
-                    "invalid creation operation key for recovered Run {id}: {error}"
-                ))
-            })?;
-        let spec_json = row
-            .get::<_, String>(2)
-            .map_err(PersistenceError::database)?;
-        let spec = decode_native_spec(id, &spec_json)?;
-        let lineage = row
-            .get::<_, Option<String>>(3)
-            .map_err(PersistenceError::database)?
-            .map(|value| serde_json::from_str(&value))
-            .transpose()
-            .map_err(PersistenceError::database)?;
-        let state: RunState = serde_json::from_str(
-            &row.get::<_, String>(4)
-                .map_err(PersistenceError::database)?,
-        )
-        .map_err(PersistenceError::database)?;
-        let pid = row
-            .get::<_, Option<i64>>(5)
-            .map_err(PersistenceError::database)?
-            .map(u32::try_from)
-            .transpose()
-            .map_err(|_| PersistenceError::Corrupt("invalid recovered PID".to_owned()))?;
-        let oldest_seq = nonnegative_u64(
-            row.get(6).map_err(PersistenceError::database)?,
-            "recovered oldest",
-        )?;
-        let head_seq = nonnegative_u64(
-            row.get(7).map_err(PersistenceError::database)?,
-            "recovered head",
-        )?;
-        let truncated = row.get::<_, i64>(8).map_err(PersistenceError::database)? != 0;
-        let mut chunk_statement = connection
-            .prepare("SELECT seq, data FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
-            .map_err(PersistenceError::database)?;
-        let chunks = chunk_statement
-            .query_map([&id_text], |chunk_row| {
-                Ok(OutputChunk {
-                    seq: u64::try_from(chunk_row.get::<_, i64>(0)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            0,
-                            rusqlite::types::Type::Integer,
-                            Box::new(error),
-                        )
-                    })?,
-                    data: chunk_row.get(1)?,
-                })
-            })
-            .map_err(PersistenceError::database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PersistenceError::database)?;
-        recovered.push(RecoveredRun {
-            operation_key,
-            info: RunInfo {
-                id,
-                spec: Some(spec),
-                lineage,
-                backend: RunBackend::Native,
-                capabilities: RunCapabilities::NATIVE,
-                pid,
-                state,
-                head_seq,
-                durable_head_seq: Some(head_seq),
-                oldest_seq,
-                attachments: 0,
-            },
-            replay: OutputReplay {
-                chunks,
-                oldest_seq,
-                head_seq,
-                truncated,
-            },
-        });
+        recovered.push(decode_recovered_row(connection, row)?);
     }
     Ok(recovered)
+}
+
+fn decode_recovered_row(
+    connection: &Connection,
+    row: &rusqlite::Row<'_>,
+) -> Result<RecoveredRun, PersistenceError> {
+    let id_text: String = row.get(0).map_err(PersistenceError::database)?;
+    let id: RunId = id_text
+        .parse()
+        .map_err(|_| PersistenceError::Corrupt("invalid recovered Run id".to_owned()))?;
+    let operation_key = row
+        .get::<_, String>(1)
+        .map_err(PersistenceError::database)?
+        .parse()
+        .map_err(|error| {
+            PersistenceError::Corrupt(format!(
+                "invalid creation operation key for recovered Run {id}: {error}"
+            ))
+        })?;
+    let spec_json = row
+        .get::<_, String>(2)
+        .map_err(PersistenceError::database)?;
+    let spec = decode_native_spec(id, &spec_json)?;
+    let lineage = row
+        .get::<_, Option<String>>(3)
+        .map_err(PersistenceError::database)?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()
+        .map_err(PersistenceError::database)?;
+    let state = serde_json::from_str(
+        &row.get::<_, String>(4)
+            .map_err(PersistenceError::database)?,
+    )
+    .map_err(PersistenceError::database)?;
+    let pid = row
+        .get::<_, Option<i64>>(5)
+        .map_err(PersistenceError::database)?
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| PersistenceError::Corrupt("invalid recovered PID".to_owned()))?;
+    let oldest_seq = nonnegative_u64(
+        row.get(6).map_err(PersistenceError::database)?,
+        "recovered oldest",
+    )?;
+    let head_seq = nonnegative_u64(
+        row.get(7).map_err(PersistenceError::database)?,
+        "recovered head",
+    )?;
+    let truncated = row.get::<_, i64>(8).map_err(PersistenceError::database)? != 0;
+    let metadata_bytes = nonnegative_u64(
+        row.get(9).map_err(PersistenceError::database)?,
+        "recovered metadata bytes",
+    )?;
+    Ok(RecoveredRun {
+        operation_key,
+        info: RunInfo {
+            id,
+            spec: Some(spec),
+            lineage,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid,
+            state,
+            head_seq,
+            durable_head_seq: Some(head_seq),
+            oldest_seq,
+            attachments: 0,
+        },
+        replay: OutputReplay {
+            chunks: load_recovered_chunks(connection, &id_text)?,
+            oldest_seq,
+            head_seq,
+            truncated,
+        },
+        metadata_bytes,
+    })
+}
+
+fn load_recovered_chunks(
+    connection: &Connection,
+    id: &str,
+) -> Result<Vec<OutputChunk>, PersistenceError> {
+    let mut statement = connection
+        .prepare("SELECT seq, data FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
+        .map_err(PersistenceError::database)?;
+    statement
+        .query_map([id], |row| {
+            Ok(OutputChunk {
+                seq: u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                data: row.get(1)?,
+            })
+        })
+        .map_err(PersistenceError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(PersistenceError::database)
 }
 
 fn validate_persistent_start(info: &RunInfo) -> Result<&RunSpec, PersistenceError> {
@@ -1700,47 +2776,6 @@ fn decode_native_spec(id: RunId, spec_json: &str) -> Result<RunSpec, Persistence
     validate_run_spec(&spec)
         .map_err(|error| PersistenceError::Corrupt(format!("invalid spec for {id}: {error}")))?;
     Ok(spec)
-}
-
-fn reserve_run_capacity_to(
-    transaction: &Transaction<'_>,
-    new_metadata_bytes: u64,
-    record_limit: u64,
-    metadata_limit: u64,
-) -> Result<bool, InsertStartError> {
-    let mut evicted = false;
-    loop {
-        let (records, metadata): (i64, i64) = transaction
-            .query_row(
-                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(PersistenceError::database)?;
-        let records = nonnegative_u64(records, "record count")?;
-        let metadata = nonnegative_u64(metadata, "metadata total")?;
-        if records < record_limit && metadata.saturating_add(new_metadata_bytes) <= metadata_limit {
-            return Ok(evicted);
-        }
-        let candidate: Option<String> = transaction
-            .query_row(
-                "SELECT id FROM runs WHERE state_kind != 'running'
-                 ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(PersistenceError::database)?;
-        let Some(candidate) = candidate else {
-            return Err(InsertStartError::AdmissionRejected(
-                "running Run records exhaust the durable record or metadata budget".to_owned(),
-            ));
-        };
-        transaction
-            .execute("DELETE FROM runs WHERE id = ?1", [candidate])
-            .map_err(PersistenceError::database)?;
-        evicted = true;
-    }
 }
 
 fn append_replay(
@@ -2082,23 +3117,23 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::fs::OpenOptions;
 
     use ctxmux_protocol::{
         CreateOperationKey, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo,
         RunSpec, RunState, TerminalSize,
     };
-    use rusqlite::{Connection, OptionalExtension, params};
+    use rusqlite::{Connection, params};
     use tempfile::TempDir;
 
     use super::{
-        AdmissionLimits, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, InsertStartError,
-        MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
-        PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, RUN_RECORDS, SHM_MAX_BYTES,
-        STATE_FILES_MAX_BYTES, StateLockGuard, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay,
-        create_schema, metadata_size, prune_global_replay_to, reserve_run_capacity_to,
-        validate_existing_schema,
+        AdmissionLimits, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, MAX_TRANSACTION_PAYLOAD_BYTES,
+        METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES, PERSISTENCE_QUEUE_CAPACITY,
+        Persistence, PersistenceError, PersistentCandidate, PersistentStartCompletion, RUN_RECORDS,
+        SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartDisposition, StartReceipt, StateLockGuard,
+        WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay, create_schema, metadata_size,
+        prune_global_replay_to, validate_existing_schema, wal_charge_for_cache,
     };
 
     #[test]
@@ -2164,6 +3199,31 @@ mod tests {
     }
 
     #[test]
+    fn staged_start_receipt_resolves_once_and_never_reopens() {
+        let receipt = StartReceipt::pending();
+        assert_eq!(receipt.disposition(), StartDisposition::Pending);
+        assert!(receipt.decide(StartDisposition::Committed));
+        assert!(!receipt.decide(StartDisposition::NotCommitted));
+        assert!(!receipt.decide(StartDisposition::CommitUnknown));
+        assert_eq!(receipt.disposition(), StartDisposition::Committed);
+
+        let lost = StartReceipt::pending();
+        assert_eq!(lost.unknown_if_pending(), StartDisposition::CommitUnknown);
+        assert!(!lost.decide(StartDisposition::NotCommitted));
+    }
+
+    #[test]
+    fn cache_charge_formula_has_an_exact_eight_mib_boundary() {
+        let admitted_frames = (WAL_CHECKPOINT_BYTES - 32) / (PAGE_SIZE_BYTES + 24);
+        let admitted_cache = admitted_frames * PAGE_SIZE_BYTES;
+        assert!(wal_charge_for_cache(admitted_cache).unwrap() <= WAL_CHECKPOINT_BYTES);
+        assert!(
+            wal_charge_for_cache(admitted_cache + 1).unwrap() > WAL_CHECKPOINT_BYTES,
+            "one byte into another conservative page crosses the frozen charge"
+        );
+    }
+
+    #[test]
     fn creation_key_index_is_unique_binary_and_exactly_validated() {
         let connection = test_connection();
         validate_existing_schema(&connection).expect("accept canonical schema 2 index");
@@ -2203,7 +3263,7 @@ mod tests {
         else {
             panic!("store-level duplicate must be a fatal owner invariant breach");
         };
-        assert!(matches!(error, PersistenceError::Database(_)));
+        assert!(matches!(error, PersistenceError::Mutation(_)));
         let later = running_info(RunId::new());
         let Err(latched) =
             persistence.insert_start(&CreateOperationKey::new("later").unwrap(), &later)
@@ -2215,62 +3275,6 @@ mod tests {
         drop(persistence);
         let (reopened, recovered) = Persistence::open(state_dir).expect("reopen prior unit");
         assert_eq!(recovered.len(), 2);
-        drop(reopened);
-    }
-
-    #[test]
-    fn unique_failure_rolls_back_a_terminal_eviction_in_the_same_transaction() {
-        let temp = TempDir::new().expect("create eviction rollback fixture");
-        let state_dir = temp.path().join("state");
-        let limits = AdmissionLimits {
-            run_records: 2,
-            metadata_bytes: METADATA_BYTES,
-        };
-        let (persistence, recovered) =
-            Persistence::open_with_admission_limits(state_dir.clone(), limits)
-                .expect("open eviction rollback store");
-        assert!(recovered.is_empty());
-
-        let terminal = running_info(RunId::new());
-        let terminal_key = CreateOperationKey::new("rollback-terminal").unwrap();
-        let terminal_durable = persistence
-            .insert_start(&terminal_key, &terminal)
-            .expect("insert terminal eviction candidate");
-        terminal_durable.finalize(terminal.id, replay(Vec::new()), exited_state());
-
-        let retained = running_info(RunId::new());
-        let conflicting_key = CreateOperationKey::new("rollback-conflict").unwrap();
-        let retained_durable = persistence
-            .insert_start(&conflicting_key, &retained)
-            .expect("insert retained conflicting owner");
-        let rejected = running_info(RunId::new());
-        let Err(error) = persistence.insert_start(&conflicting_key, &rejected) else {
-            panic!("unique conflict admitted after tentative eviction");
-        };
-        assert!(matches!(error, PersistenceError::Database(_)));
-
-        drop(retained_durable);
-        drop(terminal_durable);
-        drop(persistence);
-        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen rolled-back store");
-        assert_eq!(recovered.len(), 2);
-        let recovered_pairs = recovered
-            .iter()
-            .map(|run| {
-                (
-                    run.info.id.to_string(),
-                    run.operation_key.as_str().to_owned(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            recovered_pairs,
-            BTreeSet::from([
-                (terminal.id.to_string(), terminal_key.as_str().to_owned()),
-                (retained.id.to_string(), conflicting_key.as_str().to_owned()),
-            ])
-        );
-        assert!(!recovered.iter().any(|run| run.info.id == rejected.id));
         drop(reopened);
     }
 
@@ -2310,35 +3314,6 @@ mod tests {
     }
 
     #[test]
-    fn record_capacity_evicts_terminal_history_but_never_a_running_owner() {
-        let mut connection = test_connection();
-        let transaction = connection
-            .transaction()
-            .expect("start record capacity transaction");
-        let running = RunId::new();
-        let terminal = RunId::new();
-        insert_test_run(&transaction, running, "running", 1);
-        insert_test_run(&transaction, terminal, "exited", 1);
-        assert!(
-            reserve_run_capacity_to(&transaction, 1, 2, 3)
-                .expect("evict terminal record for new reservation")
-        );
-        assert!(run_exists(&transaction, running));
-        assert!(!run_exists(&transaction, terminal));
-        transaction.rollback().expect("rollback capacity fixture");
-
-        let transaction = connection
-            .transaction()
-            .expect("start running-only capacity transaction");
-        insert_test_run(&transaction, RunId::new(), "running", 1);
-        insert_test_run(&transaction, RunId::new(), "running", 1);
-        assert!(matches!(
-            reserve_run_capacity_to(&transaction, 1, 2, 3),
-            Err(InsertStartError::AdmissionRejected(_))
-        ));
-    }
-
-    #[test]
     fn rejected_start_admission_does_not_poison_the_actor() {
         let temp = TempDir::new().expect("create persistence admission fixture");
         let state_dir = temp.path().join("state");
@@ -2352,30 +3327,48 @@ mod tests {
         assert!(recovered.is_empty());
 
         let first = running_info(RunId::new());
+        let first_key = test_operation_key(first.id);
         let first_durable = persistence
-            .insert_start(&test_operation_key(first.id), &first)
+            .insert_start(&first_key, &first)
             .expect("insert first running record");
         let second = running_info(RunId::new());
-        let Err(rejection) = persistence.insert_start(&test_operation_key(second.id), &second)
-        else {
+        let second_key = test_operation_key(second.id);
+        let prepared = persistence
+            .prepare_start(&second_key, &second)
+            .expect("prepare second start");
+        let Err(rejection) = persistence.stage_start(prepared, Vec::new()) else {
             panic!("running-only capacity admitted a second record");
         };
-        assert!(matches!(rejection, PersistenceError::Mutation(_)));
-        assert!(
-            rejection
-                .to_string()
-                .contains("durable record or metadata budget")
-        );
+        assert_eq!(rejection.disposition(), StartDisposition::NotCommitted);
+        assert!(rejection.is_capacity());
 
         let first_replay = replay(vec![chunk(1, b"first")]);
         first_durable.append(first.id, first_replay.clone());
-        first_durable.finalize(first.id, first_replay, exited_state());
+        first_durable.finalize(first.id, 42, first_replay, exited_state());
         assert_eq!(first_durable.durable_head(), 1);
 
-        let second_durable = persistence
-            .insert_start(&test_operation_key(second.id), &second)
-            .expect("same actor admits a Run after terminal eviction");
-        second_durable.finalize(second.id, replay(Vec::new()), exited_state());
+        let prepared = persistence
+            .prepare_start(&second_key, &second)
+            .expect("prepare exact replacement");
+        let staged = persistence
+            .stage_start(
+                prepared,
+                vec![PersistentCandidate::new(
+                    first.id,
+                    first_key,
+                    first_durable
+                        .metadata_bytes_owner()
+                        .load(std::sync::atomic::Ordering::Acquire),
+                )],
+            )
+            .expect("exact terminal candidate funds replacement");
+        let PersistentStartCompletion::Committed(second_durable) = staged.commit() else {
+            panic!("exact replacement did not commit");
+        };
+        second_durable.finalize(second.id, 42, replay(Vec::new()), exited_state());
+        let second_metadata = second_durable
+            .metadata_bytes_owner()
+            .load(std::sync::atomic::Ordering::Acquire);
         drop(second_durable);
         drop(first_durable);
         persistence.assert_exclusive_owner();
@@ -2385,6 +3378,64 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].info.id, second.id);
         assert_eq!(recovered[0].info.state, exited_state());
+        assert_eq!(recovered[0].info.pid, Some(42));
+        assert_eq!(recovered[0].metadata_bytes, second_metadata);
+        drop(reopened);
+    }
+
+    #[test]
+    fn wrong_exact_candidate_snapshot_rolls_back_without_deleting_history() {
+        let temp = TempDir::new().expect("create exact-candidate fixture");
+        let state_dir = temp.path().join("state");
+        let limits = AdmissionLimits {
+            run_records: 1,
+            metadata_bytes: METADATA_BYTES,
+        };
+        let (persistence, recovered) =
+            Persistence::open_with_admission_limits(state_dir.clone(), limits)
+                .expect("open exact-candidate store");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let first_key = test_operation_key(first.id);
+        let first_durable = persistence
+            .insert_start(&first_key, &first)
+            .expect("insert candidate");
+        let first_replay = replay(vec![chunk(1, b"retained")]);
+        first_durable.append(first.id, first_replay.clone());
+        first_durable.finalize(first.id, 77, first_replay, exited_state());
+
+        let replacement = running_info(RunId::new());
+        let replacement_key = test_operation_key(replacement.id);
+        let prepared = persistence
+            .prepare_start(&replacement_key, &replacement)
+            .expect("prepare replacement");
+        let wrong_metadata = first_durable
+            .metadata_bytes_owner()
+            .load(std::sync::atomic::Ordering::Acquire)
+            .checked_add(1)
+            .expect("fixture metadata does not overflow");
+        let Err(failure) = persistence.stage_start(
+            prepared,
+            vec![PersistentCandidate::new(
+                first.id,
+                first_key,
+                wrong_metadata,
+            )],
+        ) else {
+            panic!("wrong candidate snapshot must fail closed");
+        };
+        assert_eq!(failure.disposition(), StartDisposition::NotCommitted);
+        assert!(!failure.is_capacity());
+        assert!(persistence.is_failed());
+
+        drop(first_durable);
+        drop(persistence);
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen rolled-back store");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].info.id, first.id);
+        assert_eq!(recovered[0].info.pid, Some(77));
+        assert_eq!(recovered[0].replay.chunks, vec![chunk(1, b"retained")]);
         drop(reopened);
     }
 
@@ -2605,15 +3656,5 @@ mod tests {
             seq,
             data: data.to_vec(),
         }
-    }
-
-    fn run_exists(transaction: &rusqlite::Transaction<'_>, id: RunId) -> bool {
-        transaction
-            .query_row("SELECT 1 FROM runs WHERE id = ?1", [id.to_string()], |_| {
-                Ok(())
-            })
-            .optional()
-            .expect("query test Run existence")
-            .is_some()
     }
 }
