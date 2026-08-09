@@ -1,4 +1,4 @@
-//! Narrow audited access to SQLite connection cache counters.
+//! Narrow audited access to `SQLite` connection cache counters.
 //!
 //! `rusqlite` 0.40 does not expose `sqlite3_db_status64`. Keeping the raw
 //! handle access in this private leaf lets the daemon itself retain its
@@ -8,8 +8,9 @@
 
 use rusqlite::{Connection, Error, ffi};
 
-/// SQLite version whose pager-accounting implementation backs the WAL proof.
+/// `SQLite` version whose pager-accounting implementation backs the WAL proof.
 pub const PROVEN_SQLITE_VERSION: i32 = 3_053_002;
+const _: () = assert!(ffi::SQLITE_VERSION_NUMBER == PROVEN_SQLITE_VERSION);
 
 /// Pager-cache observations used by the spill-disabled WAL admission proof.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,7 +27,7 @@ pub struct CacheStatus {
 ///
 /// # Errors
 ///
-/// Returns SQLite's typed failure when this pinned library does not support a
+/// Returns `SQLite`'s typed failure when this pinned library does not support a
 /// requested status verb or cannot observe the connection.
 pub fn reset_cache_io(connection: &Connection) -> Result<(), Error> {
     ensure_proven_version()?;
@@ -39,7 +40,7 @@ pub fn reset_cache_io(connection: &Connection) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// Returns SQLite's typed failure when the runtime SQLite version or required
+/// Returns `SQLite`'s typed failure when the runtime `SQLite` version or required
 /// connection-status observations differ from the source-bound proof.
 pub fn cache_admission_snapshot(connection: &Connection) -> Result<CacheStatus, Error> {
     ensure_proven_version()?;
@@ -74,8 +75,8 @@ fn read_status(connection: &Connection, verb: i32, reset: bool) -> Result<u64, E
         ffi::sqlite3_db_status64(
             connection.handle(),
             verb,
-            &mut current,
-            &mut high_water,
+            &raw mut current,
+            &raw mut high_water,
             i32::from(reset),
         )
     };
@@ -110,7 +111,6 @@ mod tests {
                 "CREATE TABLE facts(value BLOB); INSERT INTO facts VALUES (zeroblob(4096));",
             )
             .unwrap();
-
         reset_cache_io(&connection).unwrap();
         let observed = cache_admission_snapshot(&connection).unwrap();
 
@@ -137,6 +137,10 @@ mod tests {
                  PRAGMA wal_checkpoint(TRUNCATE);",
             )
             .unwrap();
+        let page_size: i64 = connection
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        assert_eq!(page_size, i64::try_from(PAGE_BYTES).unwrap());
         connection.release_memory().unwrap();
         reset_cache_io(&connection).unwrap();
         connection
@@ -159,6 +163,7 @@ mod tests {
 
         connection.execute_batch("COMMIT;").unwrap();
         let actual = fs::metadata(&wal).unwrap().len();
+        assert_eq!((actual - WAL_HEADER_BYTES) % FRAME_BYTES, 0);
         assert!(actual <= bound, "actual WAL {actual} exceeds bound {bound}");
     }
 }

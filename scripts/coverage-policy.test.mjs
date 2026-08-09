@@ -856,7 +856,10 @@ test("checked-in policy fixes every current product owner and floor", () => {
         id: "rust-persistence",
         language: "rust",
         floor_class: "runtime",
-        paths: ["crates/ctxmux-daemon/src/persistence.rs"],
+        paths: [
+          "crates/ctxmux-daemon/src/persistence.rs",
+          "crates/ctxmux-sqlite-status/src/lib.rs",
+        ],
       },
       {
         id: "rust-tmux",
