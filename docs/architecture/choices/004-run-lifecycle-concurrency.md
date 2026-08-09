@@ -9,7 +9,7 @@ Multiple short requests and long-lived attachments may act on the same Run while
 
 ## Decision
 
-`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and disables the sender immediately after wait observes exit. If `try_wait` itself fails, the waiter instead transfers the actual handle once into the native control owner's irreversible fail-stop state. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
+`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and uses non-reaping `waitid` until the complete owned session is empty. It then reaps the leader and disables the sender before terminal publication. If non-reaping status observation itself fails, the waiter instead transfers the actual handle once into the native control owner's irreversible fail-stop state. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
 
 Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` decrements the counter on every return path, including transport failure.
 
@@ -28,7 +28,7 @@ The hook is not a public fault API and cannot change production scheduling.
 - Lifecycle errors are explicit after a Run reaches `exited`.
 - A stop after child wait cannot signal by stale numeric identity, even while
   public state publication is deliberately paused.
-- The first unclassified native `try_wait` failure ends polling, closes Input,
+- The first unclassified native non-reaping status failure ends polling, closes Input,
   Resize, Stop, and Level-B authority with `backend_unavailable`, fences new
   physical launches, and fails the daemon incarnation. It publishes neither
   `Exited` nor `Interrupted`: no portable child status was observed. The
@@ -55,7 +55,7 @@ The hook is not a public fault API and cannot change production scheduling.
   private publication owner before waiter or output-reader worker setup can
   fail or unwind. A persistence rejection before `COMMIT` asks that same Run's
   child-handle waiter to terminate the unpublished child. The waiter's
-  `try_wait(Some(_))` receipt proves reap, but the key reopens only after
+  final `child.wait()` receipt proves reap, but the key reopens only after
   reader, waiter, control, input, and Run owners are also quiescent. Until then
   the publication owner transfers an exact-key fence to one private globally
   eight-slot-bounded cleanup owner before releasing the random stripe and
@@ -102,7 +102,7 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
 
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered byte can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
-- `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now removes signalling authority before publication, and a deterministic barrier proves stop rejects during that interval without touching an unrelated process.
+- `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now preserves the waitable leader as an incarnation anchor through descendant cleanup, then removes signalling authority before publication. A forced same-numeric fixture proves reaped identities cannot regain signal authority or touch the unrelated process.
 - `LC-004`: retrying an unclassified child-status error every 20 ms can retain
   one busy waiter forever, while treating it as exit would fabricate reap and
   permit unsafe key reuse. The first error now transfers the handle into a

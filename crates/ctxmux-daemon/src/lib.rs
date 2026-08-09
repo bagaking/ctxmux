@@ -2897,7 +2897,7 @@ impl Run {
 fn wait_for_child(
     mut child: Box<dyn Child + Send + Sync>,
     commands: mpsc::Receiver<ChildCommand>,
-    session: NativeSession,
+    mut session: NativeSession,
     control: &NativeControlOwner,
     failure: &NativeWaitFailure,
 ) -> NativeWaitOutcome {
@@ -2934,13 +2934,11 @@ fn wait_for_child(
             }
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
         }
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                match session.finish_after_direct_exit(
-                    child.as_mut(),
-                    status,
-                    Instant::now() + STOP_FORCED_TIMEOUT,
-                ) {
+        match session.leader_is_terminal() {
+            Ok(true) => {
+                match session
+                    .finish_after_direct_exit(child.as_mut(), Instant::now() + STOP_FORCED_TIMEOUT)
+                {
                     Ok(status) => {
                         control.mark_reaped();
                         return NativeWaitOutcome::Exited(exit_state(&status));
@@ -2953,9 +2951,8 @@ fn wait_for_child(
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
-                let error = format!("failed to wait for child: {error}");
                 control.mark_wait_authority_lost(error.clone(), child);
                 drop(commands);
                 failure.record(control.run_id(), &error);
@@ -4058,6 +4055,16 @@ mod tests {
         }
     }
 
+    fn wait_failing_session(counts: &Arc<WaitFailureCounts>) -> super::NativeSession {
+        let probe_counts = Arc::clone(counts);
+        super::NativeSession::from_child_pid(42)
+            .unwrap()
+            .with_leader_probe_for_test(Arc::new(move || {
+                probe_counts.try_wait.fetch_add(1, Ordering::AcqRel);
+                Err("fixture wait authority lost".to_owned())
+            }))
+    }
+
     #[test]
     fn native_wait_error_fail_stops_once_without_dropping_or_signalling_child() {
         let run_id = RunId::new();
@@ -4068,7 +4075,7 @@ mod tests {
         let outcome = wait_for_child(
             Box::new(WaitFailingChild(Arc::clone(&counts))),
             commands,
-            super::NativeSession::from_child_pid(42).unwrap(),
+            wait_failing_session(&counts),
             &control,
             &failure,
         );
@@ -4194,10 +4201,11 @@ mod tests {
 
         let waiter_counts = Arc::clone(&counts);
         let waiter = std::thread::spawn(move || {
+            let session = wait_failing_session(&waiter_counts);
             wait_for_child(
                 Box::new(WaitFailingChild(waiter_counts)),
                 commands,
-                super::NativeSession::from_child_pid(42).unwrap(),
+                session,
                 &control,
                 &wait_failure,
             )

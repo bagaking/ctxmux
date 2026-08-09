@@ -31,36 +31,55 @@ mod macos {
     /// potentially truncated owner set.
     #[allow(unsafe_code)]
     pub fn process_ids() -> io::Result<Vec<u32>> {
+        collect_process_ids(reported_process_capacity()?, |pids| {
+            let buffer_bytes = pids
+                .len()
+                .checked_mul(std::mem::size_of::<libc::pid_t>())
+                .and_then(|bytes| i32::try_from(bytes).ok())
+                .ok_or_else(|| io::Error::other("process list byte size overflow"))?;
+            let actual =
+                unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), buffer_bytes) };
+            if actual < 1 {
+                return Err(io::Error::last_os_error());
+            }
+            usize::try_from(actual).map_err(|_| io::Error::other("process list count was negative"))
+        })
+    }
+
+    #[allow(unsafe_code)]
+    fn reported_process_capacity() -> io::Result<usize> {
         let reported = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         if reported < 1 {
             return Err(io::Error::last_os_error());
         }
-        let capacity = usize::try_from(reported)
+        usize::try_from(reported)
             .ok()
             .and_then(|count| count.checked_mul(2))
-            .ok_or_else(|| io::Error::other("process list capacity overflow"))?;
-        let buffer_bytes = capacity
-            .checked_mul(std::mem::size_of::<libc::pid_t>())
-            .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| io::Error::other("process list byte size overflow"))?;
-        let mut pids = vec![0; capacity];
-        let actual =
-            unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), buffer_bytes) };
-        if actual < 1 {
-            return Err(io::Error::last_os_error());
+            .ok_or_else(|| io::Error::other("process list capacity overflow"))
+    }
+
+    fn collect_process_ids(
+        mut capacity: usize,
+        mut fill: impl FnMut(&mut [libc::pid_t]) -> io::Result<usize>,
+    ) -> io::Result<Vec<u32>> {
+        const MAX_ATTEMPTS: usize = 3;
+        for _ in 0..MAX_ATTEMPTS {
+            let mut pids = vec![0; capacity];
+            let actual = fill(&mut pids)?;
+            if actual < capacity {
+                pids.truncate(actual);
+                return Ok(pids
+                    .into_iter()
+                    .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
+                    .collect());
+            }
+            capacity = capacity
+                .checked_mul(2)
+                .ok_or_else(|| io::Error::other("process list capacity overflow"))?;
         }
-        let actual = usize::try_from(actual)
-            .map_err(|_| io::Error::other("process list count was negative"))?;
-        if actual > capacity {
-            return Err(io::Error::other(
-                "process list changed beyond the reserved snapshot capacity",
-            ));
-        }
-        pids.truncate(actual);
-        Ok(pids
-            .into_iter()
-            .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
-            .collect())
+        Err(io::Error::other(
+            "process list remained saturated across bounded snapshot retries",
+        ))
     }
 
     /// Reads one process without enumerating unrelated system PIDs.
@@ -157,6 +176,32 @@ mod macos {
             unique.sort_unstable();
             unique.dedup();
             assert_eq!(pids.len(), unique.len());
+        }
+
+        #[test]
+        fn saturated_process_snapshots_retry_then_require_spare_capacity() {
+            let mut capacities = Vec::new();
+            let pids = super::collect_process_ids(2, |buffer| {
+                capacities.push(buffer.len());
+                if buffer.len() < 8 {
+                    Ok(buffer.len())
+                } else {
+                    buffer[..2].copy_from_slice(&[17, 23]);
+                    Ok(2)
+                }
+            })
+            .unwrap();
+            assert_eq!(capacities, [2, 4, 8]);
+            assert_eq!(pids, [17, 23]);
+
+            let mut attempts = 0;
+            let error = super::collect_process_ids(2, |buffer| {
+                attempts += 1;
+                Ok(buffer.len())
+            })
+            .unwrap_err();
+            assert_eq!(attempts, 3);
+            assert!(error.to_string().contains("remained saturated"));
         }
 
         #[test]

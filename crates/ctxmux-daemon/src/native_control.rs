@@ -814,9 +814,10 @@ impl NativeControlOwner {
         mutex_lock(&self.inner.state).phase == ControlPhase::Open
     }
 
-    /// Record the only successful terminal-and-reaped proof: the waiter
-    /// observed `try_wait(Some(_))` before any authority-loss transfer. Once
-    /// the handle moves into `WaitAuthorityLost`, this cannot replace it.
+    /// Record the only successful terminal-and-reaped proof: the waiter kept
+    /// the leader waitable through session cleanup, then completed its final
+    /// `child.wait()` before any authority-loss transfer. Once the handle moves
+    /// into `WaitAuthorityLost`, this cannot replace it.
     pub(crate) fn mark_reaped(&self) {
         let mut reap = mutex_lock(&self.inner.reap);
         if matches!(&*reap, ChildReapState::Pending { .. }) {

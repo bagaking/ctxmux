@@ -154,7 +154,7 @@
       "kind": "test",
       "path": "crates/ctxmux-process-stats/src/lib.rs",
       "invariants": [
-        "the audited leaf is explicitly macOS-only; on macOS it returns complete process-ID snapshots, reads one PID without system-wide object retention, fences process identity around RSS, and matches the established ps scale"
+        "the audited leaf is explicitly macOS-only; on macOS it returns process-ID snapshots only with proven spare capacity, retries saturated buffers within one deterministic bound, reads one PID without system-wide object retention, fences process identity around RSS, and matches the established ps scale"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -245,8 +245,22 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/lib.rs",
       "invariants": [
-        "launch rollback, waiter-owned reap proof, replay retention, socket ownership, bounded tmux command tracking, and creation-stripe publication remain owner-local",
+        "launch rollback, waitable-leader incarnation ownership, final waiter-owned reap proof, replay retention, socket ownership, bounded tmux command tracking, and creation-stripe publication remain owner-local",
         "committed postcheck failures, quick terminal handoff, and durable key collection converge without a second process or immortal mapping"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-session-owner-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/native_session.rs",
+      "invariants": [
+        "a waitable leader anchors native session incarnation authority until descendant cleanup, a reaped numeric identity cannot authorize a signal, and only ESRCH proves census absence"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -458,7 +472,7 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
       "invariants": [
-        "real daemon, process, PTY, replay, stop, and fork behavior cross the public boundary",
+        "real daemon, process, PTY, replay, stop, and fork behavior cross the public boundary, including exact Interrupt, Stop, and natural-exit races with no process survivor or post-Stop signal effect",
         "abandoned Start and Fork responses converge on exact Run and PID sets while atomic process markers prove one execution per retained key"
       ],
       "selection_ref": "scripts/check.sh",

@@ -404,6 +404,14 @@ records seed, case counts, exact commands, environment, covered owner
 boundaries, and excluded claims before execution, so a failure retains replay
 information even when a later command never runs.
 
+A separate real-process terminal race runs Interrupt and Stop while the leader
+self-terminates. It accepts only an owner-ordered control success or typed
+post-exit rejection, then proves the Run leader is gone, a later Interrupt is
+rejected, and no post-Stop signal side effect appears. Owner-level fixtures
+also force a reaped numeric identity against a live unrelated sentinel, retain
+non-`ESRCH` census uncertainty, and make saturated macOS PID snapshots retry or
+fail instead of proving false quiescence.
+
 ### Benchmarks and performance regression
 
 Create a repository-owned harness for:

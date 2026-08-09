@@ -81,6 +81,8 @@ start accepted
 
 `portable-pty` establishes each native child as a POSIX session leader before
 exec. The waiter retains the actual child handle and owns that session identity.
+It observes terminal state with non-reaping `waitid`; the waitable leader remains
+an incarnation anchor until every descendant is gone, and only then is reaped.
 `interrupt` reads the current foreground process group from the PTY, proves a
 member still belongs to the Run session, and delivers `SIGINT` without changing
 the Run phase. `stop` fences later controls, sends `SIGTERM` to revalidated
@@ -96,7 +98,7 @@ remain retained until admission reaches the 128-record ceiling, then the
 Registry fences exact fully quiescent candidates; persistent COMMIT removes the
 same Runs, replay, and byte-exact keys before publishing the successor.
 
-If native `try_wait` fails before yielding a child status, ctxmux does not
+If native non-reaping status observation fails before yielding a child status, ctxmux does not
 pretend the Run exited. It stops polling, transfers the real child handle into
 an irreversible native fail-stop owner, closes that Run's live controls, fences
 new physical launches, and fails the serving daemon incarnation; `ctxmuxd`
@@ -361,8 +363,9 @@ The important guarantees are behavioral, not implied by lock types.
   process-tree policy.
 - Malformed or oversized transport frames can close the connection before a structured protocol error is sent. Explicit error categories cover validly decoded requests and lifecycle failures.
 - Native Stop owns one `portable-pty`-created POSIX session. It terminates and
-  revalidates every member, reaps the direct child, and reports failure unless
-  that scope is empty. Descendants that create another session are outside this
+  revalidates every member while the unreaped leader anchors the exact session
+  incarnation, then reaps that leader, and reports failure unless that scope is
+  empty. Descendants that create another session are outside this
   declared ownership boundary. Daemon `Ctrl-C` still stops the listener and
   drops in-memory ownership; native shutdown policy remains separate work.
 

@@ -2030,3 +2030,83 @@ async fn concurrent_interrupt_and_stop_have_only_owner_declared_outcomes() {
     }
     assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_interrupt_stop_and_natural_exit_leave_no_signal_or_process_survivor() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("terminal-race-child");
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap 'printf X >> \"$CTXMUX_RACE_MARKER\"' INT; ",
+                    "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & ",
+                    "descendant=$!; ",
+                    "printf '%s\\n%s\\n' \"$$\" \"$descendant\" > \"$CTXMUX_RACE_PID\"; ",
+                    "(sleep 0.05; kill -TERM $$) & ",
+                    "while :; do sleep 1; wait $!; done"
+                )
+                .to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::from([
+                (
+                    "CTXMUX_RACE_PID".to_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ),
+                (
+                    "CTXMUX_RACE_MARKER".to_owned(),
+                    marker
+                        .with_extension("interrupts")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+            ]),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start terminal race fixture");
+    let pids = wait_for_marker_pids(&marker, 2).await;
+    let interrupt_client = daemon.client.clone();
+    let stop_client = daemon.client.clone();
+    let (interrupt, stop) =
+        tokio::join!(interrupt_client.interrupt(run.id), stop_client.stop(run.id),);
+    if let Err(error) = interrupt {
+        assert!(matches!(
+            error,
+            ClientError::ControlRejected { ref failure }
+                if failure.error.code == ErrorCode::InvalidRunState
+        ));
+    }
+    if let Err(error) = stop {
+        assert!(matches!(
+            error,
+            ClientError::ControlRejected { ref failure }
+                if failure.error.code == ErrorCode::InvalidRunState
+        ));
+    }
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
+    for pid in pids {
+        assert!(
+            !process_exists(pid),
+            "terminal race left Run process {pid} live"
+        );
+    }
+
+    let before = std::fs::read(marker.with_extension("interrupts")).unwrap_or_default();
+    assert_protocol_error(
+        daemon
+            .client
+            .interrupt(run.id)
+            .await
+            .expect_err("terminal Run rejects post-Stop Interrupt"),
+        ErrorCode::InvalidRunState,
+    );
+    sleep(Duration::from_millis(50)).await;
+    let after = std::fs::read(marker.with_extension("interrupts")).unwrap_or_default();
+    assert_eq!(after, before, "post-Stop Interrupt produced a side effect");
+}
