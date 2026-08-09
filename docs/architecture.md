@@ -15,7 +15,7 @@ Current guarantees are deliberately narrower than the product vision.
 | Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 1.              | Other SDKs appear only for a real client requirement.               |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`. | Screen reconstruction and a multi-writer policy are open.           |
 | Backends         | One native `portable-pty` implementation.                                             | A public-surface tmux adapter is provisional.                       |
-| Integrations     | No Integration contract exists in code yet.                                           | Explicitly imported TypeScript Integrations are provisional.        |
+| Integrations     | The SDK has an explicit host binding contract and a generic shell Integration.        | The first coding-Agent Integration and semantic observer are next.  |
 | Context and fork | `RunSpec` contains launch inputs only.                                                | Level A and Level B context, artifacts, lineage, and fork are open. |
 | Persistence      | Run metadata and output live in daemon memory.                                        | Durable metadata, GC, and restart reconciliation are open.          |
 
@@ -64,23 +64,23 @@ start accepted
 
 ### Ownership split
 
-| Owner        | Responsibilities                                                                                                                                                                              |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runtime core | Run identity and launch spec, PTY and child lifecycle, ordered raw output, attachment and reconnect behavior, public errors, and the persistence required by declared guarantees.             |
-| Integration  | Tool detection, launch planning, capability declaration, tool-specific context capture, native resume or fork plans, and optional semantic events. This is target behavior, not current code. |
-| Client       | Terminal rendering, editing UI, user workflow, multi-Run composition, Agent scheduling and evaluation, and Crucible or MapReduce policy.                                                      |
+| Owner        | Responsibilities                                                                                                                                                                                    |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime core | Run identity and launch spec, PTY and child lifecycle, ordered raw output, attachment and reconnect behavior, public errors, and the persistence required by declared guarantees.                   |
+| Integration  | Tool detection, structured launch planning, capability declaration, and optional host-local semantic events. Shell behavior is current; tool-specific context, native resume, and fork are targets. |
+| Client       | Terminal rendering, editing UI, user workflow, multi-Run composition, Agent scheduling and evaluation, and Crucible or MapReduce policy.                                                            |
 
 ## Components and stable boundaries
 
 Each package has one reason to change.
 
-| Component         | Responsibility                                                                           | Must not own                                  |
-| ----------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------- |
-| `ctxmux-protocol` | Rust wire types, generation constant, frame limit, serialization, and TypeScript export. | Live processes or client policy.              |
-| `ctxmux-client`   | Rust connector, request lifecycle, attachment connection, and typed public errors.       | Daemon state.                                 |
-| `ctxmux-daemon`   | Unix listener, Run manager, PTYs, children, replay, events, and socket lifecycle.        | Agent-specific semantics or UI.               |
-| `ctxmux`          | Human CLI, raw terminal mode, resize forwarding, and detach prefix.                      | Direct access to daemon internals.            |
-| `@ctxmux/sdk`     | Node Unix-socket connector and TypeScript request and attachment APIs.                   | Electron, React, an editor, or Run ownership. |
+| Component         | Responsibility                                                                            | Must not own                                  |
+| ----------------- | ----------------------------------------------------------------------------------------- | --------------------------------------------- |
+| `ctxmux-protocol` | Rust wire types, generation constant, frame limit, serialization, and TypeScript export.  | Live processes or client policy.              |
+| `ctxmux-client`   | Rust connector, request lifecycle, attachment connection, and typed public errors.        | Daemon state.                                 |
+| `ctxmux-daemon`   | Unix listener, Run manager, PTYs, children, replay, events, and socket lifecycle.         | Agent-specific semantics or UI.               |
+| `ctxmux`          | Human CLI, raw terminal mode, resize forwarding, and detach prefix.                       | Direct access to daemon internals.            |
+| `@ctxmux/sdk`     | Node connector, request and attachment APIs, and explicit host-local Integration binding. | Electron, React, an editor, or Run ownership. |
 
 The stable product boundary is the local protocol, not a Rust ABI or Node native addon. Rust and TypeScript clients can evolve independently while exercising the same daemon path.
 
@@ -141,7 +141,7 @@ A Backend answers where and how a Run executes. An Integration answers what runs
 
 The current native PTY is a Backend implementation even though the public Backend interface has not been extracted. A future Codex Integration may launch through native PTY or tmux without creating two unrelated client APIs.
 
-Integrations remain ordinary TypeScript packages explicitly imported by a host. The daemon does not discover packages, embed JavaScript, launch plugin processes, or host a marketplace. If an Integration observer disappears, the raw daemon-owned Run must remain usable.
+Integrations remain ordinary TypeScript modules exported by explicitly imported packages; the first-party modules currently use the SDK's `integrations` subpath. The daemon does not discover packages, embed JavaScript, launch plugin processes, or host a marketplace. If an Integration observer disappears, the raw daemon-owned Run must remain usable.
 
 ## Context, fork, and tmux targets
 

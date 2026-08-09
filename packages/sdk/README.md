@@ -21,6 +21,25 @@ const run = await client.start(
 `status`, `input`, `resize`, and `stop` use short-lived protocol connections.
 Closing the SDK process does not stop a daemon-owned Run.
 
+## Bind an Integration explicitly
+
+```ts
+import { CtxmuxClient, registerIntegration } from "@ctxmux/sdk";
+import { shellIntegration } from "@ctxmux/sdk/integrations";
+
+const client = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const shell = registerIntegration(client, shellIntegration);
+const run = await shell.start({
+  args: ["-i"],
+  cwd: process.cwd(),
+});
+```
+
+Registration binds one imported module to the existing raw client. It performs
+no package discovery and owns no Run state. The returned Run remains available
+through `client.status`, `client.attach`, and the rest of the raw SDK even if
+the Integration observer or its host disappears.
+
 ## Attach to a Run
 
 ```ts

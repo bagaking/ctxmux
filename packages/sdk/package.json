@@ -8,6 +8,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./integrations": {
+      "types": "./dist/integrations/index.d.ts",
+      "import": "./dist/integrations/index.js"
     }
   },
   "files": [
@@ -15,7 +19,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "test": "tsx --test test/index.test.ts test/wrong-cases.test.ts",
+    "test": "tsx --test test/index.test.ts test/integration.test.ts test/shell-integration.test.ts test/wrong-cases.test.ts",
     "test:e2e": "tsx --test test/client-parity.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }

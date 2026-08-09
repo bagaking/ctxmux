@@ -9,7 +9,7 @@ Codex, Claude Code, TraeX, Hermes, Pi, shells, and other tools differ in detecti
 
 ## Decision
 
-The target Integration model uses ordinary TypeScript packages imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, capture declared context, and interpret semantic events.
+The generation-1 Integration model uses ordinary TypeScript modules imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, and create a disposable host-local semantic observer. Context capture, native resume, and fork plans remain later capability work.
 
 The daemon does not discover npm packages, load JavaScript, start a plugin process, or host a marketplace. A launched Run remains operable through raw Run APIs after its Integration host exits.
 
@@ -30,7 +30,7 @@ The daemon does not discover npm packages, load JavaScript, start a plugin proce
 
 ## Known constraints
 
-No Integration package or interface exists. The unresolved boundary is how a short-lived TypeScript host supplies launch and context plans while the daemon preserves the resulting Run after that host disappears. Semantic observation, secrets, Integration version identity, and capability negotiation are unimplemented.
+The TypeScript SDK now owns the generation-1 Integration interface and explicit client binding. The generic shell Integration proves detection and structured launch planning without semantic claims. The first coding-Agent probe and semantic observer are still unimplemented, and context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
 
 ## Wrong-case corpus
 
@@ -43,7 +43,8 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 
 ## Fixture mapping
 
-- Inactive: Integration fixtures until T-004 implements the contract.
+- Current: SDK tests cover explicit binding, fail-closed unavailable detection, structured shell planning, and a shell observer that makes no semantic claims.
+- Future: `INTEGRATION-01` stays inactive until a public recording-child launch proves exact argv at the process boundary; comparing `RunSpec` alone is insufficient.
 - Candidate activation fixture: Integration host exits while the raw child and Run remain usable.
 - Candidate activation fixture: unsupported executable version fails detection explicitly.
 - Candidate activation fixture: semantic parser failure preserves raw output and lifecycle.
@@ -51,8 +52,7 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 
 ## Open questions
 
-- Which Integration methods run before launch, during observation, and after exit?
-- Which data crosses the daemon protocol versus remaining host-local?
+- Which context and fidelity data must later cross the daemon protocol instead of remaining host-local?
 - How are executable version and Integration version recorded for reproducibility?
 - What is the minimum capability set for the first shell and coding-Agent Integrations?
 - How are secrets redacted from plans, events, logs, and fixtures?
@@ -62,4 +62,4 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 - `AGENTS.md`: Integration boundary and project goals
 - `docs/vision.md`: Agent-neutral Run thesis
 - `docs/roadmap.md`: M2
-- `packages/sdk/`: future TypeScript host surface
+- `packages/sdk/`: current Integration contract, explicit binding, and shell implementation

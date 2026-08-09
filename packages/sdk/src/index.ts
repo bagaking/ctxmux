@@ -5,6 +5,23 @@ export {
   CtxmuxProtocolError,
 } from "./client.js";
 export type { ByteInput, CtxmuxClientOptions } from "./client.js";
+export {
+  INTEGRATION_API_VERSION,
+  IntegrationUnavailableError,
+  registerIntegration,
+} from "./integration.js";
+export type {
+  AvailableIntegrationDetection,
+  Integration,
+  IntegrationCapability,
+  IntegrationDetection,
+  IntegrationDetectionOptions,
+  IntegrationObserver,
+  IntegrationSemanticEvent,
+  IntegrationUnavailableReason,
+  RegisteredIntegration,
+  UnavailableIntegrationDetection,
+} from "./integration.js";
 export { MAX_FRAME_BYTES, PROTOCOL_VERSION } from "./generated/constants.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 export type { ClientFrame } from "./generated/ClientFrame.js";
