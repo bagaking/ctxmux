@@ -796,11 +796,11 @@ mod replay_tests {
     #[tokio::test]
     async fn replay_accepts_the_exact_advertised_byte_boundary() {
         let mut snapshot = snapshot(2);
-        let mut frames = stream::iter([frame(OutputChunk {
+        let mut frames = stream::iter([Ok(frame(OutputChunk {
             start_byte: 0,
             end_byte: 2,
             data: vec![0, 255],
-        })]);
+        }))]);
 
         receive_replay(&mut frames, 0, &mut snapshot)
             .await
@@ -829,7 +829,7 @@ mod replay_tests {
             ),
         ] {
             let mut snapshot = snapshot(1);
-            let mut frames = stream::iter([frame(chunk)]);
+            let mut frames = stream::iter([Ok(frame(chunk))]);
             assert!(
                 matches!(
                     receive_replay(&mut frames, 0, &mut snapshot).await,
@@ -850,11 +850,11 @@ mod replay_tests {
         ));
     }
 
-    fn frame(chunk: OutputChunk) -> Result<String, LinesCodecError> {
-        Ok(encode_frame(&ServerFrame::Event {
+    fn frame(chunk: OutputChunk) -> String {
+        encode_frame(&ServerFrame::Event {
             event: RunEvent::Output { chunk },
         })
-        .expect("encode replay fixture"))
+        .expect("encode replay fixture")
     }
 
     fn snapshot(latest_output_bytes: u64) -> AttachedSnapshot {
