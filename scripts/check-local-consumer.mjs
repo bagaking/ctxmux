@@ -521,8 +521,8 @@ async function runIsolatedConsumer(consumerDirectory, args, environment) {
 }
 
 async function main() {
-  const temporaryRoot = fs.mkdtempSync(
-    path.join(os.tmpdir(), "ctxmux-local-consumer-"),
+  const temporaryRoot = fs.realpathSync(
+    fs.mkdtempSync(path.join(os.tmpdir(), "ctxmux-local-consumer-")),
   );
   try {
     assert.equal(path.relative(root, temporaryRoot).startsWith(".."), true);
