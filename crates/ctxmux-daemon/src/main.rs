@@ -6,8 +6,7 @@ fn usage() -> &'static str {
     "usage: ctxmuxd --socket <path> [--state-dir <path>]\n       ctxmuxd --version"
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let mut args = env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|value| value == "--version") {
         args.next();
@@ -65,17 +64,39 @@ async fn main() -> ExitCode {
         eprintln!("{}", usage());
         return ExitCode::from(2);
     };
-    let result = match state_dir {
-        Some(state_dir) => {
-            ctxmux_daemon::serve_with_state_dir_and_qualification(
-                socket,
-                state_dir,
-                qualification_stats_fd,
-            )
-            .await
-        }
-        None => ctxmux_daemon::serve_with_qualification(socket, qualification_stats_fd).await,
+    let qualification_stats_fd = match qualification_stats_fd {
+        Some(raw_fd) => match ctxmux_inherited_fd::duplicate_nonblocking_cloexec(raw_fd) {
+            Ok(owned) => Some(owned),
+            Err(error) => {
+                eprintln!("ctxmuxd: invalid qualification stats fd: {error}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
     };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("ctxmuxd: failed to create runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async move {
+        match state_dir {
+            Some(state_dir) => {
+                ctxmux_daemon::serve_with_state_dir_and_qualification(
+                    socket,
+                    state_dir,
+                    qualification_stats_fd,
+                )
+                .await
+            }
+            None => ctxmux_daemon::serve_with_qualification(socket, qualification_stats_fd).await,
+        }
+    });
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

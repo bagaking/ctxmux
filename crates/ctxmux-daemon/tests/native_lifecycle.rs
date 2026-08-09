@@ -1766,6 +1766,30 @@ async fn native_pty_child_does_not_inherit_the_private_qualification_descriptor(
     );
 }
 
+#[test]
+fn closed_qualification_descriptor_fails_before_the_async_runtime_starts() {
+    let directory = tempfile::tempdir().expect("create invalid descriptor fixture directory");
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3>&-; exec \"$1\" --socket \"$2\" --qualification-stats-fd 3")
+        .arg("ctxmux-closed-qualification-fd-fixture")
+        .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg(directory.path().join("ctxmux.sock"))
+        .output()
+        .expect("run ctxmuxd with a closed qualification descriptor");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid qualification stats fd"),
+        "closed descriptor should be rejected directly: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked")
+            && !String::from_utf8_lossy(&output.stderr).contains("tokio-runtime-worker"),
+        "Tokio must not start with or later lose the rejected descriptor",
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
     let daemon = TestDaemon::start().await;

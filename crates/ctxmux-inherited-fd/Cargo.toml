@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+libc.workspace = true
 rustix.workspace = true
 
 [lints.clippy]

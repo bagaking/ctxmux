@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::{self, Read, Write},
-    os::fd::RawFd,
+    os::fd::OwnedFd,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
@@ -138,7 +138,7 @@ pub async fn serve(socket_path: impl Into<PathBuf>) -> Result<(), ServerError> {
 #[doc(hidden)]
 pub async fn serve_with_qualification(
     socket_path: impl Into<PathBuf>,
-    qualification_stats_fd: Option<RawFd>,
+    qualification_stats_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     serve_with_persistence(socket_path.into(), None, qualification_stats_fd).await
 }
@@ -161,7 +161,7 @@ pub async fn serve_with_state_dir(
 pub async fn serve_with_state_dir_and_qualification(
     socket_path: impl Into<PathBuf>,
     state_dir: impl Into<PathBuf>,
-    qualification_stats_fd: Option<RawFd>,
+    qualification_stats_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     let (persistence, recovered) = Persistence::open(state_dir)?;
     let stats = QualificationStats::from_optional_inherited_fd(
@@ -180,7 +180,7 @@ pub async fn serve_with_state_dir_and_qualification(
 async fn serve_with_persistence(
     socket_path: PathBuf,
     persistence: Option<(Persistence, Vec<RecoveredRun>)>,
-    qualification_stats_fd: Option<RawFd>,
+    qualification_stats_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     let manager = if let Some((persistence, recovered)) = persistence {
         let stats = QualificationStats::from_optional_inherited_fd(

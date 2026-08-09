@@ -1,5 +1,5 @@
 use std::{
-    os::fd::{OwnedFd, RawFd},
+    os::fd::OwnedFd,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -64,23 +64,22 @@ pub(crate) struct GaugeGuard {
 
 impl QualificationStats {
     pub(crate) fn from_optional_inherited_fd(
-        raw_fd: Option<RawFd>,
+        sink: Option<OwnedFd>,
         daemon_instance: impl Into<String>,
     ) -> std::io::Result<Self> {
-        raw_fd.map_or_else(
+        sink.map_or_else(
             || Ok(Self::default()),
-            |raw_fd| Self::from_inherited_fd(raw_fd, daemon_instance),
+            |sink| Self::from_sink(sink, daemon_instance),
         )
     }
 
     /// Take one harness-owned descriptor and start its bounded single writer.
     /// The raw descriptor becomes nonblocking and close-on-exec before any Run
     /// can spawn. Runtime owner transitions only touch atomics and `try_send`.
-    pub(crate) fn from_inherited_fd(
-        raw_fd: RawFd,
+    pub(crate) fn from_sink(
+        sink: OwnedFd,
         daemon_instance: impl Into<String>,
     ) -> std::io::Result<Self> {
-        let sink = ctxmux_inherited_fd::take_nonblocking_cloexec(raw_fd)?;
         let (sender, receiver) = mpsc::sync_channel(SNAPSHOT_QUEUE_CAPACITY);
         let inner = Arc::new(Inner {
             daemon_instance: daemon_instance.into(),
@@ -336,7 +335,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use std::{
         io::{BufRead, BufReader},
-        os::fd::IntoRawFd,
         os::unix::net::UnixStream,
         sync::{
             Mutex,
@@ -352,7 +350,7 @@ mod tests {
     #[test]
     fn transition_frames_preserve_pulses_and_restart_resets_epoch() {
         let (reader, writer) = UnixStream::pair().expect("create stats stream");
-        let stats = QualificationStats::from_inherited_fd(writer.into_raw_fd(), "epoch-one")
+        let stats = QualificationStats::from_sink(writer.into(), "epoch-one")
             .expect("open qualification stats");
         {
             let _child = stats.guard(Gauge::DirectChildren);
@@ -386,7 +384,7 @@ mod tests {
         );
 
         let (reader, writer) = UnixStream::pair().expect("create restart stream");
-        let restarted = QualificationStats::from_inherited_fd(writer.into_raw_fd(), "epoch-two")
+        let restarted = QualificationStats::from_sink(writer.into(), "epoch-two")
             .expect("open restarted qualification stats");
         restarted.finish();
         let restart_frame: serde_json::Value = serde_json::from_str(
@@ -405,7 +403,7 @@ mod tests {
     #[test]
     fn disconnected_sink_never_blocks_runtime_owner_updates() {
         let (reader, writer) = UnixStream::pair().expect("create stats stream");
-        let stats = QualificationStats::from_inherited_fd(writer.into_raw_fd(), "epoch")
+        let stats = QualificationStats::from_sink(writer.into(), "epoch")
             .expect("open qualification stats");
         drop(reader);
         for _ in 0..2048 {
@@ -435,8 +433,8 @@ mod tests {
                 Err(error) => panic!("fill stats pipe: {error}"),
             }
         }
-        let stats = QualificationStats::from_inherited_fd(writer.into_raw_fd(), "epoch")
-            .expect("open qualification stats");
+        let stats =
+            QualificationStats::from_sink(writer, "epoch").expect("open qualification stats");
         for value in 0..100_000 {
             stats.set(Gauge::RetainedRuns, value % 129);
         }
