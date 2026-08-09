@@ -749,7 +749,7 @@ async function runBoundedGcChurn(
             gcTuple(daemon.client, expected),
           ),
         );
-        epochs.push(epochReceipt(daemon));
+        epochs.push(await epochReceipt(daemon, contract.run_ceiling));
         await daemon.close();
         daemon = await DaemonFixture.start(
           `gc-${mode}-${String(window)}`,
@@ -786,11 +786,11 @@ async function runBoundedGcChurn(
       }
     }
     assert.equal(nextIndex, contract.successful_lifecycles_per_mode);
+    epochs.push(await epochReceipt(daemon, contract.run_ceiling));
     assert.ok(
       Date.now() <= phaseDeadline,
       `${mode} churn exceeded its phase budget`,
     );
-    epochs.push(epochReceipt(daemon));
     return {
       mode,
       successful_lifecycles: nextIndex,
@@ -964,12 +964,17 @@ async function runGcReplayPressure(
       average_cpu_core_percent: round(averageCpu, 3),
       quiescent_cpu_core_percent: round(quiescentCpu, 3),
     });
-    epochs.push(epochReceipt(daemon));
     let recovered: Record<string, unknown> | null = null;
     if (persistent && contract.persistent_restart.after_replacement_wave) {
       const beforeRestart = sortedTuples(
         await mapLimit(retained, contract.concurrency, async (expected) =>
           gcTuple(daemon.client, expected),
+        ),
+      );
+      epochs.push(
+        await epochReceipt(
+          daemon,
+          options.gc.contract.bounded_churn.run_ceiling,
         ),
       );
       await daemon.close();
@@ -1078,7 +1083,19 @@ async function runGcReplayPressure(
       } finally {
         await recoveredSampler?.stop();
       }
-      epochs.push(epochReceipt(daemon));
+      epochs.push(
+        await epochReceipt(
+          daemon,
+          options.gc.contract.bounded_churn.run_ceiling,
+        ),
+      );
+    } else {
+      epochs.push(
+        await epochReceipt(
+          daemon,
+          options.gc.contract.bounded_churn.run_ceiling,
+        ),
+      );
     }
     assert.ok(
       Date.now() <= phaseDeadline,
@@ -1289,8 +1306,11 @@ function tupleSetDigest(tuples: readonly GcRunTuple[]): {
   };
 }
 
-function epochReceipt(daemon: DaemonFixture): Record<string, unknown> {
-  const stats = daemon.latestStats();
+async function epochReceipt(
+  daemon: DaemonFixture,
+  expectedRetainedRuns: number,
+): Promise<Record<string, unknown>> {
+  const stats = await assertGcBoundaryCount(daemon, expectedRetainedRuns);
   return {
     daemon_instance: stats.daemon_instance,
     seq: stats.seq,
