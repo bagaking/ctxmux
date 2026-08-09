@@ -1,0 +1,114 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/plans/public-local-consumer-contract-review.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/plans/public-local-consumer-contract-review.md"
+  ],
+  "supersedes_revision": 0,
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Make public output cursors cumulative bytes",
+      "objective": "Replace chunk-ordinal output positions with one cumulative byte space across the native daemon, versioned protocol, CLI and TypeScript SDK without compatibility fields.",
+      "outcome": "A client can attach after an absolute byte position, join replay and live output without rebuilding offsets, and interpret truncation or Gap in the same byte space after reconnect.",
+      "acceptance": [
+        "Every output record carries exact startByte/endByte boundaries, and Run head/oldest/attach/gap fields use cumulative bytes with explicit names; UTF-8 character count, PTY read count and protocol sequence never masquerade as byte position.",
+        "Replay eviction retains absolute byte identity; attaching before retained history returns honest truncation/Gap boundaries, while replay-to-live transition is ordered and duplicate-free.",
+        "The public CLI and TypeScript SDK expose only byte cursor names and behavior; old seq/chunk cursor fields, aliases, converters and migration paths are deleted.",
+        "Real daemon tests cover multi-byte output, multiple PTY reads, eviction, replay/live continuity, reconnect and slow-consumer Gap from public client boundaries."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Rust, protocol generation, CLI and TypeScript SDK agree on cumulative output bytes."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The public byte cursor, replay and Gap contract is authoritative."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md",
+        "docs/decisions/protocol-and-transport.md",
+        "docs/testing/strategy.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Own interrupt and complete process-tree stop",
+      "objective": "Expose public interrupt/signal and make Stop terminate the complete native Run process tree through the daemon owner with bounded graceful and forced dispositions.",
+      "outcome": "Embedding clients can interrupt an interactive Run without translating interrupt into Stop, and final Stop leaves no Run-owned descendants or ambiguous live ownership.",
+      "acceptance": [
+        "The public protocol, CLI and TypeScript SDK distinguish interrupt/signal from Stop and return typed unsupported or invalid-target results where a signal is unavailable.",
+        "POSIX native Runs are placed in an owner-controlled process group/session; interrupt targets the intended Run scope, while Stop uses a bounded graceful phase then forcefully terminates remaining descendants.",
+        "Stop completion means the complete owned process tree is quiescent and reaped or an explicit failure/disposition is returned; killing only the shell or direct child is insufficient.",
+        "Real fixtures cover shell grandchildren, stubborn descendants, already-exited races, concurrent interrupt/stop, client disconnect and no effect on unrelated processes."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "All public surfaces and native lifecycle tests pass with one daemon process owner."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Signal and complete Stop semantics, errors and platform boundaries are explicit."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/decisions/pty-process-and-signals.md",
+        "docs/testing/strategy.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Qualify exact-commit consumer artifacts and CI",
+      "objective": "Produce and verify a reproducible public TypeScript SDK plus ctxmux/ctxmuxd binary artifact from one exact clean commit, and fix any source-owned required-CI failure without publishing externally.",
+      "outcome": "An unrelated clean consumer can verify Git identity, build or unpack immutable artifacts, start the matching daemon and use only the public SDK without an adjacent checkout, global install or registry publication.",
+      "acceptance": [
+        "One repository command creates a bounded manifest binding exact Git commit, protocol/build identity, supported platform, SDK package and ctxmux/ctxmuxd binary hashes; a dirty tree fails closed.",
+        "A clean consumer fixture installs or unpacks only produced artifacts in an isolated directory and proves start/status/input/attach/replay/interrupt/stop without reading the ctxmux source tree or using file/path dependencies.",
+        "Artifact production is deterministic where declared and every unavoidable platform-specific field is explicit; no npm, crate, GitHub Release or global installation is performed or claimed.",
+        "`scripts/check.sh` and required hosted CI pass on the exact final commit. Current required-CI failures are classified; source-owned failures are fixed in this Feature, while external infrastructure failures retain precise evidence instead of being hidden."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The final exact commit passes repository and public-consumer gates."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/release.md",
+          "proves": "Exact-commit artifact creation, verification, consumption and non-publication boundaries are documented."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/testing/strategy.md",
+          "proves": "Required CI classification and clean-consumer evidence are durable."
+        }
+      ],
+      "source_refs": [
+        "docs/roadmap.md",
+        "docs/release.md",
+        "docs/testing/strategy.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "supersedes": []
+    }
+  ]
+}
