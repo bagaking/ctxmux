@@ -194,10 +194,18 @@ async fn assert_raw_connection_closes(client: &Client, frame: &[u8], newline: bo
         .await
         .expect("write malformed-wire fixture");
     if newline {
-        stream
-            .write_all(b"\n")
-            .await
-            .expect("terminate malformed-wire fixture");
+        match stream.write_all(b"\n").await {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                return;
+            }
+            Err(error) => panic!("terminate malformed-wire fixture: {error}"),
+        }
     }
 
     assert_connection_closes(stream).await;
