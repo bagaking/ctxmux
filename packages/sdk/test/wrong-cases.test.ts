@@ -117,6 +117,35 @@ test("SC-02 rejects malformed nested runtime frames", () => {
       },
       "$frame.event.run.spec.program",
     ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "forked",
+          run: {
+            ...runInfo(),
+            lineage: { parent: RUN_ID, fidelity: "invented" },
+          },
+        },
+      },
+      "$frame.response.run.lineage.fidelity",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: {
+            ...runInfo(),
+            spec: {
+              ...runInfo().spec,
+              declared_inputs: [{ kind: "invented", reference: "x" }],
+            },
+          },
+        },
+      },
+      "$frame.response.run.spec.declared_inputs[0].kind",
+    ],
     [{ type: "event", event: { type: "invented" } }, "$frame.event.type"],
     [
       { type: "error", error: { code: "other", message: "no" } },
@@ -138,6 +167,16 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
   const frames: readonly ServerFrame[] = [
     { type: "hello", protocol: PROTOCOL_VERSION },
     { type: "response", response: { type: "started", run: runInfo() } },
+    {
+      type: "response",
+      response: {
+        type: "forked",
+        run: {
+          ...runInfo(),
+          lineage: { parent: RUN_ID, fidelity: "level_a" },
+        },
+      },
+    },
     { type: "response", response: { type: "runs", runs: [runInfo()] } },
     { type: "response", response: { type: "status", run: runInfo() } },
     { type: "response", response: { type: "accepted", run: runInfo() } },
@@ -499,7 +538,9 @@ function runInfo() {
       cwd: null,
       env: { FIXTURE: "1" },
       size: { cols: 80, rows: 24 },
+      declared_inputs: [],
     },
+    lineage: null,
     pid: 42,
     state: { type: "running" as const },
     head_seq: 1,

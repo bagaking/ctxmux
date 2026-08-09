@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 1
+# 003 — Unix socket and NDJSON protocol generation 2
 
-- Status: accepted for generation 1; pre-stable
+- Status: accepted for generation 2; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -32,7 +32,7 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 The socket has no default discovery or activation policy, peer-credential check, request ID, timeout, cancellation, or Windows equivalent. JSON represents bytes as integer arrays. The stale-socket check and removal are separate filesystem operations. Malformed, invalid-UTF-8, or oversized frames can terminate the connection at the codec layer without a structured `InvalidRequest` frame.
 
-Protocol generation 1 replaces obsolete shapes directly. Compatibility policy is not yet a release guarantee.
+Protocol generation 2 replaces obsolete shapes directly. Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
 

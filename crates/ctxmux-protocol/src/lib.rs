@@ -10,8 +10,8 @@ use thiserror::Error;
 use ts_rs::TS;
 use uuid::Uuid;
 
-/// The first protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Current protocol generation developed in this repository.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -65,6 +65,30 @@ impl Default for TerminalSize {
     }
 }
 
+/// Kind of one opaque input reference explicitly declared by a caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RunInputKind {
+    /// A workspace location or identity.
+    Workspace,
+    /// An artifact location or identity.
+    Artifact,
+    /// An opaque context or native-session identity.
+    Context,
+}
+
+/// One opaque reference required to interpret or continue a Run.
+///
+/// The daemon records this value but never dereferences, copies, normalizes,
+/// or infers ownership from it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RunInputReference {
+    /// Reference category visible to generic clients.
+    pub kind: RunInputKind,
+    /// Non-empty opaque reference value.
+    pub reference: String,
+}
+
 /// Portable inputs required to start one native Run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct RunSpec {
@@ -81,6 +105,38 @@ pub struct RunSpec {
     /// Initial PTY dimensions.
     #[serde(default)]
     pub size: TerminalSize,
+    /// Explicit workspace, artifact, and context references used by this Run.
+    pub declared_inputs: Vec<RunInputReference>,
+}
+
+/// Context fidelity actually used to create a child Run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkFidelity {
+    /// Exact copy of the parent's portable [`RunSpec`].
+    LevelA,
+    /// Integration-materialized native continuation or fork plan.
+    LevelB,
+}
+
+/// Immediate derivation of one forked Run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RunLineage {
+    /// Retained parent Run used as the fork source.
+    pub parent: RunId,
+    /// Fidelity path actually executed by the daemon.
+    pub fidelity: ForkFidelity,
+}
+
+/// Explicit fork plan. The daemon never substitutes one variant for another.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ForkPlan {
+    /// Clone the parent's complete immutable [`RunSpec`].
+    LevelA,
+    /// Execute an Integration-materialized [`RunSpec`] without merging it
+    /// with the parent.
+    LevelB { spec: RunSpec },
 }
 
 /// Observable lifecycle state of a Run.
@@ -113,6 +169,8 @@ pub struct RunInfo {
     pub id: RunId,
     /// Portable inputs used to launch the Run.
     pub spec: RunSpec,
+    /// Immediate parent and actual fidelity for a fork, or `None` for start.
+    pub lineage: Option<RunLineage>,
     /// Child process identifier when supplied by the platform.
     pub pid: Option<u32>,
     /// Current lifecycle state.
@@ -130,7 +188,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in v1.
+    /// Raw PTY bytes. JSON represents these as an integer array in v2.
     pub data: Vec<u8>,
 }
 
@@ -160,6 +218,8 @@ pub struct ClientHello {
 pub enum Request {
     /// Start a new daemon-owned Run.
     Start { spec: RunSpec },
+    /// Create one child Run from an explicit fidelity plan.
+    Fork { parent: RunId, plan: ForkPlan },
     /// List all Runs retained by this daemon.
     List,
     /// Read current metadata for one Run.
@@ -203,6 +263,8 @@ pub enum ClientFrame {
 pub enum Response {
     /// A Run was created.
     Started { run: RunInfo },
+    /// A forked child Run was created.
+    Forked { run: RunInfo },
     /// Current Runs retained by the daemon.
     Runs { runs: Vec<RunInfo> },
     /// Current metadata for one Run.

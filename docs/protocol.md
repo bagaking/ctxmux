@@ -1,4 +1,4 @@
-# Native Protocol Generation 1
+# Native Protocol Generation 2
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 1.
+- Raw PTY bytes are represented as integer arrays in generation 2.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -33,6 +33,8 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 ## Native Run operations
 
 - `start`: create a PTY, spawn the declared command, and return Run metadata.
+- `fork`: create a child through an explicit Level A or Level B plan and return
+  metadata containing its immediate parent and actual fidelity.
 - `list`: return all Runs retained by this daemon.
 - `status`: return current metadata for one Run.
 - `input`: write raw bytes to a live Run's PTY.
@@ -44,6 +46,18 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, and operations against an exited Run are distinct public error
 categories. Unsupported or invalid behavior never silently succeeds.
+
+Every generation-2 `RunSpec` includes `declared_inputs`, an ordered list of
+opaque workspace, artifact, or context references. The daemon records these
+references without dereferencing, copying, normalizing, or inferring ownership
+from them. Ordinary `start` returns `lineage: null`.
+
+Level A fork resolves the retained parent and clones its complete immutable
+`RunSpec`, including `declared_inputs`. Level B executes one caller-materialized
+`RunSpec` without merging it with or falling back to the parent. Both variants
+publish the child only after native launch succeeds. A Level B tag is not by
+itself proof that an external Integration preserved richer state; the
+Integration capability gate and its behavioral evidence own that claim.
 
 ## Output and reconnect
 
@@ -82,6 +96,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-1 frame at runtime, rejects duplicate
+validates the complete nested generation-2 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

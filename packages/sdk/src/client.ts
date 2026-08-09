@@ -1,6 +1,7 @@
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 import type { ClientFrame } from "./generated/ClientFrame.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import type { ForkPlan } from "./generated/ForkPlan.js";
 import { PROTOCOL_VERSION } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
@@ -53,6 +54,14 @@ export class CtxmuxClient {
     const response = await this.#request({ type: "start", spec });
     if (response.type !== "started") {
       throw unexpected("started response", response.type);
+    }
+    return response.run;
+  }
+
+  public async fork(parent: RunId, plan: ForkPlan): Promise<RunInfo> {
+    const response = await this.#request({ type: "fork", parent, plan });
+    if (response.type !== "forked") {
+      throw unexpected("forked response", response.type);
     }
     return response.run;
   }

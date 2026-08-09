@@ -22,9 +22,9 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, ErrorCode, MAX_FRAME_BYTES, OutputChunk, OutputReplay,
-    PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo, RunSpec,
-    RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    AttachedSnapshot, ClientFrame, ErrorCode, ForkFidelity, ForkPlan, MAX_FRAME_BYTES, OutputChunk,
+    OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo,
+    RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -141,7 +141,19 @@ struct RunManager {
 
 impl RunManager {
     fn start(&self, spec: RunSpec) -> Result<RunInfo, ProtocolError> {
-        let run = Run::spawn(spec)?;
+        let run = Run::spawn(spec, None)?;
+        let info = run.info();
+        write_lock(&self.runs).insert(info.id, run);
+        Ok(info)
+    }
+
+    fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ProtocolError> {
+        let parent_run = self.get(parent)?;
+        let (spec, fidelity) = match plan {
+            ForkPlan::LevelA => (parent_run.spec.clone(), ForkFidelity::LevelA),
+            ForkPlan::LevelB { spec } => (spec, ForkFidelity::LevelB),
+        };
+        let run = Run::spawn(spec, Some(RunLineage { parent, fidelity }))?;
         let info = run.info();
         write_lock(&self.runs).insert(info.id, run);
         Ok(info)
@@ -167,7 +179,7 @@ impl RunManager {
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
-        let run = Run::spawn_with_setup(spec, setup)?;
+        let run = Run::spawn_with_setup(spec, None, setup)?;
         let info = run.info();
         write_lock(&self.runs).insert(info.id, run);
         Ok(info)
@@ -217,6 +229,7 @@ impl Drop for PendingChild {
 struct Run {
     id: RunId,
     spec: RunSpec,
+    lineage: Option<RunLineage>,
     pid: Option<u32>,
     state: Mutex<RunState>,
     output: Mutex<OutputLog>,
@@ -228,11 +241,15 @@ struct Run {
 }
 
 impl Run {
-    fn spawn(spec: RunSpec) -> Result<Arc<Self>, ProtocolError> {
-        Self::spawn_with_setup(spec, |_, _| Ok(()))
+    fn spawn(spec: RunSpec, lineage: Option<RunLineage>) -> Result<Arc<Self>, ProtocolError> {
+        Self::spawn_with_setup(spec, lineage, |_, _| Ok(()))
     }
 
-    fn spawn_with_setup<F>(spec: RunSpec, mut setup: F) -> Result<Arc<Self>, ProtocolError>
+    fn spawn_with_setup<F>(
+        spec: RunSpec,
+        lineage: Option<RunLineage>,
+        mut setup: F,
+    ) -> Result<Arc<Self>, ProtocolError>
     where
         F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
     {
@@ -271,6 +288,7 @@ impl Run {
         let run = Arc::new(Self {
             id: RunId::new(),
             spec,
+            lineage,
             pid,
             state: Mutex::new(RunState::Running),
             output: Mutex::new(OutputLog::default()),
@@ -332,6 +350,7 @@ impl Run {
         RunInfo {
             id: self.id,
             spec: self.spec.clone(),
+            lineage: self.lineage.clone(),
             pid: self.pid,
             state: mutex_lock(&self.state).clone(),
             head_seq: output.head_seq(),
@@ -473,6 +492,16 @@ fn validate_spec(spec: &RunSpec) -> Result<(), ProtocolError> {
             "Run program must not be empty",
         ));
     }
+    if spec
+        .declared_inputs
+        .iter()
+        .any(|input| input.reference.is_empty())
+    {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRequest,
+            "Run input references must not be empty",
+        ));
+    }
     validate_size(spec.size)
 }
 
@@ -566,6 +595,9 @@ fn execute_request(manager: &RunManager, request: Request) -> Result<Response, P
     match request {
         Request::Start { spec } => Ok(Response::Started {
             run: manager.start(spec)?,
+        }),
+        Request::Fork { parent, plan } => Ok(Response::Forked {
+            run: manager.fork(parent, plan)?,
         }),
         Request::List => Ok(Response::Runs {
             runs: manager.list(),
@@ -799,6 +831,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
         }
     }
 

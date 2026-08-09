@@ -1,6 +1,6 @@
 # 011 — Context, artifacts, lineage, and fork fidelity
 
-- Status: open
+- Status: Level A accepted; Level B open
 - Scope: portable Run cloning and Integration-provided continuity
 
 ## Context
@@ -16,6 +16,19 @@ The target contract has two supported fidelity levels and one non-goal:
 - Level C, arbitrary live-process memory or undeclared hidden state, is out of scope.
 
 The caller requests a level. The runtime never silently substitutes a lower one.
+
+In generation 2, `RunSpec.declared_inputs` is the sole immutable truth for
+ordered workspace, artifact, and context references. Values are non-empty and
+opaque; the daemon records them but does not dereference, normalize, copy, or
+infer ownership. `RunInfo.lineage` records derivation only: the immediate parent
+and fidelity actually executed.
+
+`ForkPlan::LevelA` accepts no replacement spec. The daemon resolves the retained
+parent and clones its complete immutable `RunSpec`. `ForkPlan::LevelB` carries a
+fully materialized replacement `RunSpec`; the daemon neither merges it with nor
+falls back to the parent. An explicitly registered Integration must establish
+Level B capability before a client sends that plan. The wire tag alone is not
+capability evidence.
 
 ## Quality attributes and invariants
 
@@ -34,7 +47,10 @@ The caller requests a level. The runtime never silently substitutes a lower one.
 
 ## Known constraints
 
-Current `RunSpec` has no context, artifact, lineage, capability, or fork fields. There is no workspace snapshot strategy, transaction boundary, idempotency key, cleanup protocol, or first Level B Integration.
+References and lineage are daemon-memory-only. There is no workspace snapshot
+strategy, artifact store, idempotency key, cleanup protocol, persistence, or
+first Level B Integration. Opaque references do not prove existence,
+immutability, ownership, portability, inclusion policy, or secret safety.
 
 ## Wrong-case corpus
 
@@ -48,8 +64,9 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 
 ## Fixture mapping
 
-- Inactive: fork fixtures until T-005 implements Level A and one real Level B path.
-- Candidate activation fixture: Level A reproduces only declared inputs.
+- Covered: the public Rust client and daemon prove that Level A reproduces only
+  the complete declared `RunSpec`, records parent plus `level_a`, creates a
+  distinct child PID, and leaves parent and child independently usable.
 - Candidate activation fixture: unsupported Level B fails without creating a child.
 - Candidate activation fixture: partial fork failure removes provisional artifacts and lineage.
 - Candidate activation fixture: concurrent retry is idempotent.
@@ -57,9 +74,6 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 
 ## Open questions
 
-- Which context values are immutable artifacts, references, or generated plans?
-- What makes fork creation transactional across workspace, metadata, and process start?
-- How is lineage represented without turning it into orchestration state?
 - What proves that a Level B Integration preserves more than Level A?
 - Which redaction and portability checks apply before fork execution?
 
@@ -68,4 +82,5 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - `docs/vision.md`: context-aware Run and composition boundary
 - `docs/architecture.md`: target fork contract
 - `docs/roadmap.md`: M3
-- `crates/ctxmux-protocol/src/lib.rs`: current `RunSpec` boundary
+- `crates/ctxmux-protocol/src/lib.rs`: `RunSpec`, `ForkPlan`, and `RunLineage`
+- `crates/ctxmux-daemon/tests/native_lifecycle.rs`: public Level A behavior

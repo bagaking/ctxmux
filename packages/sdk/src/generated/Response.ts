@@ -6,6 +6,7 @@ import type { RunInfo } from "./RunInfo.js";
  */
 export type Response =
   | { type: "started"; run: RunInfo }
+  | { type: "forked"; run: RunInfo }
   | { type: "runs"; runs: Array<RunInfo> }
   | { type: "status"; run: RunInfo }
   | { type: "accepted"; run: RunInfo };

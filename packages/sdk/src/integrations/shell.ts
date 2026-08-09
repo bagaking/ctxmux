@@ -53,6 +53,7 @@ export const shellIntegration: Integration<ShellRunConfig, never> = {
       cwd: config.cwd ?? null,
       env: { ...(config.env ?? {}) },
       size: config.size ?? { cols: 80, rows: 24 },
+      declared_inputs: [],
     };
   },
   createObserver() {

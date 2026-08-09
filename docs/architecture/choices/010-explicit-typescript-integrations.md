@@ -9,7 +9,7 @@ Codex, Claude Code, TraeX, Hermes, Pi, shells, and other tools differ in detecti
 
 ## Decision
 
-The generation-1 Integration model uses ordinary TypeScript modules imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, and create a disposable host-local semantic observer. Context capture, native resume, and fork plans remain later capability work.
+The Integration API generation 1 uses ordinary TypeScript modules imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, and create a disposable host-local semantic observer. Context capture, native resume, and fork plans remain later capability work.
 
 The daemon does not discover npm packages, load JavaScript, start a plugin process, or host a marketplace. A launched Run remains operable through raw Run APIs after its Integration host exits.
 
@@ -30,7 +30,7 @@ The daemon does not discover npm packages, load JavaScript, start a plugin proce
 
 ## Known constraints
 
-The TypeScript SDK owns the generation-1 Integration interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic claims. The Codex Integration uses bounded `--version` and `exec --help` probes, launches `codex exec --json` with a structured prompt argument, and offers a disposable JSONL observer. Context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
+The TypeScript SDK owns the Integration API generation 1 interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic claims. The Codex Integration uses bounded `--version` and `exec --help` probes, launches `codex exec --json` with a structured prompt argument, and offers a disposable JSONL observer. Context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
 
 ## Wrong-case corpus
 

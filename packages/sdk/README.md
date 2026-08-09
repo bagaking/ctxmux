@@ -18,7 +18,7 @@ const run = await client.start(
 ```
 
 `CtxmuxClient` is a stateless connector. Calls such as `start`, `list`,
-`status`, `input`, `resize`, and `stop` use short-lived protocol connections.
+`status`, `fork`, `input`, `resize`, and `stop` use short-lived protocol connections.
 Closing the SDK process does not stop a daemon-owned Run.
 
 ## Bind an Integration explicitly
@@ -68,13 +68,13 @@ running. `stop()` explicitly terminates it.
 
 On a live attachment, `input()`, `resize()`, and `stop()` resolve when Node's
 socket write callback completes. The daemon reports remote acceptance or error
-through the attachment event stream. Generation 1 has no command correlation
+through the attachment event stream. Generation 2 has no command correlation
 ID, so these promises must not be treated as remote acknowledgements. Short
 `CtxmuxClient` request methods do wait for their protocol response.
 
 `attach(id, afterSeq)` resumes ordered output after the last observed sequence.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 1 represents cursors as
+4 MiB replay contains the complete history. Generation 2 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

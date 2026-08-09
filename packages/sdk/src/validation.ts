@@ -14,7 +14,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-1 wire contract. */
+/** A daemon frame failed the runtime half of the generation-2 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -52,7 +52,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-1 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-2 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -63,6 +63,7 @@ function response(value: unknown, path: string): void {
   const valueRecord = record(value, path);
   switch (discriminant(valueRecord, path)) {
     case "started":
+    case "forked":
     case "status":
     case "accepted":
       runInfo(valueRecord.run, `${path}.run`);
@@ -107,6 +108,9 @@ function runInfo(value: unknown, path: string): void {
   const run = record(value, path);
   runId(run.id, `${path}.id`);
   runSpec(run.spec, `${path}.spec`);
+  if (run.lineage !== null) {
+    runLineage(run.lineage, `${path}.lineage`);
+  }
   if (run.pid !== null) {
     unsignedInteger(run.pid, `${path}.pid`, 0xffff_ffff);
   }
@@ -130,6 +134,28 @@ function runSpec(value: unknown, path: string): void {
     string(environmentValue, `${path}.env.${name}`);
   }
   terminalSize(spec.size, `${path}.size`);
+  array(spec.declared_inputs, `${path}.declared_inputs`).forEach(
+    (input, index) =>
+      runInputReference(input, `${path}.declared_inputs[${index}]`),
+  );
+}
+
+function runInputReference(value: unknown, path: string): void {
+  const input = record(value, path);
+  const kind = string(input.kind, `${path}.kind`);
+  if (kind !== "workspace" && kind !== "artifact" && kind !== "context") {
+    throw invalid(`${path}.kind`, "a known Run input kind");
+  }
+  string(input.reference, `${path}.reference`);
+}
+
+function runLineage(value: unknown, path: string): void {
+  const lineage = record(value, path);
+  runId(lineage.parent, `${path}.parent`);
+  const fidelity = string(lineage.fidelity, `${path}.fidelity`);
+  if (fidelity !== "level_a" && fidelity !== "level_b") {
+    throw invalid(`${path}.fidelity`, "a known fork fidelity");
+  }
 }
 
 function runState(value: unknown, path: string): void {

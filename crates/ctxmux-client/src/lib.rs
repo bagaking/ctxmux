@@ -9,7 +9,7 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, ClientHello, FrameError, MAX_FRAME_BYTES, OutputChunk,
+    AttachedSnapshot, ClientFrame, ClientHello, ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk,
     PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId, RunInfo, RunSpec,
     ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
@@ -104,6 +104,19 @@ impl Client {
         match self.request(Request::Start { spec }).await? {
             Response::Started { run } => Ok(run),
             _ => Err(ClientError::UnexpectedFrame("expected started response")),
+        }
+    }
+
+    /// Create one child Run from an explicit fidelity plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the parent does not exist or the selected
+    /// plan cannot create a child.
+    pub async fn fork(&self, parent: RunId, plan: ForkPlan) -> Result<RunInfo, ClientError> {
+        match self.request(Request::Fork { parent, plan }).await? {
+            Response::Forked { run } => Ok(run),
+            _ => Err(ClientError::UnexpectedFrame("expected forked response")),
         }
     }
 

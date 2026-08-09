@@ -8,16 +8,16 @@ This page is the architecture entrypoint. It distinguishes shipped behavior from
 
 Current guarantees are deliberately narrower than the product vision.
 
-| Area             | Current                                                                                                           | Target or open                                                      |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                               | Restart recovery and upgrade continuity are open.                   |
-| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                         | Windows transport, discovery, and daemon activation are open.       |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 1.                                          | Other SDKs appear only for a real client requirement.               |
-| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                             | Screen reconstruction and a multi-writer policy are open.           |
-| Backends         | One native `portable-pty` implementation.                                                                         | A public-surface tmux adapter is provisional.                       |
-| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex has bounded probes and host-local JSONL observation. | Context capture, native resume, and fork fidelity remain open.      |
-| Context and fork | `RunSpec` contains launch inputs only.                                                                            | Level A and Level B context, artifacts, lineage, and fork are open. |
-| Persistence      | Run metadata and output live in daemon memory.                                                                    | Durable metadata, GC, and restart reconciliation are open.          |
+| Area             | Current                                                                                                           | Target or open                                                 |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                               | Restart recovery and upgrade continuity are open.              |
+| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                         | Windows transport, discovery, and daemon activation are open.  |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 2.                                          | Other SDKs appear only for a real client requirement.          |
+| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                             | Screen reconstruction and a multi-writer policy are open.      |
+| Backends         | One native `portable-pty` implementation.                                                                         | A public-surface tmux adapter is provisional.                  |
+| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex has bounded probes and host-local JSONL observation. | Context capture, native resume, and fork fidelity remain open. |
+| Context and fork | Level A clones one complete declared `RunSpec` and records parentage plus actual fidelity.                        | Integration-provided Level B continuity remains open.          |
+| Persistence      | Run metadata and output live in daemon memory.                                                                    | Durable metadata, GC, and restart reconciliation are open.     |
 
 “Durable” therefore means durable across client lifetimes today. It does not yet mean durable across daemon restart, host reboot, or binary upgrade.
 
@@ -30,7 +30,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v1)
+                    Unix domain socket (v2)
                               |
                     long-lived ctxmux daemon
                     - RunManager / Run identity
@@ -48,7 +48,7 @@ A client may create, observe, control, or stop a Run. Socket closure removes one
 
 ### Run domain model
 
-`RunSpec` is the launch contract: program, arguments, optional working directory, selected environment additions, and initial terminal size. `RunInfo` exposes identity, PID when available, lifecycle state, retained-output cursors, and attachment count.
+`RunSpec` is the launch contract: program, arguments, optional working directory, selected environment additions, initial terminal size, and ordered opaque workspace, artifact, or context references. `RunInfo` exposes identity, immediate parent and actual fork fidelity when present, PID when available, lifecycle state, retained-output cursors, and attachment count.
 
 The implemented lifecycle has two observable states:
 
@@ -119,7 +119,7 @@ The prefix router has unit coverage. Raw-mode restoration, resize, and detach ha
 
 ### Cross-language client parity
 
-The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-1 server variant before exposing it. The cross-client test creates a Run with one client, disconnects, reconnects with the other, verifies the same PID, and controls the shared Run.
+The TypeScript SDK buffers fragmented or coalesced socket data into newline frames, enforces the frame byte limit, applies bounded inbound backpressure, and mirrors the Rust request and attachment operations. It runtime-validates every nested generation-2 server variant before exposing it. The cross-client test creates a Run with one client, disconnects, reconnects with the other, verifies the same PID, and controls the shared Run.
 
 Generated TypeScript types prevent a second handwritten wire schema. Current `u64` fields are still emitted as JavaScript `number`, so the SDK rejects values outside the safe-integer range rather than exposing a rounded cursor. A future exact large-integer representation remains a protocol decision.
 
@@ -151,7 +151,7 @@ Fork fidelity is capability-declared.
 - Level B adds Integration-provided workspace, artifact, lineage, and native resume or fork information.
 - Level C, arbitrary process-memory or undeclared-state cloning, is out of scope.
 
-A Level B request against a Level A-only Integration must fail closed. The protocol does not implement either level yet.
+Level A is implemented by cloning the retained parent's complete immutable `RunSpec`; references are recorded once in `RunSpec.declared_inputs`, while `RunInfo.lineage` records only the immediate parent and actual fidelity. The generation-2 protocol also carries a materialized Level B plan without merging or downgrade, but no Integration currently establishes that capability. A Level B request against a Level A-only Integration must fail before a fork request is sent.
 
 tmux compatibility follows the public-adapter boundary. ctxmux may use the tmux executable or Control Mode to discover and interact with existing sessions while tmux remains their owner. It will not reproduce tmux's private socket protocol or promise that an unmodified tmux client can attach to ctxmux.
 
@@ -167,20 +167,20 @@ Current state is memory-owned. A daemon restart loses Run identities, metadata, 
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
 
-| Decision                              | Status                      | Record                                                              |
-| ------------------------------------- | --------------------------- | ------------------------------------------------------------------- |
-| Rust and Tokio long-lived daemon      | accepted                    | [001](architecture/choices/001-rust-tokio-daemon.md)                |
-| `portable-pty` native Backend         | accepted                    | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 1   | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
-| Run lifecycle concurrency             | accepted, incomplete policy | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
-| Ordered bounded raw-output replay     | accepted                    | [005](architecture/choices/005-ordered-output-replay.md)            |
-| Rust schema and TypeScript codegen    | accepted                    | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
-| Node TypeScript SDK                   | accepted                    | [007](architecture/choices/007-node-typescript-sdk.md)              |
-| `crossterm` interactive CLI           | accepted                    | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
-| Runtime persistence and recovery      | open                        | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
-| Explicit TypeScript Integrations      | provisional                 | [010](architecture/choices/010-explicit-typescript-integrations.md) |
-| Context, artifacts, lineage, and fork | open                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
-| tmux Control Mode Backend             | provisional                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Decision                              | Status                         | Record                                                              |
+| ------------------------------------- | ------------------------------ | ------------------------------------------------------------------- |
+| Rust and Tokio long-lived daemon      | accepted                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
+| `portable-pty` native Backend         | accepted                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
+| Unix socket and NDJSON protocol       | accepted for generation 2      | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Run lifecycle concurrency             | accepted, incomplete policy    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
+| Ordered bounded raw-output replay     | accepted                       | [005](architecture/choices/005-ordered-output-replay.md)            |
+| Rust schema and TypeScript codegen    | accepted                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
+| Node TypeScript SDK                   | accepted                       | [007](architecture/choices/007-node-typescript-sdk.md)              |
+| `crossterm` interactive CLI           | accepted                       | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
+| Runtime persistence and recovery      | open                           | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
+| Explicit TypeScript Integrations      | accepted                       | [010](architecture/choices/010-explicit-typescript-integrations.md) |
+| Context, artifacts, lineage, and fork | Level A accepted; Level B open | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
+| tmux Control Mode Backend             | provisional                    | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
 
 ## Risk-to-fixture traceability
 

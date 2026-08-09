@@ -99,6 +99,7 @@ export const codexIntegration: Integration<CodexRunConfig, CodexSemanticEvent> =
         cwd: config.cwd,
         env: { ...(config.env ?? {}) },
         size: config.size ?? { cols: 80, rows: 24 },
+        declared_inputs: [],
       };
     },
     createObserver: createCodexObserver,

@@ -8,8 +8,9 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    ClientFrame, ClientHello, ErrorCode, MAX_FRAME_BYTES, PROTOCOL_VERSION, RunEvent, RunId,
-    RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    ClientFrame, ClientHello, ErrorCode, ForkFidelity, ForkPlan, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    RunEvent, RunId, RunInputKind, RunInputReference, RunLineage, RunSpec, RunState, ServerFrame,
+    TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use tempfile::TempDir;
@@ -116,7 +117,22 @@ fn interactive_shell() -> RunSpec {
         cwd: None,
         env: BTreeMap::default(),
         size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
     }
+}
+
+fn fork_inputs() -> Vec<RunInputReference> {
+    [
+        (RunInputKind::Workspace, "workspace://ctxmux-fixture"),
+        (RunInputKind::Artifact, "artifact://plan.json"),
+        (RunInputKind::Context, "context://parent-turn"),
+    ]
+    .into_iter()
+    .map(|(kind, reference)| RunInputReference {
+        kind,
+        reference: reference.to_owned(),
+    })
+    .collect()
 }
 
 async fn wait_for_output(
@@ -445,6 +461,110 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
+    let daemon = TestDaemon::start().await;
+    let mut spec = interactive_shell();
+    spec.declared_inputs = fork_inputs();
+    let parent = daemon
+        .client
+        .start(spec.clone())
+        .await
+        .expect("start parent Run");
+    assert_eq!(parent.spec, spec);
+    assert_eq!(parent.lineage, None);
+
+    let child = daemon
+        .client
+        .fork(parent.id, ForkPlan::LevelA)
+        .await
+        .expect("fork portable Run inputs");
+    assert_ne!(child.id, parent.id);
+    assert_ne!(child.pid, parent.pid);
+    assert_eq!(child.spec, parent.spec);
+    assert_eq!(
+        child.lineage,
+        Some(RunLineage {
+            parent: parent.id,
+            fidelity: ForkFidelity::LevelA,
+        })
+    );
+    let mut rejected_spec = parent.spec.clone();
+    rejected_spec.declared_inputs.push(RunInputReference {
+        kind: RunInputKind::Context,
+        reference: String::new(),
+    });
+    assert_protocol_error(
+        daemon
+            .client
+            .fork(
+                parent.id,
+                ForkPlan::LevelB {
+                    spec: rejected_spec,
+                },
+            )
+            .await
+            .expect_err("invalid fork plan is rejected"),
+        ErrorCode::InvalidRequest,
+    );
+    assert_eq!(
+        daemon
+            .client
+            .list()
+            .await
+            .expect("list retained Runs")
+            .len(),
+        2,
+        "rejected fork published a child",
+    );
+
+    let (mut parent_attachment, parent_snapshot) = daemon
+        .client
+        .attach(parent.id, 0)
+        .await
+        .expect("attach parent Run");
+    let (mut child_attachment, child_snapshot) = daemon
+        .client
+        .attach(child.id, 0)
+        .await
+        .expect("attach child Run");
+    let mut parent_output = replay_bytes(&parent_snapshot.replay.chunks);
+    let mut parent_seq = parent_snapshot.replay.head_seq;
+    let mut child_output = replay_bytes(&child_snapshot.replay.chunks);
+    let mut child_seq = child_snapshot.replay.head_seq;
+    parent_attachment
+        .input(b"parent\n".to_vec())
+        .await
+        .expect("write parent input");
+    child_attachment
+        .input(b"child\n".to_vec())
+        .await
+        .expect("write child input");
+    wait_for_output(
+        &mut parent_attachment,
+        &mut parent_output,
+        &mut parent_seq,
+        b"OUT:parent",
+    )
+    .await;
+    wait_for_output(
+        &mut child_attachment,
+        &mut child_output,
+        &mut child_seq,
+        b"OUT:child",
+    )
+    .await;
+    assert!(!parent_output.windows(9).any(|bytes| bytes == b"OUT:child"));
+    assert!(!child_output.windows(10).any(|bytes| bytes == b"OUT:parent"));
+
+    daemon
+        .client
+        .stop(parent.id)
+        .await
+        .expect("stop parent Run");
+    daemon.client.stop(child.id).await.expect("stop child Run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_an_incompatible_protocol_generation() {
     let daemon = TestDaemon::start().await;
     let stream = UnixStream::connect(daemon.client.socket_path())
@@ -540,6 +660,7 @@ async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
             cwd: None,
             env: BTreeMap::default(),
             size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
         })
         .await
         .expect("start binary-output Run");
@@ -588,6 +709,7 @@ async fn native_pty_child_does_not_inherit_an_ambient_daemon_descriptor() {
             cwd: None,
             env: BTreeMap::default(),
             size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
         })
         .await
         .expect("start descriptor-probe Run");
@@ -611,6 +733,7 @@ async fn stop_terminates_a_live_run_and_rejects_repeated_stop() {
             cwd: None,
             env: BTreeMap::default(),
             size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
         })
         .await
         .expect("start long-lived Run");

@@ -11,7 +11,7 @@ The Rust daemon and TypeScript SDK must not maintain parallel handwritten protoc
 
 Rust types in `ctxmux-protocol` are authoritative. `ts-rs` exports the recursive `ClientFrame` and `ServerFrame` graph plus generated protocol constants. The generator formats output with Prettier. The repository gate regenerates into a temporary directory and diffs it against checked-in declarations.
 
-Generated declarations provide static parity. The SDK separately validates full generation-1 frames at runtime and rejects unsafe integer cursors. Protocol compatibility policy remains a separate responsibility.
+Generated declarations provide static parity. The SDK separately validates full generation-2 frames at runtime and rejects unsafe integer cursors. Protocol compatibility policy remains a separate responsibility.
 
 ## Quality attributes and invariants
 

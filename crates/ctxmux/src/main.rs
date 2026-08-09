@@ -12,7 +12,8 @@ use std::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{
-    PROTOCOL_VERSION, RunEvent, RunId, RunInfo, RunSpec, RunState, TerminalSize,
+    ForkFidelity, ForkPlan, PROTOCOL_VERSION, RunEvent, RunId, RunInfo, RunSpec, RunState,
+    TerminalSize,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -26,6 +27,7 @@ usage:
   ctxmux --version
   ctxmux --socket <path> ping
   ctxmux --socket <path> start [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
+  ctxmux --socket <path> fork <run-id>
   ctxmux --socket <path> list
   ctxmux --socket <path> status <run-id>
   ctxmux --socket <path> input <run-id> <text>
@@ -69,6 +71,15 @@ async fn run() -> Result<(), String> {
             println!("ok");
         }
         "start" => start(&client, args).await?,
+        "fork" => {
+            let parent = take_run_id(&mut args)?;
+            ensure_empty(&args)?;
+            let run = client
+                .fork(parent, ForkPlan::LevelA)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_run(&run);
+        }
         "list" => {
             ensure_empty(&args)?;
             for run in client.list().await.map_err(|error| error.to_string())? {
@@ -149,6 +160,7 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
             cwd: Some(cwd),
             env: BTreeMap::default(),
             size,
+            declared_inputs: Vec::new(),
         })
         .await
         .map_err(|error| error.to_string())?;
@@ -457,12 +469,23 @@ fn print_run(run: &RunInfo) {
             None => format!("exited({code})"),
         },
     };
+    let lineage = run.lineage.as_ref().map_or_else(
+        || "root".to_owned(),
+        |lineage| {
+            let fidelity = match lineage.fidelity {
+                ForkFidelity::LevelA => "level_a",
+                ForkFidelity::LevelB => "level_b",
+            };
+            format!("{}:{fidelity}", lineage.parent)
+        },
+    );
     println!(
-        "{}\t{}\tpid={}\tattachments={}\thead={}",
+        "{}\t{}\tpid={}\tlineage={}\tattachments={}\thead={}",
         run.id,
         state,
         run.pid
             .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+        lineage,
         run.attachments,
         run.head_seq
     );

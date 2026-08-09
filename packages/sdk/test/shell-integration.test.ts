@@ -46,6 +46,7 @@ test("shell Integration preserves structured argv without implicit evaluation", 
       cwd: "/workspace with spaces",
       env: { DECLARED: "one two" },
       size: { cols: 120, rows: 40 },
+      declared_inputs: [],
     },
   );
 });

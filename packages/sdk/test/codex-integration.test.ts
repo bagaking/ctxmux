@@ -99,6 +99,7 @@ test("Codex launch planning keeps the prompt in one exact argv value", () => {
       cwd: "/workspace with spaces",
       env: { DECLARED: "one two" },
       size: { cols: 120, rows: 40 },
+      declared_inputs: [],
     },
   );
 });
