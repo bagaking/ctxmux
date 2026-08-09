@@ -154,7 +154,7 @@
       "kind": "test",
       "path": "crates/ctxmux-process-stats/src/lib.rs",
       "invariants": [
-        "the audited leaf is explicitly macOS-only; on macOS it reads one PID without system-wide enumeration, fences process identity around RSS, and matches the established ps scale"
+        "the audited leaf is explicitly macOS-only; on macOS it returns complete process-ID snapshots, reads one PID without system-wide object retention, fences process identity around RSS, and matches the established ps scale"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",

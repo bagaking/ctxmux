@@ -20,11 +20,16 @@ portable-pty.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
 serde_json.workspace = true
-sysinfo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ctxmux-process-stats = { path = "../ctxmux-process-stats" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sysinfo.workspace = true
 
 [lints]
 workspace = true

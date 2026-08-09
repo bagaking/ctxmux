@@ -1,6 +1,6 @@
 [package]
 name = "ctxmux-process-stats"
-description = "Audited macOS process-statistics leaf for ctxmux qualification"
+description = "Audited macOS process access leaf for ctxmux"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -10,6 +10,7 @@ use rustix::{
     io::Errno,
     process::{Pid, Signal, getpgid, getsid, kill_process, kill_process_group},
 };
+#[cfg(not(target_os = "macos"))]
 use sysinfo::{ProcessesToUpdate, System};
 
 const QUIESCENCE_POLL: Duration = Duration::from_millis(10);
@@ -190,23 +191,35 @@ impl NativeSession {
     }
 
     fn members(self) -> Result<Vec<Pid>, String> {
-        let mut system = System::new();
-        system.refresh_processes(ProcessesToUpdate::All, true);
         let mut members = Vec::new();
-        for (process_pid, process) in system.processes() {
-            if process.session_id().map(sysinfo::Pid::as_u32)
-                != Some(self.id.as_raw_pid().cast_unsigned())
-            {
-                continue;
-            }
-            let raw = i32::try_from(process_pid.as_u32()).map_err(|_| {
+        for process_pid in process_ids()? {
+            let raw = i32::try_from(process_pid).map_err(|_| {
                 format!("observed process ID {process_pid} does not fit POSIX pid_t")
             })?;
             let Some(pid) = Pid::from_raw(raw) else {
                 continue;
             };
-            members.push(pid);
+            if getsid(Some(pid)).is_ok_and(|session| session == self.id) {
+                members.push(pid);
+            }
         }
         Ok(members)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn process_ids() -> Result<Vec<u32>, String> {
+    ctxmux_process_stats::process_ids()
+        .map_err(|error| format!("failed to enumerate native session members: {error}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_ids() -> Result<Vec<u32>, String> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    Ok(system
+        .processes()
+        .keys()
+        .map(sysinfo::Pid::as_u32)
+        .collect())
 }

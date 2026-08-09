@@ -1,8 +1,8 @@
-//! Narrow audited macOS process-statistics access for qualification helpers.
+//! Narrow audited macOS process access for ctxmux runtime and qualification.
 //!
 //! Product crates keep `unsafe_code = "forbid"`. This private leaf owns the
-//! target-local `proc_pidinfo` calls needed to avoid enumerating every system
-//! process for each RSS observation.
+//! target-local libproc calls needed for one-PID RSS observations and bounded
+//! process-ID enumeration without linking a full system-inspection runtime.
 
 #![deny(unsafe_code)]
 
@@ -20,6 +20,47 @@ mod macos {
     pub struct ProcessStats {
         pub identity: ProcessIdentity,
         pub resident_bytes: u64,
+    }
+
+    /// Returns one snapshot of every positive process ID visible to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an OS error when libproc cannot report or fill a complete
+    /// snapshot. A process-list growth race fails closed instead of returning a
+    /// potentially truncated owner set.
+    #[allow(unsafe_code)]
+    pub fn process_ids() -> io::Result<Vec<u32>> {
+        let reported = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if reported < 1 {
+            return Err(io::Error::last_os_error());
+        }
+        let capacity = usize::try_from(reported)
+            .ok()
+            .and_then(|count| count.checked_mul(2))
+            .ok_or_else(|| io::Error::other("process list capacity overflow"))?;
+        let buffer_bytes = capacity
+            .checked_mul(std::mem::size_of::<libc::pid_t>())
+            .and_then(|bytes| i32::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("process list byte size overflow"))?;
+        let mut pids = vec![0; capacity];
+        let actual =
+            unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), buffer_bytes) };
+        if actual < 1 {
+            return Err(io::Error::last_os_error());
+        }
+        let actual = usize::try_from(actual)
+            .map_err(|_| io::Error::other("process list count was negative"))?;
+        if actual > capacity {
+            return Err(io::Error::other(
+                "process list changed beyond the reserved snapshot capacity",
+            ));
+        }
+        pids.truncate(actual);
+        Ok(pids
+            .into_iter()
+            .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
+            .collect())
     }
 
     /// Reads one process without enumerating unrelated system PIDs.
@@ -108,6 +149,17 @@ mod macos {
         use std::{process::Command, time::Instant};
 
         #[test]
+        fn process_ids_include_self_without_duplicates() {
+            let pids = super::process_ids().unwrap();
+            assert!(pids.contains(&std::process::id()));
+            assert!(pids.iter().all(|pid| *pid > 0));
+            let mut unique = pids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(pids.len(), unique.len());
+        }
+
+        #[test]
         fn self_stats_match_ps_and_keep_one_identity() {
             let first = super::process_stats(std::process::id()).unwrap();
             let second = super::process_stats(std::process::id()).unwrap();
@@ -147,7 +199,7 @@ mod macos {
 }
 
 #[cfg(target_os = "macos")]
-pub use macos::{ProcessIdentity, ProcessStats, process_stats};
+pub use macos::{ProcessIdentity, ProcessStats, process_ids, process_stats};
 
 #[cfg(all(test, not(target_os = "macos")))]
 mod tests {

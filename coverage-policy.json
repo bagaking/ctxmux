@@ -38,7 +38,7 @@
         "category": "platform_impossible",
         "language": "rust",
         "glob": "crates/ctxmux-process-stats/src/**",
-        "reason": "The qualification-only process-statistics leaf wraps a macOS API and cannot execute in the Ubuntu coverage job.",
+        "reason": "The audited process-access leaf wraps macOS APIs and cannot execute in the Ubuntu coverage job.",
         "evidence": ".github/ci-evidence-map.json#reliability-macos-process-stats"
       }
     ]

@@ -42,6 +42,9 @@ The complete-tree contract is exactly one POSIX session. A descendant that
 calls `setsid()` explicitly crosses that boundary; ctxmux does not claim host-
 wide ancestry control. Session enumeration is an operating-system snapshot, so
 every PID is revalidated against the owned SID immediately before signalling.
+On macOS the daemon obtains only a bounded PID snapshot through the existing
+audited libproc leaf; it does not retain a full-system process model for each
+Run control operation.
 Exit-code and signal mapping still depend on `portable-pty`. Windows is excluded
 by the current Unix-socket transport before PTY portability is exercised.
 
