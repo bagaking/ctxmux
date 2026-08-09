@@ -188,7 +188,9 @@ test(
         error.code === "invalid_run_state",
     );
 
-    const sdkSpec = defineRun("/bin/sh", { args: ["-c", "sleep 30"] });
+    const sdkSpec = defineRun("/bin/sh", {
+      args: ["-c", "trap ':' INT; while :; do sleep 1; wait $!; done"],
+    });
     const sdkStartKey = createOperationKey("sdk-retry-safe-start");
     const sdkRun = await reconnectedClient.start(sdkSpec, sdkStartKey);
     const retriedSdkRun = await reconnectedClient.start(sdkSpec, sdkStartKey);
