@@ -108,6 +108,20 @@
       ]
     },
     {
+      "id": "reliability-rss-sampler-contracts",
+      "kind": "test",
+      "path": "scripts/reliability-rss-sampler.test.mjs",
+      "invariants": [
+        "qualification RSS sampling remains independent of harness event-loop stalls and fails closed when the observed process disappears"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "reliability-gc-policy",
       "kind": "contract_check",
       "path": "reliability-gc-contract.json",

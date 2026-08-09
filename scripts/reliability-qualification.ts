@@ -52,6 +52,10 @@ import {
   type QualificationStatsSample,
 } from "./reliability-gc-stats.mts";
 import {
+  startRssSampler,
+  type RssSampler,
+} from "./reliability-rss-sampler.mts";
+import {
   gcTuple,
   retryGcRun,
   sortedTuples,
@@ -250,19 +254,6 @@ interface QualificationOptions {
   readonly resourceModes: readonly WorkloadMode[];
   readonly resourceStartConcurrency: number;
   readonly soakSeconds: number;
-}
-
-interface RssSampler {
-  readonly peak: () => number;
-  readonly sampleCount: () => number;
-  readonly samples: () => readonly TimedRssSample[];
-  readonly maxGapMs: () => number;
-  readonly stop: () => Promise<void>;
-}
-
-interface TimedRssSample {
-  readonly timestamp_ms: number;
-  readonly rss_kib: number;
 }
 
 const harnessPath = resolve(
@@ -815,15 +806,16 @@ async function runGcReplayPressure(
     persistent,
     preserveDirectory: true,
   });
-  const sampler = startRssSampler(
-    daemon.pid,
-    Number(contract.sampling.rss_interval_ms),
-  );
-  const baseline = sampleProcess(daemon.pid);
-  const cpuStart = performance.now();
+  let sampler: RssSampler | undefined;
   let retained: GcRunExpectation[] = [];
   const epochs: Array<Record<string, unknown>> = [];
   try {
+    sampler = await startRssSampler(
+      daemon.pid,
+      Number(contract.sampling.rss_interval_ms),
+    );
+    const baseline = sampleProcess(daemon.pid);
+    const cpuStart = performance.now();
     const fillStart = (await daemon.synchronizedStats()).cumulative
       .physical_starts_total;
     retained = await startGcWave(
@@ -903,9 +895,17 @@ async function runGcReplayPressure(
         Math.max((performance.now() - quiescentWallStart) / 1000, 0.001)) *
       100;
     await sampler.stop();
+    const maxRssSampleGapMs = sampler.maxGapMs();
+    if (maxRssSampleGapMs > Number(contract.sampling.max_rss_sample_gap_ms)) {
+      trace("gc.replay_pressure.sampling_failure", {
+        mode,
+        max_rss_sample_gap_ms: maxRssSampleGapMs,
+        rss_samples: sampler.samples(),
+      });
+    }
     assert.ok(
-      sampler.maxGapMs() <= Number(contract.sampling.max_rss_sample_gap_ms),
-      `GC RSS sampler gap ${String(sampler.maxGapMs())} ms exceeds contract`,
+      maxRssSampleGapMs <= Number(contract.sampling.max_rss_sample_gap_ms),
+      `GC RSS sampler gap ${String(maxRssSampleGapMs)} ms exceeds contract`,
     );
     const budget = gcResourceBudgets(options.gc);
     assert.ok(
@@ -957,91 +957,97 @@ async function runGcReplayPressure(
           preserveDirectory: true,
         },
       );
-      const recoveredBaseline = sampleProcess(daemon.pid);
-      const recoveredSampler = startRssSampler(
-        daemon.pid,
-        Number(contract.sampling.rss_interval_ms),
-      );
-      const initialStarts = (await daemon.synchronizedStats()).cumulative
-        .physical_starts_total;
-      assert.equal(
-        initialStarts,
-        contract.owner_budgets.physical_starts_new_incarnation_initial,
-      );
-      const recoveredTuples = sortedTuples(
-        await mapLimit(retained, contract.concurrency, async (expected) =>
-          gcTuple(daemon.client, expected),
-        ),
-      );
-      assertRecoveredGcIdentity(recoveredTuples, beforeRestart);
-      for (const [index, tuple] of recoveredTuples.entries()) {
-        const previous = beforeRestart[index]!;
-        if (tuple.oldest_seq > previous.oldest_seq) {
-          assert.equal(
-            tuple.truncated,
-            true,
-            "persistent recovered replay must report the evicted prefix",
-          );
+      let recoveredSampler: RssSampler | undefined;
+      try {
+        recoveredSampler = await startRssSampler(
+          daemon.pid,
+          Number(contract.sampling.rss_interval_ms),
+        );
+        const recoveredBaseline = sampleProcess(daemon.pid);
+        const initialStarts = (await daemon.synchronizedStats()).cumulative
+          .physical_starts_total;
+        assert.equal(
+          initialStarts,
+          contract.owner_budgets.physical_starts_new_incarnation_initial,
+        );
+        const recoveredTuples = sortedTuples(
+          await mapLimit(retained, contract.concurrency, async (expected) =>
+            gcTuple(daemon.client, expected),
+          ),
+        );
+        assertRecoveredGcIdentity(recoveredTuples, beforeRestart);
+        for (const [index, tuple] of recoveredTuples.entries()) {
+          const previous = beforeRestart[index]!;
+          if (tuple.oldest_seq > previous.oldest_seq) {
+            assert.equal(
+              tuple.truncated,
+              true,
+              "persistent recovered replay must report the evicted prefix",
+            );
+          }
         }
+        const recoveredReplayBytes = recoveredTuples.reduce(
+          (sum, tuple) => sum + tuple.replay_bytes,
+          0,
+        );
+        assert.ok(
+          recoveredReplayBytes >=
+            contract.persistent_recovered_replay_min_bytes,
+        );
+        assert.ok(
+          recoveredReplayBytes <= contract.persistent_durable_replay_max_bytes,
+        );
+        await mapLimit(retained, contract.concurrency, async (expected) =>
+          retryGcRun(daemon.client, root, options.gc, expected),
+        );
+        const recoveredStarts = (await daemon.synchronizedStats()).cumulative
+          .physical_starts_total;
+        assert.equal(recoveredStarts, initialStarts);
+        await assertGcBoundary(daemon, retained, options);
+        const recoveredCpuStart = sampleProcess(daemon.pid);
+        const recoveredWallStart = performance.now();
+        await delay(contract.quiescent_seconds * 1000);
+        const recoveredSteady = sampleProcess(daemon.pid);
+        const recoveredThreadDelta = Math.max(
+          0,
+          recoveredSteady.threads - recoveredBaseline.threads,
+        );
+        const recoveredFdDelta = Math.max(
+          0,
+          recoveredSteady.fds - recoveredBaseline.fds,
+        );
+        const recoveredCpu =
+          ((recoveredSteady.cpu_seconds - recoveredCpuStart.cpu_seconds) /
+            Math.max((performance.now() - recoveredWallStart) / 1000, 0.001)) *
+          100;
+        await recoveredSampler.stop();
+        assert.ok(
+          recoveredSampler.maxGapMs() <=
+            Number(contract.sampling.max_rss_sample_gap_ms),
+        );
+        assert.ok(
+          recoveredSteady.rss_kib <= budget.persistent_recovered_steady_rss_kib,
+        );
+        assert.ok(
+          recoveredSampler.peak() <= budget.persistent_recovered_peak_rss_kib,
+        );
+        assert.ok(recoveredCpu <= budget.quiescent_cpu_core_percent);
+        assert.ok(recoveredThreadDelta <= budget.quiescent_thread_delta);
+        assert.ok(recoveredFdDelta <= budget.quiescent_fd_delta);
+        recovered = {
+          replay: tupleSetDigest(recoveredTuples),
+          retry_physical_start_delta: recoveredStarts - initialStarts,
+          steady_rss_kib: recoveredSteady.rss_kib,
+          peak_rss_kib: recoveredSampler.peak(),
+          max_rss_sample_gap_ms: recoveredSampler.maxGapMs(),
+          rss_samples: recoveredSampler.samples(),
+          quiescent_cpu_core_percent: round(recoveredCpu, 3),
+          quiescent_thread_delta: recoveredThreadDelta,
+          quiescent_fd_delta: recoveredFdDelta,
+        };
+      } finally {
+        await recoveredSampler?.stop();
       }
-      const recoveredReplayBytes = recoveredTuples.reduce(
-        (sum, tuple) => sum + tuple.replay_bytes,
-        0,
-      );
-      assert.ok(
-        recoveredReplayBytes >= contract.persistent_recovered_replay_min_bytes,
-      );
-      assert.ok(
-        recoveredReplayBytes <= contract.persistent_durable_replay_max_bytes,
-      );
-      await mapLimit(retained, contract.concurrency, async (expected) =>
-        retryGcRun(daemon.client, root, options.gc, expected),
-      );
-      const recoveredStarts = (await daemon.synchronizedStats()).cumulative
-        .physical_starts_total;
-      assert.equal(recoveredStarts, initialStarts);
-      await assertGcBoundary(daemon, retained, options);
-      const recoveredCpuStart = sampleProcess(daemon.pid);
-      const recoveredWallStart = performance.now();
-      await delay(contract.quiescent_seconds * 1000);
-      const recoveredSteady = sampleProcess(daemon.pid);
-      const recoveredThreadDelta = Math.max(
-        0,
-        recoveredSteady.threads - recoveredBaseline.threads,
-      );
-      const recoveredFdDelta = Math.max(
-        0,
-        recoveredSteady.fds - recoveredBaseline.fds,
-      );
-      const recoveredCpu =
-        ((recoveredSteady.cpu_seconds - recoveredCpuStart.cpu_seconds) /
-          Math.max((performance.now() - recoveredWallStart) / 1000, 0.001)) *
-        100;
-      await recoveredSampler.stop();
-      assert.ok(
-        recoveredSampler.maxGapMs() <=
-          Number(contract.sampling.max_rss_sample_gap_ms),
-      );
-      assert.ok(
-        recoveredSteady.rss_kib <= budget.persistent_recovered_steady_rss_kib,
-      );
-      assert.ok(
-        recoveredSampler.peak() <= budget.persistent_recovered_peak_rss_kib,
-      );
-      assert.ok(recoveredCpu <= budget.quiescent_cpu_core_percent);
-      assert.ok(recoveredThreadDelta <= budget.quiescent_thread_delta);
-      assert.ok(recoveredFdDelta <= budget.quiescent_fd_delta);
-      recovered = {
-        replay: tupleSetDigest(recoveredTuples),
-        retry_physical_start_delta: recoveredStarts - initialStarts,
-        steady_rss_kib: recoveredSteady.rss_kib,
-        peak_rss_kib: recoveredSampler.peak(),
-        max_rss_sample_gap_ms: recoveredSampler.maxGapMs(),
-        rss_samples: recoveredSampler.samples(),
-        quiescent_cpu_core_percent: round(recoveredCpu, 3),
-        quiescent_thread_delta: recoveredThreadDelta,
-        quiescent_fd_delta: recoveredFdDelta,
-      };
       epochs.push(epochReceipt(daemon));
     }
     return {
@@ -1054,7 +1060,7 @@ async function runGcReplayPressure(
       replay_verification_runs_before_replacement: before.count,
       replay_verification_runs_after_replacement: after.count,
       peak_rss_kib: sampler.peak(),
-      max_rss_sample_gap_ms: sampler.maxGapMs(),
+      max_rss_sample_gap_ms: maxRssSampleGapMs,
       rss_samples: sampler.samples(),
       average_cpu_core_percent: round(averageCpu, 3),
       quiescent_cpu_core_percent: round(quiescentCpu, 3),
@@ -1064,13 +1070,19 @@ async function runGcReplayPressure(
       epochs,
     };
   } finally {
+    try {
+      await sampler?.stop();
+    } finally {
+      try {
+        await daemon.close();
+      } finally {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
     assert.ok(
       Date.now() <= phaseDeadline,
       `${mode} pressure exceeded its phase budget`,
     );
-    await sampler.stop();
-    await daemon.close();
-    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -1630,8 +1642,9 @@ async function runSoakScenario(
 ): Promise<unknown> {
   const daemon = await DaemonFixture.start("soak", options, receipt);
   const runCount = 8;
-  const sampler = startRssSampler(daemon.pid, 250);
+  let sampler: RssSampler | undefined;
   try {
+    sampler = await startRssSampler(daemon.pid, 250);
     const baseline = sampleProcess(daemon.pid);
     const runs = await mapLimit(
       Array.from({ length: runCount }, (_, index) => index),
@@ -1704,8 +1717,11 @@ async function runSoakScenario(
     trace("stress.soak", result);
     return result;
   } finally {
-    await sampler.stop();
-    await daemon.close();
+    try {
+      await sampler?.stop();
+    } finally {
+      await daemon.close();
+    }
   }
 }
 
@@ -1816,8 +1832,9 @@ async function measureResources(
     options,
     receipt,
   );
-  const peakSampler = startRssSampler(daemon.pid, 25);
+  let peakSampler: RssSampler | undefined;
   try {
+    peakSampler = await startRssSampler(daemon.pid, 25);
     const baseline = sampleProcess(daemon.pid);
     const startResult = await mapLimitUntilFailure(
       Array.from({ length: count }, (_, index) => index),
@@ -1921,8 +1938,11 @@ async function measureResources(
       intentional_retained_state_without_gc: true,
     };
   } finally {
-    await peakSampler.stop();
-    await daemon.close();
+    try {
+      await peakSampler?.stop();
+    } finally {
+      await daemon.close();
+    }
   }
 }
 
@@ -2680,56 +2700,6 @@ function sampleProcess(pid: number): ProcessSample {
     threads: countThreads(pid),
     fds: countFileDescriptors(pid),
     descendants: processTree(pid),
-  };
-}
-
-function sampleRssKiB(pid: number): number {
-  const raw = commandOutput("ps", ["-o", "rss=", "-p", String(pid)]).trim();
-  const rss = Number.parseInt(raw, 10);
-  assert.ok(Number.isFinite(rss), `cannot parse RSS sample for ${pid}: ${raw}`);
-  return rss;
-}
-
-function startRssSampler(pid: number, intervalMs: number): RssSampler {
-  const first = { timestamp_ms: Date.now(), rss_kib: sampleRssKiB(pid) };
-  const observed: TimedRssSample[] = [first];
-  let peakRss = first.rss_kib;
-  let stopped = false;
-  let samplingError: unknown;
-  const loop = (async () => {
-    while (!stopped) {
-      await delay(intervalMs);
-      if (stopped) break;
-      try {
-        const sample = { timestamp_ms: Date.now(), rss_kib: sampleRssKiB(pid) };
-        peakRss = Math.max(peakRss, sample.rss_kib);
-        observed.push(sample);
-      } catch (error) {
-        samplingError = error;
-        stopped = true;
-      }
-    }
-  })();
-  return {
-    peak: () => peakRss,
-    sampleCount: () => observed.length,
-    samples: () => observed,
-    maxGapMs: () =>
-      observed
-        .slice(1)
-        .reduce(
-          (maximum, sample, index) =>
-            Math.max(
-              maximum,
-              sample.timestamp_ms - observed[index]!.timestamp_ms,
-            ),
-          0,
-        ),
-    stop: async () => {
-      stopped = true;
-      await loop;
-      if (samplingError !== undefined) throw samplingError;
-    },
   };
 }
 
