@@ -433,6 +433,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | Context, artifacts, lineage, and fork | accepted                                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
 | tmux Control Mode Backend             | accepted and implemented; version lanes pending                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
 | Retained Run resource governance      | memory and persistent owners implemented; qualification pending | [013](architecture/choices/013-retained-run-resource-governance.md) |
+| Recoverable native Input              | accepted; implementation pending                                | [014](architecture/choices/014-recoverable-input-operations.md)     |
 
 ## Risk-to-fixture traceability
 

@@ -902,6 +902,24 @@
       "disposition": "future",
       "activation_task": "future:retained-run-resource-governance",
       "reason": "The exact Registry fence and SQLite replacement transaction are accepted design but not implemented yet."
+    },
+    {
+      "id": "INPUT-01",
+      "choice": "014-recoverable-input-operations",
+      "source_ids": ["m01"],
+      "source_refs": [
+        "https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html"
+      ],
+      "failure_mechanism": "A client loses the response after PTY input may have been written, reconnects, and repeats the bytes without an operation identity or retained result.",
+      "invariant": "Within one daemon incarnation, retrying the exact per-Run Input operation returns its original applied byte range without another physical PTY write; stale or cross-incarnation uncertainty fails closed.",
+      "preconditions": "A real native Run can expose one completed PTY input while the client discards its first response and reconnects with the original operation identity.",
+      "action": "Drop the first response after the child observes the payload, retry the exact operation from a fresh client, then try conflicting, stale-cursor, and replacement-incarnation variants.",
+      "oracle": "The exact retry returns the original half-open byte range and the child observes one payload; every conflicting, stale, or replacement-incarnation request mutates no PTY bytes.",
+      "platform": ["unix", "node"],
+      "tags": ["input", "idempotency", "response-loss", "cursor", "pty"],
+      "disposition": "future",
+      "activation_task": "T-004",
+      "reason": "Decision 014 is accepted and T-004 owns the protocol, native owner, public clients, and real-PTY oracle."
     }
   ]
 }

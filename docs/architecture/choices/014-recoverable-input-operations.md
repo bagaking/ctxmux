@@ -12,12 +12,10 @@ second time. This is visible in terminal supervisors such as Orca: accepting
 characters into a PTY is useful evidence, but it is neither proof that a TUI
 submitted them nor proof that another Agent understood a message.
 
-Research under
-`.bagakit/researcher/topics/engineering/recoverable-run-operations/` found that
-the reviewed tmux, Zellij, WezTerm, and Orca public mutation surfaces expose
-actions but not a caller-keyed lost-response result lookup. The Grill decision
-under `.bagakit/grill/runs/local-operation-kernel-boundary/` selected Input as
-the smallest independently valuable ctxmux closure.
+Bounded peer research found that the reviewed tmux, Zellij, WezTerm, and Orca
+public mutation surfaces expose actions but not a caller-keyed lost-response
+result lookup. Product review selected Input as the smallest independently
+valuable ctxmux closure.
 
 ## Decision
 
