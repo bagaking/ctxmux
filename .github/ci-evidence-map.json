@@ -234,6 +234,21 @@
       ]
     },
     {
+      "id": "sqlite-cache-status-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-sqlite-status/src/lib.rs",
+      "invariants": [
+        "the private raw SQLite status boundary stays pinned to the source-bound library and returns nonnegative pager-cache counters",
+        "a spill-disabled transaction bounds its final WAL bytes from the observed pre-COMMIT cache footprint"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "creation-registry-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/creation.rs",

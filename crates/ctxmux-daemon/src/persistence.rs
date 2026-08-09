@@ -3783,11 +3783,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "subprocess-only COMMIT crash fixture"]
     fn ordinary_commit_crash_subprocess() {
-        let Some(state_dir) = env::var_os(COMMIT_CRASH_STATE_DIR) else {
+        let Ok(role) = env::var(COMMIT_CRASH_ROLE) else {
             return;
         };
+        let state_dir = env::var_os(COMMIT_CRASH_STATE_DIR)
+            .expect("COMMIT crash helper receives state directory");
         let phase = match env::var(COMMIT_CRASH_PHASE).as_deref() {
             Ok("before") => StartCommitCrashPhase::Before,
             Ok("after") => StartCommitCrashPhase::After,
@@ -3799,8 +3800,7 @@ mod tests {
             .expect("COMMIT crash Run id is valid");
         let expected_role = env::var(COMMIT_CRASH_NEW_ID).unwrap();
         assert_eq!(
-            env::var(COMMIT_CRASH_ROLE).as_deref(),
-            Ok(expected_role.as_str()),
+            role, expected_role,
             "COMMIT crash helper requires its exact per-process role token"
         );
         let new_key = CreateOperationKey::new(
@@ -4060,8 +4060,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "subprocess-only public startup fixture"]
     fn startup_socket_subprocess() {
+        let Ok(role) = env::var(STARTUP_SOCKET_ROLE) else {
+            return;
+        };
         let state_dir = PathBuf::from(
             env::var_os(STARTUP_SOCKET_STATE_DIR)
                 .expect("startup socket helper receives state directory"),
@@ -4069,7 +4071,6 @@ mod tests {
         let socket = PathBuf::from(
             env::var_os(STARTUP_SOCKET_PATH).expect("startup socket helper receives socket path"),
         );
-        let role = env::var(STARTUP_SOCKET_ROLE).expect("startup socket helper receives role");
         assert_eq!(
             socket.file_stem().and_then(std::ffi::OsStr::to_str),
             Some(role.as_str()),
@@ -4430,7 +4431,6 @@ mod tests {
         let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
             .arg("--exact")
             .arg("persistence::tests::ordinary_commit_crash_subprocess")
-            .arg("--ignored")
             .arg("--nocapture")
             .env(COMMIT_CRASH_STATE_DIR, state_dir)
             .env(COMMIT_CRASH_PHASE, phase)
@@ -4449,7 +4449,6 @@ mod tests {
         let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
             .arg("--exact")
             .arg("persistence::tests::startup_socket_subprocess")
-            .arg("--ignored")
             .arg("--nocapture")
             .env(STARTUP_SOCKET_STATE_DIR, state_dir)
             .env(STARTUP_SOCKET_PATH, socket)
