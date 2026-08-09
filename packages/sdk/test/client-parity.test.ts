@@ -189,7 +189,10 @@ test(
     );
 
     const sdkSpec = defineRun("/bin/sh", {
-      args: ["-c", "trap ':' INT; while :; do sleep 1; wait $!; done"],
+      args: [
+        "-c",
+        "trap '' INT; trap 'exit 0' TERM; printf 'SDK_READY\\n'; while :; do read -r _; done",
+      ],
     });
     const sdkStartKey = createOperationKey("sdk-retry-safe-start");
     const sdkRun = await reconnectedClient.start(sdkSpec, sdkStartKey);
@@ -219,7 +222,22 @@ test(
     );
     assert.equal(retriedSdkChild.id, sdkChild.id);
     assert.equal(retriedSdkChild.pid, sdkChild.pid);
+    const sdkChildAttachment = await reconnectedClient.attach(sdkChild.id);
+    await waitForOutput(
+      sdkChildAttachment,
+      replayBytes(sdkChildAttachment.snapshot.replay.chunks),
+      sdkChildAttachment.snapshot.replay.latest_output_bytes,
+      "SDK_READY",
+    );
+    await sdkChildAttachment.detach();
+    await waitForNoAttachments(reconnectedClient, sdkChild.id);
     const sdkAttachment = await reconnectedClient.attach(sdkRun.id);
+    await waitForOutput(
+      sdkAttachment,
+      replayBytes(sdkAttachment.snapshot.replay.chunks),
+      sdkAttachment.snapshot.replay.latest_output_bytes,
+      "SDK_READY",
+    );
     assert.deepEqual(
       await step("interrupt SDK-created Run", sdkAttachment.interrupt()),
       {
