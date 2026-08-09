@@ -7,6 +7,18 @@
 This roadmap is ordered by end-to-end proof. A later milestone must not force a
 partial earlier milestone to pretend it provides capabilities it does not.
 
+## Delivery boundaries
+
+M0 through M3 form the runtime foundation and close as one delivery boundary.
+Persistence and recovery, the tmux adapter, and composition/release each use a
+separate Feature after the foundation because they have different owners,
+failure models, and rollback boundaries. The release Feature depends on those
+capability Features; it does not absorb their implementation work.
+
+Research and the wrong-case corpus are closed baseline work. New cases are
+added only when a real implementation decision or observed failure creates a
+new invariant; future cases are not expanded speculatively.
+
 ## M0 — Repository foundation
 
 Establish the smallest Rust and TypeScript workspaces, shared quality commands,
@@ -98,6 +110,25 @@ Acceptance:
 - one Integration demonstrates a genuine Level B resume or fork;
 - requesting Level B from a Level A-only Integration returns an explicit
   unsupported-capability result.
+
+## M3.5 — Persistence and restart recovery
+
+First accept a recovery contract that distinguishes durable metadata, replay,
+and live PTY ownership. Then implement only the recovery class that can be
+identified and proven without adopting a process by PID guesswork or moving Run
+ownership into a client.
+
+Acceptance:
+
+- the persistence decision names which state survives daemon restart and which
+  live-control claims remain unsupported;
+- stored generations are committed and recovered atomically or fail with a
+  typed corruption result;
+- stale or ambiguous process identity never attaches to or signals an unrelated
+  process;
+- real restart fixtures prove the accepted recovery class and activate the
+  applicable persistence wrong cases;
+- retention, cleanup, and orphan policy are explicit for every persisted item.
 
 ## M4 — tmux adapter
 
