@@ -3,12 +3,14 @@ import test from "node:test";
 
 import {
   INTEGRATION_API_VERSION,
+  IntegrationCapabilityError,
   IntegrationUnavailableError,
   registerIntegration,
 } from "../src/index.ts";
 import type {
   Integration,
   IntegrationSemanticEvent,
+  LevelBForkPlan,
   RunInfo,
   RunSpec,
 } from "../src/index.ts";
@@ -33,8 +35,15 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         attachments: 0,
       };
     },
+    async fork(): Promise<RunInfo> {
+      throw new Error("unreachable raw fork");
+    },
   };
-  const integration: Integration<{ readonly message: string }, TestEvent> = {
+  const integration: Integration<
+    { readonly message: string },
+    undefined,
+    TestEvent
+  > = {
     id: "test",
     apiVersion: INTEGRATION_API_VERSION,
     async detect() {
@@ -77,7 +86,7 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
 
 test("registerIntegration fails closed before start when detection is unavailable", async () => {
   let starts = 0;
-  const integration: Integration<Record<string, never>, never> = {
+  const integration: Integration<Record<string, never>, undefined, never> = {
     id: "missing",
     apiVersion: INTEGRATION_API_VERSION,
     async detect() {
@@ -100,6 +109,9 @@ test("registerIntegration fails closed before start when detection is unavailabl
         starts += 1;
         throw new Error("unreachable raw start");
       },
+      async fork(): Promise<RunInfo> {
+        throw new Error("unreachable raw fork");
+      },
     },
     integration,
   );
@@ -111,6 +123,57 @@ test("registerIntegration fails closed before start when detection is unavailabl
       error.detection.reason === "not_found",
   );
   assert.equal(starts, 0);
+});
+
+test("registerIntegration rejects missing or downgraded Level B plans before raw fork", async () => {
+  let forks = 0;
+  const client = {
+    async start(): Promise<RunInfo> {
+      throw new Error("unreachable raw start");
+    },
+    async fork(): Promise<RunInfo> {
+      forks += 1;
+      throw new Error("unreachable raw fork");
+    },
+  };
+  const withoutPlanner: Integration<Record<string, never>, undefined, never> = {
+    id: "claimed-only",
+    apiVersion: INTEGRATION_API_VERSION,
+    async detect() {
+      return {
+        status: "available",
+        executable: "/claimed-only",
+        version: "1.0.0",
+        capabilities: ["level_b_fork"],
+      };
+    },
+    planLaunch() {
+      throw new Error("unreachable launch plan");
+    },
+    createObserver() {
+      return { observe: () => [] };
+    },
+  };
+  const parent = rootRun();
+
+  await assert.rejects(
+    registerIntegration(client, withoutPlanner).forkLevelB(parent, undefined),
+    (error: unknown) =>
+      error instanceof IntegrationCapabilityError &&
+      error.capability === "level_b_fork",
+  );
+  const downgraded = {
+    ...withoutPlanner,
+    id: "downgraded",
+    planLevelBFork(): LevelBForkPlan {
+      return { type: "level_a" } as unknown as LevelBForkPlan;
+    },
+  };
+  await assert.rejects(
+    registerIntegration(client, downgraded).forkLevelB(parent, undefined),
+    /returned a non-Level-B fork plan/,
+  );
+  assert.equal(forks, 0);
 });
 
 test("registerIntegration rejects blank identities and unsupported generations", () => {
@@ -134,16 +197,45 @@ test("registerIntegration rejects blank identities and unsupported generations",
 
   assert.throws(
     () =>
-      registerIntegration({ start: async () => Promise.reject() }, integration),
+      registerIntegration(
+        {
+          start: async () => Promise.reject(),
+          fork: async () => Promise.reject(),
+        },
+        integration,
+      ),
     /must not be empty/,
   );
 
   assert.throws(
     () =>
       registerIntegration(
-        { start: async () => Promise.reject() },
-        { ...integration, id: "future", apiVersion: 2 as 1 },
+        {
+          start: async () => Promise.reject(),
+          fork: async () => Promise.reject(),
+        },
+        { ...integration, id: "future", apiVersion: 3 as 2 },
       ),
-    /unsupported API version 2/,
+    /unsupported API version 3/,
   );
 });
+
+function rootRun(): RunInfo {
+  return {
+    id: "00000000-0000-0000-0000-000000000001",
+    spec: {
+      program: "/bin/sh",
+      args: ["-i"],
+      cwd: "/workspace",
+      env: {},
+      size: { cols: 80, rows: 24 },
+      declared_inputs: [],
+    },
+    lineage: null,
+    pid: 123,
+    state: { type: "running" },
+    head_seq: 0,
+    oldest_seq: 0,
+    attachments: 0,
+  };
+}

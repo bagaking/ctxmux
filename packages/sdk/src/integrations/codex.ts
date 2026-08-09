@@ -2,6 +2,7 @@ import { execFile, type ExecFileException } from "node:child_process";
 
 import type {
   Integration,
+  IntegrationCapability,
   IntegrationDetection,
   IntegrationDetectionOptions,
   IntegrationObserver,
@@ -27,83 +28,150 @@ export interface CodexRunConfig {
   readonly size?: TerminalSize;
 }
 
+/** Inputs for one Codex-native session continuation. */
+export interface CodexForkConfig extends CodexRunConfig {
+  readonly sessionId: string;
+  readonly artifactReferences?: readonly string[];
+}
+
 /** Host-local event normalized from one valid Codex JSONL record. */
 export interface CodexSemanticEvent extends IntegrationSemanticEvent {
   readonly integrationId: "codex";
 }
 
 /** Explicit Codex exec Integration; interactive resume and fork are separate capabilities. */
-export const codexIntegration: Integration<CodexRunConfig, CodexSemanticEvent> =
-  {
-    id: "codex",
-    apiVersion: INTEGRATION_API_VERSION,
-    async detect(
-      options: IntegrationDetectionOptions = {},
-    ): Promise<IntegrationDetection> {
-      const executable = options.executable ?? "codex";
-      const timeoutMs = probeTimeout(options.timeoutMs);
-      const versionProbe = await probe(executable, ["--version"], timeoutMs);
-      if (versionProbe.status === "unavailable") {
-        return {
-          status: "unavailable",
-          executable,
-          reason: versionProbe.reason,
-        };
-      }
-
-      const version = VERSION_PATTERN.exec(versionProbe.stdout)?.[1];
-      if (version === undefined) {
-        return { status: "unavailable", executable, reason: "invalid_version" };
-      }
-
-      const capabilityProbe = await probe(
-        executable,
-        ["exec", "--help"],
-        timeoutMs,
-      );
-      if (capabilityProbe.status === "unavailable") {
-        return {
-          status: "unavailable",
-          executable,
-          reason: capabilityProbe.reason,
-        };
-      }
-      if (!JSON_CAPABILITY_PATTERN.test(capabilityProbe.stdout)) {
-        return {
-          status: "unavailable",
-          executable,
-          reason: "missing_capability",
-        };
-      }
-
+export const codexIntegration: Integration<
+  CodexRunConfig,
+  CodexForkConfig,
+  CodexSemanticEvent
+> = {
+  id: "codex",
+  apiVersion: INTEGRATION_API_VERSION,
+  async detect(
+    options: IntegrationDetectionOptions = {},
+  ): Promise<IntegrationDetection> {
+    const executable = options.executable ?? "codex";
+    const timeoutMs = probeTimeout(options.timeoutMs);
+    const versionProbe = await probe(executable, ["--version"], timeoutMs);
+    if (versionProbe.status === "unavailable") {
       return {
-        status: "available",
+        status: "unavailable",
         executable,
-        version,
-        capabilities: ["semantic_events"],
+        reason: versionProbe.reason,
       };
-    },
-    planLaunch(config, detection): RunSpec {
-      if (config.prompt.trim().length === 0) {
-        throw new TypeError("Codex prompt must not be empty");
-      }
-      if (config.cwd.trim().length === 0) {
-        throw new TypeError("Codex cwd must not be empty");
-      }
-      if (!detection.capabilities.includes("semantic_events")) {
-        throw new TypeError("Codex detection did not establish --json support");
-      }
+    }
+
+    const version = VERSION_PATTERN.exec(versionProbe.stdout)?.[1];
+    if (version === undefined) {
+      return { status: "unavailable", executable, reason: "invalid_version" };
+    }
+
+    const capabilityProbe = await probe(
+      executable,
+      ["exec", "--help"],
+      timeoutMs,
+    );
+    if (capabilityProbe.status === "unavailable") {
       return {
+        status: "unavailable",
+        executable,
+        reason: capabilityProbe.reason,
+      };
+    }
+    if (!JSON_CAPABILITY_PATTERN.test(capabilityProbe.stdout)) {
+      return {
+        status: "unavailable",
+        executable,
+        reason: "missing_capability",
+      };
+    }
+
+    const capabilities: IntegrationCapability[] = ["semantic_events"];
+    const resumeProbe = await probe(
+      executable,
+      ["exec", "resume", "--help"],
+      timeoutMs,
+    );
+    if (
+      resumeProbe.status === "ok" &&
+      JSON_CAPABILITY_PATTERN.test(resumeProbe.stdout)
+    ) {
+      capabilities.push("level_b_fork");
+    }
+
+    return {
+      status: "available",
+      executable,
+      version,
+      capabilities,
+    };
+  },
+  planLaunch(config, detection): RunSpec {
+    if (config.prompt.trim().length === 0) {
+      throw new TypeError("Codex prompt must not be empty");
+    }
+    if (config.cwd.trim().length === 0) {
+      throw new TypeError("Codex cwd must not be empty");
+    }
+    if (!detection.capabilities.includes("semantic_events")) {
+      throw new TypeError("Codex detection did not establish --json support");
+    }
+    return {
+      program: detection.executable,
+      args: ["exec", "--json", "--", config.prompt],
+      cwd: config.cwd,
+      env: { ...(config.env ?? {}) },
+      size: config.size ?? { cols: 80, rows: 24 },
+      declared_inputs: [{ kind: "workspace", reference: config.cwd }],
+    };
+  },
+  planLevelBFork(_parent, config, detection) {
+    if (config.sessionId.trim().length === 0) {
+      throw new TypeError("Codex session id must not be empty");
+    }
+    if (config.prompt.trim().length === 0) {
+      throw new TypeError("Codex prompt must not be empty");
+    }
+    if (config.cwd.trim().length === 0) {
+      throw new TypeError("Codex cwd must not be empty");
+    }
+    if (!detection.capabilities.includes("level_b_fork")) {
+      throw new TypeError(
+        "Codex detection did not establish exec resume --json support",
+      );
+    }
+    const artifactReferences = config.artifactReferences ?? [];
+    if (artifactReferences.some((reference) => reference.length === 0)) {
+      throw new TypeError("Codex artifact references must not be empty");
+    }
+    return {
+      type: "level_b",
+      spec: {
         program: detection.executable,
-        args: ["exec", "--json", "--", config.prompt],
+        args: [
+          "exec",
+          "resume",
+          "--json",
+          "--",
+          config.sessionId,
+          config.prompt,
+        ],
         cwd: config.cwd,
         env: { ...(config.env ?? {}) },
         size: config.size ?? { cols: 80, rows: 24 },
-        declared_inputs: [],
-      };
-    },
-    createObserver: createCodexObserver,
-  };
+        declared_inputs: [
+          { kind: "workspace", reference: config.cwd },
+          ...artifactReferences.map((reference) => ({
+            kind: "artifact" as const,
+            reference,
+          })),
+          { kind: "context", reference: config.sessionId },
+        ],
+      },
+    };
+  },
+  createObserver: createCodexObserver,
+};
 
 type ProbeResult =
   | { readonly status: "ok"; readonly stdout: string }

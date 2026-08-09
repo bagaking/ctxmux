@@ -147,7 +147,7 @@ test(
 );
 
 test(
-  "Codex Integration records exact argv and leaves the raw Run usable without an observer",
+  "Codex Integration resumes declared context through a public Level B fork",
   { timeout: 15_000 },
   async (context) => {
     const { client, directory } = await startTestDaemon(context);
@@ -160,8 +160,13 @@ if (args[0] === "--version") {
   console.log("codex-cli 0.144.4");
 } else if (args[0] === "exec" && args[1] === "--help") {
   console.log("      --json  Print JSONL");
+} else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--help") {
+  console.log("      --json  Resume as JSONL");
 } else if (args[0] === "exec" && args[1] === "--json" && args[2] === "--") {
-  console.log(JSON.stringify({ type: "thread.started", argv: args }));
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "session-123", argv: args }));
+  setInterval(() => {}, 1_000);
+} else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--json" && args[3] === "--") {
+  console.log(JSON.stringify({ type: "turn.started", argv: args }));
   setInterval(() => {}, 1_000);
 } else {
   process.exitCode = 64;
@@ -171,31 +176,97 @@ if (args[0] === "--version") {
     await chmod(executable, 0o755);
     const prompt = "review 'quoted'; $(touch never)\nthen explain";
 
-    const run = await registerIntegration(client, codexIntegration).start(
+    const registered = registerIntegration(client, codexIntegration);
+    const run = await registered.start(
       { prompt, cwd: directory },
       { executable },
     );
     assert.deepEqual(run.spec.args, ["exec", "--json", "--", prompt]);
+    assert.deepEqual(run.spec.declared_inputs, [
+      { kind: "workspace", reference: directory },
+    ]);
     const pid = run.pid;
     assert.notEqual(pid, null);
 
     const attachment = await client.attach(run.id);
     const expectedRecord = JSON.stringify({
       type: "thread.started",
+      thread_id: "session-123",
       argv: ["exec", "--json", "--", prompt],
     });
-    await waitForOutput(
+    const parentOutput = await waitForOutput(
       attachment,
       replayBytes(attachment.snapshot.replay.chunks),
       attachment.snapshot.replay.head_seq,
       expectedRecord,
     );
+    const threadStarted = registered
+      .createObserver()
+      .observe({
+        type: "output",
+        chunk: {
+          seq: parentOutput.lastSequence,
+          data: [...parentOutput.observed],
+        },
+      })
+      .find((event) => event.name === "thread.started");
+    const sessionId = threadStarted?.data.thread_id;
+    if (typeof sessionId !== "string") {
+      throw new Error("Codex thread.started did not declare a session id");
+    }
 
     attachment.close();
     const rawStatus = await waitForNoAttachments(client, run.id);
     assert.equal(rawStatus.pid, pid);
     assert.equal(rawStatus.state.type, "running");
+    const continuation = "compare the two candidates";
+    const artifactReference = "artifact://review-plan.json";
+    const child = await registered.forkLevelB(
+      run,
+      {
+        sessionId,
+        prompt: continuation,
+        cwd: directory,
+        artifactReferences: [artifactReference],
+      },
+      { executable },
+    );
+    assert.notEqual(child.id, run.id);
+    assert.notEqual(child.pid, pid);
+    assert.deepEqual(child.lineage, {
+      parent: run.id,
+      fidelity: "level_b",
+    });
+    assert.deepEqual(child.spec.args, [
+      "exec",
+      "resume",
+      "--json",
+      "--",
+      sessionId,
+      continuation,
+    ]);
+    assert.deepEqual(child.spec.declared_inputs, [
+      { kind: "workspace", reference: directory },
+      { kind: "artifact", reference: artifactReference },
+      { kind: "context", reference: sessionId },
+    ]);
+
+    const childAttachment = await client.attach(child.id);
+    const resumedRecord = JSON.stringify({
+      type: "turn.started",
+      argv: ["exec", "resume", "--json", "--", sessionId, continuation],
+    });
+    await waitForOutput(
+      childAttachment,
+      replayBytes(childAttachment.snapshot.replay.chunks),
+      childAttachment.snapshot.replay.head_seq,
+      resumedRecord,
+    );
+    childAttachment.close();
+    assert.equal((await client.status(run.id)).state.type, "running");
+    assert.equal((await client.status(child.id)).state.type, "running");
     await client.stop(run.id);
+    await client.stop(child.id);
   },
 );
 

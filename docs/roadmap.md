@@ -84,6 +84,9 @@ Acceptance:
 
 ## M3 — Context, artifacts, lineage, and fork
 
+Status: implemented for declared references and Codex-native continuation;
+workspace snapshots and artifact storage remain explicitly deferred.
+
 Add portable Level A fork, then prove Level B with the first Agent Integration.
 Keep capability requests explicit and fail closed.
 
@@ -131,4 +134,4 @@ Acceptance:
 - a hosted or distributed control plane;
 - plugin discovery, marketplace, or untrusted plugin sandbox;
 - arbitrary live-process state cloning;
-- broad Integration coverage before one Integration proves Level B value.
+- broad Integration coverage beyond the one proven Level B path.

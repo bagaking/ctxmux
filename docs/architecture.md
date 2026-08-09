@@ -8,16 +8,16 @@ This page is the architecture entrypoint. It distinguishes shipped behavior from
 
 Current guarantees are deliberately narrower than the product vision.
 
-| Area             | Current                                                                                                           | Target or open                                                 |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                               | Restart recovery and upgrade continuity are open.              |
-| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                         | Windows transport, discovery, and daemon activation are open.  |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 2.                                          | Other SDKs appear only for a real client requirement.          |
-| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                             | Screen reconstruction and a multi-writer policy are open.      |
-| Backends         | One native `portable-pty` implementation.                                                                         | A public-surface tmux adapter is provisional.                  |
-| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex has bounded probes and host-local JSONL observation. | Context capture, native resume, and fork fidelity remain open. |
-| Context and fork | Level A clones one complete declared `RunSpec` and records parentage plus actual fidelity.                        | Integration-provided Level B continuity remains open.          |
-| Persistence      | Run metadata and output live in daemon memory.                                                                    | Durable metadata, GC, and restart reconciliation are open.     |
+| Area             | Current                                                                                                          | Target or open                                                |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                              | Restart recovery and upgrade continuity are open.             |
+| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                        | Windows transport, discovery, and daemon activation are open. |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 2.                                         | Other SDKs appear only for a real client requirement.         |
+| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                            | Screen reconstruction and a multi-writer policy are open.     |
+| Backends         | One native `portable-pty` implementation.                                                                        | A public-surface tmux adapter is provisional.                 |
+| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.          | Broader Integration coverage and context capture remain open. |
+| Context and fork | Level A clones a declared `RunSpec`; Codex Level B resumes a declared session; both record lineage and fidelity. | Workspace snapshots and artifact ownership remain open.       |
+| Persistence      | Run metadata and output live in daemon memory.                                                                   | Durable metadata, GC, and restart reconciliation are open.    |
 
 “Durable” therefore means durable across client lifetimes today. It does not yet mean durable across daemon restart, host reboot, or binary upgrade.
 
@@ -64,11 +64,11 @@ start accepted
 
 ### Ownership split
 
-| Owner        | Responsibilities                                                                                                                                                                                    |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Runtime core | Run identity and launch spec, PTY and child lifecycle, ordered raw output, attachment and reconnect behavior, public errors, and the persistence required by declared guarantees.                   |
-| Integration  | Tool detection, structured launch planning, capability declaration, and optional host-local semantic events. Shell behavior is current; tool-specific context, native resume, and fork are targets. |
-| Client       | Terminal rendering, editing UI, user workflow, multi-Run composition, Agent scheduling and evaluation, and Crucible or MapReduce policy.                                                            |
+| Owner        | Responsibilities                                                                                                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Runtime core | Run identity and launch spec, PTY and child lifecycle, ordered raw output, attachment and reconnect behavior, public errors, and the persistence required by declared guarantees. |
+| Integration  | Tool detection, structured launch and Level B fork planning, capability declaration, and optional host-local semantic events. Shell and Codex native resume are current.          |
+| Client       | Terminal rendering, editing UI, user workflow, multi-Run composition, Agent scheduling and evaluation, and Crucible or MapReduce policy.                                          |
 
 ## Components and stable boundaries
 
@@ -151,7 +151,7 @@ Fork fidelity is capability-declared.
 - Level B adds Integration-provided workspace, artifact, lineage, and native resume or fork information.
 - Level C, arbitrary process-memory or undeclared-state cloning, is out of scope.
 
-Level A is implemented by cloning the retained parent's complete immutable `RunSpec`; references are recorded once in `RunSpec.declared_inputs`, while `RunInfo.lineage` records only the immediate parent and actual fidelity. The generation-2 protocol also carries a materialized Level B plan without merging or downgrade, but no Integration currently establishes that capability. A Level B request against a Level A-only Integration must fail before a fork request is sent.
+Level A is implemented by cloning the retained parent's complete immutable `RunSpec`; references are recorded once in `RunSpec.declared_inputs`, while `RunInfo.lineage` records only the immediate parent and actual fidelity. Codex establishes Level B only after `exec resume --help` proves JSON support, then materializes `codex exec resume --json` with declared workspace, artifact, and session references. Shell exposes no Level B capability, so its request fails before a raw fork request is sent. Neither path claims a workspace snapshot or owned artifact store.
 
 tmux compatibility follows the public-adapter boundary. ctxmux may use the tmux executable or Control Mode to discover and interact with existing sessions while tmux remains their owner. It will not reproduce tmux's private socket protocol or promise that an unmodified tmux client can attach to ctxmux.
 
@@ -167,20 +167,20 @@ Current state is memory-owned. A daemon restart loses Run identities, metadata, 
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
 
-| Decision                              | Status                         | Record                                                              |
-| ------------------------------------- | ------------------------------ | ------------------------------------------------------------------- |
-| Rust and Tokio long-lived daemon      | accepted                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
-| `portable-pty` native Backend         | accepted                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 2      | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
-| Run lifecycle concurrency             | accepted, incomplete policy    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
-| Ordered bounded raw-output replay     | accepted                       | [005](architecture/choices/005-ordered-output-replay.md)            |
-| Rust schema and TypeScript codegen    | accepted                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
-| Node TypeScript SDK                   | accepted                       | [007](architecture/choices/007-node-typescript-sdk.md)              |
-| `crossterm` interactive CLI           | accepted                       | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
-| Runtime persistence and recovery      | open                           | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
-| Explicit TypeScript Integrations      | accepted                       | [010](architecture/choices/010-explicit-typescript-integrations.md) |
-| Context, artifacts, lineage, and fork | Level A accepted; Level B open | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
-| tmux Control Mode Backend             | provisional                    | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Decision                              | Status                      | Record                                                              |
+| ------------------------------------- | --------------------------- | ------------------------------------------------------------------- |
+| Rust and Tokio long-lived daemon      | accepted                    | [001](architecture/choices/001-rust-tokio-daemon.md)                |
+| `portable-pty` native Backend         | accepted                    | [002](architecture/choices/002-portable-pty-native-backend.md)      |
+| Unix socket and NDJSON protocol       | accepted for generation 2   | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Run lifecycle concurrency             | accepted, incomplete policy | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
+| Ordered bounded raw-output replay     | accepted                    | [005](architecture/choices/005-ordered-output-replay.md)            |
+| Rust schema and TypeScript codegen    | accepted                    | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
+| Node TypeScript SDK                   | accepted                    | [007](architecture/choices/007-node-typescript-sdk.md)              |
+| `crossterm` interactive CLI           | accepted                    | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
+| Runtime persistence and recovery      | open                        | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
+| Explicit TypeScript Integrations      | accepted                    | [010](architecture/choices/010-explicit-typescript-integrations.md) |
+| Context, artifacts, lineage, and fork | accepted                    | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
+| tmux Control Mode Backend             | provisional                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
 
 ## Risk-to-fixture traceability
 

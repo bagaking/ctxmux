@@ -19,7 +19,7 @@ export interface ShellRunConfig {
 }
 
 /** Explicit generic-shell Integration with no semantic observer capability. */
-export const shellIntegration: Integration<ShellRunConfig, never> = {
+export const shellIntegration: Integration<ShellRunConfig, undefined, never> = {
   id: "shell",
   apiVersion: INTEGRATION_API_VERSION,
   async detect(

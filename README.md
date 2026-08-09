@@ -23,11 +23,12 @@ The current native slice provides one embeddable local runtime that can:
 - fork declared portable inputs with explicit parentage and Level A fidelity;
 - expose the same stable boundary to CLIs, editors, and other clients;
 - explicitly bind host-local shell and Codex Integrations without changing the
-  daemon's Run model.
+  daemon's Run model;
+- resume a declared Codex session through an explicit Level B fork while a
+  Level A-only Integration fails before creating a child.
 
-The roadmap adds Integration-provided high-fidelity fork, artifact handling,
-persistence, and a tmux Backend. Those are target capabilities, not current
-protocol guarantees.
+The roadmap adds workspace snapshots, artifact ownership, persistence, and a
+tmux Backend. Those are target capabilities, not current protocol guarantees.
 
 Coding agents are the flagship Integration because they make context fidelity
 especially valuable. They are not a special primitive in the runtime.

@@ -7,6 +7,7 @@ export {
 export type { ByteInput, CtxmuxClientOptions } from "./client.js";
 export {
   INTEGRATION_API_VERSION,
+  IntegrationCapabilityError,
   IntegrationUnavailableError,
   registerIntegration,
 } from "./integration.js";
@@ -19,6 +20,7 @@ export type {
   IntegrationObserver,
   IntegrationSemanticEvent,
   IntegrationUnavailableReason,
+  LevelBForkPlan,
   RegisteredIntegration,
   UnavailableIntegrationDetection,
 } from "./integration.js";

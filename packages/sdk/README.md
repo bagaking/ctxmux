@@ -45,6 +45,25 @@ after bounded version and help probes confirm JSONL support. Its optional
 observer converts complete JSONL records into host-local semantic events;
 parser diagnostics never replace or hide raw Run output.
 
+When `exec resume --help` also exposes JSON support, the registered Codex
+Integration can materialize an explicit Level B child from a session id
+reported by `thread.started`:
+
+```ts
+const codex = registerIntegration(client, codexIntegration);
+const child = await codex.forkLevelB(parent, {
+  sessionId,
+  prompt: "continue from the parent",
+  cwd: process.cwd(),
+  artifactReferences: ["artifact://review-plan.json"],
+});
+```
+
+The child records its parent, `level_b` fidelity, and declared workspace,
+artifact, and session references. A Level B call on `shellIntegration` raises
+`IntegrationCapabilityError` before the SDK sends a raw fork request; it never
+falls back to Level A.
+
 ## Attach to a Run
 
 ```ts

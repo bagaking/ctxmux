@@ -1,6 +1,6 @@
 # 011 — Context, artifacts, lineage, and fork fidelity
 
-- Status: Level A accepted; Level B open
+- Status: accepted
 - Scope: portable Run cloning and Integration-provided continuity
 
 ## Context
@@ -12,7 +12,7 @@ ctxmux's differentiated value is controlled context continuity: create another R
 The target contract has two supported fidelity levels and one non-goal:
 
 - Level A copies declared portable launch inputs and references.
-- Level B adds Integration-captured workspace state, artifacts, lineage, and native session resume or fork information.
+- Level B executes an Integration-materialized native resume or fork plan with explicitly declared workspace, artifact, and context references.
 - Level C, arbitrary live-process memory or undeclared hidden state, is out of scope.
 
 The caller requests a level. The runtime never silently substitutes a lower one.
@@ -48,9 +48,9 @@ capability evidence.
 ## Known constraints
 
 References and lineage are daemon-memory-only. There is no workspace snapshot
-strategy, artifact store, idempotency key, cleanup protocol, persistence, or
-first Level B Integration. Opaque references do not prove existence,
-immutability, ownership, portability, inclusion policy, or secret safety.
+strategy, artifact store, idempotency key, cleanup protocol, or persistence.
+Opaque references do not prove existence, immutability, ownership, portability,
+inclusion policy, or secret safety.
 
 ## Wrong-case corpus
 
@@ -67,14 +67,16 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - Covered: the public Rust client and daemon prove that Level A reproduces only
   the complete declared `RunSpec`, records parent plus `level_a`, creates a
   distinct child PID, and leaves parent and child independently usable.
-- Candidate activation fixture: unsupported Level B fails without creating a child.
+- Covered: the Codex Integration obtains a real session id from raw Run output,
+  invokes `exec resume --json` through the public fork path, and records its
+  workspace, artifact, and session references plus `level_b` lineage.
+- Covered: Shell rejects Level B before any raw fork request or child creation.
 - Candidate activation fixture: partial fork failure removes provisional artifacts and lineage.
 - Candidate activation fixture: concurrent retry is idempotent.
 - Candidate activation fixture: secret and machine-local path policy fails closed.
 
 ## Open questions
 
-- What proves that a Level B Integration preserves more than Level A?
 - Which redaction and portability checks apply before fork execution?
 
 ## Repository evidence
@@ -84,3 +86,5 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - `docs/roadmap.md`: M3
 - `crates/ctxmux-protocol/src/lib.rs`: `RunSpec`, `ForkPlan`, and `RunLineage`
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`: public Level A behavior
+- `packages/sdk/test/client-parity.test.ts`: public Codex Level B behavior
+- `packages/sdk/test/shell-integration.test.ts`: unsupported Level B rejection

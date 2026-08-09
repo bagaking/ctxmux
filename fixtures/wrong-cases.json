@@ -590,7 +590,7 @@
       "test_refs": [
         {
           "path": "packages/sdk/test/client-parity.test.ts",
-          "anchor": "Codex Integration records exact argv and leaves the raw Run usable without an observer"
+          "anchor": "Codex Integration resumes declared context through a public Level B fork"
         }
       ]
     },
@@ -629,14 +629,14 @@
       ],
       "failure_mechanism": "A snapshot omits staged, dirty, untracked, ignored, or nested state while claiming fidelity.",
       "invariant": "The fork manifest exactly matches its declared inclusion policy.",
-      "preconditions": "T-005 implements Level B workspace capture and manifests.",
+      "preconditions": "A future workspace snapshot capability claims an explicit inclusion policy.",
       "action": "Fork a workspace containing every Git state class and nested repository boundary.",
       "oracle": "The manifest and captured files agree exactly with the declared inclusion and omission policy.",
       "platform": ["portable"],
       "tags": ["fork", "workspace", "manifest", "fidelity"],
       "disposition": "future",
-      "activation_task": "future:context-fork",
-      "reason": "Context manifests and Level B workspace capture are not implemented."
+      "activation_task": "future:workspace-snapshot",
+      "reason": "Ctxmux records workspace references but does not create snapshots or inclusion manifests."
     },
     {
       "id": "FORK-02",
@@ -647,13 +647,13 @@
       ],
       "failure_mechanism": "An independent-looking child borrows objects later deleted by source cleanup.",
       "invariant": "Fork artifact ownership or dependency is explicit and truthful.",
-      "preconditions": "T-005 selects a borrowed or owned artifact storage model.",
+      "preconditions": "A future fork capability stores or borrows artifacts.",
       "action": "Create a fork, clean the source's storage, and resolve every child artifact.",
       "oracle": "Owned artifacts survive; borrowed artifacts declare the dependency and fail explicitly if it is removed.",
       "platform": ["portable"],
       "tags": ["fork", "artifact", "ownership", "cleanup"],
       "disposition": "future",
-      "activation_task": "future:context-fork",
+      "activation_task": "future:artifact-ownership",
       "reason": "Fork artifact storage and ownership do not exist."
     },
     {
@@ -663,13 +663,13 @@
       "source_refs": ["https://docs.docker.com/build/building/secrets/"],
       "failure_mechanism": "Ephemeral credentials become durable fork state.",
       "invariant": "Secret canaries are absent or explicitly redacted in every durable artifact.",
-      "preconditions": "T-005 implements durable manifests, artifacts, and lineage.",
+      "preconditions": "A future fork capability persists context manifests or artifacts.",
       "action": "Fork context containing secret canaries in supported and excluded input locations.",
       "oracle": "No canary appears in durable state except an explicit redaction record without the secret value.",
       "platform": ["portable"],
       "tags": ["fork", "secret", "redaction", "artifact"],
       "disposition": "future",
-      "activation_task": "future:context-fork",
+      "activation_task": "future:durable-context-redaction",
       "reason": "Durable context artifacts and redaction policy are not implemented."
     },
     {

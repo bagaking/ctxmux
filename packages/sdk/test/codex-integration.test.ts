@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 
-import type { AvailableIntegrationDetection, RunEvent } from "../src/index.ts";
+import type {
+  AvailableIntegrationDetection,
+  RunEvent,
+  RunInfo,
+} from "../src/index.ts";
 import {
   codexIntegration,
   type CodexSemanticEvent,
@@ -13,14 +17,32 @@ import {
 test("Codex detection fails closed across missing, malformed, incompatible, and hanging probes", async (context) => {
   const compatible = await executable(
     context,
-    probeProgram("codex-cli 0.144.4", "      --json  Print JSONL"),
+    probeProgram(
+      "codex-cli 0.144.4",
+      "      --json  Print JSONL",
+      "      --json  Resume as JSONL",
+    ),
   );
   assert.deepEqual(await codexIntegration.detect({ executable: compatible }), {
     status: "available",
     executable: compatible,
     version: "0.144.4",
-    capabilities: ["semantic_events"],
+    capabilities: ["semantic_events", "level_b_fork"],
   });
+
+  const semanticOnly = await executable(
+    context,
+    probeProgram("codex-cli 0.144.4", "      --json  Print JSONL"),
+  );
+  assert.deepEqual(
+    await codexIntegration.detect({ executable: semanticOnly }),
+    {
+      status: "available",
+      executable: semanticOnly,
+      version: "0.144.4",
+      capabilities: ["semantic_events"],
+    },
+  );
 
   assert.deepEqual(
     await codexIntegration.detect({
@@ -99,7 +121,68 @@ test("Codex launch planning keeps the prompt in one exact argv value", () => {
       cwd: "/workspace with spaces",
       env: { DECLARED: "one two" },
       size: { cols: 120, rows: 40 },
-      declared_inputs: [],
+      declared_inputs: [
+        { kind: "workspace", reference: "/workspace with spaces" },
+      ],
+    },
+  );
+});
+
+test("Codex Level B planning resumes one declared native session", () => {
+  const detection: AvailableIntegrationDetection = {
+    status: "available",
+    executable: "/opt/codex",
+    version: "0.144.4",
+    capabilities: ["semantic_events", "level_b_fork"],
+  };
+  const parent: RunInfo = {
+    id: "00000000-0000-0000-0000-000000000001",
+    spec: {
+      program: "/opt/codex",
+      args: ["exec", "--json", "--", "first"],
+      cwd: "/workspace with spaces",
+      env: {},
+      size: { cols: 80, rows: 24 },
+      declared_inputs: [
+        { kind: "workspace", reference: "/workspace with spaces" },
+      ],
+    },
+    lineage: null,
+    pid: 123,
+    state: { type: "running" },
+    head_seq: 1,
+    oldest_seq: 1,
+    attachments: 0,
+  };
+  const prompt = "continue 'exactly'; $(touch never)";
+
+  assert.deepEqual(
+    codexIntegration.planLevelBFork?.(
+      parent,
+      {
+        sessionId: "session-123",
+        prompt,
+        cwd: "/workspace with spaces",
+        env: { DECLARED: "one two" },
+        size: { cols: 120, rows: 40 },
+        artifactReferences: ["artifact://plan.json"],
+      },
+      detection,
+    ),
+    {
+      type: "level_b",
+      spec: {
+        program: "/opt/codex",
+        args: ["exec", "resume", "--json", "--", "session-123", prompt],
+        cwd: "/workspace with spaces",
+        env: { DECLARED: "one two" },
+        size: { cols: 120, rows: 40 },
+        declared_inputs: [
+          { kind: "workspace", reference: "/workspace with spaces" },
+          { kind: "artifact", reference: "artifact://plan.json" },
+          { kind: "context", reference: "session-123" },
+        ],
+      },
     },
   );
 });
@@ -180,13 +263,15 @@ async function executable(context: TestContext, body: string): Promise<string> {
   return path;
 }
 
-function probeProgram(version: string, help: string): string {
+function probeProgram(version: string, help: string, resumeHelp = ""): string {
   return `
 const args = process.argv.slice(2);
 if (args[0] === "--version") {
   process.stdout.write(${JSON.stringify(`${version}\n`)});
 } else if (args[0] === "exec" && args[1] === "--help") {
   process.stdout.write(${JSON.stringify(`${help}\n`)});
+} else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--help") {
+  process.stdout.write(${JSON.stringify(`${resumeHelp}\n`)});
 } else {
   process.exitCode = 64;
 }`;

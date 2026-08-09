@@ -1,13 +1,17 @@
 import type { CtxmuxClient } from "./client.js";
+import type { ForkPlan } from "./generated/ForkPlan.js";
 import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 
 /** Current public contract generation for host-local Integrations. */
-export const INTEGRATION_API_VERSION = 1 as const;
+export const INTEGRATION_API_VERSION = 2 as const;
 
 /** Optional behavior that an Integration can honestly provide. */
-export type IntegrationCapability = "semantic_events";
+export type IntegrationCapability = "semantic_events" | "level_b_fork";
+
+/** A materialized Level B plan that cannot silently encode Level A. */
+export type LevelBForkPlan = Extract<ForkPlan, { readonly type: "level_b" }>;
 
 /** Why a tool probe did not establish a compatible Integration. */
 export type IntegrationUnavailableReason =
@@ -54,23 +58,41 @@ export interface IntegrationObserver<Event extends IntegrationSemanticEvent> {
 }
 
 /** Explicit tool semantics layered above the generic Run protocol. */
-export interface Integration<Config, Event extends IntegrationSemanticEvent> {
+export interface Integration<
+  LaunchConfig,
+  ForkConfig,
+  Event extends IntegrationSemanticEvent,
+> {
   readonly id: string;
   readonly apiVersion: typeof INTEGRATION_API_VERSION;
   detect(options?: IntegrationDetectionOptions): Promise<IntegrationDetection>;
-  planLaunch(config: Config, detection: AvailableIntegrationDetection): RunSpec;
+  planLaunch(
+    config: LaunchConfig,
+    detection: AvailableIntegrationDetection,
+  ): RunSpec;
+  planLevelBFork?(
+    parent: RunInfo,
+    config: ForkConfig,
+    detection: AvailableIntegrationDetection,
+  ): LevelBForkPlan;
   createObserver(): IntegrationObserver<Event>;
 }
 
 /** One explicitly imported Integration bound to one existing SDK client. */
 export interface RegisteredIntegration<
-  Config,
+  LaunchConfig,
+  ForkConfig,
   Event extends IntegrationSemanticEvent,
 > {
-  readonly integration: Integration<Config, Event>;
+  readonly integration: Integration<LaunchConfig, ForkConfig, Event>;
   detect(options?: IntegrationDetectionOptions): Promise<IntegrationDetection>;
   start(
-    config: Config,
+    config: LaunchConfig,
+    options?: IntegrationDetectionOptions,
+  ): Promise<RunInfo>;
+  forkLevelB(
+    parent: RunInfo,
+    config: ForkConfig,
     options?: IntegrationDetectionOptions,
   ): Promise<RunInfo>;
   createObserver(): IntegrationObserver<Event>;
@@ -90,17 +112,31 @@ export class IntegrationUnavailableError extends Error {
   }
 }
 
+/** An available Integration cannot honestly provide the requested behavior. */
+export class IntegrationCapabilityError extends Error {
+  public readonly integrationId: string;
+  public readonly capability: IntegrationCapability;
+
+  public constructor(integrationId: string, capability: IntegrationCapability) {
+    super(`Integration ${integrationId} does not provide ${capability}`);
+    this.name = "IntegrationCapabilityError";
+    this.integrationId = integrationId;
+    this.capability = capability;
+  }
+}
+
 /**
  * Bind an explicitly imported Integration to the same public client used by
  * raw Runs. Registration performs no discovery and owns no daemon state.
  */
 export function registerIntegration<
-  Config,
+  LaunchConfig,
+  ForkConfig,
   Event extends IntegrationSemanticEvent,
 >(
-  client: Pick<CtxmuxClient, "start">,
-  integration: Integration<Config, Event>,
-): RegisteredIntegration<Config, Event> {
+  client: Pick<CtxmuxClient, "start" | "fork">,
+  integration: Integration<LaunchConfig, ForkConfig, Event>,
+): RegisteredIntegration<LaunchConfig, ForkConfig, Event> {
   if (integration.id.trim().length === 0) {
     throw new TypeError("Integration id must not be empty");
   }
@@ -123,6 +159,34 @@ export function registerIntegration<
         throw new IntegrationUnavailableError(integration.id, detection);
       }
       return client.start(integration.planLaunch(config, detection));
+    },
+    async forkLevelB(parent, config, options) {
+      const detection = await detect(options);
+      if (detection.status === "unavailable") {
+        throw new IntegrationUnavailableError(integration.id, detection);
+      }
+      if (
+        !detection.capabilities.includes("level_b_fork") ||
+        integration.planLevelBFork === undefined
+      ) {
+        throw new IntegrationCapabilityError(integration.id, "level_b_fork");
+      }
+      const plan: unknown = integration.planLevelBFork(
+        parent,
+        config,
+        detection,
+      );
+      if (
+        typeof plan !== "object" ||
+        plan === null ||
+        !("type" in plan) ||
+        plan.type !== "level_b"
+      ) {
+        throw new TypeError(
+          `Integration ${integration.id} returned a non-Level-B fork plan`,
+        );
+      }
+      return client.fork(parent.id, plan as LevelBForkPlan);
     },
     createObserver() {
       return integration.createObserver();

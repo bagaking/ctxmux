@@ -9,7 +9,7 @@ Codex, Claude Code, TraeX, Hermes, Pi, shells, and other tools differ in detecti
 
 ## Decision
 
-The Integration API generation 1 uses ordinary TypeScript modules imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, and create a disposable host-local semantic observer. Context capture, native resume, and fork plans remain later capability work.
+The Integration API generation 2 uses ordinary TypeScript modules imported and registered explicitly by the embedding host. An Integration may detect a tool, turn configuration into a portable launch plan, declare capabilities, create a disposable host-local semantic observer, and optionally materialize an explicit Level B fork plan.
 
 The daemon does not discover npm packages, load JavaScript, start a plugin process, or host a marketplace. A launched Run remains operable through raw Run APIs after its Integration host exits.
 
@@ -30,14 +30,14 @@ The daemon does not discover npm packages, load JavaScript, start a plugin proce
 
 ## Known constraints
 
-The TypeScript SDK owns the Integration API generation 1 interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic claims. The Codex Integration uses bounded `--version` and `exec --help` probes, launches `codex exec --json` with a structured prompt argument, and offers a disposable JSONL observer. Context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
+The TypeScript SDK owns the Integration API generation 2 interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic or Level B claims. The Codex Integration uses bounded `--version`, `exec --help`, and `exec resume --help` probes, launches `codex exec --json`, and materializes `codex exec resume --json` only when native resume support is present. Workspace snapshots, artifact ownership, secrets, and Integration implementation-version identity remain open.
 
 ## Wrong-case corpus
 
 Evidence pack: [integrations track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/integrations.md), claim `C010`.
 
 - `INTEGRATION-01` (`j01`): interpolating workspace paths, prompts, or options into one shell string permits metacharacters to become program text. Launch remains structured executable, argv, cwd, and env by default.
-- `INTEGRATION-02` (`j02`): executable presence is not semantic compatibility. Version, capability, malformed, and hanging probe paths fail closed before launch. Later Level B fidelity remains owned by the fork capability records.
+- `INTEGRATION-02` (`j02`): executable presence is not semantic compatibility. Version, capability, malformed, and hanging probe paths fail closed before launch. Level B fidelity remains owned by the fork capability record and public behavior proof.
 
 MCP supports the negotiation and timeout principle only. It does not justify JSON-RPC, discovery, a marketplace, or a plugin host for explicitly imported ctxmux Integrations.
 
@@ -47,7 +47,7 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 - Active: the Codex probe matrix covers missing, malformed, incompatible, and hanging executables before Run launch.
 - Current: SDK tests also cover explicit binding, structured shell planning, a no-claim shell observer, partitioned Codex JSONL, gaps, and parser diagnostics.
 - Candidate activation fixture: Integration host exits while the raw child and Run remain usable.
-- Candidate activation fixture: unsupported Level B capability never launches a Level A fork.
+- Covered: unsupported Level B capability fails before any raw fork request.
 
 ## Open questions
 

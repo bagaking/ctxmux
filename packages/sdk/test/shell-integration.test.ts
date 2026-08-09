@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import type { AvailableIntegrationDetection } from "../src/index.ts";
+import {
+  IntegrationCapabilityError,
+  registerIntegration,
+  type AvailableIntegrationDetection,
+  type RunInfo,
+} from "../src/index.ts";
 import { shellIntegration } from "../src/integrations/index.ts";
 
 test("shell Integration detects an explicit executable without discovery", async () => {
@@ -58,4 +63,45 @@ test("shell Integration has a disposable observer with no semantic claims", () =
       .observe({ type: "output", chunk: { seq: 1, data: [65] } }),
     [],
   );
+});
+
+test("shell Integration rejects Level B before a raw fork request", async () => {
+  let forks = 0;
+  const registered = registerIntegration(
+    {
+      async start(): Promise<RunInfo> {
+        throw new Error("unreachable raw start");
+      },
+      async fork(): Promise<RunInfo> {
+        forks += 1;
+        throw new Error("unreachable raw fork");
+      },
+    },
+    shellIntegration,
+  );
+  const parent: RunInfo = {
+    id: "00000000-0000-0000-0000-000000000001",
+    spec: {
+      program: "/bin/sh",
+      args: ["-i"],
+      cwd: "/workspace",
+      env: {},
+      size: { cols: 80, rows: 24 },
+      declared_inputs: [],
+    },
+    lineage: null,
+    pid: 123,
+    state: { type: "running" },
+    head_seq: 0,
+    oldest_seq: 0,
+    attachments: 0,
+  };
+
+  await assert.rejects(
+    registered.forkLevelB(parent, undefined, { executable: "/bin/sh" }),
+    (error: unknown) =>
+      error instanceof IntegrationCapabilityError &&
+      error.capability === "level_b_fork",
+  );
+  assert.equal(forks, 0);
 });
