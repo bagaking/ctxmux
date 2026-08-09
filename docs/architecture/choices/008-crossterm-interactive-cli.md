@@ -37,7 +37,9 @@ restoration cases. The background stdin thread cannot be cancelled cleanly and
 may remain blocked until process exit. Output backpressure blocks the
 interactive loop while stdout is written.
 
-On `Gap`, the CLI tells the user the daemon head sequence but does not track and print the last successfully displayed sequence needed for a precise reattach command.
+On `Gap`, the CLI tells the user the daemon's latest output byte but does not
+track and print the last successfully displayed byte cursor needed for a
+precise reattach command.
 
 ## Wrong-case corpus
 
@@ -65,7 +67,7 @@ Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engin
 - Which signals must be handled explicitly to restore terminal state?
 - Should stdin be integrated through async file descriptors on supported Unix systems?
 - What read-only and multi-attacher terminal-ownership modes are required?
-- How does the CLI persist its last observed sequence for gap recovery?
+- How does the CLI persist its last observed byte cursor for gap recovery?
 
 ## Repository evidence
 

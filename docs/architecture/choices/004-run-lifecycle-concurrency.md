@@ -21,7 +21,7 @@ The hook is not a public fault API and cannot change production scheduling.
 
 - A connection task never owns the Run's last strong reference.
 - Attach snapshot and live delivery do not have an uncovered subscribe gap.
-- Output sequence allocation and log insertion are one locked operation.
+- Output byte-range allocation and log insertion are one locked operation.
 - Memory-only output does not enter the durable transition/state/persistence
   lock path; persistence-capable Runs retain that ordering before binding.
 - A dropped attachment eventually decrements the observable count.
@@ -78,7 +78,7 @@ The hook is not a public fault API and cannot change production scheduling.
 
 ## Known constraints
 
-`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `head_seq` but does not automatically replay; callers retain their own recovery cursor. Persistent same-epoch exited Runs are not yet collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
+`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `latest_output_bytes` but does not automatically replay; callers retain their own recovery cursor. Persistent same-epoch exited Runs are not yet collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
 
 Memory-only terminal Runs remain retained below the 128-record Registry ceiling
 and become eligible for exact admission-triggered replacement only after every
@@ -90,7 +90,7 @@ panics but is not a declared consistency-recovery strategy.
 
 Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/lifecycle-concurrency.md), claim `C004`.
 
-- `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered sequence can skip or duplicate recoverable output after lag.
+- `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered byte can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
 - `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now removes signalling authority before publication, and a deterministic barrier proves stop rejects during that interval without touching an unrelated process.
 - `LC-004`: retrying an unclassified child-status error every 20 ms can retain
@@ -116,7 +116,7 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   inventing writer or resize arbitration.
 - Candidate: broader stop races with hostile output, natural exit, and a
   controllable process/PTY seam under sustained load.
-- Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous sequences and exact raw bytes.
+- Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous byte ranges and exact raw bytes.
 - Covered now: a child-wait barrier pauses public state publication after signalling authority is removed and proves concurrent stop cannot affect an unrelated process identity.
 - Covered now: a fake child returns one status error followed by a tempting
   synthetic exit; ctxmux polls exactly once, sends no kill/wait/clone signal,

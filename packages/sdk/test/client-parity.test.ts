@@ -69,11 +69,11 @@ test(
 
     const firstAttachment = await firstClient.attach(runId);
     let observed = replayBytes(firstAttachment.snapshot.replay.chunks);
-    let lastSequence = firstAttachment.snapshot.replay.head_seq;
-    ({ observed, lastSequence } = await waitForOutput(
+    let lastByte = firstAttachment.snapshot.replay.latest_output_bytes;
+    ({ observed, lastByte } = await waitForOutput(
       firstAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "READY",
     ));
     assert.deepEqual(
@@ -83,10 +83,10 @@ test(
         receipt: { type: "input", written_bytes: 6 },
       },
     );
-    ({ observed, lastSequence } = await waitForOutput(
+    ({ observed, lastByte } = await waitForOutput(
       firstAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "OUT:hello",
     ));
 
@@ -109,17 +109,17 @@ test(
     }).recoverableInput(recoverableOperation);
     assert.deepEqual(retriedApplied.receipt, applied.receipt);
     assert.equal(retriedApplied.run.applied_input_bytes, 16);
-    ({ observed, lastSequence } = await waitForOutput(
+    ({ observed, lastByte } = await waitForOutput(
       firstAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "OUT:sdk",
     ));
     assert.equal(text(observed).match(/OUT:sdk/g)?.length, 1);
-    ({ observed, lastSequence } = await waitForOutput(
+    ({ observed, lastByte } = await waitForOutput(
       firstAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "OUT:later",
     ));
 
@@ -141,14 +141,11 @@ test(
       applied_size: { cols: 120, rows: 40 },
     });
     assert.equal(resized.run.id, runId);
-    const secondAttachment = await reconnectedClient.attach(
-      runId,
-      lastSequence,
-    );
+    const secondAttachment = await reconnectedClient.attach(runId, lastByte);
     assert.equal(secondAttachment.snapshot.run.pid, pid);
     assert.equal(secondAttachment.snapshot.replay.truncated, false);
     observed = replayBytes(secondAttachment.snapshot.replay.chunks);
-    lastSequence = secondAttachment.snapshot.replay.head_seq;
+    lastByte = secondAttachment.snapshot.replay.latest_output_bytes;
     assert.deepEqual(
       await step(
         "second attachment size input",
@@ -159,10 +156,10 @@ test(
         receipt: { type: "input", written_bytes: 5 },
       },
     );
-    ({ observed, lastSequence } = await waitForOutput(
+    ({ observed, lastByte } = await waitForOutput(
       secondAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "SIZE:40 120",
     ));
     assert.deepEqual(
@@ -175,10 +172,10 @@ test(
         receipt: { type: "input", written_bytes: 5 },
       },
     );
-    ({ observed, lastSequence } = await waitForOutput(
+    ({ observed, lastByte } = await waitForOutput(
       secondAttachment,
       observed,
-      lastSequence,
+      lastByte,
       "OUT:quit",
     ));
     const exit = await waitForExit(secondAttachment);
@@ -310,7 +307,7 @@ if (args[0] === "--version") {
     const parentOutput = await waitForOutput(
       attachment,
       replayBytes(attachment.snapshot.replay.chunks),
-      attachment.snapshot.replay.head_seq,
+      attachment.snapshot.replay.latest_output_bytes,
       expectedRecord,
     );
     assert.match(
@@ -433,7 +430,7 @@ if (args[0] === "--version") {
     await waitForOutput(
       childAttachment,
       replayBytes(childAttachment.snapshot.replay.chunks),
-      childAttachment.snapshot.replay.head_seq,
+      childAttachment.snapshot.replay.latest_output_bytes,
       resumedRecord,
     );
     childAttachment.close();
@@ -500,7 +497,7 @@ test(
     const output = await waitForOutput(
       attachment,
       replayBytes(attachment.snapshot.replay.chunks),
-      attachment.snapshot.replay.head_seq,
+      attachment.snapshot.replay.latest_output_bytes,
       "TMUX:sdk-public-output",
     );
     assert.match(text(output.observed), /TMUX:sdk-public-output/);
@@ -694,11 +691,11 @@ async function waitForDaemon(
 async function waitForOutput(
   attachment: Attachment,
   initial: Uint8Array,
-  initialSequence: number,
+  initialByte: number,
   expected: string,
-): Promise<{ observed: Uint8Array; lastSequence: number }> {
+): Promise<{ observed: Uint8Array; lastByte: number }> {
   let observed = initial;
-  let lastSequence = initialSequence;
+  let lastByte = initialByte;
   const deadline = Date.now() + 5_000;
   while (!text(observed).includes(expected)) {
     if (Date.now() > deadline) {
@@ -713,17 +710,18 @@ async function waitForOutput(
       "attachment closed before expected output",
     );
     if (event?.type === "output") {
-      lastSequence = event.chunk.seq;
+      assert.equal(event.chunk.start_byte, lastByte);
+      lastByte = event.chunk.end_byte;
       observed = append(observed, Uint8Array.from(event.chunk.data));
     } else if (event?.type === "gap") {
-      throw new Error(`unexpected output gap at ${event.head_seq}`);
+      throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
     } else if (event?.type === "exited") {
       throw new Error(
         `Run exited before ${expected}: ${JSON.stringify(event.state)}; received ${JSON.stringify(text(observed))}`,
       );
     }
   }
-  return { observed, lastSequence };
+  return { observed, lastByte };
 }
 
 async function waitForExit(
@@ -736,7 +734,7 @@ async function waitForExit(
       return event.state;
     }
     if (event?.type === "gap") {
-      throw new Error(`unexpected output gap at ${event.head_seq}`);
+      throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
     }
   }
   throw new Error("timed out waiting for Run exit");
@@ -761,7 +759,7 @@ async function waitForCodexSession(
       break;
     }
     if (event.type === "gap") {
-      throw new Error(`unexpected output gap at ${event.head_seq}`);
+      throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
     }
     const session = observer.observe(event).find(isCodexSessionProvenance);
     if (session !== undefined) {
@@ -788,7 +786,7 @@ async function nextOutputEvent(
       break;
     }
     if (event.type === "gap") {
-      throw new Error(`unexpected output gap at ${event.head_seq}`);
+      throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
     }
   }
   throw new Error("attachment did not produce an output event");

@@ -212,9 +212,9 @@ test("Codex Level B planning resumes one declared native session", () => {
     },
     pid: 123,
     state: { type: "running" },
-    head_seq: 1,
-    durable_head_seq: null,
-    oldest_seq: 1,
+    latest_output_bytes: 1,
+    durable_output_bytes: null,
+    first_available_byte: 1,
     attachments: 0,
     applied_input_bytes: 0,
   };
@@ -297,7 +297,8 @@ test("Codex Level B rejects unrelated and unverifiable provenance before raw for
       registered.createObserver(parent).observe({
         type: "output",
         chunk: {
-          seq: ownedOutput.chunk.seq,
+          start_byte: ownedOutput.chunk.start_byte,
+          end_byte: ownedOutput.chunk.end_byte,
           data: [...ownedOutput.chunk.data],
         },
       }),
@@ -389,9 +390,10 @@ test("Codex observer normalizes partitioned JSONL and isolates parser failures",
     [diagnostic("invalid_json")],
   );
   observer.observe(output(1_000, [0xe4]));
-  assert.deepEqual(observer.observe({ type: "gap", head_seq: 1_001 }), [
-    diagnostic("output_gap"),
-  ]);
+  assert.deepEqual(
+    observer.observe({ type: "gap", latest_output_bytes: 1_001 }),
+    [diagnostic("output_gap")],
+  );
   assert.deepEqual(observer.observe(output(1_002, [0xff, 0x0a])), [
     diagnostic("invalid_utf8"),
   ]);
@@ -421,12 +423,23 @@ test("Codex observer normalizes partitioned JSONL and isolates parser failures",
   );
 });
 
-function output(seq: number, data: number[]): RunEvent {
-  return { type: "output", chunk: { seq, data } };
+function output(startByte: number, data: number[]): RunEvent {
+  return {
+    type: "output",
+    chunk: {
+      start_byte: startByte,
+      end_byte: startByte + data.length,
+      data,
+    },
+  };
 }
 
-function sourcedOutput(run: RunInfo, seq: number, data: number[]): RunEvent {
-  const event = output(seq, data);
+function sourcedOutput(
+  run: RunInfo,
+  startByte: number,
+  data: number[],
+): RunEvent {
+  const event = output(startByte, data);
   if (event.type !== "output") {
     throw new Error("output fixture returned a non-output event");
   }
@@ -465,9 +478,9 @@ function rootRun(id: RunInfo["id"]): RunInfo {
     },
     pid: 123,
     state: { type: "running" },
-    head_seq: 1,
-    durable_head_seq: null,
-    oldest_seq: 1,
+    latest_output_bytes: 1,
+    durable_output_bytes: null,
+    first_available_byte: 1,
     attachments: 0,
     applied_input_bytes: 0,
   };

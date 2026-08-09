@@ -25,7 +25,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-7 wire contract. */
+/** A daemon frame failed the runtime half of the generation-8 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -68,7 +68,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-7 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-8 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -135,7 +135,10 @@ function runEvent(value: unknown, path: string): void {
       tmuxRunEvent(event.event, `${path}.event`);
       return;
     case "gap":
-      validateCursorValue(event.head_seq, `${path}.head_seq`);
+      validateCursorValue(
+        event.latest_output_bytes,
+        `${path}.latest_output_bytes`,
+      );
       return;
     default:
       throw invalid(`${path}.type`, "a known Run-event discriminant");
@@ -163,11 +166,14 @@ function runInfo(value: unknown, path: string): void {
     throw invalid(`${path}.spec`, "null for an imported tmux pane");
   }
   runState(run.state, `${path}.state`);
-  validateCursorValue(run.head_seq, `${path}.head_seq`);
-  if (run.durable_head_seq !== null) {
-    validateCursorValue(run.durable_head_seq, `${path}.durable_head_seq`);
+  validateCursorValue(run.latest_output_bytes, `${path}.latest_output_bytes`);
+  if (run.durable_output_bytes !== null) {
+    validateCursorValue(
+      run.durable_output_bytes,
+      `${path}.durable_output_bytes`,
+    );
   }
-  validateCursorValue(run.oldest_seq, `${path}.oldest_seq`);
+  validateCursorValue(run.first_available_byte, `${path}.first_available_byte`);
   safeUnsignedInteger(run.attachments, `${path}.attachments`);
   if (run.applied_input_bytes !== null) {
     validateCursorValue(run.applied_input_bytes, `${path}.applied_input_bytes`);
@@ -348,17 +354,31 @@ function outputReplayHeader(value: unknown, path: string): void {
   if ("chunks" in replay) {
     throw invalid(`${path}.chunks`, "absent from the metadata-only header");
   }
-  validateCursorValue(replay.oldest_seq, `${path}.oldest_seq`);
-  validateCursorValue(replay.head_seq, `${path}.head_seq`);
+  validateCursorValue(
+    replay.first_available_byte,
+    `${path}.first_available_byte`,
+  );
+  validateCursorValue(
+    replay.latest_output_bytes,
+    `${path}.latest_output_bytes`,
+  );
   boolean(replay.truncated, `${path}.truncated`);
 }
 
 function outputChunk(value: unknown, path: string): void {
   const chunk = record(value, path);
-  validateCursorValue(chunk.seq, `${path}.seq`);
-  array(chunk.data, `${path}.data`).forEach((byte, index) =>
+  validateCursorValue(chunk.start_byte, `${path}.start_byte`);
+  validateCursorValue(chunk.end_byte, `${path}.end_byte`);
+  const data = array(chunk.data, `${path}.data`);
+  data.forEach((byte, index) =>
     unsignedInteger(byte, `${path}.data[${index}]`, 0xff),
   );
+  if (
+    (chunk.end_byte as number) <= (chunk.start_byte as number) ||
+    (chunk.end_byte as number) - (chunk.start_byte as number) !== data.length
+  ) {
+    throw invalid(path, "a non-empty byte range matching data length");
+  }
 }
 
 function attachmentCommandId(value: unknown, path: string): void {

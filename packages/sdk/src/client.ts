@@ -301,13 +301,13 @@ export class CtxmuxClient {
     );
   }
 
-  public async attach(id: RunId, afterSeq = 0): Promise<Attachment> {
-    validateCursor(afterSeq, "afterSeq");
+  public async attach(id: RunId, afterByte = 0): Promise<Attachment> {
+    validateCursor(afterByte, "afterByte");
     const { wire } = await this.#connect();
     try {
       await wire.send({
         type: "request",
-        request: { type: "attach", id, after_seq: afterSeq },
+        request: { type: "attach", id, after_byte: afterByte },
       } satisfies ClientFrame);
       const frame = serverFrame(await wire.receive());
       if (frame.type === "error") {
@@ -316,7 +316,7 @@ export class CtxmuxClient {
       if (frame.type !== "attached") {
         throw unexpected("attached snapshot", frame.type);
       }
-      const snapshot = await receiveReplay(wire, afterSeq, frame.snapshot);
+      const snapshot = await receiveReplay(wire, afterByte, frame.snapshot);
       return new Attachment(wire, snapshot);
     } catch (error) {
       wire.close();
@@ -427,18 +427,18 @@ export class CtxmuxClient {
 
 async function receiveReplay(
   wire: JsonLinesConnection,
-  afterSeq: number,
+  afterByte: number,
   header: Extract<ServerFrame, { readonly type: "attached" }>["snapshot"],
 ): Promise<AttachedSnapshot> {
   const chunks: AttachedSnapshot["replay"]["chunks"] = [];
-  if (afterSeq >= header.replay.head_seq) {
+  if (afterByte >= header.replay.latest_output_bytes) {
     return {
       run: header.run,
       replay: { ...header.replay, chunks },
     };
   }
-  let nextSequence = Math.max(afterSeq, header.replay.oldest_seq - 1);
-  while (nextSequence < header.replay.head_seq) {
+  let expectedByte = Math.max(afterByte, header.replay.first_available_byte);
+  while (expectedByte < header.replay.latest_output_bytes) {
     const frame = serverFrame(await wire.receive());
     if (frame.type === "error") {
       throw protocolError(frame.error);
@@ -446,12 +446,13 @@ async function receiveReplay(
     if (
       frame.type !== "event" ||
       frame.event.type !== "output" ||
-      frame.event.chunk.seq !== nextSequence + 1
+      frame.event.chunk.start_byte !== expectedByte ||
+      frame.event.chunk.end_byte > header.replay.latest_output_bytes
     ) {
       throw unexpected("ordered replay output", frame.type);
     }
     chunks.push(frame.event.chunk);
-    nextSequence = frame.event.chunk.seq;
+    expectedByte = frame.event.chunk.end_byte;
   }
   return {
     run: header.run,

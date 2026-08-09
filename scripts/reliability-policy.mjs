@@ -888,10 +888,10 @@ function validV3ResourceCell(cell, expectedCounts, budgets) {
 }
 
 const GC_TUPLE_FIELDS =
-  "run_id operation_key lineage state head_seq durable_head_seq oldest_seq replay_bytes replay_sha256 chunks truncated".split(
+  "run_id operation_key lineage state latest_output_bytes durable_output_bytes first_available_byte replay_bytes replay_sha256 chunks truncated".split(
     " ",
   );
-const GC_CHUNK_FIELDS = "seq bytes sha256".split(" ");
+const GC_CHUNK_FIELDS = "start_byte end_byte bytes sha256".split(" ");
 const GC_TUPLE_EVIDENCE_FIELDS = "count total_replay_bytes sha256 tuples".split(
   " ",
 );
@@ -964,9 +964,11 @@ function validateGcTupleEvidence(evidence, expected) {
             code: 0,
             signal: null,
           }) ||
-          ![tuple.head_seq, tuple.oldest_seq, tuple.replay_bytes].every(
-            (value) => Number.isSafeInteger(value) && value >= 0,
-          ) ||
+          ![
+            tuple.latest_output_bytes,
+            tuple.first_available_byte,
+            tuple.replay_bytes,
+          ].every((value) => Number.isSafeInteger(value) && value >= 0) ||
           tuple.replay_bytes > expected.payloadBytes ||
           typeof tuple.truncated !== "boolean" ||
           !Array.isArray(tuple.chunks) ||
@@ -983,11 +985,12 @@ function validateGcTupleEvidence(evidence, expected) {
         if (marker[3] !== sourceDigest) return false;
         const persistent = expected.mode.startsWith("persistent");
         if (
-          (persistent && tuple.durable_head_seq !== tuple.head_seq) ||
-          (!persistent && tuple.durable_head_seq !== null) ||
-          tuple.oldest_seq > tuple.head_seq ||
-          tuple.chunks[0]?.seq !== tuple.oldest_seq ||
-          tuple.chunks.at(-1)?.seq !== tuple.head_seq
+          (persistent &&
+            tuple.durable_output_bytes !== tuple.latest_output_bytes) ||
+          (!persistent && tuple.durable_output_bytes !== null) ||
+          tuple.first_available_byte > tuple.latest_output_bytes ||
+          tuple.chunks[0]?.start_byte !== tuple.first_available_byte ||
+          tuple.chunks.at(-1)?.end_byte !== tuple.latest_output_bytes
         )
           return false;
         let replayOffset = expected.payloadBytes - tuple.replay_bytes;
@@ -996,16 +999,19 @@ function validateGcTupleEvidence(evidence, expected) {
           if (
             !isObject(chunk) ||
             !sameMembers(Object.keys(chunk), GC_CHUNK_FIELDS) ||
-            !Number.isSafeInteger(chunk.seq) ||
-            chunk.seq < 1 ||
+            !Number.isSafeInteger(chunk.start_byte) ||
+            chunk.start_byte < 0 ||
+            !Number.isSafeInteger(chunk.end_byte) ||
+            chunk.end_byte <= chunk.start_byte ||
             !Number.isSafeInteger(chunk.bytes) ||
             chunk.bytes <= 0 ||
             chunk.bytes > tuple.replay_bytes - replayBytes ||
             (expected.maxChunkBytes !== undefined &&
               chunk.bytes > expected.maxChunkBytes) ||
             !HASH_PATTERN.test(chunk.sha256 ?? "") ||
+            chunk.end_byte - chunk.start_byte !== chunk.bytes ||
             (chunkIndex > 0 &&
-              chunk.seq !== tuple.chunks[chunkIndex - 1].seq + 1) ||
+              chunk.start_byte !== tuple.chunks[chunkIndex - 1].end_byte) ||
             chunk.sha256 !==
               repeatedDigestSliceSha256(sourceDigest, replayOffset, chunk.bytes)
           )
@@ -1024,8 +1030,8 @@ function validateGcTupleEvidence(evidence, expected) {
           (!expected.exactReplay ||
             (tuple.replay_bytes === expected.payloadBytes &&
               tuple.truncated === false &&
-              tuple.oldest_seq === 1 &&
-              tuple.head_seq === tuple.chunks.length)) &&
+              tuple.first_available_byte === 0 &&
+              tuple.latest_output_bytes === expected.payloadBytes)) &&
           recoveredTupleMatchesLive(tuple, liveByRun)
         );
       }) &&
@@ -1071,18 +1077,19 @@ function recoveredTupleMatchesLive(tuple, liveByRun) {
   if (liveByRun.size === 0) return true;
   const live = liveByRun.get(tuple.run_id);
   const liveSuffix = live?.chunks.filter(
-    (chunk) => chunk.seq >= tuple.oldest_seq,
+    (chunk) => chunk.start_byte >= tuple.first_available_byte,
   );
   return (
     live !== undefined &&
     tuple.operation_key === live.operation_key &&
     isDeepStrictEqual(tuple.lineage, live.lineage) &&
     isDeepStrictEqual(tuple.state, live.state) &&
-    tuple.head_seq === live.head_seq &&
-    tuple.durable_head_seq === live.durable_head_seq &&
-    tuple.oldest_seq >= live.oldest_seq &&
+    tuple.latest_output_bytes === live.latest_output_bytes &&
+    tuple.durable_output_bytes === live.durable_output_bytes &&
+    tuple.first_available_byte >= live.first_available_byte &&
     tuple.truncated ===
-      (live.truncated || tuple.oldest_seq > live.oldest_seq) &&
+      (live.truncated ||
+        tuple.first_available_byte > live.first_available_byte) &&
     isDeepStrictEqual(tuple.chunks, liveSuffix)
   );
 }

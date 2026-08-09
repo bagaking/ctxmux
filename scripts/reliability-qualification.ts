@@ -1017,7 +1017,7 @@ async function runGcReplayPressure(
         assertRecoveredGcIdentity(recoveredTuples, beforeRestart);
         for (const [index, tuple] of recoveredTuples.entries()) {
           const previous = beforeRestart[index]!;
-          if (tuple.oldest_seq > previous.oldest_seq) {
+          if (tuple.first_available_byte > previous.first_available_byte) {
             assert.equal(
               tuple.truncated,
               true,
@@ -1157,14 +1157,14 @@ async function strictLiveGcTupleDigest(
     assert.equal(tuple.truncated, false);
     assert.deepEqual(tuple.lineage, null);
     assert.deepEqual(tuple.state, { type: "exited", code: 0, signal: null });
-    assert.equal(tuple.chunks[0]?.seq, tuple.oldest_seq);
-    assert.equal(tuple.chunks.at(-1)?.seq, tuple.head_seq);
-    assert.equal(tuple.oldest_seq, 1);
-    assert.equal(tuple.head_seq, tuple.chunks.length);
+    assert.equal(tuple.chunks[0]?.start_byte, tuple.first_available_byte);
+    assert.equal(tuple.chunks.at(-1)?.end_byte, tuple.latest_output_bytes);
+    assert.equal(tuple.first_available_byte, 0);
+    assert.equal(tuple.latest_output_bytes, expected.payload_bytes);
     if (expected.mode.startsWith("persistent")) {
-      assert.equal(tuple.durable_head_seq, tuple.head_seq);
+      assert.equal(tuple.durable_output_bytes, tuple.latest_output_bytes);
     } else {
-      assert.equal(tuple.durable_head_seq, null);
+      assert.equal(tuple.durable_output_bytes, null);
     }
   }
   return tupleSetDigest(sortedTuples(tuples.map(({ tuple }) => tuple)));
@@ -1271,7 +1271,7 @@ function assertRecoveredGcIdentity(
   assert.deepEqual(
     recovered.map(
       ({
-        oldest_seq: _,
+        first_available_byte: _,
         replay_bytes: __,
         replay_sha256: ___,
         chunks: ____,
@@ -1281,7 +1281,7 @@ function assertRecoveredGcIdentity(
     ),
     beforeRestart.map(
       ({
-        oldest_seq: _,
+        first_available_byte: _,
         replay_bytes: __,
         replay_sha256: ___,
         chunks: ____,
@@ -2937,13 +2937,13 @@ async function consumeExactOutput(
 ): Promise<{
   readonly bytes: number;
   readonly chunks: number;
-  readonly first_seq: number | null;
-  readonly last_seq: number;
+  readonly first_byte: number | null;
+  readonly last_byte: number;
 }> {
   let observed = 0;
   let chunks = 0;
-  let expectedSequence = attachment.snapshot.replay.head_seq + 1;
-  const firstSequence = expectedSequence;
+  let expectedCursor = attachment.snapshot.replay.latest_output_bytes;
+  const firstByte = expectedCursor;
   while (observed < expectedBytes) {
     const event = await attachment.nextEvent();
     assert.notEqual(
@@ -2953,9 +2953,9 @@ async function consumeExactOutput(
     );
     if (event?.type === "output") {
       assert.equal(
-        event.chunk.seq,
-        expectedSequence,
-        "fast attachment output sequence was duplicated or skipped",
+        event.chunk.start_byte,
+        expectedCursor,
+        "fast attachment output byte range was duplicated or skipped",
       );
       assert.ok(
         event.chunk.data.length <= expectedBytes - observed,
@@ -2967,10 +2967,12 @@ async function consumeExactOutput(
       );
       observed += event.chunk.data.length;
       chunks += 1;
-      expectedSequence += 1;
+      expectedCursor = event.chunk.end_byte;
     }
     if (event?.type === "gap")
-      assert.fail(`fast attachment reported Gap at ${event.head_seq}`);
+      assert.fail(
+        `fast attachment reported Gap at ${event.latest_output_bytes}`,
+      );
     if (event?.type === "exited")
       assert.fail("Run exited before fanout workload completed");
   }
@@ -2978,8 +2980,8 @@ async function consumeExactOutput(
   return {
     bytes: observed,
     chunks,
-    first_seq: chunks === 0 ? null : firstSequence,
-    last_seq: expectedSequence - 1,
+    first_byte: chunks === 0 ? null : firstByte,
+    last_byte: expectedCursor,
   };
 }
 

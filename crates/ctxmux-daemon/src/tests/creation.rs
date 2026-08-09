@@ -875,7 +875,7 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .expect("start finalize response Run");
     let recorded = manager.get(run.id).expect("resolve finalize response Run");
     let mut events = recorded.subscribe();
-    let initial_head = recorded.info().head_seq;
+    let initial_head = recorded.info().latest_output_bytes;
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
 
     server
@@ -909,8 +909,11 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .await
         .expect("read terminal status");
     assert!(!status.state.is_running());
-    assert_eq!(status.head_seq, initial_head + 1);
-    assert_eq!(status.durable_head_seq, Some(initial_head));
+    assert_eq!(
+        status.latest_output_bytes,
+        initial_head + b"late-after-terminal".len() as u64
+    );
+    assert_eq!(status.durable_output_bytes, Some(initial_head));
     let (_, late_snapshot) = server
         .client
         .attach(run.id, initial_head)
@@ -936,8 +939,8 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .find(|candidate| candidate.info.id == run.id)
         .expect("original Run remains durable");
     assert!(!durable.info.state.is_running());
-    assert_eq!(durable.info.head_seq, initial_head);
-    assert_eq!(durable.info.durable_head_seq, Some(initial_head));
+    assert_eq!(durable.info.latest_output_bytes, initial_head);
+    assert_eq!(durable.info.durable_output_bytes, Some(initial_head));
     assert!(durable.replay.chunks.is_empty());
     assert_recovered_exit(&recovered, sentinel);
     drop(reopened);
@@ -1253,9 +1256,9 @@ struct TurnoverTuple {
     operation_key: String,
     state: RunState,
     lineage: Option<RunLineage>,
-    oldest_seq: u64,
-    head_seq: u64,
-    durable_head_seq: Option<u64>,
+    first_available_byte: u64,
+    latest_output_bytes: u64,
+    durable_output_bytes: Option<u64>,
     truncated: bool,
     replay: Vec<u8>,
 }
@@ -1411,7 +1414,7 @@ async fn assert_turnover_boundary(
         let info = manager.info(expected.id).expect("retained Run is visible");
         assert!(!info.state.is_running());
         if persistent {
-            assert_eq!(info.durable_head_seq, Some(info.head_seq));
+            assert_eq!(info.durable_output_bytes, Some(info.latest_output_bytes));
         }
         let run = manager.get(expected.id).expect("pin retained turnover Run");
         if recovered {
@@ -1461,9 +1464,9 @@ fn turnover_tuples(manager: &RunManager, retained: &VecDeque<TurnoverRun>) -> Ve
                 operation_key: expected.operation_key.as_str().to_owned(),
                 state: info.state,
                 lineage: info.lineage,
-                oldest_seq: replay.oldest_seq,
-                head_seq: replay.head_seq,
-                durable_head_seq: info.durable_head_seq,
+                first_available_byte: replay.first_available_byte,
+                latest_output_bytes: replay.latest_output_bytes,
+                durable_output_bytes: info.durable_output_bytes,
                 truncated: replay.truncated,
                 replay: replay_bytes(&replay.chunks),
             }
@@ -1548,8 +1551,8 @@ fn insert_persistence_sentinel(
         info.pid.expect("native sentinel retains a historical PID"),
         OutputReplay {
             chunks: Vec::new(),
-            oldest_seq: 0,
-            head_seq: 0,
+            first_available_byte: 0,
+            latest_output_bytes: 0,
             truncated: false,
         },
         clean_exit(),

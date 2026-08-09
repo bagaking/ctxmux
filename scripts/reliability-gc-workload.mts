@@ -26,13 +26,14 @@ export interface GcRunTuple {
   readonly operation_key: CreateOperationKey;
   readonly lineage: RunInfo["lineage"];
   readonly state: RunInfo["state"];
-  readonly head_seq: number;
-  readonly durable_head_seq: number | null;
-  readonly oldest_seq: number;
+  readonly latest_output_bytes: number;
+  readonly durable_output_bytes: number | null;
+  readonly first_available_byte: number;
   readonly replay_bytes: number;
   readonly replay_sha256: string;
   readonly chunks: readonly {
-    readonly seq: number;
+    readonly start_byte: number;
+    readonly end_byte: number;
     readonly bytes: number;
     readonly sha256: string;
   }[];
@@ -131,22 +132,23 @@ export async function gcTuple(
   const attachment = await client.attach(expected.run_id);
   try {
     const replay = attachment.snapshot.replay;
-    assert.equal(replay.head_seq, run.head_seq);
-    assert.equal(replay.oldest_seq, run.oldest_seq);
+    assert.equal(replay.latest_output_bytes, run.latest_output_bytes);
+    assert.equal(replay.first_available_byte, run.first_available_byte);
     assert.ok(
       replay.chunks.every(
         (chunk, index) =>
-          index === 0 || chunk.seq === replay.chunks[index - 1]!.seq + 1,
+          index === 0 ||
+          chunk.start_byte === replay.chunks[index - 1]!.end_byte,
       ),
-      "GC replay sequence is not contiguous",
+      "GC replay byte ranges are not contiguous",
     );
     const bytes = Buffer.concat(
       replay.chunks.map((chunk) => Buffer.from(chunk.data)),
     );
     if (loadedRequireDurableHead(expected)) {
       assert.equal(
-        run.durable_head_seq,
-        run.head_seq,
+        run.durable_output_bytes,
+        run.latest_output_bytes,
         "GC live durable cursor did not reach the observed head",
       );
     }
@@ -160,13 +162,14 @@ export async function gcTuple(
       operation_key: expected.operation_key,
       lineage: run.lineage,
       state: run.state,
-      head_seq: run.head_seq,
-      durable_head_seq: run.durable_head_seq,
-      oldest_seq: run.oldest_seq,
+      latest_output_bytes: run.latest_output_bytes,
+      durable_output_bytes: run.durable_output_bytes,
+      first_available_byte: run.first_available_byte,
       replay_bytes: bytes.length,
       replay_sha256: createHash("sha256").update(bytes).digest("hex"),
       chunks: replay.chunks.map((chunk) => ({
-        seq: chunk.seq,
+        start_byte: chunk.start_byte,
+        end_byte: chunk.end_byte,
         bytes: chunk.data.length,
         sha256: createHash("sha256")
           .update(Buffer.from(chunk.data))

@@ -39,18 +39,18 @@ export type RunInfo = {
    */
   state: RunState;
   /**
-   * Highest output sequence allocated so far, or zero before output.
+   * Total output bytes allocated so far.
    */
-  head_seq: number;
+  latest_output_bytes: number;
   /**
-   * Highest output sequence committed by the persistence actor, or `None`
+   * Total output bytes committed by the persistence actor, or `None`
    * when this daemon is running without a state directory.
    */
-  durable_head_seq: number | null;
+  durable_output_bytes: number | null;
   /**
-   * Oldest output sequence still retained, or zero before output.
+   * First output byte still retained, or zero before output.
    */
-  oldest_seq: number;
+  first_available_byte: number;
   /**
    * Number of live attachment connections.
    */

@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 7
+# 003 — Unix socket and NDJSON protocol generation 8
 
-- Status: accepted for generation 7; pre-stable
+- Status: accepted for generation 8; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -50,14 +50,16 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 7 directly replaces generation 6. It adds daemon-instance
-identity plus recoverable native Input operation keys and receipts. It retains
+Protocol generation 8 directly replaces generation 7. It replaces output
+chunk ordinals with cumulative half-open byte ranges across Run metadata,
+Attach, replay, live output, and Gap. It retains daemon-instance identity plus
+recoverable native Input operation keys and receipts from generation 7, and
 the narrow `run_capacity` error for retained-Run admission introduced by
 generation 6, the correlated attachment controls, typed owner receipts,
 failure dispositions, and applied PTY-size readback introduced by generation
 5, plus the bounded creation keys introduced by generation 4. An
 older peer fails the exact generation handshake before request dispatch;
-ctxmux does not provide a generation-6 fallback, migration, alias, or dual
+ctxmux does not provide a generation-7 fallback, migration, alias, or dual
 encoding.
 Compatibility policy is not yet a release guarantee.
 

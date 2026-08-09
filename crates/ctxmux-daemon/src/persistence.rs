@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::{creation::MAX_RETAINED_RUNS, run_spec::validate_run_spec};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
 const PAGE_SIZE_BYTES: u64 = 4 * 1024;
@@ -2061,7 +2061,7 @@ impl StateStore {
             .execute(
                 "INSERT INTO runs (
                     id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
-                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    durable_first_available_byte, durable_output_bytes, replay_bytes, replay_truncated,
                     metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, NULL, 0, 0, 0, 0, ?7, ?8, ?8, NULL)",
                 params![
@@ -2397,25 +2397,25 @@ impl StateStore {
                 let is_last = index + 1 == groups.len();
                 let partial = OutputReplay {
                     chunks: chunks.clone(),
-                    oldest_seq: replay.oldest_seq,
-                    head_seq: if is_last {
-                        replay.head_seq
+                    first_available_byte: replay.first_available_byte,
+                    latest_output_bytes: if is_last {
+                        replay.latest_output_bytes
                     } else {
-                        chunks.last().map_or(0, |chunk| chunk.seq)
+                        chunks.last().map_or(0, |chunk| chunk.end_byte)
                     },
                     truncated: replay.truncated,
                 };
                 let partial_payload = replay_payload(&partial);
-                let first_seq = partial
+                let first_byte = partial
                     .chunks
                     .first()
                     .expect("a split replay group is non-empty")
-                    .seq;
+                    .start_byte;
                 let expected_head = expected_heads
                     .get(id)
                     .copied()
                     .unwrap_or_else(|| durable_head.load(Ordering::Acquire));
-                let is_fresh_contiguous = first_seq == expected_head.saturating_add(1);
+                let is_fresh_contiguous = first_byte == expected_head;
                 if !transaction_batch.is_empty()
                     && (transaction_payload.saturating_add(partial_payload)
                         > MAX_TRANSACTION_PAYLOAD_BYTES
@@ -2431,7 +2431,7 @@ impl StateStore {
                     continue;
                 }
                 transaction_payload = transaction_payload.saturating_add(partial_payload);
-                expected_heads.insert(*id, partial.head_seq);
+                expected_heads.insert(*id, partial.latest_output_bytes);
                 transaction_batch.push((*id, partial, Arc::clone(durable_head)));
             }
         }
@@ -2472,16 +2472,16 @@ impl StateStore {
         for chunk_group in split_chunks(&prefix)? {
             let prefix_replay = OutputReplay {
                 chunks: chunk_group.clone(),
-                oldest_seq: replay.oldest_seq,
-                head_seq: chunk_group.last().map_or(0, |chunk| chunk.seq),
+                first_available_byte: replay.first_available_byte,
+                latest_output_bytes: chunk_group.last().map_or(0, |chunk| chunk.end_byte),
                 truncated: replay.truncated,
             };
             self.append_transaction(&[(id, prefix_replay, Arc::clone(durable_head))], None)?;
         }
         let terminal_replay = OutputReplay {
             chunks: final_chunks,
-            oldest_seq: replay.oldest_seq,
-            head_seq: replay.head_seq,
+            first_available_byte: replay.first_available_byte,
+            latest_output_bytes: replay.latest_output_bytes,
             truncated: replay.truncated,
         };
         self.append_transaction(
@@ -2498,7 +2498,7 @@ impl StateStore {
         let durable_head: i64 = self
             .connection
             .query_row(
-                "SELECT durable_head_seq FROM runs WHERE id = ?1",
+                "SELECT durable_output_bytes FROM runs WHERE id = ?1",
                 [id.to_string()],
                 |row| row.get(0),
             )
@@ -2508,7 +2508,7 @@ impl StateStore {
         Ok(replay
             .chunks
             .iter()
-            .filter(|chunk| chunk.seq > durable_head)
+            .filter(|chunk| chunk.end_byte > durable_head)
             .cloned()
             .collect())
     }
@@ -2750,8 +2750,8 @@ fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), Per
                 state_json TEXT NOT NULL,
                 source_epoch TEXT NOT NULL,
                 pid INTEGER,
-                durable_oldest_seq INTEGER NOT NULL CHECK (durable_oldest_seq >= 0),
-                durable_head_seq INTEGER NOT NULL CHECK (durable_head_seq >= 0),
+                durable_first_available_byte INTEGER NOT NULL CHECK (durable_first_available_byte >= 0),
+                durable_output_bytes INTEGER NOT NULL CHECK (durable_output_bytes >= 0),
                 replay_bytes INTEGER NOT NULL CHECK (replay_bytes >= 0),
                 replay_truncated INTEGER NOT NULL CHECK (replay_truncated IN (0, 1)),
                 metadata_bytes INTEGER NOT NULL CHECK (metadata_bytes >= 0),
@@ -2763,11 +2763,12 @@ fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), Per
              CREATE TABLE replay_chunks (
                 ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL CHECK (seq > 0),
+                start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
+                end_byte INTEGER NOT NULL CHECK (end_byte > start_byte),
                 data BLOB NOT NULL,
-                UNIQUE(run_id, seq)
+                UNIQUE(run_id, start_byte)
              );
-             CREATE INDEX replay_chunks_run_seq ON replay_chunks(run_id, seq);"
+             CREATE INDEX replay_chunks_run_start_byte ON replay_chunks(run_id, start_byte);"
         ))
         .map_err(PersistenceError::database)?;
     connection
@@ -2820,7 +2821,10 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(PersistenceError::database)?;
     let expected = BTreeSet::from([
-        ("index".to_owned(), "replay_chunks_run_seq".to_owned()),
+        (
+            "index".to_owned(),
+            "replay_chunks_run_start_byte".to_owned(),
+        ),
         ("index".to_owned(), "runs_creation_key".to_owned()),
         ("table".to_owned(), "replay_chunks".to_owned()),
         ("table".to_owned(), "runs".to_owned()),
@@ -2848,8 +2852,8 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
             "state_json",
             "source_epoch",
             "pid",
-            "durable_oldest_seq",
-            "durable_head_seq",
+            "durable_first_available_byte",
+            "durable_output_bytes",
             "replay_bytes",
             "replay_truncated",
             "metadata_bytes",
@@ -2861,7 +2865,7 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
     validate_table_columns(
         connection,
         "replay_chunks",
-        &["ordinal", "run_id", "seq", "data"],
+        &["ordinal", "run_id", "start_byte", "end_byte", "data"],
     )?;
     validate_creation_key_index(connection)?;
     validate_database_format_pragmas(connection)
@@ -2980,7 +2984,7 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
     let mut statement = connection
         .prepare(
             "SELECT id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
-                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    durable_first_available_byte, durable_output_bytes, replay_bytes, replay_truncated,
                     metadata_bytes FROM runs ORDER BY id",
         )
         .map_err(PersistenceError::database)?;
@@ -3105,11 +3109,18 @@ fn validate_replay_window(
     truncated: bool,
 ) -> Result<(), PersistenceError> {
     let mut statement = connection
-        .prepare("SELECT seq, length(data) FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
+        .prepare(
+            "SELECT start_byte, end_byte, length(data)
+             FROM replay_chunks WHERE run_id = ?1 ORDER BY start_byte",
+        )
         .map_err(PersistenceError::database)?;
     let chunks = statement
         .query_map([id.to_string()], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })
         .map_err(PersistenceError::database)?
         .collect::<Result<Vec<_>, _>>()
@@ -3124,23 +3135,24 @@ fn validate_replay_window(
     }
     let mut expected = oldest;
     let mut bytes = 0_u64;
-    for (seq, len) in chunks {
-        let seq = nonnegative_u64(seq, "chunk sequence")?;
+    for (start_byte, end_byte, len) in chunks {
+        let start_byte = nonnegative_u64(start_byte, "chunk start byte")?;
+        let end_byte = nonnegative_u64(end_byte, "chunk end byte")?;
         let len = nonnegative_u64(len, "chunk length")?;
-        if seq != expected {
+        if start_byte != expected || end_byte <= start_byte || end_byte - start_byte != len {
             return Err(PersistenceError::Corrupt(format!(
-                "Run {id} replay is not contiguous at {seq}, expected {expected}"
+                "Run {id} replay range [{start_byte}, {end_byte}) is invalid or not contiguous at {expected}"
             )));
         }
-        expected = expected.saturating_add(1);
+        expected = end_byte;
         bytes = bytes.saturating_add(len);
     }
-    if expected.saturating_sub(1) != head || bytes != replay_bytes {
+    if expected != head || bytes != replay_bytes {
         return Err(PersistenceError::Corrupt(format!(
             "Run {id} replay cursors or bytes do not match chunks"
         )));
     }
-    if oldest > 1 && !truncated {
+    if oldest > 0 && !truncated {
         return Err(PersistenceError::Corrupt(format!(
             "Run {id} pruned replay is not marked truncated"
         )));
@@ -3156,8 +3168,8 @@ fn validate_replay_window(
 fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, PersistenceError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, creation_key, spec_json, lineage_json, state_json, pid, durable_oldest_seq,
-                    durable_head_seq, replay_truncated, metadata_bytes
+            "SELECT id, creation_key, spec_json, lineage_json, state_json, pid, durable_first_available_byte,
+                    durable_output_bytes, replay_truncated, metadata_bytes
              FROM runs
              ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id",
         )
@@ -3208,11 +3220,11 @@ fn decode_recovered_row(
         .map(u32::try_from)
         .transpose()
         .map_err(|_| PersistenceError::Corrupt("invalid recovered PID".to_owned()))?;
-    let oldest_seq = nonnegative_u64(
+    let first_available_byte = nonnegative_u64(
         row.get(6).map_err(PersistenceError::database)?,
         "recovered oldest",
     )?;
-    let head_seq = nonnegative_u64(
+    let latest_output_bytes = nonnegative_u64(
         row.get(7).map_err(PersistenceError::database)?,
         "recovered head",
     )?;
@@ -3231,16 +3243,16 @@ fn decode_recovered_row(
             capabilities: RunCapabilities::NATIVE,
             pid,
             state,
-            head_seq,
-            durable_head_seq: Some(head_seq),
-            oldest_seq,
+            latest_output_bytes,
+            durable_output_bytes: Some(latest_output_bytes),
+            first_available_byte,
             attachments: 0,
             applied_input_bytes: None,
         },
         replay: OutputReplay {
             chunks: load_recovered_chunks(connection, &id_text)?,
-            oldest_seq,
-            head_seq,
+            first_available_byte,
+            latest_output_bytes,
             truncated,
         },
         metadata_bytes,
@@ -3252,19 +3264,29 @@ fn load_recovered_chunks(
     id: &str,
 ) -> Result<Vec<OutputChunk>, PersistenceError> {
     let mut statement = connection
-        .prepare("SELECT seq, data FROM replay_chunks WHERE run_id = ?1 ORDER BY seq")
+        .prepare(
+            "SELECT start_byte, end_byte, data
+             FROM replay_chunks WHERE run_id = ?1 ORDER BY start_byte",
+        )
         .map_err(PersistenceError::database)?;
     statement
         .query_map([id], |row| {
             Ok(OutputChunk {
-                seq: u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                start_byte: u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
                 })?,
-                data: row.get(1)?,
+                end_byte: u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                data: row.get(2)?,
             })
         })
         .map_err(PersistenceError::database)?
@@ -3309,6 +3331,10 @@ fn decode_native_spec(id: RunId, spec_json: &str) -> Result<RunSpec, Persistence
     Ok(spec)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one transaction-local range validation, append, pruning, and cursor update is easier to audit as one invariant"
+)]
 fn append_replay(
     transaction: &Transaction<'_>,
     id: RunId,
@@ -3322,7 +3348,7 @@ fn append_replay(
         String,
     ) = transaction
         .query_row(
-            "SELECT durable_oldest_seq, durable_head_seq, replay_bytes, state_kind
+            "SELECT durable_first_available_byte, durable_output_bytes, replay_bytes, state_kind
              FROM runs WHERE id = ?1",
             [&id_text],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
@@ -3333,48 +3359,66 @@ fn append_replay(
         && replay
             .chunks
             .iter()
-            .any(|chunk| chunk.seq > durable_head_unsigned)
+            .any(|chunk| chunk.end_byte > durable_head_unsigned)
     {
         return Err(PersistenceError::Mutation(format!(
             "cannot advance replay for terminal Run {id}"
         )));
     }
     for chunk in &replay.chunks {
-        let seq = i64::try_from(chunk.seq)
-            .map_err(|_| PersistenceError::Mutation("output sequence exceeds SQLite".to_owned()))?;
-        if seq <= durable_head {
-            if seq >= durable_oldest && durable_oldest != 0 {
-                let stored: Vec<u8> = transaction
-                    .query_row(
-                        "SELECT data FROM replay_chunks WHERE run_id = ?1 AND seq = ?2",
-                        params![&id_text, seq],
-                        |row| row.get(0),
-                    )
-                    .map_err(PersistenceError::database)?;
-                if stored != chunk.data {
-                    return Err(PersistenceError::Mutation(format!(
-                        "Run {id} replay sequence {} changed bytes",
-                        chunk.seq
-                    )));
-                }
+        let data_len = u64::try_from(chunk.data.len())
+            .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?;
+        if chunk.end_byte <= chunk.start_byte || chunk.end_byte - chunk.start_byte != data_len {
+            return Err(PersistenceError::Mutation(format!(
+                "Run {id} replay range [{}, {}) does not match its bytes",
+                chunk.start_byte, chunk.end_byte
+            )));
+        }
+        let start_byte = i64::try_from(chunk.start_byte).map_err(|_| {
+            PersistenceError::Mutation("output start byte exceeds SQLite".to_owned())
+        })?;
+        let end_byte = i64::try_from(chunk.end_byte)
+            .map_err(|_| PersistenceError::Mutation("output end byte exceeds SQLite".to_owned()))?;
+        if end_byte <= durable_head {
+            if start_byte < durable_oldest {
+                return Err(PersistenceError::Mutation(format!(
+                    "Run {id} cannot verify evicted replay range [{}, {})",
+                    chunk.start_byte, chunk.end_byte
+                )));
+            }
+            let stored: Option<(i64, Vec<u8>)> = transaction
+                .query_row(
+                    "SELECT end_byte, data FROM replay_chunks
+                         WHERE run_id = ?1 AND start_byte = ?2",
+                    params![&id_text, start_byte],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(PersistenceError::database)?;
+            if stored.as_ref() != Some(&(end_byte, chunk.data.clone())) {
+                return Err(PersistenceError::Mutation(format!(
+                    "Run {id} replay range [{}, {}) is missing or changed bytes",
+                    chunk.start_byte, chunk.end_byte
+                )));
             }
             continue;
         }
-        if durable_head == 0 && durable_oldest == 0 {
-            durable_oldest = seq;
-        } else if seq != durable_head + 1 {
+        if start_byte != durable_head {
             return Err(PersistenceError::Mutation(format!(
-                "Run {id} durable replay gap: got {seq}, expected {}",
-                durable_head + 1
+                "Run {id} durable replay gap: got {start_byte}, expected {durable_head}"
             )));
+        }
+        if durable_head == 0 {
+            durable_oldest = start_byte;
         }
         transaction
             .execute(
-                "INSERT INTO replay_chunks(run_id, seq, data) VALUES (?1, ?2, ?3)",
-                params![&id_text, seq, &chunk.data],
+                "INSERT INTO replay_chunks(run_id, start_byte, end_byte, data)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![&id_text, start_byte, end_byte, &chunk.data],
             )
             .map_err(PersistenceError::database)?;
-        durable_head = seq;
+        durable_head = end_byte;
         replay_bytes = replay_bytes.saturating_add(
             i64::try_from(chunk.data.len())
                 .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?,
@@ -3387,10 +3431,10 @@ fn append_replay(
         &mut durable_oldest,
         &mut replay_bytes,
     )?;
-    let truncated = replay.truncated || durable_oldest > 1;
+    let truncated = replay.truncated || durable_oldest > 0;
     transaction
         .execute(
-            "UPDATE runs SET durable_oldest_seq = ?2, durable_head_seq = ?3,
+            "UPDATE runs SET durable_first_available_byte = ?2, durable_output_bytes = ?3,
              replay_bytes = ?4, replay_truncated = ?5, updated_at_ms = ?6 WHERE id = ?1",
             params![
                 &id_text,
@@ -3434,28 +3478,29 @@ fn prune_run_replay_to(
     while u64::try_from(*replay_bytes).unwrap_or(u64::MAX) > replay_limit {
         let evicted: Option<(i64, i64)> = transaction
             .query_row(
-                "SELECT seq, length(data) FROM replay_chunks WHERE run_id = ?1 ORDER BY seq LIMIT 1",
+                "SELECT start_byte, length(data) FROM replay_chunks
+                 WHERE run_id = ?1 ORDER BY start_byte LIMIT 1",
                 [id_text],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(PersistenceError::database)?;
-        let Some((seq, bytes)) = evicted else {
+        let Some((start_byte, bytes)) = evicted else {
             return Err(PersistenceError::Corrupt(format!(
                 "Run {id} replay accounting has no chunks"
             )));
         };
         transaction
             .execute(
-                "DELETE FROM replay_chunks WHERE run_id = ?1 AND seq = ?2",
-                params![id_text, seq],
+                "DELETE FROM replay_chunks WHERE run_id = ?1 AND start_byte = ?2",
+                params![id_text, start_byte],
             )
             .map_err(PersistenceError::database)?;
         evicted_any = true;
         *replay_bytes = replay_bytes.saturating_sub(bytes);
         *durable_oldest = transaction
             .query_row(
-                "SELECT coalesce(min(seq), 0) FROM replay_chunks WHERE run_id = ?1",
+                "SELECT coalesce(min(start_byte), 0) FROM replay_chunks WHERE run_id = ?1",
                 [id_text],
                 |row| row.get(0),
             )
@@ -3486,7 +3531,7 @@ fn prune_global_replay_to(
         }
         let candidate: Option<(i64, String, i64, i64)> = transaction
             .query_row(
-                "SELECT chunk.ordinal, chunk.run_id, chunk.seq, length(chunk.data)
+                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, length(chunk.data)
                  FROM replay_chunks AS chunk
                  WHERE (SELECT count(*) FROM replay_chunks AS retained
                         WHERE retained.run_id = chunk.run_id) > 1
@@ -3496,7 +3541,7 @@ fn prune_global_replay_to(
             )
             .optional()
             .map_err(PersistenceError::database)?;
-        let Some((ordinal, run_id, _seq, bytes)) = candidate else {
+        let Some((ordinal, run_id, _start_byte, bytes)) = candidate else {
             return Err(PersistenceError::Corrupt(
                 "global replay accounting has no chunks".to_owned(),
             ));
@@ -3508,8 +3553,8 @@ fn prune_global_replay_to(
         transaction
             .execute(
                 "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
-                 durable_oldest_seq = coalesce(
-                   (SELECT min(seq) FROM replay_chunks WHERE run_id = ?1), 0
+                 durable_first_available_byte = coalesce(
+                   (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
                  ) WHERE id = ?1",
                 params![run_id, bytes],
             )
@@ -3520,7 +3565,7 @@ fn prune_global_replay_to(
 fn read_run_head(transaction: &Transaction<'_>, id: RunId) -> Result<u64, PersistenceError> {
     let value: i64 = transaction
         .query_row(
-            "SELECT durable_head_seq FROM runs WHERE id = ?1",
+            "SELECT durable_output_bytes FROM runs WHERE id = ?1",
             [id.to_string()],
             |row| row.get(0),
         )
@@ -3569,8 +3614,8 @@ fn split_chunks(chunks: &[OutputChunk]) -> Result<Vec<Vec<OutputChunk>>, Persist
     for chunk in chunks {
         if chunk.data.len() > MAX_TRANSACTION_PAYLOAD_BYTES {
             return Err(PersistenceError::Mutation(format!(
-                "output chunk {} exceeds the transaction payload ceiling",
-                chunk.seq
+                "output range [{}, {}) exceeds the transaction payload ceiling",
+                chunk.start_byte, chunk.end_byte
             )));
         }
         if !current.is_empty()
@@ -4207,26 +4252,26 @@ mod tests {
         append_replay(
             &transaction,
             first,
-            &replay(vec![chunk(1, b"aaa"), chunk(2, b"bbb")]),
+            &replay(vec![chunk(0, b"aaa"), chunk(3, b"bbb")]),
         )
         .expect("append first replay");
         append_replay(
             &transaction,
             second,
-            &replay(vec![chunk(1, b"ccc"), chunk(2, b"ddd")]),
+            &replay(vec![chunk(0, b"ccc"), chunk(3, b"ddd")]),
         )
         .expect("append second replay");
         assert!(prune_global_replay_to(&transaction, 7).expect("prune global replay"));
         for id in [first, second] {
             let (oldest, head, bytes, truncated): (i64, i64, i64, i64) = transaction
                 .query_row(
-                    "SELECT durable_oldest_seq, durable_head_seq, replay_bytes,
+                    "SELECT durable_first_available_byte, durable_output_bytes, replay_bytes,
                             replay_truncated FROM runs WHERE id = ?1",
                     [id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .expect("read pruned replay accounting");
-            assert_eq!((oldest, head, bytes, truncated), (2, 2, 3, 1));
+            assert_eq!((oldest, head, bytes, truncated), (3, 6, 3, 1));
         }
         transaction.commit().expect("commit replay pruning");
     }
@@ -4258,17 +4303,17 @@ mod tests {
             .append_batch(&[
                 (
                     first,
-                    replay(vec![chunk(1, b"aaa")]),
+                    replay(vec![chunk(0, b"aaa")]),
                     Arc::clone(&first_head),
                 ),
                 (
                     first,
-                    replay(vec![chunk(2, b"bbb")]),
+                    replay(vec![chunk(3, b"bbb")]),
                     Arc::clone(&first_head),
                 ),
                 (
                     second,
-                    replay(vec![chunk(1, b"ccc")]),
+                    replay(vec![chunk(0, b"ccc")]),
                     Arc::clone(&second_head),
                 ),
             ])
@@ -4279,13 +4324,13 @@ mod tests {
             1,
             "one actor-collected payload unit must not expand into per-command COMMITs"
         );
-        assert_eq!(first_head.load(Ordering::Acquire), 2);
-        assert_eq!(second_head.load(Ordering::Acquire), 1);
-        for (id, expected) in [(first, (1_i64, 2_i64, 6_i64)), (second, (1, 1, 3))] {
+        assert_eq!(first_head.load(Ordering::Acquire), 6);
+        assert_eq!(second_head.load(Ordering::Acquire), 3);
+        for (id, expected) in [(first, (0_i64, 6_i64, 6_i64)), (second, (0, 3, 3))] {
             let actual = store
                 .connection
                 .query_row(
-                    "SELECT durable_oldest_seq, durable_head_seq, replay_bytes FROM runs WHERE id = ?1",
+                    "SELECT durable_first_available_byte, durable_output_bytes, replay_bytes FROM runs WHERE id = ?1",
                     [id.to_string()],
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
@@ -4323,10 +4368,10 @@ mod tests {
         assert_eq!(rejection.disposition(), StartDisposition::NotCommitted);
         assert!(rejection.is_capacity());
 
-        let first_replay = replay(vec![chunk(1, b"first")]);
+        let first_replay = replay(vec![chunk(0, b"first")]);
         first_durable.append(first.id, first_replay.clone());
         first_durable.finalize(first.id, 42, first_replay, exited_state());
-        assert_eq!(first_durable.durable_head(), 1);
+        assert_eq!(first_durable.durable_head(), 5);
 
         let prepared = persistence
             .prepare_start(&second_key, &second)
@@ -4382,7 +4427,7 @@ mod tests {
         let first_durable = persistence
             .insert_start(&first_key, &first)
             .expect("insert candidate");
-        let first_replay = replay(vec![chunk(1, b"retained")]);
+        let first_replay = replay(vec![chunk(0, b"retained")]);
         first_durable.append(first.id, first_replay.clone());
         first_durable.finalize(first.id, 77, first_replay, exited_state());
 
@@ -4416,7 +4461,7 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].info.id, first.id);
         assert_eq!(recovered[0].info.pid, Some(77));
-        assert_eq!(recovered[0].replay.chunks, vec![chunk(1, b"retained")]);
+        assert_eq!(recovered[0].replay.chunks, vec![chunk(0, b"retained")]);
         drop(reopened);
     }
 
@@ -4431,8 +4476,8 @@ mod tests {
         let durable = persistence
             .insert_start(&test_operation_key(first.id), &first)
             .expect("insert fatal fixture record");
-        durable.append(first.id, replay(vec![chunk(1, b"committed")]));
-        durable.append(first.id, replay(vec![chunk(1, b"conflict")]));
+        durable.append(first.id, replay(vec![chunk(0, b"committed")]));
+        durable.append(first.id, replay(vec![chunk(0, b"conflict")]));
 
         let later = running_info(RunId::new());
         let Err(error) = persistence.insert_start(&test_operation_key(later.id), &later) else {
@@ -4440,7 +4485,7 @@ mod tests {
         };
         assert!(matches!(error, PersistenceError::Mutation(_)));
         assert!(error.to_string().contains("changed bytes"));
-        assert_eq!(durable.durable_head(), 1);
+        assert_eq!(durable.durable_head(), b"committed".len() as u64);
         drop(durable);
         drop(persistence);
 
@@ -4448,7 +4493,7 @@ mod tests {
             Persistence::open(state_dir).expect("reopen prior durable unit");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].info.id, first.id);
-        assert_eq!(recovered[0].replay.chunks, vec![chunk(1, b"committed")]);
+        assert_eq!(recovered[0].replay.chunks, vec![chunk(0, b"committed")]);
         drop(reopened);
     }
 
@@ -4642,9 +4687,10 @@ mod tests {
             if index + 1 != count {
                 let retained = if index < 3 {
                     replay(
-                        (1..=8)
-                            .map(|seq| OutputChunk {
-                                seq,
+                        (0..8)
+                            .map(|index| OutputChunk {
+                                start_byte: index * 512 * 1024,
+                                end_byte: (index + 1) * 512 * 1024,
                                 data: vec![b'x'; 512 * 1024],
                             })
                             .collect(),
@@ -4738,7 +4784,7 @@ mod tests {
             .execute(
                 "INSERT INTO runs (
                     id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
-                    durable_oldest_seq, durable_head_seq, replay_bytes, replay_truncated,
+                    durable_first_available_byte, durable_output_bytes, replay_bytes, replay_truncated,
                     metadata_bytes, created_at_ms, updated_at_ms, terminal_at_ms
                  ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, NULL, 0, 0, 0, 0, ?7, 1, 1, ?8)",
                 params![
@@ -4771,9 +4817,9 @@ mod tests {
             capabilities: RunCapabilities::NATIVE,
             pid: Some(42),
             state: RunState::Running,
-            head_seq: 0,
-            durable_head_seq: Some(0),
-            oldest_seq: 0,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
         }
@@ -4792,16 +4838,17 @@ mod tests {
 
     fn replay(chunks: Vec<OutputChunk>) -> OutputReplay {
         OutputReplay {
-            oldest_seq: chunks.first().map_or(0, |chunk| chunk.seq),
-            head_seq: chunks.last().map_or(0, |chunk| chunk.seq),
+            first_available_byte: chunks.first().map_or(0, |chunk| chunk.start_byte),
+            latest_output_bytes: chunks.last().map_or(0, |chunk| chunk.end_byte),
             chunks,
             truncated: false,
         }
     }
 
-    fn chunk(seq: u64, data: &[u8]) -> OutputChunk {
+    fn chunk(start_byte: u64, data: &[u8]) -> OutputChunk {
         OutputChunk {
-            seq,
+            start_byte,
+            end_byte: start_byte + data.len() as u64,
             data: data.to_vec(),
         }
     }

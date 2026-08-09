@@ -458,7 +458,7 @@ export class Attachment {
         this.#pendingOutputGap = undefined;
         this.#enqueueEvent({ event, bytes: eventWeight });
       } else {
-        this.#extendPendingOutputGap(event.chunk.seq);
+        this.#extendPendingOutputGap(event.chunk.end_byte);
       }
       return true;
     }
@@ -480,7 +480,7 @@ export class Attachment {
       return true;
     }
     if (event.type === "output") {
-      this.#extendPendingOutputGap(event.chunk.seq);
+      this.#extendPendingOutputGap(event.chunk.end_byte);
       return true;
     }
     this.#protocolViolation(
@@ -502,10 +502,13 @@ export class Attachment {
     this.#queuedEventBytes += event.bytes;
   }
 
-  #extendPendingOutputGap(headSequence: number): void {
+  #extendPendingOutputGap(latestOutputBytes: number): void {
     this.#pendingOutputGap = {
       type: "gap",
-      head_seq: Math.max(this.#pendingOutputGap?.head_seq ?? 0, headSequence),
+      latest_output_bytes: Math.max(
+        this.#pendingOutputGap?.latest_output_bytes ?? 0,
+        latestOutputBytes,
+      ),
     };
     rememberRunEventSource(this.#pendingOutputGap, this.snapshot.run.id);
   }

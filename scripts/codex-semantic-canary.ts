@@ -280,7 +280,7 @@ async function collectSemanticEvents(
     events.push(...observer.observe(event));
     if (event.type === "gap") {
       throw new Error(
-        `real Codex canary observed output gap at ${event.head_seq}`,
+        `real Codex canary observed output gap at ${event.latest_output_bytes}`,
       );
     }
     if (event.type === "exited") {

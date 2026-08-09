@@ -6,19 +6,19 @@ import type { OutputChunk } from "./OutputChunk.js";
  */
 export type OutputReplay = {
   /**
-   * Retained chunks newer than the requested sequence.
+   * Retained ranges beginning at or after the requested byte cursor.
    */
   chunks: Array<OutputChunk>;
   /**
-   * Oldest retained sequence, or zero when there has been no output.
+   * First retained byte, or zero when there has been no output.
    */
-  oldest_seq: number;
+  first_available_byte: number;
   /**
-   * Highest allocated output sequence, or zero when there has been no output.
+   * Total output bytes allocated so far.
    */
-  head_seq: number;
+  latest_output_bytes: number;
   /**
-   * Whether output newer than the requested cursor had already been evicted.
+   * Whether output at or after the requested cursor is unavailable.
    */
   truncated: boolean;
 };

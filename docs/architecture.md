@@ -12,9 +12,9 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 7, including daemon-incarnation fencing, recoverable native Input, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary.                                        | Other SDKs appear only for a real client requirement.                                        |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 8, including daemon-incarnation fencing, recoverable native Input, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary.                                        | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
-| Input recovery   | A short-lived generation-7 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                              | Cross-daemon exactly-once and semantic acknowledgement remain above or outside ctxmux.       |
+| Input recovery   | A short-lived generation-8 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                              | Cross-daemon exactly-once and semantic acknowledgement remain above or outside ctxmux.       |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
 | Context and fork | Level A clones a declared `RunSpec`; Codex Level B resumes a declared session; both record lineage and fidelity.                                                                                                                                                                                            | Workspace snapshots and artifact ownership remain open.                                      |
@@ -38,7 +38,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v7)
+                    Unix domain socket (v8)
                               |
                     long-lived ctxmux daemon
                     - RunManager / RunRegistry / Run identity
@@ -61,7 +61,7 @@ ordered opaque workspace, artifact, or context references. An imported tmux
 Run has no launch spec because tmux already owns its pane and process.
 `RunInfo` exposes identity, immediate parent and actual fork fidelity when
 present, Backend identity and capabilities, PID when available, lifecycle
-state, retained-output cursors, optional committed `durable_head_seq`, and
+state, retained-output cursors, optional committed `durable_output_bytes`, and
 attachment count. For an imported tmux Run, `RunInfo.pid` is the pane PID
 observed at import and participates in the target fence; it is not daemon-owned
 process authority and ctxmux never signals it.
@@ -191,7 +191,7 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 
 ### Attach, disconnect, and reattach
 
-1. An attachment uses a dedicated long-lived connection and names `after_seq`.
+1. An attachment uses a dedicated long-lived connection and names `after_byte`.
 2. The daemon subscribes to live events before taking the replay snapshot. This closes the replay/live race.
 3. The daemon sends an `Attached` header containing `RunInfo`, replay cursors,
    and `truncated`, then streams each retained chunk as an ordered
@@ -199,9 +199,9 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    transport ceiling even when total retained output is much larger.
 4. Rust and TypeScript clients reassemble those bounded frames before returning
    the public snapshot. Live chunks already covered by that snapshot are
-   deduplicated by sequence.
+   deduplicated by cumulative byte range.
 5. Clean detach returns `Detached`; abrupt socket closure drops the attachment guard. Both leave the Run in `RunManager`.
-6. A later attachment resumes from its last observed sequence or detects that retained output was evicted.
+6. A later attachment resumes from its last observed byte cursor or detects that retained output was evicted.
 
 ### Input, resize, output, and exit
 
@@ -243,8 +243,8 @@ Run. A blocking PTY write has no independent deadline, so eight stalled writes
 can delay input progress for other Runs until one owning PTY returns or closes.
 Resize and stop do not enter the input queue, so that limitation does not hold a
 Tokio worker or consume their control lane. Zero dimensions fail before resize
-mutation. A blocking reader assigns one monotonically increasing sequence per
-read chunk, stores it in the bounded log, then broadcasts it.
+mutation. A blocking reader assigns each non-empty read one contiguous
+half-open cumulative byte range, stores it in the bounded log, then broadcasts it.
 
 The waiter waits for the child and allows the output reader up to one second to finish before publishing `Exited`. This is a bounded drain policy. It is not a proof that arbitrarily large or delayed final output always precedes exit.
 
@@ -263,7 +263,7 @@ daemon-loss, and unwind restoration paths remain broader qualification work.
 The TypeScript SDK buffers fragmented or coalesced socket data into newline
 frames, enforces the frame byte limit, applies bounded inbound backpressure,
 and mirrors the Rust request and attachment operations. It runtime-validates
-every nested generation-7 server variant before exposing it. Each Rust and
+every nested generation-8 server variant before exposing it. Each Rust and
 TypeScript Attachment has one inbound router: command results resolve a
 bounded pending map while events enter a separately bounded delivery inbox, so
 a slow event consumer does not create a competing socket reader or hide a
@@ -281,9 +281,9 @@ Generated TypeScript types prevent a second handwritten wire schema. Current `u6
 
 The important guarantees are behavioral, not implied by lock types.
 
-- Output sequence is allocated under the output-log mutex before broadcast.
-- Attachment subscribes before snapshot and suppresses live chunks whose sequence is already in replay.
-- A slow attachment that overruns the Tokio broadcast buffer receives `Gap { head_seq }`; the client must reattach from its own last observed sequence.
+- Output byte ranges are allocated under the output-log mutex before broadcast.
+- Attachment subscribes before snapshot and suppresses live chunks whose byte range is already in replay.
+- A slow attachment that overruns the Tokio broadcast buffer receives `Gap { latest_output_bytes }`; the client must reattach from its own last observed byte cursor.
 - Attachment command IDs start at one and increase within one connection.
   They provide correlation, not deduplication. A non-increasing ID is fatal
   before mutation; reconnect starts a new ID scope and cannot settle old work.
@@ -293,8 +293,8 @@ The important guarantees are behavioral, not implied by lock types.
   ordered `Gap`; an unrepresentable non-output loss fails the attachment
   closed instead of being mislabeled as replayable output loss.
 - `RunInfo` reads output and lifecycle under separate locks, so it is useful metadata rather than a transactional snapshot of every field.
-- In persistent mode `durable_head_seq` advances only after the store actor
-  commits a contiguous replay batch. Live `head_seq` may be ahead.
+- In persistent mode `durable_output_bytes` advances only after the store actor
+  commits a contiguous replay batch. Live `latest_output_bytes` may be ahead.
 - Persistence-capable activation, output recording, and native terminal
   publication serialize through one daemon-private per-Run transition gate,
   then acquire output, state, and persistence in that order for short snapshots.
@@ -415,7 +415,7 @@ before socket publication. One bundled SQLite connection on one actor thread
 commits starts, contiguous output batches, pruning/accounting, and terminal
 transitions; a bounded actor queue backpressures the PTY reader instead of
 accumulating an unbounded durable-output backlog. Startup performs journal
-recovery and exact schema/application validation against the schema-2 format
+recovery and exact schema/application validation against the schema-3 format
 envelope, then uses bounded, restartable page-admitted transactions to
 reconcile old running rows, normalize retained history to 128, and finally
 finish serving-epoch publication. Only after operational revalidation can the daemon
@@ -432,7 +432,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 7                                      | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 8                                      | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                                    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                                       | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |

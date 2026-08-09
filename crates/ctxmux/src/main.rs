@@ -35,7 +35,7 @@ usage:
   ctxmux --socket <path> input <run-id> <text>
   ctxmux --socket <path> input <run-id> --stdin
   ctxmux --socket <path> resize <run-id> <cols> <rows>
-  ctxmux --socket <path> attach <run-id> [after-seq]
+  ctxmux --socket <path> attach <run-id> [after-byte]
   ctxmux --socket <path> stop <run-id>
 
 CTXMUX_SOCKET may be used instead of --socket."
@@ -277,20 +277,20 @@ async fn resize(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
 
 async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
     let id = take_run_id(&mut args)?;
-    let after_seq = if args.is_empty() {
+    let after_byte = if args.is_empty() {
         0
     } else {
-        take_number(&mut args, "output sequence")?
+        take_number(&mut args, "output byte cursor")?
     };
     ensure_empty(&args)?;
     let (attachment, snapshot) = client
-        .attach(id, after_seq)
+        .attach(id, after_byte)
         .await
         .map_err(|error| error.to_string())?;
     if snapshot.replay.truncated {
         eprintln!(
-            "ctxmux: output before sequence {} is no longer retained",
-            snapshot.replay.oldest_seq
+            "ctxmux: output before byte {} is no longer retained",
+            snapshot.replay.first_available_byte
         );
     }
     let mut stdout = io::stdout().lock();
@@ -413,8 +413,10 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
         }
         RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
         RunEvent::Tmux { .. } => Ok(true),
-        RunEvent::Gap { head_seq } => Err(format!(
-            "attachment fell behind at output sequence {head_seq}; reattach from the last observed sequence"
+        RunEvent::Gap {
+            latest_output_bytes,
+        } => Err(format!(
+            "attachment fell behind at output byte {latest_output_bytes}; reattach from the last observed byte cursor"
         )),
     }
 }
@@ -595,8 +597,8 @@ fn print_run(run: &RunInfo) {
         backend,
         lineage,
         run.attachments,
-        run.head_seq,
-        run.durable_head_seq
+        run.latest_output_bytes,
+        run.durable_output_bytes
             .map_or_else(|| "memory-only".to_owned(), |seq| seq.to_string())
     );
 }

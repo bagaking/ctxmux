@@ -62,7 +62,9 @@ test("Codex JSONL minimized regression corpus remains exact", () => {
       events.push(...observer.observe(output(index + 1, chunk)));
     }
     if (regression.terminal === "gap") {
-      events.push(...observer.observe({ type: "gap", head_seq: 10_000 }));
+      events.push(
+        ...observer.observe({ type: "gap", latest_output_bytes: 10_000 }),
+      );
     } else if (regression.terminal === "exit") {
       events.push(...observer.observe(exited()));
     }
@@ -154,7 +156,9 @@ test("seeded Codex JSONL observer fuzz target stays bounded and diagnostic", () 
         offset += size;
         sequence += 1;
         if (random.integer(257) === 0) {
-          events.push(...observer.observe({ type: "gap", head_seq: sequence }));
+          events.push(
+            ...observer.observe({ type: "gap", latest_output_bytes: sequence }),
+          );
         }
       }
       events.push(...observer.observe(exited()));
@@ -188,8 +192,16 @@ test("seeded Codex JSONL observer fuzz target stays bounded and diagnostic", () 
   );
 });
 
-function output(seq: number, data: ArrayLike<number>): RunEvent {
-  return { type: "output", chunk: { seq, data: Array.from(data) } };
+function output(startByte: number, data: ArrayLike<number>): RunEvent {
+  const bytes = Array.from(data);
+  return {
+    type: "output",
+    chunk: {
+      start_byte: startByte,
+      end_byte: startByte + bytes.length,
+      data: bytes,
+    },
+  };
 }
 
 function exited(): RunEvent {

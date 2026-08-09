@@ -501,7 +501,7 @@ impl Client {
         )
     }
 
-    /// Attach after the last output sequence already observed by the caller.
+    /// Attach after the cumulative output byte cursor already observed by the caller.
     ///
     /// # Errors
     ///
@@ -510,13 +510,13 @@ impl Client {
     pub async fn attach(
         &self,
         id: RunId,
-        after_seq: u64,
+        after_byte: u64,
     ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
         let (mut wire, _) = self.connect().await?;
         send(
             &mut wire,
             &ClientFrame::Request {
-                request: Request::Attach { id, after_seq },
+                request: Request::Attach { id, after_byte },
             },
         )
         .await?;
@@ -527,12 +527,12 @@ impl Client {
                     run: header.run,
                     replay: OutputReplay {
                         chunks: Vec::new(),
-                        oldest_seq: header.replay.oldest_seq,
-                        head_seq: header.replay.head_seq,
+                        first_available_byte: header.replay.first_available_byte,
+                        latest_output_bytes: header.replay.latest_output_bytes,
                         truncated: header.replay.truncated,
                     },
                 };
-                receive_replay(&mut wire, after_seq, &mut snapshot).await?;
+                receive_replay(&mut wire, after_byte, &mut snapshot).await?;
                 Ok((Attachment::from_wire(wire), snapshot))
             }
             ServerFrame::Error { error } => Err(error.into()),
@@ -685,35 +685,43 @@ fn decode_stop_receipt(receipt: &ControlReceipt) -> Result<StopReceipt, ClientEr
     }
 }
 
-async fn receive_replay(
-    wire: &mut Wire,
-    after_seq: u64,
+async fn receive_replay<S>(
+    wire: &mut S,
+    after_byte: u64,
     snapshot: &mut AttachedSnapshot,
-) -> Result<(), ClientError> {
+) -> Result<(), ClientError>
+where
+    S: futures_util::Stream<Item = Result<String, LinesCodecError>> + Unpin,
+{
     if snapshot
         .replay
         .chunks
         .last()
-        .is_some_and(|chunk| chunk.seq == snapshot.replay.head_seq)
-        || (snapshot.replay.chunks.is_empty() && after_seq >= snapshot.replay.head_seq)
+        .is_some_and(|chunk| chunk.end_byte == snapshot.replay.latest_output_bytes)
+        || (snapshot.replay.chunks.is_empty() && after_byte >= snapshot.replay.latest_output_bytes)
     {
         return Ok(());
     }
-    let mut next_seq = snapshot.replay.chunks.last().map_or_else(
-        || after_seq.saturating_add(1).max(snapshot.replay.oldest_seq),
-        |chunk| chunk.seq + 1,
+    let mut expected_byte = snapshot.replay.chunks.last().map_or_else(
+        || after_byte.max(snapshot.replay.first_available_byte),
+        |chunk| chunk.end_byte,
     );
     loop {
-        match receive(wire).await? {
+        match receive_optional(wire).await?.ok_or(ClientError::Closed)? {
             ServerFrame::Event {
                 event: RunEvent::Output { chunk },
-            } if chunk.seq == next_seq => {
-                let complete = chunk.seq == snapshot.replay.head_seq;
+            } if chunk.start_byte == expected_byte
+                && chunk.end_byte > chunk.start_byte
+                && chunk.end_byte <= snapshot.replay.latest_output_bytes
+                && chunk.end_byte - chunk.start_byte
+                    == u64::try_from(chunk.data.len()).unwrap_or(u64::MAX) =>
+            {
+                let complete = chunk.end_byte == snapshot.replay.latest_output_bytes;
+                expected_byte = chunk.end_byte;
                 snapshot.replay.chunks.push(chunk);
                 if complete {
                     return Ok(());
                 }
-                next_seq += 1;
             }
             ServerFrame::Error { error } => return Err(error.into()),
             _ => {
@@ -772,4 +780,105 @@ pub fn replay_bytes(chunks: &[OutputChunk]) -> Vec<u8> {
         output.extend_from_slice(&chunk.data);
     }
     output
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use ctxmux_protocol::{
+        AttachedSnapshot, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunEvent,
+        RunInfo, RunState, ServerFrame, encode_frame,
+    };
+    use futures_util::stream;
+    use tokio_util::codec::LinesCodecError;
+
+    use super::{ClientError, receive_replay};
+
+    #[tokio::test]
+    async fn replay_accepts_the_exact_advertised_byte_boundary() {
+        let mut snapshot = snapshot(2);
+        let mut frames = stream::iter([frame(OutputChunk {
+            start_byte: 0,
+            end_byte: 2,
+            data: vec![0, 255],
+        })]);
+
+        receive_replay(&mut frames, 0, &mut snapshot)
+            .await
+            .expect("accept exact replay boundary");
+        assert_eq!(snapshot.replay.chunks[0].end_byte, 2);
+    }
+
+    #[tokio::test]
+    async fn replay_rejects_overshoot_non_progress_and_eof() {
+        for (label, chunk) in [
+            (
+                "overshoot",
+                OutputChunk {
+                    start_byte: 0,
+                    end_byte: 2,
+                    data: vec![1, 2],
+                },
+            ),
+            (
+                "non-progress",
+                OutputChunk {
+                    start_byte: 0,
+                    end_byte: 0,
+                    data: Vec::new(),
+                },
+            ),
+        ] {
+            let mut snapshot = snapshot(1);
+            let mut frames = stream::iter([frame(chunk)]);
+            assert!(
+                matches!(
+                    receive_replay(&mut frames, 0, &mut snapshot).await,
+                    Err(ClientError::UnexpectedFrame(
+                        "expected ordered replay output"
+                    ))
+                ),
+                "{label} must fail closed"
+            );
+            assert!(snapshot.replay.chunks.is_empty(), "{label} was appended");
+        }
+
+        let mut snapshot = snapshot(1);
+        let mut eof = stream::empty::<Result<String, LinesCodecError>>();
+        assert!(matches!(
+            receive_replay(&mut eof, 0, &mut snapshot).await,
+            Err(ClientError::Closed)
+        ));
+    }
+
+    fn frame(chunk: OutputChunk) -> Result<String, LinesCodecError> {
+        Ok(encode_frame(&ServerFrame::Event {
+            event: RunEvent::Output { chunk },
+        })
+        .expect("encode replay fixture"))
+    }
+
+    fn snapshot(latest_output_bytes: u64) -> AttachedSnapshot {
+        AttachedSnapshot {
+            run: RunInfo {
+                id: ctxmux_protocol::RunId::new(),
+                spec: None,
+                lineage: None,
+                backend: RunBackend::Native,
+                capabilities: RunCapabilities::NATIVE,
+                pid: None,
+                state: RunState::Running,
+                latest_output_bytes,
+                durable_output_bytes: None,
+                first_available_byte: 0,
+                attachments: 1,
+                applied_input_bytes: Some(0),
+            },
+            replay: OutputReplay {
+                chunks: Vec::new(),
+                first_available_byte: 0,
+                latest_output_bytes,
+                truncated: false,
+            },
+        }
+    }
 }

@@ -511,8 +511,9 @@ function passingNightlyV3ReceiptFixture() {
         .createHash("sha256")
         .update(suffix)
         .digest("hex");
-      const chunkIdentity = (seq, start, bytes) => ({
-        seq,
+      const chunkIdentity = (start, bytes) => ({
+        start_byte: start,
+        end_byte: start + bytes,
         bytes,
         sha256: crypto
           .createHash("sha256")
@@ -537,12 +538,10 @@ function passingNightlyV3ReceiptFixture() {
       const maxChunkBytes =
         mode === "persistent_replay_pressure" ? 8192 : replayBytes;
       const chunkCount = Math.ceil(replayBytes / maxChunkBytes);
-      const fullChunkCount = Math.ceil(payloadBytes / maxChunkBytes);
-      const firstSeq = recovered ? fullChunkCount - chunkCount + 1 : 1;
       let chunkOffset = payloadBytes - replayBytes;
       const chunks = Array.from({ length: chunkCount }, (_, chunkIndex) => {
         const bytes = Math.min(maxChunkBytes, payloadBytes - chunkOffset);
-        const chunk = chunkIdentity(firstSeq + chunkIndex, chunkOffset, bytes);
+        const chunk = chunkIdentity(chunkOffset, bytes);
         chunkOffset += bytes;
         return chunk;
       });
@@ -551,9 +550,11 @@ function passingNightlyV3ReceiptFixture() {
         operation_key: operationKey,
         lineage: null,
         state: { type: "exited", code: 0, signal: null },
-        head_seq: fullChunkCount,
-        durable_head_seq: mode.startsWith("persistent") ? fullChunkCount : null,
-        oldest_seq: firstSeq,
+        latest_output_bytes: payloadBytes,
+        durable_output_bytes: mode.startsWith("persistent")
+          ? payloadBytes
+          : null,
+        first_available_byte: payloadBytes - replayBytes,
         replay_bytes: replayBytes,
         replay_sha256: replaySha256,
         chunks,
@@ -1225,9 +1226,12 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
           ({ id }) => id === "retained-state-plateau",
         ).result.bounded_churn[0].fill;
         const tuple = evidence.tuples[0];
-        tuple.oldest_seq += 100;
-        tuple.head_seq += 100;
-        for (const chunk of tuple.chunks) chunk.seq += 100;
+        tuple.first_available_byte += 100;
+        tuple.latest_output_bytes += 100;
+        for (const chunk of tuple.chunks) {
+          chunk.start_byte += 100;
+          chunk.end_byte += 100;
+        }
         rehashTupleEvidence(evidence);
       },
     ],
@@ -1242,12 +1246,12 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       },
     ],
     [
-      "chunk sequence with rehashed envelope",
+      "chunk byte range with rehashed envelope",
       (value) => {
         const evidence = value.stages.find(
           ({ id }) => id === "retained-state-plateau",
         ).result.replay_pressure[0].after;
-        evidence.tuples[0].chunks[0].seq += 1;
+        evidence.tuples[0].chunks[0].start_byte += 1;
         rehashTupleEvidence(evidence);
       },
     ],
@@ -1321,7 +1325,7 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
               "ascii",
             );
           let offset = 4_194_304 - replayBytes;
-          tuple.oldest_seq = 3 - chunkBytes.length;
+          tuple.first_available_byte = 4_194_304 - replayBytes;
           tuple.replay_bytes = replayBytes;
           tuple.replay_sha256 = crypto
             .createHash("sha256")
@@ -1329,7 +1333,8 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
             .digest("hex");
           tuple.chunks = chunkBytes.map((bytes, index) => {
             const chunk = {
-              seq: tuple.oldest_seq + index,
+              start_byte: offset,
+              end_byte: offset + bytes,
               bytes,
               sha256: crypto
                 .createHash("sha256")
@@ -1362,7 +1367,7 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
         const live = mode.after.tuples[0];
         const tuple = replay.tuples[0];
         Object.assign(tuple, {
-          oldest_seq: live.oldest_seq,
+          first_available_byte: live.first_available_byte,
           replay_bytes: live.replay_bytes,
           replay_sha256: live.replay_sha256,
           chunks: structuredClone(live.chunks),
@@ -1374,7 +1379,7 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
           const replayBytes = 1024 * 1024;
           const offset = 4 * 1024 * 1024 - replayBytes;
           candidate.chunks = candidate.chunks.slice(-replayBytes / 8192);
-          candidate.oldest_seq = candidate.chunks[0].seq;
+          candidate.first_available_byte = candidate.chunks[0].start_byte;
           candidate.replay_bytes = replayBytes;
           candidate.replay_sha256 = crypto
             .createHash("sha256")

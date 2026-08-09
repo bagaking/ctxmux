@@ -58,9 +58,10 @@ test("shell Integration preserves structured argv without implicit evaluation", 
 
 test("shell Integration has a disposable observer with no semantic claims", () => {
   assert.deepEqual(
-    shellIntegration
-      .createObserver()
-      .observe({ type: "output", chunk: { seq: 1, data: [65] } }),
+    shellIntegration.createObserver().observe({
+      type: "output",
+      chunk: { start_byte: 0, end_byte: 1, data: [65] },
+    }),
     [],
   );
 });
@@ -101,9 +102,9 @@ test("shell Integration rejects Level B before a raw fork request", async () => 
     },
     pid: 123,
     state: { type: "running" },
-    head_seq: 0,
-    durable_head_seq: null,
-    oldest_seq: 0,
+    latest_output_bytes: 0,
+    durable_output_bytes: null,
+    first_available_byte: 0,
     attachments: 0,
     applied_input_bytes: 0,
   };

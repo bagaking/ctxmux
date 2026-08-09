@@ -741,8 +741,8 @@ impl RunManager {
                 let durable = persistence.recovered_run(
                     recovered
                         .info
-                        .durable_head_seq
-                        .unwrap_or(recovered.info.head_seq),
+                        .durable_output_bytes
+                        .unwrap_or(recovered.info.latest_output_bytes),
                     metadata_bytes,
                 );
                 let metadata_owner = durable.metadata_bytes_owner();
@@ -1426,9 +1426,9 @@ impl MaterializedCreation {
             capabilities: RunCapabilities::NATIVE,
             pid: None,
             state: RunState::Running,
-            head_seq: 0,
-            durable_head_seq: Some(0),
-            oldest_seq: 0,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
         }
@@ -2445,11 +2445,11 @@ impl Run {
             capabilities: self.capabilities,
             pid: self.pid,
             state: mutex_lock(&self.state).clone(),
-            head_seq: output.head_seq(),
-            durable_head_seq: mutex_lock(&self.persistence)
+            latest_output_bytes: output.latest_output_bytes(),
+            durable_output_bytes: mutex_lock(&self.persistence)
                 .durable()
                 .map(PersistentRun::durable_head),
-            oldest_seq: output.oldest_seq(),
+            first_available_byte: output.first_available_byte(),
             attachments: self.attachments.load(Ordering::Acquire),
             applied_input_bytes,
         }
@@ -2520,6 +2520,9 @@ impl Run {
     }
 
     fn record_output(&self, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
         let chunk = match self.persistence_mode {
             PersistenceMode::MemoryOnly => mutex_lock(&self.output).push(data),
             PersistenceMode::PersistentCapable => {
@@ -2527,7 +2530,7 @@ impl Run {
                 let (chunk, replay, running, persistence) = {
                     let mut output = mutex_lock(&self.output);
                     let chunk = output.push(data);
-                    let replay = output.replay(chunk.seq.saturating_sub(1));
+                    let replay = output.replay(chunk.start_byte);
                     let running = mutex_lock(&self.state).is_running();
                     let persistence = mutex_lock(&self.persistence).active().cloned();
                     (chunk, replay, running, persistence)
@@ -2545,7 +2548,7 @@ impl Run {
         mutex_lock(&self.output).mark_source_gap()
     }
 
-    fn attach(self: &Arc<Self>, after_seq: u64) -> (AttachmentGuard, AttachedSnapshot) {
+    fn attach(self: &Arc<Self>, after_byte: u64) -> (AttachmentGuard, AttachedSnapshot) {
         self.attachments.fetch_add(1, Ordering::AcqRel);
         let qualification_guard = self
             .qualification_stats
@@ -2554,7 +2557,7 @@ impl Run {
             run: Arc::clone(self),
             _qualification_guard: qualification_guard,
         };
-        let replay = mutex_lock(&self.output).replay(after_seq);
+        let replay = mutex_lock(&self.output).replay(after_byte);
         let snapshot = AttachedSnapshot {
             run: self.info(),
             replay,
@@ -3245,11 +3248,13 @@ fn handle_tmux_control_item(
             ));
         }
         ControlItem::Paused { pane_id } if pane_id == target.pane_id => {
-            let head_seq = run.mark_output_source_gap();
+            let latest_output_bytes = run.mark_output_source_gap();
             let _ = run.events.send(RunEvent::Tmux {
                 event: TmuxRunEvent::Paused,
             });
-            let _ = run.events.send(RunEvent::Gap { head_seq });
+            let _ = run.events.send(RunEvent::Gap {
+                latest_output_bytes,
+            });
             let command = format!("refresh-client -A {pane_id}:continue\n");
             if let Err(error) =
                 run.write_tmux_command(TmuxCommandKind::Continue, command.as_bytes())
@@ -3407,14 +3412,14 @@ impl Drop for AttachmentGuard {
 struct OutputLog {
     chunks: VecDeque<OutputChunk>,
     retained_bytes: usize,
-    next_seq: u64,
-    source_gap_after_seq: Option<u64>,
+    latest_output_bytes: u64,
+    source_gap_after_byte: Option<u64>,
 }
 
 impl OutputLog {
     fn with_initial_truncation() -> Self {
         Self {
-            source_gap_after_seq: Some(0),
+            source_gap_after_byte: Some(0),
             ..Self::default()
         }
     }
@@ -3423,22 +3428,31 @@ impl OutputLog {
         Self {
             retained_bytes: replay.chunks.iter().map(|chunk| chunk.data.len()).sum(),
             chunks: replay.chunks.into(),
-            next_seq: replay.head_seq,
-            source_gap_after_seq: None,
+            latest_output_bytes: replay.latest_output_bytes,
+            source_gap_after_byte: None,
         }
     }
 
     fn mark_source_gap(&mut self) -> u64 {
-        self.source_gap_after_seq = Some(self.next_seq);
-        self.next_seq
+        self.source_gap_after_byte = Some(self.latest_output_bytes);
+        self.latest_output_bytes
     }
 
     fn push(&mut self, data: Vec<u8>) -> OutputChunk {
-        self.next_seq = self.next_seq.saturating_add(1);
+        assert!(
+            !data.is_empty(),
+            "output chunks must contain at least one byte"
+        );
+        let start_byte = self.latest_output_bytes;
+        let end_byte = start_byte
+            .checked_add(u64::try_from(data.len()).expect("output chunk length fits u64"))
+            .expect("one Run cannot allocate more than u64::MAX output bytes");
         let chunk = OutputChunk {
-            seq: self.next_seq,
+            start_byte,
+            end_byte,
             data,
         };
+        self.latest_output_bytes = end_byte;
         self.retained_bytes = self.retained_bytes.saturating_add(chunk.data.len());
         self.chunks.push_back(chunk.clone());
         while self.retained_bytes > OUTPUT_RETENTION_BYTES && self.chunks.len() > 1 {
@@ -3449,31 +3463,45 @@ impl OutputLog {
         chunk
     }
 
-    const fn head_seq(&self) -> u64 {
-        self.next_seq
+    const fn latest_output_bytes(&self) -> u64 {
+        self.latest_output_bytes
     }
 
-    fn oldest_seq(&self) -> u64 {
-        self.chunks.front().map_or(0, |chunk| chunk.seq)
+    fn first_available_byte(&self) -> u64 {
+        self.chunks.front().map_or(0, |chunk| chunk.start_byte)
     }
 
-    fn replay(&self, after_seq: u64) -> OutputReplay {
-        let oldest_seq = self.oldest_seq();
+    fn replay(&self, after_byte: u64) -> OutputReplay {
+        let first_available_byte = self.first_available_byte();
         OutputReplay {
             chunks: self
                 .chunks
                 .iter()
-                .filter(|chunk| chunk.seq > after_seq)
-                .cloned()
+                .filter_map(|chunk| retained_after(chunk, after_byte))
                 .collect(),
-            oldest_seq,
-            head_seq: self.head_seq(),
+            first_available_byte,
+            latest_output_bytes: self.latest_output_bytes(),
             truncated: self
-                .source_gap_after_seq
-                .is_some_and(|gap_seq| after_seq <= gap_seq)
-                || (oldest_seq > 0 && after_seq.saturating_add(1) < oldest_seq),
+                .source_gap_after_byte
+                .is_some_and(|gap_byte| after_byte <= gap_byte)
+                || after_byte < first_available_byte,
         }
     }
+}
+
+fn retained_after(chunk: &OutputChunk, after_byte: u64) -> Option<OutputChunk> {
+    if chunk.end_byte <= after_byte {
+        return None;
+    }
+    if chunk.start_byte >= after_byte {
+        return Some(chunk.clone());
+    }
+    let offset = usize::try_from(after_byte - chunk.start_byte).ok()?;
+    Some(OutputChunk {
+        start_byte: after_byte,
+        end_byte: chunk.end_byte,
+        data: chunk.data.get(offset..)?.to_vec(),
+    })
 }
 
 fn read_output(run: &Run, mut reader: Box<dyn Read + Send>) {
@@ -3607,8 +3635,8 @@ async fn handle_connection(
         return Ok(());
     };
 
-    if let Request::Attach { id, after_seq } = request {
-        return attachment::handle(wire, manager, id, after_seq).await;
+    if let Request::Attach { id, after_byte } = request {
+        return attachment::handle(wire, manager, id, after_byte).await;
     }
     let response = execute_request(&manager, request).await;
     match response {
@@ -4881,7 +4909,7 @@ mod tests {
             .expect("attachment task completes")
             .expect("attach after subscribe/snapshot barrier");
         assert_eq!(replay_bytes(&snapshot.replay.chunks), b"between");
-        assert_eq!(snapshot.replay.head_seq, 1);
+        assert_eq!(snapshot.replay.latest_output_bytes, b"between".len() as u64);
 
         recorded.record_output(b"after".to_vec());
         let event = tokio::time::timeout(Duration::from_secs(5), attachment.next_event())
@@ -4892,7 +4920,10 @@ mod tests {
         let RunEvent::Output { chunk } = event else {
             panic!("expected post-snapshot output, got {event:?}");
         };
-        assert_eq!(chunk.seq, 2);
+        assert_eq!(
+            (chunk.start_byte, chunk.end_byte),
+            (b"between".len() as u64, b"betweenafter".len() as u64)
+        );
         assert_eq!(chunk.data, b"after");
 
         attachment.detach().await.expect("detach joined attachment");
@@ -4913,7 +4944,7 @@ mod tests {
             .attach(run.id, 0)
             .await
             .expect("attach before detach/output race");
-        let caller_cursor = snapshot.replay.head_seq;
+        let caller_cursor = snapshot.replay.latest_output_bytes;
         let detaching = tokio::spawn(async move { attachment.detach().await });
 
         tokio::time::timeout(Duration::from_secs(5), reached.recv())
@@ -5169,8 +5200,8 @@ mod tests {
         }
         let replay = output.replay(0);
         assert!(replay.truncated);
-        assert!(replay.oldest_seq > 1);
-        assert_eq!(replay.head_seq, 600);
+        assert!(replay.first_available_byte > 0);
+        assert_eq!(replay.latest_output_bytes, 600 * 8192);
     }
 
     #[test]
@@ -5184,46 +5215,69 @@ mod tests {
 
         let exact_limit = output.replay(0);
         assert!(!exact_limit.truncated);
-        assert_eq!(exact_limit.oldest_seq, 1);
-        assert_eq!(exact_limit.head_seq, 2);
+        assert_eq!(exact_limit.first_available_byte, 0);
+        assert_eq!(
+            exact_limit.latest_output_bytes,
+            OUTPUT_RETENTION_BYTES as u64
+        );
         assert_eq!(
             exact_limit
                 .chunks
                 .iter()
-                .map(|chunk| chunk.seq)
+                .map(|chunk| (chunk.start_byte, chunk.end_byte))
                 .collect::<Vec<_>>(),
-            vec![1, 2]
+            vec![
+                (0, first_size as u64),
+                (first_size as u64, OUTPUT_RETENTION_BYTES as u64),
+            ]
         );
 
         output.push(vec![b'c']);
         let evicted = output.replay(0);
         assert!(evicted.truncated);
-        assert_eq!(evicted.oldest_seq, 2);
-        assert_eq!(evicted.head_seq, 3);
+        assert_eq!(evicted.first_available_byte, first_size as u64);
+        assert_eq!(
+            evicted.latest_output_bytes,
+            OUTPUT_RETENTION_BYTES as u64 + 1
+        );
         assert_eq!(
             evicted
                 .chunks
                 .iter()
-                .map(|chunk| chunk.seq)
+                .map(|chunk| (chunk.start_byte, chunk.end_byte))
                 .collect::<Vec<_>>(),
-            vec![2, 3]
+            vec![
+                (first_size as u64, OUTPUT_RETENTION_BYTES as u64),
+                (
+                    OUTPUT_RETENTION_BYTES as u64,
+                    OUTPUT_RETENTION_BYTES as u64 + 1
+                ),
+            ]
         );
 
-        let immediately_before_oldest = output.replay(1);
+        let immediately_before_oldest = output.replay(first_size as u64);
         assert!(!immediately_before_oldest.truncated);
         assert_eq!(immediately_before_oldest.chunks, evicted.chunks);
         assert_eq!(
             output
-                .replay(2)
+                .replay(OUTPUT_RETENTION_BYTES as u64)
                 .chunks
                 .iter()
-                .map(|chunk| chunk.seq)
+                .map(|chunk| (chunk.start_byte, chunk.end_byte))
                 .collect::<Vec<_>>(),
-            vec![3]
+            vec![(
+                OUTPUT_RETENTION_BYTES as u64,
+                OUTPUT_RETENTION_BYTES as u64 + 1
+            )]
         );
-        assert!(output.replay(3).chunks.is_empty());
-        assert!(output.replay(99).chunks.is_empty());
-        assert!(!output.replay(99).truncated);
+        assert!(
+            output
+                .replay(OUTPUT_RETENTION_BYTES as u64 + 1)
+                .chunks
+                .is_empty()
+        );
+        assert!(output.replay(u64::MAX).chunks.is_empty());
+        assert!(!output.replay(u64::MAX).truncated);
     }
 
     #[test]
@@ -5233,18 +5287,27 @@ mod tests {
         assert_eq!(output.mark_source_gap(), 0);
 
         output.push(b"before-gap".to_vec());
-        assert_eq!(output.mark_source_gap(), 1);
-        let at_gap = output.replay(1);
+        assert_eq!(output.mark_source_gap(), b"before-gap".len() as u64);
+        let at_gap = output.replay(b"before-gap".len() as u64);
         assert!(at_gap.truncated);
         assert!(at_gap.chunks.is_empty());
 
         output.push(b"after-gap".to_vec());
-        let recovery = output.replay(1);
+        let recovery = output.replay(b"before-gap".len() as u64);
         assert!(recovery.truncated);
-        assert_eq!(recovery.oldest_seq, 1);
-        assert_eq!(recovery.head_seq, 2);
-        assert_eq!(recovery.chunks[0].seq, 2);
-        assert!(!output.replay(2).truncated);
+        assert_eq!(recovery.first_available_byte, 0);
+        assert_eq!(
+            recovery.latest_output_bytes,
+            b"before-gapafter-gap".len() as u64
+        );
+        assert_eq!(
+            (recovery.chunks[0].start_byte, recovery.chunks[0].end_byte),
+            (
+                b"before-gap".len() as u64,
+                b"before-gapafter-gap".len() as u64
+            )
+        );
+        assert!(!output.replay(b"before-gapafter-gap".len() as u64).truncated);
     }
 
     #[test]
@@ -5255,15 +5318,18 @@ mod tests {
 
         let replay = output.replay(0);
         assert!(!replay.truncated);
-        assert_eq!(replay.oldest_seq, 1);
-        assert_eq!(replay.head_seq, 1);
+        assert_eq!(replay.first_available_byte, 0);
+        assert_eq!(replay.latest_output_bytes, oversized.len() as u64);
         assert_eq!(replay.chunks[0].data, oversized);
 
         output.push(vec![0x5a]);
         let after_eviction = output.replay(0);
         assert!(after_eviction.truncated);
-        assert_eq!(after_eviction.oldest_seq, 2);
-        assert_eq!(after_eviction.head_seq, 2);
+        assert_eq!(after_eviction.first_available_byte, oversized.len() as u64);
+        assert_eq!(
+            after_eviction.latest_output_bytes,
+            oversized.len() as u64 + 1
+        );
         assert_eq!(after_eviction.chunks[0].data, vec![0x5a]);
     }
 
@@ -5288,9 +5354,9 @@ mod tests {
             replay
                 .chunks
                 .iter()
-                .map(|chunk| chunk.seq)
+                .map(|chunk| (chunk.start_byte, chunk.end_byte))
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4]
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
         );
         assert_eq!(
             replay
@@ -5373,7 +5439,7 @@ mod tests {
             .await
             .expect("open public attachment before output");
         assert!(initial.replay.chunks.is_empty());
-        let caller_cursor = initial.replay.head_seq;
+        let caller_cursor = initial.replay.latest_output_bytes;
         tokio::time::timeout(Duration::from_secs(5), reached_rx.recv())
             .await
             .expect("attachment reaches post-snapshot barrier")
@@ -5413,7 +5479,9 @@ mod tests {
                 .expect("read lagged attachment event")
                 .expect("lagged attachment remains connected")
             {
-                RunEvent::Gap { head_seq } => head_seq,
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => latest_output_bytes,
                 event => panic!("expected public Gap event, got {event:?}"),
             };
         drop(lagged_attachment);
@@ -5423,16 +5491,14 @@ mod tests {
             .await
             .expect("reattach from caller-owned cursor");
         assert!(!recovered.replay.truncated);
-        assert_eq!(recovered.replay.head_seq, gap_head);
-        assert_eq!(
-            recovered
-                .replay
-                .chunks
-                .iter()
-                .map(|chunk| chunk.seq)
-                .collect::<Vec<_>>(),
-            ((caller_cursor + 1)..=gap_head).collect::<Vec<_>>()
-        );
+        assert_eq!(recovered.replay.latest_output_bytes, gap_head);
+        let mut expected_byte = caller_cursor;
+        for chunk in &recovered.replay.chunks {
+            assert_eq!(chunk.start_byte, expected_byte);
+            assert_eq!(chunk.end_byte - chunk.start_byte, chunk.data.len() as u64);
+            expected_byte = chunk.end_byte;
+        }
+        assert_eq!(expected_byte, gap_head);
         let recovered_bytes = replay_bytes(&recovered.replay.chunks);
         assert_eq!(recovered_bytes.len(), 4 * 8192);
         assert!(recovered_bytes.iter().all(|byte| *byte == 0));

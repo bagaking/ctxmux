@@ -24,8 +24,8 @@ The accepted recovery class is historical Run recovery:
   immutable `RunSpec`, lineage, lifecycle state, source daemon epoch, output
   cursors, and persistence timestamps.
 - Durable replay is the newest bounded, contiguous window committed by the
-  persistence actor. `RunInfo.durable_head_seq` is `None` in memory-only mode
-  and the highest committed sequence in persistent mode; durable oldest/head
+  persistence actor. `RunInfo.durable_output_bytes` is `None` in memory-only mode
+  and the highest committed output byte in persistent mode; durable first/latest
   cursors and `truncated` describe pruning at the front of that window. Live
   delivery may be ahead of the durable head; after abrupt daemon loss only the
   committed window is promised.
@@ -56,8 +56,8 @@ version, `PRAGMA quick_check`, and application invariants: typed IDs, bounded
 creation keys, an exact BINARY unique-key index, and typed JSON, a required
 native `RunSpec` accepted by the same semantic validator as live
 start and fork, allowed lifecycle values, non-self lineage, byte totals,
-strictly contiguous retained chunk sequences, matching durable oldest/head
-cursors, and quota accounting. Schema-2 validation accepts its legacy
+strictly contiguous retained byte ranges, matching durable first/latest
+cursors, and quota accounting. Schema-3 validation accepts its 4,096-record
 4,096-record format envelope, then startup normalization uses bounded,
 spill-disabled transactions to reconcile prior running rows and evict the
 canonical terminal prefix to the operational 128-record ceiling. Each batch
@@ -67,8 +67,8 @@ bootstrap epoch immediately so an interrupted first open remains structurally
 reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
-application and operational invariants are revalidated. Protocol generation 6
-and persistence schema 2 are pre-stable, so the current schema has no
+application and operational invariants are revalidated. Protocol generation 8
+and persistence schema 3 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed
 startup failure. Ctxmux performs no repair, reset, migration, or partial

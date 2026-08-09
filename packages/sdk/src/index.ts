@@ -102,7 +102,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 7. */
+/** Fill the portable defaults required by protocol generation 8. */
 export function defineRun(
   program: string,
   options: {

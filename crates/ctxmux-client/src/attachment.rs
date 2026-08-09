@@ -580,7 +580,7 @@ impl EventInbox {
 
         match event {
             RunEvent::Output { chunk } => {
-                let head_seq = chunk.seq;
+                let latest_output_bytes = chunk.end_byte;
                 let event = RunEvent::Output { chunk };
                 let bytes = event_bytes(&event);
                 if state.pending_gap.is_some()
@@ -590,14 +590,17 @@ impl EventInbox {
                         .checked_add(bytes)
                         .is_none_or(|total| total > MAX_QUEUED_EVENT_BYTES)
                 {
-                    state.pending_gap = Some(state.pending_gap.unwrap_or(0).max(head_seq));
+                    state.pending_gap =
+                        Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
                 } else {
                     state.queued_bytes += bytes;
                     state.queue.push_back(event);
                 }
             }
-            RunEvent::Gap { head_seq } => {
-                state.pending_gap = Some(state.pending_gap.unwrap_or(0).max(head_seq));
+            RunEvent::Gap {
+                latest_output_bytes,
+            } => {
+                state.pending_gap = Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
             }
             terminal @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => {
                 state.saw_terminal = true;
@@ -621,8 +624,10 @@ impl EventInbox {
                 {
                     return Err("bounded event inbox cannot represent a non-output event loss");
                 }
-                if let Some(head_seq) = state.pending_gap.take() {
-                    state.queue.push_back(RunEvent::Gap { head_seq });
+                if let Some(latest_output_bytes) = state.pending_gap.take() {
+                    state.queue.push_back(RunEvent::Gap {
+                        latest_output_bytes,
+                    });
                 }
                 state.queued_bytes += bytes;
                 state.queue.push_back(event);
@@ -660,8 +665,10 @@ impl EventInbox {
                     state.queued_bytes -= event_bytes(&event);
                     return Ok(Some(event));
                 }
-                if let Some(head_seq) = state.pending_gap.take() {
-                    return Ok(Some(RunEvent::Gap { head_seq }));
+                if let Some(latest_output_bytes) = state.pending_gap.take() {
+                    return Ok(Some(RunEvent::Gap {
+                        latest_output_bytes,
+                    }));
                 }
                 if let Some(event) = state.terminal.take() {
                     return Ok(Some(event));
@@ -965,7 +972,8 @@ mod tests {
         inbox
             .push(RunEvent::Output {
                 chunk: OutputChunk {
-                    seq: 1,
+                    start_byte: 0,
+                    end_byte: MAX_QUEUED_EVENT_BYTES as u64,
                     data: vec![0; MAX_QUEUED_EVENT_BYTES],
                 },
             })
@@ -973,7 +981,8 @@ mod tests {
         inbox
             .push(RunEvent::Output {
                 chunk: OutputChunk {
-                    seq: 2,
+                    start_byte: MAX_QUEUED_EVENT_BYTES as u64,
+                    end_byte: MAX_QUEUED_EVENT_BYTES as u64 + 1,
                     data: vec![1],
                 },
             })
@@ -981,7 +990,7 @@ mod tests {
         assert!(matches!(
             inbox.next().await.unwrap(),
             Some(RunEvent::Output {
-                chunk: OutputChunk { seq: 1, .. }
+                chunk: OutputChunk { start_byte: 0, .. }
             })
         ));
 
@@ -992,7 +1001,9 @@ mod tests {
             .expect("materialize Gap before a later non-output event");
         assert_eq!(
             inbox.next().await.unwrap(),
-            Some(RunEvent::Gap { head_seq: 2 })
+            Some(RunEvent::Gap {
+                latest_output_bytes: MAX_QUEUED_EVENT_BYTES as u64 + 1
+            })
         );
         assert_eq!(
             inbox.next().await.unwrap(),
@@ -1005,11 +1016,12 @@ mod tests {
     #[tokio::test]
     async fn terminal_event_survives_full_output_inbox() {
         let inbox = EventInbox::new();
-        for seq in 1..=MAX_QUEUED_EVENTS as u64 {
+        for start_byte in 0..MAX_QUEUED_EVENTS as u64 {
             inbox
                 .push(RunEvent::Output {
                     chunk: OutputChunk {
-                        seq,
+                        start_byte,
+                        end_byte: start_byte + 1,
                         data: vec![b'x'],
                     },
                 })
@@ -1018,7 +1030,8 @@ mod tests {
         inbox
             .push(RunEvent::Output {
                 chunk: OutputChunk {
-                    seq: MAX_QUEUED_EVENTS as u64 + 1,
+                    start_byte: MAX_QUEUED_EVENTS as u64,
+                    end_byte: MAX_QUEUED_EVENTS as u64 + 1,
                     data: vec![b'y'],
                 },
             })
@@ -1042,7 +1055,7 @@ mod tests {
         assert_eq!(
             inbox.next().await.unwrap(),
             Some(RunEvent::Gap {
-                head_seq: MAX_QUEUED_EVENTS as u64 + 1
+                latest_output_bytes: MAX_QUEUED_EVENTS as u64 + 1
             })
         );
         assert_eq!(inbox.next().await.unwrap(), Some(exited));

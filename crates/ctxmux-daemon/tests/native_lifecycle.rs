@@ -352,7 +352,7 @@ fn fork_inputs() -> Vec<RunInputReference> {
 async fn wait_for_output(
     attachment: &mut Attachment,
     observed: &mut Vec<u8>,
-    last_seq: &mut u64,
+    last_byte: &mut u64,
     expected: &[u8],
 ) {
     timeout(Duration::from_secs(5), async {
@@ -367,10 +367,13 @@ async fn wait_for_output(
                 .expect("attachment remains live")
             {
                 RunEvent::Output { chunk } => {
-                    *last_seq = chunk.seq;
+                    assert_eq!(chunk.start_byte, *last_byte);
+                    *last_byte = chunk.end_byte;
                     observed.extend_from_slice(&chunk.data);
                 }
-                RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => {
                     panic!("Run exited before expected output: {state:?}")
                 }
@@ -396,7 +399,9 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
             {
                 RunEvent::Exited { state } => return state,
                 RunEvent::Output { .. } => {}
-                RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Interrupted { reason } => {
                     panic!("live Run was unexpectedly interrupted: {reason:?}")
                 }
@@ -570,7 +575,7 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
         .await
         .expect("attach to native Run");
     let mut observed = replay_bytes(&first_snapshot.replay.chunks);
-    let mut last_seq = first_snapshot.replay.head_seq;
+    let mut last_seq = first_snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(
             &mut first_attachment,
@@ -635,7 +640,7 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
     assert_eq!(second_snapshot.run.pid, Some(pid));
     assert!(!second_snapshot.replay.truncated);
     observed = replay_bytes(&second_snapshot.replay.chunks);
-    last_seq = second_snapshot.replay.head_seq;
+    last_seq = second_snapshot.replay.latest_output_bytes;
     second_attachment
         .input(b"size\n".to_vec())
         .await
@@ -713,7 +718,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
         .await
         .expect("attach raw pipeline client");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
     }
@@ -808,7 +813,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
                             );
                             return state;
                         }
-                        RunEvent::Gap { head_seq } => panic!("unexpected post-stop gap at {head_seq}"),
+                        RunEvent::Gap { latest_output_bytes } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
                         RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                         RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
                     }
@@ -850,7 +855,7 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
         .await
         .expect("attach independent control lane");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(&mut control, &mut observed, &mut last_seq, b"READY").await;
     }
@@ -921,7 +926,9 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
             {
                 RunEvent::Exited { state } => return state,
                 RunEvent::Output { .. } => {}
-                RunEvent::Gap { head_seq } => panic!("unexpected saturation gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected saturation gap at {latest_output_bytes}"),
                 RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                 RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
             }
@@ -992,7 +999,7 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
         encode_frame(&ClientFrame::Request {
             request: Request::Attach {
                 id: run.id,
-                after_seq: 0,
+                after_byte: 0,
             },
         })
         .expect("encode raw attach"),
@@ -1054,7 +1061,7 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
         .await
         .expect("reattach after fatal command-id violation");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     let reconnected = attachment
         .input(b"\n".to_vec())
         .await
@@ -1176,7 +1183,7 @@ async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
         .await
         .expect("attach response-loss oracle");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
     }
@@ -1278,7 +1285,7 @@ async fn recoverable_input_rejects_another_daemon_instance_before_pty_mutation()
         .await
         .expect("attach replacement capture oracle");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
     }
@@ -1400,9 +1407,9 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
         .await
         .expect("attach child Run");
     let mut parent_output = replay_bytes(&parent_snapshot.replay.chunks);
-    let mut parent_seq = parent_snapshot.replay.head_seq;
+    let mut parent_seq = parent_snapshot.replay.latest_output_bytes;
     let mut child_output = replay_bytes(&child_snapshot.replay.chunks);
-    let mut child_seq = child_snapshot.replay.head_seq;
+    let mut child_seq = child_snapshot.replay.latest_output_bytes;
     parent_attachment
         .input(b"parent\n".to_vec())
         .await
@@ -1482,17 +1489,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_6_before_request_dispatch() {
+async fn daemon_rejects_generation_7_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 7,
+        PROTOCOL_VERSION, 8,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_6_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 6 },
+    let generation_7_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 7 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -1510,7 +1517,7 @@ async fn daemon_rejects_generation_6_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_6_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_7_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -1631,19 +1638,19 @@ async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
     assert!(replay[..zero_prefix].iter().all(|byte| *byte == 0));
     assert_eq!(&replay[zero_prefix..], marker);
     assert_eq!(
-        snapshot.replay.chunks.first().map(|chunk| chunk.seq),
-        Some(snapshot.replay.oldest_seq)
+        snapshot.replay.chunks.first().map(|chunk| chunk.start_byte),
+        Some(snapshot.replay.first_available_byte)
     );
     assert_eq!(
-        snapshot.replay.chunks.last().map(|chunk| chunk.seq),
-        Some(snapshot.replay.head_seq)
+        snapshot.replay.chunks.last().map(|chunk| chunk.end_byte),
+        Some(snapshot.replay.latest_output_bytes)
     );
     assert!(
         snapshot
             .replay
             .chunks
             .windows(2)
-            .all(|pair| pair[1].seq == pair[0].seq + 1)
+            .all(|pair| pair[1].start_byte == pair[0].end_byte)
     );
 }
 
@@ -1687,6 +1694,35 @@ async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
             0x00, 0xff, 0x1b, b'[', b'3', b'1', b'm', 0xe2, 0x82, 0xac, 0x1b, b'[', b'0', b'm',
             b'F', b'I', b'N', b'A', b'L',
         ]
+    );
+    assert!(
+        snapshot
+            .replay
+            .chunks
+            .windows(2)
+            .any(|pair| pair[0].end_byte == 8 && pair[1].start_byte == 8),
+        "the fixture must split the three-byte UTF-8 scalar after its first byte"
+    );
+    let interior = snapshot
+        .replay
+        .chunks
+        .iter()
+        .find(|chunk| chunk.data.len() > 1)
+        .expect("fixture retains a multi-byte output chunk");
+    let interior_cursor = interior.start_byte + 1;
+    let (_, suffix) = daemon
+        .client
+        .attach(run.id, interior_cursor)
+        .await
+        .expect("reattach from inside one retained byte range");
+    let expected = replay_bytes(&snapshot.replay.chunks);
+    assert_eq!(
+        replay_bytes(&suffix.replay.chunks),
+        expected[usize::try_from(interior_cursor).expect("fixture cursor fits usize")..]
+    );
+    assert_eq!(
+        suffix.replay.chunks.first().map(|chunk| chunk.start_byte),
+        Some(interior_cursor)
     );
     assert_eq!(
         attachment.next_event().await.expect("read terminal event"),
@@ -1816,7 +1852,7 @@ async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
         .await
         .expect("attach before clean detach");
     let mut observed = replay_bytes(&snapshot.replay.chunks);
-    let mut last_seq = snapshot.replay.head_seq;
+    let mut last_seq = snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
         wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
     }

@@ -1058,9 +1058,9 @@ fn terminate_process(pid: u32) {
 async fn attach_with_timeout(
     client: &Client,
     id: RunId,
-    after_seq: u64,
+    after_byte: u64,
 ) -> (Attachment, AttachedSnapshot) {
-    timeout(PUBLIC_ATTACHMENT_TIMEOUT, client.attach(id, after_seq))
+    timeout(PUBLIC_ATTACHMENT_TIMEOUT, client.attach(id, after_byte))
         .await
         .expect("public attachment handshake exceeded its deadline")
         .expect("attach to Run")
@@ -1108,7 +1108,9 @@ async fn wait_for_output(
             {
                 RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
                 RunEvent::Tmux { .. } => {}
-                RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
                     panic!("tmux Run was interrupted unexpectedly: {reason:?}")
@@ -1134,7 +1136,9 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                     panic!("unexpected tmux event while waiting for {expected:?}: {event:?}")
                 }
                 RunEvent::Output { .. } => {}
-                RunEvent::Gap { head_seq } => panic!("unexpected output gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
                     panic!("tmux Run was interrupted unexpectedly: {reason:?}")
@@ -1395,11 +1399,11 @@ fn expected_burst() -> Vec<u8> {
 async fn collect_exact_output_with_gap_replay(
     client: &Client,
     id: RunId,
-    after_seq: u64,
+    after_byte: u64,
     expected_end: &[u8],
 ) -> Vec<u8> {
     timeout(Duration::from_secs(10), async {
-        let mut cursor = after_seq;
+        let mut cursor = after_byte;
         let mut observed = Vec::new();
         loop {
             let (mut attachment, snapshot) = attach_with_timeout(client, id, cursor).await;
@@ -1408,8 +1412,8 @@ async fn collect_exact_output_with_gap_replay(
                 "burst remains below retention and must be replayable after the import boundary"
             );
             for chunk in snapshot.replay.chunks {
-                assert_eq!(chunk.seq, cursor + 1);
-                cursor = chunk.seq;
+                assert_eq!(chunk.start_byte, cursor);
+                cursor = chunk.end_byte;
                 observed.extend_from_slice(&chunk.data);
             }
             if observed.ends_with(expected_end) {
@@ -1424,8 +1428,8 @@ async fn collect_exact_output_with_gap_replay(
                     .expect("queued-output attachment remains live")
                 {
                     RunEvent::Output { chunk } => {
-                        assert_eq!(chunk.seq, cursor + 1);
-                        cursor = chunk.seq;
+                        assert_eq!(chunk.start_byte, cursor);
+                        cursor = chunk.end_byte;
                         observed.extend_from_slice(&chunk.data);
                         if observed.ends_with(expected_end) {
                             detach_with_timeout(attachment).await;
@@ -1484,8 +1488,8 @@ async fn real_discovery_import_exposes_raw_since_import_without_prehistory() {
     let (mut attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
     let mut observed = replay_bytes(&snapshot.replay.chunks);
     assert!(snapshot.replay.truncated);
-    assert_eq!(snapshot.replay.oldest_seq, 0);
-    assert_eq!(snapshot.replay.head_seq, 0);
+    assert_eq!(snapshot.replay.first_available_byte, 0);
+    assert_eq!(snapshot.replay.latest_output_bytes, 0);
     assert!(observed.is_empty());
 
     server.send_line(&target_pane_id, "after-import");
@@ -2018,19 +2022,19 @@ async fn pause_storm_writes_one_bounded_continue_command() {
     let client = daemon.client();
     let run = import_fake_pane(&client, &fake).await;
     fake.trigger_control("pause-storm");
+    let expected = b"AFTER-CONTINUE\r\nSTORM-DRAINED\r\n";
 
     timeout(Duration::from_secs(5), async {
-        while client.status(run.id).await.unwrap().head_seq < 2 {
+        while client.status(run.id).await.unwrap().latest_output_bytes
+            < u64::try_from(expected.len()).expect("fixture output length fits u64")
+        {
             sleep(Duration::from_millis(20)).await;
         }
     })
     .await
     .expect("post-storm output should follow the draining target probe result");
     let (attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
-    assert_eq!(
-        replay_bytes(&snapshot.replay.chunks),
-        b"AFTER-CONTINUE\r\nSTORM-DRAINED\r\n"
-    );
+    assert_eq!(replay_bytes(&snapshot.replay.chunks), expected);
     assert_eq!(fake.refresh_command_count(), 1);
     assert!(client.status(run.id).await.unwrap().state.is_running());
     assert!(process_exists(fake.pane_pid()));
@@ -2056,7 +2060,7 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
     let run = import_fake_pane(&client, &fake).await;
     let (mut attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
     assert!(snapshot.replay.truncated);
-    assert_eq!(snapshot.replay.head_seq, 0);
+    assert_eq!(snapshot.replay.latest_output_bytes, 0);
     assert!(snapshot.replay.chunks.is_empty());
 
     fake.trigger_output_before_pause();
@@ -2067,9 +2071,9 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
         Some(RunEvent::Output { chunk }) => chunk,
         event => panic!("expected pre-pause output, got {event:?}"),
     };
-    assert_eq!(before_pause.seq, 1);
+    assert_eq!((before_pause.start_byte, before_pause.end_byte), (0, 14));
     assert_eq!(before_pause.data, b"BEFORE-PAUSE\r\n");
-    let caller_cursor = before_pause.seq;
+    let caller_cursor = before_pause.end_byte;
 
     fake.trigger_pause();
 
@@ -2086,7 +2090,7 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
             .await
             .expect("receive public Gap event"),
         Some(RunEvent::Gap {
-            head_seq: caller_cursor,
+            latest_output_bytes: caller_cursor,
         })
     );
     assert_eq!(
@@ -2104,7 +2108,7 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
         Some(RunEvent::Output { chunk }) => chunk,
         event => panic!("expected post-continue output, got {event:?}"),
     };
-    assert_eq!(after_continue.seq, caller_cursor + 1);
+    assert_eq!(after_continue.start_byte, caller_cursor);
     assert_eq!(after_continue.data, b"AFTER-CONTINUE\r\n");
     fake.assert_refresh_command();
     let control_pid = fake.control_pid();
@@ -2115,14 +2119,17 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
 
     let (reattached, replay) = attach_with_timeout(&client, run.id, caller_cursor).await;
     assert!(replay.replay.truncated);
-    assert_eq!(replay.replay.head_seq, after_continue.seq);
+    assert_eq!(replay.replay.latest_output_bytes, after_continue.end_byte);
     assert_eq!(replay.replay.chunks, vec![after_continue.clone()]);
     assert_eq!(replay_bytes(&replay.replay.chunks), b"AFTER-CONTINUE\r\n");
     detach_with_timeout(reattached).await;
 
     let (late, late_replay) = attach_with_timeout(&client, run.id, caller_cursor).await;
     assert!(late_replay.replay.truncated);
-    assert_eq!(late_replay.replay.head_seq, after_continue.seq);
+    assert_eq!(
+        late_replay.replay.latest_output_bytes,
+        after_continue.end_byte
+    );
     assert_eq!(late_replay.replay.chunks, vec![after_continue]);
     assert_eq!(
         replay_bytes(&late_replay.replay.chunks),
@@ -2301,8 +2308,8 @@ async fn detach_during_queued_output_preserves_replay_and_tmux_session() {
     assert!(server.is_reachable());
     assert!(process_exists(pane_process_id));
 
-    let after_seq = client.status(run.id).await.unwrap().head_seq;
-    let (mut control_lifetime, snapshot) = attach_with_timeout(&client, run.id, after_seq).await;
+    let after_byte = client.status(run.id).await.unwrap().latest_output_bytes;
+    let (mut control_lifetime, snapshot) = attach_with_timeout(&client, run.id, after_byte).await;
     server.send_line(&target_pane_id, "burst");
     wait_for_output(
         &mut control_lifetime,

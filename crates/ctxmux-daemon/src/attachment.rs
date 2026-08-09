@@ -22,7 +22,7 @@ pub(super) async fn handle(
     mut wire: Framed<UnixStream, LinesCodec>,
     manager: Arc<RunManager>,
     id: RunId,
-    after_seq: u64,
+    after_byte: u64,
 ) -> Result<(), ConnectionError> {
     let run = match manager.pin(id) {
         Ok(run) => run,
@@ -36,9 +36,9 @@ pub(super) async fn handle(
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSubscribe).await;
     }
-    let (_guard, snapshot) = run.attach(after_seq);
+    let (_guard, snapshot) = run.attach(after_byte);
     let (header, replay_chunks, terminal_state) = split_snapshot(snapshot);
-    let mut last_sent_seq = header.replay.head_seq;
+    let mut sent_through_byte = header.replay.latest_output_bytes;
     send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;
     send_replay(&mut wire, replay_chunks).await?;
     #[cfg(test)]
@@ -90,9 +90,9 @@ pub(super) async fn handle(
             }
             event = events.recv() => {
                 match event {
-                    Ok(RunEvent::Output { chunk }) if chunk.seq <= last_sent_seq => {}
+                    Ok(RunEvent::Output { chunk }) if chunk.end_byte <= sent_through_byte => {}
                     Ok(RunEvent::Output { chunk }) => {
-                        last_sent_seq = chunk.seq;
+                        sent_through_byte = chunk.end_byte;
                         send(&mut wire, &ServerFrame::Event {
                             event: RunEvent::Output { chunk },
                         }).await?;
@@ -107,10 +107,10 @@ pub(super) async fn handle(
                     }
                     Ok(event) => send(&mut wire, &ServerFrame::Event { event }).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let head_seq = run.info().head_seq;
-                        last_sent_seq = head_seq;
+                        let latest_output_bytes = run.info().latest_output_bytes;
+                        sent_through_byte = latest_output_bytes;
                         send(&mut wire, &ServerFrame::Event {
-                            event: RunEvent::Gap { head_seq },
+                            event: RunEvent::Gap { latest_output_bytes },
                         }).await?;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -230,16 +230,16 @@ fn split_snapshot(snapshot: AttachedSnapshot) -> (AttachedHeader, Vec<OutputChun
     } = snapshot;
     let OutputReplay {
         chunks,
-        oldest_seq,
-        head_seq,
+        first_available_byte,
+        latest_output_bytes,
         truncated,
     } = replay;
     let terminal_state = run_info.state.clone();
     let header = AttachedHeader {
         run: run_info,
         replay: OutputReplayHeader {
-            oldest_seq,
-            head_seq,
+            first_available_byte,
+            latest_output_bytes,
             truncated,
         },
     };

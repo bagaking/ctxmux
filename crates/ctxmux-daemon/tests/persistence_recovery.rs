@@ -184,7 +184,9 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
             {
                 event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => return event,
                 RunEvent::Output { .. } => {}
-                RunEvent::Gap { head_seq } => panic!("unexpected recovered gap at {head_seq}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => panic!("unexpected recovered gap at {latest_output_bytes}"),
                 RunEvent::Tmux { event } => panic!("unexpected recovered tmux event: {event:?}"),
             }
         }
@@ -217,16 +219,19 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
         .await
         .expect("start durable parent");
     let initial_durable_head = parent
-        .durable_head_seq
+        .durable_output_bytes
         .expect("persistent Start reports a durable cursor");
     assert!(
-        initial_durable_head <= parent.head_seq,
+        initial_durable_head <= parent.latest_output_bytes,
         "the dynamic Start snapshot cannot report durable output beyond its live head"
     );
     let exited = wait_terminal(&first_client, parent.id).await;
     assert!(matches!(exited.state, RunState::Exited { code: 0, .. }));
-    assert_eq!(exited.durable_head_seq, Some(exited.head_seq));
-    assert!(exited.head_seq > 0);
+    assert_eq!(
+        exited.durable_output_bytes,
+        Some(exited.latest_output_bytes)
+    );
+    assert!(exited.latest_output_bytes > 0);
     first.kill_and_wait();
 
     let second = Daemon::start(socket, &state_dir).await;
@@ -239,14 +244,34 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
     assert_eq!(recovered.spec, parent.spec);
     assert_eq!(recovered.lineage, None);
     assert_eq!(recovered.state, exited.state);
-    assert_eq!(recovered.head_seq, exited.durable_head_seq.unwrap());
-    assert_eq!(recovered.durable_head_seq, Some(recovered.head_seq));
+    assert_eq!(
+        recovered.latest_output_bytes,
+        exited.durable_output_bytes.unwrap()
+    );
+    assert_eq!(
+        recovered.durable_output_bytes,
+        Some(recovered.latest_output_bytes)
+    );
 
     let (mut attachment, snapshot) = client
         .attach(parent.id, 0)
         .await
         .expect("attach recovered parent");
     assert_eq!(replay_bytes(&snapshot.replay.chunks), b"persisted-output");
+    assert_eq!(snapshot.replay.first_available_byte, 0);
+    assert_eq!(
+        snapshot.replay.latest_output_bytes,
+        b"persisted-output".len() as u64
+    );
+    let (_, suffix) = client
+        .attach(parent.id, 4)
+        .await
+        .expect("attach recovered parent from an interior byte cursor");
+    assert_eq!(replay_bytes(&suffix.replay.chunks), b"isted-output");
+    assert_eq!(
+        suffix.replay.chunks.first().map(|chunk| chunk.start_byte),
+        Some(4)
+    );
     assert!(matches!(
         terminal_event(&mut attachment).await,
         RunEvent::Exited {
@@ -297,7 +322,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
                 .status(live.id)
                 .await
                 .expect("read live status");
-            if info.durable_head_seq.is_some_and(|head| head > 0) {
+            if info.durable_output_bytes.is_some_and(|head| head > 0) {
                 break;
             }
             sleep(Duration::from_millis(10)).await;
@@ -337,7 +362,10 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
         }
     );
     assert_eq!(recovered.pid, None);
-    assert_eq!(recovered.durable_head_seq, Some(recovered.head_seq));
+    assert_eq!(
+        recovered.durable_output_bytes,
+        Some(recovered.latest_output_bytes)
+    );
     assert_invalid_state(&client.input(live.id, b"never".to_vec()).await);
     assert_invalid_state(
         &client
@@ -391,8 +419,11 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
         .await
         .expect("start output retention Run");
     let exited = wait_terminal_within(&client, run.id, RETAINED_REPLAY_TERMINAL_WAIT).await;
-    assert_eq!(exited.durable_head_seq, Some(exited.head_seq));
-    assert!(exited.oldest_seq > 1);
+    assert_eq!(
+        exited.durable_output_bytes,
+        Some(exited.latest_output_bytes)
+    );
+    assert!(exited.first_available_byte > 1);
     let (_, live_snapshot) = client
         .attach(run.id, 0)
         .await
@@ -411,8 +442,14 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
         .expect("attach recovered retained tail");
     let recovered_bytes = replay_bytes(&recovered_snapshot.replay.chunks);
     assert_eq!(recovered_bytes, live_bytes);
-    assert_eq!(recovered_snapshot.replay.oldest_seq, exited.oldest_seq);
-    assert_eq!(recovered_snapshot.replay.head_seq, exited.head_seq);
+    assert_eq!(
+        recovered_snapshot.replay.first_available_byte,
+        exited.first_available_byte
+    );
+    assert_eq!(
+        recovered_snapshot.replay.latest_output_bytes,
+        exited.latest_output_bytes
+    );
     assert!(recovered_snapshot.replay.truncated);
 }
 
@@ -524,14 +561,14 @@ async fn corrupt_replay_generation_fails_closed_without_partial_run_exposure() {
         .await
         .expect("start corruption source Run");
     let exited = wait_terminal(&client, run.id).await;
-    assert!(exited.head_seq > 0);
+    assert!(exited.latest_output_bytes > 0);
     first.kill_and_wait();
 
     let database = state_dir.join("state.sqlite3");
     let connection = rusqlite::Connection::open(&database).expect("open state for corruption");
     connection
         .execute(
-            "UPDATE runs SET durable_head_seq = durable_head_seq + 1 WHERE id = ?1",
+            "UPDATE runs SET durable_output_bytes = durable_output_bytes + 1 WHERE id = ?1",
             [run.id.to_string()],
         )
         .expect("create parseable mixed replay generation");

@@ -1,4 +1,4 @@
-# Local Protocol Generation 7
+# Local Protocol Generation 8
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 7.
+- Raw PTY bytes are represented as integer arrays in generation 8.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -25,11 +25,11 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. Generation 7 does not yet
+The generation fence covers the wire contract only. Generation 8 does not yet
 negotiate runtime build identity, host identity, or a daemon-wide capability
 manifest; those remain separate open work.
 
-Generation 7 adds one random daemon-incarnation identity to the successful
+Generation 8 includes one random daemon-incarnation identity in the successful
 Hello frame. It is a live retry fence, not build, host, platform, or durable
 process identity. Ordinary `input` retains the prior receipt semantics:
 when its result is lost, callers must not retry it. The separate
@@ -66,7 +66,7 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   after reconnect within the same daemon incarnation.
 - `resize`: request new live PTY rows and columns and report the size read back
   from the owning PTY.
-- `attach`: return retained output after a sequence cursor and follow new
+- `attach`: return retained output after a cumulative byte cursor and follow new
   output and exit events.
 - `stop`: request termination of the owned direct child and return after the
   native child handle accepts that request. On Unix the current
@@ -88,14 +88,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 7.
+ownership in generation 8.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 7 declares `run_capacity` for the global retained-Run admission
+Generation 8 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -104,7 +104,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-7 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-8 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -127,7 +127,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-7 decoding and
+The daemon compares canonical typed requests after generation-8 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -324,7 +324,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 7 import accepts only socket path plus pane ID, so it
+associations. Generation 8 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -339,7 +339,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 7 does not claim general tmux command correlation beyond those bounded
+Generation 8 does not claim general tmux command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -349,12 +349,12 @@ the pane.
 
 ## Output and reconnect
 
-PTY output is divided into monotonically sequenced chunks. The daemon currently
-retains at most 4 MiB per Run. An attachment supplies its last observed sequence
+PTY output is divided into contiguous half-open cumulative byte ranges. The daemon currently
+retains at most 4 MiB per Run. An attachment supplies its last observed byte cursor
 and receives:
 
-- retained chunks newer than that sequence;
-- the oldest and newest retained sequences;
+- retained bytes after that cursor, slicing the first range when it falls inside a retained chunk;
+- the first retained byte and total output bytes allocated;
 - a `truncated` flag when required output was already evicted;
 - future ordered output, Backend observation, gap, and exit events.
 
@@ -368,9 +368,9 @@ part of replay and are never retained across reconnect. A client that permits
 multiple in-flight commands must demultiplex the single inbound stream by
 `AttachmentCommandId`; competing socket readers are outside the contract.
 
-`RunInfo.durable_head_seq` is `null` in memory-only mode. In persistent mode it
-is the highest contiguous output sequence committed by the store actor and may
-lag the live `head_seq`. After restart, recovered `head_seq`, replay cursors,
+`RunInfo.durable_output_bytes` is `null` in memory-only mode. In persistent mode it
+is the highest contiguous output byte committed by the store actor and may
+lag the live `latest_output_bytes`. After restart, recovered `latest_output_bytes`, replay cursors,
 chunks, and truncation describe exactly that committed retained window. A late
 attachment receives either one `exited` event or one `interrupted` event after
 replay reassembly.
@@ -384,11 +384,11 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-7 peer that puts `chunks` back into the header is invalid.
+generation-8 peer that puts `chunks` back into the header is invalid.
 
-`Gap { head_seq }` reports where the daemon had advanced when a live receiver
+`Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
-last successfully observed sequence. Replay then returns an exact retained
+last successfully observed byte cursor. Replay then returns an exact retained
 continuation or sets `truncated` when the required history was evicted.
 
 Imported tmux replay begins at the Control Mode import boundary. The initial
@@ -414,7 +414,7 @@ same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
 state lock. Exact schema version, SQLite integrity, typed JSON, a required
 native `RunSpec` satisfying the live-start semantic rules, lifecycle, lineage,
 cursor, contiguous chunk, byte-accounting, and quota invariants are validated
-against the schema-2 format envelope before the socket is published. A valid
+against the schema-3 format envelope before the socket is published. A valid
 older store may contain up to 4,096 records; bounded, restartable startup
 transactions reconcile prior running rows, evict the canonical terminal prefix
 to the operational 128-record ceiling, and finish serving-epoch publication before
@@ -438,6 +438,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-7 frame at runtime, rejects duplicate
+validates the complete nested generation-8 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

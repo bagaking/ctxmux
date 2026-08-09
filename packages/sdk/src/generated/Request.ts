@@ -29,7 +29,7 @@ export type Request =
       type: "attach";
       id: RunId;
       /**
-       * Last sequence already observed by the client.
+       * Cumulative number of output bytes already observed by the client.
        */
-      after_seq: number;
+      after_byte: number;
     };

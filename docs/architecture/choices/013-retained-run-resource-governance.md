@@ -62,7 +62,7 @@ multiply each existing local bound, while parser containers, transient clones,
 Run metadata, and allocator overhead remain measured RSS rather than being
 misrepresented as replay bytes.
 
-SQLite may accept an older schema-2 store containing up to 4,096 structurally
+SQLite may accept a schema-3 store containing up to 4,096 structurally
 valid rows during fail-closed format validation. Bounded, restartable startup
 transactions reconcile prior running rows to interrupted, evict the canonical
 terminal prefix to 128, and finish serving-epoch publication before socket publication.
@@ -367,7 +367,7 @@ WAL-frame fixture before the dependency can change.
 
 This implementation supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
-replacement. Decision 009 remains authoritative for schema-2 validation up to
+replacement. Decision 009 remains authoritative for schema-3 validation up to
 the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
 limits, file ceilings, recovery class, and SQLite durability assumptions.
 
@@ -452,14 +452,14 @@ windows. The retained key is `gc:<mode>:<index>:<digest-hex>` under the public
 length and character rules.
 
 A lifecycle is complete only after public terminal state, no direct child,
-exact 4,096-byte replay and sequence, and, in persistent mode,
-`durable_head_seq == head_seq`. Each window uses the fixed seed and schedule;
+exact 4,096-byte replay and byte cursor, and, in persistent mode,
+`durable_output_bytes == latest_output_bytes`. Each window uses the fixed seed and schedule;
 failures retain the first failing index.
 
 The restart oracle hashes a canonically RunId-sorted array of correlated tuples,
 not separately permutable sets. Each tuple contains RunId, exact key or unkeyed
-marker, terminal state, lineage, oldest/head/durable-head/truncated cursors, and
-the ordered `(sequence, length, SHA-256(data))` replay digest. The same tuple
+marker, terminal state, lineage, first/latest/durable/truncated byte cursors, and
+the ordered `(start_byte, end_byte, length, SHA-256(data))` replay digest. The same tuple
 digest must appear before shutdown and after restart. Before shutdown and again
 after restart, all 128 exact keys are retried with their canonical requests;
 every retry returns the tuple's same RunId and changes neither process count nor
@@ -495,7 +495,7 @@ the maximum retained payload with the maximum physical publication concurrency;
 the three-window small-record phase remains the full turnover proof.
 
 Persistent pressure has two explicit domains. Before restart, same-epoch live
-`OutputLog` payload is exactly 512 MiB and `durable_head_seq == head_seq` even
+`OutputLog` payload is exactly 512 MiB and `durable_output_bytes == latest_output_bytes` even
 though SQLite globally retains at most 256 MiB. After restart, the recovered
 durable aggregate must lie in the exact native-chunk interval frozen by the
 machine contract, every replay is the expected suffix, and a moved oldest
@@ -658,7 +658,7 @@ or deterministic-owner fixtures.
   attachment lookup paths
 - `crates/ctxmux-daemon/src/native_control.rs`: native child, reap, PTY, and
   input-drain ownership
-- `crates/ctxmux-daemon/src/persistence.rs`: schema-2 validation, SQLite actor,
+- `crates/ctxmux-daemon/src/persistence.rs`: schema-3 validation, SQLite actor,
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts

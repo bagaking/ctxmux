@@ -11,7 +11,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -562,13 +562,13 @@ pub struct RunInfo {
     pub pid: Option<u32>,
     /// Current lifecycle state.
     pub state: RunState,
-    /// Highest output sequence allocated so far, or zero before output.
-    pub head_seq: u64,
-    /// Highest output sequence committed by the persistence actor, or `None`
+    /// Total output bytes allocated so far.
+    pub latest_output_bytes: u64,
+    /// Total output bytes committed by the persistence actor, or `None`
     /// when this daemon is running without a state directory.
-    pub durable_head_seq: Option<u64>,
-    /// Oldest output sequence still retained, or zero before output.
-    pub oldest_seq: u64,
+    pub durable_output_bytes: Option<u64>,
+    /// First output byte still retained, or zero before output.
+    pub first_available_byte: u64,
     /// Number of live attachment connections.
     pub attachments: usize,
     /// Bytes successfully applied by the current native Input owner, or
@@ -591,35 +591,37 @@ pub struct RecoverableInput {
     pub data: Vec<u8>,
 }
 
-/// One ordered PTY output chunk.
+/// One ordered half-open PTY output byte range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct OutputChunk {
-    /// Monotonically increasing sequence within one Run.
-    pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 7.
+    /// Inclusive cumulative byte offset of the first byte in `data`.
+    pub start_byte: u64,
+    /// Exclusive cumulative byte offset immediately after `data`.
+    pub end_byte: u64,
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 8.
     pub data: Vec<u8>,
 }
 
 /// Bounded output retained for a newly attached client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct OutputReplay {
-    /// Retained chunks newer than the requested sequence.
+    /// Retained ranges beginning at or after the requested byte cursor.
     pub chunks: Vec<OutputChunk>,
-    /// Oldest retained sequence, or zero when there has been no output.
-    pub oldest_seq: u64,
-    /// Highest allocated output sequence, or zero when there has been no output.
-    pub head_seq: u64,
-    /// Whether output newer than the requested cursor had already been evicted.
+    /// First retained byte, or zero when there has been no output.
+    pub first_available_byte: u64,
+    /// Total output bytes allocated so far.
+    pub latest_output_bytes: u64,
+    /// Whether output at or after the requested cursor is unavailable.
     pub truncated: bool,
 }
 
 /// Replay metadata sent in the initial attachment frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct OutputReplayHeader {
-    /// Oldest retained sequence, or zero when there has been no output.
-    pub oldest_seq: u64,
-    /// Highest allocated output sequence, or zero when there has been no output.
-    pub head_seq: u64,
+    /// First retained byte, or zero when there has been no output.
+    pub first_available_byte: u64,
+    /// Total output bytes allocated so far.
+    pub latest_output_bytes: u64,
     /// Whether output newer than the requested cursor had already been evicted.
     pub truncated: bool,
 }
@@ -668,9 +670,9 @@ pub enum Request {
     /// Attach to retained output and future lifecycle events.
     Attach {
         id: RunId,
-        /// Last sequence already observed by the client.
+        /// Cumulative number of output bytes already observed by the client.
         #[serde(default)]
-        after_seq: u64,
+        after_byte: u64,
     },
 }
 
@@ -805,7 +807,7 @@ pub enum RunEvent {
     /// ownership semantics.
     Tmux { event: TmuxRunEvent },
     /// The attachment lagged behind live delivery and should request replay.
-    Gap { head_seq: u64 },
+    Gap { latest_output_bytes: u64 },
 }
 
 /// Observable public-Control-Mode event for one imported tmux pane.
@@ -1059,9 +1061,9 @@ mod tests {
             capabilities: RunCapabilities::NATIVE,
             pid: Some(42),
             state: RunState::Running,
-            head_seq: 0,
-            durable_head_seq: None,
-            oldest_seq: 0,
+            latest_output_bytes: 0,
+            durable_output_bytes: None,
+            first_available_byte: 0,
             attachments: 1,
             applied_input_bytes: Some(0),
         }
@@ -1107,11 +1109,11 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_input_has_exact_generation_7_wire_shapes() {
+    fn recoverable_input_has_exact_generation_8_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
-        let operation_key = InputOperationKey::new("input-7").unwrap();
+        let operation_key = InputOperationKey::new("input-8").unwrap();
 
         assert_eq!(
             serde_json::to_value(ServerFrame::Hello {
@@ -1121,7 +1123,7 @@ mod tests {
             .unwrap(),
             serde_json::json!({
                 "type": "hello",
-                "protocol": 7,
+                "protocol": 8,
                 "daemon_instance": daemon_instance.to_string(),
             })
         );
@@ -1140,7 +1142,7 @@ mod tests {
                 "type": "recoverable_input",
                 "operation": {
                     "daemon_instance": daemon_instance.to_string(),
-                    "operation_key": "input-7",
+                    "operation_key": "input-8",
                     "id": run_id.to_string(),
                     "expected_byte": 4,
                     "data": [0, 255],

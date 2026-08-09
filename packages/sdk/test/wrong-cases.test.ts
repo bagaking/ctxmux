@@ -15,6 +15,7 @@ import {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
   inputOperationKey,
+  type OutputChunk,
   type ServerFrame,
 } from "../src/index.ts";
 import { runEventSource } from "../src/attachment.ts";
@@ -44,18 +45,18 @@ const MALFORMED_PROTOCOL_FRAMES = (
 test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
   const safeFrame = {
     type: "event",
-    event: { type: "gap", head_seq: Number.MAX_SAFE_INTEGER },
+    event: { type: "gap", latest_output_bytes: Number.MAX_SAFE_INTEGER },
   } satisfies ServerFrame;
   assert.equal(validateServerFrame(safeFrame), safeFrame);
 
   const rounded = JSON.parse(
-    '{"type":"event","event":{"type":"gap","head_seq":9007199254740993}}',
+    '{"type":"event","event":{"type":"gap","latest_output_bytes":9007199254740993}}',
   ) as unknown;
   assert.throws(
     () => validateServerFrame(rounded),
     (error: unknown) =>
       error instanceof CtxmuxInvalidFrameError &&
-      error.path === "$frame.event.head_seq",
+      error.path === "$frame.event.latest_output_bytes",
   );
 
   const daemon = await mockDaemon(context, async (socket) => {
@@ -67,7 +68,7 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
       request: {
         type: "attach",
         id: RUN_ID,
-        after_seq: Number.MAX_SAFE_INTEGER,
+        after_byte: Number.MAX_SAFE_INTEGER,
       },
     });
     peer.send({
@@ -78,13 +79,16 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
 
   const client = new CtxmuxClient({ socketPath: daemon.socketPath });
   const attachment = await client.attach(RUN_ID, Number.MAX_SAFE_INTEGER);
-  assert.equal(attachment.snapshot.replay.head_seq, Number.MAX_SAFE_INTEGER);
+  assert.equal(
+    attachment.snapshot.replay.latest_output_bytes,
+    Number.MAX_SAFE_INTEGER,
+  );
   attachment.close();
 
   await assert.rejects(
     client.attach(RUN_ID, Number.MAX_SAFE_INTEGER + 1),
     (error: unknown) =>
-      error instanceof CtxmuxInvalidFrameError && error.path === "afterSeq",
+      error instanceof CtxmuxInvalidFrameError && error.path === "afterByte",
   );
 });
 
@@ -137,10 +141,10 @@ test("SC-02 rejects malformed nested runtime frames", () => {
         type: "response",
         response: {
           type: "started",
-          run: { ...runInfo(), durable_head_seq: -1 },
+          run: { ...runInfo(), durable_output_bytes: -1 },
         },
       },
-      "$frame.response.run.durable_head_seq",
+      "$frame.response.run.durable_output_bytes",
     ],
     [
       {
@@ -157,10 +161,10 @@ test("SC-02 rejects malformed nested runtime frames", () => {
         type: "attached",
         snapshot: {
           ...attachedHeader(),
-          replay: { ...attachedHeader().replay, oldest_seq: "0" },
+          replay: { ...attachedHeader().replay, first_available_byte: "0" },
         },
       },
-      "$frame.snapshot.replay.oldest_seq",
+      "$frame.snapshot.replay.first_available_byte",
     ],
     [
       {
@@ -175,7 +179,10 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     [
       {
         type: "event",
-        event: { type: "output", chunk: { seq: 1, data: [0, 256] } },
+        event: {
+          type: "output",
+          chunk: { start_byte: 0, end_byte: 2, data: [0, 256] },
+        },
       },
       "$frame.event.chunk.data[1]",
     ],
@@ -364,7 +371,10 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
     { type: "attached", snapshot: attachedHeader() },
     {
       type: "event",
-      event: { type: "output", chunk: { seq: 1, data: [0, 10, 255] } },
+      event: {
+        type: "output",
+        chunk: { start_byte: 0, end_byte: 3, data: [0, 10, 255] },
+      },
     },
     {
       type: "event",
@@ -381,7 +391,7 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
       type: "event",
       event: { type: "interrupted", reason: "tmux_protocol_error" },
     },
-    { type: "event", event: { type: "gap", head_seq: 1 } },
+    { type: "event", event: { type: "gap", latest_output_bytes: 1 } },
     {
       type: "command_result",
       command_id: 1,
@@ -697,26 +707,32 @@ test("LP-02 reassembles retained replay streamed across bounded frames", async (
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_seq: 0 },
+      request: { type: "attach", id: RUN_ID, after_byte: 0 },
     });
     peer.send({
       type: "attached",
       snapshot: {
-        ...attachedHeader(2),
+        ...attachedHeader(5),
         replay: {
-          oldest_seq: 1,
-          head_seq: 2,
+          first_available_byte: 0,
+          latest_output_bytes: 5,
           truncated: false,
         },
       },
     });
     peer.send({
       type: "event",
-      event: { type: "output", chunk: { seq: 1, data: [0, 255] } },
+      event: {
+        type: "output",
+        chunk: { start_byte: 0, end_byte: 2, data: [0, 255] },
+      },
     });
     peer.send({
       type: "event",
-      event: { type: "output", chunk: { seq: 2, data: [1, 2, 3] } },
+      event: {
+        type: "output",
+        chunk: { start_byte: 2, end_byte: 5, data: [1, 2, 3] },
+      },
     });
   });
 
@@ -724,25 +740,91 @@ test("LP-02 reassembles retained replay streamed across bounded frames", async (
     socketPath: daemon.socketPath,
   }).attach(RUN_ID);
   assert.deepEqual(attachment.snapshot.replay.chunks, [
-    { seq: 1, data: [0, 255] },
-    { seq: 2, data: [1, 2, 3] },
+    { start_byte: 0, end_byte: 2, data: [0, 255] },
+    { start_byte: 2, end_byte: 5, data: [1, 2, 3] },
   ]);
   attachment.close();
 });
 
-test("LP-02 settles a truncated empty replay without inventing sequence zero", async (context) => {
+test("LP-02 rejects replay overshoot, non-progress, and EOF before the advertised byte boundary", async (context) => {
+  for (const [label, chunk] of [
+    ["overshoot", { start_byte: 0, end_byte: 2, data: [1, 2] }],
+    ["non-progress", { start_byte: 0, end_byte: 0, data: [] }],
+  ] satisfies ReadonlyArray<readonly [string, OutputChunk]>) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      await peer.receive();
+      peer.send({
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(1),
+          replay: {
+            first_available_byte: 0,
+            latest_output_bytes: 1,
+            truncated: false,
+          },
+        },
+      });
+      peer.send({ type: "event", event: { type: "output", chunk } });
+    });
+    await assert.rejects(
+      settleWithin(
+        new CtxmuxClient({ socketPath: daemon.socketPath }).attach(RUN_ID),
+        1_000,
+      ),
+      label === "overshoot"
+        ? /expected ordered replay output/u
+        : (error: unknown) =>
+            error instanceof CtxmuxInvalidFrameError &&
+            error.path === "$frame.event.chunk",
+      label,
+    );
+  }
+
+  const eof = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({
+      type: "attached",
+      snapshot: {
+        ...attachedHeader(1),
+        replay: {
+          first_available_byte: 0,
+          latest_output_bytes: 1,
+          truncated: false,
+        },
+      },
+    });
+    socket.end();
+  });
+  await assert.rejects(
+    settleWithin(
+      new CtxmuxClient({ socketPath: eof.socketPath }).attach(RUN_ID),
+      1_000,
+    ),
+    WireClosedError,
+  );
+});
+
+test("LP-02 settles a truncated empty replay without inventing a byte range", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_seq: 0 },
+      request: { type: "attach", id: RUN_ID, after_byte: 0 },
     });
     peer.send({
       type: "attached",
       snapshot: {
         ...attachedHeader(),
-        replay: { oldest_seq: 0, head_seq: 0, truncated: true },
+        replay: {
+          first_available_byte: 0,
+          latest_output_bytes: 0,
+          truncated: true,
+        },
       },
     });
   });
@@ -762,18 +844,25 @@ test("LP-02 resumes after a retained source gap from the caller cursor", async (
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_seq: 2 },
+      request: { type: "attach", id: RUN_ID, after_byte: 2 },
     });
     peer.send({
       type: "attached",
       snapshot: {
         ...attachedHeader(3),
-        replay: { oldest_seq: 1, head_seq: 3, truncated: true },
+        replay: {
+          first_available_byte: 1,
+          latest_output_bytes: 3,
+          truncated: true,
+        },
       },
     });
     peer.send({
       type: "event",
-      event: { type: "output", chunk: { seq: 3, data: [3] } },
+      event: {
+        type: "output",
+        chunk: { start_byte: 2, end_byte: 3, data: [3] },
+      },
     });
   });
 
@@ -782,7 +871,9 @@ test("LP-02 resumes after a retained source gap from the caller cursor", async (
     1_000,
   );
   assert.equal(attachment.snapshot.replay.truncated, true);
-  assert.deepEqual(attachment.snapshot.replay.chunks, [{ seq: 3, data: [3] }]);
+  assert.deepEqual(attachment.snapshot.replay.chunks, [
+    { start_byte: 2, end_byte: 3, data: [3] },
+  ]);
   attachment.close();
 });
 
@@ -1232,7 +1323,7 @@ test(
       await peer.handshake();
       assert.deepEqual(await peer.receive(), {
         type: "request",
-        request: { type: "attach", id: RUN_ID, after_seq: 0 },
+        request: { type: "attach", id: RUN_ID, after_byte: 0 },
       });
       peer.send({ type: "attached", snapshot: attachedHeader() });
       assert.deepEqual(await peer.receive(), { type: "detach" });
@@ -1327,10 +1418,17 @@ test(
       await peer.handshake();
       await peer.receive();
       peer.send({ type: "attached", snapshot: attachedHeader() });
-      for (let sequence = 1; sequence <= frameCount; sequence += 1) {
+      for (let startByte = 0; startByte < frameCount; startByte += 1) {
         await peer.sendWithBackpressure({
           type: "event",
-          event: { type: "output", chunk: { seq: sequence, data: [65] } },
+          event: {
+            type: "output",
+            chunk: {
+              start_byte: startByte,
+              end_byte: startByte + 1,
+              data: [65],
+            },
+          },
         });
       }
       assert.deepEqual(await peer.receive(), {
@@ -1351,16 +1449,16 @@ test(
       commandId: 1,
       receipt: { type: "stop" },
     });
-    for (let expected = 1; expected <= 256; expected += 1) {
+    for (let expected = 0; expected < 256; expected += 1) {
       assert.deepEqual(await attachment.nextEvent(), {
         type: "output",
-        chunk: { seq: expected, data: [65] },
+        chunk: { start_byte: expected, end_byte: expected + 1, data: [65] },
       });
     }
     const gap = await attachment.nextEvent();
     assert.deepEqual(gap, {
       type: "gap",
-      head_seq: frameCount,
+      latest_output_bytes: frameCount,
     });
     assert.equal(
       gap === undefined ? undefined : runEventSource(gap),
@@ -1377,10 +1475,13 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
     await peer.handshake();
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
-    for (let sequence = 1; sequence <= 257; sequence += 1) {
+    for (let startByte = 0; startByte < 257; startByte += 1) {
       peer.send({
         type: "event",
-        event: { type: "output", chunk: { seq: sequence, data: [65] } },
+        event: {
+          type: "output",
+          chunk: { start_byte: startByte, end_byte: startByte + 1, data: [65] },
+        },
       });
     }
     assert.deepEqual(await peer.receive(), { type: "stop", command_id: 1 });
@@ -1390,7 +1491,10 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
     });
     peer.send({
       type: "event",
-      event: { type: "output", chunk: { seq: 258, data: [66] } },
+      event: {
+        type: "output",
+        chunk: { start_byte: 257, end_byte: 258, data: [66] },
+      },
     });
     peer.send({
       type: "event",
@@ -1413,15 +1517,15 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
   assert.equal((await attachment.nextEvent())?.type, "output");
   assert.equal((await attachment.nextEvent())?.type, "output");
   await attachment.stop();
-  for (let expected = 3; expected <= 256; expected += 1) {
+  for (let expected = 2; expected < 256; expected += 1) {
     assert.deepEqual(await attachment.nextEvent(), {
       type: "output",
-      chunk: { seq: expected, data: [65] },
+      chunk: { start_byte: expected, end_byte: expected + 1, data: [65] },
     });
   }
   assert.deepEqual(await attachment.nextEvent(), {
     type: "gap",
-    head_seq: 257,
+    latest_output_bytes: 257,
   });
   assert.deepEqual(await attachment.nextEvent(), {
     type: "tmux",
@@ -1429,7 +1533,7 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
   });
   assert.deepEqual(await attachment.nextEvent(), {
     type: "gap",
-    head_seq: 258,
+    latest_output_bytes: 258,
   });
   assert.deepEqual(await attachment.nextEvent(), {
     type: "exited",
@@ -1472,7 +1576,10 @@ test("SDK-02 permits only one pending attachment event consumer", async (context
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
     await delay(50);
-    peer.send({ type: "event", event: { type: "gap", head_seq: 7 } });
+    peer.send({
+      type: "event",
+      event: { type: "gap", latest_output_bytes: 7 },
+    });
   });
 
   const attachment = await new CtxmuxClient({
@@ -1483,7 +1590,7 @@ test("SDK-02 permits only one pending attachment event consumer", async (context
     attachment.nextEvent(),
     /only one nextEvent\(\) call may be pending/,
   );
-  assert.deepEqual(await first, { type: "gap", head_seq: 7 });
+  assert.deepEqual(await first, { type: "gap", latest_output_bytes: 7 });
   attachment.close();
 });
 
@@ -1554,7 +1661,10 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
     for (let sequence = 1; sequence <= 257; sequence += 1) {
-      peer.send({ type: "event", event: { type: "gap", head_seq: sequence } });
+      peer.send({
+        type: "event",
+        event: { type: "gap", latest_output_bytes: sequence },
+      });
     }
   });
 
@@ -1565,7 +1675,7 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
   for (let expected = 1; expected <= 256; expected += 1) {
     assert.deepEqual(await attachment.nextEvent(), {
       type: "gap",
-      head_seq: expected,
+      latest_output_bytes: expected,
     });
   }
   await assert.rejects(
@@ -1714,9 +1824,9 @@ function runInfo() {
     },
     pid: 42,
     state: { type: "running" as const },
-    head_seq: 1,
-    durable_head_seq: null,
-    oldest_seq: 1,
+    latest_output_bytes: 1,
+    durable_output_bytes: null,
+    first_available_byte: 1,
     attachments: 1,
     applied_input_bytes: 0,
   };
@@ -1766,10 +1876,14 @@ function tmuxRunInfo() {
 
 function attachedHeader(headSequence = 0) {
   return {
-    run: { ...runInfo(), head_seq: headSequence, oldest_seq: headSequence },
+    run: {
+      ...runInfo(),
+      latest_output_bytes: headSequence,
+      first_available_byte: headSequence,
+    },
     replay: {
-      oldest_seq: headSequence,
-      head_seq: headSequence,
+      first_available_byte: headSequence,
+      latest_output_bytes: headSequence,
       truncated: false,
     },
   };

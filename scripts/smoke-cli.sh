@@ -135,8 +135,8 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 7"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 7"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 8"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 8"
 
 expect_failure "--socket or CTXMUX_SOCKET is required" env -u CTXMUX_SOCKET "$ctxmux_cli_bin" list
 expect_failure "unknown command" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" unknown
@@ -145,7 +145,7 @@ expect_failure "missing program" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket"
 expect_failure "must not be empty" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --operation-key "" -- /bin/true
 expect_failure "invalid Run id" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status invalid
 expect_failure "unexpected arguments" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" list extra
-expect_failure "invalid output sequence" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" attach "$ctxmux_cli_run" invalid
+expect_failure "invalid output byte cursor" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" attach "$ctxmux_cli_run" invalid
 expect_failure "greater than zero" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" resize "$ctxmux_cli_run" 0 40
 expect_failure "usage: ctxmuxd" "$ctxmux_daemon_bin" --socket
 expect_failure "usage: ctxmuxd" "$ctxmux_daemon_bin" invalid

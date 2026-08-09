@@ -48,9 +48,9 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         },
         pid: 123,
         state: { type: "running" },
-        head_seq: 0,
-        durable_head_seq: null,
-        oldest_seq: 0,
+        latest_output_bytes: 0,
+        durable_output_bytes: null,
+        first_available_byte: 0,
         attachments: 0,
         applied_input_bytes: 0,
       };
@@ -238,7 +238,7 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
       return { type: "level_a" } as unknown as LevelBForkPlan;
     },
   };
-  const chunk = { seq: 1, data: [65] };
+  const chunk = { start_byte: 0, end_byte: 1, data: [65] };
   rememberRunEventSource({ type: "output", chunk }, parent.id);
   const registered = registerIntegration(client, downgraded);
   const receipt = registered
@@ -320,9 +320,9 @@ function rootRun(): RunInfo {
     },
     pid: 123,
     state: { type: "running" },
-    head_seq: 0,
-    durable_head_seq: null,
-    oldest_seq: 0,
+    latest_output_bytes: 0,
+    durable_output_bytes: null,
+    first_available_byte: 0,
     attachments: 0,
     applied_input_bytes: 0,
   };
