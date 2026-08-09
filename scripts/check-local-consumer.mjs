@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -522,7 +521,7 @@ async function runIsolatedConsumer(consumerDirectory, args, environment) {
 
 async function main() {
   const temporaryRoot = fs.realpathSync(
-    fs.mkdtempSync(path.join(os.tmpdir(), "ctxmux-local-consumer-")),
+    fs.mkdtempSync(path.join(fs.realpathSync("/tmp"), "ctxmux-consumer-")),
   );
   try {
     assert.equal(path.relative(root, temporaryRoot).startsWith(".."), true);
