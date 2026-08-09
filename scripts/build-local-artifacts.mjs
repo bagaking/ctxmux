@@ -46,7 +46,7 @@ function canonicalEnvironment() {
   return environment;
 }
 
-function buildEnvironment(sourceDateEpoch) {
+function buildEnvironment(sourceDateEpoch, npmConfigRoot) {
   const environment = canonicalEnvironment();
   for (const name of Object.keys(environment)) {
     if (
@@ -64,10 +64,13 @@ function buildEnvironment(sourceDateEpoch) {
   environment.SOURCE_DATE_EPOCH = sourceDateEpoch;
   environment.npm_config_audit = "false";
   environment.npm_config_fund = "false";
-  environment.npm_config_globalconfig = "/dev/null";
+  environment.npm_config_globalconfig = path.join(
+    npmConfigRoot,
+    ".npmrc-global",
+  );
   environment.npm_config_ignore_scripts = "true";
   environment.npm_config_update_notifier = "false";
-  environment.npm_config_userconfig = "/dev/null";
+  environment.npm_config_userconfig = path.join(npmConfigRoot, ".npmrc-user");
   return environment;
 }
 
@@ -259,7 +262,7 @@ export async function buildLocalArtifacts({
         `unsupported local artifact platform: ${process.platform}`,
       );
     }
-    const environment = buildEnvironment(source.commit_time_unix);
+    const environment = buildEnvironment(source.commit_time_unix, stage);
     runChecked(
       "cargo",
       [

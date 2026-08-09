@@ -245,10 +245,13 @@ function installEnvironment(cacheDirectory) {
   environment.npm_config_audit = "false";
   environment.npm_config_cache = cacheDirectory;
   environment.npm_config_fund = "false";
-  environment.npm_config_globalconfig = "/dev/null";
+  environment.npm_config_globalconfig = path.join(
+    cacheDirectory,
+    ".npmrc-global",
+  );
   environment.npm_config_ignore_scripts = "true";
   environment.npm_config_update_notifier = "false";
-  environment.npm_config_userconfig = "/dev/null";
+  environment.npm_config_userconfig = path.join(cacheDirectory, ".npmrc-user");
   return environment;
 }
 
