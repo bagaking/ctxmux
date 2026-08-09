@@ -74,9 +74,7 @@
         "docs/decisions/pty-process-and-signals.md",
         "docs/testing/strategy.md"
       ],
-      "supersedes": [
-        "T-002"
-      ]
+      "supersedes": ["T-002"]
     },
     {
       "id": "T-003",
