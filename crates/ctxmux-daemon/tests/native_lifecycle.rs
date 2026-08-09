@@ -62,6 +62,25 @@ impl TestDaemon {
         Self::from_spawned(child, directory, socket).await
     }
 
+    async fn start_with_qualification_stats_fd(sentinel: &Path) -> Self {
+        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let socket = directory.path().join("ctxmux.sock");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3>\"$1\"; shift; exec \"$@\" --qualification-stats-fd 3")
+            .arg("ctxmux-qualification-fd-fixture")
+            .arg(sentinel)
+            .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn ctxmuxd with qualification descriptor");
+        Self::from_spawned(child, directory, socket).await
+    }
+
     async fn from_spawned(
         child: Child,
         directory: TempDir,
@@ -1709,6 +1728,42 @@ async fn native_pty_child_does_not_inherit_an_ambient_daemon_descriptor() {
         .await
         .expect("replay descriptor probe");
     assert_eq!(replay_bytes(&snapshot.replay.chunks), b"CLOSED");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_pty_child_does_not_inherit_the_private_qualification_descriptor() {
+    let sentinel_directory = tempfile::tempdir().expect("create descriptor fixture directory");
+    let sentinel = sentinel_directory.path().join("qualification-stats.ndjson");
+    let daemon = TestDaemon::start_with_qualification_stats_fd(&sentinel).await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "( : >&3 ) 2>/dev/null && printf LEAKED || printf CLOSED".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start qualification-descriptor probe Run");
+    wait_until_exited(&daemon.client, run.id).await;
+    let (_, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("replay qualification-descriptor probe");
+    assert_eq!(replay_bytes(&snapshot.replay.chunks), b"CLOSED");
+    assert!(
+        std::fs::metadata(sentinel)
+            .expect("qualification stats file")
+            .len()
+            > 0,
+        "daemon should have consumed the inherited stats descriptor",
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

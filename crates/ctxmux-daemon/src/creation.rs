@@ -15,6 +15,7 @@ use ctxmux_protocol::{
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 
 use super::{Run, RunControl, read_lock, write_lock};
+use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
 const CREATION_STRIPES: usize = 64;
 // Matches the pre-registered resource start concurrency while bounding only
@@ -80,6 +81,7 @@ impl TerminalPublicationOwner {
 #[derive(Clone)]
 pub(crate) struct CreationFlightOwner {
     inner: Arc<CreationFlightInner>,
+    qualification_stats: QualificationStats,
 }
 
 struct CreationFlightInner {
@@ -97,10 +99,17 @@ struct CreationFlightState {
 pub(crate) struct CreationFlight {
     inner: Arc<CreationFlightInner>,
     admission: Option<OwnedSemaphorePermit>,
+    qualification_stats: QualificationStats,
 }
 
 impl Default for CreationFlightOwner {
     fn default() -> Self {
+        Self::with_stats(QualificationStats::default())
+    }
+}
+
+impl CreationFlightOwner {
+    pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
         Self {
             inner: Arc::new(CreationFlightInner {
                 state: Mutex::new(CreationFlightState {
@@ -110,11 +119,9 @@ impl Default for CreationFlightOwner {
                 drained: Condvar::new(),
                 admission: Arc::new(Semaphore::new(MAX_CREATION_OWNER_SLOTS)),
             }),
+            qualification_stats,
         }
     }
-}
-
-impl CreationFlightOwner {
     /// Wait asynchronously for one creation-thread admission slot.
     ///
     /// Cancellation while waiting releases no flight because none exists yet.
@@ -139,9 +146,12 @@ impl CreationFlightOwner {
             .active
             .checked_add(1)
             .expect("active creation flight count does not overflow");
+        self.qualification_stats
+            .set(QualificationGauge::CreationFlights, state.active);
         Some(CreationFlight {
             inner: Arc::clone(&self.inner),
             admission: Some(admission),
+            qualification_stats: self.qualification_stats.clone(),
         })
     }
 
@@ -218,6 +228,8 @@ impl Drop for CreationFlight {
             .active
             .checked_sub(1)
             .expect("a creation flight releases exactly one active owner");
+        self.qualification_stats
+            .set(QualificationGauge::CreationFlights, state.active);
         // Return admission while the active-count lock is held, so a woken
         // waiter cannot increment before this flight has decremented.
         drop(self.admission.take());
@@ -236,9 +248,9 @@ impl Drop for CreationFlight {
 /// an unkeyed cleanup entry. Both retain the Run until their Backend-local
 /// child, reader, waiter, writer, and control cleanup are proven. This is
 /// neither a public pending Run nor durable transaction state.
-#[derive(Default)]
 pub(crate) struct UnpublishedCleanupOwner {
     inner: Arc<UnpublishedCleanupInner>,
+    qualification_stats: QualificationStats,
 }
 
 #[derive(Default)]
@@ -272,12 +284,14 @@ struct TmuxCleanupEntry {
 pub(crate) struct UnpublishedCleanupReservation {
     inner: Arc<UnpublishedCleanupInner>,
     operation_key: Option<CreateOperationKey>,
+    qualification_stats: QualificationStats,
 }
 
 #[must_use = "dropping the reservation releases tmux cleanup capacity"]
 pub(crate) struct TmuxCleanupReservation {
     inner: Arc<UnpublishedCleanupInner>,
     active: bool,
+    qualification_stats: QualificationStats,
 }
 
 /// Armed ownership for one native Run that has started but is not published.
@@ -296,6 +310,13 @@ pub(crate) struct PendingPublication {
 }
 
 impl UnpublishedCleanupOwner {
+    pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self {
+            inner: Arc::default(),
+            qualification_stats,
+        }
+    }
+
     /// Resolve an existing exact-key fence before launch admission can wait.
     pub(crate) fn resolve_fence(
         &self,
@@ -308,6 +329,7 @@ impl UnpublishedCleanupOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_reaped(&mut state);
+        sync_cleanup_stats(&self.qualification_stats, &state);
         if let Some(fence) = state.entries.get(operation_key) {
             return Err(if fence.request == *request {
                 ProtocolError::new(
@@ -336,6 +358,7 @@ impl UnpublishedCleanupOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_reaped(&mut state);
+        sync_cleanup_stats(&self.qualification_stats, &state);
         if state.owned >= MAX_CREATION_OWNER_SLOTS {
             return Err(ProtocolError::new(
                 ErrorCode::BackendUnavailable,
@@ -343,9 +366,11 @@ impl UnpublishedCleanupOwner {
             ));
         }
         state.owned += 1;
+        sync_cleanup_stats(&self.qualification_stats, &state);
         Ok(UnpublishedCleanupReservation {
             inner: Arc::clone(&self.inner),
             operation_key: Some(operation_key.clone()),
+            qualification_stats: self.qualification_stats.clone(),
         })
     }
 
@@ -357,6 +382,7 @@ impl UnpublishedCleanupOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_reaped(&mut state);
+        sync_cleanup_stats(&self.qualification_stats, &state);
         if state.owned >= MAX_CREATION_OWNER_SLOTS {
             return Err(ProtocolError::new(
                 ErrorCode::BackendUnavailable,
@@ -364,9 +390,11 @@ impl UnpublishedCleanupOwner {
             ));
         }
         state.owned += 1;
+        sync_cleanup_stats(&self.qualification_stats, &state);
         Ok(TmuxCleanupReservation {
             inner: Arc::clone(&self.inner),
             active: true,
+            qualification_stats: self.qualification_stats.clone(),
         })
     }
 
@@ -427,6 +455,7 @@ impl UnpublishedCleanupOwner {
             .owned
             .checked_sub(reaped)
             .expect("proven cleanups release only owned slots");
+        sync_cleanup_stats(&self.qualification_stats, &state);
         pending.sort();
         pending
     }
@@ -515,6 +544,7 @@ impl UnpublishedCleanupReservation {
                 entry.get_mut().owners.push(owner);
             }
         }
+        sync_cleanup_stats(&self.qualification_stats, &state);
     }
 }
 
@@ -532,6 +562,7 @@ impl Drop for UnpublishedCleanupReservation {
             .owned
             .checked_sub(1)
             .expect("cleanup reservation releases exactly one owner slot");
+        sync_cleanup_stats(&self.qualification_stats, &state);
     }
 }
 
@@ -542,15 +573,16 @@ impl TmuxCleanupReservation {
             "tmux cleanup reservation transfers at most once"
         );
         self.active = false;
-        self.inner
+        let mut state = self
+            .inner
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .tmux_entries
-            .push(TmuxCleanupEntry {
-                run,
-                transfer_reason,
-            });
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.tmux_entries.push(TmuxCleanupEntry {
+            run,
+            transfer_reason,
+        });
+        sync_cleanup_stats(&self.qualification_stats, &state);
     }
 }
 
@@ -568,7 +600,27 @@ impl Drop for TmuxCleanupReservation {
             .owned
             .checked_sub(1)
             .expect("tmux cleanup reservation releases exactly one owner slot");
+        sync_cleanup_stats(&self.qualification_stats, &state);
     }
+}
+
+impl Default for UnpublishedCleanupOwner {
+    fn default() -> Self {
+        Self::with_stats(QualificationStats::default())
+    }
+}
+
+fn sync_cleanup_stats(telemetry: &QualificationStats, owner_state: &UnpublishedCleanupState) {
+    telemetry.set(QualificationGauge::OverlapOwners, owner_state.owned);
+    telemetry.set(
+        QualificationGauge::CleanupOwners,
+        owner_state
+            .entries
+            .values()
+            .map(|fence| fence.owners.len())
+            .sum::<usize>()
+            + owner_state.tmux_entries.len(),
+    );
 }
 
 impl PendingPublication {
@@ -953,10 +1005,15 @@ fn compare_memory_collection_candidates(
     left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
 }
 
+struct CandidateSelection {
+    evaluated: usize,
+    result: Result<Vec<RunId>, ProtocolError>,
+}
+
 fn select_publication_candidates(
     state: &RegistryState,
     new_metadata_bytes: Option<u64>,
-) -> Result<Vec<RunId>, ProtocolError> {
+) -> CandidateSelection {
     let projected_record_burden = state
         .reservations
         .values()
@@ -977,10 +1034,12 @@ fn select_publication_candidates(
                     .saturating_sub(super::persistence::METADATA_BYTES)
             });
     let needs_record = projected_records >= state.record_capacity;
+    let mut evaluated = 0;
     let mut ordered = state
         .runs
         .iter()
         .filter_map(|(id, entry)| {
+            evaluated += 1;
             if entry.residency != RegistryResidency::Retained
                 || Arc::strong_count(&entry.run) != 1
                 || (new_metadata_bytes.is_some() && entry.metadata_bytes.is_none())
@@ -1011,13 +1070,16 @@ fn select_publication_candidates(
         candidates.push(id);
     }
     if (needs_record && candidates.is_empty()) || candidate_metadata < metadata_to_fund {
-        return Err(ProtocolError::new(
-            ErrorCode::RunCapacity,
-            format!(
-                "retained Run capacity {} has no eligible exact replacement",
-                state.record_capacity
-            ),
-        ));
+        return CandidateSelection {
+            evaluated,
+            result: Err(ProtocolError::new(
+                ErrorCode::RunCapacity,
+                format!(
+                    "retained Run capacity {} has no eligible exact replacement",
+                    state.record_capacity
+                ),
+            )),
+        };
     }
     if candidates.len() > 1
         && state
@@ -1025,12 +1087,18 @@ fn select_publication_candidates(
             .values()
             .any(|reservation| reservation.candidates.len() > 1)
     {
-        return Err(ProtocolError::new(
-            ErrorCode::BackendUnavailable,
-            "persistent metadata replacement is already reserved",
-        ));
+        return CandidateSelection {
+            evaluated,
+            result: Err(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "persistent metadata replacement is already reserved",
+            )),
+        };
     }
-    Ok(candidates)
+    CandidateSelection {
+        evaluated,
+        result: Ok(candidates),
+    }
 }
 
 fn projected_metadata_bytes(state: &RegistryState) -> u64 {
@@ -1086,6 +1154,7 @@ fn reserve_registry_insertion_capacity(state: &mut RegistryState) -> Result<(), 
 #[must_use = "a Registry publication reservation must be published or restored"]
 pub(crate) struct PublicationReservation {
     state: Arc<RwLock<RegistryState>>,
+    qualification_stats: QualificationStats,
     ticket: Option<PublicationTicket>,
     removed: Vec<RegistryEntry>,
 }
@@ -1111,21 +1180,29 @@ pub(crate) struct RunRegistry {
     state: Arc<RwLock<RegistryState>>,
     creation_stripes: [Arc<AsyncMutex<()>>; CREATION_STRIPES],
     creation_hash: RandomState,
+    qualification_stats: QualificationStats,
 }
 
 impl Default for RunRegistry {
     fn default() -> Self {
-        Self {
-            state: Arc::new(RwLock::default()),
-            creation_stripes: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
-            creation_hash: RandomState::new(),
-        }
+        Self::with_stats(QualificationStats::default())
     }
 }
 
 impl RunRegistry {
-    pub(crate) fn recovered(runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>) -> Self {
-        let registry = Self::default();
+    pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self {
+            state: Arc::new(RwLock::default()),
+            creation_stripes: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
+            creation_hash: RandomState::new(),
+            qualification_stats,
+        }
+    }
+    pub(crate) fn recovered_with_stats(
+        runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>,
+        qualification_stats: QualificationStats,
+    ) -> Self {
+        let registry = Self::with_stats(qualification_stats);
         {
             let mut state = write_lock(&registry.state);
             for (operation_key, run, metadata_bytes) in runs {
@@ -1144,7 +1221,13 @@ impl RunRegistry {
                 debug_assert!(previous_key.is_none());
             }
         }
+        registry.sync_stats();
         registry
+    }
+
+    fn sync_stats(&self) {
+        let state = read_lock(&self.state);
+        sync_registry_stats(&self.qualification_stats, &state);
     }
 
     /// Acquire the bounded per-key owner before dispatching physical launch work.
@@ -1279,7 +1362,10 @@ impl RunRegistry {
                 .is_none_or(|key| !state.creation_runs.contains_key(key))
         );
 
-        let candidates = select_publication_candidates(&state, new_metadata_bytes)?;
+        let selection = select_publication_candidates(&state, new_metadata_bytes);
+        self.qualification_stats
+            .record_candidate_selection(selection.evaluated);
+        let candidates = selection.result?;
         reserve_registry_insertion_capacity(&mut state)?;
         let mut removed = Vec::new();
         removed
@@ -1315,24 +1401,32 @@ impl RunRegistry {
             },
         );
         debug_assert!(previous.is_none());
+        self.qualification_stats
+            .record_candidate_fences(candidates.len());
+        sync_registry_stats(&self.qualification_stats, &state);
 
         let detached = candidates
             .iter()
             .filter_map(|candidate| state.runs.get(candidate))
             .map(|entry| entry.run.detach_collection_descriptors())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
+            .collect::<Result<Vec<_>, _>>();
+        let detached = match detached {
+            Ok(detached) => detached,
+            Err(error) => {
                 restore_reservation(&mut state, ticket);
-                ProtocolError::new(
+                sync_registry_stats(&self.qualification_stats, &state);
+                return Err(ProtocolError::new(
                     ErrorCode::Internal,
                     format!("failed to fence retained Run replacement: {error}"),
-                )
-            })?;
+                ));
+            }
+        };
         drop(state);
         drop(detached);
 
         Ok(PublicationReservation {
             state: Arc::clone(&self.state),
+            qualification_stats: self.qualification_stats.clone(),
             ticket: Some(ticket),
             removed,
         })
@@ -1370,6 +1464,9 @@ impl RunRegistry {
         );
         state.creation_runs.insert(operation_key, id);
         let cleanup_reservation = pending.into_published_reservation();
+        self.qualification_stats
+            .record_exact_replacements(removed.len());
+        sync_registry_stats(&self.qualification_stats, &state);
         drop(state);
         drop(removed);
         drop(cleanup_reservation);
@@ -1397,6 +1494,9 @@ impl RunRegistry {
             },
         );
         debug_assert!(previous.is_none());
+        self.qualification_stats
+            .record_exact_replacements(removed.len());
+        sync_registry_stats(&self.qualification_stats, &state);
         drop(state);
         drop(removed);
     }
@@ -1551,7 +1651,9 @@ impl Drop for PublicationReservation {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
-        restore_reservation(&mut write_lock(&self.state), ticket);
+        let mut state = write_lock(&self.state);
+        restore_reservation(&mut state, ticket);
+        sync_registry_stats(&self.qualification_stats, &state);
     }
 }
 
@@ -1568,6 +1670,30 @@ fn restore_reservation(state: &mut RegistryState, ticket: PublicationTicket) {
         debug_assert_eq!(entry.residency, RegistryResidency::Collecting(ticket));
         entry.residency = RegistryResidency::Retained;
     }
+}
+
+fn sync_registry_stats(telemetry: &QualificationStats, registry_state: &RegistryState) {
+    let collecting = registry_state
+        .runs
+        .values()
+        .filter_map(|entry| match entry.residency {
+            RegistryResidency::Retained => None,
+            RegistryResidency::Collecting(ticket) => Some(ticket),
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    telemetry.set_many(&[
+        (QualificationGauge::RetainedRuns, registry_state.runs.len()),
+        (
+            QualificationGauge::CreationKeys,
+            registry_state.creation_runs.len(),
+        ),
+        (
+            QualificationGauge::PublicationReservations,
+            registry_state.reservations.len(),
+        ),
+        (QualificationGauge::CollectingTickets, collecting),
+    ]);
 }
 
 fn consume_reservation(

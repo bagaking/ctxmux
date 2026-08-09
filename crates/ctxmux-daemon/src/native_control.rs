@@ -17,6 +17,8 @@ use ctxmux_protocol::{
 use portable_pty::{Child, MasterPty, PtySize};
 use tokio::sync::{oneshot, watch};
 
+use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
+
 const INPUT_QUEUE_MAX_COMMANDS: usize = 1_024;
 const INPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const INPUT_DRAIN_MAX_ACTIVE: usize = 8;
@@ -72,6 +74,7 @@ struct InputDrainGateInner {
     max_active: usize,
     burst_max_commands: usize,
     burst_max_bytes: usize,
+    qualification_stats: QualificationStats,
 }
 
 #[derive(Default)]
@@ -91,7 +94,30 @@ impl Default for InputDrainGate {
 }
 
 impl InputDrainGate {
+    pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self::with_limits_and_stats(
+            INPUT_DRAIN_MAX_ACTIVE,
+            INPUT_BURST_MAX_COMMANDS,
+            INPUT_BURST_MAX_BYTES,
+            qualification_stats,
+        )
+    }
+
     fn with_limits(max_active: usize, burst_max_commands: usize, burst_max_bytes: usize) -> Self {
+        Self::with_limits_and_stats(
+            max_active,
+            burst_max_commands,
+            burst_max_bytes,
+            QualificationStats::default(),
+        )
+    }
+
+    fn with_limits_and_stats(
+        max_active: usize,
+        burst_max_commands: usize,
+        burst_max_bytes: usize,
+        qualification_stats: QualificationStats,
+    ) -> Self {
         debug_assert!(max_active > 0);
         debug_assert!(burst_max_commands > 0);
         debug_assert!(burst_max_bytes > 0);
@@ -101,6 +127,7 @@ impl InputDrainGate {
                 max_active,
                 burst_max_commands,
                 burst_max_bytes,
+                qualification_stats,
             }),
         }
     }
@@ -110,6 +137,9 @@ impl InputDrainGate {
             let mut state = mutex_lock(&self.inner.state);
             if state.active < self.inner.max_active {
                 state.active += 1;
+                self.inner
+                    .qualification_stats
+                    .set(QualificationGauge::InputDrains, state.active);
                 Some(owner)
             } else {
                 state.waiting.push_back(Arc::downgrade(&owner));
@@ -171,6 +201,9 @@ impl InputDrainGate {
         }
         debug_assert!(state.active > 0);
         state.active -= 1;
+        self.inner
+            .qualification_stats
+            .set(QualificationGauge::InputDrains, state.active);
         None
     }
 }

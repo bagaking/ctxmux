@@ -119,6 +119,7 @@ name = "ctxmux-daemon"
 version = "0.1.0"
 dependencies = [
  "ctxmux-client",
+ "ctxmux-inherited-fd",
  "ctxmux-protocol",
  "ctxmux-sqlite-status",
  "futures-util",
@@ -131,6 +132,13 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+]
+
+[[package]]
+name = "ctxmux-inherited-fd"
+version = "0.1.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

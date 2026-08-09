@@ -7,6 +7,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::{self, Read, Write},
+    os::fd::RawFd,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
@@ -25,6 +26,7 @@ mod attachment;
 mod creation;
 mod native_control;
 mod persistence;
+mod qualification_stats;
 mod run_spec;
 mod tmux;
 
@@ -38,7 +40,7 @@ use ctxmux_protocol::{
     RunState, ServerFrame, TerminalSize, TmuxRunEvent, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
-use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
@@ -61,6 +63,7 @@ use crate::persistence::{
     CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
     PersistentStartFailure, RecoveredRun, StagedPersistentStart, StartDisposition,
 };
+use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
@@ -129,7 +132,15 @@ impl ServerError {
 /// ctxmux-owned runtime work cannot be drained or Backend control processes
 /// cannot be cleaned up during shutdown.
 pub async fn serve(socket_path: impl Into<PathBuf>) -> Result<(), ServerError> {
-    serve_with_persistence(socket_path.into(), None).await
+    serve_with_qualification(socket_path, None).await
+}
+
+#[doc(hidden)]
+pub async fn serve_with_qualification(
+    socket_path: impl Into<PathBuf>,
+    qualification_stats_fd: Option<RawFd>,
+) -> Result<(), ServerError> {
+    serve_with_persistence(socket_path.into(), None, qualification_stats_fd).await
 }
 
 /// Serve Runs with historical metadata and replay persisted in `state_dir`.
@@ -143,18 +154,53 @@ pub async fn serve_with_state_dir(
     socket_path: impl Into<PathBuf>,
     state_dir: impl Into<PathBuf>,
 ) -> Result<(), ServerError> {
+    serve_with_state_dir_and_qualification(socket_path, state_dir, None).await
+}
+
+#[doc(hidden)]
+pub async fn serve_with_state_dir_and_qualification(
+    socket_path: impl Into<PathBuf>,
+    state_dir: impl Into<PathBuf>,
+    qualification_stats_fd: Option<RawFd>,
+) -> Result<(), ServerError> {
     let (persistence, recovered) = Persistence::open(state_dir)?;
-    let manager = Arc::new(RunManager::persistent(persistence, recovered));
+    let stats = QualificationStats::from_optional_inherited_fd(
+        qualification_stats_fd,
+        persistence.daemon_instance().to_string(),
+    )
+    .map_err(|source| ServerError::io("qualification stats fd", source))?;
+    let manager = Arc::new(RunManager::persistent_with_stats(
+        persistence,
+        recovered,
+        stats,
+    ));
     serve_with_persistence_manager(socket_path.into(), manager).await
 }
 
 async fn serve_with_persistence(
     socket_path: PathBuf,
     persistence: Option<(Persistence, Vec<RecoveredRun>)>,
+    qualification_stats_fd: Option<RawFd>,
 ) -> Result<(), ServerError> {
-    let manager = match persistence {
-        Some((persistence, recovered)) => Arc::new(RunManager::persistent(persistence, recovered)),
-        None => Arc::new(RunManager::default()),
+    let manager = if let Some((persistence, recovered)) = persistence {
+        let stats = QualificationStats::from_optional_inherited_fd(
+            qualification_stats_fd,
+            persistence.daemon_instance().to_string(),
+        )
+        .map_err(|source| ServerError::io("qualification stats fd", source))?;
+        Arc::new(RunManager::persistent_with_stats(
+            persistence,
+            recovered,
+            stats,
+        ))
+    } else {
+        let daemon_instance = DaemonInstanceId::new();
+        let stats = QualificationStats::from_optional_inherited_fd(
+            qualification_stats_fd,
+            daemon_instance.to_string(),
+        )
+        .map_err(|source| ServerError::io("qualification stats fd", source))?;
+        Arc::new(RunManager::with_instance_and_stats(daemon_instance, stats))
     };
     serve_with_persistence_manager(socket_path, manager).await
 }
@@ -192,6 +238,7 @@ async fn serve_with_manager(
             signal = tokio::signal::ctrl_c() => {
                 signal.map_err(|source| ServerError::io(&socket_path, source))?;
                 manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
+                manager.qualification_stats.finish();
                 return Ok(());
             }
             failure = manager.incarnation_failure.wait() => {
@@ -200,6 +247,7 @@ async fn serve_with_manager(
                     Ok(()) => failure,
                     Err(error) => format!("{failure}; shutdown: {error}"),
                 };
+                manager.qualification_stats.finish();
                 return Err(ServerError::Shutdown { failures });
             }
         }
@@ -305,6 +353,7 @@ struct RunManager {
     unpublished_cleanups: UnpublishedCleanupOwner,
     terminal_publications: TerminalPublicationOwner,
     native_input_drains: InputDrainGate,
+    qualification_stats: QualificationStats,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
@@ -643,13 +692,23 @@ impl CreationTestHook {
 
 impl Default for RunManager {
     fn default() -> Self {
+        Self::with_instance_and_stats(DaemonInstanceId::new(), QualificationStats::default())
+    }
+}
+
+impl RunManager {
+    fn with_instance_and_stats(
+        daemon_instance: DaemonInstanceId,
+        qualification_stats: QualificationStats,
+    ) -> Self {
         Self {
-            daemon_instance: DaemonInstanceId::new(),
-            registry: RunRegistry::default(),
-            creation_flights: CreationFlightOwner::default(),
-            unpublished_cleanups: UnpublishedCleanupOwner::default(),
+            daemon_instance,
+            registry: RunRegistry::with_stats(qualification_stats.clone()),
+            creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
+            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
             terminal_publications: TerminalPublicationOwner::default(),
-            native_input_drains: InputDrainGate::default(),
+            native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
+            qualification_stats,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -662,10 +721,17 @@ impl Default for RunManager {
             creation_hook: None,
         }
     }
-}
 
-impl RunManager {
+    #[cfg(test)]
     fn persistent(persistence: Persistence, recovered: Vec<RecoveredRun>) -> Self {
+        Self::persistent_with_stats(persistence, recovered, QualificationStats::default())
+    }
+
+    fn persistent_with_stats(
+        persistence: Persistence,
+        recovered: Vec<RecoveredRun>,
+        qualification_stats: QualificationStats,
+    ) -> Self {
         let terminal_publications = TerminalPublicationOwner::default();
         let runs = recovered
             .into_iter()
@@ -687,6 +753,7 @@ impl RunManager {
                         durable,
                         LIVE_EVENT_CAPACITY,
                         terminal_publications.clone(),
+                        qualification_stats.clone(),
                     ),
                     metadata_owner,
                 )
@@ -694,11 +761,12 @@ impl RunManager {
             .collect();
         Self {
             daemon_instance: persistence.daemon_instance(),
-            registry: RunRegistry::recovered(runs),
-            creation_flights: CreationFlightOwner::default(),
-            unpublished_cleanups: UnpublishedCleanupOwner::default(),
+            registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
+            creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
+            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
             terminal_publications,
-            native_input_drains: InputDrainGate::default(),
+            native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
+            qualification_stats,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -820,6 +888,7 @@ impl RunManager {
                     creation_flights: self.creation_flights.clone(),
                     incarnation_failure: self.incarnation_failure.clone(),
                 },
+                qualification_stats: self.qualification_stats.clone(),
             },
             request,
             cleanup_reservation,
@@ -1099,6 +1168,7 @@ impl RunManager {
                     discovery_deadline: started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
                     prepare_deadline: started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
                     total_deadline: started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
+                    qualification_stats: self.qualification_stats.clone(),
                 },
                 cleanup_reservation,
             )?;
@@ -1278,6 +1348,7 @@ impl RunManager {
                 input_drains: InputDrainGate::default(),
                 terminal_publications: self.terminal_publications.clone(),
                 wait_failure: NativeWaitFailure::default(),
+                qualification_stats: self.qualification_stats.clone(),
             },
             request,
             cleanup_reservation,
@@ -1336,6 +1407,7 @@ struct NativeSpawnConfig {
     input_drains: InputDrainGate,
     terminal_publications: TerminalPublicationOwner,
     wait_failure: NativeWaitFailure,
+    qualification_stats: QualificationStats,
 }
 
 struct MaterializedCreation {
@@ -1380,6 +1452,7 @@ struct TmuxImportConfig {
     discovery_deadline: Instant,
     prepare_deadline: Instant,
     total_deadline: Instant,
+    qualification_stats: QualificationStats,
 }
 
 #[must_use = "a started tmux Control owner must be published or transferred for cleanup"]
@@ -1455,6 +1528,43 @@ struct PendingChild {
     reap_control: Option<NativeControlOwner>,
 }
 
+struct ObservedChild {
+    child: Box<dyn Child + Send + Sync>,
+    _qualification_guard: crate::qualification_stats::GaugeGuard,
+}
+
+impl fmt::Debug for ObservedChild {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObservedChild")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChildKiller for ObservedChild {
+    fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        self.child.clone_killer()
+    }
+}
+
+impl Child for ObservedChild {
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+}
+
 impl PendingChild {
     const fn new(child: Box<dyn Child + Send + Sync>) -> Self {
         Self {
@@ -1523,6 +1633,7 @@ struct Run {
     persistence_transition: Mutex<()>,
     persistence: Mutex<PersistenceBinding>,
     attachments: AtomicUsize,
+    qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
     events: broadcast::Sender<RunEvent>,
@@ -1858,6 +1969,7 @@ impl Run {
                 input_drains: InputDrainGate::default(),
                 terminal_publications: TerminalPublicationOwner::default(),
                 wait_failure: NativeWaitFailure::default(),
+                qualification_stats: QualificationStats::default(),
             },
             id,
             Some(42),
@@ -1884,6 +1996,7 @@ impl Run {
                 input_drains,
                 terminal_publications: TerminalPublicationOwner::default(),
                 wait_failure: NativeWaitFailure::default(),
+                qualification_stats: QualificationStats::default(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -1953,6 +2066,7 @@ impl Run {
                 input_drains: InputDrainGate::default(),
                 terminal_publications,
                 wait_failure: NativeWaitFailure::default(),
+                qualification_stats: QualificationStats::default(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -1986,6 +2100,7 @@ impl Run {
         G: FnOnce() + Send + 'static,
     {
         validate_run_spec(&config.spec).map_err(invalid_run_spec)?;
+        let qualification_stats = config.qualification_stats.clone();
         let pair = native_pty_system()
             .openpty(to_pty_size(config.spec.size))
             .map_err(|error| spawn_error("open PTY", error))?;
@@ -2006,6 +2121,11 @@ impl Run {
             .slave
             .spawn_command(config.command())
             .map_err(|error| spawn_error("spawn child", error))?;
+        qualification_stats.record_physical_start();
+        let child: Box<dyn Child + Send + Sync> = Box::new(ObservedChild {
+            child,
+            _qualification_guard: qualification_stats.guard(QualificationGauge::DirectChildren),
+        });
         drop(pair.slave);
         let mut pending_child = PendingChild::new(child);
         let pid = pending_child.child().process_id();
@@ -2035,9 +2155,11 @@ impl Run {
             return Err(error);
         }
         let (child_tx, child_rx) = mpsc::channel::<PendingChild>();
+        let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
         thread::Builder::new()
             .name(format!("ctxmux-wait-{}", run.id))
             .spawn(move || {
+                let _waiter_guard = waiter_guard;
                 let Ok(pending_child) = child_rx.recv() else {
                     wait_control.mark_closed();
                     return;
@@ -2061,10 +2183,12 @@ impl Run {
             })?;
 
         let output_run = Arc::clone(&run);
+        let reader_guard = qualification_stats.guard(QualificationGauge::Readers);
         setup(LaunchSetupStep::StartOutputThread, pid)?;
         thread::Builder::new()
             .name(format!("ctxmux-output-{}", run.id))
             .spawn(move || {
+                let _reader_guard = reader_guard;
                 read_output(&output_run, reader);
                 let _ = output_done_tx.send(());
             })
@@ -2106,19 +2230,29 @@ impl Run {
                 }
             }),
             attachments: AtomicUsize::new(0),
+            qualification_stats: config.qualification_stats,
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
             events,
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one tmux Control Mode owner handoff remains linear and rollback-auditable"
+    )]
     fn import_tmux(
         socket_path: &str,
         pane_id: &str,
         config: TmuxImportConfig,
         cleanup_reservation: TmuxCleanupReservation,
     ) -> Result<PendingTmuxPublication, ProtocolError> {
-        let mut pending = tmux::spawn_control(socket_path, pane_id, config.discovery_deadline)?;
+        let mut pending = tmux::spawn_control(
+            socket_path,
+            pane_id,
+            config.discovery_deadline,
+            &config.qualification_stats,
+        )?;
         let target = pending.target.clone();
         let socket_identity = pending.socket_identity;
         let control_pid = pending.child_id();
@@ -2153,6 +2287,7 @@ impl Run {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
+            qualification_stats: config.qualification_stats.clone(),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
             events,
@@ -2163,9 +2298,13 @@ impl Run {
         let output_run = Arc::clone(pending_publication.run());
         let output_target = target.clone();
         let output_ready = ready_tx.clone();
+        let reader_guard = config
+            .qualification_stats
+            .guard(QualificationGauge::Readers);
         thread::Builder::new()
             .name(format!("ctxmux-tmux-output-{}", config.id))
             .spawn(move || {
+                let _reader_guard = reader_guard;
                 let termination =
                     read_tmux_output(&output_run, stdout, &output_target, &output_ready);
                 if output_done_tx.send(termination).is_ok() {
@@ -2178,9 +2317,13 @@ impl Run {
         let wait_target = target;
         let wait_ready = ready_tx;
         let (child_tx, child_rx) = mpsc::sync_channel(0);
+        let waiter_guard = config
+            .qualification_stats
+            .guard(QualificationGauge::Waiters);
         thread::Builder::new()
             .name(format!("ctxmux-tmux-wait-{}", config.id))
             .spawn(move || {
+                let _waiter_guard = waiter_guard;
                 let Ok(mut child) = child_rx.recv() else {
                     return;
                 };
@@ -2262,6 +2405,7 @@ impl Run {
         persistence: PersistentRun,
         live_event_capacity: usize,
         terminal_publications: TerminalPublicationOwner,
+        qualification_stats: QualificationStats,
     ) -> Arc<Self> {
         let (events, _) = broadcast::channel(live_event_capacity);
         let terminal_ordinal = OnceLock::new();
@@ -2280,6 +2424,7 @@ impl Run {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
+            qualification_stats,
             terminal_publications,
             terminal_ordinal,
             events,
@@ -2402,7 +2547,13 @@ impl Run {
 
     fn attach(self: &Arc<Self>, after_seq: u64) -> (AttachmentGuard, AttachedSnapshot) {
         self.attachments.fetch_add(1, Ordering::AcqRel);
-        let guard = AttachmentGuard(Arc::clone(self));
+        let qualification_guard = self
+            .qualification_stats
+            .guard(QualificationGauge::Attachments);
+        let guard = AttachmentGuard {
+            run: Arc::clone(self),
+            _qualification_guard: qualification_guard,
+        };
         let replay = mutex_lock(&self.output).replay(after_seq);
         let snapshot = AttachedSnapshot {
             run: self.info(),
@@ -2750,7 +2901,7 @@ fn wait_for_child(
 }
 
 fn wait_for_tmux_control(
-    child: &mut std::process::Child,
+    child: &mut tmux::ObservedControl,
     run: &Run,
     commands: &mpsc::Receiver<TmuxControlCommand>,
     target: &ctxmux_protocol::TmuxPaneInfo,
@@ -2930,7 +3081,7 @@ const fn interruption_error_code(reason: InterruptionReason) -> ErrorCode {
     }
 }
 
-fn terminate_tmux_control_child(child: &mut std::process::Child) -> Result<(), String> {
+fn terminate_tmux_control_child(child: &mut tmux::ObservedControl) -> Result<(), String> {
     let status_error = match child.try_wait() {
         Ok(Some(_)) => return Ok(()),
         Ok(None) => None,
@@ -3241,11 +3392,14 @@ fn backend_protocol_error(action: &str, error: impl fmt::Display) -> ProtocolErr
     )
 }
 
-struct AttachmentGuard(Arc<Run>);
+struct AttachmentGuard {
+    run: Arc<Run>,
+    _qualification_guard: crate::qualification_stats::GaugeGuard,
+}
 
 impl Drop for AttachmentGuard {
     fn drop(&mut self) {
-        self.0.attachments.fetch_sub(1, Ordering::AcqRel);
+        self.run.attachments.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -4181,6 +4335,7 @@ mod tests {
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: std::sync::atomic::AtomicUsize::new(0),
+            qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
             events,

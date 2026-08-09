@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf, process::ExitCode};
+use std::{env, os::fd::RawFd, path::PathBuf, process::ExitCode};
 
 use ctxmux_protocol::PROTOCOL_VERSION;
 
@@ -25,7 +25,24 @@ async fn main() -> ExitCode {
 
     let mut socket = None;
     let mut state_dir = None;
+    let mut qualification_stats_fd = None;
     while let Some(flag) = args.next() {
+        if flag == "--qualification-stats-fd" {
+            if qualification_stats_fd.is_some() {
+                eprintln!("{}", usage());
+                return ExitCode::from(2);
+            }
+            let Some(value) = args.next() else {
+                eprintln!("{}", usage());
+                return ExitCode::from(2);
+            };
+            let Ok(value) = value.to_string_lossy().parse::<RawFd>() else {
+                eprintln!("{}", usage());
+                return ExitCode::from(2);
+            };
+            qualification_stats_fd = Some(value);
+            continue;
+        }
         let target = if flag == "--socket" {
             &mut socket
         } else if flag == "--state-dir" {
@@ -49,8 +66,15 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let result = match state_dir {
-        Some(state_dir) => ctxmux_daemon::serve_with_state_dir(socket, state_dir).await,
-        None => ctxmux_daemon::serve(socket).await,
+        Some(state_dir) => {
+            ctxmux_daemon::serve_with_state_dir_and_qualification(
+                socket,
+                state_dir,
+                qualification_stats_fd,
+            )
+            .await
+        }
+        None => ctxmux_daemon::serve_with_qualification(socket, qualification_stats_fd).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

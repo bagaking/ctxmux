@@ -11,6 +11,7 @@ use std::{
 use ctxmux_protocol::{ErrorCode, ProtocolError, TerminalSize, TmuxPaneInfo};
 
 use self::short_command::{BoundedOutput, CaptureLimits};
+use crate::qualification_stats::{Gauge as QualificationGauge, GaugeGuard, QualificationStats};
 
 mod short_command;
 
@@ -36,11 +37,35 @@ pub(crate) struct TmuxDiscovery {
 }
 
 pub(crate) struct PendingControl {
-    child: Option<Child>,
+    child: Option<ObservedControl>,
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     pub(crate) target: TmuxPaneInfo,
     pub(crate) socket_identity: SocketIdentity,
+}
+
+pub(crate) struct ObservedControl {
+    child: Child,
+    _direct_child_guard: GaugeGuard,
+    _tmux_owner_guard: GaugeGuard,
+}
+
+impl ObservedControl {
+    pub(crate) fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub(crate) fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
+    pub(crate) fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        self.child.wait()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +87,7 @@ impl PendingControl {
         self.stdout.take().expect("tmux control stdout is present")
     }
 
-    pub(crate) fn take_child(&mut self) -> Child {
+    pub(crate) fn take_child(&mut self) -> ObservedControl {
         self.child.take().expect("tmux child is present")
     }
 }
@@ -158,6 +183,7 @@ pub(crate) fn spawn_control(
     socket_path: &str,
     pane_id: &str,
     discovery_deadline: Instant,
+    qualification_stats: &QualificationStats,
 ) -> Result<PendingControl, ProtocolError> {
     validate_pane_id(pane_id)?;
     let discovery = discover(socket_path, discovery_deadline)?;
@@ -181,7 +207,7 @@ pub(crate) fn spawn_control(
         ));
     }
     let executable = executable();
-    let mut child = base_command(&executable)
+    let child = base_command(&executable)
         .arg("-S")
         .arg(socket_path)
         .arg("-C")
@@ -192,6 +218,12 @@ pub(crate) fn spawn_control(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|error| backend_error("start tmux Control Mode client", error))?;
+    qualification_stats.record_physical_start();
+    let mut child = ObservedControl {
+        child,
+        _direct_child_guard: qualification_stats.guard(QualificationGauge::DirectChildren),
+        _tmux_owner_guard: qualification_stats.guard(QualificationGauge::TmuxOwners),
+    };
     if current_socket_identity(socket_path).ok() != Some(socket_identity) {
         let _ = child.kill();
         let _ = child.wait();
@@ -200,13 +232,13 @@ pub(crate) fn spawn_control(
             "tmux socket changed while starting the Control Mode client",
         ));
     }
-    let stdin = child.stdin.take().ok_or_else(|| {
+    let stdin = child.child.stdin.take().ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::BackendUnavailable,
             "tmux Control Mode client has no stdin",
         )
     })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
+    let stdout = child.child.stdout.take().ok_or_else(|| {
         ProtocolError::new(
             ErrorCode::BackendUnavailable,
             "tmux Control Mode client has no stdout",
