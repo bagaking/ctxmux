@@ -32,7 +32,6 @@ const FRAME_FIELDS = [
   "rss_kib",
   "final_frame",
 ] as const;
-const HELPER_READINESS_TIMEOUT_MS = 5_000;
 const HELPER_REAP_TIMEOUT_MS = 5_000;
 
 export async function startRssSampler(
@@ -148,7 +147,7 @@ async function ownNativeSampler(
     const readinessTimeout = setTimeout(() => {
       fail(new Error("RSS sampler did not emit its first frame in time"));
       child.kill("SIGKILL");
-    }, HELPER_READINESS_TIMEOUT_MS);
+    }, maximumGapMs);
     await Promise.race([
       ready.promise,
       outputClosed.promise.then(async () => {

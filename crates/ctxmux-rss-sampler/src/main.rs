@@ -252,28 +252,30 @@ mod tests {
     }
 
     #[test]
-    fn receipt_timestamp_is_the_observation_start_boundary() {
-        let (entered_sender, entered_receiver) = mpsc::channel();
-        let (resume_sender, resume_receiver) = mpsc::channel();
-        let observation = thread::spawn(move || {
-            super::observe_rss(None, Duration::from_millis(100), || {
-                entered_sender.send(()).unwrap();
-                resume_receiver.recv().unwrap();
-                Ok(1)
-            })
-            .unwrap()
-        });
-        entered_receiver.recv().unwrap();
-        let measurement_in_progress_ms: u64 = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis()
-            .try_into()
-            .unwrap();
-        thread::sleep(Duration::from_millis(25));
-        resume_sender.send(()).unwrap();
+    fn receipt_timestamp_remains_the_start_boundary_across_observation_durations() {
+        for duration in [Duration::from_millis(5), Duration::from_millis(35)] {
+            let (entered_sender, entered_receiver) = mpsc::channel();
+            let (resume_sender, resume_receiver) = mpsc::channel();
+            let observation = thread::spawn(move || {
+                super::observe_rss(None, Duration::from_millis(100), || {
+                    entered_sender.send(()).unwrap();
+                    resume_receiver.recv().unwrap();
+                    Ok(1)
+                })
+                .unwrap()
+            });
+            entered_receiver.recv().unwrap();
+            let measurement_in_progress_ms: u64 = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                .try_into()
+                .unwrap();
+            thread::sleep(duration);
+            resume_sender.send(()).unwrap();
 
-        assert!(observation.join().unwrap().timestamp_ms <= measurement_in_progress_ms);
+            assert!(observation.join().unwrap().timestamp_ms <= measurement_in_progress_ms);
+        }
     }
 
     #[test]
