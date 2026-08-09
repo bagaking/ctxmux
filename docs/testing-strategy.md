@@ -373,13 +373,13 @@ launcher, and exact adjacency between their supervised boundaries; it accepts
 the final smoke only after that core publishes a private completion token.
 
 The PR profile runs the full named matrix with the one-Run resource cells and
-no time soak. Nightly currently uses the complete resource matrix plus a real
-30-minute active soak inside a 45-minute harness budget. The superseded T-030
-proposal's larger pressure budget never became current harness policy. Explicit release dispatch uses a
-two-hour soak inside a three-hour harness budget. Both scheduled profiles run
-on Ubuntu and macOS and attempt to upload any produced receipt and daemon logs
-even when the workload step fails; missing artifacts are themselves an upload
-failure rather than evidence of a completed run.
+no time soak. Nightly uses the complete resource matrix, the frozen turnover
+and replay-pressure workloads, and the ordinary 30-minute active soak inside a
+4,200-second harness budget. Explicit release dispatch uses a two-hour soak
+inside a three-hour harness budget. Both scheduled profiles run on Ubuntu and
+macOS and attempt to upload any produced receipt and daemon logs even when the
+workload step fails; missing artifacts are themselves an upload failure rather
+than evidence of a completed run.
 
 ### Concurrency and race testing
 
@@ -458,65 +458,54 @@ persistent same-epoch terminal history cannot pass a Registry leak oracle until
 its exact-replacement path ships. Tests must keep that open policy visible
 rather than normalize unbounded growth.
 
-The superseded T-030 design pre-registered production qualification before implementation
-or candidate measurements can influence it. The operational Registry ceiling
-is 128 in memory-only mode and becomes the persistent-mode ceiling only when
-T-029 closes exact durable replacement; SQLite's older 4,096-row validation
-envelope is not a live capacity claim. A PR-only reduced ceiling must cross at
-least three complete collection windows but cannot substitute for the canonical
+The production qualification contract was pre-registered before implementation
+or candidate measurements could influence it. Its first Tracker task was later
+superseded, but T-005 adopted the unchanged machine contract instead of
+inventing a second workload. The operational Registry ceiling is 128 in both
+memory-only and persistent modes; SQLite's older 4,096-row validation envelope
+is not a live capacity claim. A PR-only reduced ceiling must cross at least
+three complete collection windows but cannot substitute for the canonical
 nightly workload. `reliability-gc-contract.json` is the executable SSOT for the
-new seed, helper hash, payload, concurrency, max-replay pressure, RSS/CPU/owner
-ceilings, sampling, and profile time budgets; policy and harness must consume
-it, and an observed timeout cannot rewrite it. Nightly fills 128 records and
-then completes three 128-Run turnover windows in each mode, for at least 512
+seed, helper hash, payload, concurrency, max-replay pressure, RSS/CPU/owner
+ceilings, sampling, and profile time budgets; policy and harness consume it,
+and an observed timeout cannot rewrite it. Nightly fills 128 records and then
+completes three 128-Run turnover windows in each mode, for at least 512
 successful lifecycles per mode, before still running the ordinary 1,800-second
-soak. Each lifecycle uses concurrency eight and the source-bound Node helper,
-fixed non-overridable seed `226004`, exact 80x24 RunSpec, and the 0..511 index
-schedule. The helper writes the lowercase ASCII SHA-256 hex string without a
-newline, making the exact 4,096-byte payload stable across ordinary PTY output
-translation. Persistent restart is fixed immediately after its second turnover
-window.
+soak. Each bounded-churn lifecycle uses concurrency eight and the source-bound
+Node helper, fixed non-overridable seed `226004`, exact 80x24 RunSpec, and the
+0..511 index schedule. The helper writes the lowercase ASCII SHA-256 hex string
+without a newline, making the exact 4,096-byte payload stable across ordinary
+PTY output translation. Persistent restart is fixed immediately after its
+second turnover window.
 
-The GC receipt preserves one-second CPU samples, 25 ms RSS samples, and at least
-five-second thread, descriptor, process-tree, attachment, retained Run/key,
-replay, and observable owner samples, plus every window boundary. Each quiescent checkpoint
-must retain exactly 128 records with no live direct child, attachment, or
-transient thread growth and must remain inside the already frozen 128-Run
-idle/active budgets. Later-window p95 uses nearest rank over 128 samples and may
-not exceed the first turnover window by both 25 percent and 5 milliseconds;
-later quiescent RSS may not exceed the first checkpoint by both 25 percent and
-2,048 KiB. Later average CPU may not exceed the first window by both 25 percent
-and 5 core-percentage points, and later candidate-evaluation p95 may not exceed
-it by both 25 percent and one evaluation. Restart hashes one RunId-sorted array
-of correlated RunId, exact key, state, lineage, cursor, and ordered chunk-digest
-tuples, then retries every exact key before and after restart to prove the same
-RunId and no process/record change. A monotonic creation-owner
+The GC receipt preserves complete boundary Run/key/replay tuples, candidate and
+owner counters, cumulative physical starts, and raw 25 ms RSS samples for the
+replay-pressure phases. Every bounded-turnover boundary retains exactly 128
+records with no live direct child, attachment, or transient owner. Restart
+hashes one RunId-sorted array of correlated RunId, exact key, state, lineage,
+cursor, and ordered chunk-digest tuples, then retries every exact key before and
+after restart to prove the same RunId and no process/record change. A monotonic creation-owner
 `physical_starts_total` must remain unchanged across every retry wave, closing
 the gap where a duplicate could start and exit between process samples. Each
 fresh wave must advance it by the exact admitted count; a restart resets it only
 with a new recorded daemon epoch. Exact
 internal zero counts come from a bounded non-blocking harness-FD-only daemon
 receipt whose descriptor is marked close-on-exec before Run spawn; any sink
-loss fails qualification without blocking the daemon. Terminal-control
-compaction follows actual ownership:
-memory-only turnover windows record 128 each, persistent windows before restart
-record 128 each, and the post-restart persistent window records zero because
-recovered candidates have no local incarnation control. The memory-only soak
-keeps exactly eight live Runs and replaces one on every even one-second cycle;
-each post-capacity 60-second bin applies the same plateau rules. Historical
-observe receipts and `reliability-budgets.json` are immutable; T-030 writes
-separate raw evidence and completes only with
+loss fails qualification without blocking the daemon. Earlier proposed
+per-window latency percentiles, CPU/RSS growth comparisons, and periodic
+turnover resource samples are not part of T-005. The ordinary
+memory-only soak keeps exactly eight live `activeSpec()` Runs, writes input on
+each approximately one-second cycle, resizes every 16 cycles, and opens and
+closes one attachment every 64 cycles. It does not replace Runs or reuse the
+bounded-churn helper topology. Historical observe receipts and
+`reliability-budgets.json` are immutable; T-005 writes separate raw evidence
+and completes only with
 `scripts/check-reliability.sh --profile nightly`, not the default smoke command.
 
-Revision 17 superseded that program before its private metrics sink or pressure
-harness was implemented. The frozen JSON and the preceding description remain
-historical design evidence, not current Kernel closure requirements. T-033
-instead uses one ordinary reduced-capacity test that crosses three complete
-turnover windows in both memory-only and persistent modes, restarts persistent
-mode after window two, and checks retained Run/key identity, exact replay,
-same-key retry without another physical child, and absence of recovered live
-control authority. A future production-scale pressure, soak, or platform
-program requires its own reviewed Feature.
+T-033 remains the ordinary reduced-capacity correctness oracle. T-005 is the
+source-bound production-scale evidence for the declared turnover, replay,
+restart, resource, and soak workloads. Platform expansion, arbitrary
+attachment fan-out, and general total-RSS admission remain outside that claim.
 
 The supplemental pressure phase fills all 128 retained Logs with exact 4 MiB
 ASCII payloads, verifies all replay in batches of eight, then performs one

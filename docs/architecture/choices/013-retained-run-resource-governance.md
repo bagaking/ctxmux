@@ -1,7 +1,7 @@
 # 013 — Retained Run resource governance
 
-- Status: memory-only and persistent owners implemented; sustained
-  qualification pending
+- Status: accepted, implemented, and source-bound sustained qualification
+  complete for the declared workload
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -405,22 +405,20 @@ Copy-only List and Status linearize before exact removal and may be followed by
 operation that needs the Run after releasing the Registry lock must pin and
 therefore fails while Collecting.
 
-## Superseded production-scale qualification proposal
+## Production-scale qualification contract
 
-The detailed contract below was frozen before implementation as a possible
-T-030 production-scale qualification program. Revision 17 superseded T-030
-before its pressure harness or daemon-private metrics sink was built. The JSON
-contract and this section remain historical design evidence; they are not
-current Run-Kernel behavior, required infrastructure, or Feature closure
-criteria.
+The first Tracker task proposed for this contract was superseded before its
+pressure harness and daemon-private metrics sink were built. The reviewed
+machine contract remained frozen, and T-005 later adopted it as the current
+source-bound qualification truth instead of inventing a second workload.
 
-Current T-033 closure uses one ordinary reduced-capacity test: memory-only and
+T-033 remains the ordinary reduced-capacity correctness oracle: memory-only and
 persistent modes each fill four records and cross three complete four-Run
-turnover windows; persistent mode restarts after window two. Every boundary
-checks retained Run identity, exact replay, current creation-key retry without
-another physical child, and recovered absence of current-incarnation control.
-This is representative correctness evidence, not a production-scale CPU/RSS
-claim. A future pressure or soak program needs its own reviewed Feature.
+turnover windows, with persistent restart after window two. T-005 adds the
+production 128-record turnover, pressure, restart, resource, and ordinary-soak
+evidence below. Passing it qualifies only the declared workload and owner
+boundaries; it does not create a general daemon RSS or attachment-fan-out
+guarantee.
 
 PR tests use a lower private ceiling to cross at least three collection windows
 without claiming production-scale evidence. The tracked
@@ -476,27 +474,16 @@ retry waves advance it by zero. Restart may reset the counter only while the
 receipt records the new daemon epoch, after which recovered-key retries again
 leave it at zero.
 
-Creation latency covers request dispatch through the Start response. Window p95
-uses the nearest-rank definition: sort all 128 successful samples and select
-index `ceil(0.95 * 128) - 1`. Each turnover performs exactly 128 replacements
-and leaves exactly 128 retained records. Every window's core-normalized CPU and
-peak RSS stay within the existing frozen active-128 ceilings of 400 percent and
-32,768 KiB; each five-second quiescent dwell stays within the frozen idle-128
-ceilings of 15 percent CPU and 24,576 KiB steady RSS. A later quiescent RSS may
-not exceed the first turnover checkpoint by both 25 percent and 2,048 KiB, and
-a later p95 may not exceed the first turnover p95 by both 25 percent and 5
-milliseconds. Thread, descriptor, replay, child, and attachment values must
-remain inside their existing 128-Run frozen ceilings at every checkpoint.
-Later turnover-window average CPU may not exceed the first turnover window by
-both 25 percent and 5 core-percentage points. For this one-small-record
-workload, each turnover has exactly 128 collection attempts, 128 single
-candidate fences, and 128 exact replacements, with no multi-candidate or failed
-reservation. Memory-only turnover windows compact 128 terminal-control owners
-each. Persistent windows one and two also compact 128 each; the fixed restart
-then makes all third-window candidates recovered historical Runs with no local
-incarnation control, so that window compacts exactly zero. The private receipt
-records candidate evaluations per replacement; a later-window p95 may not
-exceed the first by both 25 percent and one evaluation.
+Each turnover performs exactly 128 replacements and leaves exactly 128 retained
+records. For this one-small-record workload, each window records the exact
+physical-start, retry, candidate-selection, candidate-evaluation, candidate-fence,
+and replacement deltas. Candidate evaluation is bounded by 128 records per
+replacement. The final owner snapshot requires 128 retained Runs and keys while
+creation flights, publication reservations, collection tickets, overlap and
+cleanup owners, children, readers, waiters, input drains, attachments, and tmux
+owners are all zero. Earlier proposals for per-window latency percentiles,
+growth comparisons, and periodic turnover CPU/RSS sampling are superseded and
+are not part of the T-005 claim.
 
 The supplemental replay-pressure phase does not masquerade as another complete
 turnover. In each mode it fills 128 terminal native Runs with the contract's
@@ -533,43 +520,33 @@ the ordinary append queue, and actor working clones at once. Recovered peak
 accounts for durable payload plus the replay-clone batch. No undocumented
 ordering assumption subtracts a named owner from those formulas.
 
-The source-bound receipt preserves raw 25 ms RSS samples, one-second CPU
-samples, every latency, and five-second plus window-boundary process, thread, descriptor,
-attachment, Run/key, replay, cumulative physical starts, queued persistence
-bytes, and owner samples. Exact internal counts come from
-one daemon-private qualification sink backed directly by the owning Registry,
+The source-bound receipt preserves raw 25 ms RSS samples for replay pressure,
+complete Run/key/replay tuples, cumulative physical starts, and final owner
+snapshots for bounded churn and pressure. Exact internal counts come from one
+daemon-private qualification sink backed directly by the owning Registry,
 publication-overlap, T-026 cleanup, reader, waiter, input-drain, and tmux state;
 it is enabled only by an inherited harness-owned descriptor, emits counts and
 no keys or metadata, and is not a socket request or public admin API. The daemon
 marks the descriptor close-on-exec before any Run spawn, uses bounded
 non-blocking writes, and never lets a disconnected or backpressured sink block
 or alter runtime ownership. The harness drains continuously and fails
-qualification on any missing, dropped, disconnected, or malformed snapshot. At
-each quiescent boundary Collecting tickets, publication reservations, creation
-flights, T-026 cleanups, readers, waiters, input drains, tmux owners, direct
-children, and attachments are all zero.
+qualification on any missing, dropped, disconnected, or malformed snapshot.
 Every owner transition also updates daemon-private high-water and cumulative
-counters. Periodic samples prove boundary state and external process census;
-they are not used as evidence that a subsecond owner maximum was absent.
+counters; final boundary snapshots prove quiescent owner convergence.
 
 The ordinary 1,800 second memory-only soak is not shortened after these bounded
-workloads. It retains exactly eight live Runs and its one-second input cycle,
-16-cycle resize, and 64-cycle attach behavior. On every even-numbered cycle it
-stops and fully settles one Run, starts its deterministic successor, and
-returns to eight live Runs. Each 60-second bin therefore has exactly 30
-replacements; after capacity is first reached, the first complete 60-second bin
-is the plateau baseline and every later bin applies the same CPU, RSS, owner,
-and collection-work non-growth rules above. Soak helper mode is the literal
-`memory_only_soak`; it uses the same no-newline ASCII-hex payload and its index
-increases once per replacement. Per-bin p95 uses
-the same nearest-rank algorithm with 30 samples, selecting index
-`ceil(0.95 * 30) - 1 = 28`, before applying the latency growth rule. Final T-030
-completion evidence runs
+workloads. It retains exactly eight live `activeSpec()` Runs, writes 4 KiB to
+each Run once per approximately one-second cycle, resizes all Runs every 16
+cycles, and opens and closes one attachment every 64 cycles. It does not
+perform retained-Run replacement or reuse the bounded-churn helper topology.
+After the deadline it proves the declared per-Run retention bound, stops and
+settles all eight Runs, and requires zero live children and attachments with no
+transient cleanup-thread slope. Final T-005 completion evidence runs
 `scripts/check-reliability.sh --profile nightly`; the default smoke command is
 not canonical evidence. Historical observe receipts, hashes, measurement
 identities, and the numeric ceilings in `reliability-budgets.json` are never
-rewritten or rebaselined. The new pressure ceilings and raised nightly time
-budget live only in the separately source-bound GC contract.
+rewritten or rebaselined. The pressure ceilings and raised nightly time budget
+live only in the separately source-bound GC contract.
 
 ## Quality attributes and invariants
 
@@ -669,6 +646,9 @@ or deterministic-owner fixtures.
   windows in memory-only and persistent modes, restarts persistent mode after
   window two, and proves exact retained identity, replay, key retry, and
   current-incarnation control boundaries without new qualification machinery.
+- T-005: the source-bound canonical nightly fills and turns over 128 records in
+  each mode, restarts persistent state, verifies maximum replay pressure and
+  the ordinary soak, and fails closed on telemetry or frozen-identity drift.
 
 ## Repository evidence
 
@@ -682,6 +662,6 @@ or deterministic-owner fixtures.
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts
-- `reliability-gc-contract.json`: superseded T-030 workload, helper identity,
+- `reliability-gc-contract.json`: canonical T-005 workload, helper identity,
   resource ceilings, and time budgets
 - `scripts/reliability-gc-child.mjs`: PTY-stable deterministic payload producer

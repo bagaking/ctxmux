@@ -390,10 +390,12 @@ Each Run retains at most 4 MiB of raw output by byte count, except that one over
 owns the shared 128-record Registry ceiling and ownership-safe collection
 contract. Persistent mode uses the same ticket and candidate SSOT, with a
 spill-disabled cache-resident page proof before launch and exact durable
-replacement at COMMIT. T-033 closes this Kernel boundary with one ordinary,
-reduced-capacity three-window oracle across memory-only, persistent, retry, and
-restart paths. Production-scale pressure, long soak, and private metrics
-infrastructure are outside this Kernel closure.
+replacement at COMMIT. T-033 covers the ordinary reduced-capacity correctness
+matrix. The source-bound T-005 nightly qualification additionally exercises
+both production 128-record modes across three turnover windows, persistent
+restart, maximum replay pressure, the existing 1,800-second soak, and bounded
+private owner telemetry. This qualifies that declared workload; it does not
+add an attachment-admission or total-RSS product guarantee.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
@@ -426,22 +428,22 @@ a PID from durable metadata.
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
 
-| Decision                              | Status                                                          | Record                                                              |
-| ------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Rust and Tokio long-lived daemon      | accepted                                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
-| `portable-pty` native Backend         | accepted                                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 7                                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
-| Run lifecycle concurrency             | accepted, incomplete policy                                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
-| Ordered bounded raw-output replay     | accepted                                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
-| Rust schema and TypeScript codegen    | accepted                                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
-| Node TypeScript SDK                   | accepted                                                        | [007](architecture/choices/007-node-typescript-sdk.md)              |
-| `crossterm` interactive CLI           | accepted                                                        | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
-| Runtime persistence and recovery      | accepted and implemented                                        | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
-| Explicit TypeScript Integrations      | accepted                                                        | [010](architecture/choices/010-explicit-typescript-integrations.md) |
-| Context, artifacts, lineage, and fork | accepted                                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
-| tmux Control Mode Backend             | accepted and implemented; version lanes pending                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
-| Retained Run resource governance      | memory and persistent owners implemented; qualification pending | [013](architecture/choices/013-retained-run-resource-governance.md) |
-| Recoverable native Input              | accepted and implemented                                        | [014](architecture/choices/014-recoverable-input-operations.md)     |
+| Decision                              | Status                                                         | Record                                                              |
+| ------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Rust and Tokio long-lived daemon      | accepted                                                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
+| `portable-pty` native Backend         | accepted                                                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
+| Unix socket and NDJSON protocol       | accepted for generation 7                                      | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Run lifecycle concurrency             | accepted, incomplete policy                                    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
+| Ordered bounded raw-output replay     | accepted                                                       | [005](architecture/choices/005-ordered-output-replay.md)            |
+| Rust schema and TypeScript codegen    | accepted                                                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
+| Node TypeScript SDK                   | accepted                                                       | [007](architecture/choices/007-node-typescript-sdk.md)              |
+| `crossterm` interactive CLI           | accepted                                                       | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
+| Runtime persistence and recovery      | accepted and implemented                                       | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
+| Explicit TypeScript Integrations      | accepted                                                       | [010](architecture/choices/010-explicit-typescript-integrations.md) |
+| Context, artifacts, lineage, and fork | accepted                                                       | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
+| tmux Control Mode Backend             | accepted and implemented; version lanes pending                | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Retained Run resource governance      | accepted, implemented, and qualified for the declared workload | [013](architecture/choices/013-retained-run-resource-governance.md) |
+| Recoverable native Input              | accepted and implemented                                       | [014](architecture/choices/014-recoverable-input-operations.md)     |
 
 ## Risk-to-fixture traceability
 
