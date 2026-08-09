@@ -16,6 +16,7 @@ import {
   qualificationPolicyFromHarness,
   validateQualificationArtifacts,
   validateQualificationInvocationIdentity,
+  validatePassingQualificationReceiptV3,
   validateReliabilityPolicy,
 } from "./reliability-policy.mjs";
 import {
@@ -32,6 +33,7 @@ import {
   readOwnedJson,
   writeOwnedJsonAtomically,
 } from "./reliability-artifact-owner.mts";
+import { loadReliabilityGcContract } from "./reliability-gc-contract.mts";
 
 const root = path.resolve(import.meta.dirname, "..");
 const receiptPaths = [
@@ -406,6 +408,399 @@ function passingSmokeReceiptFixture() {
   };
 }
 
+function passingNightlyV3ReceiptFixture() {
+  const inputs = buildV2Template();
+  const gc = loadReliabilityGcContract(root);
+  const qualificationErrors = [];
+  const qualificationPolicy = qualificationPolicyFromHarness(
+    inputs.harnessSource,
+    qualificationErrors,
+  );
+  assert.deepEqual(qualificationErrors, []);
+  const receipt = structuredClone(inputs.baselineReceipts[0]);
+  const provenance = receipt.value.provenance;
+  provenance.workload_contract = structuredClone(gc.workload_contract);
+  provenance.workload_helper = structuredClone(gc.workload_helper);
+  const epoch = (suffix) => ({
+    daemon_instance: `00000000-0000-0000-0000-${suffix.padStart(12, "0")}`,
+    seq: 2,
+    current: {
+      retained_runs: 128,
+      creation_keys: 128,
+      creation_flights: 0,
+      publication_reservations: 0,
+      collecting_tickets: 0,
+      overlap_owners: 0,
+      cleanup_owners: 0,
+      direct_children: 0,
+      readers: 0,
+      waiters: 0,
+      input_drains: 0,
+      attachments: 0,
+      tmux_owners: 0,
+    },
+    high_water: {
+      retained_runs: 128,
+      creation_keys: 128,
+      creation_flights: 8,
+      publication_reservations: 8,
+      collecting_tickets: 8,
+      overlap_owners: 8,
+      cleanup_owners: 0,
+      direct_children: 8,
+      readers: 8,
+      waiters: 8,
+      input_drains: 0,
+      attachments: 8,
+      tmux_owners: 0,
+    },
+    cumulative: {
+      physical_starts_total: 512,
+      candidate_selections_total: 384,
+      candidate_evaluations_total: 384,
+      candidate_evaluations_max: 128,
+      candidate_fences_total: 0,
+      exact_replacements_total: 384,
+    },
+  });
+  const digest = (
+    mode,
+    payloadBytes,
+    totalReplayBytes = 128 * payloadBytes,
+    recovered = false,
+    firstIndex = 0,
+  ) => {
+    const base = Math.floor(totalReplayBytes / 128);
+    const remainder = totalReplayBytes % 128;
+    const tuples = Array.from({ length: 128 }, (_, offset) => {
+      const index = firstIndex + offset;
+      const replayBytes = base + (offset < remainder ? 1 : 0);
+      const sourceDigest = crypto
+        .createHash("sha256")
+        .update(`226004:${mode}:${String(index)}`, "utf8")
+        .digest("hex");
+      const operationKey = `gc-pressure:${mode}:${String(index)}:${sourceDigest}`;
+      const suffixOffset =
+        (payloadBytes - replayBytes) % sourceDigest.length;
+      const suffix = Buffer.from(
+        sourceDigest
+          .repeat(
+            Math.ceil(
+              (suffixOffset + replayBytes) / sourceDigest.length,
+            ),
+          )
+          .slice(suffixOffset, suffixOffset + replayBytes),
+        "ascii",
+      );
+      const replaySha256 = crypto
+        .createHash("sha256")
+        .update(suffix)
+        .digest("hex");
+      const chunkIdentity = (seq, start, bytes) => ({
+        seq,
+        bytes,
+        sha256: crypto
+          .createHash("sha256")
+          .update(
+            Buffer.from(
+              sourceDigest
+                .repeat(
+                  Math.ceil(
+                    ((start % sourceDigest.length) + bytes) /
+                      sourceDigest.length,
+                  ),
+                )
+                .slice(
+                  start % sourceDigest.length,
+                  (start % sourceDigest.length) + bytes,
+                ),
+              "ascii",
+            ),
+          )
+          .digest("hex"),
+      });
+      const firstChunkBytes = Math.floor(replayBytes / 2);
+      return {
+        run_id: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+        operation_key: operationKey,
+        lineage: null,
+        state: { type: "exited", code: 0, signal: null },
+        head_seq: 2,
+        durable_head_seq: mode.startsWith("persistent")
+          ? 2
+          : null,
+        oldest_seq: recovered ? 2 : 1,
+        replay_bytes: replayBytes,
+        replay_sha256: replaySha256,
+        chunks: recovered
+          ? [
+              chunkIdentity(
+                2,
+                payloadBytes - replayBytes,
+                replayBytes,
+              ),
+            ]
+          : [
+              chunkIdentity(1, 0, firstChunkBytes),
+              chunkIdentity(
+                2,
+                firstChunkBytes,
+                replayBytes - firstChunkBytes,
+              ),
+            ],
+        truncated: recovered,
+      };
+    });
+    return {
+      count: tuples.length,
+      total_replay_bytes: totalReplayBytes,
+      sha256: crypto
+        .createHash("sha256")
+        .update(JSON.stringify(tuples))
+        .digest("hex"),
+      tuples,
+    };
+  };
+  const turnovers = [1, 2, 3].map((window) => ({
+    window,
+    retained_runs: 128,
+    physical_start_delta: 128,
+    retry_physical_start_delta: 0,
+    candidate_selections_delta: 128,
+    candidate_evaluations_delta: 16_384,
+    candidate_fences_delta: 128,
+    exact_replacements_delta: 128,
+  }));
+  const churn = ["memory_only", "persistent"].map((mode, index) => ({
+    mode,
+    successful_lifecycles: 512,
+    fill_physical_start_delta: 128,
+    turnovers: structuredClone(turnovers),
+    restart:
+      mode === "persistent"
+        ? {
+            after_window: 2,
+            before: digest(mode, 4096, 128 * 4096, false, 256),
+            after: digest(mode, 4096, 128 * 4096, false, 256),
+            new_incarnation_initial_physical_starts: 0,
+          }
+        : null,
+    retained: digest(mode, 4096, 128 * 4096, false, 384),
+    epochs: mode === "persistent" ? [epoch("1"), epoch("2")] : [epoch("3")],
+  }));
+  const rssSamples = [
+    { timestamp_ms: 1_000, rss_kib: 1 },
+    { timestamp_ms: 1_025, rss_kib: 1 },
+  ];
+  const pressure = ["memory_replay_pressure", "persistent_replay_pressure"].map(
+    (mode, index) => ({
+      mode,
+      before: digest(mode, 4_194_304),
+      after: digest(mode, 4_194_304, 128 * 4_194_304, false, 8),
+      fill_physical_start_delta: 128,
+      replacement_physical_start_delta: 8,
+      retry_physical_start_delta: 0,
+      replay_verification_runs_before_replacement: 128,
+      replay_verification_runs_after_replacement: 128,
+      peak_rss_kib: 1,
+      max_rss_sample_gap_ms: 25,
+      rss_samples: structuredClone(rssSamples),
+      average_cpu_core_percent: 0,
+      quiescent_cpu_core_percent: 0,
+      peak_thread_delta: 0,
+      peak_fd_delta: 0,
+      recovered:
+        mode === "persistent_replay_pressure"
+          ? {
+              replay: digest(mode, 4_194_304, 268_427_265, true, 8),
+              retry_physical_start_delta: 0,
+              steady_rss_kib: 1,
+              peak_rss_kib: 1,
+              max_rss_sample_gap_ms: 25,
+              rss_samples: structuredClone(rssSamples),
+              quiescent_cpu_core_percent: 0,
+              quiescent_thread_delta: 0,
+              quiescent_fd_delta: 0,
+            }
+          : null,
+      epochs:
+        mode === "persistent_replay_pressure"
+          ? [epoch(String(index + 4)), epoch(String(index + 5))]
+          : [epoch(String(index + 4))],
+    }),
+  );
+  const retainedResult = {
+    bounded_churn: churn,
+    replay_pressure: pressure,
+  };
+  const soakResult = {
+    configured_duration_seconds: 1800,
+    elapsed_seconds: 1800,
+    cycles: 1800,
+    active_runs: 8,
+    retained_output_bytes: 1,
+    peak_rss_kib: 1,
+    cleanup_threads_delta: 0,
+    cleanup_live_children: 0,
+    cleanup_attachments: 0,
+    rss_samples: structuredClone(rssSamples),
+    max_rss_sample_gap_ms: 25,
+    retained_runs_are_intentional_without_gc: true,
+  };
+  const stageIdsV3 = [
+    "chaos-owner-matrix",
+    "security-negative-space",
+    "stress-and-soak",
+    "retained-state-plateau",
+    "resource-census",
+    "frozen-resource-budgets",
+  ];
+  const originalResourceResult = receipt.value.stages.find(
+    ({ id }) => id === "resource-census",
+  ).result;
+  receipt.value.schema = "ctxmux.reliability-qualification.v3";
+  receipt.value.profile = "nightly";
+  receipt.value.observation_round = null;
+  receipt.value.time_budget_seconds = 4200;
+  receipt.value.recorded_at = "2026-08-11T00:00:00.000Z";
+  receipt.value.completed_at = "2026-08-11T00:31:00.000Z";
+  receipt.value.error = null;
+  receipt.value.daemon_logs = ["target/reliability/nightly/daemon.log"];
+  receipt.value.stats_logs = [
+    {
+      path: "target/reliability/nightly/stats.ndjson",
+      sha256: "b".repeat(64),
+      daemon_instance: "00000000-0000-0000-0000-000000000001",
+      final_seq: 2,
+    },
+  ];
+  Object.assign(receipt.value.declared_limits, {
+    global_run_quota: 128,
+    exited_run_gc: "exact_terminal_replacement",
+    qualification_stage: "all",
+    resource_counts: [1, 32, 128],
+    resource_modes: ["idle", "active"],
+    resource_start_concurrency: 8,
+    soak_seconds: 1800,
+  });
+  receipt.value.stages = stageIdsV3.map((id, index) => ({
+    id,
+    status: "pass",
+    started_at: `2026-08-11T00:00:0${String(index + 1)}.000Z`,
+    completed_at: `2026-08-11T00:00:0${String(index + 1)}.500Z`,
+    result:
+      id === "retained-state-plateau"
+        ? retainedResult
+        : id === "stress-and-soak"
+          ? { soak: soakResult }
+          : id === "resource-census"
+            ? originalResourceResult
+            : { synthetic: true },
+  }));
+  const stressStage = receipt.value.stages.find(
+    ({ id }) => id === "stress-and-soak",
+  );
+  stressStage.started_at = "2026-08-11T00:00:03.000Z";
+  stressStage.completed_at = "2026-08-11T00:30:03.000Z";
+  for (const [id, second] of [
+    ["retained-state-plateau", 4],
+    ["resource-census", 5],
+    ["frozen-resource-budgets", 6],
+  ]) {
+    const stage = receipt.value.stages.find((candidate) => candidate.id === id);
+    stage.started_at = `2026-08-11T00:30:0${String(second)}.000Z`;
+    stage.completed_at = `2026-08-11T00:30:0${String(second)}.500Z`;
+  }
+  const captured = {
+    timestamp: "2026-08-11T00:00:00.000Z",
+    action: "provenance.captured",
+    source_commit: provenance.source.commit,
+    worktree_clean: true,
+    harness_sha256: provenance.harness.sha256,
+    launcher_sha256: provenance.launcher.sha256,
+    daemon_sha256: provenance.daemon.sha256,
+    measurement_contract_sha256: provenance.measurement_contract_sha256,
+    workload_contract: provenance.workload_contract,
+    workload_helper: provenance.workload_helper,
+    invocation_nonce: invocationNonce,
+  };
+  const trace = [
+    captured,
+    {
+      timestamp: "2026-08-11T00:00:00.100Z",
+      action: "provenance.verified",
+      observation_round: null,
+    },
+  ];
+  for (const [index, id] of stageIdsV3.entries()) {
+    const afterSoak = index >= 3;
+    trace.push({
+      timestamp: `2026-08-11T00:${afterSoak ? "30" : "00"}:0${String(index + 1)}.000Z`,
+      action: "stage.start",
+      id,
+    });
+    if (id === "retained-state-plateau") {
+      for (const mode of ["memory_only", "persistent"]) {
+        for (const window of [1, 2, 3]) {
+          trace.push({
+            timestamp: "2026-08-11T00:30:04.100Z",
+            action: "gc.turnover",
+            mode,
+            window,
+          });
+        }
+      }
+      for (const mode of [
+        "memory_replay_pressure",
+        "persistent_replay_pressure",
+      ]) {
+        trace.push({
+          timestamp: "2026-08-11T00:30:04.200Z",
+          action: "gc.replay_pressure",
+          mode,
+        });
+      }
+    }
+    if (id === "stress-and-soak") {
+      trace.push({
+        timestamp: "2026-08-11T00:30:02.000Z",
+        action: "stress.soak",
+        configured_duration_seconds: 1800,
+        elapsed_seconds: 1800,
+      });
+    }
+    trace.push({
+      timestamp:
+        id === "stress-and-soak"
+          ? "2026-08-11T00:30:03.000Z"
+          : `2026-08-11T00:${afterSoak ? "30" : "00"}:0${String(index + 1)}.500Z`,
+      action: "stage.pass",
+      id,
+    });
+  }
+  trace.push({
+    timestamp: "2026-08-11T00:30:10.000Z",
+    action: "provenance.reverified",
+    daemon_sha256: provenance.daemon.sha256,
+    workload_contract: provenance.workload_contract,
+    workload_helper: provenance.workload_helper,
+  });
+  receipt.value.action_trace = trace;
+  return {
+    receipt,
+    qualificationPolicy,
+    gc,
+    budgets: inputs.budgets,
+    preflight: {
+      invocation_nonce: invocationNonce,
+      workload_contract: structuredClone(gc.workload_contract),
+      workload_helper: structuredClone(gc.workload_helper),
+    },
+    notBefore: "2026-08-10T23:59:59.999Z",
+    verifiedAt: "2026-08-11T00:31:01.000Z",
+  };
+}
+
 function resourceCell(mode, runs, round) {
   const baseline = {
     rss_kib: 1000,
@@ -611,6 +1006,254 @@ test("validates a complete source-bound qualification receipt postcondition", ()
   assert.ok(validate().some((error) => error.includes("current invocation")));
 });
 
+test("production v3 verifier is mutation-sensitive to the frozen GC evidence", () => {
+  const fixture = passingNightlyV3ReceiptFixture();
+  const rehashTupleEvidence = (evidence) => {
+    evidence.count = evidence.tuples.length;
+    evidence.total_replay_bytes = evidence.tuples.reduce(
+      (sum, tuple) => sum + tuple.replay_bytes,
+      0,
+    );
+    evidence.sha256 = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(evidence.tuples))
+      .digest("hex");
+  };
+  const validate = (value = fixture.receipt.value) =>
+    validatePassingQualificationReceiptV3({
+      receiptPath: fixture.receipt.path,
+      value,
+      expectedProfile: "nightly",
+      qualificationPolicy: fixture.qualificationPolicy,
+      gc: fixture.gc,
+      preflight: fixture.preflight,
+      budgets: fixture.budgets,
+      notBefore: fixture.notBefore,
+      verifiedAt: fixture.verifiedAt,
+    });
+  assert.deepEqual(validate(), []);
+  for (const [label, mutate] of [
+    ["stats logs", (value) => value.stats_logs.pop()],
+    [
+      "workload identity",
+      (value) => (value.provenance.workload_contract.sha256 = "f".repeat(64)),
+    ],
+    [
+      "GC stage",
+      (value) =>
+        value.stages
+          .find(({ id }) => id === "retained-state-plateau")
+          .result.bounded_churn[0].turnovers.pop(),
+    ],
+    [
+      "GC trace",
+      (value) => {
+        const index = value.action_trace.findIndex(
+          ({ action }) => action === "gc.turnover",
+        );
+        value.action_trace.splice(index, 1);
+      },
+    ],
+    [
+      "frozen budget",
+      (value) =>
+        (value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].peak_rss_kib = 1_000_000),
+    ],
+    [
+      "owner boundary",
+      (value) =>
+        (value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].epochs[0].current.waiters = 1),
+    ],
+    [
+      "RSS sample series",
+      (value) =>
+        value.stages
+          .find(({ id }) => id === "retained-state-plateau")
+          .result.replay_pressure[0].rss_samples.pop(),
+    ],
+    [
+      "duplicate GC mode",
+      (value) =>
+        (value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[1].mode = "memory_only"),
+    ],
+    [
+      "shortened soak",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "stress-and-soak",
+        ).result.soak.elapsed_seconds = 1799;
+        value.action_trace.find(
+          ({ action }) => action === "stress.soak",
+        ).elapsed_seconds = 1799;
+      },
+    ],
+    [
+      "shortened soak wall clock",
+      (value) => {
+        value.stages.find(({ id }) => id === "stress-and-soak").completed_at =
+          "2026-08-11T00:30:02.000Z";
+      },
+    ],
+    [
+      "turnover transition counter",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].turnovers[0].candidate_fences_delta = 0;
+      },
+    ],
+    [
+      "pressure before replay",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].before.total_replay_bytes -= 1;
+      },
+    ],
+    [
+      "bounded replay digest",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].retained;
+        evidence.tuples[0].replay_sha256 = "f".repeat(64);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "bounded missing tuple with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].retained;
+        evidence.tuples.pop();
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "bounded duplicate tuple with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].retained;
+        evidence.tuples[1] = structuredClone(evidence.tuples[0]);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "forged chunk with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].after;
+        evidence.tuples[0].chunks[0].sha256 = "f".repeat(64);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "chunk sequence with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].after;
+        evidence.tuples[0].chunks[1].seq += 1;
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "live pressure digest",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].after.sha256 = "f".repeat(64);
+      },
+    ],
+    [
+      "recovered suffix digest",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1].recovered.replay;
+        evidence.tuples[0].replay_sha256 = "f".repeat(64);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "recovered identity swap with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1].recovered.replay;
+        const first = evidence.tuples[0].run_id;
+        evidence.tuples[0].run_id = evidence.tuples[1].run_id;
+        evidence.tuples[1].run_id = first;
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "recovered truncation",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1].recovered.replay;
+        evidence.tuples[0].truncated = false;
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "resource budget",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "resource-census",
+        ).result[0].steady.rss_kib = 1_000_000;
+      },
+    ],
+    [
+      "recovered resource budget",
+      (value) => {
+        value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1].recovered.quiescent_thread_delta = -1;
+      },
+    ],
+    [
+      "environment",
+      (value) => {
+        value.environment.logical_cpus = 0;
+      },
+    ],
+    [
+      "toolchain",
+      (value) => {
+        value.provenance.toolchain.node_version = "";
+      },
+    ],
+    [
+      "epoch cardinality",
+      (value) => {
+        value.stages
+          .find(({ id }) => id === "retained-state-plateau")
+          .result.bounded_churn[0].epochs.push(
+            structuredClone(
+              value.stages.find(({ id }) => id === "retained-state-plateau")
+                .result.bounded_churn[0].epochs[0],
+            ),
+          );
+      },
+    ],
+  ]) {
+    const value = structuredClone(fixture.receipt.value);
+    mutate(value);
+    assert.notDeepEqual(validate(value), [], label);
+  }
+});
+
 test("validates a fresh complete observe receipt postcondition", () => {
   const inputs = buildV2Template();
   const receipt = inputs.baselineReceipts[0];
@@ -764,6 +1407,45 @@ test("qualification evidence preparation preserves old bytes and binds one owner
   const outsidePath = path.join(outsideRoot, "result.json");
   const previousDirectory = process.cwd();
   const prepare = (requestedPath, profile) => {
+    fs.copyFileSync(
+      path.join(root, "reliability-gc-contract.json"),
+      path.join(temporaryRoot, "reliability-gc-contract.json"),
+    );
+    fs.mkdirSync(path.join(temporaryRoot, "scripts"), { recursive: true });
+    fs.copyFileSync(
+      path.join(root, "scripts", "reliability-gc-child.mjs"),
+      path.join(temporaryRoot, "scripts", "reliability-gc-child.mjs"),
+    );
+    if (!fs.existsSync(path.join(temporaryRoot, ".git"))) {
+      execFileSync("git", ["init", "--quiet"], { cwd: temporaryRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=ctxmux fixture",
+          "-c",
+          "user.email=fixture@ctxmux.invalid",
+          "add",
+          "reliability-gc-contract.json",
+          "scripts/reliability-gc-child.mjs",
+        ],
+        { cwd: temporaryRoot },
+      );
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=ctxmux fixture",
+          "-c",
+          "user.email=fixture@ctxmux.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "fixture",
+        ],
+        { cwd: temporaryRoot },
+      );
+    }
     process.chdir(temporaryRoot);
     try {
       return prepareQualificationEvidencePath(
@@ -796,6 +1478,12 @@ test("qualification evidence preparation preserves old bytes and binds one owner
       parseQualificationPreflight(JSON.stringify(prepared.preflight), "smoke"),
       prepared.preflight,
     );
+    const gc = loadReliabilityGcContract(temporaryRoot);
+    assert.deepEqual(
+      prepared.preflight.workload_contract,
+      gc.workload_contract,
+    );
+    assert.deepEqual(prepared.preflight.workload_helper, gc.workload_helper);
     const afterMetadata = fs.statSync(canonicalPath);
     assert.equal(afterMetadata.dev, beforeMetadata.dev);
     assert.equal(afterMetadata.ino, beforeMetadata.ino);

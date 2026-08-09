@@ -34,6 +34,11 @@ import {
   readOwnedFile,
   readOwnedJson,
 } from "./reliability-artifact-owner.mts";
+import {
+  assertReliabilityGcIdentities,
+  loadReliabilityGcContract,
+} from "./reliability-gc-contract.mts";
+import { validateQualificationStatsArtifact } from "./reliability-gc-stats.mts";
 
 export { deriveBudgetCeiling } from "./reliability-budget-contract.mjs";
 
@@ -51,7 +56,7 @@ const EXPECTED_QUALIFICATION_POLICY = {
       resource_counts: [1],
     },
     nightly: {
-      time_budget_seconds: 45 * 60,
+      time_budget_seconds: 70 * 60,
       soak_seconds: 30 * 60,
       resource_counts: [1, 32, 128],
     },
@@ -143,37 +148,152 @@ export function validateQualificationArtifacts({
     return errors;
   }
   const seen = new Set();
-  for (const logPath of Array.isArray(value?.daemon_logs)
-    ? value.daemon_logs
-    : []) {
-    const resolvedLogPath = path.resolve(root, logPath);
-    const artifactRelativeLog = path.relative(
-      artifactDirectory,
-      resolvedLogPath,
-    );
-    const logName = path.basename(resolvedLogPath);
-    let logIdentity;
-    try {
-      logIdentity = existingOwnedFileIdentity(logName);
-    } catch {
-      logIdentity = undefined;
-    }
+  const statsSummaries = [];
+  const gcContract =
+    value?.schema === "ctxmux.reliability-qualification.v3"
+      ? loadReliabilityGcContract(root)
+      : null;
+  const artifactSets = [
+    ["daemon", value?.daemon_logs, false],
+    ["stats", value?.stats_logs, true],
+  ];
+  for (const [kind, paths, validateStats] of artifactSets) {
     if (
-      !canonicalFixturePath(logPath) ||
-      path.dirname(resolvedLogPath) !== artifactDirectory ||
-      artifactRelativeLog !== logName ||
-      logIdentity === undefined ||
-      logIdentity === null ||
-      (receiptIdentity !== undefined &&
-        logIdentity.dev === receiptIdentity.dev &&
-        logIdentity.ino === receiptIdentity.ino) ||
-      seen.has(resolvedLogPath)
+      kind === "stats" &&
+      value?.schema !== "ctxmux.reliability-qualification.v3" &&
+      paths === undefined
     ) {
-      errors.push(`qualification daemon log is unavailable: ${logPath}`);
+      continue;
     }
-    seen.add(resolvedLogPath);
+    if (!Array.isArray(paths) || paths.length === 0) {
+      errors.push(`qualification ${kind} logs must be a non-empty array`);
+      continue;
+    }
+    for (const declared of paths) {
+      const logPath = validateStats ? declared?.path : declared;
+      if (typeof logPath !== "string") {
+        errors.push(`qualification ${kind} log declaration is malformed`);
+        continue;
+      }
+      const resolvedLogPath = path.resolve(root, logPath);
+      const artifactRelativeLog = path.relative(
+        artifactDirectory,
+        resolvedLogPath,
+      );
+      const logName = path.basename(resolvedLogPath);
+      let logIdentity;
+      let logBytes;
+      try {
+        const owned = readOwnedFile(logName);
+        logIdentity = owned.identity;
+        logBytes = owned.bytes;
+      } catch {
+        logIdentity = undefined;
+      }
+      if (
+        !canonicalFixturePath(logPath) ||
+        path.dirname(resolvedLogPath) !== artifactDirectory ||
+        artifactRelativeLog !== logName ||
+        logIdentity === undefined ||
+        logIdentity === null ||
+        (receiptIdentity !== undefined &&
+          logIdentity.dev === receiptIdentity.dev &&
+          logIdentity.ino === receiptIdentity.ino) ||
+        seen.has(resolvedLogPath)
+      ) {
+        errors.push(`qualification ${kind} log is unavailable: ${logPath}`);
+      } else if (validateStats) {
+        try {
+          const summary = validateQualificationStatsArtifact(logBytes);
+          if (gcContract === null) {
+            throw new Error("stats logs require the v3 qualification contract");
+          }
+          const maxGap = Number(
+            gcContract.contract.replay_pressure.sampling
+              .max_owner_sample_gap_ms,
+          );
+          if (summary.max_sample_gap_ms > maxGap) {
+            throw new Error(
+              `producer gap ${String(summary.max_sample_gap_ms)}ms exceeds ${String(maxGap)}ms`,
+            );
+          }
+          if (
+            !isObject(declared) ||
+            !sameMembers(Object.keys(declared), [
+              "path",
+              "sha256",
+              "daemon_instance",
+              "final_seq",
+            ]) ||
+            declared.sha256 !==
+              crypto.createHash("sha256").update(logBytes).digest("hex") ||
+            declared.daemon_instance !== summary.daemon_instance ||
+            declared.final_seq !== summary.last_seq
+          ) {
+            throw new Error("declared stats identity differs from owned bytes");
+          }
+          statsSummaries.push(summary);
+        } catch (error) {
+          errors.push(
+            `qualification stats log is invalid: ${logPath}: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      }
+      seen.add(resolvedLogPath);
+    }
+  }
+  if (value?.schema === "ctxmux.reliability-qualification.v3") {
+    const actualEpochs = statsSummaries.map(
+      ({ daemon_instance }) => daemon_instance,
+    );
+    const summariesByEpoch = new Map(
+      statsSummaries.map((summary) => [summary.daemon_instance, summary]),
+    );
+    const requiredEpochs = gcEpochsFromReceipt(value);
+    if (new Set(actualEpochs).size !== actualEpochs.length) {
+      errors.push("qualification stats logs repeat a daemon instance");
+    }
+    if (new Set(requiredEpochs).size !== requiredEpochs.length) {
+      errors.push("qualification GC epochs repeat a daemon instance");
+    }
+    for (const daemonInstance of requiredEpochs) {
+      if (!actualEpochs.includes(daemonInstance)) {
+        errors.push(
+          `qualification GC epoch has no owned stats log: ${daemonInstance}`,
+        );
+      }
+    }
+    for (const epoch of gcEpochReceipts(value)) {
+      const artifact = summariesByEpoch.get(epoch.daemon_instance);
+      if (
+        artifact === undefined ||
+        !isDeepStrictEqual(artifact.final.current, epoch.current) ||
+        !isDeepStrictEqual(artifact.final.high_water, epoch.high_water) ||
+        !isDeepStrictEqual(artifact.final.cumulative, epoch.cumulative)
+      ) {
+        errors.push(
+          `qualification GC epoch differs from its final stats frame: ${String(epoch.daemon_instance)}`,
+        );
+      }
+    }
   }
   return errors;
+}
+
+function gcEpochsFromReceipt(value) {
+  return gcEpochReceipts(value)
+    .map(({ daemon_instance }) => daemon_instance)
+    .filter((value) => typeof value === "string");
+}
+
+function gcEpochReceipts(value) {
+  const result = value?.stages?.find(
+    ({ id }) => id === "retained-state-plateau",
+  )?.result;
+  if (!isObject(result)) return [];
+  return [result.bounded_churn, result.replay_pressure]
+    .flatMap((modes) => (Array.isArray(modes) ? modes : []))
+    .flatMap(({ epochs }) => (Array.isArray(epochs) ? epochs : []));
 }
 
 function resolveCanonicalQualificationEvidencePath(
@@ -226,10 +346,13 @@ export function prepareQualificationEvidencePath(
     create: true,
   });
   const preexistingReceiptIdentity = existingOwnedFileIdentity("result.json");
+  const gcContract = loadReliabilityGcContract(resolvedRoot);
   const preflight = createQualificationPreflight(
     expectedProfile,
     artifactOwnerIdentity,
     preexistingReceiptIdentity,
+    gcContract.workload_contract,
+    gcContract.workload_helper,
   );
   return {
     resolvedEvidencePath,
@@ -262,6 +385,1069 @@ export function validateQualificationInvocationIdentity(value, current) {
 
 function validTimestamp(value) {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
+}
+
+const V3_RECEIPT_FIELDS = [
+  "schema",
+  "status",
+  "profile",
+  "observation_round",
+  "seed",
+  "recorded_at",
+  "completed_at",
+  "time_budget_seconds",
+  "environment",
+  "provenance",
+  "declared_limits",
+  "action_trace",
+  "stages",
+  "daemon_logs",
+  "stats_logs",
+  "error",
+];
+const V3_PROVENANCE_FIELDS = [
+  "claim_scope",
+  "binary_source_attestation",
+  "source",
+  "harness",
+  "launcher",
+  "daemon",
+  "lockfiles",
+  "build",
+  "toolchain",
+  "measurement_contract_encoding",
+  "measurement_contract_sha256",
+  "workload_contract",
+  "workload_helper",
+];
+const V3_BASE_STAGE_IDS = [
+  "chaos-owner-matrix",
+  "security-negative-space",
+  "stress-and-soak",
+];
+const V3_PASSING_ACTIONS = new Set([
+  "provenance.captured",
+  "provenance.verified",
+  "provenance.reverified",
+  "stage.start",
+  "stage.pass",
+  "chaos.integration_host.spawn",
+  "chaos.integration_host.survived",
+  "chaos.child.kill",
+  "chaos.daemon.kill",
+  "security.negative_space",
+  "stress.concurrent_start",
+  "stress.soak",
+  "stress.fanout",
+  "resource.measurement",
+  "gc.turnover",
+  "gc.replay_pressure",
+]);
+
+/** Validate receipts emitted by the current qualification harness. Historical
+ * source-bound v2 observation receipts continue to use the frozen validator
+ * in reliability-baseline-policy.mjs. */
+export function validatePassingQualificationReceiptV3({
+  receiptPath,
+  value,
+  expectedProfile,
+  qualificationPolicy,
+  gc,
+  preflight,
+  notBefore,
+  verifiedAt,
+  current,
+  budgets,
+}) {
+  const errors = [];
+  const expect = (condition, message) => {
+    if (!condition) errors.push(`v3 ${message}: ${receiptPath}`);
+  };
+  if (!isObject(value) || !sameMembers(Object.keys(value), V3_RECEIPT_FIELDS)) {
+    errors.push(`v3 receipt fields are not exact: ${receiptPath}`);
+    return errors;
+  }
+  const profilePolicy = qualificationPolicy?.profiles?.[expectedProfile];
+  expect(
+    value.schema === "ctxmux.reliability-qualification.v3" &&
+      value.status === "pass" &&
+      value.profile === expectedProfile &&
+      value.error === null,
+    `receipt must pass ${expectedProfile}`,
+  );
+  expect(
+    Number.isSafeInteger(value.seed) &&
+      value.seed === Number(gc.contract.seed) &&
+      value.time_budget_seconds ===
+        gc.contract.profile_time_budgets_seconds[expectedProfile],
+    "receipt seed/time budget drifted from the GC contract",
+  );
+  expect(
+    validTimestamp(value.recorded_at) &&
+      validTimestamp(value.completed_at) &&
+      validTimestamp(notBefore) &&
+      validTimestamp(verifiedAt) &&
+      Date.parse(value.recorded_at) >= Date.parse(notBefore) &&
+      Date.parse(value.recorded_at) <= Date.parse(value.completed_at) &&
+      Date.parse(value.completed_at) <= Date.parse(verifiedAt),
+    "receipt is not a fresh monotonic invocation",
+  );
+  expect(
+    validHost(value.environment),
+    "environment fields are not exact and non-empty",
+  );
+  expect(
+    expectedProfile === "observe"
+      ? [1, 2, 3].includes(value.observation_round)
+      : value.observation_round === null,
+    "observation round does not match the profile",
+  );
+  expect(
+    Array.isArray(value.daemon_logs) &&
+      value.daemon_logs.length > 0 &&
+      value.daemon_logs.every(canonicalFixturePath) &&
+      Array.isArray(value.stats_logs) &&
+      value.stats_logs.length > 0 &&
+      value.stats_logs.length <= value.daemon_logs.length &&
+      value.stats_logs.every(
+        (entry) => isObject(entry) && canonicalFixturePath(entry.path),
+      ),
+    "daemon/stats artifact lists are incomplete",
+  );
+
+  const provenance = value.provenance;
+  expect(
+    isObject(provenance) &&
+      sameMembers(Object.keys(provenance), V3_PROVENANCE_FIELDS) &&
+      provenance.claim_scope === "locally_observed" &&
+      provenance.binary_source_attestation === false &&
+      isDeepStrictEqual(provenance.workload_contract, gc.workload_contract) &&
+      isDeepStrictEqual(provenance.workload_helper, gc.workload_helper) &&
+      isDeepStrictEqual(
+        provenance.workload_contract,
+        preflight.workload_contract,
+      ) &&
+      isDeepStrictEqual(provenance.workload_helper, preflight.workload_helper),
+    "provenance does not bind the frozen workload identities",
+  );
+  expect(
+    isObject(provenance?.source) &&
+      GIT_OBJECT_PATTERN.test(provenance.source.commit ?? "") &&
+      GIT_OBJECT_PATTERN.test(provenance.source.tree ?? "") &&
+      isDeepStrictEqual(provenance.source.worktree, {
+        status_format: "git-status-porcelain-v1-z",
+        clean: true,
+        entries: [],
+      }) &&
+      provenance?.build?.source_commit === provenance.source.commit &&
+      provenance?.build?.source_tree === provenance.source.tree &&
+      provenance?.build?.worktree_clean === true &&
+      provenance?.build?.locked === true,
+    "source/build provenance is not exact and clean",
+  );
+  expect(
+    [provenance?.harness, provenance?.launcher, provenance?.daemon].every(
+      validFileIdentity,
+    ) &&
+      Array.isArray(provenance?.lockfiles) &&
+      provenance.lockfiles.length === 2 &&
+      provenance.lockfiles.every(validFileIdentity),
+    "file provenance is malformed",
+  );
+  expect(
+    validToolchain(provenance?.toolchain) &&
+      provenance?.measurement_contract_encoding === "json-stringify-utf8" &&
+      provenance?.measurement_contract_sha256 ===
+        crypto
+          .createHash("sha256")
+          .update(JSON.stringify(budgets?.measurement_contract))
+          .digest("hex"),
+    "toolchain or measurement contract is malformed",
+  );
+  if (current !== undefined) {
+    expect(
+      provenance.source.commit === current.commit &&
+        provenance.source.tree === current.tree &&
+        current.clean === true &&
+        isDeepStrictEqual(provenance.harness, current.harness) &&
+        isDeepStrictEqual(provenance.launcher, current.launcher) &&
+        isDeepStrictEqual(provenance.daemon, current.daemon) &&
+        isDeepStrictEqual(provenance.lockfiles, current.lockfiles) &&
+        provenance.measurement_contract_sha256 ===
+          current.measurement_contract_sha256,
+      "source, binary, lockfile, or measurement bytes differ from the current invocation",
+    );
+  }
+  expect(
+    isDeepStrictEqual(provenance?.build, {
+      cwd: ".",
+      argv: [
+        "cargo",
+        "build",
+        "--locked",
+        "--quiet",
+        "--package",
+        "ctxmux-daemon",
+        "--target-dir",
+        "target/reliability/provenance-build",
+      ],
+      source_commit: provenance?.source?.commit,
+      source_tree: provenance?.source?.tree,
+      worktree_clean: true,
+      target_directory: "target/reliability/provenance-build",
+      daemon_path: "target/reliability/provenance-build/debug/ctxmuxd",
+      locked: true,
+    }),
+    "build provenance does not match the fixed locked envelope",
+  );
+
+  const limits = value.declared_limits;
+  expect(
+    isObject(limits) &&
+      limits.qualification_stage === "all" &&
+      isDeepStrictEqual(
+        limits.resource_counts,
+        profilePolicy?.resource_counts,
+      ) &&
+      isDeepStrictEqual(limits.resource_modes, ["idle", "active"]) &&
+      limits.resource_start_concurrency ===
+        gc.contract.bounded_churn.concurrency &&
+      limits.soak_seconds === profilePolicy?.soak_seconds &&
+      limits.global_run_quota === gc.contract.bounded_churn.run_ceiling &&
+      limits.exited_run_gc === "exact_terminal_replacement",
+    "declared workload does not match the canonical profile/GC contract",
+  );
+
+  const expectedStages = [
+    ...V3_BASE_STAGE_IDS,
+    ...(expectedProfile === "nightly" || expectedProfile === "release"
+      ? ["retained-state-plateau"]
+      : []),
+    "resource-census",
+    ...(expectedProfile === "observe" ? [] : ["frozen-resource-budgets"]),
+  ];
+  expect(
+    Array.isArray(value.stages) &&
+      isDeepStrictEqual(
+        value.stages.map((stage) => stage?.id),
+        expectedStages,
+      ) &&
+      value.stages.every(
+        (stage) =>
+          isObject(stage) &&
+          sameMembers(Object.keys(stage), [
+            "id",
+            "status",
+            "started_at",
+            "completed_at",
+            "result",
+          ]) &&
+          stage.status === "pass" &&
+          validTimestamp(stage.started_at) &&
+          validTimestamp(stage.completed_at) &&
+          Date.parse(stage.started_at) <= Date.parse(stage.completed_at),
+      ),
+    "stages are incomplete, out of order, or not passing",
+  );
+  validateV3Trace(value, expectedStages, provenance, preflight, expect);
+  validateV3ResourceStage(
+    value.stages?.find((stage) => stage?.id === "resource-census")?.result,
+    profilePolicy?.resource_counts,
+    budgets,
+    expect,
+  );
+  validateV3Soak(value, expectedProfile, profilePolicy?.soak_seconds, expect);
+  if (expectedStages.includes("retained-state-plateau")) {
+    validateV3GcStage(
+      value.stages.find((stage) => stage?.id === "retained-state-plateau")
+        ?.result,
+      gc.contract,
+      expect,
+    );
+  }
+  return errors;
+}
+
+function validateV3Soak(value, profile, expectedSeconds, expect) {
+  const stress = value.stages?.find(
+    ({ id }) => id === "stress-and-soak",
+  )?.result;
+  if (profile !== "nightly" && profile !== "release") {
+    expect(
+      stress?.soak?.duration_seconds === 0,
+      "short profile ran a time soak",
+    );
+    return;
+  }
+  const soak = stress?.soak;
+  const stressStage = value.stages?.find(({ id }) => id === "stress-and-soak");
+  const actions = value.action_trace.filter(
+    ({ action }) => action === "stress.soak",
+  );
+  expect(
+    actions.length === 1 &&
+      actions[0].configured_duration_seconds === expectedSeconds &&
+      actions[0].elapsed_seconds === soak?.elapsed_seconds &&
+      soak?.configured_duration_seconds === expectedSeconds &&
+      soak?.elapsed_seconds >= expectedSeconds &&
+      Date.parse(stressStage?.completed_at) -
+        Date.parse(stressStage?.started_at) >=
+        expectedSeconds * 1000 &&
+      Number.isSafeInteger(soak?.cycles) &&
+      soak.cycles > 0 &&
+      soak?.active_runs === 8 &&
+      soak?.cleanup_live_children === 0 &&
+      soak?.cleanup_attachments === 0 &&
+      validRssSeries(soak?.rss_samples, soak?.max_rss_sample_gap_ms, 1000),
+    "ordinary soak is shortened, missing, or has no cleanup/resource evidence",
+  );
+}
+
+function validateV3Trace(value, expectedStages, provenance, preflight, expect) {
+  const trace = value.action_trace;
+  if (!Array.isArray(trace)) {
+    expect(false, "action trace is missing");
+    return;
+  }
+  expect(
+    trace.every(
+      (entry) =>
+        isObject(entry) &&
+        validTimestamp(entry.timestamp) &&
+        V3_PASSING_ACTIONS.has(entry.action),
+    ),
+    "action trace contains a malformed or non-passing action",
+  );
+  const indexes = (action) =>
+    trace.flatMap((entry, index) => (entry.action === action ? [index] : []));
+  const captured = indexes("provenance.captured");
+  const verified = indexes("provenance.verified");
+  const reverified = indexes("provenance.reverified");
+  const starts = trace.filter((entry) => entry.action === "stage.start");
+  const passes = trace.filter((entry) => entry.action === "stage.pass");
+  expect(
+    captured.length === 1 &&
+      verified.length === 1 &&
+      reverified.length === 1 &&
+      trace[captured[0]]?.invocation_nonce === preflight.invocation_nonce &&
+      isDeepStrictEqual(
+        trace[captured[0]]?.workload_contract,
+        provenance.workload_contract,
+      ) &&
+      isDeepStrictEqual(
+        trace[captured[0]]?.workload_helper,
+        provenance.workload_helper,
+      ) &&
+      trace[captured[0]]?.source_commit === provenance.source.commit &&
+      trace[captured[0]]?.worktree_clean === true &&
+      trace[captured[0]]?.harness_sha256 === provenance.harness.sha256 &&
+      trace[captured[0]]?.launcher_sha256 === provenance.launcher.sha256 &&
+      trace[captured[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
+      trace[captured[0]]?.measurement_contract_sha256 ===
+        provenance.measurement_contract_sha256 &&
+      trace[reverified[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
+      isDeepStrictEqual(
+        trace[reverified[0]]?.workload_contract,
+        provenance.workload_contract,
+      ) &&
+      isDeepStrictEqual(
+        trace[reverified[0]]?.workload_helper,
+        provenance.workload_helper,
+      ) &&
+      isDeepStrictEqual(
+        starts.map(({ id }) => id),
+        expectedStages,
+      ) &&
+      isDeepStrictEqual(
+        passes.map(({ id }) => id),
+        expectedStages,
+      ) &&
+      captured[0] < verified[0] &&
+      verified[0] < indexes("stage.start")[0] &&
+      reverified[0] > indexes("stage.pass").at(-1),
+    "action trace does not fence the invocation and canonical stages",
+  );
+  const timestamps = trace.map(({ timestamp }) => Date.parse(timestamp));
+  expect(
+    timestamps.every(
+      (timestamp, index) =>
+        timestamp >= Date.parse(value.recorded_at) &&
+        timestamp <= Date.parse(value.completed_at) &&
+        (index === 0 || timestamp >= timestamps[index - 1]),
+    ),
+    "action trace chronology is not monotonic inside the receipt",
+  );
+  expect(
+    value.stages.every(
+      (stage) =>
+        Date.parse(stage.started_at) >= Date.parse(value.recorded_at) &&
+        Date.parse(stage.completed_at) <= Date.parse(value.completed_at),
+    ),
+    "stage chronology escapes the receipt interval",
+  );
+  if (expectedStages.includes("retained-state-plateau")) {
+    const turnovers = trace.filter(({ action }) => action === "gc.turnover");
+    const pressure = trace.filter(
+      ({ action }) => action === "gc.replay_pressure",
+    );
+    expect(
+      turnovers.length === 6 &&
+        sameMembers(
+          turnovers.map(({ mode, window }) => `${mode}/${String(window)}`),
+          ["memory_only", "persistent"].flatMap((mode) =>
+            [1, 2, 3].map((window) => `${mode}/${String(window)}`),
+          ),
+        ) &&
+        pressure.length === 2 &&
+        sameMembers(
+          pressure.map(({ mode }) => mode),
+          ["memory_replay_pressure", "persistent_replay_pressure"],
+        ),
+      "GC trace does not cover both modes, three turnovers, and replay pressure",
+    );
+  }
+}
+
+function validateV3ResourceStage(cells, expectedCounts, budgets, expect) {
+  const expected = ["idle", "active"].flatMap((mode) =>
+    (expectedCounts ?? []).map((count) => `${mode}/${String(count)}`),
+  );
+  expect(
+    Array.isArray(cells) &&
+      cells.length === expected.length &&
+      isDeepStrictEqual(
+        cells.map((cell) => `${cell?.mode}/${String(cell?.runs)}`).sort(),
+        expected.sort(),
+      ) &&
+      cells.every((cell) => validV3ResourceCell(cell, expectedCounts, budgets)),
+    "resource census does not cover the canonical cells, derived values, and frozen budgets",
+  );
+}
+
+function validV3ResourceCell(cell, expectedCounts, budgets) {
+  const fields =
+    "mode runs baseline steady cleanup peak_rss_kib peak_rss_sample_count peak_rss_sample_interval_ms cpu_core_percent retained_output_bytes retained_output_bytes_per_run rss_kib_per_run threads_per_run fds_per_run cleanup_rss_kib_delta cleanup_fds_delta cleanup_retained_runs cleanup_live_children cleanup_attachments intentional_retained_state_without_gc".split(
+      " ",
+    );
+  if (
+    !isObject(cell) ||
+    !sameMembers(Object.keys(cell), fields) ||
+    !["idle", "active"].includes(cell.mode) ||
+    !(expectedCounts ?? []).includes(cell.runs) ||
+    ![cell.baseline, cell.steady, cell.cleanup].every(validProcessSample) ||
+    !Number.isSafeInteger(cell.peak_rss_sample_count) ||
+    cell.peak_rss_sample_count <= 0 ||
+    cell.peak_rss_sample_interval_ms !== 25 ||
+    cell.intentional_retained_state_without_gc !== true
+  ) {
+    return false;
+  }
+  const numericFields =
+    "peak_rss_kib cpu_core_percent retained_output_bytes retained_output_bytes_per_run rss_kib_per_run threads_per_run fds_per_run cleanup_rss_kib_delta cleanup_fds_delta cleanup_retained_runs cleanup_live_children cleanup_attachments".split(
+      " ",
+    );
+  if (!numericFields.every((field) => finiteNonNegative(cell[field]))) {
+    return false;
+  }
+  const divide = (value) => Math.round((value / cell.runs) * 1000) / 1000;
+  const derived = {
+    retained_output_bytes_per_run: divide(cell.retained_output_bytes),
+    rss_kib_per_run: divide(
+      Math.max(0, cell.steady.rss_kib - cell.baseline.rss_kib),
+    ),
+    threads_per_run: divide(
+      Math.max(0, cell.steady.threads - cell.baseline.threads),
+    ),
+    fds_per_run: divide(Math.max(0, cell.steady.fds - cell.baseline.fds)),
+    cleanup_live_children: cell.cleanup.descendants.length,
+  };
+  if (
+    !Object.entries(derived).every(
+      ([field, expected]) => cell[field] === expected,
+    )
+  ) {
+    return false;
+  }
+  const budget = budgets?.budgets?.[cell.mode]?.[String(cell.runs)];
+  return (
+    isObject(budget) &&
+    cell.cpu_core_percent <= budget.max_cpu_core_percent &&
+    cell.peak_rss_kib <= budget.max_peak_rss_kib &&
+    cell.steady.rss_kib <= budget.max_steady_rss_kib &&
+    cell.retained_output_bytes_per_run <=
+      budget.max_retained_output_bytes_per_run &&
+    cell.rss_kib_per_run <= budget.max_rss_kib_per_run &&
+    cell.threads_per_run <= budget.max_threads_per_run &&
+    cell.fds_per_run <= budget.max_fds_per_run &&
+    Math.max(0, cell.cleanup.threads - cell.baseline.threads) <=
+      budget.max_cleanup_threads_delta &&
+    cell.cleanup_live_children <= budget.max_cleanup_live_children &&
+    cell.cleanup_attachments <= budget.max_cleanup_attachments
+  );
+}
+
+const GC_TUPLE_FIELDS =
+  "run_id operation_key lineage state head_seq durable_head_seq oldest_seq replay_bytes replay_sha256 chunks truncated".split(
+    " ",
+  );
+const GC_CHUNK_FIELDS = "seq bytes sha256".split(" ");
+const GC_TUPLE_EVIDENCE_FIELDS =
+  "count total_replay_bytes sha256 tuples".split(" ");
+const CANONICAL_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+function validateGcTupleEvidence(evidence, expected) {
+  try {
+    const exactIndices = expected.firstIndex === undefined ? null : new Set(
+      Array.from(
+        { length: expected.count },
+        (_, offset) => expected.firstIndex + offset,
+      ),
+    );
+    const runIds = new Set();
+    const operationKeys = new Set();
+    const observedIndices = new Set();
+    const liveByRun = new Map(
+      (expected.live?.tuples ?? []).map((tuple) => [tuple.run_id, tuple]),
+    );
+    return (
+      isObject(evidence) &&
+      sameMembers(Object.keys(evidence), GC_TUPLE_EVIDENCE_FIELDS) &&
+      HASH_PATTERN.test(evidence.sha256 ?? "") &&
+      Array.isArray(evidence.tuples) &&
+      evidence.count === expected.count &&
+      evidence.count === evidence.tuples.length &&
+      (expected.totalReplayBytes === undefined ||
+        evidence.total_replay_bytes === expected.totalReplayBytes) &&
+      evidence.total_replay_bytes ===
+        evidence.tuples.reduce((sum, tuple) => sum + tuple.replay_bytes, 0) &&
+      evidence.sha256 ===
+        crypto
+          .createHash("sha256")
+          .update(JSON.stringify(evidence.tuples))
+          .digest("hex") &&
+      evidence.tuples.every((tuple) => {
+        if (!isObject(tuple) || !sameMembers(Object.keys(tuple), GC_TUPLE_FIELDS))
+          return false;
+        const marker = /^gc-pressure:([^:]+):(\d+):([0-9a-f]{64})$/u.exec(
+          tuple.operation_key,
+        );
+        const index = Number(marker?.[2]);
+        if (
+          marker === null ||
+          marker[1] !== expected.mode ||
+          !Number.isSafeInteger(index) ||
+          String(index) !== marker[2] ||
+          index < expected.minimumIndex ||
+          index > expected.maximumIndex ||
+          (exactIndices !== null && !exactIndices.has(index)) ||
+          !CANONICAL_UUID_PATTERN.test(tuple.run_id ?? "") ||
+          runIds.has(tuple.run_id) ||
+          operationKeys.has(tuple.operation_key) ||
+          observedIndices.has(index) ||
+          tuple.lineage !== null ||
+          !isDeepStrictEqual(tuple.state, {
+            type: "exited",
+            code: 0,
+            signal: null,
+          }) ||
+          ![tuple.head_seq, tuple.oldest_seq, tuple.replay_bytes].every(
+            (value) => Number.isSafeInteger(value) && value >= 0,
+          ) ||
+          tuple.replay_bytes > expected.payloadBytes ||
+          typeof tuple.truncated !== "boolean" ||
+          !Array.isArray(tuple.chunks) ||
+          tuple.chunks.length === 0
+        )
+          return false;
+        runIds.add(tuple.run_id);
+        operationKeys.add(tuple.operation_key);
+        observedIndices.add(index);
+        const sourceDigest = crypto
+          .createHash("sha256")
+          .update(`${expected.seed}:${expected.mode}:${marker[2]}`, "utf8")
+          .digest("hex");
+        if (marker[3] !== sourceDigest) return false;
+        const persistent = expected.mode.startsWith("persistent");
+        if (
+          (persistent && tuple.durable_head_seq !== tuple.head_seq) ||
+          (!persistent && tuple.durable_head_seq !== null) ||
+          tuple.oldest_seq > tuple.head_seq ||
+          tuple.chunks[0]?.seq !== tuple.oldest_seq ||
+          tuple.chunks.at(-1)?.seq !== tuple.head_seq
+        )
+          return false;
+        let replayOffset = expected.payloadBytes - tuple.replay_bytes;
+        let replayBytes = 0;
+        for (const [chunkIndex, chunk] of tuple.chunks.entries()) {
+          if (
+            !isObject(chunk) ||
+            !sameMembers(Object.keys(chunk), GC_CHUNK_FIELDS) ||
+            !Number.isSafeInteger(chunk.seq) ||
+            chunk.seq < 1 ||
+            !Number.isSafeInteger(chunk.bytes) ||
+            chunk.bytes <= 0 ||
+            chunk.bytes > tuple.replay_bytes - replayBytes ||
+            !HASH_PATTERN.test(chunk.sha256 ?? "") ||
+            (chunkIndex > 0 &&
+              chunk.seq !== tuple.chunks[chunkIndex - 1].seq + 1) ||
+            chunk.sha256 !==
+              repeatedDigestSliceSha256(
+                sourceDigest,
+                replayOffset,
+                chunk.bytes,
+              )
+          )
+            return false;
+          replayOffset += chunk.bytes;
+          replayBytes += chunk.bytes;
+        }
+        return (
+          replayBytes === tuple.replay_bytes &&
+          tuple.replay_sha256 ===
+            repeatedDigestSliceSha256(
+              sourceDigest,
+              expected.payloadBytes - tuple.replay_bytes,
+              tuple.replay_bytes,
+            ) &&
+          (!expected.exactReplay ||
+            (tuple.replay_bytes === expected.payloadBytes &&
+              tuple.truncated === false)) &&
+          recoveredTupleMatchesLive(tuple, liveByRun)
+        );
+      }) &&
+      observedIndices.size === expected.count
+    );
+  } catch {
+    return false;
+  }
+}
+
+function repeatedDigestSliceSha256(digest, offset, bytes) {
+  const start = offset % digest.length;
+  const cacheKey = `${digest}:${String(start)}:${String(bytes)}`;
+  const cached = GC_REPLAY_DIGEST_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const hash = crypto.createHash("sha256");
+  let remaining = bytes;
+  if (start !== 0 && remaining > 0) {
+    const prefix = digest.slice(start, start + remaining);
+    hash.update(prefix, "ascii");
+    remaining -= prefix.length;
+  }
+  const block = digest.repeat(1024);
+  while (remaining >= block.length) {
+    hash.update(block, "ascii");
+    remaining -= block.length;
+  }
+  if (remaining > 0) {
+    hash.update(
+      digest.repeat(Math.ceil(remaining / digest.length)).slice(0, remaining),
+      "ascii",
+    );
+  }
+  const sha256 = hash.digest("hex");
+  if (GC_REPLAY_DIGEST_CACHE.size >= 4096) GC_REPLAY_DIGEST_CACHE.clear();
+  GC_REPLAY_DIGEST_CACHE.set(cacheKey, sha256);
+  return sha256;
+}
+
+const GC_REPLAY_DIGEST_CACHE = new Map();
+
+function recoveredTupleMatchesLive(tuple, liveByRun) {
+  if (liveByRun.size === 0) return true;
+  const live = liveByRun.get(tuple.run_id);
+  return (
+    live !== undefined &&
+    tuple.operation_key === live.operation_key &&
+    isDeepStrictEqual(tuple.lineage, live.lineage) &&
+    isDeepStrictEqual(tuple.state, live.state) &&
+    tuple.head_seq === live.head_seq &&
+    tuple.durable_head_seq === live.durable_head_seq &&
+    tuple.oldest_seq >= live.oldest_seq &&
+    (tuple.oldest_seq === live.oldest_seq || tuple.truncated === true)
+  );
+}
+
+function validProcessSample(value) {
+  return (
+    isObject(value) &&
+    sameMembers(Object.keys(value), [
+      "rss_kib",
+      "cpu_seconds",
+      "threads",
+      "fds",
+      "descendants",
+    ]) &&
+    ["rss_kib", "cpu_seconds", "threads", "fds"].every((field) =>
+      finiteNonNegative(value[field]),
+    ) &&
+    Number.isSafeInteger(value.threads) &&
+    Number.isSafeInteger(value.fds) &&
+    Array.isArray(value.descendants)
+  );
+}
+
+function validHost(value) {
+  return (
+    isObject(value) &&
+    sameMembers(Object.keys(value), [
+      "os",
+      "os_release",
+      "architecture",
+      "logical_cpus",
+      "cpu_model",
+    ]) &&
+    ["os", "os_release", "architecture", "cpu_model"].every(
+      (field) => typeof value[field] === "string" && value[field].trim() !== "",
+    ) &&
+    Number.isSafeInteger(value.logical_cpus) &&
+    value.logical_cpus > 0
+  );
+}
+
+function validToolchain(value) {
+  return (
+    isObject(value) &&
+    sameMembers(Object.keys(value), [
+      "rustc_version_verbose",
+      "cargo_version",
+      "node_version",
+    ]) &&
+    Object.values(value).every(
+      (field) => typeof field === "string" && field.trim() !== "",
+    )
+  );
+}
+
+function validateV3GcStage(result, contract, expect) {
+  const churn = result?.bounded_churn;
+  const pressure = result?.replay_pressure;
+  expect(
+    isObject(result) &&
+      sameMembers(Object.keys(result), ["bounded_churn", "replay_pressure"]) &&
+      Array.isArray(churn) &&
+      churn.length === 2 &&
+      Array.isArray(pressure) &&
+      pressure.length === 2,
+    "retained-state stage has no two-mode churn/pressure result",
+  );
+  expect(
+    sameMembers(
+      (Array.isArray(churn) ? churn : []).map(({ mode }) => mode),
+      ["memory_only", "persistent"],
+    ) &&
+      sameMembers(
+        (Array.isArray(pressure) ? pressure : []).map(({ mode }) => mode),
+        ["memory_replay_pressure", "persistent_replay_pressure"],
+      ),
+    "retained-state stage mode sets are not exact",
+  );
+  for (const mode of Array.isArray(churn) ? churn : []) {
+    const persistent = mode?.mode === "persistent";
+    const payloadBytes = contract.payload_modes[mode?.mode]?.payload_bytes;
+    expect(
+      ["memory_only", "persistent"].includes(mode?.mode) &&
+        mode.successful_lifecycles ===
+          contract.bounded_churn.successful_lifecycles_per_mode &&
+        mode.fill_physical_start_delta ===
+          contract.bounded_churn.physical_start_deltas.fill &&
+        validateGcTupleEvidence(
+          mode.retained,
+          {
+            payloadBytes,
+            exactReplay: true,
+            seed: contract.seed,
+            mode: mode.mode,
+            count: contract.bounded_churn.run_ceiling,
+            totalReplayBytes:
+              contract.bounded_churn.run_ceiling * payloadBytes,
+            firstIndex:
+              contract.bounded_churn.successful_lifecycles_per_mode -
+              contract.bounded_churn.run_ceiling,
+            minimumIndex: 0,
+            maximumIndex:
+              contract.bounded_churn.successful_lifecycles_per_mode - 1,
+          },
+        ) &&
+        Array.isArray(mode.turnovers) &&
+        mode.turnovers.length === contract.bounded_churn.turnover_windows &&
+        mode.turnovers.every(
+          (window, index) =>
+            window.window === index + 1 &&
+            window.retained_runs === contract.bounded_churn.run_ceiling &&
+            window.physical_start_delta ===
+              contract.bounded_churn.physical_start_deltas
+                .each_turnover_window &&
+            window.retry_physical_start_delta ===
+              contract.bounded_churn.physical_start_deltas.retry_wave &&
+            window.candidate_selections_delta ===
+              contract.bounded_churn.replacements_per_window &&
+            window.candidate_evaluations_delta ===
+              contract.bounded_churn.replacements_per_window *
+                contract.bounded_churn.run_ceiling &&
+            window.candidate_fences_delta ===
+              contract.bounded_churn.replacements_per_window &&
+            window.exact_replacements_delta ===
+              contract.bounded_churn.replacements_per_window,
+        ) &&
+        (persistent
+          ? mode.restart?.after_window ===
+              contract.bounded_churn.persistent_restart_after_window &&
+            isDeepStrictEqual(mode.restart.before, mode.restart.after) &&
+            validateGcTupleEvidence(
+              mode.restart.before,
+              {
+                payloadBytes,
+                exactReplay: true,
+                seed: contract.seed,
+                mode: mode.mode,
+                count: contract.bounded_churn.run_ceiling,
+                totalReplayBytes:
+                  contract.bounded_churn.run_ceiling * payloadBytes,
+                firstIndex:
+                  contract.bounded_churn.fill_runs +
+                  (contract.bounded_churn.persistent_restart_after_window -
+                    1) *
+                    contract.bounded_churn.replacements_per_window,
+                minimumIndex: 0,
+                maximumIndex:
+                  contract.bounded_churn.successful_lifecycles_per_mode - 1,
+              },
+            ) &&
+            mode.restart.new_incarnation_initial_physical_starts ===
+              contract.bounded_churn.physical_start_deltas
+                .new_daemon_incarnation_initial
+          : mode.restart === null) &&
+        validOwnerEpochs(mode.epochs, contract, persistent ? 2 : 1),
+      `bounded churn evidence is incomplete for ${String(mode?.mode)}`,
+    );
+  }
+  for (const mode of Array.isArray(pressure) ? pressure : []) {
+    const persistent = mode?.mode === "persistent_replay_pressure";
+    const budget = contract.replay_pressure.resource_budgets;
+    const payloadBytes = contract.payload_modes[mode?.mode]?.payload_bytes;
+    expect(
+      ["memory_replay_pressure", "persistent_replay_pressure"].includes(
+        mode?.mode,
+      ) &&
+        validateGcTupleEvidence(
+          mode.before,
+          {
+            payloadBytes,
+            exactReplay: true,
+            seed: contract.seed,
+            mode: mode.mode,
+            count:
+              contract.replay_pressure
+                .public_replay_verification_runs_before_replacement,
+            totalReplayBytes:
+              contract.replay_pressure.live_retained_payload_bytes,
+            firstIndex: contract.replay_pressure.fill_indices.first,
+            minimumIndex: contract.replay_pressure.fill_indices.first,
+            maximumIndex: contract.replay_pressure.fill_indices.last,
+          },
+        ) &&
+        mode.before?.count ===
+          contract.replay_pressure
+            .public_replay_verification_runs_before_replacement &&
+        mode.before?.total_replay_bytes ===
+          contract.replay_pressure.live_retained_payload_bytes &&
+        validateGcTupleEvidence(
+          mode.after,
+          {
+            payloadBytes,
+            exactReplay: true,
+            seed: contract.seed,
+            mode: mode.mode,
+            count:
+              contract.replay_pressure
+                .public_replay_verification_runs_after_replacement,
+            totalReplayBytes:
+              contract.replay_pressure.live_retained_payload_bytes,
+            minimumIndex: contract.replay_pressure.fill_indices.first,
+            maximumIndex: contract.replay_pressure.replacement_indices.last,
+          },
+        ) &&
+        mode.after?.count ===
+          contract.replay_pressure
+            .public_replay_verification_runs_after_replacement &&
+        mode.after?.total_replay_bytes ===
+          contract.replay_pressure.live_retained_payload_bytes &&
+        mode.fill_physical_start_delta ===
+          contract.replay_pressure.owner_budgets.physical_starts_fill_delta &&
+        mode.replacement_physical_start_delta ===
+          contract.replay_pressure.owner_budgets
+            .physical_starts_replacement_delta &&
+        mode.retry_physical_start_delta ===
+          contract.replay_pressure.owner_budgets.physical_starts_retry_delta &&
+        mode.max_rss_sample_gap_ms <=
+          contract.replay_pressure.sampling.max_rss_sample_gap_ms &&
+        finiteNonNegative(mode.peak_rss_kib) &&
+        finiteNonNegative(mode.average_cpu_core_percent) &&
+        finiteNonNegative(mode.quiescent_cpu_core_percent) &&
+        finiteNonNegative(mode.peak_thread_delta) &&
+        finiteNonNegative(mode.peak_fd_delta) &&
+        validRssSeries(
+          mode.rss_samples,
+          mode.max_rss_sample_gap_ms,
+          contract.replay_pressure.sampling.max_rss_sample_gap_ms,
+        ) &&
+        mode.peak_rss_kib <=
+          (persistent
+            ? budget.persistent_peak_rss_kib
+            : budget.memory_peak_rss_kib) &&
+        mode.average_cpu_core_percent <=
+          (persistent
+            ? budget.persistent_average_cpu_core_percent
+            : budget.memory_average_cpu_core_percent) &&
+        mode.quiescent_cpu_core_percent <= budget.quiescent_cpu_core_percent &&
+        mode.peak_thread_delta <= budget.peak_thread_delta &&
+        mode.peak_fd_delta <= budget.peak_fd_delta &&
+        (persistent
+          ? mode.recovered?.replay?.count ===
+              contract.replay_pressure
+                .require_exact_retained_run_and_key_count &&
+            validateGcTupleEvidence(
+              mode.recovered.replay,
+              {
+                payloadBytes,
+                exactReplay: false,
+                seed: contract.seed,
+                mode: mode.mode,
+                count:
+                  contract.replay_pressure
+                    .require_exact_retained_run_and_key_count,
+                minimumIndex: contract.replay_pressure.fill_indices.first,
+                maximumIndex:
+                  contract.replay_pressure.replacement_indices.last,
+                live: mode.after,
+              },
+            ) &&
+            mode.recovered.replay.total_replay_bytes >=
+              contract.replay_pressure.persistent_recovered_replay_min_bytes &&
+            mode.recovered.replay.total_replay_bytes <=
+              contract.replay_pressure.persistent_durable_replay_max_bytes &&
+            mode.recovered.retry_physical_start_delta === 0 &&
+            finiteNonNegative(mode.recovered.steady_rss_kib) &&
+            mode.recovered.steady_rss_kib <=
+              budget.persistent_recovered_steady_rss_kib &&
+            finiteNonNegative(mode.recovered.peak_rss_kib) &&
+            mode.recovered.peak_rss_kib <=
+              budget.persistent_recovered_peak_rss_kib &&
+            finiteNonNegative(mode.recovered.quiescent_cpu_core_percent) &&
+            mode.recovered.quiescent_cpu_core_percent <=
+              budget.quiescent_cpu_core_percent &&
+            finiteNonNegative(mode.recovered.quiescent_thread_delta) &&
+            mode.recovered.quiescent_thread_delta <=
+              budget.quiescent_thread_delta &&
+            finiteNonNegative(mode.recovered.quiescent_fd_delta) &&
+            mode.recovered.quiescent_fd_delta <= budget.quiescent_fd_delta &&
+            validRssSeries(
+              mode.recovered.rss_samples,
+              mode.recovered.max_rss_sample_gap_ms,
+              contract.replay_pressure.sampling.max_rss_sample_gap_ms,
+            )
+          : mode.recovered === null) &&
+        validOwnerEpochs(mode.epochs, contract, persistent ? 2 : 1),
+      `replay-pressure evidence is incomplete for ${String(mode?.mode)}`,
+    );
+  }
+}
+
+function validRssSeries(samples, recordedMaxGap, contractMaxGap) {
+  if (!Array.isArray(samples) || samples.length < 2) return false;
+  const gaps = samples
+    .slice(1)
+    .map(
+      (sample, index) => sample?.timestamp_ms - samples[index]?.timestamp_ms,
+    );
+  return (
+    samples.every(
+      (sample) =>
+        Number.isSafeInteger(sample?.timestamp_ms) &&
+        finiteNonNegative(sample?.rss_kib),
+    ) &&
+    gaps.every((gap) => Number.isFinite(gap) && gap >= 0) &&
+    Math.max(...gaps) === recordedMaxGap &&
+    recordedMaxGap <= contractMaxGap
+  );
+}
+
+function validOwnerEpochs(epochs, contract, expectedCount) {
+  const boundaries = [
+    "creation_flights",
+    "publication_reservations",
+    "collecting_tickets",
+    "overlap_owners",
+    "cleanup_owners",
+    "direct_children",
+    "readers",
+    "waiters",
+    "input_drains",
+    "attachments",
+    "tmux_owners",
+  ];
+  const highWater = {
+    direct_children: "max_children",
+    readers: "max_readers",
+    waiters: "max_waiters",
+    publication_reservations: "max_publication_reservations",
+    collecting_tickets: "max_collecting_tickets",
+    overlap_owners: "max_overlap_owners",
+    attachments: "max_attachments_during_replay",
+  };
+  return (
+    Array.isArray(epochs) &&
+    epochs.length === expectedCount &&
+    new Set(epochs.map(({ daemon_instance }) => daemon_instance)).size ===
+      epochs.length &&
+    epochs.every(
+      (epoch) =>
+        epoch?.current?.retained_runs === contract.bounded_churn.run_ceiling &&
+        epoch?.current?.creation_keys === contract.bounded_churn.run_ceiling &&
+        boundaries.every((name) => epoch?.current?.[name] === 0) &&
+        Object.entries(highWater).every(
+          ([name, budget]) =>
+            finiteNonNegative(epoch?.high_water?.[name]) &&
+            epoch.high_water[name] <=
+              contract.replay_pressure.owner_budgets[budget],
+        ) &&
+        epoch?.high_water?.tmux_owners === 0 &&
+        epoch?.cumulative?.candidate_evaluations_max <=
+          contract.bounded_churn.run_ceiling,
+    )
+  );
+}
+
+function validFileIdentity(value) {
+  return (
+    isObject(value) &&
+    sameMembers(Object.keys(value), ["path", "sha256"]) &&
+    canonicalFixturePath(value.path) &&
+    HASH_PATTERN.test(value.sha256 ?? "")
+  );
+}
+
+function currentQualificationIdentity(root, source, budgets) {
+  const identity = (filePath) => ({
+    path: filePath,
+    sha256: crypto
+      .createHash("sha256")
+      .update(fs.readFileSync(path.join(root, filePath)))
+      .digest("hex"),
+  });
+  return {
+    ...source,
+    harness: identity("scripts/reliability-qualification.ts"),
+    launcher: identity("scripts/check-reliability.sh"),
+    daemon: identity("target/reliability/provenance-build/debug/ctxmuxd"),
+    lockfiles: [identity("Cargo.lock"), identity("package-lock.json")],
+    measurement_contract_sha256: crypto
+      .createHash("sha256")
+      .update(JSON.stringify(budgets.measurement_contract))
+      .digest("hex"),
+  };
 }
 
 function finiteNonNegative(value) {
@@ -702,7 +1888,6 @@ function validateReachability(
         "github.event_name == 'schedule' || inputs.qualification == 'nightly'",
       timeoutMinutes: 90,
       environment: {
-        CTXMUX_RELIABILITY_SEED: "${{ github.run_id }}",
         CTXMUX_RELIABILITY_ARTIFACT_DIR:
           "${{ github.workspace }}/target/reliability/nightly",
         CTXMUX_RELIABILITY_EVIDENCE:
@@ -721,7 +1906,6 @@ function validateReachability(
         "github.event_name == 'workflow_dispatch' && inputs.qualification == 'release'",
       timeoutMinutes: 210,
       environment: {
-        CTXMUX_RELIABILITY_SEED: "${{ github.run_id }}",
         CTXMUX_RELIABILITY_ARTIFACT_DIR:
           "${{ github.workspace }}/target/reliability/release",
         CTXMUX_RELIABILITY_EVIDENCE:
@@ -967,6 +2151,7 @@ function verifyQualificationReceipt(args) {
   const requestedPath = args[1];
   const expectedProfile = args[3];
   const preflight = parseQualificationPreflight(args[5], expectedProfile);
+  assertReliabilityGcIdentities(loadReliabilityGcContract(root), preflight);
   const receiptPath = requestedPath;
   const resolvedReceiptPath = resolveCanonicalQualificationEvidencePath(
     root,
@@ -1028,14 +2213,31 @@ function verifyQualificationReceipt(args) {
     verifiedAt: new Date().toISOString(),
     invocationNonce: preflight.invocation_nonce,
   };
-  const semanticErrors =
-    expectedProfile === "observe"
-      ? validatePassingObservationReceipt(receiptValidation)
-      : validatePassingQualificationReceipt({
-          ...receiptValidation,
-          expectedProfile,
-          qualificationPolicy,
-        });
+  const gc = loadReliabilityGcContract(root);
+  let semanticErrors;
+  if (value?.schema !== "ctxmux.reliability-qualification.v3") {
+    semanticErrors = [
+      "current qualification receipts must use the source-bound v3 schema",
+    ];
+  } else {
+    semanticErrors = validatePassingQualificationReceiptV3({
+      ...receiptValidation,
+      expectedProfile,
+      qualificationPolicy,
+      gc,
+      preflight,
+      budgets,
+      current: currentQualificationIdentity(
+        root,
+        {
+          commit: currentCommit,
+          tree: currentTree,
+          clean: status.stdout.length === 0,
+        },
+        budgets,
+      ),
+    });
+  }
   const errors = [
     ...policyErrors,
     ...semanticErrors,

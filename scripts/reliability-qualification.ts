@@ -4,16 +4,19 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
   createWriteStream,
   existsSync,
   readFileSync,
   readdirSync,
   type WriteStream,
+  writeFileSync,
 } from "node:fs";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, type Socket } from "node:net";
 import { arch, cpus, platform, release, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { Readable } from "node:stream";
 import { finished } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -37,6 +40,25 @@ import {
   type QualificationPreflight,
   writeOwnedJsonAtomically,
 } from "./reliability-artifact-owner.mts";
+import {
+  assertReliabilityGcIdentities,
+  assertCanonicalGcQualificationInvocation,
+  gcResourceBudgets,
+  loadReliabilityGcContract,
+  type LoadedReliabilityGcContract,
+} from "./reliability-gc-contract.mts";
+import {
+  QualificationStatsCollector,
+  type QualificationStatsSample,
+} from "./reliability-gc-stats.mts";
+import {
+  gcTuple,
+  retryGcRun,
+  sortedTuples,
+  startGcRun,
+  type GcRunExpectation,
+  type GcRunTuple,
+} from "./reliability-gc-workload.mts";
 
 type QualificationProfile = "smoke" | "nightly" | "release" | "observe";
 type QualificationStage = "all" | "resource-census";
@@ -62,7 +84,7 @@ export const QUALIFICATION_POLICY_SOURCE = String.raw`{
   "schema": "ctxmux.reliability-qualification-policy.v1",
   "profiles": {
     "smoke": { "time_budget_seconds": 60, "soak_seconds": 0, "resource_counts": [1] },
-    "nightly": { "time_budget_seconds": 2700, "soak_seconds": 1800, "resource_counts": [1, 32, 128] },
+    "nightly": { "time_budget_seconds": 4200, "soak_seconds": 1800, "resource_counts": [1, 32, 128] },
     "release": { "time_budget_seconds": 10800, "soak_seconds": 7200, "resource_counts": [1, 32, 128] },
     "observe": { "time_budget_seconds": 2700, "soak_seconds": 0, "resource_counts": [1, 32, 128] }
   },
@@ -185,10 +207,12 @@ interface QualificationProvenance {
   };
   readonly measurement_contract_encoding: "json-stringify-utf8";
   readonly measurement_contract_sha256: string;
+  readonly workload_contract: FileIdentity;
+  readonly workload_helper: FileIdentity;
 }
 
 interface QualificationReceipt {
-  readonly schema: "ctxmux.reliability-qualification.v2";
+  readonly schema: "ctxmux.reliability-qualification.v3";
   status: "running" | "pass" | "fail";
   readonly profile: QualificationProfile;
   readonly observation_round: number | null;
@@ -202,7 +226,15 @@ interface QualificationReceipt {
   readonly action_trace: Array<Record<string, unknown>>;
   readonly stages: StageResult[];
   readonly daemon_logs: string[];
+  readonly stats_logs: StatsArtifactReceipt[];
   error: string | null;
+}
+
+interface StatsArtifactReceipt {
+  readonly path: string;
+  readonly sha256: string;
+  readonly daemon_instance: string;
+  readonly final_seq: number;
 }
 
 interface QualificationOptions {
@@ -212,6 +244,7 @@ interface QualificationOptions {
   readonly seed: number;
   readonly artifactDirectory: string;
   readonly preflight: QualificationPreflight;
+  readonly gc: LoadedReliabilityGcContract;
   readonly timeBudgetSeconds: number;
   readonly resourceCounts: readonly number[];
   readonly resourceModes: readonly WorkloadMode[];
@@ -222,7 +255,14 @@ interface QualificationOptions {
 interface RssSampler {
   readonly peak: () => number;
   readonly sampleCount: () => number;
+  readonly samples: () => readonly TimedRssSample[];
+  readonly maxGapMs: () => number;
   readonly stop: () => Promise<void>;
+}
+
+interface TimedRssSample {
+  readonly timestamp_ms: number;
+  readonly rss_kib: number;
 }
 
 const harnessPath = resolve(
@@ -359,10 +399,10 @@ function recordSupervisorTimeout(options: QualificationOptions): void {
 }
 
 async function qualify(options: QualificationOptions): Promise<void> {
-  const provenance = captureProvenance();
+  const provenance = captureProvenance(options.gc);
   const cpu = cpus();
   const receipt: QualificationReceipt = {
-    schema: "ctxmux.reliability-qualification.v2",
+    schema: "ctxmux.reliability-qualification.v3",
     status: "running",
     profile: options.profile,
     observation_round: options.observationRound,
@@ -382,9 +422,9 @@ async function qualify(options: QualificationOptions): Promise<void> {
       frame_bytes: MAX_FRAME_BYTES,
       retained_output_bytes_per_run: 4 * 1024 * 1024,
       live_event_capacity: 256,
-      global_run_quota: null,
+      global_run_quota: options.gc.contract.bounded_churn.run_ceiling,
       global_attachment_quota: null,
-      exited_run_gc: null,
+      exited_run_gc: "exact_terminal_replacement",
       qualification_stage: options.stage,
       resource_counts: options.resourceCounts,
       resource_modes: options.resourceModes,
@@ -392,11 +432,12 @@ async function qualify(options: QualificationOptions): Promise<void> {
       peak_rss_sample_interval_ms: 25,
       soak_seconds: options.soakSeconds,
       seed_controls: [...QUALIFICATION_POLICY.seed_controls],
-      note: "Absent global quotas and GC remain visible; the harness bounds are qualification workloads, not product limits.",
+      note: "Run retention is bounded by exact terminal replacement; attachment fan-out remains outside this qualification claim.",
     },
     action_trace: [],
     stages: [],
     daemon_logs: [],
+    stats_logs: [],
     error: null,
   };
   const deadline = Date.now() + options.timeBudgetSeconds * 1000;
@@ -454,6 +495,8 @@ async function qualify(options: QualificationOptions): Promise<void> {
     launcher_sha256: provenance.launcher.sha256,
     daemon_sha256: provenance.daemon.sha256,
     measurement_contract_sha256: provenance.measurement_contract_sha256,
+    workload_contract: provenance.workload_contract,
+    workload_helper: provenance.workload_helper,
     invocation_nonce: options.preflight.invocation_nonce,
   });
   try {
@@ -471,6 +514,11 @@ async function qualify(options: QualificationOptions): Promise<void> {
       await stage("stress-and-soak", () =>
         runStressMatrix(options, receipt, trace),
       );
+      if (options.profile === "nightly" || options.profile === "release") {
+        await stage("retained-state-plateau", () =>
+          runRetainedStatePlateau(options, receipt, trace),
+        );
+      }
     }
     const resources = await stage("resource-census", () =>
       runResourceCensus(options, receipt, trace),
@@ -490,6 +538,8 @@ async function qualify(options: QualificationOptions): Promise<void> {
     assertQualificationProvenance(options, provenance);
     trace("provenance.reverified", {
       daemon_sha256: provenance.daemon.sha256,
+      workload_contract: provenance.workload_contract,
+      workload_helper: provenance.workload_helper,
     });
     receipt.status = "pass";
   } catch (error) {
@@ -500,6 +550,717 @@ async function qualify(options: QualificationOptions): Promise<void> {
     receipt.completed_at = new Date().toISOString();
     writeReceipt();
   }
+}
+
+async function runRetainedStatePlateau(
+  options: QualificationOptions,
+  receipt: QualificationReceipt,
+  trace: (action: string, detail?: Record<string, unknown>) => void,
+): Promise<unknown> {
+  assert.deepEqual(options.gc.contract.replay_pressure.profiles, [
+    "nightly",
+    "release",
+  ]);
+  const boundedChurn = [];
+  for (const persistent of [false, true]) {
+    boundedChurn.push(
+      await runBoundedGcChurn(persistent, options, receipt, trace),
+    );
+  }
+  const replayPressure = [];
+  for (const persistent of [false, true]) {
+    replayPressure.push(
+      await runGcReplayPressure(persistent, options, receipt, trace),
+    );
+  }
+  return { bounded_churn: boundedChurn, replay_pressure: replayPressure };
+}
+
+async function runBoundedGcChurn(
+  persistent: boolean,
+  options: QualificationOptions,
+  receipt: QualificationReceipt,
+  trace: (action: string, detail?: Record<string, unknown>) => void,
+): Promise<unknown> {
+  const contract = options.gc.contract.bounded_churn;
+  const mode = persistent ? "persistent" : "memory_only";
+  const directory = await mkdtemp(join(tmpdir(), `ctxmux-gc-${mode}-`));
+  let daemon = await DaemonFixture.start(`gc-${mode}-0`, options, receipt, {
+    directory,
+    persistent,
+    preserveDirectory: true,
+  });
+  const epochs: Array<Record<string, unknown>> = [];
+  const turnovers: Array<Record<string, unknown>> = [];
+  let restart: Record<string, unknown> | null = null;
+  const phaseDeadline =
+    Date.now() +
+    options.gc.contract.replay_pressure.time_budgets_seconds[
+      persistent ? "persistent" : "memory_only"
+    ] *
+      1000;
+  let retained: GcRunExpectation[] = [];
+  let nextIndex = 0;
+  try {
+    const fillStart = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    retained = await startGcWave(
+      daemon.client,
+      options,
+      mode,
+      nextIndex,
+      contract.fill_runs,
+      contract.concurrency,
+    );
+    await verifyLiveGcRuns(
+      daemon.client,
+      retained,
+      options,
+      contract.concurrency,
+    );
+    nextIndex += contract.fill_runs;
+    await assertGcBoundary(daemon, retained, options);
+    const fillEnd = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    assert.equal(
+      fillEnd - fillStart,
+      contract.physical_start_deltas.fill,
+      `${mode} fill physical-start delta drifted`,
+    );
+    const fillPhysicalStartDelta = fillEnd - fillStart;
+    for (let window = 1; window <= contract.turnover_windows; window += 1) {
+      const before = await daemon.synchronizedStats();
+      const replacements = await startGcWave(
+        daemon.client,
+        options,
+        mode,
+        nextIndex,
+        contract.replacements_per_window,
+        contract.concurrency,
+      );
+      nextIndex += contract.replacements_per_window;
+      retained = replacements;
+      await verifyLiveGcRuns(
+        daemon.client,
+        retained,
+        options,
+        contract.concurrency,
+      );
+      await assertGcBoundary(daemon, retained, options);
+      const after = await daemon.synchronizedStats();
+      assert.equal(
+        after.cumulative.physical_starts_total -
+          before.cumulative.physical_starts_total,
+        contract.physical_start_deltas.each_turnover_window,
+        `${mode} turnover ${String(window)} physical-start delta drifted`,
+      );
+      const physicalStartDelta =
+        after.cumulative.physical_starts_total -
+        before.cumulative.physical_starts_total;
+      const retryBefore = after.cumulative.physical_starts_total;
+      await mapLimit(retained, contract.concurrency, async (expected) =>
+        retryGcRun(daemon.client, root, options.gc, expected),
+      );
+      const afterRetry = await daemon.synchronizedStats();
+      assert.equal(
+        afterRetry.cumulative.physical_starts_total - retryBefore,
+        contract.physical_start_deltas.retry_wave,
+        `${mode} retry wave started a physical child`,
+      );
+      const retryPhysicalStartDelta =
+        afterRetry.cumulative.physical_starts_total - retryBefore;
+      const candidateSelectionsDelta =
+        afterRetry.cumulative.candidate_selections_total -
+        before.cumulative.candidate_selections_total;
+      const candidateEvaluationsDelta =
+        afterRetry.cumulative.candidate_evaluations_total -
+        before.cumulative.candidate_evaluations_total;
+      const candidateFencesDelta =
+        afterRetry.cumulative.candidate_fences_total -
+        before.cumulative.candidate_fences_total;
+      const exactReplacementsDelta =
+        afterRetry.cumulative.exact_replacements_total -
+        before.cumulative.exact_replacements_total;
+      assert.equal(candidateSelectionsDelta, contract.replacements_per_window);
+      assert.equal(
+        candidateEvaluationsDelta,
+        contract.replacements_per_window * contract.run_ceiling,
+      );
+      assert.equal(candidateFencesDelta, contract.replacements_per_window);
+      assert.equal(exactReplacementsDelta, contract.replacements_per_window);
+      turnovers.push({
+        window,
+        retained_runs: retained.length,
+        physical_start_delta: physicalStartDelta,
+        retry_physical_start_delta: retryPhysicalStartDelta,
+        candidate_selections_delta: candidateSelectionsDelta,
+        candidate_evaluations_delta: candidateEvaluationsDelta,
+        candidate_fences_delta: candidateFencesDelta,
+        exact_replacements_delta: exactReplacementsDelta,
+      });
+      trace("gc.turnover", {
+        mode,
+        window,
+        retained_runs: retained.length,
+        physical_starts_total: afterRetry.cumulative.physical_starts_total,
+        candidate_selections_delta: candidateSelectionsDelta,
+        candidate_evaluations_delta: candidateEvaluationsDelta,
+        candidate_fences_delta: candidateFencesDelta,
+        exact_replacements_delta: exactReplacementsDelta,
+      });
+      if (persistent && window === contract.persistent_restart_after_window) {
+        const beforeRestart = sortedTuples(
+          await mapLimit(retained, contract.concurrency, async (expected) =>
+            gcTuple(daemon.client, expected),
+          ),
+        );
+        epochs.push(epochReceipt(daemon));
+        await daemon.close();
+        daemon = await DaemonFixture.start(
+          `gc-${mode}-${String(window)}`,
+          options,
+          receipt,
+          { directory, persistent: true, preserveDirectory: true },
+        );
+        assert.equal(
+          (await daemon.synchronizedStats()).cumulative.physical_starts_total,
+          contract.physical_start_deltas.new_daemon_incarnation_initial,
+        );
+        const afterRestart = sortedTuples(
+          await mapLimit(retained, contract.concurrency, async (expected) =>
+            gcTuple(daemon.client, expected),
+          ),
+        );
+        assert.deepEqual(afterRestart, beforeRestart);
+        const restartRetryStart = (await daemon.synchronizedStats()).cumulative
+          .physical_starts_total;
+        await mapLimit(retained, contract.concurrency, async (expected) =>
+          retryGcRun(daemon.client, root, options.gc, expected),
+        );
+        const restartRetryEnd = (await daemon.synchronizedStats()).cumulative
+          .physical_starts_total;
+        assert.equal(restartRetryEnd - restartRetryStart, 0);
+        restart = {
+          after_window: window,
+          before: tupleSetDigest(beforeRestart),
+          after: tupleSetDigest(afterRestart),
+          new_incarnation_initial_physical_starts: (
+            await daemon.synchronizedStats()
+          ).cumulative.physical_starts_total,
+        };
+      }
+    }
+    assert.equal(nextIndex, contract.successful_lifecycles_per_mode);
+    assert.ok(
+      Date.now() <= phaseDeadline,
+      `${mode} churn exceeded its phase budget`,
+    );
+    epochs.push(epochReceipt(daemon));
+    return {
+      mode,
+      successful_lifecycles: nextIndex,
+      fill_physical_start_delta: fillPhysicalStartDelta,
+      turnovers,
+      restart,
+      retained: await gcTupleDigest(
+        daemon.client,
+        retained,
+        contract.concurrency,
+      ),
+      epochs,
+    };
+  } finally {
+    await daemon.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function runGcReplayPressure(
+  persistent: boolean,
+  options: QualificationOptions,
+  receipt: QualificationReceipt,
+  trace: (action: string, detail?: Record<string, unknown>) => void,
+): Promise<unknown> {
+  const contract = options.gc.contract.replay_pressure;
+  const mode = persistent
+    ? "persistent_replay_pressure"
+    : "memory_replay_pressure";
+  const directory = await mkdtemp(join(tmpdir(), `ctxmux-${mode}-`));
+  let daemon = await DaemonFixture.start(mode, options, receipt, {
+    directory,
+    persistent,
+    preserveDirectory: true,
+  });
+  const sampler = startRssSampler(
+    daemon.pid,
+    Number(contract.sampling.rss_interval_ms),
+  );
+  const baseline = sampleProcess(daemon.pid);
+  const cpuStart = performance.now();
+  let retained: GcRunExpectation[] = [];
+  const epochs: Array<Record<string, unknown>> = [];
+  const phaseDeadline =
+    Date.now() +
+    contract.time_budgets_seconds[persistent ? "persistent" : "memory_only"] *
+      1000;
+  try {
+    const fillStart = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    retained = await startGcWave(
+      daemon.client,
+      options,
+      mode,
+      contract.fill_indices.first,
+      contract.fill_runs,
+      contract.concurrency,
+    );
+    await assertGcBoundary(daemon, retained, options);
+    const fillEnd = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    assert.equal(
+      fillEnd - fillStart,
+      contract.owner_budgets.physical_starts_fill_delta,
+      `${mode} fill physical-start delta drifted`,
+    );
+    const before = await strictLiveGcTupleDigest(
+      daemon.client,
+      retained,
+      contract.public_replay_batch_size,
+    );
+    const replacementIndices = range(
+      contract.replacement_indices.first,
+      contract.replacement_indices.last + 1,
+    );
+    const replacementStart = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    const replacements = await mapLimit(
+      replacementIndices,
+      contract.concurrency,
+      (index) => startGcRun(daemon.client, root, options.gc, mode, index),
+    );
+    retained = await resolveRetainedExpectations(daemon.client, [
+      ...retained,
+      ...replacements,
+    ]);
+    await assertGcBoundary(daemon, retained, options);
+    const replacementEnd = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    assert.equal(
+      replacementEnd - replacementStart,
+      contract.owner_budgets.physical_starts_replacement_delta,
+      `${mode} replacement physical-start delta drifted`,
+    );
+    const after = await strictLiveGcTupleDigest(
+      daemon.client,
+      retained,
+      contract.public_replay_batch_size,
+    );
+    const retryStart = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    await mapLimit(retained, contract.concurrency, async (expected) =>
+      retryGcRun(daemon.client, root, options.gc, expected),
+    );
+    const retryEnd = (await daemon.synchronizedStats()).cumulative
+      .physical_starts_total;
+    assert.equal(
+      retryEnd - retryStart,
+      contract.owner_budgets.physical_starts_retry_delta,
+      `${mode} retry wave started a physical child`,
+    );
+    const elapsedSeconds = Math.max(
+      (performance.now() - cpuStart) / 1000,
+      0.001,
+    );
+    const process = sampleProcess(daemon.pid);
+    const averageCpu =
+      ((process.cpu_seconds - baseline.cpu_seconds) / elapsedSeconds) * 100;
+    const quiescentCpuStart = sampleProcess(daemon.pid);
+    const quiescentWallStart = performance.now();
+    await delay(contract.quiescent_seconds * 1000);
+    const quiescentProcess = sampleProcess(daemon.pid);
+    const quiescentCpu =
+      ((quiescentProcess.cpu_seconds - quiescentCpuStart.cpu_seconds) /
+        Math.max((performance.now() - quiescentWallStart) / 1000, 0.001)) *
+      100;
+    await sampler.stop();
+    assert.ok(
+      sampler.maxGapMs() <= Number(contract.sampling.max_rss_sample_gap_ms),
+      `GC RSS sampler gap ${String(sampler.maxGapMs())} ms exceeds contract`,
+    );
+    const budget = gcResourceBudgets(options.gc);
+    assert.ok(
+      quiescentCpu <= budget.quiescent_cpu_core_percent,
+      `${mode} quiescent CPU exceeds the frozen pressure budget`,
+    );
+    const peakThreadDelta = Math.max(0, process.threads - baseline.threads);
+    const peakFdDelta = Math.max(0, process.fds - baseline.fds);
+    assert.ok(peakThreadDelta <= budget.peak_thread_delta);
+    assert.ok(peakFdDelta <= budget.peak_fd_delta);
+    assert.ok(
+      sampler.peak() <=
+        (persistent
+          ? budget.persistent_peak_rss_kib
+          : budget.memory_peak_rss_kib),
+      `${mode} peak RSS exceeds the frozen pressure budget`,
+    );
+    assert.ok(
+      averageCpu <=
+        (persistent
+          ? budget.persistent_average_cpu_core_percent
+          : budget.memory_average_cpu_core_percent),
+      `${mode} average CPU exceeds the frozen pressure budget`,
+    );
+    trace("gc.replay_pressure", {
+      mode,
+      retained_runs: retained.length,
+      replay_bytes: after.total_replay_bytes,
+      peak_rss_kib: sampler.peak(),
+      average_cpu_core_percent: round(averageCpu, 3),
+      quiescent_cpu_core_percent: round(quiescentCpu, 3),
+    });
+    epochs.push(epochReceipt(daemon));
+    let recovered: Record<string, unknown> | null = null;
+    if (persistent && contract.persistent_restart.after_replacement_wave) {
+      const beforeRestart = sortedTuples(
+        await mapLimit(retained, contract.concurrency, async (expected) =>
+          gcTuple(daemon.client, expected),
+        ),
+      );
+      await daemon.close();
+      daemon = await DaemonFixture.start(
+        `${mode}-recovered`,
+        options,
+        receipt,
+        {
+          directory,
+          persistent: true,
+          preserveDirectory: true,
+        },
+      );
+      const recoveredBaseline = sampleProcess(daemon.pid);
+      const recoveredSampler = startRssSampler(
+        daemon.pid,
+        Number(contract.sampling.rss_interval_ms),
+      );
+      const initialStarts = (await daemon.synchronizedStats()).cumulative
+        .physical_starts_total;
+      assert.equal(
+        initialStarts,
+        contract.owner_budgets.physical_starts_new_incarnation_initial,
+      );
+      const recoveredTuples = sortedTuples(
+        await mapLimit(retained, contract.concurrency, async (expected) =>
+          gcTuple(daemon.client, expected),
+        ),
+      );
+      assertRecoveredGcIdentity(recoveredTuples, beforeRestart);
+      for (const [index, tuple] of recoveredTuples.entries()) {
+        const previous = beforeRestart[index]!;
+        if (tuple.oldest_seq > previous.oldest_seq) {
+          assert.equal(
+            tuple.truncated,
+            true,
+            "persistent recovered replay must report the evicted prefix",
+          );
+        }
+      }
+      const recoveredReplayBytes = recoveredTuples.reduce(
+        (sum, tuple) => sum + tuple.replay_bytes,
+        0,
+      );
+      assert.ok(
+        recoveredReplayBytes >= contract.persistent_recovered_replay_min_bytes,
+      );
+      assert.ok(
+        recoveredReplayBytes <= contract.persistent_durable_replay_max_bytes,
+      );
+      await mapLimit(retained, contract.concurrency, async (expected) =>
+        retryGcRun(daemon.client, root, options.gc, expected),
+      );
+      const recoveredStarts = (await daemon.synchronizedStats()).cumulative
+        .physical_starts_total;
+      assert.equal(recoveredStarts, initialStarts);
+      await assertGcBoundary(daemon, retained, options);
+      const recoveredCpuStart = sampleProcess(daemon.pid);
+      const recoveredWallStart = performance.now();
+      await delay(contract.quiescent_seconds * 1000);
+      const recoveredSteady = sampleProcess(daemon.pid);
+      const recoveredThreadDelta = Math.max(
+        0,
+        recoveredSteady.threads - recoveredBaseline.threads,
+      );
+      const recoveredFdDelta = Math.max(
+        0,
+        recoveredSteady.fds - recoveredBaseline.fds,
+      );
+      const recoveredCpu =
+        ((recoveredSteady.cpu_seconds - recoveredCpuStart.cpu_seconds) /
+          Math.max((performance.now() - recoveredWallStart) / 1000, 0.001)) *
+        100;
+      await recoveredSampler.stop();
+      assert.ok(
+        recoveredSampler.maxGapMs() <=
+          Number(contract.sampling.max_rss_sample_gap_ms),
+      );
+      assert.ok(
+        recoveredSteady.rss_kib <= budget.persistent_recovered_steady_rss_kib,
+      );
+      assert.ok(
+        recoveredSampler.peak() <= budget.persistent_recovered_peak_rss_kib,
+      );
+      assert.ok(recoveredCpu <= budget.quiescent_cpu_core_percent);
+      assert.ok(recoveredThreadDelta <= budget.quiescent_thread_delta);
+      assert.ok(recoveredFdDelta <= budget.quiescent_fd_delta);
+      recovered = {
+        replay: tupleSetDigest(recoveredTuples),
+        retry_physical_start_delta: recoveredStarts - initialStarts,
+        steady_rss_kib: recoveredSteady.rss_kib,
+        peak_rss_kib: recoveredSampler.peak(),
+        max_rss_sample_gap_ms: recoveredSampler.maxGapMs(),
+        rss_samples: recoveredSampler.samples(),
+        quiescent_cpu_core_percent: round(recoveredCpu, 3),
+        quiescent_thread_delta: recoveredThreadDelta,
+        quiescent_fd_delta: recoveredFdDelta,
+      };
+      epochs.push(epochReceipt(daemon));
+    }
+    return {
+      mode,
+      before,
+      after,
+      fill_physical_start_delta: fillEnd - fillStart,
+      replacement_physical_start_delta: replacementEnd - replacementStart,
+      retry_physical_start_delta: retryEnd - retryStart,
+      replay_verification_runs_before_replacement: before.count,
+      replay_verification_runs_after_replacement: after.count,
+      peak_rss_kib: sampler.peak(),
+      max_rss_sample_gap_ms: sampler.maxGapMs(),
+      rss_samples: sampler.samples(),
+      average_cpu_core_percent: round(averageCpu, 3),
+      quiescent_cpu_core_percent: round(quiescentCpu, 3),
+      peak_thread_delta: peakThreadDelta,
+      peak_fd_delta: peakFdDelta,
+      recovered,
+      epochs,
+    };
+  } finally {
+    assert.ok(
+      Date.now() <= phaseDeadline,
+      `${mode} pressure exceeded its phase budget`,
+    );
+    await sampler.stop();
+    await daemon.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function verifyLiveGcRuns(
+  client: CtxmuxClient,
+  retained: readonly GcRunExpectation[],
+  options: QualificationOptions,
+  concurrency: number,
+): Promise<void> {
+  const tuples = await mapLimit(retained, concurrency, async (expected) =>
+    gcTuple(client, expected),
+  );
+  for (let index = 0; index < tuples.length; index += 1) {
+    const tuple = tuples[index]!;
+    const expected = retained[index]!;
+    assert.equal(tuple.replay_bytes, expected.payload_bytes);
+    assert.equal(tuple.replay_sha256, expected.payload_sha256);
+    assert.equal(tuple.truncated, false);
+    if (expected.mode === "persistent") {
+      assert.equal(tuple.durable_head_seq, tuple.head_seq);
+    }
+  }
+}
+
+async function strictLiveGcTupleDigest(
+  client: CtxmuxClient,
+  retained: readonly GcRunExpectation[],
+  concurrency: number,
+): Promise<{
+  readonly count: number;
+  readonly total_replay_bytes: number;
+  readonly sha256: string;
+  readonly tuples: readonly GcRunTuple[];
+}> {
+  const tuples = await mapLimit(retained, concurrency, async (expected) => ({
+    expected,
+    tuple: await gcTuple(client, expected),
+  }));
+  for (const { expected, tuple } of tuples) {
+    assert.equal(tuple.replay_bytes, expected.payload_bytes);
+    assert.equal(tuple.replay_sha256, expected.payload_sha256);
+    assert.equal(tuple.truncated, false);
+    if (expected.mode === "persistent_replay_pressure") {
+      assert.equal(tuple.durable_head_seq, tuple.head_seq);
+    }
+  }
+  return tupleSetDigest(sortedTuples(tuples.map(({ tuple }) => tuple)));
+}
+
+async function resolveRetainedExpectations(
+  client: CtxmuxClient,
+  candidates: readonly GcRunExpectation[],
+): Promise<GcRunExpectation[]> {
+  const expectedByRun = new Map(
+    candidates.map((expected) => [expected.run_id, expected] as const),
+  );
+  const listed = await client.list();
+  return listed.map((run) => {
+    const expected = expectedByRun.get(run.id);
+    assert.notEqual(
+      expected,
+      undefined,
+      `Registry retained unexpected pressure Run ${run.id}`,
+    );
+    return expected!;
+  });
+}
+
+async function startGcWave(
+  client: CtxmuxClient,
+  options: QualificationOptions,
+  mode: string,
+  firstIndex: number,
+  count: number,
+  concurrency: number,
+): Promise<GcRunExpectation[]> {
+  return mapLimit(range(firstIndex, firstIndex + count), concurrency, (index) =>
+    startGcRun(client, root, options.gc, mode, index),
+  );
+}
+
+async function assertGcBoundary(
+  daemon: DaemonFixture,
+  retained: readonly GcRunExpectation[],
+  options: QualificationOptions,
+): Promise<void> {
+  const expected = options.gc.contract.bounded_churn.run_ceiling;
+  assert.equal(retained.length, expected);
+  await assertGcBoundaryCount(daemon, expected);
+}
+
+async function assertGcBoundaryCount(
+  daemon: DaemonFixture,
+  expected: number,
+): Promise<QualificationStatsSample> {
+  assert.equal((await daemon.client.list()).length, expected);
+  let observed: QualificationStatsSample | null = null;
+  await withDeadline(
+    poll(async () => {
+      observed = await daemon.synchronizedStats();
+      return boundaryIsQuiescent(observed, expected);
+    }),
+    10_000,
+    "GC owner boundary",
+  );
+  return observed!;
+}
+
+function boundaryIsQuiescent(
+  stats: QualificationStatsSample,
+  expected: number,
+): boolean {
+  return (
+    stats.current.retained_runs === expected &&
+    stats.current.creation_keys === expected &&
+    (
+      [
+        "creation_flights",
+        "publication_reservations",
+        "collecting_tickets",
+        "overlap_owners",
+        "cleanup_owners",
+        "direct_children",
+        "readers",
+        "waiters",
+        "input_drains",
+        "attachments",
+        "tmux_owners",
+      ] as const
+    ).every((name) => stats.current[name] === 0)
+  );
+}
+
+function assertRecoveredGcIdentity(
+  recovered: readonly GcRunTuple[],
+  beforeRestart: readonly GcRunTuple[],
+): void {
+  assert.deepEqual(
+    recovered.map(
+      ({
+        oldest_seq: _,
+        replay_bytes: __,
+        replay_sha256: ___,
+        chunks: ____,
+        truncated: _____,
+        ...tuple
+      }) => tuple,
+    ),
+    beforeRestart.map(
+      ({
+        oldest_seq: _,
+        replay_bytes: __,
+        replay_sha256: ___,
+        chunks: ____,
+        truncated: _____,
+        ...tuple
+      }) => tuple,
+    ),
+    "persistent restart changed the retained Run/key/state/cursor tuple set",
+  );
+}
+
+function tupleSetDigest(tuples: readonly GcRunTuple[]): {
+  readonly count: number;
+  readonly total_replay_bytes: number;
+  readonly sha256: string;
+  readonly tuples: readonly GcRunTuple[];
+} {
+  return {
+    count: tuples.length,
+    total_replay_bytes: tuples.reduce(
+      (sum, tuple) => sum + tuple.replay_bytes,
+      0,
+    ),
+    sha256: sha256(JSON.stringify(tuples)),
+    tuples,
+  };
+}
+
+async function gcTupleDigest(
+  client: CtxmuxClient,
+  retained: readonly GcRunExpectation[],
+  concurrency: number,
+): Promise<{
+  readonly count: number;
+  readonly total_replay_bytes: number;
+  readonly sha256: string;
+  readonly tuples: readonly GcRunTuple[];
+}> {
+  const tuples = sortedTuples(
+    await mapLimit(retained, concurrency, async (expected) =>
+      gcTuple(client, expected),
+    ),
+  );
+  return tupleSetDigest(tuples);
+}
+
+function epochReceipt(daemon: DaemonFixture): Record<string, unknown> {
+  const stats = daemon.latestStats();
+  return {
+    daemon_instance: stats.daemon_instance,
+    seq: stats.seq,
+    current: stats.current,
+    high_water: stats.high_water,
+    cumulative: stats.cumulative,
+  };
+}
+
+function range(first: number, end: number): number[] {
+  return Array.from({ length: end - first }, (_, offset) => first + offset);
 }
 
 async function runChaosOwnerMatrix(
@@ -943,6 +1704,12 @@ async function runSoakScenario(
       peak_rss_kib: sampler.peak(),
       cleanup_threads_delta: cleanup.threads - baseline.threads,
       cleanup_live_children: cleanup.descendants.length,
+      cleanup_attachments: (await daemon.client.list()).reduce(
+        (sum, run) => sum + run.attachments,
+        0,
+      ),
+      rss_samples: sampler.samples(),
+      max_rss_sample_gap_ms: sampler.maxGapMs(),
       retained_runs_are_intentional_without_gc: true,
     };
     trace("stress.soak", result);
@@ -1174,14 +1941,21 @@ class DaemonFixture {
   public readonly client: CtxmuxClient;
   #closed = false;
   #logClosed = false;
+  #statsClosed = false;
+  #statsPersisted = false;
 
   private constructor(
     public readonly label: string,
     public readonly directory: string,
     public readonly socketPath: string,
     public readonly logPath: string,
+    public readonly statsLogPath: string,
     public readonly child: ChildProcess,
     private readonly log: WriteStream,
+    public readonly stats: QualificationStatsCollector,
+    private readonly preserveDirectory: boolean,
+    private readonly receipt: QualificationReceipt,
+    private readonly portableStatsLogPath: string,
   ) {
     this.client = new CtxmuxClient({ socketPath });
   }
@@ -1195,32 +1969,59 @@ class DaemonFixture {
     label: string,
     options: QualificationOptions,
     receipt: QualificationReceipt,
+    settings: {
+      readonly directory?: string;
+      readonly persistent?: boolean;
+      readonly preserveDirectory?: boolean;
+    } = {},
   ): Promise<DaemonFixture> {
     assert.deepEqual(
       fileIdentity(daemonBinary),
       receipt.provenance.daemon,
       "ctxmux daemon bytes changed during qualification",
     );
-    const directory = await mkdtemp(join(tmpdir(), `ctxmux-${label}-`));
+    const directory =
+      settings.directory ?? (await mkdtemp(join(tmpdir(), `ctxmux-${label}-`)));
     const socketPath = join(directory, "ctxmux.sock");
     const logName = `${options.preflight.invocation_nonce}-${sanitize(label)}-daemon.log`;
+    const statsLogName = `${options.preflight.invocation_nonce}-${sanitize(label)}-stats.ndjson`;
     const log = createWriteStream(logName, {
       fd: openFreshOwnedFile(logName),
       autoClose: true,
     });
-    const child = spawn(daemonBinary, ["--socket", socketPath], {
+    const statsFd = 3;
+    const args = ["--socket", socketPath];
+    if (settings.persistent === true) {
+      args.push("--state-dir", join(directory, "state"));
+    }
+    args.push("--qualification-stats-fd", String(statsFd));
+    const child = spawn(daemonBinary, args, {
       cwd: root,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["ignore", "pipe", "pipe", "pipe"],
     });
+    const statsStream = child.stdio[statsFd];
+    assert.ok(
+      statsStream instanceof Readable,
+      "ctxmuxd qualification stats pipe is unavailable",
+    );
+    const stats = new QualificationStatsCollector(statsStream);
     child.stdout?.pipe(log, { end: false });
     child.stderr?.pipe(log, { end: false });
+    const portableStatsLogPath = portablePath(
+      join(options.artifactDirectory, statsLogName),
+    );
     const fixture = new DaemonFixture(
       label,
       directory,
       socketPath,
       logName,
+      statsLogName,
       child,
       log,
+      stats,
+      settings.preserveDirectory ?? false,
+      receipt,
+      portableStatsLogPath,
     );
     receipt.daemon_logs.push(
       portablePath(join(options.artifactDirectory, logName)),
@@ -1235,6 +2036,9 @@ class DaemonFixture {
           }
           try {
             await fixture.client.ping();
+            fixture.stats.bindDaemonInstance(
+              await fixture.client.daemonInstance(),
+            );
             return true;
           } catch {
             return false;
@@ -1245,7 +2049,7 @@ class DaemonFixture {
       );
       return fixture;
     } catch (error) {
-      await fixture.close();
+      await fixture.kill("SIGKILL");
       throw error;
     }
   }
@@ -1253,15 +2057,18 @@ class DaemonFixture {
   public async kill(signal: NodeJS.Signals): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.stats.markClosing();
     this.child.kill(signal);
     await waitForProcess(this.child, 5_000);
+    await this.closeStats(false);
     await this.closeLog();
-    await rm(this.directory, { recursive: true, force: true });
+    await this.removeDirectory();
   }
 
   public async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.stats.markClosing();
     if (this.child.exitCode === null) {
       this.child.kill("SIGINT");
       try {
@@ -1271,8 +2078,66 @@ class DaemonFixture {
         await waitForProcess(this.child, 5_000);
       }
     }
+    await this.closeStats(true);
     await this.closeLog();
-    await rm(this.directory, { recursive: true, force: true });
+    await this.removeDirectory();
+  }
+
+  public latestStats(): QualificationStatsSample {
+    return this.stats.latest();
+  }
+
+  public async synchronizedStats(): Promise<QualificationStatsSample> {
+    const barrier = Date.now();
+    let observed: QualificationStatsSample | null = null;
+    await withDeadline(
+      poll(async () => {
+        observed = this.stats.latestAfter(barrier);
+        return observed !== null;
+      }),
+      2_500,
+      `qualification stats visibility ${this.label}`,
+    );
+    return observed!;
+  }
+
+  private async closeStats(requireFinal: boolean): Promise<void> {
+    if (this.#statsClosed) return;
+    this.#statsClosed = true;
+    const final = await withDeadline(
+      this.stats.finish(requireFinal),
+      5_000,
+      `qualification stats ${this.label}`,
+    );
+    const sha256 = this.persistStats();
+    if (requireFinal) {
+      this.receipt.stats_logs.push({
+        path: this.portableStatsLogPath,
+        sha256,
+        daemon_instance: final.daemon_instance,
+        final_seq: final.seq,
+      });
+    }
+  }
+
+  private persistStats(): string {
+    const raw = this.stats.rawBytes();
+    const digest = sha256(raw);
+    if (this.#statsPersisted) return digest;
+    this.#statsPersisted = true;
+    const fd = openFreshOwnedFile(this.statsLogPath);
+    try {
+      writeFileSync(fd, raw);
+    } finally {
+      closeSync(fd);
+    }
+    return digest;
+  }
+
+  private async removeDirectory(): Promise<void> {
+    if (!this.preserveDirectory) {
+      await rm(this.directory, { recursive: true, force: true });
+    }
   }
 
   private async closeLog(): Promise<void> {
@@ -1316,6 +2181,12 @@ function parseOptions(): QualificationOptions {
     `invalid reliability profile: ${String(rawProfile)}`,
   );
   const profile = rawProfile as QualificationProfile;
+  const gc = loadReliabilityGcContract(root);
+  assertCanonicalGcQualificationInvocation(
+    profile,
+    process.argv.slice(2),
+    process.env,
+  );
   const rawObservationRound = optionValue("--observation-round");
   const observationRound =
     rawObservationRound === undefined
@@ -1327,15 +2198,21 @@ function parseOptions(): QualificationOptions {
     `invalid qualification stage: ${rawStage}`,
   );
   const stage = rawStage as QualificationStage;
-  const seed = positiveInteger(
+  const seed = positiveInteger("GC contract seed", gc.contract.seed);
+  assertFrozenOverride(
     "CTXMUX_RELIABILITY_SEED",
-    process.env.CTXMUX_RELIABILITY_SEED ?? "226004",
+    process.env.CTXMUX_RELIABILITY_SEED,
+    seed,
   );
   const profilePolicy = QUALIFICATION_POLICY.profiles[profile];
   const timeBudgetSeconds = positiveInteger(
+    `GC contract ${profile} time budget`,
+    String(gc.contract.profile_time_budgets_seconds[profile]),
+  );
+  assertFrozenOverride(
     "CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS",
-    process.env.CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS ??
-      String(profilePolicy.time_budget_seconds),
+    process.env.CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS,
+    timeBudgetSeconds,
   );
   const artifactDirectory = resolve(
     root,
@@ -1365,6 +2242,7 @@ function parseOptions(): QualificationOptions {
     process.env.CTXMUX_RELIABILITY_PREFLIGHT,
     profile,
   );
+  assertReliabilityGcIdentities(gc, preflight);
   if (process.env.CTXMUX_RELIABILITY_WORKER === "1") {
     assertInheritedArtifactOwner(preflight.artifact_owner_identity);
   } else {
@@ -1390,9 +2268,42 @@ function parseOptions(): QualificationOptions {
     resourceStartConcurrency <= 128,
     "--resource-start-concurrency must be at most 128",
   );
+  if (profile === "nightly" || profile === "release") {
+    assert.equal(
+      stage,
+      "all",
+      `${profile} requires the complete qualification stage`,
+    );
+    assert.deepEqual(
+      resourceCounts,
+      profilePolicy.resource_counts,
+      `${profile} cannot reduce the canonical resource counts`,
+    );
+    assert.deepEqual(
+      resourceModes,
+      ["idle", "active"],
+      `${profile} cannot reduce the canonical resource modes`,
+    );
+    assert.equal(
+      resourceStartConcurrency,
+      gc.contract.bounded_churn.concurrency,
+      `${profile} cannot change the frozen concurrency`,
+    );
+  }
   const soakSeconds = nonNegativeInteger(
+    `GC contract ${profile} soak`,
+    String(
+      profile === "nightly"
+        ? gc.contract.profile_time_budgets_seconds.nightly_soak
+        : profile === "release"
+          ? gc.contract.profile_time_budgets_seconds.release_soak
+          : 0,
+    ),
+  );
+  assertFrozenOverride(
     "--soak-seconds",
-    optionValue("--soak-seconds") ?? String(profilePolicy.soak_seconds),
+    optionValue("--soak-seconds"),
+    soakSeconds,
   );
   assert.ok(
     soakSeconds === 0 || soakSeconds + 10 * 60 < timeBudgetSeconds,
@@ -1405,6 +2316,7 @@ function parseOptions(): QualificationOptions {
     seed,
     artifactDirectory,
     preflight,
+    gc,
     timeBudgetSeconds,
     resourceCounts,
     resourceModes,
@@ -1481,7 +2393,9 @@ function workloadModeList(raw: string | undefined): readonly WorkloadMode[] {
   return values as WorkloadMode[];
 }
 
-function captureProvenance(): QualificationProvenance {
+function captureProvenance(
+  gc: LoadedReliabilityGcContract,
+): QualificationProvenance {
   const budgets = JSON.parse(readFileSync(budgetPath, "utf8")) as {
     readonly measurement_contract?: unknown;
   };
@@ -1526,6 +2440,8 @@ function captureProvenance(): QualificationProvenance {
     measurement_contract_sha256: sha256(
       JSON.stringify(budgets.measurement_contract),
     ),
+    workload_contract: gc.workload_contract,
+    workload_helper: gc.workload_helper,
   };
 }
 
@@ -1594,6 +2510,10 @@ function assertQualificationProvenance(
     fixedBuildTargetDirectory,
     "qualification must use the fixed provenance build directory",
   );
+  const gc = loadReliabilityGcContract(root);
+  assertReliabilityGcIdentities(gc, options.preflight);
+  assert.deepEqual(provenance.workload_contract, gc.workload_contract);
+  assert.deepEqual(provenance.workload_helper, gc.workload_helper);
   assert.equal(provenance.build.daemon_path, fixedDaemonPath);
   assert.equal(provenance.build.locked, true);
   assert.equal(
@@ -1782,8 +2702,9 @@ function sampleRssKiB(pid: number): number {
 }
 
 function startRssSampler(pid: number, intervalMs: number): RssSampler {
-  let peakRss = sampleRssKiB(pid);
-  let samples = 1;
+  const first = { timestamp_ms: Date.now(), rss_kib: sampleRssKiB(pid) };
+  const observed: TimedRssSample[] = [first];
+  let peakRss = first.rss_kib;
   let stopped = false;
   let samplingError: unknown;
   const loop = (async () => {
@@ -1791,8 +2712,9 @@ function startRssSampler(pid: number, intervalMs: number): RssSampler {
       await delay(intervalMs);
       if (stopped) break;
       try {
-        peakRss = Math.max(peakRss, sampleRssKiB(pid));
-        samples += 1;
+        const sample = { timestamp_ms: Date.now(), rss_kib: sampleRssKiB(pid) };
+        peakRss = Math.max(peakRss, sample.rss_kib);
+        observed.push(sample);
       } catch (error) {
         samplingError = error;
         stopped = true;
@@ -1801,7 +2723,19 @@ function startRssSampler(pid: number, intervalMs: number): RssSampler {
   })();
   return {
     peak: () => peakRss,
-    sampleCount: () => samples,
+    sampleCount: () => observed.length,
+    samples: () => observed,
+    maxGapMs: () =>
+      observed
+        .slice(1)
+        .reduce(
+          (maximum, sample, index) =>
+            Math.max(
+              maximum,
+              sample.timestamp_ms - observed[index]!.timestamp_ms,
+            ),
+          0,
+        ),
     stop: async () => {
       stopped = true;
       await loop;
@@ -2260,6 +3194,19 @@ function nonNegativeInteger(name: string, value: string): number {
     `${name} must be a canonical non-negative integer`,
   );
   return parsed;
+}
+
+function assertFrozenOverride(
+  name: string,
+  raw: string | undefined,
+  expected: number,
+): void {
+  if (raw === undefined) return;
+  assert.equal(
+    raw,
+    String(expected),
+    `${name} cannot override the frozen reliability GC contract`,
+  );
 }
 
 function portablePath(path: string): string {

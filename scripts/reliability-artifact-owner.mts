@@ -20,12 +20,20 @@ export interface InodeIdentity {
 }
 
 export interface QualificationPreflight {
-  readonly schema: "ctxmux.reliability-preflight.v2";
+  readonly schema: "ctxmux.reliability-preflight.v3";
   readonly profile: string;
   readonly not_before: string;
   readonly invocation_nonce: string;
   readonly artifact_owner_identity: InodeIdentity;
   readonly preexisting_receipt_identity: InodeIdentity | null;
+  readonly workload_contract: {
+    readonly path: string;
+    readonly sha256: string;
+  };
+  readonly workload_helper: {
+    readonly path: string;
+    readonly sha256: string;
+  };
 }
 
 const PROFILES = new Set(["smoke", "nightly", "release", "observe"]);
@@ -272,15 +280,19 @@ export function createQualificationPreflight(
   profile: string,
   artifactOwnerIdentity: InodeIdentity,
   preexistingReceiptIdentity: InodeIdentity | null,
+  workloadContract: { readonly path: string; readonly sha256: string },
+  workloadHelper: { readonly path: string; readonly sha256: string },
 ): QualificationPreflight {
   assertProfile(profile);
   return {
-    schema: "ctxmux.reliability-preflight.v2",
+    schema: "ctxmux.reliability-preflight.v3",
     profile,
     not_before: new Date().toISOString(),
     invocation_nonce: randomBytes(32).toString("hex"),
     artifact_owner_identity: artifactOwnerIdentity,
     preexisting_receipt_identity: preexistingReceiptIdentity,
+    workload_contract: workloadContract,
+    workload_helper: workloadHelper,
   };
 }
 
@@ -306,19 +318,36 @@ export function parseQualificationPreflight(
       "invocation_nonce",
       "artifact_owner_identity",
       "preexisting_receipt_identity",
+      "workload_contract",
+      "workload_helper",
     ]) ||
-    preflight.schema !== "ctxmux.reliability-preflight.v2" ||
+    preflight.schema !== "ctxmux.reliability-preflight.v3" ||
     preflight.profile !== expectedProfile ||
     typeof preflight.not_before !== "string" ||
     !Number.isFinite(Date.parse(preflight.not_before)) ||
     typeof preflight.invocation_nonce !== "string" ||
     !INVOCATION_NONCE_PATTERN.test(preflight.invocation_nonce) ||
     !validIdentity(preflight.artifact_owner_identity) ||
-    !(priorIdentity === null || validIdentity(priorIdentity))
+    !(priorIdentity === null || validIdentity(priorIdentity)) ||
+    !validFileIdentity(preflight.workload_contract) ||
+    !validFileIdentity(preflight.workload_helper)
   ) {
     throw new Error(
       "qualification preflight token must bind the expected profile, invocation, owner, and prior receipt",
     );
   }
   return preflight as unknown as QualificationPreflight;
+}
+
+function validFileIdentity(value: unknown): boolean {
+  return (
+    isObject(value) &&
+    sameMembers(Object.keys(value), ["path", "sha256"]) &&
+    typeof value.path === "string" &&
+    value.path.length > 0 &&
+    !value.path.includes("\\") &&
+    !value.path.split("/").includes("..") &&
+    typeof value.sha256 === "string" &&
+    /^[0-9a-f]{64}$/u.test(value.sha256)
+  );
 }
