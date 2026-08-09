@@ -40,6 +40,14 @@
         "glob": "crates/ctxmux-process-stats/src/**",
         "reason": "The audited process-access leaf wraps macOS APIs and cannot execute in the Ubuntu coverage job.",
         "evidence": ".github/ci-evidence-map.json#reliability-macos-process-stats"
+      },
+      {
+        "id": "macos-pty-signal-leaf",
+        "category": "platform_impossible",
+        "language": "rust",
+        "glob": "crates/ctxmux-pty-signal/src/**",
+        "reason": "The audited PTY signalling leaf wraps macOS TIOCSIG and cannot execute in the Ubuntu coverage job.",
+        "evidence": ".github/ci-evidence-map.json#native-macos-pty-signal"
       }
     ]
   },

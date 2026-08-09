@@ -122,6 +122,7 @@ dependencies = [
  "ctxmux-inherited-fd",
  "ctxmux-process-stats",
  "ctxmux-protocol",
+ "ctxmux-pty-signal",
  "ctxmux-sqlite-status",
  "futures-util",
  "portable-pty",
@@ -160,6 +161,13 @@ dependencies = [
  "thiserror 2.0.20",
  "ts-rs",
  "uuid",
+]
+
+[[package]]
+name = "ctxmux-pty-signal"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

@@ -6,12 +6,11 @@ use std::{
 };
 
 use portable_pty::{Child, ExitStatus};
+#[cfg(not(target_os = "macos"))]
+use rustix::process::{getpgid, kill_process_group};
 use rustix::{
     io::Errno,
-    process::{
-        Pid, Signal, WaitId, WaitIdOptions, getpgid, getsid, kill_process, kill_process_group,
-        waitid,
-    },
+    process::{Pid, Signal, WaitId, WaitIdOptions, getsid, kill_process, waitid},
 };
 #[cfg(not(target_os = "macos"))]
 use sysinfo::{ProcessesToUpdate, System};
@@ -55,6 +54,7 @@ impl NativeSession {
 
     /// Deliver SIGINT to the current foreground process group after proving
     /// that group still belongs to this Run's session.
+    #[cfg(not(target_os = "macos"))]
     pub(crate) fn interrupt(&self, foreground_group: u32) -> Result<(), String> {
         if self.leader_is_terminal()? {
             return Err(format!(
@@ -171,28 +171,8 @@ impl NativeSession {
         let mut failures = Vec::new();
         let leader_terminal = self.leader_is_terminal()?;
         for pid in self.members(!leader_terminal)? {
-            match getsid(Some(pid)) {
-                Ok(session) if session == self.id => {
-                    if let Err(error) = kill_process(pid, signal)
-                        && error != Errno::SRCH
-                    {
-                        failures.push(format!(
-                            "failed to signal native session member {}: {error}",
-                            pid.as_raw_pid()
-                        ));
-                    }
-                }
-                Ok(session) => failures.push(format!(
-                    "process {} moved from native session {} to {} before signal",
-                    pid.as_raw_pid(),
-                    self.id.as_raw_pid(),
-                    session.as_raw_pid()
-                )),
-                Err(Errno::SRCH) => {}
-                Err(error) => failures.push(format!(
-                    "failed to revalidate native session member {}: {error}",
-                    pid.as_raw_pid()
-                )),
+            if let Err(error) = self.signal_member(pid, signal) {
+                failures.push(error);
             }
         }
         if failures.is_empty() {
@@ -202,6 +182,36 @@ impl NativeSession {
         }
     }
 
+    /// Revalidate one numeric PID and signal it immediately.
+    ///
+    /// POSIX exposes no portable incarnation handle for an arbitrary session
+    /// descendant. Keep this boundary to the two adjacent syscalls: no wait,
+    /// lock acquisition, allocation, logging, or unrelated I/O belongs between
+    /// the successful `getsid` check and `kill`.
+    fn signal_member(&self, pid: Pid, signal: Signal) -> Result<(), String> {
+        match getsid(Some(pid)) {
+            Ok(session) if session == self.id => match kill_process(pid, signal) {
+                Ok(()) | Err(Errno::SRCH) => Ok(()),
+                Err(error) => Err(format!(
+                    "failed to signal native session member {}: {error}",
+                    pid.as_raw_pid()
+                )),
+            },
+            Ok(session) => Err(format!(
+                "process {} moved from native session {} to {} before signal",
+                pid.as_raw_pid(),
+                self.id.as_raw_pid(),
+                session.as_raw_pid()
+            )),
+            Err(Errno::SRCH) => Ok(()),
+            Err(error) => Err(format!(
+                "failed to revalidate native session member {}: {error}",
+                pid.as_raw_pid()
+            )),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn verify_member(&self, pid: Pid) -> Result<(), String> {
         match getsid(Some(pid)) {
             Ok(session) if session == self.id => Ok(()),
@@ -341,7 +351,7 @@ mod tests {
     use super::NativeSession;
 
     #[test]
-    fn reaped_numeric_session_identity_cannot_signal_a_reincarnated_process() {
+    fn reaped_numeric_session_identity_cannot_regain_census_authority() {
         let mut unrelated = Command::new("/bin/sleep")
             .arg("30")
             .spawn()
@@ -351,8 +361,8 @@ mod tests {
         session.mark_leader_reaped_for_test();
 
         let error = session
-            .interrupt(pid)
-            .expect_err("reaped numeric identity cannot regain signal authority");
+            .members(true)
+            .expect_err("reaped numeric identity cannot regain census authority");
         assert!(error.contains("lost its waitable leader incarnation anchor"));
         assert!(
             Command::new("/bin/sh")
@@ -388,5 +398,34 @@ mod tests {
             .classify_members(vec![own_pid], true, |_| Ok(session_id))
             .expect("matching SID is retained");
         assert_eq!(present, [session_id]);
+    }
+
+    #[test]
+    fn stop_member_signal_rejects_a_pid_outside_the_anchored_session() {
+        let mut unrelated = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn unrelated sentinel");
+        let unrelated_pid = Pid::from_raw(i32::try_from(unrelated.id()).unwrap()).unwrap();
+        let session = NativeSession::from_child_pid(std::process::id())
+            .unwrap()
+            .with_leader_probe_for_test(Arc::new(|| Ok(false)));
+
+        let error = session
+            .signal_member(unrelated_pid, rustix::process::Signal::TERM)
+            .expect_err("foreign session membership must fail before signal");
+        assert!(error.contains("moved from native session"));
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", "kill -0 \"$1\" 2>/dev/null", "ctxmux-fixture"])
+                .arg(unrelated.id().to_string())
+                .status()
+                .expect("probe unrelated sentinel")
+                .success(),
+            "foreign session sentinel was signalled"
+        );
+
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
     }
 }

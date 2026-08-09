@@ -27,6 +27,7 @@ uuid.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ctxmux-process-stats = { path = "../ctxmux-process-stats" }
+ctxmux-pty-signal = { path = "../ctxmux-pty-signal" }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 sysinfo.workspace = true

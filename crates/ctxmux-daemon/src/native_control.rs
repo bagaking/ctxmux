@@ -61,6 +61,7 @@ pub(crate) struct PendingSignal {
 
 /// One direct-child command handled by the existing waiter thread.
 pub(crate) enum ChildCommand {
+    #[cfg(not(target_os = "macos"))]
     Signal {
         signal: RunSignal,
         foreground_group: u32,
@@ -339,6 +340,9 @@ impl InputOperationEntry {
 trait PtyControl: Send {
     fn resize(&self, size: PtySize) -> io::Result<()>;
     fn get_size(&self) -> io::Result<PtySize>;
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground(&self) -> io::Result<()>;
+    #[cfg(not(target_os = "macos"))]
     fn foreground_process_group(&self) -> Option<u32>;
 }
 
@@ -353,6 +357,16 @@ impl PtyControl for PortablePtyControl {
         self.0.get_size().map_err(io::Error::other)
     }
 
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground(&self) -> io::Result<()> {
+        let raw_fd = self
+            .0
+            .as_raw_fd()
+            .ok_or_else(|| io::Error::other("PTY master does not expose a raw descriptor"))?;
+        ctxmux_pty_signal::interrupt_foreground(raw_fd)
+    }
+
+    #[cfg(not(target_os = "macos"))]
     fn foreground_process_group(&self) -> Option<u32> {
         self.0
             .process_group_leader()
@@ -392,6 +406,12 @@ impl NativeControlOwner {
                 Ok(PtySize::default())
             }
 
+            #[cfg(target_os = "macos")]
+            fn interrupt_foreground(&self) -> io::Result<()> {
+                Err(io::Error::other("test PTY has no foreground owner"))
+            }
+
+            #[cfg(not(target_os = "macos"))]
             fn foreground_process_group(&self) -> Option<u32> {
                 None
             }
@@ -640,37 +660,55 @@ impl NativeControlOwner {
                     "signal",
                 )));
             }
-            let sender = state.child_sender.as_ref().ok_or_else(|| {
-                not_applied(ProtocolError::new(
+            if state.child_sender.is_none() {
+                return Err(not_applied(ProtocolError::new(
                     ErrorCode::InvalidRunState,
                     format!("cannot signal exited Run {}", self.inner.run_id),
-                ))
-            })?;
-            let foreground_group = mutex_lock(&self.inner.pty)
-                .as_ref()
-                .and_then(|pty| pty.foreground_process_group())
-                .ok_or_else(|| {
-                    not_applied(ProtocolError::new(
-                        ErrorCode::InvalidRunState,
-                        format!(
-                            "Run {} has no current foreground process group",
-                            self.inner.run_id
-                        ),
-                    ))
-                })?;
-            sender
-                .send(ChildCommand::Signal {
-                    signal,
-                    foreground_group,
-                    reply: reply_tx,
-                })
-                .map_err(|_| {
-                    not_applied(invalid_phase_error(
-                        self.inner.run_id,
-                        state.phase,
-                        "signal",
-                    ))
-                })?;
+                )));
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let result = mutex_lock(&self.inner.pty)
+                    .as_ref()
+                    .ok_or_else(|| "Run PTY owner is no longer available".to_owned())
+                    .and_then(|pty| {
+                        pty.interrupt_foreground()
+                            .map_err(|error| format!("failed to interrupt Run PTY: {error}"))
+                    });
+                let _ = reply_tx.send(result);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let sender = state
+                    .child_sender
+                    .as_ref()
+                    .expect("checked live child sender remains present under owner lock");
+                let foreground_group = mutex_lock(&self.inner.pty)
+                    .as_ref()
+                    .and_then(|pty| pty.foreground_process_group())
+                    .ok_or_else(|| {
+                        not_applied(ProtocolError::new(
+                            ErrorCode::InvalidRunState,
+                            format!(
+                                "Run {} has no current foreground process group",
+                                self.inner.run_id
+                            ),
+                        ))
+                    })?;
+                sender
+                    .send(ChildCommand::Signal {
+                        signal,
+                        foreground_group,
+                        reply: reply_tx,
+                    })
+                    .map_err(|_| {
+                        not_applied(invalid_phase_error(
+                            self.inner.run_id,
+                            state.phase,
+                            "signal",
+                        ))
+                    })?;
+            }
         }
         Ok(PendingSignal {
             run_id: self.inner.run_id,
@@ -1028,7 +1066,7 @@ impl PendingSignal {
             Err(_) => Err(unknown(ProtocolError::new(
                 ErrorCode::InvalidRunState,
                 format!(
-                    "Run {} child owner ended before acknowledging signal",
+                    "Run {} native owner ended before acknowledging signal",
                     self.run_id
                 ),
             ))),
@@ -1486,6 +1524,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    #[cfg(target_os = "macos")]
+    use ctxmux_protocol::RunSignal;
     use ctxmux_protocol::{
         AppliedInputRange, CommandDisposition, ControlReceipt, ErrorCode, InputOperationKey, RunId,
         StopDisposition, TerminalSize,
@@ -1519,6 +1559,12 @@ mod tests {
             Ok(*mutex_lock(&self.size))
         }
 
+        #[cfg(target_os = "macos")]
+        fn interrupt_foreground(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
         fn foreground_process_group(&self) -> Option<u32> {
             None
         }
@@ -1554,12 +1600,37 @@ mod tests {
             Ok(PtySize::default())
         }
 
+        #[cfg(target_os = "macos")]
+        fn interrupt_foreground(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "macos"))]
         fn foreground_process_group(&self) -> Option<u32> {
             None
         }
     }
 
     struct DropCountingWriter(Arc<AtomicUsize>);
+
+    #[cfg(target_os = "macos")]
+    struct InterruptCountingPty(Arc<AtomicUsize>);
+
+    #[cfg(target_os = "macos")]
+    impl PtyControl for InterruptCountingPty {
+        fn resize(&self, _size: PtySize) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_size(&self) -> io::Result<PtySize> {
+            Ok(PtySize::default())
+        }
+
+        fn interrupt_foreground(&self) -> io::Result<()> {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+    }
 
     impl Drop for DropCountingWriter {
         fn drop(&mut self) {
@@ -1737,6 +1808,33 @@ mod tests {
         assert!(error.contains("fixture kill failure"));
         assert!(error.contains("fixture wait failure"));
         assert!(!error.contains("later wait failure"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn interrupt_uses_the_retained_pty_owner_without_a_numeric_child_command() {
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let (owner, child) = owner(
+            Box::new(io::sink()),
+            Box::new(InterruptCountingPty(Arc::clone(&interrupts))),
+            InputDrainGate::default(),
+        );
+
+        let receipt = owner
+            .begin_signal(RunSignal::Interrupt)
+            .expect("admit PTY-owned interrupt")
+            .resolve()
+            .await
+            .expect("PTY owner acknowledges interrupt");
+
+        assert_eq!(
+            receipt,
+            ControlReceipt::Signal {
+                signal: RunSignal::Interrupt
+            }
+        );
+        assert_eq!(interrupts.load(Ordering::Acquire), 1);
+        assert!(matches!(child.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 
     #[test]

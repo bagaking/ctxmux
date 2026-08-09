@@ -944,6 +944,12 @@ test("checked-in policy fixes every current product owner and floor", () => {
         language: "rust",
         glob: "crates/ctxmux-process-stats/src/**",
       },
+      {
+        id: "macos-pty-signal-leaf",
+        category: "platform_impossible",
+        language: "rust",
+        glob: "crates/ctxmux-pty-signal/src/**",
+      },
     ],
   );
 });

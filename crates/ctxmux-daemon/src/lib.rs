@@ -2903,6 +2903,7 @@ fn wait_for_child(
 ) -> NativeWaitOutcome {
     loop {
         match commands.recv_timeout(CHILD_CONTROL_POLL) {
+            #[cfg(not(target_os = "macos"))]
             Ok(ChildCommand::Signal {
                 signal: ctxmux_protocol::RunSignal::Interrupt,
                 foreground_group,

@@ -164,6 +164,20 @@
       ]
     },
     {
+      "id": "native-macos-pty-signal",
+      "kind": "test",
+      "path": "crates/ctxmux-pty-signal/src/lib.rs",
+      "invariants": [
+        "the audited macOS-only leaf uses retained-master TIOCSIG so the tty driver selects the current foreground process group without private process identity APIs or a userspace numeric-PGID signal target"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "reliability-rss-sampler-lifecycle",
       "kind": "test",
       "path": "crates/ctxmux-rss-sampler/tests/lifecycle.rs",
@@ -260,7 +274,7 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/native_session.rs",
       "invariants": [
-        "a waitable leader anchors native session incarnation authority until descendant cleanup, a reaped numeric identity cannot authorize a signal, and only ESRCH proves census absence"
+        "a waitable leader anchors native session census authority until descendant cleanup, a foreign member is rejected immediately before numeric signalling, and only ESRCH proves census absence; the practical POSIX contract retains the documented PID-reuse syscall gap"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
