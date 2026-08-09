@@ -280,11 +280,13 @@ async fn projected_memory_record_blocks_a_second_physical_start_before_publicati
     let temp = tempfile::tempdir().expect("create projected capacity fixture");
     let first_marker = temp.path().join("first.log");
     let rejected_marker = temp.path().join("rejected.log");
+    let first_key = CreateOperationKey::new("projected-first").unwrap();
+    let rejected_key = operation_key_on_other_stripe(&manager, &first_key, "projected-second");
     let first_manager = Arc::clone(&manager);
     let first = tokio::spawn(async move {
         first_manager
             .create(
-                CreateOperationKey::new("projected-first").unwrap(),
+                first_key,
                 CreationRequest::Start {
                     spec: marker_spec(&first_marker, true),
                 },
@@ -299,7 +301,7 @@ async fn projected_memory_record_blocks_a_second_physical_start_before_publicati
 
     let rejected = manager
         .create(
-            CreateOperationKey::new("projected-second").unwrap(),
+            rejected_key,
             CreationRequest::Start {
                 spec: marker_spec(&rejected_marker, false),
             },
