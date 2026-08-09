@@ -112,10 +112,38 @@
       "kind": "test",
       "path": "scripts/reliability-rss-sampler.test.mjs",
       "invariants": [
-        "qualification RSS sampling remains independent of harness event-loop stalls and fails closed when the observed process disappears"
+        "qualification RSS sampling remains independent of harness event-loop stalls, preserves exact cadence and final-frame evidence, and reaps its single helper without descendants"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "reliability-rss-sampler-helper",
+      "kind": "test",
+      "path": "crates/ctxmux-rss-sampler/src/main.rs",
+      "invariants": [
+        "single-PID sysinfo memory refresh preserves the frozen 25/100 ms cadence and the established ps RSS scale"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "reliability-rss-sampler-lifecycle",
+      "kind": "test",
+      "path": "crates/ctxmux-rss-sampler/tests/lifecycle.rs",
+      "invariants": [
+        "the qualification-only native sampler uses one process, produces sequenced real RSS without descendants, and fails when its target disappears"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }

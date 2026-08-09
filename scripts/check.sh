@@ -88,6 +88,7 @@ minimum-3.4|current)
   ;;
 esac
 
+cargo build --locked --quiet --package ctxmux-rss-sampler
 node --test scripts/*.test.mjs
 node scripts/check-fixtures.mjs
 node scripts/ci-reachability.mjs

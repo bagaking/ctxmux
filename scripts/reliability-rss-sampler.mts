@@ -1,11 +1,10 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
 import {
-  isMainThread,
-  parentPort,
-  Worker,
-  workerData,
-} from "node:worker_threads";
+  spawn,
+  type ChildProcess,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
+import { createInterface } from "node:readline";
 
 export interface TimedRssSample {
   readonly timestamp_ms: number;
@@ -20,42 +19,33 @@ export interface RssSampler {
   readonly stop: () => Promise<void>;
 }
 
-export function nextRssSampleDelay(
-  previousStartedAt: number,
-  now: number,
-  intervalMs: number,
-): number {
-  return Math.max(0, previousStartedAt + intervalMs - now);
+interface NativeFrame extends TimedRssSample {
+  readonly schema: "ctxmux.rss-sample.v1";
+  readonly seq: number;
+  readonly final_frame: boolean;
 }
 
-interface SamplerWorkerData {
-  readonly pid: number;
-  readonly interval_ms: number;
-  readonly observation_timeout_ms: number;
-}
-
-interface ReadyMessage {
-  readonly type: "ready";
-}
-
-interface StoppedMessage {
-  readonly type: "stopped";
-  readonly samples: readonly TimedRssSample[];
-}
-
-interface ErrorMessage {
-  readonly type: "error";
-  readonly error: string;
-}
-
-type WorkerMessage = ReadyMessage | StoppedMessage | ErrorMessage;
+const FRAME_FIELDS = [
+  "schema",
+  "timestamp_ms",
+  "seq",
+  "rss_kib",
+  "final_frame",
+] as const;
+const HELPER_READINESS_TIMEOUT_MS = 5_000;
+const HELPER_REAP_TIMEOUT_MS = 5_000;
 
 export async function startRssSampler(
-  pid: number,
+  helperBinary: string,
+  target: number | ChildProcess,
   intervalMs: number,
   maximumGapMs: number,
 ): Promise<RssSampler> {
-  assert.ok(Number.isSafeInteger(pid) && pid > 0, "RSS sampler PID is invalid");
+  const pid = typeof target === "number" ? target : target.pid;
+  assert.ok(
+    pid !== undefined && Number.isSafeInteger(pid) && pid > 0,
+    "RSS sampler PID is invalid",
+  );
   assert.ok(
     Number.isSafeInteger(intervalMs) && intervalMs > 0,
     "RSS sampler interval is invalid",
@@ -64,75 +54,218 @@ export async function startRssSampler(
     Number.isSafeInteger(maximumGapMs) && maximumGapMs >= intervalMs,
     "RSS sampler maximum gap is invalid",
   );
-  const worker = new Worker(new URL(import.meta.url), {
-    workerData: {
-      pid,
-      interval_ms: intervalMs,
-      observation_timeout_ms: maximumGapMs,
-    } satisfies SamplerWorkerData,
-  });
-  let samples: readonly TimedRssSample[] = [];
-  let stopped: Promise<void> | undefined;
-  let workerFailure: Error | undefined;
-  let finalReceived = false;
+  const child = spawn(
+    helperBinary,
+    [
+      "--pid",
+      String(pid),
+      "--interval-ms",
+      String(intervalMs),
+      "--max-gap-ms",
+      String(maximumGapMs),
+    ],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  return ownNativeSampler(
+    child,
+    maximumGapMs,
+    typeof target === "number" ? undefined : target,
+  );
+}
+
+async function ownNativeSampler(
+  child: ChildProcessWithoutNullStreams,
+  maximumGapMs: number,
+  target: ChildProcess | undefined,
+): Promise<RssSampler> {
+  const frames: NativeFrame[] = [];
+  let stderr = "";
+  let stdoutEndedWithNewline = true;
+  let failure: Error | undefined;
+  let stopping: Promise<void> | undefined;
+  let stopRequested = false;
   const ready = Promise.withResolvers<void>();
-  const finished = Promise.withResolvers<void>();
-  const exited = Promise.withResolvers<void>();
+  const finalFrame = Promise.withResolvers<void>();
+  const closed = Promise.withResolvers<number | null>();
+  const outputClosed = Promise.withResolvers<void>();
   const fail = (error: Error): void => {
-    workerFailure ??= error;
-    ready.reject(workerFailure);
-    finished.reject(workerFailure);
+    failure ??= error;
+    ready.reject(failure);
   };
-  worker.on("message", (message: WorkerMessage) => {
-    if (message.type === "ready") {
-      ready.resolve();
-    } else if (message.type === "error") {
-      fail(new Error(message.error));
-    } else {
-      samples = message.samples;
-      finalReceived = true;
-      finished.resolve();
+  const onTargetExit = (): void => {
+    fail(new Error("RSS sampling target exited before sampler completion"));
+    child.kill("SIGKILL");
+  };
+  target?.once("exit", onTargetExit);
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPIPE") fail(error);
+  });
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdoutEndedWithNewline = chunk.at(-1) === 0x0a;
+  });
+  child.once("error", fail);
+  child.once("close", (code) => {
+    if (!stopRequested) {
+      fail(
+        new Error(
+          `RSS sampler terminated before stop was requested with code ${String(code)}: ${stderr.trim()}`,
+        ),
+      );
+    }
+    closed.resolve(code);
+  });
+  const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  lines.once("close", () => outputClosed.resolve());
+  lines.on("line", (line) => {
+    try {
+      const frame = validateFrame(
+        JSON.parse(line) as unknown,
+        frames,
+        maximumGapMs,
+        stopRequested,
+      );
+      frames.push(frame);
+      if (frame.final_frame) finalFrame.resolve();
+      if (frames.length === 1) {
+        assert.equal(
+          frame.final_frame,
+          false,
+          "RSS sampler ended before it became ready",
+        );
+        ready.resolve();
+      }
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+      child.kill("SIGKILL");
     }
   });
-  worker.once("error", fail);
-  worker.once("exit", (code) => {
-    if (code !== 0) {
-      fail(new Error(`RSS sampler worker exited with code ${code}`));
-    } else if (!finalReceived) {
-      fail(new Error("RSS sampler worker exited without a final sample"));
-    }
-    exited.resolve();
-  });
-  void ready.promise.catch(() => undefined);
-  void finished.promise.catch(() => undefined);
+
   try {
-    await ready.promise;
+    const readinessTimeout = setTimeout(() => {
+      fail(new Error("RSS sampler did not emit its first frame in time"));
+      child.kill("SIGKILL");
+    }, HELPER_READINESS_TIMEOUT_MS);
+    await Promise.race([
+      ready.promise,
+      outputClosed.promise.then(async () => {
+        const code = await closed.promise;
+        throw new Error(
+          `RSS sampler exited before readiness with code ${String(code)}: ${stderr.trim()}`,
+        );
+      }),
+    ]).finally(() => clearTimeout(readinessTimeout));
   } catch (error) {
-    await exited.promise;
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await Promise.all([closed.promise, outputClosed.promise]);
+    target?.off("exit", onTargetExit);
     throw error;
   }
 
   const stop = async (): Promise<void> => {
-    if (workerFailure === undefined) worker.postMessage("stop");
+    stopRequested = true;
     try {
-      await finished.promise;
+      if (failure === undefined && child.exitCode === null)
+        child.stdin.end("stop\n");
+      const finalTimeout = setTimeout(
+        () => child.kill("SIGKILL"),
+        maximumGapMs,
+      );
+      await Promise.race([
+        finalFrame.promise,
+        closed.promise.then(() => undefined),
+      ]).finally(() => clearTimeout(finalTimeout));
+      const reapTimeout = setTimeout(
+        () => child.kill("SIGKILL"),
+        HELPER_REAP_TIMEOUT_MS,
+      );
+      let hardReapTimeout: NodeJS.Timeout | undefined;
+      const [code] = await Promise.race([
+        Promise.all([closed.promise, outputClosed.promise]),
+        new Promise<never>((_, reject) => {
+          hardReapTimeout = setTimeout(
+            () =>
+              reject(new Error("RSS sampler did not close and reap in time")),
+            HELPER_REAP_TIMEOUT_MS * 2,
+          );
+        }),
+      ]).finally(() => {
+        clearTimeout(reapTimeout);
+        clearTimeout(hardReapTimeout);
+      });
+      if (failure !== undefined) throw failure;
+      assert.equal(code, 0, `RSS sampler failed: ${stderr.trim()}`);
+      assert.equal(
+        stdoutEndedWithNewline,
+        true,
+        "RSS sampler ended with a partial frame",
+      );
+      assert.equal(
+        frames.filter(({ final_frame }) => final_frame).length,
+        1,
+        "RSS sampler omitted its single final frame",
+      );
+      assert.equal(frames.at(-1)?.final_frame, true);
     } finally {
-      await exited.promise;
+      target?.off("exit", onTargetExit);
     }
-    if (workerFailure !== undefined) throw workerFailure;
   };
 
   return {
     peak: () =>
-      samples.reduce((maximum, sample) => Math.max(maximum, sample.rss_kib), 0),
-    sampleCount: () => samples.length,
-    samples: () => samples,
-    maxGapMs: () => maxSampleGap(samples),
+      frames.reduce((maximum, sample) => Math.max(maximum, sample.rss_kib), 0),
+    sampleCount: () => frames.length,
+    samples: () =>
+      frames.map(({ timestamp_ms, rss_kib }) => ({ timestamp_ms, rss_kib })),
+    maxGapMs: () => maxSampleGap(frames),
     stop: () => {
-      stopped ??= stop();
-      return stopped;
+      stopping ??= stop();
+      return stopping;
     },
   };
+}
+
+function validateFrame(
+  value: unknown,
+  frames: readonly NativeFrame[],
+  maximumGapMs: number,
+  allowFinalFrame: boolean,
+): NativeFrame {
+  assert.ok(
+    value !== null && typeof value === "object" && !Array.isArray(value),
+  );
+  const frame = value as Record<string, unknown>;
+  assert.deepEqual(Object.keys(frame).sort(), [...FRAME_FIELDS].sort());
+  assert.equal(frame.schema, "ctxmux.rss-sample.v1");
+  assert.ok(
+    Number.isSafeInteger(frame.timestamp_ms) && Number(frame.timestamp_ms) >= 0,
+  );
+  assert.ok(Number.isSafeInteger(frame.rss_kib) && Number(frame.rss_kib) > 0);
+  assert.equal(frame.seq, frames.length + 1, "RSS sampler sequence gap");
+  assert.equal(typeof frame.final_frame, "boolean");
+  if (frame.final_frame === true && !allowFinalFrame) {
+    assert.fail(
+      frames.length === 0
+        ? "RSS sampler ended before it became ready"
+        : "RSS sampler ended before stop was requested",
+    );
+  }
+  assert.ok(
+    !frames.some(({ final_frame }) => final_frame),
+    "RSS sampler emitted after final frame",
+  );
+  const previous = frames.at(-1);
+  if (previous !== undefined) {
+    assert.ok(
+      Number(frame.timestamp_ms) >= previous.timestamp_ms &&
+        Number(frame.timestamp_ms) - previous.timestamp_ms <= maximumGapMs,
+      "RSS sampler timestamp gap exceeded its contract",
+    );
+  }
+  return frame as unknown as NativeFrame;
 }
 
 function maxSampleGap(samples: readonly TimedRssSample[]): number {
@@ -144,78 +277,3 @@ function maxSampleGap(samples: readonly TimedRssSample[]): number {
       0,
     );
 }
-
-function sampleRssKiB(pid: number, timeoutMs: number): TimedRssSample {
-  const timestamp = Date.now();
-  const result = spawnSync("ps", ["-o", "rss=", "-p", String(pid)], {
-    encoding: "utf8",
-    killSignal: "SIGKILL",
-    timeout: timeoutMs,
-  });
-  const rss = Number.parseInt(result.stdout.trim(), 10);
-  assert.ok(
-    result.status === 0 && Number.isFinite(rss),
-    `cannot sample RSS for ${pid}: ${result.stderr || result.error?.message || result.stdout || "unknown"}`,
-  );
-  return { timestamp_ms: timestamp, rss_kib: rss };
-}
-
-async function runSamplerWorker(): Promise<void> {
-  assert.notEqual(parentPort, null, "RSS sampler worker has no parent port");
-  const port = parentPort!;
-  const data = workerData as SamplerWorkerData;
-  const samples: TimedRssSample[] = [];
-  let timer: NodeJS.Timeout | undefined;
-  let stopping = false;
-
-  const fail = (error: unknown): void => {
-    const message = error instanceof Error ? error.message : String(error);
-    port.postMessage({ type: "error", error: message } satisfies ErrorMessage);
-    port.close();
-  };
-  const sample = (): void => {
-    samples.push(sampleRssKiB(data.pid, data.observation_timeout_ms));
-  };
-  const schedule = (previousStartedAt: number): void => {
-    const delayMs = nextRssSampleDelay(
-      previousStartedAt,
-      Date.now(),
-      data.interval_ms,
-    );
-    timer = setTimeout(() => {
-      if (stopping) return;
-      try {
-        sample();
-        schedule(samples.at(-1)!.timestamp_ms);
-      } catch (error) {
-        stopping = true;
-        fail(error);
-      }
-    }, delayMs);
-  };
-
-  try {
-    sample();
-    port.postMessage({ type: "ready" } satisfies ReadyMessage);
-    schedule(samples.at(-1)!.timestamp_ms);
-    port.once("message", (message: unknown) => {
-      if (message !== "stop" || stopping) return;
-      stopping = true;
-      if (timer !== undefined) clearTimeout(timer);
-      try {
-        sample();
-        port.postMessage({
-          type: "stopped",
-          samples,
-        } satisfies StoppedMessage);
-      } catch (error) {
-        fail(error);
-      }
-      port.close();
-    });
-  } catch (error) {
-    fail(error);
-  }
-}
-
-if (!isMainThread) void runSamplerWorker();

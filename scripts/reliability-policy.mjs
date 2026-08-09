@@ -49,9 +49,9 @@ export { deriveBudgetCeiling } from "./reliability-budget-contract.mjs";
 
 const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
 const EXPECTED_CHECK_CORE_SHA256 =
-  "b3ae60d8b72e02baeb1cdf3c466057d4df9d26ae0072a95648c44d4720b61b84";
+  "6701ec274df3af84aae25bc7e21bb9d3c9c7ff939c2e3b618024bb6b0bb97b54";
 const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
-  "a041719262dc1187848b9b7f66899c50554464700c2b51411943d4a689329a4f";
+  "ea4b034e70736db01d40e61dc530d81efdc1752f455f56697c93c222b4e11f9b";
 const EXPECTED_QUALIFICATION_POLICY = {
   schema: "ctxmux.reliability-qualification-policy.v1",
   profiles: {
@@ -417,6 +417,8 @@ const V3_PROVENANCE_FIELDS = [
   "harness",
   "launcher",
   "daemon",
+  "rss_sampler",
+  "rss_sampler_source",
   "lockfiles",
   "build",
   "toolchain",
@@ -556,9 +558,13 @@ export function validatePassingQualificationReceiptV3({
     "source/build provenance is not exact and clean",
   );
   expect(
-    [provenance?.harness, provenance?.launcher, provenance?.daemon].every(
-      validFileIdentity,
-    ) &&
+    [
+      provenance?.harness,
+      provenance?.launcher,
+      provenance?.daemon,
+      provenance?.rss_sampler,
+      provenance?.rss_sampler_source,
+    ].every(validFileIdentity) &&
       Array.isArray(provenance?.lockfiles) &&
       provenance.lockfiles.length === 2 &&
       provenance.lockfiles.every(validFileIdentity),
@@ -587,6 +593,11 @@ export function validatePassingQualificationReceiptV3({
         isDeepStrictEqual(provenance.harness, current.harness) &&
         isDeepStrictEqual(provenance.launcher, current.launcher) &&
         isDeepStrictEqual(provenance.daemon, current.daemon) &&
+        isDeepStrictEqual(provenance.rss_sampler, current.rss_sampler) &&
+        isDeepStrictEqual(
+          provenance.rss_sampler_source,
+          current.rss_sampler_source,
+        ) &&
         isDeepStrictEqual(provenance.lockfiles, current.lockfiles) &&
         provenance.measurement_contract_sha256 ===
           current.measurement_contract_sha256,
@@ -603,6 +614,8 @@ export function validatePassingQualificationReceiptV3({
         "--quiet",
         "--package",
         "ctxmux-daemon",
+        "--package",
+        "ctxmux-rss-sampler",
         "--target-dir",
         "target/reliability/provenance-build",
       ],
@@ -768,9 +781,17 @@ function validateV3Trace(value, expectedStages, provenance, preflight, expect) {
       trace[captured[0]]?.harness_sha256 === provenance.harness.sha256 &&
       trace[captured[0]]?.launcher_sha256 === provenance.launcher.sha256 &&
       trace[captured[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
+      trace[captured[0]]?.rss_sampler_sha256 ===
+        provenance.rss_sampler.sha256 &&
+      trace[captured[0]]?.rss_sampler_source_sha256 ===
+        provenance.rss_sampler_source.sha256 &&
       trace[captured[0]]?.measurement_contract_sha256 ===
         provenance.measurement_contract_sha256 &&
       trace[reverified[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
+      trace[reverified[0]]?.rss_sampler_sha256 ===
+        provenance.rss_sampler.sha256 &&
+      trace[reverified[0]]?.rss_sampler_source_sha256 ===
+        provenance.rss_sampler_source.sha256 &&
       isDeepStrictEqual(
         trace[reverified[0]]?.workload_contract,
         provenance.workload_contract,
@@ -1457,6 +1478,10 @@ function currentQualificationIdentity(root, source, budgets) {
     harness: identity("scripts/reliability-qualification.ts"),
     launcher: identity("scripts/check-reliability.sh"),
     daemon: identity("target/reliability/provenance-build/debug/ctxmuxd"),
+    rss_sampler: identity(
+      "target/reliability/provenance-build/debug/ctxmux-rss-sampler",
+    ),
+    rss_sampler_source: identity("crates/ctxmux-rss-sampler/src/main.rs"),
     lockfiles: [identity("Cargo.lock"), identity("package-lock.json")],
     measurement_contract_sha256: crypto
       .createHash("sha256")

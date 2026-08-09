@@ -533,6 +533,17 @@ risks rather than hidden claims. Internal transition high-water counters prove
 subsecond owner maxima; periodic samples prove boundary-zero and the external
 process census only.
 
+The 25 ms pressure sampler is one qualification-only native helper, not a
+daemon capability or protocol surface. It uses `sysinfo` to refresh only the
+named daemon PID, avoiding one `ps` fork/exec per observation while preserving
+the established daemon-only RSS-in-KiB scale. Its NDJSON frames carry exact
+sequence, producer timestamp, RSS, and one final marker. The harness rejects
+sequence or cadence gaps, malformed or partial output, target loss, missing
+final state, and helper failure; every stop or failure path kills when needed
+and waits for the single helper to be reaped. The locked build records the
+helper binary and source identities alongside the daemon before a receipt can
+be accepted.
+
 ## Gate topology
 
 | Lane                  | Trigger                                                                | Required evidence                                                                                                                                                                     | Failure policy                                                                |

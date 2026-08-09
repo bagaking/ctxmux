@@ -849,6 +849,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "crates/ctxmux-daemon/src/qualification_stats.rs",
           "crates/ctxmux-daemon/src/main.rs",
           "crates/ctxmux-inherited-fd/src/lib.rs",
+          "crates/ctxmux-rss-sampler/src/main.rs",
           "crates/ctxmux-client/src/lib.rs",
           "crates/ctxmux-client/src/attachment.rs",
           "crates/ctxmux/src/main.rs",

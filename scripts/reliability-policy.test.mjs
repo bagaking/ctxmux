@@ -421,6 +421,20 @@ function passingNightlyV3ReceiptFixture() {
   const provenance = receipt.value.provenance;
   provenance.workload_contract = structuredClone(gc.workload_contract);
   provenance.workload_helper = structuredClone(gc.workload_helper);
+  provenance.rss_sampler = {
+    path: "target/reliability/provenance-build/debug/ctxmux-rss-sampler",
+    sha256: "e".repeat(64),
+  };
+  provenance.rss_sampler_source = {
+    path: "crates/ctxmux-rss-sampler/src/main.rs",
+    sha256: "a".repeat(64),
+  };
+  provenance.build.argv.splice(
+    provenance.build.argv.indexOf("--target-dir"),
+    0,
+    "--package",
+    "ctxmux-rss-sampler",
+  );
   const epoch = (suffix) => ({
     daemon_instance: `00000000-0000-0000-0000-${suffix.padStart(12, "0")}`,
     seq: 2,
@@ -711,6 +725,8 @@ function passingNightlyV3ReceiptFixture() {
     harness_sha256: provenance.harness.sha256,
     launcher_sha256: provenance.launcher.sha256,
     daemon_sha256: provenance.daemon.sha256,
+    rss_sampler_sha256: provenance.rss_sampler.sha256,
+    rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
     measurement_contract_sha256: provenance.measurement_contract_sha256,
     workload_contract: provenance.workload_contract,
     workload_helper: provenance.workload_helper,
@@ -774,6 +790,8 @@ function passingNightlyV3ReceiptFixture() {
     timestamp: "2026-08-11T00:30:10.000Z",
     action: "provenance.reverified",
     daemon_sha256: provenance.daemon.sha256,
+    rss_sampler_sha256: provenance.rss_sampler.sha256,
+    rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
     workload_contract: provenance.workload_contract,
     workload_helper: provenance.workload_helper,
   });
@@ -1029,6 +1047,10 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
     [
       "workload identity",
       (value) => (value.provenance.workload_contract.sha256 = "f".repeat(64)),
+    ],
+    [
+      "RSS sampler identity",
+      (value) => (value.provenance.rss_sampler.sha256 = "f".repeat(64)),
     ],
     [
       "declared workload envelope",
@@ -2381,15 +2403,18 @@ if [[ $command == git && $# -eq 3 && \${args[0]} == status && \${args[1]} == --p
   exit 0
 fi
 
-if [[ $command == cargo && $# -eq 7 && \${args[0]} == build && \${args[1]} == --locked && \${args[2]} == --quiet && \${args[3]} == --package && \${args[4]} == ctxmux-daemon && \${args[5]} == --target-dir && \${args[6]} == target/reliability/provenance-build ]]; then
+if [[ $command == cargo && $# -eq 9 && \${args[0]} == build && \${args[1]} == --locked && \${args[2]} == --quiet && \${args[3]} == --package && \${args[4]} == ctxmux-daemon && \${args[5]} == --package && \${args[6]} == ctxmux-rss-sampler && \${args[7]} == --target-dir && \${args[8]} == target/reliability/provenance-build ]]; then
   if [[ \${CTXMUX_SENTINEL_PHASE:-} == build ]]; then
     exit 79
   fi
   if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
     daemon=target/reliability/provenance-build/debug/ctxmuxd
+    sampler=target/reliability/provenance-build/debug/ctxmux-rss-sampler
     mkdir -p "\${daemon%/*}"
     : > "$daemon"
+    : > "$sampler"
     chmod 755 "$daemon"
+    chmod 755 "$sampler"
     exit 0
   fi
   exit 97
@@ -2403,7 +2428,7 @@ if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
     exit 0
   fi
   if [[ $command == node && \${args[0]:-} == -e ]]; then
-    printf '["cargo","build","--locked","--quiet","--package","ctxmux-daemon","--target-dir","target/reliability/provenance-build"]'
+    printf '["cargo","build","--locked","--quiet","--package","ctxmux-daemon","--package","ctxmux-rss-sampler","--target-dir","target/reliability/provenance-build"]'
     exit 0
   fi
   if [[ $command == node && $# -eq 5 && \${args[0]} == --import && \${args[1]} == tsx && \${args[2]} == scripts/reliability-qualification.ts && \${args[3]} == --profile ]] &&
@@ -2469,6 +2494,8 @@ exit 98
       "--quiet",
       "--package",
       "ctxmux-daemon",
+      "--package",
+      "ctxmux-rss-sampler",
       "--target-dir",
       "target/reliability/provenance-build",
     ],

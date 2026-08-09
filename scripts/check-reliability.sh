@@ -29,6 +29,7 @@ ctxmux_reliability_preflight=$(
 
 ctxmux_reliability_build_target_dir=target/reliability/provenance-build
 ctxmux_reliability_daemon_bin=$ctxmux_reliability_build_target_dir/debug/ctxmuxd
+ctxmux_reliability_rss_sampler_bin=$ctxmux_reliability_build_target_dir/debug/ctxmux-rss-sampler
 ctxmux_reliability_build_argv=(
   cargo
   build
@@ -36,6 +37,8 @@ ctxmux_reliability_build_argv=(
   --quiet
   --package
   ctxmux-daemon
+  --package
+  ctxmux-rss-sampler
   --target-dir
   "$ctxmux_reliability_build_target_dir"
 )
@@ -48,10 +51,16 @@ else
   ctxmux_reliability_build_worktree_clean=false
 fi
 rm -f -- "$ctxmux_reliability_daemon_bin"
+rm -f -- "$ctxmux_reliability_rss_sampler_bin"
 "${ctxmux_reliability_build_argv[@]}"
 if [[ ! -x $ctxmux_reliability_daemon_bin ]]
 then
   echo "locked build did not produce $ctxmux_reliability_daemon_bin" >&2
+  exit 1
+fi
+if [[ ! -x $ctxmux_reliability_rss_sampler_bin ]]
+then
+  echo "locked build did not produce $ctxmux_reliability_rss_sampler_bin" >&2
   exit 1
 fi
 cargo test --locked --quiet --package ctxmux-daemon socket_path
@@ -63,6 +72,7 @@ ctxmux_reliability_build_argv_json=$(
     "${ctxmux_reliability_build_argv[@]}"
 )
 CTXMUXD_BIN="$PWD/$ctxmux_reliability_daemon_bin" \
+CTXMUX_RSS_SAMPLER_BIN="$PWD/$ctxmux_reliability_rss_sampler_bin" \
 CTXMUX_RELIABILITY_BUILD_ARGV_JSON="$ctxmux_reliability_build_argv_json" \
 CTXMUX_RELIABILITY_BUILD_SOURCE_COMMIT="$ctxmux_reliability_build_source_commit" \
 CTXMUX_RELIABILITY_BUILD_SOURCE_TREE="$ctxmux_reliability_build_source_tree" \

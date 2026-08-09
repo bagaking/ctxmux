@@ -5,6 +5,7 @@ members = [
   "crates/ctxmux-client",
   "crates/ctxmux-daemon",
   "crates/ctxmux-inherited-fd",
+  "crates/ctxmux-rss-sampler",
   "crates/ctxmux-protocol",
   "crates/ctxmux-sqlite-status",
 ]
@@ -24,6 +25,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["event", "fs", "pipe", "process"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
