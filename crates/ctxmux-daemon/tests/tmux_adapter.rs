@@ -192,7 +192,7 @@ impl Drop for TestDaemon {
 }
 
 struct TmuxServer {
-    _fixture_owner: MutexGuard<'static, ()>,
+    _fixture_owner: TmuxFixtureReservation,
     executable: OsString,
     _directory: TempDir,
     socket: PathBuf,
@@ -460,7 +460,7 @@ impl Drop for TmuxServer {
 }
 
 struct FakeTmuxControl {
-    _fixture_owner: MutexGuard<'static, ()>,
+    _fixture_owner: TmuxFixtureReservation,
     _directory: TempDir,
     _socket_listener: UnixListener,
     pane_process: Child,
@@ -886,14 +886,20 @@ exit 0
     }
 }
 
-fn lock_tmux_fixture_owner() -> MutexGuard<'static, ()> {
+struct TmuxFixtureReservation {
+    _guard: MutexGuard<'static, ()>,
+}
+
+fn lock_tmux_fixture_owner() -> TmuxFixtureReservation {
     // Each real/fake fixture starts independent daemon/server process trees.
     // Serialize those owners so cross-test process pressure cannot consume a
     // fixed production wall deadline; concurrency inside one daemon remains
     // explicit in the dedicated adversarial tests.
-    TMUX_FIXTURE_OWNER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    TmuxFixtureReservation {
+        _guard: TMUX_FIXTURE_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    }
 }
 
 impl Drop for FakeTmuxControl {
@@ -1622,6 +1628,7 @@ async fn tmux_server_loss_is_an_explicit_interruption() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_tmux_version_fails_before_server_access() {
+    let _fixture_owner = lock_tmux_fixture_owner();
     let fixture = tempfile::tempdir().expect("create version fixture directory");
     let executable = fixture.path().join("tmux-unsupported");
     std::fs::write(
