@@ -83,8 +83,8 @@ start accepted
 exec. The waiter retains the actual child handle and owns that session identity.
 It observes terminal state with non-reaping `waitid`; the waitable leader remains
 an incarnation anchor until every descendant is gone, and only then is reaped.
-`interrupt` reads the current foreground process group from the PTY, proves a
-member still belongs to the Run session, and delivers `SIGINT` without changing
+On macOS, `interrupt` asks the retained PTY master to generate `SIGINT`; the tty
+driver selects its current foreground process group atomically without changing
 the Run phase. `stop` fences later controls, sends `SIGTERM` to revalidated
 session members, escalates remaining members to `SIGKILL`, reaps the direct
 child, and returns only after the session is empty. Its receipt names whether
@@ -363,11 +363,17 @@ The important guarantees are behavioral, not implied by lock types.
   process-tree policy.
 - Malformed or oversized transport frames can close the connection before a structured protocol error is sent. Explicit error categories cover validly decoded requests and lifecycle failures.
 - Native Stop owns one `portable-pty`-created POSIX session. It terminates and
-  revalidates every member while the unreaped leader anchors the exact session
-  incarnation, then reaps that leader, and reports failure unless that scope is
-  empty. Descendants that create another session are outside this
-  declared ownership boundary. Daemon `Ctrl-C` still stops the listener and
-  drops in-memory ownership; native shutdown policy remains separate work.
+  revalidates every visible local, same-user, non-elevated member while the
+  unreaped leader anchors the session ID, then reaps that leader, and reports
+  failure unless that scope is empty. The member SID check and numeric signal
+  are adjacent syscalls with no wait, lock, allocation, logging, or unrelated
+  I/O between them; observation and permission uncertainty fail closed. POSIX
+  still permits exit and PID reuse in that syscall gap, so this practical
+  contract has a documented residual wrong-process TOCTOU rather than a
+  zero-risk incarnation guarantee. Descendants that create another session are
+  outside this declared ownership boundary. Daemon `Ctrl-C` still stops the
+  listener and drops in-memory ownership; native shutdown policy remains
+  separate work.
 
 ## Backend and Integration remain independent
 

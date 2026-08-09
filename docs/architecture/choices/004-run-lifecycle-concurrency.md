@@ -102,7 +102,15 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
 
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered byte can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
-- `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now preserves the waitable leader as an incarnation anchor through descendant cleanup, then removes signalling authority before publication. A forced same-numeric fixture proves reaped identities cannot regain signal authority or touch the unrelated process.
+- `LC-003` (`d03`): the waiter can reap a child before public state changes;
+  signalling through a cached numeric PID risks a reused process identity. The
+  waiter preserves the waitable leader as a session-ID anchor through
+  descendant cleanup, then removes signalling authority before publication.
+  On macOS, foreground Interrupt instead uses retained-PTY `TIOCSIG`. Stop
+  immediately revalidates each ordinary member SID before numeric signalling,
+  but supported POSIX APIs cannot make those two syscalls one atomic process-
+  incarnation operation. Fixtures prove the reaped-leader and observed foreign-
+  member fences; they do not claim to eliminate the residual PID-reuse TOCTOU.
 - `LC-004`: retrying an unclassified child-status error every 20 ms can retain
   one busy waiter forever, while treating it as exit would fabricate reap and
   permit unsafe key reuse. The first error now transfers the handle into a

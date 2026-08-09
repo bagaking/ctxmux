@@ -67,8 +67,9 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 - `resize`: request new live PTY rows and columns and report the size read back
   from the owning PTY.
 - `signal { signal: interrupt }`: deliver `SIGINT` to the current foreground
-  process group after the daemon owner proves that group still belongs to the
-  native Run session. Interrupt does not enter Stop or end Run ownership.
+  process group. On macOS the retained PTY master uses `TIOCSIG`, so the tty
+  driver selects that group without a userspace numeric-PGID check/signal gap.
+  Interrupt does not enter Stop or end Run ownership.
 - `attach`: return retained output after a cumulative byte cursor and follow new
   output and exit events.
 - `stop`: terminate every process in the daemon-owned native Run session. The
@@ -77,6 +78,12 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   to be reaped and the session to be empty; the receipt reports `graceful` or
   `forced`. A descendant that deliberately enters another session leaves the
   Run ownership boundary and is not claimed by this POSIX session contract.
+  Complete-session Stop supports local, same-user, non-elevated processes. The
+  waiter keeps the session leader waitable, treats observation and permission
+  uncertainty as failure, and performs each `kill` immediately after rechecking
+  that numeric PID's SID. POSIX provides no portable incarnation handle for an
+  arbitrary descendant, so exit and PID reuse between those two syscalls remain
+  a small residual wrong-process TOCTOU; this contract does not claim zero risk.
 
 An unclassified native child-status observation failure is daemon-fatal and
 does not create a terminal Run event. The affected Run rejects further live
@@ -263,8 +270,9 @@ Receipts name the precise owner boundary reached:
 - `resize { applied_size }` is the terminal size read back from the owning PTY
   after resize. It lets clients detect and repair requested-versus-applied
   drift rather than treating the requested size as fact.
-- `signal { signal }` proves the native waiter delivered the requested portable
-  signal to a foreground process group still fenced inside the Run session.
+- `signal { signal }` proves the daemon's retained native PTY owner delivered
+  the requested portable signal. On macOS the kernel selected the PTY's current
+  foreground process group at the `TIOCSIG` mutation boundary.
 - `stop { disposition }` proves the waiter reaped the direct child and observed
   the complete owned session empty. `graceful` means `SIGTERM` was sufficient;
   `forced` means at least one session member required `SIGKILL`. Public

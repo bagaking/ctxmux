@@ -396,7 +396,7 @@ Loom or an equivalent scheduler belongs only around a genuinely small extracted
 owner state machine. ThreadSanitizer can be a scheduled native/dependency smoke,
 but it is not a replacement for protocol-level race oracles.
 
-The current bounded model races public input, resize, Interrupt, and complete-session Stop
+The current bounded model races public input, resize, and complete-session Stop
 through separate socket clients. It accepts only success, the declared
 post-exit rejection, or an owner I/O failure where those outcomes are honest;
 it does not infer byte ordering or resize arbitration. The scheduled runner
@@ -407,10 +407,14 @@ information even when a later command never runs.
 A separate real-process terminal race runs Interrupt and Stop while the leader
 self-terminates. It accepts only an owner-ordered control success or typed
 post-exit rejection, then proves the Run leader is gone, a later Interrupt is
-rejected, and no post-Stop signal side effect appears. Owner-level fixtures
-also force a reaped numeric identity against a live unrelated sentinel, retain
-non-`ESRCH` census uncertainty, and make saturated macOS PID snapshots retry or
-fail instead of proving false quiescence.
+rejected, and no observed post-Stop signal side effect appears. On macOS a real
+PTY fixture and an owner seam prove Interrupt crosses retained-master `TIOCSIG`
+rather than a numeric foreground-PGID command. Owner-level fixtures also reject
+a member outside the anchored session before signal, prevent a reaped numeric
+session identity from regaining census authority, retain non-`ESRCH` census
+uncertainty, and make saturated macOS PID snapshots retry or fail instead of
+proving false quiescence. These fixtures exercise deterministic schedules; they
+do not eliminate or simulate every possible POSIX PID-reuse timing.
 
 ### Benchmarks and performance regression
 
@@ -449,6 +453,10 @@ The security matrix covers:
 
 Every rejected request asserts both the error and negative space: no child, Run,
 file replacement, unrelated signal, credential disclosure, or daemon death.
+For complete-session Stop, this negative-space evidence is bounded to the
+tested local, same-user, non-elevated schedules. POSIX has no portable atomic
+member-identity-plus-signal operation, so the documented validation-to-signal
+PID-reuse TOCTOU remains outside a zero-risk claim.
 
 ### Resource-leak testing
 
