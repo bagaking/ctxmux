@@ -759,7 +759,7 @@ impl NativeControlOwner {
         &self,
     ) -> Result<oneshot::Receiver<Result<StopDisposition, String>>, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let (sender, rejected) = {
+        let (rejected, sent, phase) = {
             let mut state = mutex_lock(&self.inner.state);
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
@@ -783,12 +783,18 @@ impl NativeControlOwner {
                     format!("cannot write to stopping Run {}", self.inner.run_id),
                 ),
             );
-            (sender, rejected)
+            // Stop admission and command publication share this owner lock
+            // with `mark_closed`. Once admission returns, the waiter either
+            // observes this command or the send has already failed closed.
+            let sent = sender.send(ChildCommand::Stop(reply_tx)).is_ok();
+            if !sent {
+                state.phase = ControlPhase::Closed;
+                state.child_sender = None;
+            }
+            (rejected, sent, state.phase)
         };
         send_rejections(rejected);
-        if sender.send(ChildCommand::Stop(reply_tx)).is_err() {
-            self.mark_closed();
-            let phase = mutex_lock(&self.inner.state).phase;
+        if !sent {
             return Err(not_applied(invalid_phase_error(
                 self.inner.run_id,
                 phase,

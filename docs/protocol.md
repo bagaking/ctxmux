@@ -73,11 +73,13 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 - `attach`: return retained output after a cumulative byte cursor and follow new
   output and exit events.
 - `stop`: terminate every process in the daemon-owned native Run session. The
-  waiter sends `SIGTERM`, waits for a bounded graceful phase, then sends
-  `SIGKILL` to revalidated session members. Success requires the direct child
-  to be reaped and the session to be empty; the receipt reports `graceful` or
-  `forced`. A descendant that deliberately enters another session leaves the
-  Run ownership boundary and is not claimed by this POSIX session contract.
+  waiter normally sends `SIGTERM`, waits for a bounded graceful phase, then
+  sends `SIGKILL` to revalidated session members. If Stop is admitted after a
+  receive poll but before the natural-exit fence, the waiter drains that queued
+  command and reuses the same cleanup and reap proof. Success requires the
+  direct child to be reaped and the session to be empty; the receipt reports
+  `graceful` or `forced`. A descendant that deliberately enters another session
+  leaves the Run ownership boundary and is not claimed by this POSIX session contract.
   Complete-session Stop supports local, same-user, non-elevated processes. The
   waiter keeps the session leader waitable, treats observation and permission
   uncertainty as failure, and performs each `kill` immediately after rechecking
@@ -274,8 +276,9 @@ Receipts name the precise owner boundary reached:
   the requested portable signal. On macOS the kernel selected the PTY's current
   foreground process group at the `TIOCSIG` mutation boundary.
 - `stop { disposition }` proves the waiter reaped the direct child and observed
-  the complete owned session empty. `graceful` means `SIGTERM` was sufficient;
-  `forced` means at least one session member required `SIGKILL`. Public
+  the complete owned session empty. `graceful` means no forced phase was needed,
+  including an owner-ordered natural exit after Stop admission; `forced` means
+  at least one session member required `SIGKILL`. Public
   `exited` publication remains a later lifecycle event, so the returned
   `RunInfo` can still say `running` while no owned process remains.
 

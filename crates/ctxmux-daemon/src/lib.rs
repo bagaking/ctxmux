@@ -2940,14 +2940,44 @@ fn wait_for_child(
         }
         match session.leader_is_terminal() {
             Ok(true) => {
+                // Fence admission before draining. Any command admitted before
+                // this lock transition completed its channel send under the
+                // same owner lock and is therefore visible to try_recv below.
+                control.mark_closed();
+                let mut pending_stop = None;
+                while let Ok(command) = commands.try_recv() {
+                    match command {
+                        #[cfg(not(target_os = "macos"))]
+                        ChildCommand::Signal { reply, .. } => {
+                            let _ = reply.send(Err(
+                                "native session leader exited before interrupt".to_owned(),
+                            ));
+                        }
+                        ChildCommand::Stop(reply) => {
+                            if let Some(previous) = pending_stop.replace(reply) {
+                                let _ = previous.send(Err(
+                                    "multiple Stop commands crossed one native owner fence"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                        ChildCommand::CleanupUnpublished => {}
+                    }
+                }
                 match session
                     .finish_after_direct_exit(child.as_mut(), Instant::now() + STOP_FORCED_TIMEOUT)
                 {
-                    Ok(status) => {
+                    Ok((status, disposition)) => {
                         control.mark_reaped();
+                        if let Some(reply) = pending_stop {
+                            let _ = reply.send(Ok(disposition));
+                        }
                         return NativeWaitOutcome::Exited(exit_state(&status));
                     }
                     Err(error) => {
+                        if let Some(reply) = pending_stop {
+                            let _ = reply.send(Err(error.clone()));
+                        }
                         control.mark_wait_authority_lost(error.clone(), child);
                         drop(commands);
                         failure.record(control.run_id(), &error);
@@ -3953,9 +3983,9 @@ mod tests {
 
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
-        CommandDisposition, CreateOperationKey, ErrorCode, ForkPlan, InterruptionReason,
-        ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunSpec, RunState,
-        TerminalSize,
+        CommandDisposition, ControlReceipt, CreateOperationKey, ErrorCode, ForkPlan,
+        InterruptionReason, ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunSpec,
+        RunState, StopDisposition, TerminalSize,
     };
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
@@ -4148,6 +4178,71 @@ mod tests {
         drop(manager);
         drop(control);
         assert_eq!(counts.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitted_stop_receives_natural_exit_reap_after_the_receiver_poll_gap() {
+        let run_id = RunId::new();
+        let counts = Arc::new(WaitFailureCounts::default());
+        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let probe_reached = Arc::new(std::sync::Barrier::new(2));
+        let release_probe = Arc::new(std::sync::Barrier::new(2));
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let session = super::NativeSession::from_child_pid(2_000_000_000)
+            .unwrap()
+            .with_leader_probe_for_test(Arc::new({
+                let probe_reached = Arc::clone(&probe_reached);
+                let release_probe = Arc::clone(&release_probe);
+                let probe_calls = Arc::clone(&probe_calls);
+                move || {
+                    if probe_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                        probe_reached.wait();
+                        release_probe.wait();
+                    }
+                    Ok(true)
+                }
+            }));
+        let waiter_control = control.clone();
+        let waiter_counts = Arc::clone(&counts);
+        let waiter = std::thread::spawn(move || {
+            wait_for_child(
+                Box::new(WaitFailingChild(waiter_counts)),
+                commands,
+                session,
+                &waiter_control,
+                &NativeWaitFailure::default(),
+            )
+        });
+
+        // The waiter has already observed an empty receive poll and is paused
+        // immediately before publishing natural terminal ownership.
+        probe_reached.wait();
+        let pending = control
+            .begin_stop()
+            .expect("Stop is admitted before the natural-exit owner fence");
+        release_probe.wait();
+
+        assert_eq!(
+            pending
+                .resolve(Duration::from_secs(1))
+                .await
+                .expect("admitted Stop reuses final reap evidence"),
+            ControlReceipt::Stop {
+                disposition: StopDisposition::Graceful
+            }
+        );
+        assert!(matches!(
+            waiter.join().expect("join natural-exit waiter"),
+            NativeWaitOutcome::Exited(RunState::Exited {
+                code: 91,
+                signal: None
+            })
+        ));
+        assert_eq!(counts.kill.load(Ordering::Acquire), 0);
+        assert_eq!(counts.wait.load(Ordering::Acquire), 1);
+        control
+            .reap_result()
+            .expect("natural-exit Stop proves reap");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

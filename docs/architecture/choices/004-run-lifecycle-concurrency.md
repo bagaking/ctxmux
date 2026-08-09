@@ -83,7 +83,10 @@ transactional snapshot. Concurrent writers and resizers have no product-level
 arbitration. Signal admission and the Stop phase transition share the native
 owner lock, so Interrupt is either ordered before Stop or rejected without
 application. Stop acknowledgement proves direct-child reap plus an empty owned
-session but still precedes terminal-state publication. Broadcast lag reports
+session but still precedes terminal-state publication. The natural-exit path
+closes command admission under that same lock before draining the channel, so a
+Stop sent after a waiter receive timeout but before the exit fence reuses the
+final cleanup/reap receipt instead of becoming unknown. Broadcast lag reports
 one `latest_output_bytes` but does not automatically replay; callers retain
 their own recovery cursor. Persistent same-epoch exited Runs are not yet
 collected. Shutdown now fences and drains creation and tmux control owners,
@@ -132,6 +135,9 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   stops. Exactly one stop is accepted; other results are limited to the
   protocol's declared success, exited-state, and owner-I/O outcomes without
   inventing writer or resize arbitration.
+- Covered now: a deterministic leader probe pauses after an empty waiter receive
+  poll; a Stop admitted in that gap is drained after the natural-exit fence and
+  receives the same graceful reap evidence.
 - Candidate: broader stop races with hostile output, natural exit, and a
   controllable process/PTY seam under sustained load.
 - Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous byte ranges and exact raw bytes.

@@ -415,6 +415,9 @@ session identity from regaining census authority, retain non-`ESRCH` census
 uncertainty, and make saturated macOS PID snapshots retry or fail instead of
 proving false quiescence. These fixtures exercise deterministic schedules; they
 do not eliminate or simulate every possible POSIX PID-reuse timing.
+A separate deterministic owner fixture pauses natural-exit observation after an
+empty command poll, admits Stop, then proves the terminal fence drains that
+already-sent command and returns the actual reap receipt rather than unknown.
 
 ### Benchmarks and performance regression
 

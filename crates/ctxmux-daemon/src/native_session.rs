@@ -128,7 +128,7 @@ impl NativeSession {
         &mut self,
         child: &mut (dyn Child + Send + Sync),
         deadline: Instant,
-    ) -> Result<ExitStatus, String> {
+    ) -> Result<(ExitStatus, ctxmux_protocol::StopDisposition), String> {
         if !self.leader_is_terminal()? {
             return Err(format!(
                 "native session {} leader was not terminal at natural-exit cleanup",
@@ -136,12 +136,16 @@ impl NativeSession {
             ));
         }
         if self.members(false)?.is_empty() {
-            return self.reap_leader(child);
+            return self
+                .reap_leader(child)
+                .map(|status| (status, ctxmux_protocol::StopDisposition::Graceful));
         }
         self.signal_members(Signal::KILL)?;
         while Instant::now() < deadline {
             if self.members(false)?.is_empty() {
-                return self.reap_leader(child);
+                return self
+                    .reap_leader(child)
+                    .map(|status| (status, ctxmux_protocol::StopDisposition::Forced));
             }
             thread::sleep(QUIESCENCE_POLL.min(deadline.saturating_duration_since(Instant::now())));
         }

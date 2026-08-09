@@ -607,7 +607,8 @@ pub enum RunSignal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum StopDisposition {
-    /// Every session member exited during the bounded graceful phase.
+    /// The session emptied without a forced phase, including an owner-ordered
+    /// natural exit after Stop admission.
     Graceful,
     /// At least one session member required the forced phase.
     Forced,
