@@ -145,6 +145,9 @@ struct PersistenceTestHooks {
 }
 
 #[cfg(test)]
+static NEXT_OPEN_TEST_HOOKS: Mutex<Option<Arc<PersistenceTestHooks>>> = Mutex::new(None);
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum StartCommitCrashPhase {
@@ -387,12 +390,27 @@ impl Persistence {
         state_dir: PathBuf,
         admission_limits: AdmissionLimits,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        #[cfg(test)]
+        let test_hooks = mutex_lock(&NEXT_OPEN_TEST_HOOKS)
+            .take()
+            .unwrap_or_else(|| Arc::new(PersistenceTestHooks::default()));
+        Self::open_with_admission_limits_and_hooks(
+            state_dir,
+            admission_limits,
+            #[cfg(test)]
+            test_hooks,
+        )
+    }
+
+    fn open_with_admission_limits_and_hooks(
+        state_dir: PathBuf,
+        admission_limits: AdmissionLimits,
+        #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
-        #[cfg(test)]
-        let test_hooks = Arc::new(PersistenceTestHooks::default());
         #[cfg(test)]
         let actor_test_hooks = Arc::clone(&test_hooks);
         let join = thread::Builder::new()
@@ -431,6 +449,18 @@ impl Persistence {
             }),
         };
         Ok((persistence, recovered))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_open_after_startup_commit() {
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        hooks.startup_fail_after_commits.store(1, Ordering::Release);
+        let mut next = mutex_lock(&NEXT_OPEN_TEST_HOOKS);
+        assert!(
+            next.is_none(),
+            "only one persistence open fixture may be armed"
+        );
+        *next = Some(hooks);
     }
 
     pub(crate) fn prepare_start(
@@ -3569,10 +3599,12 @@ mod tests {
     use std::{
         collections::BTreeMap,
         env,
-        fs::OpenOptions,
-        os::unix::process::ExitStatusExt,
-        path::Path,
-        process::{Command as ProcessCommand, Output as ProcessOutput, Stdio},
+        fs::{self, OpenOptions},
+        os::unix::{fs::MetadataExt, process::ExitStatusExt},
+        path::{Path, PathBuf},
+        process::{
+            Child as ProcessChild, Command as ProcessCommand, Output as ProcessOutput, Stdio,
+        },
         sync::{Arc, atomic::Ordering},
         thread,
         time::{Duration, Instant},
@@ -3602,6 +3634,9 @@ mod tests {
     const COMMIT_CRASH_NEW_ID: &str = "CTXMUX_COMMIT_CRASH_NEW_ID";
     const COMMIT_CRASH_NEW_KEY: &str = "CTXMUX_COMMIT_CRASH_NEW_KEY";
     const COMMIT_CRASH_ROLE: &str = "CTXMUX_COMMIT_CRASH_ROLE";
+    const STARTUP_SOCKET_STATE_DIR: &str = "CTXMUX_STARTUP_SOCKET_STATE_DIR";
+    const STARTUP_SOCKET_PATH: &str = "CTXMUX_STARTUP_SOCKET_PATH";
+    const STARTUP_SOCKET_ROLE: &str = "CTXMUX_STARTUP_SOCKET_ROLE";
 
     #[test]
     fn state_lock_release_does_not_wait_for_an_inherited_file_description() {
@@ -3959,6 +3994,101 @@ mod tests {
     }
 
     #[test]
+    fn startup_normalization_failure_precedes_public_socket_publication() {
+        let temp = TempDir::new().expect("create public startup failure fixture");
+        let state_dir = temp.path().join("state");
+        let seeded = seed_startup_overflow(&state_dir);
+        let role = uuid::Uuid::new_v4().to_string();
+        let socket = temp.path().join(format!("{role}.sock"));
+        let sentinel = b"ctxmux startup precedence sentinel";
+        fs::write(&socket, sentinel).expect("write socket precedence sentinel");
+        let identity = fs::metadata(&socket)
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+            .expect("read socket precedence identity");
+        let output = run_startup_socket_subprocess(&state_dir, &socket, &role);
+        assert!(
+            output.status.success(),
+            "startup socket helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&socket).expect("read preserved socket sentinel"),
+            sentinel
+        );
+        assert_eq!(
+            fs::metadata(&socket)
+                .map(|metadata| (metadata.dev(), metadata.ino()))
+                .expect("read preserved socket identity"),
+            identity
+        );
+        let connection = Connection::open(state_dir.join(DATABASE_FILE))
+            .expect("inspect committed startup side effect");
+        let (records, running, interrupted): (i64, i64, i64) = connection
+            .query_row(
+                "SELECT count(*), coalesce(sum(state_kind = 'running'), 0),
+                        coalesce(sum(state_kind = 'interrupted'), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read committed startup side effect");
+        assert_eq!((records, running, interrupted), (131, 0, 1));
+        drop(connection);
+
+        let (persistence, recovered) =
+            Persistence::open(&state_dir).expect("restart resumes startup normalization");
+        assert_eq!(recovered.len(), MAX_RETAINED_RUNS);
+        let expected = &seeded[seeded.len() - MAX_RETAINED_RUNS..];
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|run| (run.info.id, run.operation_key.clone()))
+                .collect::<Vec<_>>(),
+            expected.to_vec()
+        );
+        assert_eq!(
+            recovered
+                .last()
+                .expect("retain reconciled prior Run")
+                .info
+                .state,
+            RunState::Interrupted {
+                reason: InterruptionReason::DaemonRestart
+            }
+        );
+        assert_eq!(recovered.last().unwrap().info.pid, None);
+        persistence.assert_exclusive_owner();
+    }
+
+    #[test]
+    #[ignore = "subprocess-only public startup fixture"]
+    fn startup_socket_subprocess() {
+        let state_dir = PathBuf::from(
+            env::var_os(STARTUP_SOCKET_STATE_DIR)
+                .expect("startup socket helper receives state directory"),
+        );
+        let socket = PathBuf::from(
+            env::var_os(STARTUP_SOCKET_PATH).expect("startup socket helper receives socket path"),
+        );
+        let role = env::var(STARTUP_SOCKET_ROLE).expect("startup socket helper receives role");
+        assert_eq!(
+            socket.file_stem().and_then(std::ffi::OsStr::to_str),
+            Some(role.as_str()),
+            "startup socket helper requires its exact per-process role token"
+        );
+        let sentinel = fs::read(&socket).expect("startup socket helper reads sentinel");
+        Persistence::fail_next_open_after_startup_commit();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build startup socket helper runtime");
+        let error = runtime
+            .block_on(crate::serve_with_state_dir(socket.clone(), state_dir))
+            .expect_err("injected startup failure unexpectedly served a socket");
+        assert!(error.to_string().contains("injected interruption"));
+        assert_eq!(fs::read(&socket).unwrap(), sentinel);
+    }
+
+    #[test]
     fn creation_key_index_is_unique_binary_and_exactly_validated() {
         let connection = test_connection();
         validate_existing_schema(&connection).expect("accept canonical schema 2 index");
@@ -4297,7 +4427,7 @@ mod tests {
         new_key: &CreateOperationKey,
     ) -> ProcessOutput {
         let role = new_id.to_string();
-        let mut child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
+        let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
             .arg("--exact")
             .arg("persistence::tests::ordinary_commit_crash_subprocess")
             .arg("--ignored")
@@ -4312,24 +4442,47 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn isolated COMMIT crash fixture");
+        wait_for_test_subprocess(child, &format!("{phase}-COMMIT"))
+    }
+
+    fn run_startup_socket_subprocess(state_dir: &Path, socket: &Path, role: &str) -> ProcessOutput {
+        let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
+            .arg("--exact")
+            .arg("persistence::tests::startup_socket_subprocess")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(STARTUP_SOCKET_STATE_DIR, state_dir)
+            .env(STARTUP_SOCKET_PATH, socket)
+            .env(STARTUP_SOCKET_ROLE, role)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated startup socket fixture");
+        wait_for_test_subprocess(child, "startup-socket")
+    }
+
+    fn wait_for_test_subprocess(mut child: ProcessChild, label: &str) -> ProcessOutput {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if child
                 .try_wait()
-                .expect("poll COMMIT crash fixture")
+                .unwrap_or_else(|error| panic!("poll {label} fixture: {error}"))
                 .is_some()
             {
                 return child
                     .wait_with_output()
-                    .expect("collect COMMIT crash fixture output");
+                    .unwrap_or_else(|error| panic!("collect {label} fixture output: {error}"));
             }
             if Instant::now() >= deadline {
-                child.kill().expect("kill hung COMMIT crash fixture");
+                child
+                    .kill()
+                    .unwrap_or_else(|error| panic!("kill hung {label} fixture: {error}"));
                 let output = child
                     .wait_with_output()
-                    .expect("reap hung COMMIT crash fixture");
+                    .unwrap_or_else(|error| panic!("reap hung {label} fixture: {error}"));
                 panic!(
-                    "{phase}-COMMIT helper exceeded its 10 second budget: {}",
+                    "{label} helper exceeded its 10 second budget: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
             }

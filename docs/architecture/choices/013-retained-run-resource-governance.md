@@ -637,9 +637,10 @@ or deterministic-owner fixtures.
   identity, pre-COMMIT cleanup, persistence-finalize eligibility, same-epoch
   key replacement, restart convergence, bounded startup normalization, real
   process crash immediately before/after ordinary COMMIT, and actor-routed
-  old/new/hybrid COMMIT-error classification. The public
-  startup-before-socket oracle and source-bound Task Gate remain required
-  before T-029 closes.
+  old/new/hybrid COMMIT-error classification. A separate process also proves a
+  committed startup-normalization failure returns before socket publication and
+  the next open resumes to the canonical 128 records. The source-bound Task
+  Gate remains required before T-029 closes.
 - T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
   projection invariant under reverse publication order without a production
   process census.
