@@ -2314,10 +2314,9 @@ test("qualification gates every profile through final harness dispatch", () => {
     path.join(os.tmpdir(), "ctxmux-reliability-policy-"),
   );
   const sentinelLog = path.join(temporaryRoot, "admission.log");
-  const stubDirectory = path.join(temporaryRoot, "bin");
+  const stubPath = path.join(temporaryRoot, "command-stubs.bash");
   const launcherDirectory = path.join(temporaryRoot, "scripts");
   const launcherPath = path.join(launcherDirectory, "check-reliability.sh");
-  fs.mkdirSync(stubDirectory);
   fs.mkdirSync(launcherDirectory);
   fs.copyFileSync(
     path.join(root, "scripts", "check-reliability.sh"),
@@ -2333,14 +2332,13 @@ test("qualification gates every profile through final harness dispatch", () => {
       artifact_owner_identity: { dev: "1", ino: "2" },
       preexisting_receipt_identity: null,
     });
-  // Keep the real Bash launcher boundary while avoiding roughly 95 Node cold
-  // starts in this one policy-envelope fixture. NUL framing preserves argv
-  // exactly without making the stub responsible for JSON escaping.
-  const stubSource = String.raw`#!/bin/bash
-set -euo pipefail
-
-command=\${0##*/}
-args=("$@")
+  // Keep the real Bash launcher boundary while avoiding a child process for
+  // every intercepted command. NUL framing preserves argv exactly without
+  // making the fixture responsible for JSON escaping.
+  const stubSource = String.raw`ctxmux_sentinel_dispatch() {
+local command=$1
+shift
+local args=("$@")
 {
   printf '%s\0%s\0' "$command" "$#"
   printf '%s\0' "$@"
@@ -2366,13 +2364,13 @@ absolute_path() {
 
 if [[ \${CTXMUX_SENTINEL_PHASE:-} == failure ]]; then
   if [[ $command == node && $# -eq 1 && \${args[0]} == scripts/reliability-policy.mjs ]]; then
-    exit 73
+    return 73
   fi
-  exit 99
+  return 99
 fi
 
 if [[ $command == node && $# -eq 1 && \${args[0]} == scripts/reliability-policy.mjs ]]; then
-  exit 0
+  return 0
 fi
 
 if [[ $command == node && $# -eq 5 && \${args[0]} == scripts/reliability-policy.mjs && \${args[1]} == --prepare-qualification-evidence && \${args[3]} == --profile ]] &&
@@ -2380,70 +2378,71 @@ if [[ $command == node && $# -eq 5 && \${args[0]} == scripts/reliability-policy.
   [[ $(absolute_path "\${args[2]}") == $(absolute_path "target/reliability/\${args[4]}/result.json") ]]; then
   preflight_token "\${args[4]}"
   printf '\n'
-  exit 0
+  return 0
 fi
 
 if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification && $command == node && $# -eq 7 && \${args[0]} == scripts/reliability-policy.mjs && \${args[1]} == --qualification-receipt && \${args[3]} == --profile && \${args[5]} == --preflight ]] &&
   valid_profile "\${args[4]}"; then
-  expected_evidence=\${CTXMUX_RELIABILITY_EVIDENCE:-\${CTXMUX_RELIABILITY_ARTIFACT_DIR:-target/reliability/\${args[4]}}/result.json}
+  local expected_evidence=\${CTXMUX_RELIABILITY_EVIDENCE:-\${CTXMUX_RELIABILITY_ARTIFACT_DIR:-target/reliability/\${args[4]}}/result.json}
   if [[ \${args[2]} == "$expected_evidence" && \${args[6]} == "$(preflight_token "\${args[4]}")" ]]; then
-    exit 83
+    return 83
   fi
 fi
 
 if [[ $command == git && $# -eq 2 && \${args[0]} == rev-parse && \${args[1]} == HEAD ]]; then
   printf '1111111111111111111111111111111111111111\n'
-  exit 0
+  return 0
 fi
 if [[ $command == git && $# -eq 2 && \${args[0]} == rev-parse && \${args[1]} == 'HEAD^{tree}' ]]; then
   printf '2222222222222222222222222222222222222222\n'
-  exit 0
+  return 0
 fi
 if [[ $command == git && $# -eq 3 && \${args[0]} == status && \${args[1]} == --porcelain=v1 && \${args[2]} == --untracked-files=all ]]; then
-  exit 0
+  return 0
 fi
 
 if [[ $command == cargo && $# -eq 9 && \${args[0]} == build && \${args[1]} == --locked && \${args[2]} == --quiet && \${args[3]} == --package && \${args[4]} == ctxmux-daemon && \${args[5]} == --package && \${args[6]} == ctxmux-rss-sampler && \${args[7]} == --target-dir && \${args[8]} == target/reliability/provenance-build ]]; then
   if [[ \${CTXMUX_SENTINEL_PHASE:-} == build ]]; then
-    exit 79
+    return 79
   fi
   if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
-    daemon=target/reliability/provenance-build/debug/ctxmuxd
-    sampler=target/reliability/provenance-build/debug/ctxmux-rss-sampler
+    local daemon=target/reliability/provenance-build/debug/ctxmuxd
+    local sampler=target/reliability/provenance-build/debug/ctxmux-rss-sampler
     mkdir -p "\${daemon%/*}"
     : > "$daemon"
     : > "$sampler"
     chmod 755 "$daemon"
     chmod 755 "$sampler"
-    exit 0
+    return 0
   fi
-  exit 97
+  return 97
 fi
 
 if [[ \${CTXMUX_SENTINEL_PHASE:-} == qualification ]]; then
   if [[ $command == cargo && \${args[0]:-} == test ]]; then
-    exit 0
+    return 0
   fi
   if [[ $command == node && $# -eq 4 && \${args[0]} == --import && \${args[1]} == tsx && \${args[2]} == --test && \${args[3]} == packages/sdk/test/wrong-cases.test.ts ]]; then
-    exit 0
+    return 0
   fi
   if [[ $command == node && \${args[0]:-} == -e ]]; then
     printf '["cargo","build","--locked","--quiet","--package","ctxmux-daemon","--package","ctxmux-rss-sampler","--target-dir","target/reliability/provenance-build"]'
-    exit 0
+    return 0
   fi
   if [[ $command == node && $# -eq 5 && \${args[0]} == --import && \${args[1]} == tsx && \${args[2]} == scripts/reliability-qualification.ts && \${args[3]} == --profile ]] &&
-    valid_profile "\${args[4]}" &&
-    [[ \${CTXMUX_RELIABILITY_PREFLIGHT:-} == "$(preflight_token "\${args[4]}")" ]]; then
-    exit 0
+  valid_profile "\${args[4]}" &&
+  [[ \${CTXMUX_RELIABILITY_PREFLIGHT:-} == "$(preflight_token "\${args[4]}")" ]]; then
+    return 0
   fi
 fi
-exit 98
+return 98
+}
+
+node() { ctxmux_sentinel_dispatch node "$@"; }
+git() { ctxmux_sentinel_dispatch git "$@"; }
+cargo() { ctxmux_sentinel_dispatch cargo "$@"; }
 `.replaceAll("\\${", "${");
-  for (const command of ["node", "git", "cargo"]) {
-    fs.writeFileSync(path.join(stubDirectory, command), stubSource, {
-      mode: 0o755,
-    });
-  }
+  fs.writeFileSync(stubPath, stubSource);
   const run = (
     profile,
     phase,
@@ -2457,12 +2456,12 @@ exit 98
         cwd: temporaryRoot,
         encoding: "utf8",
         env: {
-          BASH_ENV: "/dev/null",
+          BASH_ENV: stubPath,
           CTXMUX_SENTINEL_LOG: sentinelLog,
           CTXMUX_SENTINEL_PHASE: phase,
           CTXMUX_SENTINEL_ROOT: fs.realpathSync(temporaryRoot),
           ENV: "/dev/null",
-          PATH: `${stubDirectory}${path.delimiter}${process.env.PATH ?? ""}`,
+          PATH: process.env.PATH ?? "",
           ...environment,
         },
         timeout: 5_000,
