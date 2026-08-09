@@ -11,7 +11,7 @@
     "docs/roadmap.md",
     "docs/plans/public-local-consumer-contract-review.md"
   ],
-  "supersedes_revision": 0,
+  "supersedes_revision": 1,
   "tasks": [
     {
       "id": "T-001",
@@ -44,15 +44,17 @@
       "supersedes": []
     },
     {
-      "id": "T-002",
-      "title": "Own interrupt and complete process-tree stop",
-      "objective": "Expose public interrupt/signal and make Stop terminate the complete native Run process tree through the daemon owner with bounded graceful and forced dispositions.",
-      "outcome": "Embedding clients can interrupt an interactive Run without translating interrupt into Stop, and final Stop leaves no Run-owned descendants or ambiguous live ownership.",
+      "id": "T-004",
+      "title": "Own practical POSIX interrupt and complete-session stop",
+      "objective": "Expose kernel-directed PTY Interrupt on macOS and make Stop terminate the complete visible native Run session under an explicit practical POSIX identity boundary.",
+      "outcome": "Embedding clients can interrupt an interactive Run without translating interrupt into Stop, and successful Stop leaves no visible Run-session descendants while the unavoidable numeric identity reuse race remains explicit.",
       "acceptance": [
         "The public protocol, CLI and TypeScript SDK distinguish interrupt/signal from Stop and return typed unsupported or invalid-target results where a signal is unavailable.",
-        "POSIX native Runs are placed in an owner-controlled process group/session; interrupt targets the intended Run scope, while Stop uses a bounded graceful phase then forcefully terminates remaining descendants.",
-        "Stop completion means the complete owned process tree is quiescent and reaped or an explicit failure/disposition is returned; killing only the shell or direct child is insufficient.",
-        "Real fixtures cover shell grandchildren, stubborn descendants, already-exited races, concurrent interrupt/stop, client disconnect and no effect on unrelated processes."
+        "On macOS, Interrupt uses `TIOCSIG` on the retained PTY master so the kernel targets the current foreground process group without a userspace PGID validation-to-signal gap; no private API, entitlement or synthetic audit token is introduced.",
+        "Stop owns the local, same-user, non-elevated processes still visible in the `portable-pty`-created POSIX session, keeps the leader waitable as the SID incarnation anchor, immediately revalidates each ordinary member before numeric signalling, and performs no waits, locks or unrelated I/O between that revalidation and signal delivery.",
+        "Stop uses bounded graceful and forced phases and succeeds only after the direct child is reaped and the visible session is empty; observation, permission or retained-descendant uncertainty fails explicitly, and killing only the shell or direct child is insufficient.",
+        "Protocol, architecture, testing and threat-boundary documentation state that POSIX PID/PGID reuse between identity check and signal is an unavoidable residual TOCTOU rather than a zero-risk guarantee; a descendant that creates another session is out of scope.",
+        "Real fixtures cover PTY-directed foreground Interrupt, shell grandchildren, stubborn descendants, already-exited races, concurrent Interrupt/Stop, client disconnect, immediate revalidation failure, and unrelated-process sentinels without claiming to eliminate numeric identity reuse."
       ],
       "verification": [
         {
@@ -72,7 +74,9 @@
         "docs/decisions/pty-process-and-signals.md",
         "docs/testing/strategy.md"
       ],
-      "supersedes": []
+      "supersedes": [
+        "T-002"
+      ]
     },
     {
       "id": "T-003",
