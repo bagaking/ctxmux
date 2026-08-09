@@ -645,6 +645,7 @@ async function runBoundedGcChurn(
       nextIndex,
       contract.fill_runs,
       contract.concurrency,
+      phaseDeadline,
     );
     const fill = await strictLiveGcTupleDigest(
       daemon.client,
@@ -670,6 +671,7 @@ async function runBoundedGcChurn(
         nextIndex,
         contract.replacements_per_window,
         contract.concurrency,
+        phaseDeadline,
       );
       nextIndex += contract.replacements_per_window;
       retained = replacements;
@@ -844,6 +846,7 @@ async function runGcReplayPressure(
       contract.fill_indices.first,
       contract.fill_runs,
       contract.concurrency,
+      phaseDeadline,
     );
     await assertGcBoundary(daemon, retained, options);
     const fillEnd = (await daemon.synchronizedStats()).cumulative
@@ -864,10 +867,14 @@ async function runGcReplayPressure(
     );
     const replacementStart = (await daemon.synchronizedStats()).cumulative
       .physical_starts_total;
-    const replacements = await mapLimit(
-      replacementIndices,
+    const replacements = await startGcWave(
+      daemon.client,
+      options,
+      mode,
+      replacementIndices[0]!,
+      replacementIndices.length,
       contract.concurrency,
-      (index) => startGcRun(daemon.client, root, options.gc, mode, index),
+      phaseDeadline,
     );
     retained = await resolveRetainedExpectations(daemon.client, [
       ...retained,
@@ -1073,6 +1080,10 @@ async function runGcReplayPressure(
       }
       epochs.push(epochReceipt(daemon));
     }
+    assert.ok(
+      Date.now() <= phaseDeadline,
+      `${mode} pressure exceeded its phase budget`,
+    );
     return {
       mode,
       before,
@@ -1102,10 +1113,6 @@ async function runGcReplayPressure(
         await rm(directory, { recursive: true, force: true });
       }
     }
-    assert.ok(
-      Date.now() <= phaseDeadline,
-      `${mode} pressure exceeded its phase budget`,
-    );
   }
 }
 
@@ -1168,10 +1175,20 @@ async function startGcWave(
   firstIndex: number,
   count: number,
   concurrency: number,
+  phaseDeadline: number,
 ): Promise<GcRunExpectation[]> {
-  return mapLimit(range(firstIndex, firstIndex + count), concurrency, (index) =>
-    startGcRun(client, root, options.gc, mode, index),
+  const result = await mapLimitUntilFailure(
+    range(firstIndex, firstIndex + count),
+    concurrency,
+    (index) => startGcRun(client, root, options.gc, mode, index, phaseDeadline),
   );
+  if (result.failure !== undefined) throw result.failure.error;
+  assert.equal(
+    result.outputs.length,
+    count,
+    `${mode} GC wave did not settle every scheduled Run`,
+  );
+  return result.outputs;
 }
 
 async function assertGcBoundary(

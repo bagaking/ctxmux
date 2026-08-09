@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { setTimeout as delay } from "node:timers/promises";
 
-import {
+import type {
+  CreateOperationKey,
   CtxmuxClient,
-  type CreateOperationKey,
-  type RunId,
-  type RunInfo,
-  type RunSpec,
+  RunId,
+  RunInfo,
+  RunSpec,
 } from "../packages/sdk/src/index.ts";
 import type { LoadedReliabilityGcContract } from "./reliability-gc-contract.mts";
+import { startAndWaitForGcRunExit } from "./reliability-gc-deadline.mts";
 
 export interface GcRunExpectation {
   readonly mode: string;
@@ -79,11 +79,22 @@ export async function startGcRun(
   loaded: LoadedReliabilityGcContract,
   mode: string,
   index: number,
+  phaseDeadline: number,
 ): Promise<GcRunExpectation> {
   const spec = gcSpec(root, loaded, mode, index);
   const operationKey = gcOperationKey(loaded, mode, index);
-  const run = await client.start(spec, operationKey);
-  await waitForExit(client, run.id);
+  const run = await startAndWaitForGcRunExit(
+    {
+      start: () => client.start(spec, operationKey),
+      status: (id) => client.status(id as RunId),
+    },
+    {
+      mode,
+      index,
+      operation_key: operationKey,
+    },
+    phaseDeadline,
+  );
   const payload = payloadIdentity(loaded, mode, index);
   return {
     mode,
@@ -258,13 +269,4 @@ function sourceDigestFromOperationKey(operationKey: string): string {
     "GC operation key no longer carries its source digest",
   );
   return marker![1]!;
-}
-
-async function waitForExit(client: CtxmuxClient, id: RunId): Promise<void> {
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if ((await client.status(id)).state.type !== "running") return;
-    await delay(10);
-  }
-  assert.fail(`GC Run ${id} did not reach a terminal state`);
 }
