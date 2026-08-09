@@ -18,7 +18,7 @@
     "claim_scope": "locally_observed",
     "binary_source_attestation": false,
     "source": {
-      "commit": "24e32a53605d22739b98cfe86c5ad0b214006bd4",
+      "commit": "bcd06b157d49fd79423b5208f729904a7eaf4163",
       "tree": "62aee545d8f5af7781b9d77c8ad3fa46a595a89b",
       "worktree": {
         "status_format": "git-status-porcelain-v1-z",
@@ -60,7 +60,7 @@
         "--target-dir",
         "target/reliability/provenance-build"
       ],
-      "source_commit": "24e32a53605d22739b98cfe86c5ad0b214006bd4",
+      "source_commit": "bcd06b157d49fd79423b5208f729904a7eaf4163",
       "source_tree": "62aee545d8f5af7781b9d77c8ad3fa46a595a89b",
       "worktree_clean": true,
       "target_directory": "target/reliability/provenance-build",
@@ -105,7 +105,7 @@
     {
       "timestamp": "2026-08-10T19:33:10.558Z",
       "action": "provenance.captured",
-      "source_commit": "24e32a53605d22739b98cfe86c5ad0b214006bd4",
+      "source_commit": "bcd06b157d49fd79423b5208f729904a7eaf4163",
       "source_tree": "62aee545d8f5af7781b9d77c8ad3fa46a595a89b",
       "worktree_clean": true,
       "harness_sha256": "851c1dbf5c9f3601091efa95fb8e3df8083bdb1576d28e471f7b172f4ddc7bcc",

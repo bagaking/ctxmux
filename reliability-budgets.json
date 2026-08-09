@@ -12,7 +12,7 @@
       "logical_cpus": 14,
       "cpu_model": "Apple M4 Pro"
     },
-    "evidence_scope": "This local baseline binds clean source commit 24e32a53605d22739b98cfe86c5ad0b214006bd4 and tree 62aee545d8f5af7781b9d77c8ad3fa46a595a89b; each receipt carries the exact harness, launcher, daemon binary, lockfiles, build, toolchain, workload, and measurement identities. Remote nightly, release, and other-platform qualification remain pending until their own artifacts exist.",
+    "evidence_scope": "This local baseline binds clean source commit bcd06b157d49fd79423b5208f729904a7eaf4163 and tree 62aee545d8f5af7781b9d77c8ad3fa46a595a89b; bcd06b is the current-history identity of the tree-equivalent baseline commit after timestamp-only history rewriting. Each receipt carries the exact harness, launcher, daemon binary, lockfiles, build, toolchain, workload, and measurement identities. Remote nightly, release, and other-platform qualification remain pending until their own artifacts exist.",
     "resource_start_concurrency": 8,
     "peak_rss_sample_interval_ms": 25,
     "policy_contracts": [
@@ -24,15 +24,15 @@
     "raw_receipts": [
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r1.json",
-        "sha256": "5307aca98b2ed5889f363d6b99cc22b64e3ca562ddcf5f9a02d3275b8c6f5ad4"
+        "sha256": "943df55c0e9aab3eb361894d22bc2faed0f87ad9213813dca39a114a1129bd29"
       },
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r2.json",
-        "sha256": "55d030503b69bba00460a1aff8a06e2400905fe1530d243ab20fec9e14e903c0"
+        "sha256": "241bf82cb60f92abb672731fc834502da8c238ecf2f593b3e6ce9a695b90ddca"
       },
       {
         "path": "fixtures/reliability/observe-darwin-arm64-r3.json",
-        "sha256": "ebb64d7c55a2c1b9aae963d58ce3e1b0a2a6cf59448037b90f5a0bb0bdaf7997"
+        "sha256": "ddaa513d937145e9a46dcb43fb14a05f1a20921801f4ab2cf2822433e14b1efb"
       }
     ],
     "observed_maxima": {
