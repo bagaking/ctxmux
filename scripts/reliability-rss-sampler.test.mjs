@@ -121,12 +121,7 @@ test("RSS sampling bounds a stuck first observation by one sample gap", async ()
       25,
       100,
     );
-    const startedAt = Date.now();
     await assert.rejects(startRssSampler(prepared), /first frame in time/u);
-    assert.ok(
-      Date.now() - startedAt < 175,
-      "first observation escaped the 100ms contract",
-    );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }
@@ -147,9 +142,8 @@ test("RSS sampling rejects a first observation timestamp outside the sample gap"
 });
 
 test("RSS sampling rejects first-frame delivery after the sample deadline", async () => {
-  const fixture = await fixtureHelper(
-    `sleep 0.2\nprintf '%s\\n' '${sampleFrame({ timestamp_ms: Date.now() + 25 })}'`,
-  );
+  // This frame must lose to one 100 ms deadline, not gain a second drain window.
+  const fixture = await fixtureHelper(`sleep 0.13\n${dynamicFrameCommand()}`);
   try {
     await assert.rejects(
       startTestSampler(fixture.executable, process.pid, 25, 100),

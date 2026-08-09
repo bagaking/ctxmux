@@ -271,12 +271,13 @@ async function prepareNativeSampler(
       "RSS sampler preparation can start only once",
     );
     observationWindowStartedAtMs = Date.now();
+    const observationDeadlineMs = observationWindowStartedAtMs + maximumGapMs;
     child.stdin.write("start\n");
     try {
       await Promise.race([
         awaitBounded(
           ready.promise,
-          maximumGapMs,
+          Math.max(0, observationDeadlineMs - Date.now()),
           "RSS sampler did not emit its first frame in time",
         ),
         outputClosed.promise.then(async () => {
