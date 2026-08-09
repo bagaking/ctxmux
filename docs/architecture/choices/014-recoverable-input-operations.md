@@ -35,13 +35,19 @@ complete payload and flush cross the PTY write boundary, and returns
 every successful legacy or recoverable PTY write so other input cannot be
 silently skipped.
 
-Operation identity is the tuple `(daemon incarnation, RunId, key)`. A
-byte-exact matching request for that tuple joins a pending operation or returns
-its completed result without another write. Reusing the same per-Run key with a
-different expected cursor or payload is a typed conflict. Keys on different
-Runs do not require a daemon-global index. An unexpected cursor is rejected
-before mutation. Empty recoverable input is rejected because it cannot leave
-cursor evidence after result eviction.
+Operation identity is the tuple `(daemon incarnation, RunId, key)`. While that
+tuple is pending or retained, a byte-exact matching request joins the operation
+or returns its completed result without another write; a different expected
+cursor or payload is a typed conflict. Keys on different Runs do not require a
+daemon-global index. Clients use a fresh key for every new logical operation.
+
+Key uniqueness is not permanent within an incarnation. After a completed
+result is evicted, the old key may identify a new operation only when the caller
+also supplies the current cursor. Retrying the original request still carries
+its older cursor and fails before mutation, so eviction cannot duplicate its
+bytes. This avoids unbounded tombstones or a second identity owner. Empty
+recoverable input is rejected because it cannot leave cursor evidence after
+result eviction.
 
 The per-Run result ledger is bounded by both entry count and retained request
 bytes. Once a successful result is evicted, its original expected cursor is
@@ -60,13 +66,15 @@ be committed atomically without a cooperating target protocol.
 ## Success boundary
 
 ```text
-accepted
+admitted / pending                         # not a wire success receipt
   -> bytes_applied [start_byte, end_byte)  # ctxmux
   -> acknowledged                         # Integration / target protocol
   -> replied or settled                    # Agent harness
 ```
 
-The daemon owns only admission and `bytes_applied`. It must not expose Agent,
+The daemon owns only admission and `bytes_applied`. Generation 7 does not add a
+separate asynchronous `accepted` frame; public success remains the final
+applied range. The daemon must not expose Agent,
 Message, Delivery, ACK, Reply, Task, dispatch, DAG, or UI-timeline concepts.
 
 ## Rejected alternatives
@@ -89,3 +97,11 @@ operation, observes the original byte range, and proves from child output that
 the payload arrived once. Focused variants prove conflict, daemon replacement,
 and bounded-ledger stale-cursor rejection. Rust and TypeScript clients must
 agree on the generated wire shape and failure vocabulary.
+
+## Wrong-case corpus（错题集）
+
+- `INPUT-01` transfers the response-loss duplicate-write failure. It remains
+  `future` under T-004 until a real child proves that a dropped first response
+  followed by an exact fresh-client retry returns the original applied range
+  while the PTY observes one payload. Retained conflict, stale cursor, and a
+  replacement daemon must all fail before mutation.

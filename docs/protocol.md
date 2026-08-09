@@ -204,6 +204,10 @@ a separate operation-specific deduplication contract is introduced.
 The planned recoverable Input operation in Decision 014 is that separate
 contract for short-lived native Input only. It does not change the meaning of
 attachment command IDs or generalize recovery to Resize, Stop, or Signal.
+Its per-Run key conflict guarantee lasts only while the operation is pending or
+retained in the bounded result ledger; callers use a fresh key for new logical
+operations. An evicted exact retry remains safe because its original expected
+cursor is stale and fails before mutation.
 
 Receipts name the precise owner boundary reached:
 

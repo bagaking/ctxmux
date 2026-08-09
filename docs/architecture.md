@@ -218,13 +218,13 @@ child read or interpreted the bytes.
 The success vocabulary is deliberately layered:
 
 ```text
-accepted
+admitted / pending                         # not a wire success receipt
   -> bytes_applied [start_byte, end_byte)  # ctxmux native Input owner
   -> acknowledged                         # Integration / target protocol
   -> replied or settled                    # Agent harness
 ```
 
-Only acceptance through `bytes_applied` belongs to the runtime kernel. Agent
+Only admission through `bytes_applied` belongs to the runtime kernel. Agent
 messages, delivery state, semantic acknowledgement, replies, task graphs, and
 UI timelines remain outside the daemon.
 
