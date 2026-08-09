@@ -52,6 +52,21 @@ Acceptance:
 - applicable high-risk fixtures run in `scripts/check.sh` and CI, while future
   capability cases fail closed as explicit backlog rather than pretend tests.
 
+## M1 hardening — launch rollback
+
+Before adding Integrations, close the native launch transaction at its owning
+boundary. Once `spawn_command` succeeds, any later setup failure must terminate
+and reap the child before `start` returns an error; no Run identity may be
+published for that failed launch.
+
+Acceptance:
+
+- deterministic owner-controlled failure points cover post-spawn reader,
+  writer, output-thread, and waiter-thread setup transitions;
+- every rejected launch leaves no live child, zombie, or Run in the manager;
+- the fix stays inside the native launch owner and does not extract a public
+  Backend framework, plugin surface, or general fault-injection system.
+
 ## M2 — Integration contract and first Agent
 
 Introduce explicit in-process Integration registration only after the generic
