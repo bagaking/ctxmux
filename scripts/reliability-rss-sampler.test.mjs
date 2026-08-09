@@ -7,10 +7,13 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
-import { startRssSampler } from "./reliability-rss-sampler.mts";
+import {
+  nextRssSampleDelay,
+  startRssSampler,
+} from "./reliability-rss-sampler.mts";
 
 test("RSS sampling survives qualification event-loop stalls", async () => {
-  const sampler = await startRssSampler(process.pid, 25);
+  const sampler = await startRssSampler(process.pid, 25, 100);
   const blockStartedAt = Date.now();
   Atomics.wait(
     new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)),
@@ -38,13 +41,17 @@ test("RSS sampling survives qualification event-loop stalls", async () => {
 });
 
 test("RSS sampling fails closed when the target cannot be observed", async () => {
-  await assert.rejects(startRssSampler(99_999_999, 25), /cannot sample RSS/u);
+  await assert.rejects(startRssSampler(process.pid, 25, 24), /maximum gap/u);
+  await assert.rejects(
+    startRssSampler(99_999_999, 25, 100),
+    /cannot sample RSS/u,
+  );
 });
 
 test("RSS sampling fails closed when the target disappears", async () => {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
   try {
-    const sampler = await startRssSampler(child.pid, 25);
+    const sampler = await startRssSampler(child.pid, 25, 100);
     child.kill("SIGKILL");
     await once(child, "exit");
     await delay(50);
@@ -68,7 +75,7 @@ test("RSS sampling bounds and reaps a stuck observation command", async () => {
   try {
     const startedAt = Date.now();
     await assert.rejects(
-      startRssSampler(process.pid, 25),
+      startRssSampler(process.pid, 25, 100),
       /cannot sample RSS/u,
     );
     assert.ok(Date.now() - startedAt < 1000, "stuck sampler was not reaped");
@@ -76,4 +83,9 @@ test("RSS sampling bounds and reaps a stuck observation command", async () => {
     process.env.PATH = previousPath;
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("RSS sampling anchors cadence to observation start time", () => {
+  assert.equal(nextRssSampleDelay(1000, 1010, 25), 15);
+  assert.equal(nextRssSampleDelay(1000, 1060, 25), 0);
 });

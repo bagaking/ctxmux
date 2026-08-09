@@ -813,6 +813,7 @@ async function runGcReplayPressure(
     sampler = await startRssSampler(
       daemon.pid,
       Number(contract.sampling.rss_interval_ms),
+      Number(contract.sampling.max_rss_sample_gap_ms),
     );
     const baseline = sampleProcess(daemon.pid);
     const cpuStart = performance.now();
@@ -962,6 +963,7 @@ async function runGcReplayPressure(
         recoveredSampler = await startRssSampler(
           daemon.pid,
           Number(contract.sampling.rss_interval_ms),
+          Number(contract.sampling.max_rss_sample_gap_ms),
         );
         const recoveredBaseline = sampleProcess(daemon.pid);
         const initialStarts = (await daemon.synchronizedStats()).cumulative
@@ -1644,7 +1646,7 @@ async function runSoakScenario(
   const runCount = 8;
   let sampler: RssSampler | undefined;
   try {
-    sampler = await startRssSampler(daemon.pid, 250);
+    sampler = await startRssSampler(daemon.pid, 250, 750);
     const baseline = sampleProcess(daemon.pid);
     const runs = await mapLimit(
       Array.from({ length: runCount }, (_, index) => index),
@@ -1834,7 +1836,7 @@ async function measureResources(
   );
   let peakSampler: RssSampler | undefined;
   try {
-    peakSampler = await startRssSampler(daemon.pid, 25);
+    peakSampler = await startRssSampler(daemon.pid, 25, 75);
     const baseline = sampleProcess(daemon.pid);
     const startResult = await mapLimitUntilFailure(
       Array.from({ length: count }, (_, index) => index),

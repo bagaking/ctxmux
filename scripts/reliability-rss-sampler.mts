@@ -20,6 +20,14 @@ export interface RssSampler {
   readonly stop: () => Promise<void>;
 }
 
+export function nextRssSampleDelay(
+  previousStartedAt: number,
+  now: number,
+  intervalMs: number,
+): number {
+  return Math.max(0, previousStartedAt + intervalMs - now);
+}
+
 interface SamplerWorkerData {
   readonly pid: number;
   readonly interval_ms: number;
@@ -45,17 +53,22 @@ type WorkerMessage = ReadyMessage | StoppedMessage | ErrorMessage;
 export async function startRssSampler(
   pid: number,
   intervalMs: number,
+  maximumGapMs: number,
 ): Promise<RssSampler> {
   assert.ok(Number.isSafeInteger(pid) && pid > 0, "RSS sampler PID is invalid");
   assert.ok(
     Number.isSafeInteger(intervalMs) && intervalMs > 0,
     "RSS sampler interval is invalid",
   );
+  assert.ok(
+    Number.isSafeInteger(maximumGapMs) && maximumGapMs >= intervalMs,
+    "RSS sampler maximum gap is invalid",
+  );
   const worker = new Worker(new URL(import.meta.url), {
     workerData: {
       pid,
       interval_ms: intervalMs,
-      observation_timeout_ms: intervalMs * 3,
+      observation_timeout_ms: maximumGapMs,
     } satisfies SamplerWorkerData,
   });
   let samples: readonly TimedRssSample[] = [];
@@ -163,23 +176,28 @@ async function runSamplerWorker(): Promise<void> {
   const sample = (): void => {
     samples.push(sampleRssKiB(data.pid, data.observation_timeout_ms));
   };
-  const schedule = (): void => {
+  const schedule = (previousStartedAt: number): void => {
+    const delayMs = nextRssSampleDelay(
+      previousStartedAt,
+      Date.now(),
+      data.interval_ms,
+    );
     timer = setTimeout(() => {
       if (stopping) return;
       try {
         sample();
-        schedule();
+        schedule(samples.at(-1)!.timestamp_ms);
       } catch (error) {
         stopping = true;
         fail(error);
       }
-    }, data.interval_ms);
+    }, delayMs);
   };
 
   try {
     sample();
     port.postMessage({ type: "ready" } satisfies ReadyMessage);
-    schedule();
+    schedule(samples.at(-1)!.timestamp_ms);
     port.once("message", (message: unknown) => {
       if (message !== "stop" || stopping) return;
       stopping = true;
