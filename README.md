@@ -56,6 +56,7 @@ Project decisions live in:
 - [Architecture](docs/architecture.md)
 - [Architecture wrong-case casebook](docs/architecture/casebook.md)
 - [Native protocol](docs/protocol.md)
+- [Test evidence strategy](docs/testing-strategy.md)
 - [Roadmap](docs/roadmap.md)
 
 ## Native Run quick start
