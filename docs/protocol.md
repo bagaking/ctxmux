@@ -73,6 +73,13 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   `portable-pty` path gives `SIGHUP` a short grace period, then escalates to a
   forced kill if the direct child remains alive.
 
+An unclassified native child-status observation failure is daemon-fatal and
+does not create a terminal Run event. The affected Run rejects further live
+control with `backend_unavailable`; ctxmux retains the child handle without
+signalling it and exits the daemon incarnation instead of polling, fabricating
+an exit status, or permitting same-epoch collection. Persistent restart then
+applies the ordinary `interrupted { daemon_restart }` reconciliation.
+
 In persistent mode, recovered `exited` and `interrupted { reason:
 daemon_restart }` Runs support `list`, `status`, `attach`, and Level A `fork`.
 They reject `input`, `resize`, `stop`, and Level B `fork` with

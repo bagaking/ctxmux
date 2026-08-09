@@ -80,6 +80,14 @@ start accepted
 
 `stop` sends one termination command to the waiter that owns the direct child handle. On Unix that handle gives `SIGHUP` a short grace period and escalates to a forced kill when the child remains alive. Acknowledgement still precedes public terminal-state publication, so the returned `RunInfo` may say `running`; repeated stop is rejected. The waiter disables further signalling as soon as wait observes exit, before it publishes `Exited`, so a concurrent stop cannot fall back to a cached numeric PID. Descendant or process-tree termination is not promised. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted { daemon_restart }`, clears their PID, and exposes no live control. Terminal Runs remain retained until admission reaches the 128-record ceiling, then the Registry fences exact fully quiescent candidates; persistent COMMIT removes the same Runs, replay, and byte-exact keys before publishing the successor.
 
+If native `try_wait` fails before yielding a child status, ctxmux does not
+pretend the Run exited. It stops polling, transfers the real child handle into
+an irreversible native fail-stop owner, closes that Run's live controls, fences
+new physical launches, and fails the serving daemon incarnation; `ctxmuxd`
+then exits. The Run remains running-but-uncontrollable and ineligible for
+same-epoch collection; persistent restart uses the existing `daemon_restart`
+reconciliation.
+
 ### Ownership split
 
 | Owner        | Responsibilities                                                                                                                                                                                                     |

@@ -9,7 +9,7 @@ Multiple short requests and long-lived attachments may act on the same Run while
 
 ## Decision
 
-`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and disables the sender immediately after wait observes exit. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
+`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and disables the sender immediately after wait observes exit. If `try_wait` itself fails, the waiter instead transfers the actual handle once into the native control owner's irreversible fail-stop state. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
 
 Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` decrements the counter on every return path, including transport failure.
 
@@ -28,6 +28,16 @@ The hook is not a public fault API and cannot change production scheduling.
 - Lifecycle errors are explicit after a Run reaches `exited`.
 - A stop after child wait cannot signal by stale numeric identity, even while
   public state publication is deliberately paused.
+- The first unclassified native `try_wait` failure ends polling, closes Input,
+  Resize, Stop, and Level-B authority with `backend_unavailable`, fences new
+  physical launches, and fails the daemon incarnation. It publishes neither
+  `Exited` nor `Interrupted`: no portable child status was observed. The
+  native control owner retains the real child handle without calling kill,
+  wait, or a cached-PID signal, so same-epoch collection and key reuse remain
+  impossible. A persistent restart later performs the existing
+  `interrupted { daemon_restart }` reconciliation. A Stop already admitted
+  before the failure may lose its reply and remain `unknown`; controls begun
+  after the fail-stop fence are `not_applied` with `backend_unavailable`.
 - One bounded creation key has one async stripe owner; only its unique leader
   can seek physical-launch admission, and successful mapping plus Run
   publication share one registry write. A separate Tokio semaphore admits at
@@ -83,6 +93,10 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered sequence can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
 - `LC-003` (`d03`): the waiter can reap a child before public state changes; signalling through a cached numeric PID risks a reused process identity. The waiter now removes signalling authority before publication, and a deterministic barrier proves stop rejects during that interval without touching an unrelated process.
+- `LC-004`: retrying an unclassified child-status error every 20 ms can retain
+  one busy waiter forever, while treating it as exit would fabricate reap and
+  permit unsafe key reuse. The first error now transfers the handle into a
+  non-collectable fail-stop owner and fails the daemon incarnation.
 
 Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux's composition of broadcast, replay, and lifecycle state, not a claim that current Tokio loses messages.
 
@@ -104,6 +118,10 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   controllable process/PTY seam under sustained load.
 - Covered now: a real socket attachment is paused after snapshot, overruns a bounded live channel, observes `Gap`, and reattaches from the caller-owned cursor with contiguous sequences and exact raw bytes.
 - Covered now: a child-wait barrier pauses public state publication after signalling authority is removed and proves concurrent stop cannot affect an unrelated process identity.
+- Covered now: a fake child returns one status error followed by a tempting
+  synthetic exit; ctxmux polls exactly once, sends no kill/wait/clone signal,
+  retains the handle, rejects native controls as Backend unavailable, and
+  fences creation plus the daemon incarnation.
 - Covered now: 32 concurrent duplicate Start requests, abandoned public Start
   and Fork responses, conflicting reuse, failed spawn, and a post-publication
   cancellation barrier converge on one physical Run without making queued

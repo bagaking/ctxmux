@@ -77,6 +77,7 @@ impl TerminalPublicationOwner {
 /// This is deliberately not an executor or queue. A flight starts only after
 /// its creation key is known to be unbound, and its guard follows that one OS
 /// thread until launch and publication finish even if the requester cancels.
+#[derive(Clone)]
 pub(crate) struct CreationFlightOwner {
     inner: Arc<CreationFlightInner>,
 }
@@ -1450,6 +1451,21 @@ impl RunRegistry {
             .collect()
     }
 
+    /// Copy operator-visible native wait-authority failures without taking a
+    /// child owner or attempting cleanup.
+    pub(crate) fn native_wait_failures(&self) -> Vec<(RunId, String)> {
+        read_lock(&self.state)
+            .runs
+            .iter()
+            .filter_map(|(id, entry)| match &entry.run.incarnation_control {
+                Some(RunControl::Native(control)) => {
+                    control.wait_authority_failure().map(|error| (*id, error))
+                }
+                Some(RunControl::Tmux(_)) | None => None,
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<Arc<Run>> {
         read_lock(&self.state)
@@ -1457,6 +1473,21 @@ impl RunRegistry {
             .values()
             .map(|entry| Arc::clone(&entry.run))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_unkeyed_for_test(&self, run: Arc<Run>) {
+        let id = run.id;
+        let mut state = write_lock(&self.state);
+        state.runs.insert(
+            id,
+            RegistryEntry {
+                run,
+                operation_key: None,
+                metadata_bytes: None,
+                residency: RegistryResidency::Retained,
+            },
+        );
     }
 
     #[cfg(test)]

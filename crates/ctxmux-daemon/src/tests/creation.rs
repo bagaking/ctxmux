@@ -2186,7 +2186,7 @@ async fn assert_persistent_commit_unwind_converges(
         vec![old.id]
     );
     assert_eq!(mutex_lock(&manager.commit_unknown_reservations).len(), 1);
-    assert!(mutex_lock(&manager.incarnation_failure.message).is_some());
+    assert!(manager.incarnation_failure.message().is_some());
     let old_retry = manager
         .create(old_key.clone(), CreationRequest::Start { spec: old_spec })
         .await

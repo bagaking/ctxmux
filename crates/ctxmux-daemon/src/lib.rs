@@ -317,29 +317,54 @@ struct RunManager {
     creation_hook: Option<Arc<CreationTestHook>>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct IncarnationFailure {
+    inner: Arc<IncarnationFailureInner>,
+}
+
+#[derive(Default)]
+struct IncarnationFailureInner {
     message: Mutex<Option<String>>,
     changed: Notify,
 }
 
 impl IncarnationFailure {
     fn record(&self, message: String) {
-        let mut current = mutex_lock(&self.message);
+        let mut current = mutex_lock(&self.inner.message);
         if current.is_none() {
             *current = Some(message);
-            self.changed.notify_waiters();
+            self.inner.changed.notify_waiters();
         }
     }
 
     async fn wait(&self) -> String {
         loop {
-            let notified = self.changed.notified();
-            if let Some(message) = mutex_lock(&self.message).clone() {
+            let notified = self.inner.changed.notified();
+            if let Some(message) = mutex_lock(&self.inner.message).clone() {
                 return message;
             }
             notified.await;
         }
+    }
+
+    #[cfg(test)]
+    fn message(&self) -> Option<String> {
+        mutex_lock(&self.inner.message).clone()
+    }
+}
+
+#[derive(Clone, Default)]
+struct NativeWaitFailure {
+    creation_flights: CreationFlightOwner,
+    incarnation_failure: IncarnationFailure,
+}
+
+impl NativeWaitFailure {
+    fn record(&self, run_id: RunId, error: &str) {
+        self.creation_flights.fence();
+        self.incarnation_failure.record(format!(
+            "Run {run_id} lost native child wait authority; restart is required: {error}"
+        ));
     }
 }
 
@@ -782,6 +807,10 @@ impl RunManager {
                 live_event_capacity: self.live_event_capacity,
                 input_drains: self.native_input_drains.clone(),
                 terminal_publications: self.terminal_publications.clone(),
+                wait_failure: NativeWaitFailure {
+                    creation_flights: self.creation_flights.clone(),
+                    incarnation_failure: self.incarnation_failure.clone(),
+                },
             },
             request,
             cleanup_reservation,
@@ -1160,6 +1189,12 @@ impl RunManager {
                 .into_iter()
                 .map(|failure| format!("unpublished Run cleanup {failure}")),
         );
+        failures.extend(
+            self.registry
+                .native_wait_failures()
+                .into_iter()
+                .map(|(id, failure)| format!("Run {id}: {failure}")),
+        );
 
         if failures.is_empty() {
             Ok(())
@@ -1227,6 +1262,7 @@ impl RunManager {
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
                 terminal_publications: self.terminal_publications.clone(),
+                wait_failure: NativeWaitFailure::default(),
             },
             request,
             cleanup_reservation,
@@ -1284,6 +1320,7 @@ struct NativeSpawnConfig {
     live_event_capacity: usize,
     input_drains: InputDrainGate,
     terminal_publications: TerminalPublicationOwner,
+    wait_failure: NativeWaitFailure,
 }
 
 struct MaterializedCreation {
@@ -1775,12 +1812,45 @@ enum TmuxWaitCause {
     ChildStatusFailed(String),
 }
 
+enum NativeWaitOutcome {
+    Exited(RunState),
+    AuthorityLost,
+}
+
 struct TmuxWaitOutcome {
     cause: TmuxWaitCause,
     cleanup: Result<(), String>,
 }
 
 impl Run {
+    #[cfg(test)]
+    fn new_native_for_wait_test(id: RunId, control: NativeControlOwner) -> Arc<Self> {
+        let (events, _) = broadcast::channel(LIVE_EVENT_CAPACITY);
+        Self::new_native(
+            NativeSpawnConfig {
+                id,
+                spec: RunSpec {
+                    program: "/bin/cat".to_owned(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: std::collections::BTreeMap::new(),
+                    size: TerminalSize::default(),
+                    declared_inputs: Vec::new(),
+                },
+                lineage: None,
+                persistence_mode: PersistenceMode::MemoryOnly,
+                live_event_capacity: LIVE_EVENT_CAPACITY,
+                input_drains: InputDrainGate::default(),
+                terminal_publications: TerminalPublicationOwner::default(),
+                wait_failure: NativeWaitFailure::default(),
+            },
+            id,
+            Some(42),
+            control,
+            events,
+        )
+    }
+
     #[cfg(test)]
     fn spawn(
         spec: RunSpec,
@@ -1798,6 +1868,7 @@ impl Run {
                 live_event_capacity,
                 input_drains,
                 terminal_publications: TerminalPublicationOwner::default(),
+                wait_failure: NativeWaitFailure::default(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -1866,6 +1937,7 @@ impl Run {
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
                 terminal_publications,
+                wait_failure: NativeWaitFailure::default(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -1927,6 +1999,7 @@ impl Run {
         let (native_control, child_command_rx) =
             NativeControlOwner::new(id, pair.master, writer, config.input_drains.clone());
         pending_child.bind_reap_control(native_control.clone());
+        let wait_failure = config.wait_failure.clone();
         let owner = make_owner(Self::new_native(config, id, pid, native_control, events));
         let run = Arc::clone(owner.run());
 
@@ -1954,13 +2027,16 @@ impl Run {
                     wait_control.mark_closed();
                     return;
                 };
-                let mut child = pending_child.into_child();
-                let state = wait_for_child(child.as_mut(), &child_command_rx, &wait_control);
-                drop(child_command_rx);
-                wait_control.mark_closed();
-                after_wait();
-                let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
-                wait_run.publish_terminal(state);
+                let child = pending_child.into_child();
+                match wait_for_child(child, child_command_rx, &wait_control, &wait_failure) {
+                    NativeWaitOutcome::Exited(state) => {
+                        wait_control.mark_closed();
+                        after_wait();
+                        let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
+                        wait_run.publish_terminal(state);
+                    }
+                    NativeWaitOutcome::AuthorityLost => {}
+                }
             })
             .map_err(|error| {
                 run.native_control()
@@ -2618,10 +2694,11 @@ impl Run {
 }
 
 fn wait_for_child(
-    child: &mut dyn Child,
-    commands: &mpsc::Receiver<ChildCommand>,
+    mut child: Box<dyn Child + Send + Sync>,
+    commands: mpsc::Receiver<ChildCommand>,
     control: &NativeControlOwner,
-) -> RunState {
+    failure: &NativeWaitFailure,
+) -> NativeWaitOutcome {
     loop {
         match commands.recv_timeout(CHILD_CONTROL_POLL) {
             Ok(ChildCommand::Stop(reply)) => {
@@ -2640,14 +2717,18 @@ fn wait_for_child(
         match child.try_wait() {
             Ok(Some(status)) => {
                 control.mark_reaped();
-                return RunState::Exited {
+                return NativeWaitOutcome::Exited(RunState::Exited {
                     code: status.exit_code(),
                     signal: status.signal().map(str::to_owned),
-                };
+                });
             }
             Ok(None) => {}
             Err(error) => {
-                control.record_wait_error(format!("failed to wait for child: {error}"));
+                let error = format!("failed to wait for child: {error}");
+                control.mark_wait_authority_lost(error.clone(), child);
+                drop(commands);
+                failure.record(control.run_id(), &error);
+                return NativeWaitOutcome::AuthorityLost;
             }
         }
     }
@@ -3575,7 +3656,7 @@ use std::fmt;
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        fs,
+        fs, io,
         os::unix::{
             fs::{PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
@@ -3583,7 +3664,7 @@ mod tests {
         process::{Command, Stdio},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -3594,21 +3675,24 @@ mod tests {
         ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunSpec, RunState,
         TerminalSize,
     };
+    use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog,
-        OutputReplay, PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode,
-        RecoveredRun, Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT,
-        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
-        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
-        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
-        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
-        TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
+        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, NativeWaitFailure,
+        NativeWaitOutcome, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
+        Persistence, PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager,
+        ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
+        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
+        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
+        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
+        TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
         prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager, spawn_error,
+        wait_for_child,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
+    use crate::native_control::NativeControlOwner;
 
     mod creation;
 
@@ -3621,6 +3705,156 @@ mod tests {
         );
         assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
         assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
+
+    #[derive(Debug, Default)]
+    struct WaitFailureCounts {
+        try_wait: AtomicUsize,
+        kill: AtomicUsize,
+        wait: AtomicUsize,
+        clone_killer: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct WaitFailingChild(Arc<WaitFailureCounts>);
+
+    impl Drop for WaitFailingChild {
+        fn drop(&mut self) {
+            self.0.dropped.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl Child for WaitFailingChild {
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            let attempt = self.0.try_wait.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                Err(io::Error::other("fixture wait authority lost"))
+            } else {
+                Ok(Some(ExitStatus::with_exit_code(91)))
+            }
+        }
+
+        fn wait(&mut self) -> io::Result<ExitStatus> {
+            self.0.wait.fetch_add(1, Ordering::AcqRel);
+            Ok(ExitStatus::with_exit_code(91))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    impl ChildKiller for WaitFailingChild {
+        fn kill(&mut self) -> io::Result<()> {
+            self.0.kill.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            self.0.clone_killer.fetch_add(1, Ordering::AcqRel);
+            Box::new(WaitFailingKiller(Arc::clone(&self.0)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct WaitFailingKiller(Arc<WaitFailureCounts>);
+
+    impl ChildKiller for WaitFailingKiller {
+        fn kill(&mut self) -> io::Result<()> {
+            self.0.kill.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+            self.0.clone_killer.fetch_add(1, Ordering::AcqRel);
+            Box::new(Self(Arc::clone(&self.0)))
+        }
+    }
+
+    #[test]
+    fn native_wait_error_fail_stops_once_without_dropping_or_signalling_child() {
+        let run_id = RunId::new();
+        let counts = Arc::new(WaitFailureCounts::default());
+        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let failure = NativeWaitFailure::default();
+
+        let outcome = wait_for_child(
+            Box::new(WaitFailingChild(Arc::clone(&counts))),
+            commands,
+            &control,
+            &failure,
+        );
+        assert!(matches!(outcome, NativeWaitOutcome::AuthorityLost));
+        assert_eq!(counts.try_wait.load(Ordering::Acquire), 1);
+        assert_eq!(counts.kill.load(Ordering::Acquire), 0);
+        assert_eq!(counts.wait.load(Ordering::Acquire), 0);
+        assert_eq!(counts.clone_killer.load(Ordering::Acquire), 0);
+        assert_eq!(counts.dropped.load(Ordering::Acquire), 0);
+        assert!(control.retains_failed_child());
+        assert!(
+            control
+                .reap_result()
+                .unwrap_err()
+                .contains("fixture wait authority lost")
+        );
+
+        let stop = control.begin_stop().expect_err("failed waiter fences stop");
+        assert_eq!(stop.disposition, CommandDisposition::NotApplied);
+        assert_eq!(stop.error.code, ErrorCode::BackendUnavailable);
+        let input = control
+            .begin_input(vec![1])
+            .expect_err("failed waiter fences input");
+        assert_eq!(input.error.code, ErrorCode::BackendUnavailable);
+        let resize = control
+            .resize(TerminalSize { rows: 24, cols: 80 })
+            .expect_err("failed waiter fences resize");
+        assert_eq!(resize.error.code, ErrorCode::BackendUnavailable);
+        let started = Instant::now();
+        let reap_error = control
+            .wait_until_reaped(Instant::now() + Duration::from_secs(30))
+            .expect_err("authority loss can never prove reap");
+        assert!(started.elapsed() < Duration::from_millis(20));
+        assert!(reap_error.contains("fixture wait authority lost"));
+        assert!(control.closed_quiescence_result().is_err());
+        assert_eq!(counts.try_wait.load(Ordering::Acquire), 1);
+        assert_eq!(counts.kill.load(Ordering::Acquire), 0);
+        assert_eq!(counts.wait.load(Ordering::Acquire), 0);
+        assert_eq!(counts.clone_killer.load(Ordering::Acquire), 0);
+        assert_eq!(counts.dropped.load(Ordering::Acquire), 0);
+        assert!(failure.creation_flights.is_fenced());
+        let message = failure
+            .incarnation_failure
+            .message()
+            .expect("daemon incarnation is failed");
+        assert!(message.contains(&run_id.to_string()));
+        assert!(message.contains("fixture wait authority lost"));
+
+        let manager = RunManager::default();
+        manager
+            .registry
+            .publish_unkeyed_for_test(Run::new_native_for_wait_test(run_id, control.clone()));
+        let shutdown = manager
+            .shutdown_owned_controls(Duration::ZERO)
+            .expect_err("shutdown reports retained wait-authority failure");
+        let ServerError::Shutdown { failures } = shutdown else {
+            panic!("wait-authority failure has shutdown disposition");
+        };
+        assert!(failures.contains(&run_id.to_string()));
+        assert!(failures.contains("fixture wait authority lost"));
+        assert_eq!(counts.kill.load(Ordering::Acquire), 0);
+        assert_eq!(counts.wait.load(Ordering::Acquire), 0);
+        assert_eq!(counts.clone_killer.load(Ordering::Acquire), 0);
+        assert_eq!(counts.dropped.load(Ordering::Acquire), 0);
+
+        drop(manager);
+        drop(control);
+        assert_eq!(counts.dropped.load(Ordering::Acquire), 1);
     }
 
     #[test]

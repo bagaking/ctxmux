@@ -14,7 +14,7 @@ use ctxmux_protocol::{
     AppliedInputRange, CommandDisposition, ControlFailure, ControlReceipt, ErrorCode,
     InputOperationKey, ProtocolError, RunId, TerminalSize,
 };
-use portable_pty::{MasterPty, PtySize};
+use portable_pty::{Child, MasterPty, PtySize};
 use tokio::sync::{oneshot, watch};
 
 const INPUT_QUEUE_MAX_COMMANDS: usize = 1_024;
@@ -215,6 +215,11 @@ enum ChildReapState {
         cleanup_error: Option<String>,
         wait_error: Option<String>,
     },
+    WaitAuthorityLost {
+        cleanup_error: Option<String>,
+        wait_error: String,
+        _child: Box<dyn Child + Send + Sync>,
+    },
     Reaped,
 }
 
@@ -239,6 +244,7 @@ enum ControlPhase {
     Open,
     Stopping,
     Closed,
+    Failed,
 }
 
 struct InputCommand {
@@ -303,6 +309,10 @@ impl PtyControl for PortablePtyControl {
 }
 
 impl NativeControlOwner {
+    pub(crate) fn run_id(&self) -> RunId {
+        self.inner.run_id
+    }
+
     pub(crate) fn new(
         run_id: RunId,
         master: Box<dyn MasterPty + Send>,
@@ -315,6 +325,43 @@ impl NativeControlOwner {
             writer,
             input_drains,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_wait_test(run_id: RunId) -> (Self, mpsc::Receiver<ChildCommand>) {
+        struct TestPty;
+
+        impl PtyControl for TestPty {
+            fn resize(&self, _size: PtySize) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn get_size(&self) -> io::Result<PtySize> {
+                Ok(PtySize::default())
+            }
+        }
+
+        Self::new_with_pty(
+            run_id,
+            Box::new(TestPty),
+            Box::new(io::sink()),
+            InputDrainGate::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retains_failed_child(&self) -> bool {
+        matches!(
+            &*mutex_lock(&self.inner.reap),
+            ChildReapState::WaitAuthorityLost { .. }
+        )
+    }
+
+    pub(crate) fn wait_authority_failure(&self) -> Option<String> {
+        match &*mutex_lock(&self.inner.reap) {
+            ChildReapState::WaitAuthorityLost { wait_error, .. } => Some(wait_error.clone()),
+            ChildReapState::Pending { .. } | ChildReapState::Reaped => None,
+        }
     }
 
     fn new_with_pty(
@@ -534,7 +581,7 @@ impl NativeControlOwner {
             match state.phase {
                 ControlPhase::Open => state.phase = ControlPhase::Stopping,
                 ControlPhase::Stopping => return Ok(()),
-                ControlPhase::Closed => return self.reap_result(),
+                ControlPhase::Closed | ControlPhase::Failed => return self.reap_result(),
             }
             let Some(sender) = state.child_sender.clone() else {
                 let error = format!(
@@ -595,9 +642,11 @@ impl NativeControlOwner {
         send_rejections(rejected);
         if sender.send(ChildCommand::Stop(reply_tx)).is_err() {
             self.mark_closed();
-            return Err(not_applied(ProtocolError::new(
-                ErrorCode::InvalidRunState,
-                format!("cannot stop exited Run {}", self.inner.run_id),
+            let phase = mutex_lock(&self.inner.state).phase;
+            return Err(not_applied(invalid_phase_error(
+                self.inner.run_id,
+                phase,
+                "stop",
             )));
         }
         Ok(reply_rx)
@@ -608,14 +657,46 @@ impl NativeControlOwner {
     pub(crate) fn mark_closed(&self) {
         let rejected = {
             let mut state = mutex_lock(&self.inner.state);
-            state.phase = ControlPhase::Closed;
+            if state.phase != ControlPhase::Failed {
+                state.phase = ControlPhase::Closed;
+            }
+            state.child_sender = None;
+            let phase = state.phase;
+            reject_queued_inputs(
+                &mut state,
+                &invalid_phase_error(self.inner.run_id, phase, "write to"),
+            )
+        };
+        send_rejections(rejected);
+    }
+
+    /// Irreversibly fence live control after the child waiter can no longer
+    /// observe process status. This does not claim exit or reap.
+    pub(crate) fn mark_wait_authority_lost(
+        &self,
+        error: String,
+        child: Box<dyn Child + Send + Sync>,
+    ) {
+        {
+            let mut reap = mutex_lock(&self.inner.reap);
+            if let ChildReapState::Pending { cleanup_error, .. } = &mut *reap {
+                *reap = ChildReapState::WaitAuthorityLost {
+                    cleanup_error: cleanup_error.take(),
+                    wait_error: error.clone(),
+                    _child: child,
+                };
+                self.inner.reap_changed.notify_all();
+            } else {
+                unreachable!("child wait authority is lost at most once");
+            }
+        }
+        let rejected = {
+            let mut state = mutex_lock(&self.inner.state);
+            state.phase = ControlPhase::Failed;
             state.child_sender = None;
             reject_queued_inputs(
                 &mut state,
-                &ProtocolError::new(
-                    ErrorCode::InvalidRunState,
-                    format!("cannot write to exited Run {}", self.inner.run_id),
-                ),
+                &ProtocolError::new(ErrorCode::BackendUnavailable, error),
             )
         };
         send_rejections(rejected);
@@ -625,18 +706,26 @@ impl NativeControlOwner {
         mutex_lock(&self.inner.state).phase == ControlPhase::Open
     }
 
-    /// Record the only successful terminal-and-reaped proof: the waiter that
-    /// exclusively owns the child handle observed `try_wait(Some(_))`.
+    /// Record the only successful terminal-and-reaped proof: the waiter
+    /// observed `try_wait(Some(_))` before any authority-loss transfer. Once
+    /// the handle moves into `WaitAuthorityLost`, this cannot replace it.
     pub(crate) fn mark_reaped(&self) {
-        *mutex_lock(&self.inner.reap) = ChildReapState::Reaped;
-        self.inner.reap_changed.notify_all();
+        let mut reap = mutex_lock(&self.inner.reap);
+        if matches!(&*reap, ChildReapState::Pending { .. }) {
+            *reap = ChildReapState::Reaped;
+            self.inner.reap_changed.notify_all();
+        }
     }
 
     pub(crate) fn record_cleanup_error(&self, error: String) {
         let mut reap = mutex_lock(&self.inner.reap);
-        if let ChildReapState::Pending { cleanup_error, .. } = &mut *reap {
-            cleanup_error.get_or_insert(error);
-            self.inner.reap_changed.notify_all();
+        match &mut *reap {
+            ChildReapState::Pending { cleanup_error, .. }
+            | ChildReapState::WaitAuthorityLost { cleanup_error, .. } => {
+                cleanup_error.get_or_insert(error);
+                self.inner.reap_changed.notify_all();
+            }
+            ChildReapState::Reaped => {}
         }
     }
 
@@ -653,6 +742,10 @@ impl NativeControlOwner {
         loop {
             match &*reap {
                 ChildReapState::Reaped => return Ok(()),
+                ChildReapState::WaitAuthorityLost { .. } => {
+                    drop(reap);
+                    return self.reap_result();
+                }
                 ChildReapState::Pending { .. } if Instant::now() >= deadline => {
                     drop(reap);
                     return self.reap_result();
@@ -677,6 +770,26 @@ impl NativeControlOwner {
                 wait_error,
             } => {
                 let mut errors = [cleanup_error.as_deref(), wait_error.as_deref()]
+                    .into_iter()
+                    .flatten();
+                let Some(first) = errors.next() else {
+                    return Err(format!(
+                        "Run {} child waiter has not yet proven reap",
+                        self.inner.run_id
+                    ));
+                };
+                Err(errors.fold(first.to_owned(), |mut combined, error| {
+                    combined.push_str("; ");
+                    combined.push_str(error);
+                    combined
+                }))
+            }
+            ChildReapState::WaitAuthorityLost {
+                cleanup_error,
+                wait_error,
+                _child: _,
+            } => {
+                let mut errors = [cleanup_error.as_deref(), Some(wait_error.as_str())]
                     .into_iter()
                     .flatten();
                 let Some(first) = errors.next() else {
@@ -1188,15 +1301,21 @@ fn evict_completed_input_results(state: &mut NativeControlState, new_bytes: usiz
 }
 
 fn invalid_phase_error(run_id: RunId, phase: ControlPhase, operation: &str) -> ProtocolError {
-    let phase = match phase {
+    match phase {
         ControlPhase::Open => unreachable!("open phase is valid"),
-        ControlPhase::Stopping => "stopping",
-        ControlPhase::Closed => "exited",
-    };
-    ProtocolError::new(
-        ErrorCode::InvalidRunState,
-        format!("cannot {operation} {phase} Run {run_id}"),
-    )
+        ControlPhase::Stopping => ProtocolError::new(
+            ErrorCode::InvalidRunState,
+            format!("cannot {operation} stopping Run {run_id}"),
+        ),
+        ControlPhase::Closed => ProtocolError::new(
+            ErrorCode::InvalidRunState,
+            format!("cannot {operation} exited Run {run_id}"),
+        ),
+        ControlPhase::Failed => ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            format!("cannot {operation} Run {run_id} after child wait authority was lost"),
+        ),
+    }
 }
 
 fn not_applied(error: ProtocolError) -> ControlFailure {
