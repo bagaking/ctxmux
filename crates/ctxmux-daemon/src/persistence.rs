@@ -24,7 +24,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::run_spec::validate_run_spec;
+use crate::{creation::MAX_RETAINED_RUNS, run_spec::validate_run_spec};
 
 const SCHEMA_VERSION: i64 = 2;
 const DATABASE_FILE: &str = "state.sqlite3";
@@ -45,6 +45,7 @@ const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
+const STARTUP_BATCH_MAX_ROWS: usize = 128;
 
 #[derive(Clone, Copy)]
 struct AdmissionLimits {
@@ -53,8 +54,14 @@ struct AdmissionLimits {
 }
 
 impl AdmissionLimits {
+    #[cfg(test)]
     const FORMAT: Self = Self {
         run_records: RUN_RECORDS,
+        metadata_bytes: METADATA_BYTES,
+    };
+
+    const OPERATIONAL: Self = Self {
+        run_records: MAX_RETAINED_RUNS as u64,
         metadata_bytes: METADATA_BYTES,
     };
 }
@@ -129,6 +136,10 @@ struct PersistenceTestHooks {
     fail_next_insert_after_commit: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
+    startup_batch_wal_bytes: Mutex<Vec<u64>>,
+    startup_fail_after_commits: AtomicU64,
+    startup_over_budget_attempts: AtomicU64,
+    force_startup_over_budget_once: AtomicBool,
 }
 
 /// Immutable persistence-owned encoding of one native Run before launch.
@@ -359,7 +370,7 @@ impl Persistence {
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
-        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::FORMAT)
+        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL)
     }
 
     fn open_with_admission_limits(
@@ -559,6 +570,11 @@ impl Persistence {
     #[cfg(test)]
     pub(crate) fn is_failed(&self) -> bool {
         mutex_lock(&self.inner.failure).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn startup_batch_wal_bytes(&self) -> Vec<u64> {
+        mutex_lock(&self.inner.test_hooks.startup_batch_wal_bytes).clone()
     }
 
     #[cfg(test)]
@@ -997,6 +1013,51 @@ fn replay_payload(replay: &OutputReplay) -> usize {
     replay.chunks.iter().map(|chunk| chunk.data.len()).sum()
 }
 
+struct StartupRunningRow {
+    id: String,
+    metadata_bytes: u64,
+    terminal_at_ms: i64,
+}
+
+#[derive(Clone, Copy)]
+enum StartupBatch<'a> {
+    Reconcile(&'a [StartupRunningRow]),
+    Evict(&'a [String]),
+    PublishEpoch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupBatchDisposition {
+    Committed,
+    OverBudget,
+}
+
+impl StartupBatch<'_> {
+    fn len(self) -> usize {
+        match self {
+            Self::Reconcile(rows) => rows.len(),
+            Self::Evict(ids) => ids.len(),
+            Self::PublishEpoch => 1,
+        }
+    }
+
+    fn prefix(self, len: usize) -> Self {
+        match self {
+            Self::Reconcile(rows) => Self::Reconcile(&rows[..len]),
+            Self::Evict(ids) => Self::Evict(&ids[..len]),
+            Self::PublishEpoch => Self::PublishEpoch,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Reconcile(_) => "running reconciliation",
+            Self::Evict(_) => "terminal eviction",
+            Self::PublishEpoch => "epoch publication",
+        }
+    }
+}
+
 struct StateStore {
     state_dir: PathBuf,
     database_path: PathBuf,
@@ -1062,6 +1123,7 @@ impl StateStore {
             validate_optional_state_file(path)?;
         }
         let database_existed = database_path.exists();
+        let epoch = Uuid::new_v4().to_string();
         if database_existed
             && fs::metadata(&database_path)
                 .map_err(|source| PersistenceError::io(&database_path, source))?
@@ -1088,7 +1150,7 @@ impl StateStore {
         if database_existed {
             validate_existing_schema(&connection)?;
         } else {
-            create_schema(&connection)?;
+            create_schema(&connection, &epoch)?;
         }
         connection
             .pragma_update(
@@ -1113,10 +1175,7 @@ impl StateStore {
         validate_application_state(&connection)?;
         validate_physical_limits(state_dir, &database_path, &wal_path, &shm_path)?;
 
-        let epoch = Uuid::new_v4().to_string();
-        reconcile_epoch(&connection, &epoch)?;
-        let recovered = load_recovered(&connection)?;
-        let store = Self {
+        let mut store = Self {
             state_dir: state_dir.to_path_buf(),
             database_path,
             wal_path,
@@ -1128,8 +1187,415 @@ impl StateStore {
             #[cfg(test)]
             test_hooks,
         };
+        store.normalize_startup()?;
+        validate_application_state(&store.connection)?;
+        store.validate_operational_state()?;
+        let recovered = load_recovered(&store.connection)?;
         store.validate_files()?;
         Ok((store, recovered))
+    }
+
+    fn normalize_startup(&mut self) -> Result<(), PersistenceError> {
+        let terminal_at_ms = self.startup_terminal_anchor()?;
+        loop {
+            let running =
+                self.load_startup_running_prefix(STARTUP_BATCH_MAX_ROWS, terminal_at_ms)?;
+            if running.is_empty() {
+                break;
+            }
+            self.commit_startup_with_reduction(StartupBatch::Reconcile(&running))?;
+        }
+        loop {
+            let candidates = self.load_startup_eviction_prefix(STARTUP_BATCH_MAX_ROWS)?;
+            if candidates.is_empty() {
+                break;
+            }
+            self.commit_startup_with_reduction(StartupBatch::Evict(&candidates))?;
+        }
+        match self.commit_startup_batch(StartupBatch::PublishEpoch)? {
+            StartupBatchDisposition::Committed => Ok(()),
+            StartupBatchDisposition::OverBudget => Err(PersistenceError::Mutation(
+                "startup epoch publication exceeds the 8 MiB WAL charge".to_owned(),
+            )),
+        }
+    }
+
+    fn load_startup_running_prefix(
+        &self,
+        limit: usize,
+        terminal_at_ms: i64,
+    ) -> Result<Vec<StartupRunningRow>, PersistenceError> {
+        let interrupted = RunState::Interrupted {
+            reason: InterruptionReason::DaemonRestart,
+        };
+        let state_json =
+            serde_json::to_string(&interrupted).map_err(PersistenceError::serialization)?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, creation_key, spec_json, lineage_json, source_epoch, updated_at_ms
+                 FROM runs WHERE state_kind = 'running'
+                 ORDER BY created_at_ms, id LIMIT ?1",
+            )
+            .map_err(PersistenceError::database)?;
+        let rows = statement
+            .query_map(
+                [i64::try_from(limit).expect("startup batch limit fits SQLite")],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(PersistenceError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::database)?;
+        rows.into_iter()
+            .map(
+                |(id, creation_key, spec_json, lineage_json, source_epoch, _)| {
+                    Ok(StartupRunningRow {
+                        metadata_bytes: metadata_size(
+                            &id,
+                            &creation_key,
+                            &spec_json,
+                            lineage_json.as_deref(),
+                            &state_json,
+                            &source_epoch,
+                        )?,
+                        id,
+                        terminal_at_ms,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn startup_terminal_anchor(&self) -> Result<i64, PersistenceError> {
+        let latest: i64 = self
+            .connection
+            .query_row(
+                "SELECT coalesce(max(updated_at_ms), 0) FROM runs",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        Ok(latest.saturating_add(1))
+    }
+
+    fn load_startup_eviction_prefix(&self, limit: usize) -> Result<Vec<String>, PersistenceError> {
+        let (records, metadata, running): (i64, i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT count(*), coalesce(sum(metadata_bytes), 0),
+                        coalesce(sum(state_kind = 'running'), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        let records = nonnegative_u64(records, "record count")?;
+        let metadata = nonnegative_u64(metadata, "metadata total")?;
+        if running != 0 {
+            return Err(PersistenceError::Corrupt(
+                "startup retention ran before every prior running row was interrupted".to_owned(),
+            ));
+        }
+        let records_to_remove = records.saturating_sub(self.admission_limits.run_records);
+        let metadata_to_remove = metadata.saturating_sub(self.admission_limits.metadata_bytes);
+        if records_to_remove == 0 && metadata_to_remove == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, metadata_bytes FROM runs
+                 ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id",
+            )
+            .map_err(PersistenceError::database)?;
+        let mut rows = statement.query([]).map_err(PersistenceError::database)?;
+        let mut candidates = Vec::new();
+        let mut candidate_metadata = 0_u64;
+        while let Some(row) = rows.next().map_err(PersistenceError::database)? {
+            candidates.push(
+                row.get::<_, String>(0)
+                    .map_err(PersistenceError::database)?,
+            );
+            candidate_metadata = candidate_metadata.saturating_add(nonnegative_u64(
+                row.get(1).map_err(PersistenceError::database)?,
+                "candidate metadata",
+            )?);
+            let candidate_records =
+                u64::try_from(candidates.len()).expect("format record count fits u64");
+            if (candidate_records >= records_to_remove && candidate_metadata >= metadata_to_remove)
+                || candidates.len() == limit
+            {
+                return Ok(candidates);
+            }
+        }
+        Err(PersistenceError::Corrupt(
+            "terminal history cannot fund the operational startup limits".to_owned(),
+        ))
+    }
+
+    fn commit_startup_with_reduction(
+        &mut self,
+        batch: StartupBatch<'_>,
+    ) -> Result<(), PersistenceError> {
+        let mut len = batch.len();
+        loop {
+            match self.commit_startup_batch(batch.prefix(len))? {
+                StartupBatchDisposition::Committed => return Ok(()),
+                StartupBatchDisposition::OverBudget if len > 1 => len /= 2,
+                StartupBatchDisposition::OverBudget => {
+                    return Err(PersistenceError::Mutation(format!(
+                        "one startup {} unit exceeds the 8 MiB WAL charge",
+                        batch.label()
+                    )));
+                }
+            }
+        }
+    }
+
+    fn commit_startup_batch(
+        &mut self,
+        batch: StartupBatch<'_>,
+    ) -> Result<StartupBatchDisposition, PersistenceError> {
+        self.truncate_wal_to_zero()?;
+        self.connection
+            .release_memory()
+            .map_err(PersistenceError::database)?;
+        let previous_cache_spill = self
+            .disable_cache_spill()
+            .map_err(|failure| failure.error)?;
+        let result = self.commit_startup_batch_with_spill_disabled(batch);
+        let restore = self.restore_cache_spill(previous_cache_spill);
+        match (result, restore) {
+            (Ok(disposition), Ok(())) => Ok(disposition),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(restore_error)) => Err(combine_errors(&error, &restore_error)),
+        }
+    }
+
+    fn commit_startup_batch_with_spill_disabled(
+        &mut self,
+        batch: StartupBatch<'_>,
+    ) -> Result<StartupBatchDisposition, PersistenceError> {
+        ctxmux_sqlite_status::reset_cache_io(&self.connection)
+            .map_err(PersistenceError::database)?;
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(PersistenceError::database)?;
+        let initial_wal = match file_len(&self.wal_path) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.rollback_startup_error(error),
+        };
+        if initial_wal != 0 {
+            return self.rollback_startup_error(PersistenceError::Mutation(
+                "persistent WAL changed before startup normalization".to_owned(),
+            ));
+        }
+        if let Err(error) = self.apply_startup_batch(batch) {
+            return self.rollback_startup_error(error);
+        }
+        let snapshot = match ctxmux_sqlite_status::cache_admission_snapshot(&self.connection) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self.rollback_startup_error(PersistenceError::database(error));
+            }
+        };
+        let wal_bytes = match file_len(&self.wal_path) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.rollback_startup_error(error),
+        };
+        #[cfg(test)]
+        let cache_used = self.startup_cache_used(snapshot.used_bytes);
+        #[cfg(not(test))]
+        let cache_used = snapshot.used_bytes;
+        let charge = wal_charge_for_cache(cache_used);
+        if wal_bytes != 0 || snapshot.writes != 0 || snapshot.spills != 0 {
+            return self.rollback_startup_error(PersistenceError::Mutation(format!(
+                "startup normalization violated its no-spill proof: cache writes={}, spills={}, wal={} bytes",
+                snapshot.writes, snapshot.spills, wal_bytes
+            )));
+        }
+        let Some(charge) = charge else {
+            return self.rollback_startup_error(PersistenceError::Mutation(
+                "startup normalization cache charge overflowed".to_owned(),
+            ));
+        };
+        if charge > WAL_CHECKPOINT_BYTES {
+            #[cfg(test)]
+            self.test_hooks
+                .startup_over_budget_attempts
+                .fetch_add(1, Ordering::AcqRel);
+            self.connection
+                .execute_batch("ROLLBACK")
+                .map_err(PersistenceError::database)?;
+            return Ok(StartupBatchDisposition::OverBudget);
+        }
+        if let Err(commit_error) = self.connection.execute_batch("COMMIT") {
+            let error = PersistenceError::database(commit_error);
+            if self.connection.is_autocommit() {
+                return Err(error);
+            }
+            return match self.connection.execute_batch("ROLLBACK") {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(PersistenceError::Mutation(format!(
+                    "{error}; startup rollback after COMMIT error failed: {rollback_error}"
+                ))),
+            };
+        }
+        let actual_wal = file_len(&self.wal_path)?;
+        if actual_wal > charge || actual_wal > WAL_CHECKPOINT_BYTES {
+            return Err(PersistenceError::Mutation(format!(
+                "startup WAL used {actual_wal} bytes above its admitted {charge} byte charge"
+            )));
+        }
+        self.validate_files()?;
+        #[cfg(test)]
+        {
+            mutex_lock(&self.test_hooks.startup_batch_wal_bytes).push(actual_wal);
+            let remaining = self
+                .test_hooks
+                .startup_fail_after_commits
+                .load(Ordering::Acquire);
+            if remaining > 0
+                && self
+                    .test_hooks
+                    .startup_fail_after_commits
+                    .fetch_sub(1, Ordering::AcqRel)
+                    == 1
+            {
+                return Err(PersistenceError::Mutation(
+                    "injected interruption after a committed startup batch".to_owned(),
+                ));
+            }
+        }
+        Ok(StartupBatchDisposition::Committed)
+    }
+
+    #[cfg(test)]
+    fn startup_cache_used(&self, measured_bytes: u64) -> u64 {
+        if self
+            .test_hooks
+            .force_startup_over_budget_once
+            .swap(false, Ordering::AcqRel)
+        {
+            return WAL_CHECKPOINT_BYTES;
+        }
+        measured_bytes
+    }
+
+    fn apply_startup_batch(&self, batch: StartupBatch<'_>) -> Result<(), PersistenceError> {
+        let interrupted = serde_json::to_string(&RunState::Interrupted {
+            reason: InterruptionReason::DaemonRestart,
+        })
+        .map_err(PersistenceError::serialization)?;
+        match batch {
+            StartupBatch::Reconcile(rows) => {
+                for row in rows {
+                    let changed = self
+                        .connection
+                        .execute(
+                            "UPDATE runs SET state_kind = 'interrupted', state_json = ?2,
+                             pid = NULL, terminal_at_ms = ?3, metadata_bytes = ?4
+                             WHERE id = ?1 AND state_kind = 'running'",
+                            params![
+                                row.id,
+                                interrupted,
+                                row.terminal_at_ms,
+                                i64::try_from(row.metadata_bytes)
+                                    .expect("metadata budget fits SQLite")
+                            ],
+                        )
+                        .map_err(PersistenceError::database)?;
+                    if changed != 1 {
+                        return Err(PersistenceError::Mutation(format!(
+                            "startup running Run {} changed before reconciliation",
+                            row.id
+                        )));
+                    }
+                }
+            }
+            StartupBatch::Evict(ids) => {
+                for id in ids {
+                    let changed = self
+                        .connection
+                        .execute(
+                            "DELETE FROM runs WHERE id = ?1 AND state_kind != 'running'",
+                            [id],
+                        )
+                        .map_err(PersistenceError::database)?;
+                    if changed != 1 {
+                        return Err(PersistenceError::Mutation(format!(
+                            "startup terminal Run {id} changed before eviction"
+                        )));
+                    }
+                }
+            }
+            StartupBatch::PublishEpoch => {
+                let changed = self
+                    .connection
+                    .execute(
+                        "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
+                        [&self.epoch],
+                    )
+                    .map_err(PersistenceError::database)?;
+                if changed != 1 {
+                    return Err(PersistenceError::Corrupt(
+                        "runtime metadata singleton is missing".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback_startup_error(
+        &self,
+        error: PersistenceError,
+    ) -> Result<StartupBatchDisposition, PersistenceError> {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(PersistenceError::Mutation(format!(
+                "{error}; startup normalization rollback failed: {rollback_error}"
+            ))),
+        }
+    }
+
+    fn validate_operational_state(&self) -> Result<(), PersistenceError> {
+        let (records, metadata, running): (i64, i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT count(*), coalesce(sum(metadata_bytes), 0),
+                        coalesce(sum(state_kind = 'running'), 0) FROM runs",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(PersistenceError::database)?;
+        let current_epoch: String = self
+            .connection
+            .query_row(
+                "SELECT current_epoch FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        if nonnegative_u64(records, "record count")? > self.admission_limits.run_records
+            || nonnegative_u64(metadata, "metadata total")? > self.admission_limits.metadata_bytes
+            || running != 0
+            || current_epoch != self.epoch
+        {
+            return Err(PersistenceError::Corrupt(
+                "startup normalization did not reach the operational state".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     fn drive_staged_start(
@@ -2108,7 +2574,7 @@ fn validate_state_file(path: &Path) -> Result<(), PersistenceError> {
     Ok(())
 }
 
-fn create_schema(connection: &Connection) -> Result<(), PersistenceError> {
+fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), PersistenceError> {
     connection
         .execute_batch(&format!(
             "PRAGMA page_size={PAGE_SIZE_BYTES};
@@ -2145,10 +2611,15 @@ fn create_schema(connection: &Connection) -> Result<(), PersistenceError> {
                 data BLOB NOT NULL,
                 UNIQUE(run_id, seq)
              );
-             CREATE INDEX replay_chunks_run_seq ON replay_chunks(run_id, seq);
-             INSERT INTO runtime_meta(singleton, schema_version, current_epoch)
-             VALUES (1, {SCHEMA_VERSION}, 'initializing');"
+             CREATE INDEX replay_chunks_run_seq ON replay_chunks(run_id, seq);"
         ))
+        .map_err(PersistenceError::database)?;
+    connection
+        .execute(
+            "INSERT INTO runtime_meta(singleton, schema_version, current_epoch)
+             VALUES (1, ?1, ?2)",
+            params![SCHEMA_VERSION, initial_epoch],
+        )
         .map_err(PersistenceError::database)?;
     Ok(())
 }
@@ -2347,103 +2818,6 @@ fn validate_quick_check(connection: &Connection) -> Result<(), PersistenceError>
         )));
     }
     Ok(())
-}
-
-fn reconcile_epoch(connection: &Connection, epoch: &str) -> Result<(), PersistenceError> {
-    let transaction = connection
-        .unchecked_transaction()
-        .map_err(PersistenceError::database)?;
-    let interrupted = RunState::Interrupted {
-        reason: InterruptionReason::DaemonRestart,
-    };
-    let state_json =
-        serde_json::to_string(&interrupted).map_err(PersistenceError::serialization)?;
-    let now = now_millis();
-    let running = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT id, creation_key, spec_json, lineage_json, source_epoch
-                 FROM runs WHERE state_kind = 'running'",
-            )
-            .map_err(PersistenceError::database)?;
-        statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })
-            .map_err(PersistenceError::database)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PersistenceError::database)?
-    };
-    for (id, creation_key, spec_json, lineage_json, source_epoch) in running {
-        let metadata_bytes = metadata_size(
-            &id,
-            &creation_key,
-            &spec_json,
-            lineage_json.as_deref(),
-            &state_json,
-            &source_epoch,
-        )?;
-        transaction
-            .execute(
-                "UPDATE runs SET state_kind = 'interrupted', state_json = ?2, pid = NULL,
-                 updated_at_ms = ?3, terminal_at_ms = ?3, metadata_bytes = ?4 WHERE id = ?1",
-                params![
-                    id,
-                    state_json,
-                    now,
-                    i64::try_from(metadata_bytes).expect("metadata budget fits SQLite")
-                ],
-            )
-            .map_err(PersistenceError::database)?;
-    }
-    evict_terminal_overflow(&transaction)?;
-    transaction
-        .execute(
-            "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
-            [epoch],
-        )
-        .map_err(PersistenceError::database)?;
-    transaction.commit().map_err(PersistenceError::database)
-}
-
-fn evict_terminal_overflow(transaction: &Transaction<'_>) -> Result<(), PersistenceError> {
-    loop {
-        let (records, metadata): (i64, i64) = transaction
-            .query_row(
-                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(PersistenceError::database)?;
-        if nonnegative_u64(records, "record count")? <= RUN_RECORDS
-            && nonnegative_u64(metadata, "metadata total")? <= METADATA_BYTES
-        {
-            return Ok(());
-        }
-        let candidate: Option<String> = transaction
-            .query_row(
-                "SELECT id FROM runs WHERE state_kind != 'running'
-                 ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(PersistenceError::database)?;
-        let Some(candidate) = candidate else {
-            return Err(PersistenceError::Corrupt(
-                "running records exceed startup metadata retention".to_owned(),
-            ));
-        };
-        transaction
-            .execute("DELETE FROM runs WHERE id = ?1", [candidate])
-            .map_err(PersistenceError::database)?;
-    }
 }
 
 fn validate_application_state(connection: &Connection) -> Result<(), PersistenceError> {
@@ -3117,24 +3491,30 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::fs::OpenOptions;
+    use std::{
+        collections::BTreeMap,
+        fs::OpenOptions,
+        path::Path,
+        sync::{Arc, atomic::Ordering},
+    };
 
     use ctxmux_protocol::{
-        CreateOperationKey, OutputChunk, OutputReplay, RunBackend, RunCapabilities, RunId, RunInfo,
-        RunSpec, RunState, TerminalSize,
+        CreateOperationKey, InterruptionReason, OutputChunk, OutputReplay, RunBackend,
+        RunCapabilities, RunId, RunInfo, RunSpec, RunState, TerminalSize,
     };
     use rusqlite::{Connection, params};
     use tempfile::TempDir;
 
     use super::{
-        AdmissionLimits, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES, MAX_TRANSACTION_PAYLOAD_BYTES,
-        METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES, PERSISTENCE_QUEUE_CAPACITY,
-        Persistence, PersistenceError, PersistentCandidate, PersistentStartCompletion, RUN_RECORDS,
-        SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartDisposition, StartReceipt, StateLockGuard,
+        AdmissionLimits, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
+        MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
+        PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
+        PersistentCandidate, PersistentStartCompletion, RUN_RECORDS, SHM_MAX_BYTES,
+        STATE_FILES_MAX_BYTES, StartDisposition, StartReceipt, StateLockGuard, StateStore,
         WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay, create_schema, metadata_size,
-        prune_global_replay_to, validate_existing_schema, wal_charge_for_cache,
+        mutex_lock, prune_global_replay_to, validate_existing_schema, wal_charge_for_cache,
     };
+    use crate::creation::MAX_RETAINED_RUNS;
 
     #[test]
     fn state_lock_release_does_not_wait_for_an_inherited_file_description() {
@@ -3221,6 +3601,77 @@ mod tests {
             wal_charge_for_cache(admitted_cache + 1).unwrap() > WAL_CHECKPOINT_BYTES,
             "one byte into another conservative page crosses the frozen charge"
         );
+    }
+
+    #[test]
+    fn schema_bootstrap_uses_a_reopenable_epoch_before_normalization() {
+        let connection = Connection::open_in_memory().expect("open bootstrap fixture");
+        let epoch = uuid::Uuid::new_v4().to_string();
+        create_schema(&connection, &epoch).expect("create schema with a valid bootstrap epoch");
+        validate_existing_schema(&connection).expect("bootstrap schema is immediately reopenable");
+        let stored: String = connection
+            .query_row(
+                "SELECT current_epoch FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read bootstrap epoch");
+        assert_eq!(stored, epoch);
+    }
+
+    #[test]
+    fn startup_normalization_is_bounded_restartable_and_canonical() {
+        let temp = TempDir::new().expect("create startup normalization fixture");
+        let state_dir = temp.path().join("state");
+        let seeded = seed_startup_overflow(&state_dir);
+
+        for expected_phase in ["reconcile", "evict"] {
+            let hooks = Arc::new(PersistenceTestHooks::default());
+            hooks.startup_fail_after_commits.store(1, Ordering::Release);
+            if expected_phase == "evict" {
+                hooks
+                    .force_startup_over_budget_once
+                    .store(true, Ordering::Release);
+            }
+            let Err(error) =
+                StateStore::open(&state_dir, AdmissionLimits::OPERATIONAL, Arc::clone(&hooks))
+            else {
+                panic!("injected startup {expected_phase} interruption unexpectedly opened");
+            };
+            assert!(error.to_string().contains("injected interruption"));
+            let wal = mutex_lock(&hooks.startup_batch_wal_bytes).clone();
+            assert_eq!(wal.len(), 1);
+            assert!(wal[0] <= WAL_CHECKPOINT_BYTES);
+            if expected_phase == "evict" {
+                assert!(
+                    hooks.startup_over_budget_attempts.load(Ordering::Acquire) > 0,
+                    "page-heavy eviction shrinks before committing one exact prefix"
+                );
+            }
+        }
+
+        let (persistence, recovered) =
+            Persistence::open(&state_dir).expect("restart completes startup normalization");
+        assert_eq!(recovered.len(), MAX_RETAINED_RUNS);
+        let expected = &seeded[seeded.len() - MAX_RETAINED_RUNS..];
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|run| (run.info.id, run.operation_key.clone()))
+                .collect::<Vec<_>>(),
+            expected.to_vec()
+        );
+        let interrupted = recovered.last().expect("retain newest prior running Run");
+        assert_eq!(
+            interrupted.info.state,
+            RunState::Interrupted {
+                reason: InterruptionReason::DaemonRestart
+            }
+        );
+        assert_eq!(interrupted.info.pid, None);
+        let wal = persistence.startup_batch_wal_bytes();
+        assert!(!wal.is_empty());
+        assert!(wal.iter().all(|bytes| *bytes <= WAL_CHECKPOINT_BYTES));
     }
 
     #[test]
@@ -3537,12 +3988,73 @@ mod tests {
         }
     }
 
+    fn seed_startup_overflow(state_dir: &Path) -> Vec<(RunId, CreateOperationKey)> {
+        let (persistence, recovered) = Persistence::open_with_admission_limits(
+            state_dir.to_path_buf(),
+            AdmissionLimits::FORMAT,
+        )
+        .expect("open format-envelope persistence");
+        assert!(recovered.is_empty());
+        let count = MAX_RETAINED_RUNS + 3;
+        let mut seeded = Vec::with_capacity(count);
+        for index in 0..count {
+            let id = RunId::new();
+            let key = CreateOperationKey::new(format!("startup-{index:03}")).unwrap();
+            let info = running_info(id);
+            let durable = persistence
+                .insert_start(&key, &info)
+                .expect("insert startup normalization fixture");
+            if index + 1 != count {
+                let retained = if index < 3 {
+                    replay(
+                        (1..=8)
+                            .map(|seq| OutputChunk {
+                                seq,
+                                data: vec![b'x'; 512 * 1024],
+                            })
+                            .collect(),
+                    )
+                } else {
+                    replay(Vec::new())
+                };
+                durable.append(id, retained.clone());
+                durable.finalize(id, 42, retained, exited_state());
+            }
+            drop(durable);
+            seeded.push((id, key));
+        }
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let mut connection = Connection::open(state_dir.join(DATABASE_FILE))
+            .expect("open startup fixture timestamps");
+        let transaction = connection
+            .transaction()
+            .expect("start startup timestamp transaction");
+        for (index, (id, _)) in seeded.iter().enumerate() {
+            let timestamp = i64::try_from(index).expect("fixture index fits SQLite");
+            transaction
+                .execute(
+                    "UPDATE runs SET created_at_ms = ?2, updated_at_ms = ?2,
+                     terminal_at_ms = CASE WHEN state_kind = 'running' THEN NULL ELSE ?2 END
+                     WHERE id = ?1",
+                    params![id.to_string(), timestamp],
+                )
+                .expect("set deterministic startup fixture order");
+        }
+        transaction
+            .commit()
+            .expect("commit startup fixture timestamps");
+        seeded
+    }
+
     fn test_connection() -> Connection {
         let connection = Connection::open_in_memory().expect("open in-memory persistence store");
         connection
             .execute_batch("PRAGMA foreign_keys=ON;")
             .expect("enable test foreign keys");
-        create_schema(&connection).expect("create test persistence schema");
+        create_schema(&connection, &uuid::Uuid::new_v4().to_string())
+            .expect("create test persistence schema");
         connection
             .execute(
                 "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",

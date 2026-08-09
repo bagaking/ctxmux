@@ -20,7 +20,7 @@ const CREATION_STRIPES: usize = 64;
 // Matches the pre-registered resource start concurrency while bounding only
 // transient physical launch owners; this is not a public Run quota.
 const MAX_CREATION_OWNER_SLOTS: usize = 8;
-const MAX_RETAINED_RUNS: usize = 128;
+pub(crate) const MAX_RETAINED_RUNS: usize = 128;
 const CLEANUP_POLL: Duration = Duration::from_millis(20);
 
 /// Total order of terminal state publication within one daemon incarnation.

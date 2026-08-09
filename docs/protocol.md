@@ -81,10 +81,11 @@ silently succeeds.
 Generation 6 declares `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
-before native spawn or tmux Control startup. The same error is declared for
-persistent record or metadata admission, but persistent exact replacement is
-not implemented yet; the current persistent path must not manufacture it as a
-substitute for Backend or persistence failure.
+before native spawn or tmux Control startup. In persistent mode it also means
+that no exact eligible terminal candidate set can satisfy projected record or
+metadata capacity within the admitted SQLite page charge. Candidate Runs,
+their replay and byte-exact keys, and the successor Run/key change in one
+transaction; Backend or persistence failures remain their own error classes.
 
 Every generation-6 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
@@ -140,8 +141,8 @@ The fence publishes no Run, retains neither the random key stripe nor a launch
 permit, and is reported by bounded shutdown. It is not a durable tombstone and
 cannot survive daemon crash.
 
-Durable `COMMIT` is the point of no return. If a post-commit vacuum or
-physical-file check fails, persistence is latched and the first request reports
+Durable `COMMIT` is the point of no return. If a post-commit physical-file
+check fails, persistence is latched and the first request reports
 `persistence`, but the daemon still publishes the committed Run and key in its
 registry; a same-key retry returns that Run rather than launching another
 process. Likewise, failure to deliver a response does not roll back the Run or
@@ -359,8 +360,13 @@ same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
 state lock. Exact schema version, SQLite integrity, typed JSON, a required
 native `RunSpec` satisfying the live-start semantic rules, lifecycle, lineage,
 cursor, contiguous chunk, byte-accounting, and quota invariants are validated
-before the socket is published. Unknown versions or corrupt state fail startup;
-there is no migration, reset, salvage, or partial exposure.
+against the schema-2 format envelope before the socket is published. A valid
+older store may contain up to 4,096 records; bounded, restartable startup
+transactions reconcile prior running rows, evict the canonical terminal prefix
+to the operational 128-record ceiling, and finish serving-epoch publication before
+the socket becomes visible. Unknown versions, corrupt state, or an
+individually unprovable normalization unit fail startup; there is no migration,
+reset, salvage, or partial exposure.
 
 A prior-epoch running record becomes `interrupted { reason: daemon_restart }`
 with `pid: null`. Live PTY ownership and child control are not recovered. An old

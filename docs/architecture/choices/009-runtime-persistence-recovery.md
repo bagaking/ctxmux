@@ -32,7 +32,8 @@ The accepted recovery class is historical Run recovery:
 - A recovered exited Run supports `list`, `status`, replay attachment, and
   portable Level A fork. It rejects input, resize, and stop as terminal.
 - A row left `running` by an older daemon epoch becomes the explicit terminal
-  state `interrupted { reason: daemon_restart }` in one startup transaction.
+  state `interrupted { reason: daemon_restart }` during bounded, restartable
+  startup normalization before socket publication.
   Its public PID is cleared. It supports the same historical read/replay and
   Level A behavior as an exited Run, but never claims an exit code.
 - Live PTY ownership, child-handle transfer, PID re-adoption, and transparent
@@ -56,14 +57,23 @@ creation keys, an exact BINARY unique-key index, and typed JSON, a required
 native `RunSpec` accepted by the same semantic validator as live
 start and fork, allowed lifecycle values, non-self lineage, byte totals,
 strictly contiguous retained chunk sequences, matching durable oldest/head
-cursors, and quota accounting. Epoch creation and all prior-epoch
-running-to-interrupted changes commit in one transaction before socket
-publication. Protocol generation 6 and persistence schema 2 are pre-stable, so
-the current schema has no migration, downgrade, reset, salvage, or
-compatibility fallback. An unknown version, failed integrity check, or invalid
-application invariant is a typed startup failure. Ctxmux performs no repair,
-reset, migration, or partial exposure; SQLite recovery writes allowed by its
-documented commit algorithm are not described as leaving bytes untouched.
+cursors, and quota accounting. Schema-2 validation accepts its legacy
+4,096-record format envelope, then startup normalization uses bounded,
+spill-disabled transactions to reconcile prior running rows and evict the
+canonical terminal prefix to the operational 128-record ceiling. Each batch
+starts from a zero WAL, proves its cache-resident page charge before COMMIT,
+and may be resumed after interruption. A new schema stores its valid UUID as a
+bootstrap epoch immediately so an interrupted first open remains structurally
+reopenable; an existing store retains its previous epoch during normalization.
+In both cases the final startup transaction completes serving-epoch
+publication only after normalization, and the socket is published only after
+application and operational invariants are revalidated. Protocol generation 6
+and persistence schema 2 are pre-stable, so the current schema has no
+migration, downgrade, reset, salvage, or compatibility fallback. An unknown
+version, failed integrity check, or invalid application invariant is a typed
+startup failure. Ctxmux performs no repair, reset, migration, or partial
+exposure; SQLite recovery writes allowed by its documented commit algorithm
+are not described as leaving bytes untouched.
 
 The persistence actor batches ordered output without adding a per-Run thread.
 Its bounded 1,024-command queue applies backpressure to the PTY reader instead
@@ -79,8 +89,8 @@ mode and transactions define four indivisible application units:
   oldest/head cursors and byte accounting together;
 - a terminal transition commits the final replay batch, exited state, and the
   actual historical child PID in the same transaction;
-- startup epoch/reconciliation and record eviction with dependent replay removal
-  each commit as one transaction.
+- each startup reconciliation prefix, record-eviction prefix with dependent
+  replay removal, and final epoch publication commits as one transaction.
 
 Output batches may lag live delivery but advance only contiguously. Process crash
 or torn WAL recovery therefore yields the previous or next complete unit, never
@@ -98,14 +108,17 @@ Runs may still be explicitly controlled so storage failure does not strand a
 child behind a false success.
 
 Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
-replay tail remains. Persistent replay has a 256 MiB global logical byte budget;
-serialized metadata has a separate 64 MiB logical byte budget; and at most 4,096
-Run records are retained. The oldest chunks are pruned across Runs while keeping
-each retained replay window contiguous and its truncation cursors exact. The
-oldest terminal or interrupted records are removed when either metadata limit is
-reached. Because the creation key is a required column of that same row,
-retention removes the durable mapping in the same transaction. Running records
-are not deleted; a start that cannot reserve its full metadata fails before
+replay tail remains. Persistent replay has a 256 MiB global logical byte budget
+and serialized metadata has a separate 64 MiB logical byte budget. Schema 2 can
+validate an older store containing up to 4,096 records, but a serving daemon
+normalizes it to the same 128 retained or projected records used by the
+Registry before socket publication. The oldest chunks are pruned across Runs
+while keeping each retained replay window contiguous and its truncation cursors
+exact. The oldest exact terminal or interrupted candidates are removed when
+record or metadata admission requires replacement. Because the creation key is
+a required column of that same row, retention removes the durable mapping in
+the same transaction. Running records are not deleted by ordinary admission; a
+start that cannot reserve its full record and metadata burden fails before
 child publication.
 
 The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main

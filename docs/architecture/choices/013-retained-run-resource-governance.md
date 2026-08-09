@@ -1,7 +1,7 @@
 # 013 — Retained Run resource governance
 
-- Status: implemented memory-only owner; persistent exact-replacement page
-  admission accepted and implementation in progress under T-029
+- Status: memory-only and persistent owners implemented; sustained
+  qualification pending
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -9,9 +9,9 @@
 
 Before the memory-only owner in this decision, the daemon retained every
 published Run and creation-key mapping for its whole epoch. Memory-only mode
-now uses the bound below. Persistent SQLite storage bounds its own rows,
-metadata, and replay, but the live Registry still does not remove the
-corresponding same-epoch in-memory Run; that remaining path stays under T-029.
+now uses the bound below. Persistent mode uses the same Registry collection
+owner and atomically removes the corresponding durable Run, replay, and exact
+creation-key mapping before publishing its replacement.
 
 The correction must preserve the stronger owner rules already established by
 creation idempotency, unpublished-child rollback, attachment replay, native
@@ -23,24 +23,23 @@ general Backend framework.
 
 ### One operational Run-record ceiling
 
-The production memory-only daemon admits at most 128 retained or projected
-publication records across native and tmux Runs. Persistent mode adopts the
-same operational Registry ceiling only after T-029 closes exact durable
-replacement. A publication reservation counts before native spawn or tmux
-Control child startup. Its own exact candidate replacement can make that
-ticket's projected burden zero, but an uncommitted net release never becomes
-global slack. Concurrent reservations therefore cannot publish a 129th
-memory-only Run. This is a retained-record bound, not a claim that no transient
-owner can coexist with those records.
+The production daemon admits at most 128 retained or projected publication
+records across native and tmux Runs. Persistent mode uses the same operational
+Registry ceiling and couples its exact durable replacement to the Registry
+ticket. A publication reservation counts before native spawn or tmux Control
+child startup. Its own exact candidate replacement can make that ticket's
+projected burden zero, but an uncommitted net release never becomes global
+slack. Concurrent reservations therefore cannot publish a 129th Run. This is a
+retained-record bound, not a claim that no transient owner can coexist with
+those records.
 
 The value 128 preserves the already qualified 1/32/128 live-Run matrix while
 avoiding the false safety of reusing SQLite's historical 4,096-row format
 envelope. The existing 4 MiB per-Run retention contract therefore derives a
 512 MiB live memory-only `OutputLog` payload ceiling without another hot-path
 byte quota. Up to 128 live native readers separately hold one 8 KiB read buffer
-each. The same live bound becomes applicable to persistent mode only with
-T-029; its existing 256 MiB durable SQLite logical replay limit remains
-independently authoritative.
+each. Persistent mode uses the same live bound while its 256 MiB durable SQLite
+logical replay limit remains independently authoritative.
 
 One daemon-private eight-slot overlap owner is shared by native Start/Fork,
 tmux import, and transferred T-026 unpublished-child cleanup. A slot is held
@@ -64,11 +63,12 @@ Run metadata, and allocator overhead remain measured RSS rather than being
 misrepresented as replay bytes.
 
 SQLite may accept an older schema-2 store containing up to 4,096 structurally
-valid rows during fail-closed startup validation. T-029 must normalize terminal
-history to 128 before socket publication while reconciling prior running rows
-to interrupted. The 4,096 value is a legacy format-validation envelope, not a
-second live capacity promise. The existing 64 MiB metadata, 256 MiB replay,
-database, WAL, SHM, and state-directory limits remain unchanged.
+valid rows during fail-closed format validation. Bounded, restartable startup
+transactions reconcile prior running rows to interrupted, evict the canonical
+terminal prefix to 128, and finish serving-epoch publication before socket publication.
+The 4,096 value is a legacy format-validation envelope, not a second live
+capacity promise. The existing 64 MiB metadata, 256 MiB replay, database, WAL,
+SHM, and state-directory limits remain unchanged.
 
 T-026 unpublished-child cleanup is not a published Run record. It keeps its
 exact-key fence while retaining one of the shared eight overlap slots above.
@@ -240,8 +240,8 @@ all ordinary launches.
 Decision 009 freezes an 8 MiB per-transaction WAL ceiling and a 16 MiB total
 WAL ceiling. Logical replay bytes are not a page-cost proof: cascade deletes,
 chunk cardinality, overflow pages, indexes, B-tree rebalancing, freelist and
-pointer-map updates can all change the number of dirty SQLite pages. T-029
-therefore admits a live replacement from the actual exact transaction's
+pointer-map updates can all change the number of dirty SQLite pages. The
+persistence owner therefore admits a live replacement from the exact transaction's
 cache-resident page set, not from a payload estimate.
 
 The single persistence connection uses a scoped `cache_spill=OFF` guard only
@@ -362,7 +362,7 @@ expose only the safe connection-status observation needed here. A SQLite or
 rusqlite upgrade must re-run the cache-accounting, no-spill, rollback, and final
 WAL-frame fixture before the dependency can change.
 
-Once implemented, this decision supersedes decision 009 only for live Registry
+This implementation supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
 replacement. Decision 009 remains authoritative for schema-2 validation up to
 the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
@@ -633,9 +633,11 @@ or deterministic-owner fixtures.
 - Existing native-control and tmux completion fixtures prove the Backend-local
   quiescence oracles reused by memory-only eligibility; source-bound race and
   sustained-churn pressure remain T-030 qualification work.
-- Future/T-029: exact multi-candidate SQLite replacement, wrong candidate
-  identity, pre/post-COMMIT injection, persistence-finalize eligibility, and
-  real restart around COMMIT.
+- Implemented/T-029: exact multi-candidate SQLite replacement, wrong candidate
+  identity, pre-COMMIT cleanup, persistence-finalize eligibility, same-epoch
+  key replacement, restart convergence, and bounded startup normalization.
+  Final crash-around-COMMIT evidence and the source-bound Task Gate remain
+  required before T-029 closes.
 - T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
   projection invariant under reverse publication order without a production
   process census.

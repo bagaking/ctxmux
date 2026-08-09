@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
 | Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the memory-only retained-Run capacity boundary. Persistent exact replacement remains under implementation.                                                     | Other SDKs appear only for a real client requirement.                                        |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary.                                                                                              | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
 | Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
@@ -77,7 +77,7 @@ start accepted
      +-- later daemon epoch --> interrupted(daemon_restart)
 ```
 
-`stop` sends one termination command to the waiter that owns the direct child handle. On Unix that handle gives `SIGHUP` a short grace period and escalates to a forced kill when the child remains alive. Acknowledgement still precedes public terminal-state publication, so the returned `RunInfo` may say `running`; repeated stop is rejected. The waiter disables further signalling as soon as wait observes exit, before it publishes `Exited`, so a concurrent stop cannot fall back to a cached numeric PID. Descendant or process-tree termination is not promised. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted { daemon_restart }`, clears their PID, and exposes no live control. Memory-only terminal Runs remain retained until admission reaches the 128-record ceiling, then one exact fully quiescent candidate is replaced; persistent history uses the bounded durable retention policy from decision 009 but does not yet remove its same-epoch Registry owner.
+`stop` sends one termination command to the waiter that owns the direct child handle. On Unix that handle gives `SIGHUP` a short grace period and escalates to a forced kill when the child remains alive. Acknowledgement still precedes public terminal-state publication, so the returned `RunInfo` may say `running`; repeated stop is rejected. The waiter disables further signalling as soon as wait observes exit, before it publishes `Exited`, so a concurrent stop cannot fall back to a cached numeric PID. Descendant or process-tree termination is not promised. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted { daemon_restart }`, clears their PID, and exposes no live control. Terminal Runs remain retained until admission reaches the 128-record ceiling, then the Registry fences exact fully quiescent candidates; persistent COMMIT removes the same Runs, replay, and byte-exact keys before publishing the successor.
 
 ### Ownership split
 
@@ -353,15 +353,14 @@ promise that an unmodified tmux client can attach to ctxmux.
 
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
-Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Memory-only mode admits at most 128 retained or projected Run records and replaces only a fenced, terminal, fully quiescent candidate. Persistent same-epoch Registry collection is under implementation; attachment admission and a total daemon RSS quota remain open.
+Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Both memory-only and persistent modes admit at most 128 retained or projected Run records and replace only fenced, terminal, fully quiescent candidates. Persistent replacement removes the exact durable Run, replay, and byte-exact key in the same transaction before the Registry publishes its successor. Attachment admission and a total daemon RSS quota remain open.
 
 [Decision 013](architecture/choices/013-retained-run-resource-governance.md)
-owns the shipped memory-only 128-record Registry ceiling and ownership-safe
-collection contract. Persistent exact-replacement semantics and the
-spill-disabled cache-resident page proof are accepted, while their production
-integration remains in progress. The sustained-churn qualification remains
-pending and persistent mode therefore retains its current same-epoch no-GC
-behavior until T-029 closes.
+owns the shared 128-record Registry ceiling and ownership-safe collection
+contract. Persistent mode uses the same ticket and candidate SSOT, with a
+spill-disabled cache-resident page proof before launch and exact durable
+replacement at COMMIT. Sustained memory and persistent churn qualification
+remains pending under T-030.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
@@ -380,9 +379,12 @@ Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread
 commits starts, contiguous output batches, pruning/accounting, and terminal
 transitions; a bounded actor queue backpressures the PTY reader instead of
-accumulating an unbounded durable-output backlog. Startup performs journal recovery, exact-schema and application
-invariant checks, then atomically allocates a new epoch and reconciles old
-running rows. Recovered exited or interrupted Runs support list, status, replay
+accumulating an unbounded durable-output backlog. Startup performs journal
+recovery and exact schema/application validation against the schema-2 format
+envelope, then uses bounded, restartable page-admitted transactions to
+reconcile old running rows, normalize retained history to 128, and finally
+finish serving-epoch publication. Only after operational revalidation can the daemon
+publish its socket. Recovered exited or interrupted Runs support list, status, replay
 attach, and Level A fork; input, resize, stop, and recovered Level B fork fail
 explicitly. The replacement daemon never opens, adopts, attaches to, or signals
 a PID from durable metadata.
@@ -391,21 +393,21 @@ a PID from durable metadata.
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
 
-| Decision                              | Status                                           | Record                                                              |
-| ------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------- |
-| Rust and Tokio long-lived daemon      | accepted                                         | [001](architecture/choices/001-rust-tokio-daemon.md)                |
-| `portable-pty` native Backend         | accepted                                         | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 6                        | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
-| Run lifecycle concurrency             | accepted, incomplete policy                      | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
-| Ordered bounded raw-output replay     | accepted                                         | [005](architecture/choices/005-ordered-output-replay.md)            |
-| Rust schema and TypeScript codegen    | accepted                                         | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
-| Node TypeScript SDK                   | accepted                                         | [007](architecture/choices/007-node-typescript-sdk.md)              |
-| `crossterm` interactive CLI           | accepted                                         | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
-| Runtime persistence and recovery      | accepted and implemented                         | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
-| Explicit TypeScript Integrations      | accepted                                         | [010](architecture/choices/010-explicit-typescript-integrations.md) |
-| Context, artifacts, lineage, and fork | accepted                                         | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
-| tmux Control Mode Backend             | accepted and implemented; version lanes pending  | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
-| Retained Run resource governance      | memory owner implemented; persistent owner in progress | [013](architecture/choices/013-retained-run-resource-governance.md) |
+| Decision                              | Status                                                          | Record                                                              |
+| ------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Rust and Tokio long-lived daemon      | accepted                                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
+| `portable-pty` native Backend         | accepted                                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
+| Unix socket and NDJSON protocol       | accepted for generation 6                                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Run lifecycle concurrency             | accepted, incomplete policy                                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
+| Ordered bounded raw-output replay     | accepted                                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
+| Rust schema and TypeScript codegen    | accepted                                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
+| Node TypeScript SDK                   | accepted                                                        | [007](architecture/choices/007-node-typescript-sdk.md)              |
+| `crossterm` interactive CLI           | accepted                                                        | [008](architecture/choices/008-crossterm-interactive-cli.md)        |
+| Runtime persistence and recovery      | accepted and implemented                                        | [009](architecture/choices/009-runtime-persistence-recovery.md)     |
+| Explicit TypeScript Integrations      | accepted                                                        | [010](architecture/choices/010-explicit-typescript-integrations.md) |
+| Context, artifacts, lineage, and fork | accepted                                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
+| tmux Control Mode Backend             | accepted and implemented; version lanes pending                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
+| Retained Run resource governance      | memory and persistent owners implemented; qualification pending | [013](architecture/choices/013-retained-run-resource-governance.md) |
 
 ## Risk-to-fixture traceability
 
