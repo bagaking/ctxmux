@@ -635,9 +635,11 @@ or deterministic-owner fixtures.
   sustained-churn pressure remain T-030 qualification work.
 - Implemented/T-029: exact multi-candidate SQLite replacement, wrong candidate
   identity, pre-COMMIT cleanup, persistence-finalize eligibility, same-epoch
-  key replacement, restart convergence, and bounded startup normalization.
-  Final crash-around-COMMIT evidence and the source-bound Task Gate remain
-  required before T-029 closes.
+  key replacement, restart convergence, bounded startup normalization, real
+  process crash immediately before/after ordinary COMMIT, and actor-routed
+  old/new/hybrid COMMIT-error classification. The public
+  startup-before-socket oracle and source-bound Task Gate remain required
+  before T-029 closes.
 - T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
   projection invariant under reverse publication order without a production
   process census.

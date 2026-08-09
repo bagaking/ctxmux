@@ -14,7 +14,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use ctxmux_protocol::{
     CreateOperationKey, InterruptionReason, OutputChunk, OutputReplay, RunBackend, RunCapabilities,
@@ -140,6 +140,16 @@ struct PersistenceTestHooks {
     startup_fail_after_commits: AtomicU64,
     startup_over_budget_attempts: AtomicU64,
     force_startup_over_budget_once: AtomicBool,
+    start_commit_crash_phase: AtomicU8,
+    fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum StartCommitCrashPhase {
+    Before = 1,
+    After = 2,
 }
 
 /// Immutable persistence-owned encoding of one native Run before launch.
@@ -552,6 +562,24 @@ impl Persistence {
             .test_hooks
             .fail_next_start_before_commit
             .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn crash_next_start_commit_at(&self, phase: StartCommitCrashPhase) {
+        self.inner
+            .test_hooks
+            .start_commit_crash_phase
+            .store(phase as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn fail_next_start_commit_as(&self, durable_unit: CommitProbe) {
+        let previous =
+            mutex_lock(&self.inner.test_hooks.fail_next_start_commit_as).replace(durable_unit);
+        assert!(
+            previous.is_none(),
+            "only one failed COMMIT fixture may be armed"
+        );
     }
 
     #[cfg(test)]
@@ -2112,8 +2140,19 @@ impl StateStore {
                 }
             };
         }
-        match self.connection.execute_batch("COMMIT") {
+        #[cfg(test)]
+        self.crash_start_commit_if_armed(StartCommitCrashPhase::Before);
+        #[cfg(test)]
+        let commit_result = match mutex_lock(&self.test_hooks.fail_next_start_commit_as).take() {
+            Some(durable_unit) => self.inject_start_commit_error(prepared, durable_unit),
+            None => self.connection.execute_batch("COMMIT"),
+        };
+        #[cfg(not(test))]
+        let commit_result = self.connection.execute_batch("COMMIT");
+        match commit_result {
             Ok(()) => {
+                #[cfg(test)]
+                self.crash_start_commit_if_armed(StartCommitCrashPhase::After);
                 let _ = receipt.decide(StartDisposition::Committed);
                 let mut post_commit_error = None;
                 #[cfg(test)]
@@ -2135,6 +2174,42 @@ impl StateStore {
                 self.classify_failed_commit(prepared, candidates, receipt, commit_error)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn crash_start_commit_if_armed(&self, phase: StartCommitCrashPhase) {
+        if self
+            .test_hooks
+            .start_commit_crash_phase
+            .compare_exchange(phase as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            std::process::abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_start_commit_error(
+        &self,
+        prepared: &PreparedPersistentStart,
+        durable_unit: CommitProbe,
+    ) -> rusqlite::Result<()> {
+        match durable_unit {
+            CommitProbe::OldUnit => self.connection.execute_batch("ROLLBACK")?,
+            CommitProbe::NewUnit => self.connection.execute_batch("COMMIT")?,
+            CommitProbe::Hybrid => {
+                self.connection.execute_batch("ROLLBACK; BEGIN IMMEDIATE")?;
+                self.apply_exact_replacement(prepared, &[])
+                    .unwrap_or_else(|failure| {
+                        panic!(
+                            "failed to construct old+new COMMIT fixture: {}",
+                            failure.error
+                        )
+                    });
+                self.connection.execute_batch("COMMIT")?;
+            }
+        }
+        Err(rusqlite::Error::ExecuteReturnedResults)
     }
 
     fn classify_failed_commit(
@@ -3493,9 +3568,14 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use std::{
         collections::BTreeMap,
+        env,
         fs::OpenOptions,
+        os::unix::process::ExitStatusExt,
         path::Path,
+        process::{Command as ProcessCommand, Output as ProcessOutput, Stdio},
         sync::{Arc, atomic::Ordering},
+        thread,
+        time::{Duration, Instant},
     };
 
     use ctxmux_protocol::{
@@ -3506,15 +3586,22 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AdmissionLimits, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
+        AdmissionLimits, CommitProbe, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
         MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
         PersistentCandidate, PersistentStartCompletion, RUN_RECORDS, SHM_MAX_BYTES,
-        STATE_FILES_MAX_BYTES, StartDisposition, StartReceipt, StateLockGuard, StateStore,
-        WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay, create_schema, metadata_size,
-        mutex_lock, prune_global_replay_to, validate_existing_schema, wal_charge_for_cache,
+        STATE_FILES_MAX_BYTES, StartCommitCrashPhase, StartDisposition, StartReceipt,
+        StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay,
+        create_schema, metadata_size, mutex_lock, prune_global_replay_to, validate_existing_schema,
+        wal_charge_for_cache,
     };
     use crate::creation::MAX_RETAINED_RUNS;
+
+    const COMMIT_CRASH_STATE_DIR: &str = "CTXMUX_COMMIT_CRASH_STATE_DIR";
+    const COMMIT_CRASH_PHASE: &str = "CTXMUX_COMMIT_CRASH_PHASE";
+    const COMMIT_CRASH_NEW_ID: &str = "CTXMUX_COMMIT_CRASH_NEW_ID";
+    const COMMIT_CRASH_NEW_KEY: &str = "CTXMUX_COMMIT_CRASH_NEW_KEY";
+    const COMMIT_CRASH_ROLE: &str = "CTXMUX_COMMIT_CRASH_ROLE";
 
     #[test]
     fn state_lock_release_does_not_wait_for_an_inherited_file_description() {
@@ -3590,6 +3677,203 @@ mod tests {
         let lost = StartReceipt::pending();
         assert_eq!(lost.unknown_if_pending(), StartDisposition::CommitUnknown);
         assert!(!lost.decide(StartDisposition::NotCommitted));
+    }
+
+    #[test]
+    fn ordinary_exact_replacement_recovers_old_or_new_around_real_commit_crash() {
+        for (phase, expected_new) in [("before", false), ("after", true)] {
+            let temp = TempDir::new().expect("create COMMIT crash fixture");
+            let state_dir = temp.path().join(phase);
+            let (old_id, old_key) = seed_terminal_candidate(&state_dir, phase);
+            let new_id = RunId::new();
+            let new_key = CreateOperationKey::new(format!("commit-crash-new-{phase}"))
+                .expect("valid COMMIT crash key");
+            let output = run_commit_crash_subprocess(&state_dir, phase, new_id, &new_key);
+            assert_eq!(
+                output.status.code(),
+                None,
+                "{phase}-COMMIT helper exited normally: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                output.status.signal(),
+                Some(rustix::process::Signal::ABORT.as_raw()),
+                "{phase}-COMMIT helper did not terminate with SIGABRT: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let raw = raw_run_units(&state_dir);
+            assert_eq!(raw.len(), 1, "raw crash recovery exposed a hybrid unit");
+            let expected_raw = if expected_new {
+                (new_id.to_string(), new_key.as_str(), "running", None)
+            } else {
+                (old_id.to_string(), old_key.as_str(), "exited", Some(42))
+            };
+            assert_eq!(
+                (
+                    raw[0].0.clone(),
+                    raw[0].1.as_str(),
+                    raw[0].2.as_str(),
+                    raw[0].3
+                ),
+                expected_raw,
+                "{phase}-COMMIT raw SQLite recovery chose the wrong durable unit"
+            );
+            let (persistence, recovered) =
+                Persistence::open_with_test_limits(state_dir, 1, METADATA_BYTES)
+                    .expect("SQLite recovery resolves the crashed exact replacement");
+            assert_eq!(recovered.len(), 1, "crash recovery exposed a hybrid unit");
+            let expected = if expected_new {
+                (new_id, &new_key)
+            } else {
+                (old_id, &old_key)
+            };
+            assert_eq!(
+                (recovered[0].info.id, &recovered[0].operation_key),
+                expected,
+                "{phase}-COMMIT recovery chose the wrong durable unit"
+            );
+            if expected_new {
+                assert_eq!(
+                    recovered[0].info.state,
+                    RunState::Interrupted {
+                        reason: InterruptionReason::DaemonRestart
+                    }
+                );
+            } else {
+                assert_eq!(recovered[0].info.state, exited_state());
+            }
+            persistence.assert_exclusive_owner();
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess-only COMMIT crash fixture"]
+    fn ordinary_commit_crash_subprocess() {
+        let Some(state_dir) = env::var_os(COMMIT_CRASH_STATE_DIR) else {
+            return;
+        };
+        let phase = match env::var(COMMIT_CRASH_PHASE).as_deref() {
+            Ok("before") => StartCommitCrashPhase::Before,
+            Ok("after") => StartCommitCrashPhase::After,
+            value => panic!("invalid COMMIT crash phase: {value:?}"),
+        };
+        let new_id = env::var(COMMIT_CRASH_NEW_ID)
+            .expect("COMMIT crash helper receives new Run id")
+            .parse()
+            .expect("COMMIT crash Run id is valid");
+        let expected_role = env::var(COMMIT_CRASH_NEW_ID).unwrap();
+        assert_eq!(
+            env::var(COMMIT_CRASH_ROLE).as_deref(),
+            Ok(expected_role.as_str()),
+            "COMMIT crash helper requires its exact per-process role token"
+        );
+        let new_key = CreateOperationKey::new(
+            env::var(COMMIT_CRASH_NEW_KEY).expect("COMMIT crash helper receives new key"),
+        )
+        .expect("COMMIT crash key is valid");
+        let (persistence, recovered) =
+            Persistence::open_with_test_limits(state_dir.into(), 1, METADATA_BYTES)
+                .expect("open COMMIT crash helper persistence");
+        assert_eq!(recovered.len(), 1);
+        let old = &recovered[0];
+        let prepared = persistence
+            .prepare_start(&new_key, &running_info(new_id))
+            .expect("prepare replacement for COMMIT crash");
+        let staged = persistence
+            .stage_start(
+                prepared,
+                vec![PersistentCandidate::new(
+                    old.info.id,
+                    old.operation_key.clone(),
+                    old.metadata_bytes,
+                )],
+            )
+            .expect("stage replacement before COMMIT crash");
+        persistence.crash_next_start_commit_at(phase);
+        let _ = staged.commit();
+        panic!("COMMIT crash hook did not terminate the helper process");
+    }
+
+    #[test]
+    fn failed_commit_actor_route_distinguishes_old_new_and_hybrid_units() {
+        for expected in [
+            CommitProbe::OldUnit,
+            CommitProbe::NewUnit,
+            CommitProbe::Hybrid,
+        ] {
+            let temp = TempDir::new().expect("create failed COMMIT actor fixture");
+            let state_dir = temp.path().join("state");
+            let (old_id, old_key) = seed_terminal_candidate(&state_dir, "classifier");
+            let (persistence, recovered) =
+                Persistence::open_with_test_limits(state_dir.clone(), 1, METADATA_BYTES)
+                    .expect("open failed COMMIT actor persistence");
+            assert_eq!(recovered.len(), 1);
+            let new_id = RunId::new();
+            let new_key = CreateOperationKey::new(format!("failed-commit-{expected:?}"))
+                .expect("valid failed COMMIT key");
+            let prepared = persistence
+                .prepare_start(&new_key, &running_info(new_id))
+                .expect("prepare failed COMMIT replacement");
+            let staged = persistence
+                .stage_start(
+                    prepared,
+                    vec![PersistentCandidate::new(
+                        recovered[0].info.id,
+                        recovered[0].operation_key.clone(),
+                        recovered[0].metadata_bytes,
+                    )],
+                )
+                .expect("stage failed COMMIT replacement");
+            persistence.fail_next_start_commit_as(expected);
+            let result = staged.commit();
+            match (expected, result) {
+                (CommitProbe::OldUnit, PersistentStartCompletion::NotCommitted(failure)) => {
+                    assert_eq!(failure.disposition(), StartDisposition::NotCommitted);
+                    assert!(!persistence.is_failed());
+                }
+                (CommitProbe::NewUnit, PersistentStartCompletion::Committed(committed)) => {
+                    assert!(committed.post_commit_error.is_some());
+                    assert!(persistence.is_failed());
+                }
+                (CommitProbe::Hybrid, PersistentStartCompletion::CommitUnknown(failure)) => {
+                    assert!(failure.to_string().contains("durable rows are hybrid"));
+                    assert_eq!(failure.disposition(), StartDisposition::CommitUnknown);
+                    assert!(persistence.is_failed());
+                }
+                (_, _) => panic!("failed COMMIT actor returned the wrong disposition"),
+            }
+            persistence.assert_exclusive_owner();
+            drop(persistence);
+            let raw = raw_run_units(&state_dir);
+            let expected_ids = match expected {
+                CommitProbe::OldUnit => vec![old_id.to_string()],
+                CommitProbe::NewUnit => vec![new_id.to_string()],
+                CommitProbe::Hybrid => {
+                    let mut ids = vec![old_id.to_string(), new_id.to_string()];
+                    ids.sort();
+                    ids
+                }
+            };
+            assert_eq!(
+                raw.iter().map(|row| row.0.clone()).collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(
+                raw.iter()
+                    .map(|row| row.1.as_str())
+                    .collect::<Vec<_>>()
+                    .contains(&old_key.as_str()),
+                !matches!(expected, CommitProbe::NewUnit)
+            );
+            assert_eq!(
+                raw.iter()
+                    .map(|row| row.1.as_str())
+                    .collect::<Vec<_>>()
+                    .contains(&new_key.as_str()),
+                !matches!(expected, CommitProbe::OldUnit)
+            );
+        }
     }
 
     #[test]
@@ -3986,6 +4270,90 @@ mod tests {
             assert!(recovered.is_empty(), "{label} left a partial durable row");
             drop(reopened);
         }
+    }
+
+    fn seed_terminal_candidate(state_dir: &Path, label: &str) -> (RunId, CreateOperationKey) {
+        let (persistence, recovered) =
+            Persistence::open_with_test_limits(state_dir.to_path_buf(), 1, METADATA_BYTES)
+                .expect("open terminal candidate fixture");
+        assert!(recovered.is_empty());
+        let id = RunId::new();
+        let key = CreateOperationKey::new(format!("commit-crash-old-{label}"))
+            .expect("valid terminal candidate key");
+        let durable = persistence
+            .insert_start(&key, &running_info(id))
+            .expect("insert terminal candidate");
+        durable.finalize(id, 42, replay(Vec::new()), exited_state());
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+        (id, key)
+    }
+
+    fn run_commit_crash_subprocess(
+        state_dir: &Path,
+        phase: &str,
+        new_id: RunId,
+        new_key: &CreateOperationKey,
+    ) -> ProcessOutput {
+        let role = new_id.to_string();
+        let mut child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
+            .arg("--exact")
+            .arg("persistence::tests::ordinary_commit_crash_subprocess")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .env(COMMIT_CRASH_STATE_DIR, state_dir)
+            .env(COMMIT_CRASH_PHASE, phase)
+            .env(COMMIT_CRASH_NEW_ID, &role)
+            .env(COMMIT_CRASH_NEW_KEY, new_key.as_str())
+            .env(COMMIT_CRASH_ROLE, &role)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated COMMIT crash fixture");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if child
+                .try_wait()
+                .expect("poll COMMIT crash fixture")
+                .is_some()
+            {
+                return child
+                    .wait_with_output()
+                    .expect("collect COMMIT crash fixture output");
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("kill hung COMMIT crash fixture");
+                let output = child
+                    .wait_with_output()
+                    .expect("reap hung COMMIT crash fixture");
+                panic!(
+                    "{phase}-COMMIT helper exceeded its 10 second budget: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn raw_run_units(state_dir: &Path) -> Vec<(String, String, String, Option<i64>)> {
+        let connection = Connection::open(state_dir.join(DATABASE_FILE))
+            .expect("open raw crash-recovered SQLite store");
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .expect("run raw crash-recovery quick_check");
+        assert_eq!(quick_check, "ok");
+        let mut statement = connection
+            .prepare("SELECT id, creation_key, state_kind, pid FROM runs ORDER BY id")
+            .expect("prepare raw durable unit query");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query raw durable units")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode raw durable units")
     }
 
     fn seed_startup_overflow(state_dir: &Path) -> Vec<(RunId, CreateOperationKey)> {
