@@ -137,10 +137,7 @@ async fn memory_only_output_does_not_take_durable_transition_locks() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_terminal_run() {
-    let manager = Arc::new(RunManager {
-        registry: RunRegistry::with_record_capacity(1),
-        ..RunManager::default()
-    });
+    let (manager, creation_hook) = capacity_test_manager(1);
     let temp = tempfile::tempdir().expect("create memory capacity fixture");
     let first_marker = temp.path().join("first.log");
     let rejected_marker = temp.path().join("rejected.log");
@@ -194,6 +191,8 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
         .expect_err("a live retained Run cannot fund replacement");
     assert_eq!(rejected.code, ErrorCode::RunCapacity);
     assert!(read_marker_pids(&rejected_marker).is_empty());
+    assert_valid_fork_rejected_before_spawn(&manager, &creation_hook, first.id, &first_marker)
+        .await;
     assert_eq!(manager.list().len(), 1);
 
     stop_run_and_wait(&manager, first.id).await;
@@ -243,6 +242,31 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
     assert_eq!(manager.list().len(), 1);
     assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
     stop_run_and_wait(&manager, recreated.id).await;
+}
+
+async fn assert_valid_fork_rejected_before_spawn(
+    manager: &Arc<RunManager>,
+    creation_hook: &CreationTestHook,
+    parent: RunId,
+    parent_marker: &std::path::Path,
+) {
+    let error = manager
+        .create(
+            CreateOperationKey::new("memory-capacity-rejected-fork").unwrap(),
+            CreationRequest::Fork {
+                parent,
+                plan: ForkPlan::LevelA,
+            },
+        )
+        .await
+        .expect_err("a valid Fork reserves capacity before launching its child");
+    assert_eq!(error.code, ErrorCode::RunCapacity);
+    assert_eq!(
+        creation_hook.physical_spawn_count(),
+        1,
+        "capacity rejection cannot launch a hidden fork child"
+    );
+    assert_eq!(read_marker_pids(parent_marker).len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -553,10 +577,7 @@ async fn concurrent_reservations_stay_bounded_under_reverse_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacity_first() {
-    let manager = Arc::new(RunManager {
-        registry: RunRegistry::with_record_capacity(1),
-        ..RunManager::default()
-    });
+    let (manager, creation_hook) = capacity_test_manager(1);
     let first_key = CreateOperationKey::new("restored-candidate").unwrap();
     let first_spec = short_lived_spec();
     let first = manager
@@ -603,14 +624,19 @@ async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacit
         )
         .await
         .expect("replace the restored terminal candidate with a live Run");
-    let tmux_flight = manager
-        .begin_creation_flight()
+    let server = InProcessServer::start(Arc::clone(&manager));
+    let tmux_error = server
+        .client
+        .import_tmux("/ctxmux/definitely/missing.sock", "%0")
         .await
-        .expect("tmux fixture acquires shared physical admission");
-    let tmux_error = manager
-        .import_tmux("/ctxmux/definitely/missing.sock", "%0", tmux_flight)
-        .expect_err("tmux import reserves capacity before Control startup");
-    assert_eq!(tmux_error.code, ErrorCode::RunCapacity);
+        .expect_err("public tmux import reserves capacity before discovery or Control startup");
+    assert_protocol_code(tmux_error, ErrorCode::RunCapacity);
+    assert_eq!(
+        creation_hook.tmux_import_start_count(),
+        0,
+        "capacity rejection cannot enter tmux discovery or Control startup"
+    );
+    assert_eq!(manager.list().len(), 1, "rejected import publishes no Run");
     manager
         .get(live.id)
         .unwrap()
@@ -1757,12 +1783,23 @@ fn creation_hook(
         point,
         armed: AtomicBool::new(armed),
         physical_spawns: AtomicUsize::new(0),
+        tmux_import_starts: AtomicUsize::new(0),
         reached: reached_tx,
         released: Mutex::new(false),
         release: std::sync::Condvar::new(),
         captured_runs: Mutex::new(Vec::new()),
     });
     (hook, reached_rx)
+}
+
+fn capacity_test_manager(record_capacity: usize) -> (Arc<RunManager>, Arc<CreationTestHook>) {
+    let (hook, _reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(record_capacity),
+        creation_hook: Some(Arc::clone(&hook)),
+        ..RunManager::default()
+    });
+    (manager, hook)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

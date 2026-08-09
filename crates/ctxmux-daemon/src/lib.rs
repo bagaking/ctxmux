@@ -537,6 +537,7 @@ struct CreationTestHook {
     point: CreationHookPoint,
     armed: AtomicBool,
     physical_spawns: AtomicUsize,
+    tmux_import_starts: AtomicUsize,
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     released: Mutex<bool>,
     release: std::sync::Condvar,
@@ -573,6 +574,14 @@ impl CreationTestHook {
 
     fn physical_spawn_count(&self) -> usize {
         self.physical_spawns.load(Ordering::Acquire)
+    }
+
+    fn record_tmux_import_start(&self) {
+        self.tmux_import_starts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn tmux_import_start_count(&self) -> usize {
+        self.tmux_import_starts.load(Ordering::Acquire)
     }
 
     fn capture_run(&self, point: CreationHookPoint, run: Arc<Run>) {
@@ -826,6 +835,10 @@ impl RunManager {
                 return Err(spawn_error);
             }
         };
+        #[cfg(test)]
+        if let Some(hook) = &self.creation_hook {
+            hook.record_physical_spawn();
+        }
         let result = match publication {
             CreationPublication::Memory(reservation) => {
                 Ok(self.publish_memory_creation(operation_key, pending, reservation))
@@ -896,7 +909,6 @@ impl RunManager {
     ) -> RunInfo {
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
-            hook.record_physical_spawn();
             hook.pause_once(CreationHookPoint::AfterSpawn);
             hook.capture_run(
                 CreationHookPoint::PanicAfterSpawn,
@@ -917,7 +929,6 @@ impl RunManager {
         debug_assert!(std::ptr::eq(self, publication.manager));
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
-            hook.record_physical_spawn();
             hook.capture_run(
                 CreationHookPoint::AfterSpawnWithRunHold,
                 Arc::clone(pending.run()),
@@ -1074,6 +1085,10 @@ impl RunManager {
             let registry_reservation =
                 self.registry.reserve_memory_publication(new_run_id, None)?;
             let started_at = Instant::now();
+            #[cfg(test)]
+            if let Some(hook) = &self.creation_hook {
+                hook.record_tmux_import_start();
+            }
             let pending = Run::import_tmux(
                 socket_path,
                 pane_id,
