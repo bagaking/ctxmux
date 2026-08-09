@@ -1,19 +1,37 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import {
+  cpSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-import contract from "../reliability-gc-contract.json" with { type: "json" };
+import {
+  assertReliabilityGcIdentities,
+  assertCanonicalGcQualificationInvocation,
+  GC_CONTRACT_SHA256,
+  loadReliabilityGcContract,
+} from "./reliability-gc-contract.mts";
 
 const MIB = 1024 * 1024;
 const repositoryUrl = new URL("../", import.meta.url);
+const repositoryPath = fileURLToPath(repositoryUrl);
+const loaded = loadReliabilityGcContract(repositoryPath);
+const contract = loaded.contract;
 const helperUrl = new URL(contract.helper.path, repositoryUrl);
 const helperPath = fileURLToPath(helperUrl);
 
 test("GC contract fixes internally consistent payload and resource ceilings", () => {
+  assert.equal(loaded.workload_contract.sha256, GC_CONTRACT_SHA256);
   assert.equal(contract.schema, "ctxmux.reliability-gc-contract.v1");
   assert.equal(contract.frozen_before_implementation, true);
   assert.equal(contract.helper.path, "scripts/reliability-gc-child.mjs");
@@ -33,7 +51,10 @@ test("GC contract fixes internally consistent payload and resource ceilings", ()
   const pressure = contract.replay_pressure;
   const pressureBytes =
     contract.payload_modes.memory_replay_pressure.payload_bytes;
-  assert.equal(pressureBytes, 4 * MIB);
+  assert.equal(
+    pressureBytes,
+    64 * contract.payload_modes.memory_replay_pressure.hex_repetitions,
+  );
   assert.equal(
     pressure.live_retained_payload_bytes,
     pressure.fill_runs * pressureBytes,
@@ -92,7 +113,11 @@ test("GC contract fixes internally consistent payload and resource ceilings", ()
   const formula = pressure.rss_formula;
   assert.equal(
     rss.live_steady_rss_kib,
-    rssCeiling(formula.idle_128_base_kib, 512 * 1024, formula.quantum_kib),
+    rssCeiling(
+      formula.idle_128_base_kib,
+      pressure.live_retained_payload_bytes / 1024,
+      formula.quantum_kib,
+    ),
   );
   assert.equal(
     rss.memory_peak_rss_kib,
@@ -117,7 +142,11 @@ test("GC contract fixes internally consistent payload and resource ceilings", ()
   );
   assert.equal(
     rss.persistent_recovered_steady_rss_kib,
-    rssCeiling(formula.idle_128_base_kib, 256 * 1024, formula.quantum_kib),
+    rssCeiling(
+      formula.idle_128_base_kib,
+      pressure.persistent_durable_replay_max_bytes / 1024,
+      formula.quantum_kib,
+    ),
   );
   assert.equal(
     rss.persistent_recovered_peak_rss_kib,
@@ -164,6 +193,13 @@ test("GC contract fixes internally consistent payload and resource ceilings", ()
     workflow.jobs["release-soak"]["timeout-minutes"],
     contract.ci_job_timeout_minutes.release,
   );
+  for (const job of ["reliability-nightly", "release-soak"]) {
+    assert.equal(
+      workflow.jobs[job].env.CTXMUX_RELIABILITY_SEED,
+      undefined,
+      `${job} must consume only the frozen GC contract seed`,
+    );
+  }
   assert.equal(
     pressure.owner_budgets.physical_starts_fill_delta,
     pressure.fill_runs,
@@ -197,6 +233,120 @@ test("GC contract fixes internally consistent payload and resource ceilings", ()
     owner_counts: "absolute_daemon_transition_high_water_and_boundary_counts",
     excludes: ["client", "helper_children", "sqlite_file_bytes"],
   });
+});
+
+test("GC loader rejects worktree and Git-blob drift", () => {
+  const fixture = mkdtempSync(join(tmpdir(), "ctxmux-gc-contract-"));
+  try {
+    mkdirSync(join(fixture, "scripts"));
+    cpSync(
+      fileURLToPath(new URL("reliability-gc-contract.json", repositoryUrl)),
+      join(fixture, "reliability-gc-contract.json"),
+    );
+    cpSync(helperPath, join(fixture, "scripts", "reliability-gc-child.mjs"));
+    git(fixture, ["init", "--quiet"]);
+    git(fixture, ["add", "reliability-gc-contract.json", contract.helper.path]);
+    git(fixture, [
+      "-c",
+      "user.name=ctxmux fixture",
+      "-c",
+      "user.email=fixture@ctxmux.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "fixture",
+    ]);
+    assert.equal(
+      loadReliabilityGcContract(fixture).contract.seed,
+      contract.seed,
+    );
+
+    writeFileSync(
+      join(fixture, contract.helper.path),
+      Buffer.concat([readFileSync(helperPath), Buffer.from("\n")]),
+    );
+    assert.throws(
+      () => loadReliabilityGcContract(fixture),
+      /helper bytes drifted/u,
+    );
+
+    cpSync(helperPath, join(fixture, contract.helper.path));
+    git(fixture, ["rm", "--cached", "--quiet", contract.helper.path]);
+    git(fixture, [
+      "-c",
+      "user.name=ctxmux fixture",
+      "-c",
+      "user.email=fixture@ctxmux.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "remove helper blob",
+    ]);
+    assert.throws(
+      () => loadReliabilityGcContract(fixture),
+      /cannot read source-bound Git blob/u,
+    );
+  } finally {
+    rmSync(fixture, { force: true, recursive: true });
+  }
+});
+
+test("GC invocation identities fail closed on contract or helper drift", () => {
+  assert.doesNotThrow(() => assertReliabilityGcIdentities(loaded, loaded));
+  for (const field of ["workload_contract", "workload_helper"]) {
+    const drifted = structuredClone(loaded);
+    drifted[field].sha256 = "f".repeat(64);
+    assert.throws(
+      () => assertReliabilityGcIdentities(loaded, drifted),
+      /identity drifted/u,
+    );
+  }
+});
+
+test("canonical nightly and release reject every workload override surface", () => {
+  assert.doesNotThrow(() =>
+    assertCanonicalGcQualificationInvocation(
+      "nightly",
+      ["--profile", "nightly"],
+      {},
+    ),
+  );
+  assert.doesNotThrow(() =>
+    assertCanonicalGcQualificationInvocation(
+      "smoke",
+      ["--profile", "smoke", "--stage", "resource-census"],
+      { CTXMUX_RELIABILITY_SEED: "226004" },
+    ),
+  );
+  for (const profile of ["nightly", "release"]) {
+    for (const name of [
+      "--stage",
+      "--resource-counts",
+      "--resource-modes",
+      "--resource-start-concurrency",
+      "--soak-seconds",
+    ]) {
+      assert.throws(() =>
+        assertCanonicalGcQualificationInvocation(
+          profile,
+          ["--profile", profile, name, "canonical-looking"],
+          {},
+        ),
+      );
+    }
+    for (const name of [
+      "CTXMUX_RELIABILITY_SEED",
+      "CTXMUX_RELIABILITY_TIME_BUDGET_SECONDS",
+    ]) {
+      assert.throws(() =>
+        assertCanonicalGcQualificationInvocation(
+          profile,
+          ["--profile", profile],
+          { [name]: "226004" },
+        ),
+      );
+    }
+  }
 });
 
 test("GC helper is source-bound and emits PTY-stable exact ASCII payloads", () => {
@@ -256,4 +406,9 @@ test("GC helper rejects every input outside the frozen invocation", () => {
 function rssCeiling(baseKib, logicalKib, quantumKib) {
   const raw = baseKib + (3 * logicalKib) / 2;
   return Math.ceil(raw / quantumKib) * quantumKib;
+}
+
+function git(cwd, args) {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
 }

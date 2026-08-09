@@ -27,7 +27,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
-      CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
       CTXMUX_RELIABILITY_ARTIFACT_DIR: ${{ github.workspace }}/target/reliability/nightly
       CTXMUX_RELIABILITY_EVIDENCE: ${{ github.workspace }}/target/reliability/nightly/result.json
 
@@ -71,7 +70,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 210
     env:
-      CTXMUX_RELIABILITY_SEED: ${{ github.run_id }}
       CTXMUX_RELIABILITY_ARTIFACT_DIR: ${{ github.workspace }}/target/reliability/release
       CTXMUX_RELIABILITY_EVIDENCE: ${{ github.workspace }}/target/reliability/release/result.json
 

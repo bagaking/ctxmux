@@ -80,15 +80,17 @@ one-Run CPU, RSS, retention, thread, fd, and cleanup budgets. To reproduce the
 full resource matrix without a long soak, run:
 
 ```bash
-scripts/check-reliability.sh --profile nightly --soak-seconds 1
+scripts/check-reliability.sh --profile nightly
 ```
 
 The scheduled `nightly` profile uses a real 30-minute soak; explicit `release`
 dispatch uses two hours. `observe` bypasses budget assertions only for a new
-pre-optimization baseline. Resource-only diagnosis is available through
-`--stage resource-census`, `--resource-counts`, `--resource-modes`, and
-`--resource-start-concurrency`. Every run writes a structured receipt and
-daemon logs under `target/reliability/`. The harness runs inside a supervised
+pre-optimization baseline. Smoke may use focused `--stage resource-census`,
+`--resource-counts`,
+`--resource-modes`, and `--resource-start-concurrency` seams. Nightly and
+release reject workload reductions and run the frozen GC contract. Every run
+writes a structured receipt plus daemon and private owner-stat logs under
+`target/reliability/`. The harness runs inside a supervised
 process group; `time_budget_seconds` is a hard kill boundary, not just receipt
 metadata. Frozen baseline receipts are checked in under `fixtures/reliability/`
 and hash-verified by `scripts/reliability-policy.mjs`.
