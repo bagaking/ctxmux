@@ -2,7 +2,7 @@ use super::*;
 use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
 use ctxmux_protocol::{ForkFidelity, RunId, RunInfo, RunLineage};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
@@ -1211,6 +1211,267 @@ async fn assert_persistent_replacement_restart(
     );
 }
 
+const TURNOVER_RECORDS: usize = 4;
+const TURNOVER_WINDOWS: usize = 3;
+
+struct TurnoverRun {
+    id: RunId,
+    operation_key: CreateOperationKey,
+    spec: RunSpec,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TurnoverTuple {
+    id: RunId,
+    operation_key: String,
+    state: RunState,
+    lineage: Option<RunLineage>,
+    oldest_seq: u64,
+    head_seq: u64,
+    durable_head_seq: Option<u64>,
+    truncated: bool,
+    replay: Vec<u8>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retained_state_converges_across_three_turnover_windows_and_restart() {
+    for persistent in [false, true] {
+        let temp = tempfile::tempdir().expect("create retained turnover fixture");
+        let state_dir = temp.path().join("state");
+        let marker = temp.path().join("physical-starts.log");
+        let (creation_hook, _reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+        let mut manager = if persistent {
+            let (persistence, recovered) = Persistence::open_with_test_limits(
+                state_dir.clone(),
+                TURNOVER_RECORDS as u64,
+                64 * 1024 * 1024,
+            )
+            .expect("open reduced persistent turnover store");
+            assert!(recovered.is_empty());
+            Arc::new(RunManager {
+                registry: RunRegistry::with_record_capacity(TURNOVER_RECORDS),
+                creation_hook: Some(Arc::clone(&creation_hook)),
+                ..RunManager::persistent(persistence, recovered)
+            })
+        } else {
+            Arc::new(RunManager {
+                registry: RunRegistry::with_record_capacity(TURNOVER_RECORDS),
+                creation_hook: Some(Arc::clone(&creation_hook)),
+                ..RunManager::default()
+            })
+        };
+        let mode = if persistent { "persistent" } else { "memory" };
+        let mut retained = VecDeque::new();
+
+        for index in 0..TURNOVER_RECORDS {
+            retained.push_back(
+                create_turnover_run(&manager, &creation_hook, &marker, mode, index).await,
+            );
+        }
+        assert_turnover_boundary(
+            &manager,
+            &retained,
+            &creation_hook,
+            &marker,
+            persistent,
+            false,
+        )
+        .await;
+
+        for window in 0..TURNOVER_WINDOWS {
+            for offset in 0..TURNOVER_RECORDS {
+                let index = TURNOVER_RECORDS * (window + 1) + offset;
+                retained.pop_front().expect("one oldest Run is replaced");
+                retained.push_back(
+                    create_turnover_run(&manager, &creation_hook, &marker, mode, index).await,
+                );
+            }
+            assert_turnover_boundary(
+                &manager,
+                &retained,
+                &creation_hook,
+                &marker,
+                persistent,
+                false,
+            )
+            .await;
+
+            if persistent && window == 1 {
+                let before_restart = turnover_tuples(&manager, &retained);
+                drop(manager);
+                let (persistence, recovered) = Persistence::open_with_test_limits(
+                    state_dir.clone(),
+                    TURNOVER_RECORDS as u64,
+                    64 * 1024 * 1024,
+                )
+                .expect("restart reduced persistent turnover store");
+                assert_eq!(recovered.len(), TURNOVER_RECORDS);
+                let restarted = Arc::new(RunManager {
+                    creation_hook: Some(Arc::clone(&creation_hook)),
+                    ..RunManager::persistent(persistence, recovered)
+                });
+                restarted
+                    .registry
+                    .set_record_capacity_for_test(TURNOVER_RECORDS);
+                manager = restarted;
+                assert_eq!(turnover_tuples(&manager, &retained), before_restart);
+                assert_turnover_boundary(&manager, &retained, &creation_hook, &marker, true, true)
+                    .await;
+            }
+        }
+    }
+}
+
+async fn create_turnover_run(
+    manager: &Arc<RunManager>,
+    creation_hook: &CreationTestHook,
+    marker: &std::path::Path,
+    mode: &str,
+    index: usize,
+) -> TurnoverRun {
+    let payload = format!("ctxmux-{mode}-turnover-{index:03}").into_bytes();
+    let spec = turnover_spec(marker, &payload);
+    let operation_key = CreateOperationKey::new(format!("turnover:{mode}:{index:03}")).unwrap();
+    let physical_spawns_before = creation_hook.physical_spawn_count();
+    let info = manager
+        .create(
+            operation_key.clone(),
+            CreationRequest::Start { spec: spec.clone() },
+        )
+        .await
+        .expect("publish turnover Run");
+    assert_eq!(
+        creation_hook.physical_spawn_count(),
+        physical_spawns_before + 1,
+        "one fresh creation owns exactly one physical spawn"
+    );
+    wait_for_run_terminal_async(&manager.get(info.id).unwrap()).await;
+    wait_for_run_workers(manager).await;
+    assert_eq!(
+        wait_for_marker_pids(marker, physical_spawns_before + 1)
+            .await
+            .len(),
+        physical_spawns_before + 1
+    );
+    TurnoverRun {
+        id: info.id,
+        operation_key,
+        spec,
+        payload,
+    }
+}
+
+async fn assert_turnover_boundary(
+    manager: &Arc<RunManager>,
+    retained: &VecDeque<TurnoverRun>,
+    creation_hook: &CreationTestHook,
+    marker: &std::path::Path,
+    persistent: bool,
+    recovered: bool,
+) {
+    assert_eq!(retained.len(), TURNOVER_RECORDS);
+    assert_eq!(manager.list().len(), TURNOVER_RECORDS);
+    assert_eq!(
+        manager
+            .list()
+            .into_iter()
+            .map(|info| info.id)
+            .collect::<HashSet<_>>(),
+        retained.iter().map(|run| run.id).collect::<HashSet<_>>()
+    );
+    let physical_spawns_before_retries = creation_hook.physical_spawn_count();
+    for expected in retained {
+        let info = manager.info(expected.id).expect("retained Run is visible");
+        assert!(!info.state.is_running());
+        if persistent {
+            assert_eq!(info.durable_head_seq, Some(info.head_seq));
+        }
+        let run = manager.get(expected.id).expect("pin retained turnover Run");
+        if recovered {
+            assert!(
+                run.incarnation_control.is_none(),
+                "recovered terminal Run has no current-incarnation control authority"
+            );
+        }
+        assert_eq!(
+            replay_bytes(&mutex_lock(&run.output).replay(0).chunks),
+            expected.payload
+        );
+        drop(run);
+        let retried = manager
+            .create(
+                expected.operation_key.clone(),
+                CreationRequest::Start {
+                    spec: expected.spec.clone(),
+                },
+            )
+            .await
+            .expect("same-key turnover retry resolves retained Run");
+        assert_eq!(retried.id, expected.id);
+    }
+    assert_eq!(
+        creation_hook.physical_spawn_count(),
+        physical_spawns_before_retries,
+        "same-key retry wave starts no physical child"
+    );
+    assert_eq!(
+        read_marker_pids(marker).len(),
+        creation_hook.physical_spawn_count()
+    );
+}
+
+fn turnover_tuples(manager: &RunManager, retained: &VecDeque<TurnoverRun>) -> Vec<TurnoverTuple> {
+    let mut tuples = retained
+        .iter()
+        .map(|expected| {
+            let info = manager
+                .info(expected.id)
+                .expect("retained tuple is visible");
+            let run = manager.get(expected.id).expect("pin retained tuple Run");
+            let replay = mutex_lock(&run.output).replay(0);
+            TurnoverTuple {
+                id: info.id,
+                operation_key: expected.operation_key.as_str().to_owned(),
+                state: info.state,
+                lineage: info.lineage,
+                oldest_seq: replay.oldest_seq,
+                head_seq: replay.head_seq,
+                durable_head_seq: info.durable_head_seq,
+                truncated: replay.truncated,
+                replay: replay_bytes(&replay.chunks),
+            }
+        })
+        .collect::<Vec<_>>();
+    tuples.sort_by_key(|tuple| tuple.id.to_string());
+    tuples
+}
+
+fn turnover_spec(marker: &std::path::Path, payload: &[u8]) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; \
+             printf '%s' \"$CTXMUX_TURNOVER_PAYLOAD\""
+                .to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([
+            (
+                "CTXMUX_CREATION_MARKER".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ),
+            (
+                "CTXMUX_TURNOVER_PAYLOAD".to_owned(),
+                String::from_utf8(payload.to_vec()).expect("turnover payload is ASCII"),
+            ),
+        ]),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
 fn short_lived_spec() -> RunSpec {
     RunSpec {
         program: "/bin/sh".to_owned(),
@@ -1495,6 +1756,7 @@ fn creation_hook(
     let hook = Arc::new(CreationTestHook {
         point,
         armed: AtomicBool::new(armed),
+        physical_spawns: AtomicUsize::new(0),
         reached: reached_tx,
         released: Mutex::new(false),
         release: std::sync::Condvar::new(),

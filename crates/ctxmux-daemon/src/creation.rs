@@ -1465,6 +1465,11 @@ impl RunRegistry {
         write_lock(&registry.state).record_capacity = record_capacity;
         registry
     }
+
+    #[cfg(test)]
+    pub(crate) fn set_record_capacity_for_test(&self, record_capacity: usize) {
+        write_lock(&self.state).record_capacity = record_capacity;
+    }
 }
 
 impl PublicationReservation {

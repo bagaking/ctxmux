@@ -76,7 +76,7 @@ at the 128-record ceiling.
 | Protocol generation and malformed frames         | Shared corpus reaches Rust decode, real daemon, and Node validation; exact frame cap plus seeded Rust and TypeScript byte targets are checked                                                          | Strong for retained and seeded cases                        | No coverage-guided continuous fuzzer, sanitizer, or Rust-produced all-variant golden matrix                           |
 | Socket path safety and mode `0600`               | Sequential targets plus forced startup and shutdown replacement prove identity recheck, live-listener preservation, and mode                                                                           | Strong for checked owner-controlled schedules               | Hostile writable-parent atomicity, renamed-original cleanup, and peer identity remain open                            |
 | SDK backpressure and close races                 | Deterministic mock socket tests, including 20,000 queued frames, plus real 8/32-way fast/slow fan-out with explicit `Gap`                                                                              | Strong for SDK queue and real lag behavior                  | Silent-peer cancellation and request deadlines are absent                                                             |
-| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-6 matrix           | Hostile parent/FD exhaustion, persistent GC, attachment admission, RSS quota, and T-030 proof remain open             |
+| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-6 matrix           | Hostile parent/FD exhaustion, attachment admission, total RSS quota, and production-scale pressure remain open        |
 | Level A fork                                     | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control                                                                                                   | Strong                                                      | Post-spawn fork failure is not forced through the public boundary                                                     |
 | Codex Level B                                    | Source-bound receipt negatives, unrelated-Run public E2E, minimized JSONL corpus, seeded observer target, and a redacted real-Codex continuation artifact                                              | Strong supported-API owner, parser, and semantic proof      | Host-local provenance is not authentication; scheduled hosted evidence remains separate                               |
 | Interactive CLI attach                           | Checked-in controlling-PTY E2E proves raw input, `SIGWINCH`, detach, exact restoration, and same-PID survival                                                                                          | Strong for ordinary detach on Unix                          | Daemon-loss, error, unwind, and catchable-signal restoration remain open                                              |
@@ -374,9 +374,8 @@ the final smoke only after that core publishes a private completion token.
 
 The PR profile runs the full named matrix with the one-Run resource cells and
 no time soak. Nightly currently uses the complete resource matrix plus a real
-30-minute active soak inside a 45-minute harness budget; T-030's separately
-frozen GC contract raises that supervisor budget to 70 minutes when its pressure
-phase lands, without shortening the soak. Explicit release dispatch uses a
+30-minute active soak inside a 45-minute harness budget. The superseded T-030
+proposal's larger pressure budget never became current harness policy. Explicit release dispatch uses a
 two-hour soak inside a three-hour harness budget. Both scheduled profiles run
 on Ubuntu and macOS and attempt to upload any produced receipt and daemon logs
 even when the workload step fails; missing artifacts are themselves an upload
@@ -459,7 +458,7 @@ persistent same-epoch terminal history cannot pass a Registry leak oracle until
 its exact-replacement path ships. Tests must keep that open policy visible
 rather than normalize unbounded growth.
 
-T-030 pre-registers the pending production qualification before implementation
+The superseded T-030 design pre-registered production qualification before implementation
 or candidate measurements can influence it. The operational Registry ceiling
 is 128 in memory-only mode and becomes the persistent-mode ceiling only when
 T-029 closes exact durable replacement; SQLite's older 4,096-row validation
@@ -508,6 +507,16 @@ each post-capacity 60-second bin applies the same plateau rules. Historical
 observe receipts and `reliability-budgets.json` are immutable; T-030 writes
 separate raw evidence and completes only with
 `scripts/check-reliability.sh --profile nightly`, not the default smoke command.
+
+Revision 17 superseded that program before its private metrics sink or pressure
+harness was implemented. The frozen JSON and the preceding description remain
+historical design evidence, not current Kernel closure requirements. T-033
+instead uses one ordinary reduced-capacity test that crosses three complete
+turnover windows in both memory-only and persistent modes, restarts persistent
+mode after window two, and checks retained Run/key identity, exact replay,
+same-key retry without another physical child, and absence of recovered live
+control authority. A future production-scale pressure, soak, or platform
+program requires its own reviewed Feature.
 
 The supplemental pressure phase fills all 128 retained Logs with exact 4 MiB
 ASCII payloads, verifies all replay in batches of eight, then performs one

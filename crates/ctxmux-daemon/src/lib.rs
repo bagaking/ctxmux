@@ -510,6 +510,7 @@ struct AttachmentTestHook {
 struct CreationTestHook {
     point: CreationHookPoint,
     armed: AtomicBool,
+    physical_spawns: AtomicUsize,
     reached: tokio::sync::mpsc::UnboundedSender<()>,
     released: Mutex<bool>,
     release: std::sync::Condvar,
@@ -540,6 +541,14 @@ impl AttachmentTestHook {
 
 #[cfg(test)]
 impl CreationTestHook {
+    fn record_physical_spawn(&self) {
+        self.physical_spawns.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn physical_spawn_count(&self) -> usize {
+        self.physical_spawns.load(Ordering::Acquire)
+    }
+
     fn capture_run(&self, point: CreationHookPoint, run: Arc<Run>) {
         if self.point == point && self.armed.load(Ordering::Acquire) {
             mutex_lock(&self.captured_runs).push(run);
@@ -855,6 +864,7 @@ impl RunManager {
     ) -> RunInfo {
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
+            hook.record_physical_spawn();
             hook.pause_once(CreationHookPoint::AfterSpawn);
             hook.capture_run(
                 CreationHookPoint::PanicAfterSpawn,
@@ -875,6 +885,7 @@ impl RunManager {
         debug_assert!(std::ptr::eq(self, publication.manager));
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
+            hook.record_physical_spawn();
             hook.capture_run(
                 CreationHookPoint::AfterSpawnWithRunHold,
                 Arc::clone(pending.run()),
@@ -3513,7 +3524,10 @@ mod tests {
             net::{UnixListener, UnixStream},
         },
         process::{Command, Stdio},
-        sync::{Arc, Mutex, atomic::AtomicBool},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize},
+        },
         time::{Duration, Instant},
     };
 

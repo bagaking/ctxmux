@@ -359,8 +359,10 @@ Each Run retains at most 4 MiB of raw output by byte count, except that one over
 owns the shared 128-record Registry ceiling and ownership-safe collection
 contract. Persistent mode uses the same ticket and candidate SSOT, with a
 spill-disabled cache-resident page proof before launch and exact durable
-replacement at COMMIT. Sustained memory and persistent churn qualification
-remains pending under T-030.
+replacement at COMMIT. T-033 closes this Kernel boundary with one ordinary,
+reduced-capacity three-window oracle across memory-only, persistent, retry, and
+restart paths. Production-scale pressure, long soak, and private metrics
+infrastructure are outside this Kernel closure.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run

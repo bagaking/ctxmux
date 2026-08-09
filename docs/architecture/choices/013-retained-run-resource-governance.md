@@ -402,7 +402,22 @@ Copy-only List and Status linearize before exact removal and may be followed by
 operation that needs the Run after releasing the Registry lock must pin and
 therefore fails while Collecting.
 
-## Qualification contract frozen before implementation
+## Superseded production-scale qualification proposal
+
+The detailed contract below was frozen before implementation as a possible
+T-030 production-scale qualification program. Revision 17 superseded T-030
+before its pressure harness or daemon-private metrics sink was built. The JSON
+contract and this section remain historical design evidence; they are not
+current Run-Kernel behavior, required infrastructure, or Feature closure
+criteria.
+
+Current T-033 closure uses one ordinary reduced-capacity test: memory-only and
+persistent modes each fill four records and cross three complete four-Run
+turnover windows; persistent mode restarts after window two. Every boundary
+checks retained Run identity, exact replay, current creation-key retry without
+another physical child, and recovered absence of current-incarnation control.
+This is representative correctness evidence, not a production-scale CPU/RSS
+claim. A future pressure or soak program needs its own reviewed Feature.
 
 PR tests use a lower private ceiling to cross at least three collection windows
 without claiming production-scale evidence. The tracked
@@ -506,7 +521,8 @@ policy without modifying `reliability-budgets.json`. These are canonical
 workload ceilings over Registry-owned payload and named transient owners, not a
 hard bound on every daemon allocation: arbitrary attachment fan-out remains
 unbounded, and byte retention alone does not provide a small chunk-cardinality
-bound. Those broader admission decisions remain release risks outside T-030.
+bound. Those broader admission decisions remain outside the shipped Kernel
+claim and need separately reviewed work.
 Memory peak accounts for retained payload plus the larger of publication
 overlap or the fixed replay-clone batch. Persistent peak conservatively accounts
 for retained payload, publication overlap, full catch-up/finalize snapshots,
@@ -631,8 +647,7 @@ or deterministic-owner fixtures.
   materialization, dangling lineage, `run_not_found`, and tmux pre-Control
   admission fixtures.
 - Existing native-control and tmux completion fixtures prove the Backend-local
-  quiescence oracles reused by memory-only eligibility; source-bound race and
-  sustained-churn pressure remain T-030 qualification work.
+  quiescence oracles reused by memory-only eligibility.
 - Implemented/T-029: exact multi-candidate SQLite replacement, wrong candidate
   identity, pre-COMMIT cleanup, persistence-finalize eligibility, same-epoch
   key replacement, restart convergence, bounded startup normalization, real
@@ -644,9 +659,10 @@ or deterministic-owner fixtures.
 - T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
   projection invariant under reverse publication order without a production
   process census.
-- Future/T-030: source-bound production-scale 127-to-129 admission plus memory
-  and persistent three-window churn with raw CPU, RSS, latency, record/key,
-  thread, descriptor, process, replay, and owner evidence.
+- T-033: one reduced-capacity ordinary oracle crosses three complete turnover
+  windows in memory-only and persistent modes, restarts persistent mode after
+  window two, and proves exact retained identity, replay, key retry, and
+  current-incarnation control boundaries without new qualification machinery.
 
 ## Repository evidence
 
@@ -660,6 +676,6 @@ or deterministic-owner fixtures.
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts
-- `reliability-gc-contract.json`: frozen T-030 workload, helper identity,
+- `reliability-gc-contract.json`: superseded T-030 workload, helper identity,
   resource ceilings, and time budgets
 - `scripts/reliability-gc-child.mjs`: PTY-stable deterministic payload producer
