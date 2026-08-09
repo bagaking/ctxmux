@@ -23,6 +23,8 @@ Current guarantees are deliberately narrower than the product vision.
 
 ## System and ownership model
 
+### System boundary
+
 The daemon is the only process that owns live runtime state.
 
 ```text
@@ -81,6 +83,8 @@ Each package has one reason to change.
 | `ctxmux-daemon`   | Unix listener, Run manager, PTYs, children, replay, events, and socket lifecycle.         | Agent-specific semantics or UI.               |
 | `ctxmux`          | Human CLI, raw terminal mode, resize forwarding, and detach prefix.                       | Direct access to daemon internals.            |
 | `@ctxmux/sdk`     | Node connector, request and attachment APIs, and explicit host-local Integration binding. | Electron, React, an editor, or Run ownership. |
+
+### Stable boundary
 
 The stable product boundary is the local protocol, not a Rust ABI or Node native addon. Rust and TypeScript clients can evolve independently while exercising the same daemon path.
 
