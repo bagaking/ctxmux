@@ -586,7 +586,9 @@ Collection is admission-triggered; history below 128 is retained and no age or
 wall-clock expiration is promised. The 128 ceiling bounds Registry records and
 their 512 MiB replay payload; the shared eight-slot overlap owner produces the
 separate 544 MiB retained-plus-overlap payload bound above. Neither value bounds
-descendant processes because native stop still owns only the direct child.
+descendant processes from legacy direct-child Stop semantics. Generation 9
+replaces that boundary with complete POSIX-session Stop; a session-escaping
+descendant remains deliberately outside the declared owner scope.
 The payload ceiling is not a universal daemon RSS claim: extreme short reads
 can amplify chunk/Vec metadata, and public attachments clone replay without a
 global attachment quota. The canonical pressure workload measures and caps its

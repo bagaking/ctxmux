@@ -9,6 +9,7 @@ import {
   CtxmuxProtocolError,
   decodeInputReceipt,
   decodeResizeReceipt,
+  decodeSignalReceipt,
   decodeShortControl,
   decodeStopReceipt,
   protocolError,
@@ -16,6 +17,7 @@ import {
   type ControlAccepted,
   type InputReceipt,
   type ResizeReceipt,
+  type SignalReceipt,
   type StopReceipt,
 } from "./control.js";
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
@@ -301,6 +303,17 @@ export class CtxmuxClient {
     );
   }
 
+  public async interrupt(id: RunId): Promise<ControlAccepted<SignalReceipt>> {
+    return decodeShortControl(
+      await this.#controlRequest({
+        type: "signal",
+        id,
+        signal: "interrupt",
+      }),
+      decodeSignalReceipt,
+    );
+  }
+
   public async attach(id: RunId, afterByte = 0): Promise<Attachment> {
     validateCursor(afterByte, "afterByte");
     const { wire } = await this.#connect();
@@ -480,5 +493,6 @@ export type {
   ControlAccepted,
   InputReceipt,
   ResizeReceipt,
+  SignalReceipt,
   StopReceipt,
 } from "./control.js";

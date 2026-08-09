@@ -35,6 +35,7 @@ usage:
   ctxmux --socket <path> input <run-id> <text>
   ctxmux --socket <path> input <run-id> --stdin
   ctxmux --socket <path> resize <run-id> <cols> <rows>
+  ctxmux --socket <path> interrupt <run-id>
   ctxmux --socket <path> attach <run-id> [after-byte]
   ctxmux --socket <path> stop <run-id>
 
@@ -90,6 +91,15 @@ async fn run() -> Result<(), String> {
         }
         "input" => input(&client, args).await?,
         "resize" => resize(&client, args).await?,
+        "interrupt" => {
+            let id = take_run_id(&mut args)?;
+            ensure_empty(&args)?;
+            let accepted = client
+                .interrupt(id)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_run(&accepted.run);
+        }
         "attach" => attach(&client, args).await?,
         "stop" => {
             let id = take_run_id(&mut args)?;

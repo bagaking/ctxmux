@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 8
+# 003 — Unix socket and NDJSON protocol generation 9
 
-- Status: accepted for generation 8; pre-stable
+- Status: accepted for generation 9; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -50,7 +50,9 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 8 directly replaces generation 7. It replaces output
+Protocol generation 9 directly replaces generation 8. It retains cumulative
+output byte cursors and adds native Signal plus Stop disposition without a
+compatibility layer. Generation 8 had replaced output
 chunk ordinals with cumulative half-open byte ranges across Run metadata,
 Attach, replay, live output, and Gap. It retains daemon-instance identity plus
 recoverable native Input operation keys and receipts from generation 7, and

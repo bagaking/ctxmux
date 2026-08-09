@@ -11,7 +11,8 @@ use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
     PROTOCOL_VERSION, RecoverableInput, Request, RunEvent, RunId, RunInputKind, RunInputReference,
-    RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    RunLineage, RunSignal, RunSpec, RunState, ServerFrame, StopDisposition, TerminalSize,
+    decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use tempfile::TempDir;
@@ -1489,17 +1490,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_7_before_request_dispatch() {
+async fn daemon_rejects_generation_8_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 8,
+        PROTOCOL_VERSION, 9,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_7_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 7 },
+    let generation_8_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 8 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -1517,7 +1518,7 @@ async fn daemon_rejects_generation_7_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_7_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_8_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -1884,4 +1885,148 @@ async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
             .expect_err("repeated stop is rejected"),
         ErrorCode::InvalidRunState,
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_reaches_the_foreground_group_without_stopping_the_run() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap 'printf \"INTERRUPTED\\n\"' INT; ",
+                    "printf 'READY\\n'; ",
+                    "while :; do sleep 1; wait $!; done"
+                )
+                .to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start interrupt fixture");
+    assert!(run.capabilities.signal);
+    let (mut attachment, snapshot) = daemon.client.attach(run.id, 0).await.expect("attach");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_byte = snapshot.replay.latest_output_bytes;
+    wait_for_output(&mut attachment, &mut observed, &mut last_byte, b"READY").await;
+
+    let accepted = attachment
+        .interrupt()
+        .await
+        .expect("interrupt foreground group");
+    assert_eq!(accepted.receipt.signal, RunSignal::Interrupt);
+    wait_for_output(
+        &mut attachment,
+        &mut observed,
+        &mut last_byte,
+        b"INTERRUPTED",
+    )
+    .await;
+    assert!(
+        daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("status")
+            .state
+            .is_running()
+    );
+    daemon.client.stop(run.id).await.expect("stop fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_forces_stubborn_descendants_and_preserves_unrelated_processes() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("descendants");
+    let mut unrelated = Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn unrelated sentinel");
+    let unrelated_pid = unrelated.id();
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap '' TERM; ",
+                    "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & ",
+                    "child=$!; ",
+                    "sh -c 'trap \"\" TERM; while :; do sleep 1; done' & ",
+                    "grandchild=$!; ",
+                    "printf '%s\\n%s\\n' \"$child\" \"$grandchild\" > \"$CTXMUX_DESCENDANTS\"; ",
+                    "printf 'READY\\n'; while :; do sleep 1; done"
+                )
+                .to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::from([(
+                "CTXMUX_DESCENDANTS".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            )]),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start hostile descendant fixture");
+    let descendants = wait_for_marker_pids(&marker, 2).await;
+    let accepted = daemon
+        .client
+        .stop(run.id)
+        .await
+        .expect("stop complete session");
+    assert_eq!(accepted.receipt.disposition, StopDisposition::Forced);
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
+    for pid in descendants {
+        assert!(
+            !process_exists(pid),
+            "Run-owned descendant {pid} survived Stop"
+        );
+    }
+    assert!(
+        process_exists(unrelated_pid),
+        "unrelated process was signalled"
+    );
+    let _ = unrelated.kill();
+    let _ = unrelated.wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_interrupt_and_stop_have_only_owner_declared_outcomes() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start concurrency fixture");
+    let interrupt_client = daemon.client.clone();
+    let stop_client = daemon.client.clone();
+    let (interrupt, stop) =
+        tokio::join!(interrupt_client.interrupt(run.id), stop_client.stop(run.id),);
+    assert!(
+        stop.is_ok(),
+        "Stop must retain the unique terminal owner: {stop:?}"
+    );
+    if let Err(error) = interrupt {
+        assert!(matches!(
+            error,
+            ClientError::ControlRejected { ref failure }
+                if failure.error.code == ErrorCode::InvalidRunState
+        ));
+    }
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
 }

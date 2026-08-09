@@ -16,8 +16,8 @@ use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello,
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
     ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
-    ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSpec,
-    ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
+    ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSignal,
+    RunSpec, ServerFrame, StopDisposition, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -179,9 +179,19 @@ pub struct ResizeReceipt {
     pub applied_size: TerminalSize,
 }
 
-/// Typed receipt that the direct-child owner accepted a stop request.
+/// Typed receipt that one portable signal reached the native lifecycle owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StopReceipt;
+pub struct SignalReceipt {
+    /// Exact signal delivered by the daemon.
+    pub signal: RunSignal,
+}
+
+/// Typed receipt that the complete native Run session reached quiescence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopReceipt {
+    /// Whether the graceful phase was sufficient or force was required.
+    pub disposition: StopDisposition,
+}
 
 /// One accepted short-lived control request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,6 +499,26 @@ impl Client {
         )
     }
 
+    /// Interrupt the current foreground process group without stopping Run ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the Run cannot receive a native signal or
+    /// the owner cannot prove delivery.
+    pub async fn interrupt(
+        &self,
+        id: RunId,
+    ) -> Result<ControlAccepted<SignalReceipt>, ClientError> {
+        decode_short_control(
+            self.control_request(Request::Signal {
+                id,
+                signal: RunSignal::Interrupt,
+            })
+            .await?,
+            |receipt| decode_signal_receipt(receipt, RunSignal::Interrupt),
+        )
+    }
+
     /// Terminate one live Run.
     ///
     /// # Errors
@@ -652,9 +682,11 @@ fn decode_input_receipt(
         ControlReceipt::Input { .. } => Err(ClientError::ProtocolContractViolation(
             "input receipt byte count differs from the command payload",
         )),
-        ControlReceipt::Resize { .. } | ControlReceipt::Stop => Err(
-            ClientError::ProtocolContractViolation("input returned another receipt kind"),
-        ),
+        ControlReceipt::Resize { .. }
+        | ControlReceipt::Signal { .. }
+        | ControlReceipt::Stop { .. } => Err(ClientError::ProtocolContractViolation(
+            "input returned another receipt kind",
+        )),
     }
 }
 
@@ -670,18 +702,43 @@ fn decode_resize_receipt(receipt: &ControlReceipt) -> Result<ResizeReceipt, Clie
         ControlReceipt::Resize { .. } => Err(ClientError::ProtocolContractViolation(
             "resize receipt reported a zero applied dimension",
         )),
-        ControlReceipt::Input { .. } | ControlReceipt::Stop => Err(
-            ClientError::ProtocolContractViolation("resize returned another receipt kind"),
-        ),
+        ControlReceipt::Input { .. }
+        | ControlReceipt::Signal { .. }
+        | ControlReceipt::Stop { .. } => Err(ClientError::ProtocolContractViolation(
+            "resize returned another receipt kind",
+        )),
     }
 }
 
 fn decode_stop_receipt(receipt: &ControlReceipt) -> Result<StopReceipt, ClientError> {
     match receipt {
-        ControlReceipt::Stop => Ok(StopReceipt),
-        ControlReceipt::Input { .. } | ControlReceipt::Resize { .. } => Err(
-            ClientError::ProtocolContractViolation("stop returned another receipt kind"),
-        ),
+        ControlReceipt::Stop { disposition } => Ok(StopReceipt {
+            disposition: *disposition,
+        }),
+        ControlReceipt::Input { .. }
+        | ControlReceipt::Resize { .. }
+        | ControlReceipt::Signal { .. } => Err(ClientError::ProtocolContractViolation(
+            "stop returned another receipt kind",
+        )),
+    }
+}
+
+fn decode_signal_receipt(
+    receipt: &ControlReceipt,
+    expected: RunSignal,
+) -> Result<SignalReceipt, ClientError> {
+    match receipt {
+        ControlReceipt::Signal { signal } if *signal == expected => {
+            Ok(SignalReceipt { signal: *signal })
+        }
+        ControlReceipt::Signal { .. } => Err(ClientError::ProtocolContractViolation(
+            "signal receipt differs from the requested signal",
+        )),
+        ControlReceipt::Input { .. }
+        | ControlReceipt::Resize { .. }
+        | ControlReceipt::Stop { .. } => Err(ClientError::ProtocolContractViolation(
+            "signal returned another receipt kind",
+        )),
     }
 }
 

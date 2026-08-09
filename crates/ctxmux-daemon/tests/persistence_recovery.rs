@@ -285,6 +285,7 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
             .await,
     );
     assert_invalid_state(&client.stop(parent.id).await);
+    assert_invalid_state(&client.interrupt(parent.id).await);
 
     let child = client
         .fork(parent.id, ForkPlan::LevelA)
@@ -373,6 +374,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
             .await,
     );
     assert_invalid_state(&client.stop(live.id).await);
+    assert_invalid_state(&client.interrupt(live.id).await);
     assert_invalid_state(
         &client
             .fork(

@@ -25,7 +25,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-8 wire contract. */
+/** A daemon frame failed the runtime half of the generation-9 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -68,7 +68,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-8 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-9 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -251,6 +251,7 @@ function runCapabilities(
   const capabilities = record(value, path);
   const input = boolean(capabilities.input, `${path}.input`);
   const resize = boolean(capabilities.resize, `${path}.resize`);
+  const signal = boolean(capabilities.signal, `${path}.signal`);
   const stop = boolean(capabilities.stop, `${path}.stop`);
   const forkLevelA = boolean(capabilities.fork_level_a, `${path}.fork_level_a`);
   const forkLevelB = boolean(capabilities.fork_level_b, `${path}.fork_level_b`);
@@ -259,6 +260,7 @@ function runCapabilities(
   if (
     input !== native ||
     resize !== native ||
+    signal !== native ||
     stop !== native ||
     forkLevelA !== native ||
     forkLevelB !== native ||
@@ -412,7 +414,18 @@ function controlReceipt(value: unknown, path: string): void {
     case "resize":
       terminalSize(receipt.applied_size, `${path}.applied_size`, true);
       return;
+    case "signal":
+      if (string(receipt.signal, `${path}.signal`) !== "interrupt") {
+        throw invalid(`${path}.signal`, '"interrupt"');
+      }
+      return;
     case "stop":
+      if (
+        string(receipt.disposition, `${path}.disposition`) !== "graceful" &&
+        receipt.disposition !== "forced"
+      ) {
+        throw invalid(`${path}.disposition`, '"graceful" or "forced"');
+      }
       return;
     default:
       throw invalid(`${path}.type`, "a known control receipt");

@@ -1,4 +1,4 @@
-# Local Protocol Generation 8
+# Local Protocol Generation 9
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 8.
+- Raw PTY bytes are represented as integer arrays in generation 9.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -25,11 +25,11 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. Generation 8 does not yet
+The generation fence covers the wire contract only. Generation 9 does not yet
 negotiate runtime build identity, host identity, or a daemon-wide capability
 manifest; those remain separate open work.
 
-Generation 8 includes one random daemon-incarnation identity in the successful
+Generation 9 includes one random daemon-incarnation identity in the successful
 Hello frame. It is a live retry fence, not build, host, platform, or durable
 process identity. Ordinary `input` retains the prior receipt semantics:
 when its result is lost, callers must not retry it. The separate
@@ -66,12 +66,17 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   after reconnect within the same daemon incarnation.
 - `resize`: request new live PTY rows and columns and report the size read back
   from the owning PTY.
+- `signal { signal: interrupt }`: deliver `SIGINT` to the current foreground
+  process group after the daemon owner proves that group still belongs to the
+  native Run session. Interrupt does not enter Stop or end Run ownership.
 - `attach`: return retained output after a cumulative byte cursor and follow new
   output and exit events.
-- `stop`: request termination of the owned direct child and return after the
-  native child handle accepts that request. On Unix the current
-  `portable-pty` path gives `SIGHUP` a short grace period, then escalates to a
-  forced kill if the direct child remains alive.
+- `stop`: terminate every process in the daemon-owned native Run session. The
+  waiter sends `SIGTERM`, waits for a bounded graceful phase, then sends
+  `SIGKILL` to revalidated session members. Success requires the direct child
+  to be reaped and the session to be empty; the receipt reports `graceful` or
+  `forced`. A descendant that deliberately enters another session leaves the
+  Run ownership boundary and is not claimed by this POSIX session contract.
 
 An unclassified native child-status observation failure is daemon-fatal and
 does not create a terminal Run event. The affected Run rejects further live
@@ -82,20 +87,20 @@ applies the ordinary `interrupted { daemon_restart }` reconciliation.
 
 In persistent mode, recovered `exited` and `interrupted { reason:
 daemon_restart }` Runs support `list`, `status`, `attach`, and Level A `fork`.
-They reject `input`, `resize`, `stop`, and Level B `fork` with
+They reject `input`, `resize`, `signal`, `stop`, and Level B `fork` with
 `invalid_run_state`; a replacement daemon never turns a stored PID into live
 process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 8.
+ownership in generation 9.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 8 retains `run_capacity` for the global retained-Run admission
+Generation 9 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -104,7 +109,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-8 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-9 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -127,7 +132,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-8 decoding and
+The daemon compares canonical typed requests after generation-9 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -258,9 +263,13 @@ Receipts name the precise owner boundary reached:
 - `resize { applied_size }` is the terminal size read back from the owning PTY
   after resize. It lets clients detect and repair requested-versus-applied
   drift rather than treating the requested size as fact.
-- `stop` means the direct-child control owner accepted the termination request.
-  Final `exited` remains a later lifecycle event and may carry the actual code
-  or signal.
+- `signal { signal }` proves the native waiter delivered the requested portable
+  signal to a foreground process group still fenced inside the Run session.
+- `stop { disposition }` proves the waiter reaped the direct child and observed
+  the complete owned session empty. `graceful` means `SIGTERM` was sufficient;
+  `forced` means at least one session member required `SIGKILL`. Public
+  `exited` publication remains a later lifecycle event, so the returned
+  `RunInfo` can still say `running` while no owned process remains.
 
 Every wire `ControlFailure` carries `not_applied` or `unknown`. `not_applied` means
 the command did not cross its mutation boundary. `unknown` means it may have
@@ -384,7 +393,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-8 peer that puts `chunks` back into the header is invalid.
+generation-9 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -438,6 +447,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-8 frame at runtime, rejects duplicate
+validates the complete nested generation-9 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

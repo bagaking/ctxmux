@@ -81,10 +81,11 @@ payload. Matching retry returns the original byte range without another
 physical write; stale, conflicting, evicted, cross-incarnation, partial, or
 ambiguous cases fail closed.
 
-This milestone does not include durable Resize, arbitrary Signal, owned
-process-group Stop, SSH transport, release work, or Agent message semantics.
-Process-group Stop follows as a separate lifecycle Feature because its target,
-grace, force, and quiescence rules are not Input's mutation algebra.
+This milestone does not include durable Resize, arbitrary Signal, SSH
+transport, release work, or Agent message semantics. The later public-local-
+consumer Feature owns foreground-group Interrupt and complete POSIX-session
+Stop because their target, grace, force, and quiescence rules are not Input's
+mutation algebra.
 
 ## Architecture evidence and failure corpus
 

@@ -12,7 +12,7 @@ use std::{
 
 use ctxmux_protocol::{
     AppliedInputRange, CommandDisposition, ControlFailure, ControlReceipt, ErrorCode,
-    InputOperationKey, ProtocolError, RunId, TerminalSize,
+    InputOperationKey, ProtocolError, RunId, RunSignal, StopDisposition, TerminalSize,
 };
 use portable_pty::{Child, MasterPty, PtySize};
 use tokio::sync::{oneshot, watch};
@@ -49,12 +49,24 @@ pub(crate) enum PendingRecoverableInput {
 #[derive(Debug)]
 pub(crate) struct PendingStop {
     run_id: RunId,
+    reply: oneshot::Receiver<Result<StopDisposition, String>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct PendingSignal {
+    run_id: RunId,
+    signal: RunSignal,
     reply: oneshot::Receiver<Result<(), String>>,
 }
 
 /// One direct-child command handled by the existing waiter thread.
 pub(crate) enum ChildCommand {
-    Stop(oneshot::Sender<Result<(), String>>),
+    Signal {
+        signal: RunSignal,
+        foreground_group: u32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    Stop(oneshot::Sender<Result<StopDisposition, String>>),
     CleanupUnpublished,
 }
 
@@ -327,6 +339,7 @@ impl InputOperationEntry {
 trait PtyControl: Send {
     fn resize(&self, size: PtySize) -> io::Result<()>;
     fn get_size(&self) -> io::Result<PtySize>;
+    fn foreground_process_group(&self) -> Option<u32>;
 }
 
 struct PortablePtyControl(Box<dyn MasterPty + Send>);
@@ -338,6 +351,12 @@ impl PtyControl for PortablePtyControl {
 
     fn get_size(&self) -> io::Result<PtySize> {
         self.0.get_size().map_err(io::Error::other)
+    }
+
+    fn foreground_process_group(&self) -> Option<u32> {
+        self.0
+            .process_group_leader()
+            .and_then(|pid| u32::try_from(pid).ok())
     }
 }
 
@@ -371,6 +390,10 @@ impl NativeControlOwner {
 
             fn get_size(&self) -> io::Result<PtySize> {
                 Ok(PtySize::default())
+            }
+
+            fn foreground_process_group(&self) -> Option<u32> {
+                None
             }
         }
 
@@ -606,6 +629,56 @@ impl NativeControlOwner {
         })
     }
 
+    pub(crate) fn begin_signal(&self, signal: RunSignal) -> Result<PendingSignal, ControlFailure> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let state = mutex_lock(&self.inner.state);
+            if state.phase != ControlPhase::Open {
+                return Err(not_applied(invalid_phase_error(
+                    self.inner.run_id,
+                    state.phase,
+                    "signal",
+                )));
+            }
+            let sender = state.child_sender.as_ref().ok_or_else(|| {
+                not_applied(ProtocolError::new(
+                    ErrorCode::InvalidRunState,
+                    format!("cannot signal exited Run {}", self.inner.run_id),
+                ))
+            })?;
+            let foreground_group = mutex_lock(&self.inner.pty)
+                .as_ref()
+                .and_then(|pty| pty.foreground_process_group())
+                .ok_or_else(|| {
+                    not_applied(ProtocolError::new(
+                        ErrorCode::InvalidRunState,
+                        format!(
+                            "Run {} has no current foreground process group",
+                            self.inner.run_id
+                        ),
+                    ))
+                })?;
+            sender
+                .send(ChildCommand::Signal {
+                    signal,
+                    foreground_group,
+                    reply: reply_tx,
+                })
+                .map_err(|_| {
+                    not_applied(invalid_phase_error(
+                        self.inner.run_id,
+                        state.phase,
+                        "signal",
+                    ))
+                })?;
+        }
+        Ok(PendingSignal {
+            run_id: self.inner.run_id,
+            signal,
+            reply: reply_rx,
+        })
+    }
+
     /// Ask the child-handle waiter to clean up a Run rejected before durable
     /// publication. Completion remains a separate waiter-owned reap receipt.
     pub(crate) fn cleanup_unpublished(&self) -> Result<(), String> {
@@ -644,7 +717,9 @@ impl NativeControlOwner {
         })
     }
 
-    fn begin_stop_inner(&self) -> Result<oneshot::Receiver<Result<(), String>>, ControlFailure> {
+    fn begin_stop_inner(
+        &self,
+    ) -> Result<oneshot::Receiver<Result<StopDisposition, String>>, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let (sender, rejected) = {
             let mut state = mutex_lock(&self.inner.state);
@@ -925,7 +1000,7 @@ impl PendingRecoverableInput {
 impl PendingStop {
     pub(crate) async fn resolve(self, timeout: Duration) -> ControlResult {
         match tokio::time::timeout(timeout, self.reply).await {
-            Ok(Ok(Ok(()))) => Ok(ControlReceipt::Stop),
+            Ok(Ok(Ok(disposition))) => Ok(ControlReceipt::Stop { disposition }),
             Ok(Ok(Err(error))) => Err(unknown(ProtocolError::new(ErrorCode::Io, error))),
             Ok(Err(_)) => Err(unknown(ProtocolError::new(
                 ErrorCode::InvalidRunState,
@@ -937,6 +1012,24 @@ impl PendingStop {
             Err(_) => Err(unknown(ProtocolError::new(
                 ErrorCode::Internal,
                 format!("timed out while stopping Run {}", self.run_id),
+            ))),
+        }
+    }
+}
+
+impl PendingSignal {
+    pub(crate) async fn resolve(self) -> ControlResult {
+        match self.reply.await {
+            Ok(Ok(())) => Ok(ControlReceipt::Signal {
+                signal: self.signal,
+            }),
+            Ok(Err(error)) => Err(unknown(ProtocolError::new(ErrorCode::Io, error))),
+            Err(_) => Err(unknown(ProtocolError::new(
+                ErrorCode::InvalidRunState,
+                format!(
+                    "Run {} child owner ended before acknowledging signal",
+                    self.run_id
+                ),
             ))),
         }
     }
@@ -1394,7 +1487,7 @@ mod tests {
 
     use ctxmux_protocol::{
         AppliedInputRange, CommandDisposition, ControlReceipt, ErrorCode, InputOperationKey, RunId,
-        TerminalSize,
+        StopDisposition, TerminalSize,
     };
     use portable_pty::PtySize;
 
@@ -1423,6 +1516,10 @@ mod tests {
 
         fn get_size(&self) -> io::Result<PtySize> {
             Ok(*mutex_lock(&self.size))
+        }
+
+        fn foreground_process_group(&self) -> Option<u32> {
+            None
         }
     }
 
@@ -1454,6 +1551,10 @@ mod tests {
 
         fn get_size(&self) -> io::Result<PtySize> {
             Ok(PtySize::default())
+        }
+
+        fn foreground_process_group(&self) -> Option<u32> {
+            None
         }
     }
 
@@ -1665,7 +1766,9 @@ mod tests {
         else {
             panic!("public stop sends the stop command variant");
         };
-        reply.send(Ok(())).expect("acknowledge fixture stop");
+        reply
+            .send(Ok(StopDisposition::Graceful))
+            .expect("acknowledge fixture stop");
         drop(stop);
 
         owner.mark_closed();
@@ -2126,12 +2229,16 @@ mod tests {
         else {
             panic!("public stop sends the stop command variant");
         };
-        reply.send(Ok(())).expect("acknowledge stop");
+        reply
+            .send(Ok(StopDisposition::Graceful))
+            .expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))
                 .await
                 .expect("stop is accepted"),
-            ControlReceipt::Stop
+            ControlReceipt::Stop {
+                disposition: StopDisposition::Graceful,
+            }
         );
         let rejected = queued
             .resolve()
@@ -2192,12 +2299,16 @@ mod tests {
         else {
             panic!("public stop sends the stop command variant");
         };
-        reply.send(Ok(())).expect("acknowledge stop");
+        reply
+            .send(Ok(StopDisposition::Graceful))
+            .expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))
                 .await
                 .expect("stop accepted after input failure"),
-            ControlReceipt::Stop
+            ControlReceipt::Stop {
+                disposition: StopDisposition::Graceful,
+            }
         );
     }
 

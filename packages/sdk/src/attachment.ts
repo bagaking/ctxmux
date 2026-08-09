@@ -9,6 +9,7 @@ import {
   type ByteInput,
   type InputReceipt,
   type ResizeReceipt,
+  type SignalReceipt,
   type StopReceipt,
 } from "./control.js";
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
@@ -117,6 +118,14 @@ export class Attachment {
     return this.#command<StopReceipt>("stop", 0, (commandId) => ({
       type: "stop",
       command_id: commandId,
+    }));
+  }
+
+  public interrupt(): Promise<AttachmentControlAccepted<SignalReceipt>> {
+    return this.#command<SignalReceipt>("signal", 0, (commandId) => ({
+      type: "signal",
+      command_id: commandId,
+      signal: "interrupt",
     }));
   }
 

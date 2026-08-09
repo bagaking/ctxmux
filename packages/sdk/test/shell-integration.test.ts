@@ -95,6 +95,7 @@ test("shell Integration rejects Level B before a raw fork request", async () => 
     capabilities: {
       input: true,
       resize: true,
+      signal: true,
       stop: true,
       fork_level_a: true,
       fork_level_b: true,

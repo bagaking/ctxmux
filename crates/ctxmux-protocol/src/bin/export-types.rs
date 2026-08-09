@@ -8,7 +8,7 @@ use std::{
 
 use ctxmux_protocol::{
     AttachedSnapshot, ClientFrame, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-    MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ServerFrame,
+    MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, RunSignal, ServerFrame, StopDisposition,
 };
 use ts_rs::{Config, TS};
 
@@ -33,6 +33,8 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     ClientFrame::export_all(&config)?;
     ServerFrame::export_all(&config)?;
     AttachedSnapshot::export_all(&config)?;
+    RunSignal::export_all(&config)?;
+    StopDisposition::export_all(&config)?;
     fs::write(
         output.join("constants.ts"),
         format!(

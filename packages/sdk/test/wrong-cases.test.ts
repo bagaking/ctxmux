@@ -252,7 +252,10 @@ test("SC-02 rejects malformed nested runtime frames", () => {
       {
         type: "command_result",
         command_id: 0,
-        outcome: { type: "accepted", receipt: { type: "stop" } },
+        outcome: {
+          type: "accepted",
+          receipt: { type: "stop", disposition: "graceful" },
+        },
       },
       "$frame.command_id",
     ],
@@ -993,7 +996,10 @@ test("T-013 makes every pending command unknown on a correlated receipt violatio
     peer.send({
       type: "command_result",
       command_id: 1,
-      outcome: { type: "accepted", receipt: { type: "stop" } },
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
     });
   });
 
@@ -1063,7 +1069,10 @@ test("T-013 reserves attachment capacity for resize and stop after 32 pending in
     peer.send({
       type: "command_result",
       command_id: 34,
-      outcome: { type: "accepted", receipt: { type: "stop" } },
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
     });
   });
 
@@ -1117,7 +1126,10 @@ test("T-013 bounds pending input bytes without consuming the rejected command ID
     peer.send({
       type: "command_result",
       command_id: 3,
-      outcome: { type: "accepted", receipt: { type: "stop" } },
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
     });
   });
 
@@ -1189,7 +1201,10 @@ test("T-013 rejects an oversize attachment frame before consuming its command ID
     peer.send({
       type: "command_result",
       command_id: 1,
-      outcome: { type: "accepted", receipt: { type: "stop" } },
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
     });
   });
 
@@ -1438,7 +1453,10 @@ test(
       peer.send({
         type: "command_result",
         command_id: 1,
-        outcome: { type: "accepted", receipt: { type: "stop" } },
+        outcome: {
+          type: "accepted",
+          receipt: { type: "stop", disposition: "graceful" },
+        },
       });
     });
 
@@ -1447,7 +1465,7 @@ test(
     }).attach(RUN_ID);
     assert.deepEqual(await attachment.stop(), {
       commandId: 1,
-      receipt: { type: "stop" },
+      receipt: { type: "stop", disposition: "graceful" },
     });
     for (let expected = 0; expected < 256; expected += 1) {
       assert.deepEqual(await attachment.nextEvent(), {
@@ -1506,7 +1524,10 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
     peer.send({
       type: "command_result",
       command_id: 1,
-      outcome: { type: "accepted", receipt: { type: "stop" } },
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
     });
   });
 
@@ -1817,6 +1838,7 @@ function runInfo() {
     capabilities: {
       input: true,
       resize: true,
+      signal: true,
       stop: true,
       fork_level_a: true,
       fork_level_b: true,
@@ -1864,6 +1886,7 @@ function tmuxRunInfo() {
     capabilities: {
       input: false,
       resize: false,
+      signal: false,
       stop: false,
       fork_level_a: false,
       fork_level_b: false,

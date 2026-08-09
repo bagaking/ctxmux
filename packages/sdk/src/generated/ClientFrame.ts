@@ -2,6 +2,7 @@
 import type { AttachmentCommandId } from "./AttachmentCommandId.js";
 import type { ClientHello } from "./ClientHello.js";
 import type { Request } from "./Request.js";
+import type { RunSignal } from "./RunSignal.js";
 import type { TerminalSize } from "./TerminalSize.js";
 
 /**
@@ -12,5 +13,6 @@ export type ClientFrame =
   | { type: "request"; request: Request }
   | { type: "input"; command_id: AttachmentCommandId; data: Array<number> }
   | { type: "resize"; command_id: AttachmentCommandId; size: TerminalSize }
+  | { type: "signal"; command_id: AttachmentCommandId; signal: RunSignal }
   | { type: "stop"; command_id: AttachmentCommandId }
   | { type: "detach" };

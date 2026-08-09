@@ -99,7 +99,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 8 imports by socket path plus pane ID, an ambiguous linked
+because generation 9 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -215,21 +215,23 @@ disconnect. `detach()` resolves after the daemon acknowledges `Detached`;
 `close()` returns immediately without sending that frame. Both leave a live Run
 running. `stop()` explicitly terminates it.
 
-On a live attachment, `input()`, `resize()`, and `stop()` allocate a
+On a live attachment, `input()`, `resize()`, `interrupt()`, and `stop()` allocate a
 connection-local command ID and resolve only after the daemon returns the
 matching owner receipt. One background receive pump demultiplexes command
 results from Run events, so a slow event consumer cannot steal an acknowledgement
 or block control correlation. Pending controls are bounded to 64 commands, of
 which at most 32 may be input, with at most 1 MiB of raw input pending; this
-keeps capacity available for resize and stop.
+keeps capacity available for resize, interrupt, and stop.
 
 An input receipt proves that all reported bytes reached the daemon-owned PTY
 write boundary, not that the child consumed or interpreted them. A resize
 receipt contains the size read back from the owning PTY, which may differ from
-the request. A stop receipt means the direct-child owner accepted termination;
-the final `exited` event remains a later lifecycle fact.
+the request. An interrupt receipt proves the native owner delivered `SIGINT` to
+the Run's current foreground process group. A stop receipt reports `graceful`
+or `forced` only after the direct child is reaped and the complete owned POSIX
+session is empty; the final `exited` event remains a later publication fact.
 
-`CtxmuxClient.input()`, `resize()`, and `stop()` expose the same typed receipts
+`CtxmuxClient.input()`, `resize()`, `interrupt()`, and `stop()` expose the same typed receipts
 as `{ run, receipt }` over short-lived connections. A rejected control throws
 `CtxmuxCommandError` with `not_applied` or `unknown`. If a sent command loses its
 unique result, the SDK reports `unknown`, closes that attachment when required,

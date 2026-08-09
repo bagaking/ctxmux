@@ -8,7 +8,7 @@ use std::{
 
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ControlFailure, ControlOutcome, ControlReceipt, RunEvent,
-    ServerFrame, TerminalSize, decode_frame, encode_frame,
+    RunSignal, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{
     StreamExt,
@@ -21,9 +21,9 @@ use tokio::{
 
 use super::{
     AttachmentControlAccepted, AttachmentUnavailableReason, AttachmentUnknownReason, ClientError,
-    InputReceipt, ResizeReceipt, StopReceipt, Wire, control_not_applied, decode_input_receipt,
-    decode_resize_receipt, decode_stop_receipt, send_encoded_sink, send_sink,
-    validate_control_failure,
+    InputReceipt, ResizeReceipt, SignalReceipt, StopReceipt, Wire, control_not_applied,
+    decode_input_receipt, decode_resize_receipt, decode_signal_receipt, decode_stop_receipt,
+    send_encoded_sink, send_sink, validate_control_failure,
 };
 
 type WireSink = SplitSink<Wire, String>;
@@ -122,7 +122,32 @@ impl Attachment {
         })
     }
 
-    /// Stop the attached Run and await direct-child owner acceptance.
+    /// Interrupt the attached Run without ending Run ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the live owner cannot prove signal delivery.
+    pub async fn interrupt(&self) -> Result<AttachmentControlAccepted<SignalReceipt>, ClientError> {
+        let (command_id, receipt) = self
+            .issue_command(PendingKind::Signal(RunSignal::Interrupt), |command_id| {
+                ClientFrame::Signal {
+                    command_id,
+                    signal: RunSignal::Interrupt,
+                }
+            })
+            .await?;
+        let ValidatedReceipt::Signal(receipt) = receipt else {
+            return Err(ClientError::ProtocolContractViolation(
+                "validated signal command resolved with another receipt kind",
+            ));
+        };
+        Ok(AttachmentControlAccepted {
+            command_id,
+            receipt,
+        })
+    }
+
+    /// Stop the attached Run and await complete owned-session quiescence.
     ///
     /// # Errors
     ///
@@ -242,6 +267,7 @@ impl Drop for Attachment {
 enum PendingKind {
     Input { expected_bytes: usize },
     Resize,
+    Signal(RunSignal),
     Stop,
 }
 
@@ -249,7 +275,7 @@ impl PendingKind {
     fn input_bytes(self) -> usize {
         match self {
             Self::Input { expected_bytes } => expected_bytes,
-            Self::Resize | Self::Stop => 0,
+            Self::Resize | Self::Signal(_) | Self::Stop => 0,
         }
     }
 
@@ -261,6 +287,9 @@ impl PendingKind {
             Self::Resize => decode_resize_receipt(receipt)
                 .map(ValidatedReceipt::Resize)
                 .map_err(|_| "attachment resize receipt does not match its command"),
+            Self::Signal(signal) => decode_signal_receipt(receipt, signal)
+                .map(ValidatedReceipt::Signal)
+                .map_err(|_| "attachment signal receipt does not match its command"),
             Self::Stop => decode_stop_receipt(receipt)
                 .map(ValidatedReceipt::Stop)
                 .map_err(|_| "attachment stop receipt does not match its command"),
@@ -272,6 +301,7 @@ impl PendingKind {
 enum ValidatedReceipt {
     Input(InputReceipt),
     Resize(ResizeReceipt),
+    Signal(SignalReceipt),
     Stop(StopReceipt),
 }
 

@@ -9,7 +9,12 @@ Interactive shells and coding Agents require terminal semantics: a PTY, terminal
 
 ## Decision
 
-The native Backend uses `portable-pty`. The daemon opens a platform-native PTY, configures a `CommandBuilder`, spawns the child on the slave, and retains the master and writer. The waiter thread retains the actual owned child handle and receives stop commands through one owner-local channel; ctxmux does not signal a cached numeric PID from another thread.
+The native Backend uses `portable-pty`. The daemon opens a platform-native PTY,
+configures a `CommandBuilder`, spawns the child on the slave, and retains the
+master and writer. On POSIX, `portable-pty` calls `setsid()` before exec, making
+the direct child the Run session leader. The waiter thread retains the actual
+child handle and receives Signal and Stop through one owner-local channel;
+ctxmux does not signal from a client task or from persisted PID metadata.
 
 Raw PTY bytes are the runtime truth. UTF-8 decoding and terminal-screen interpretation remain client concerns.
 
@@ -19,9 +24,11 @@ Raw PTY bytes are the runtime truth. UTF-8 decoding and terminal-screen interpre
 - Input is byte-preserving; output may contain NUL, split UTF-8, and terminal control sequences.
 - Resize rejects zero rows or columns.
 - An exited Run rejects input, resize, and repeated stop explicitly.
-- Stop means eventual termination of the owned direct child, not process-group
-  or descendant-tree termination. On Unix the native child handle escalates
-  from `SIGHUP` to a forced kill when the child ignores HUP.
+- Interrupt delivers `SIGINT` only to the PTY foreground process group after
+  proving that group still belongs to the owned session.
+- Stop means bounded graceful then forced termination of the complete owned
+  session. Success requires direct-child reap and an empty session, and reports
+  whether force was required.
 
 ## Alternatives
 
@@ -31,7 +38,12 @@ Raw PTY bytes are the runtime truth. UTF-8 decoding and terminal-screen interpre
 
 ## Known constraints
 
-The current code deliberately has no process-group or descendant-kill contract. Direct-child termination delegates its HUP grace period and forced-kill escalation to `portable-pty`; real tests cover a HUP-ignoring child and a wait/publication identity barrier. Exit-code and signal mapping depend on the library. Windows is excluded by the current Unix-socket transport before PTY portability is exercised.
+The complete-tree contract is exactly one POSIX session. A descendant that
+calls `setsid()` explicitly crosses that boundary; ctxmux does not claim host-
+wide ancestry control. Session enumeration is an operating-system snapshot, so
+every PID is revalidated against the owned SID immediately before signalling.
+Exit-code and signal mapping still depend on `portable-pty`. Windows is excluded
+by the current Unix-socket transport before PTY portability is exercised.
 
 The waiter allows the reader one second to finish. This is a bounded drain, not an unbounded final-output guarantee.
 
@@ -47,16 +59,19 @@ The signal-mask and descriptor bugs are fixed upstream. They justify dependency-
 
 ## Fixture mapping
 
-- Covered now: real input, resize through `stty size`, exit, invalid dimensions, repeated stop, and eventual direct-child termination when HUP is ignored.
+- Covered now: real input, resize through `stty size`, exit, invalid dimensions,
+  foreground-group Interrupt, repeated Stop, stubborn child and descendants,
+  forced disposition, unrelated-process safety, and concurrent Interrupt/Stop.
 - Active: controlled ambient descriptor is absent in the native child.
 - Active: binary output, NUL, and split UTF-8 remain exact through replay.
 - Characterization: high-volume or delayed descendant output at exit.
-- Future: inherited signal mask, process-tree termination, and alternate-screen presentation boundaries. Process-tree termination would require a separately reviewed contract rather than being inferred from direct-child stop.
+- Future: inherited signal mask and alternate-screen presentation boundaries.
 
 ## Open questions
 
-- What separately declared capability, if any, should add process-group or descendant-tree termination beyond current direct-child stop?
-- What terminal signals must the Backend expose or forward?
+- Should a future non-POSIX Backend expose another owner scope with equivalent
+  complete-tree semantics?
+- What signals beyond Interrupt have portable, Agent-neutral value?
 - What behavior is portable across Unix and Windows?
 - When does PTY reader failure become public Run state rather than a daemon log?
 

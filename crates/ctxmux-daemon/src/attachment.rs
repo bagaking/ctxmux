@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use ctxmux_protocol::{
     AttachedHeader, AttachedSnapshot, AttachmentCommandId, ClientFrame, ControlOutcome, ErrorCode,
-    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RunEvent, RunId, RunState,
-    ServerFrame, TerminalSize,
+    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RunEvent, RunId, RunSignal,
+    RunState, ServerFrame, TerminalSize,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{net::UnixStream, sync::broadcast};
@@ -148,6 +148,7 @@ type PendingResults = FuturesUnordered<BoxFuture<'static, (AttachmentCommandId, 
 enum ControlCommand {
     Input(Vec<u8>),
     Resize(TerminalSize),
+    Signal(RunSignal),
     Stop,
 }
 
@@ -164,6 +165,7 @@ async fn handle_frame(
     let (command_id, command) = match frame {
         ClientFrame::Input { command_id, data } => (command_id, ControlCommand::Input(data)),
         ClientFrame::Resize { command_id, size } => (command_id, ControlCommand::Resize(size)),
+        ClientFrame::Signal { command_id, signal } => (command_id, ControlCommand::Signal(signal)),
         ClientFrame::Stop { command_id } => (command_id, ControlCommand::Stop),
         ClientFrame::Detach => {
             #[cfg(test)]
@@ -199,6 +201,14 @@ async fn handle_frame(
         ControlCommand::Resize(size) => {
             send_command_result(wire, command_id, outcome(run.resize(size))).await?;
         }
+        ControlCommand::Signal(signal) => match run.begin_signal(signal) {
+            Ok(pending) => {
+                results.push(async move { (command_id, outcome(pending.resolve().await)) }.boxed());
+            }
+            Err(failure) => {
+                send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+            }
+        },
         ControlCommand::Stop => match run.begin_stop() {
             Ok(pending) => {
                 controls.pending_stop = Some(command_id);

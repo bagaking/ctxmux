@@ -2220,6 +2220,10 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
         attachment.stop().await.unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
+    assert_protocol_error(
+        attachment.interrupt().await.unwrap_err(),
+        ErrorCode::UnsupportedCapability,
+    );
     detach_with_timeout(attachment).await;
 
     assert_protocol_error(
@@ -2244,6 +2248,10 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
     );
     assert_protocol_error(
         client.stop(run.id).await.unwrap_err(),
+        ErrorCode::UnsupportedCapability,
+    );
+    assert_protocol_error(
+        client.interrupt(run.id).await.unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
     assert_protocol_error(

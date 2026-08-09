@@ -118,6 +118,7 @@ ctxmux_cli_fork_retry=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" fork --o
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status "$ctxmux_cli_child" >/dev/null
 
 ctxmux_cli_stop_run=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c "sleep 30")
+"$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" interrupt "$ctxmux_cli_stop_run" >/dev/null
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" stop "$ctxmux_cli_stop_run" >/dev/null
 ctxmux_cli_stopped=false
 for _ in $(seq 1 100)
@@ -135,8 +136,8 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 8"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 8"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 9"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 9"
 
 expect_failure "--socket or CTXMUX_SOCKET is required" env -u CTXMUX_SOCKET "$ctxmux_cli_bin" list
 expect_failure "unknown command" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" unknown

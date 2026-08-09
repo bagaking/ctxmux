@@ -218,6 +218,13 @@ test(
     assert.equal(retriedSdkChild.id, sdkChild.id);
     assert.equal(retriedSdkChild.pid, sdkChild.pid);
     const sdkAttachment = await reconnectedClient.attach(sdkRun.id);
+    assert.deepEqual(
+      await step("interrupt SDK-created Run", sdkAttachment.interrupt()),
+      {
+        commandId: 1,
+        receipt: { type: "signal", signal: "interrupt" },
+      },
+    );
     await sdkAttachment.detach();
     await waitForNoAttachments(reconnectedClient, sdkRun.id);
     const cliStatus = await execFile(cliBinary, [
@@ -233,12 +240,12 @@ test(
     assert.deepEqual(
       (await step("stop SDK-forked Run", reconnectedClient.stop(sdkChild.id)))
         .receipt,
-      { type: "stop" },
+      { type: "stop", disposition: "graceful" },
     );
     assert.deepEqual(
       (await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id)))
         .receipt,
-      { type: "stop" },
+      { type: "stop", disposition: "graceful" },
     );
   },
 );
@@ -475,6 +482,7 @@ test(
     assert.deepEqual(run.capabilities, {
       input: false,
       resize: false,
+      signal: false,
       stop: false,
       fork_level_a: false,
       fork_level_b: false,

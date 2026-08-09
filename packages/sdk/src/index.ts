@@ -15,6 +15,7 @@ export type {
   InputReceipt,
   RecoverableInputOperation,
   ResizeReceipt,
+  SignalReceipt,
   StopReceipt,
 } from "./client.js";
 export {
@@ -77,6 +78,8 @@ export type { RunInputReference } from "./generated/RunInputReference.js";
 export type { RunLineage } from "./generated/RunLineage.js";
 export type { RunSpec } from "./generated/RunSpec.js";
 export type { RunState } from "./generated/RunState.js";
+export type { RunSignal } from "./generated/RunSignal.js";
+export type { StopDisposition } from "./generated/StopDisposition.js";
 export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { TerminalSize } from "./generated/TerminalSize.js";
 export type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
@@ -102,7 +105,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 8. */
+/** Fill the portable defaults required by protocol generation 9. */
 export function defineRun(
   program: string,
   options: {

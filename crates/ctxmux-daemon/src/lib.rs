@@ -25,6 +25,7 @@ use std::{
 mod attachment;
 mod creation;
 mod native_control;
+mod native_session;
 mod persistence;
 mod qualification_stats;
 mod run_spec;
@@ -57,8 +58,9 @@ use crate::creation::{
 };
 use crate::native_control::{
     ChildCommand, ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner,
-    PendingInput, PendingStop,
+    PendingInput, PendingSignal, PendingStop,
 };
+use crate::native_session::NativeSession;
 use crate::persistence::{
     CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
     PersistentStartFailure, RecoveredRun, StagedPersistentStart, StartDisposition,
@@ -72,7 +74,9 @@ const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
 const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const LIVE_EVENT_CAPACITY: usize = 256;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
-const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(1);
+const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
+const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2087,6 +2091,10 @@ impl Run {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one linear launch transaction keeps fallible setup and child-owner handoff auditable"
+    )]
     fn spawn_with_hooks<O, H, F, G>(
         config: NativeSpawnConfig,
         make_owner: H,
@@ -2129,6 +2137,11 @@ impl Run {
         drop(pair.slave);
         let mut pending_child = PendingChild::new(child);
         let pid = pending_child.child().process_id();
+        let session =
+            NativeSession::from_child_pid(pid.ok_or_else(|| {
+                spawn_error("identify native session", "child PID is unavailable")
+            })?)
+            .map_err(|error| spawn_error("identify native session", error))?;
         let (events, _) = broadcast::channel(config.live_event_capacity);
         let id = config.id;
         let (native_control, child_command_rx) =
@@ -2165,7 +2178,13 @@ impl Run {
                     return;
                 };
                 let child = pending_child.into_child();
-                match wait_for_child(child, child_command_rx, &wait_control, &wait_failure) {
+                match wait_for_child(
+                    child,
+                    child_command_rx,
+                    session,
+                    &wait_control,
+                    &wait_failure,
+                ) {
                     NativeWaitOutcome::Exited(state) => {
                         wait_control.mark_closed();
                         after_wait();
@@ -2491,6 +2510,19 @@ impl Run {
             )?
             .resolve()
             .await
+    }
+
+    async fn signal(&self, signal: ctxmux_protocol::RunSignal) -> ControlResult {
+        self.begin_signal(signal)?.resolve().await
+    }
+
+    fn begin_signal(
+        &self,
+        signal: ctxmux_protocol::RunSignal,
+    ) -> Result<PendingSignal, ControlFailure> {
+        self.native_control()
+            .map_err(control_not_applied)?
+            .begin_signal(signal)
     }
 
     fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
@@ -2865,19 +2897,38 @@ impl Run {
 fn wait_for_child(
     mut child: Box<dyn Child + Send + Sync>,
     commands: mpsc::Receiver<ChildCommand>,
+    session: NativeSession,
     control: &NativeControlOwner,
     failure: &NativeWaitFailure,
 ) -> NativeWaitOutcome {
     loop {
         match commands.recv_timeout(CHILD_CONTROL_POLL) {
+            Ok(ChildCommand::Signal {
+                signal: ctxmux_protocol::RunSignal::Interrupt,
+                foreground_group,
+                reply,
+            }) => {
+                let _ = reply.send(session.interrupt(foreground_group));
+            }
             Ok(ChildCommand::Stop(reply)) => {
-                let result = child.kill().map_err(|error| error.to_string());
-                let _ = reply.send(result);
+                match session.stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT) {
+                    Ok((disposition, status)) => {
+                        control.mark_reaped();
+                        let _ = reply.send(Ok(disposition));
+                        return NativeWaitOutcome::Exited(exit_state(&status));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
+                    }
+                }
             }
             Ok(ChildCommand::CleanupUnpublished) => {
-                if let Err(error) = child.kill() {
+                if let Err(error) = session
+                    .stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT)
+                    .map(|_| ())
+                {
                     control.record_cleanup_error(format!(
-                        "failed to kill unpublished Run child: {error}"
+                        "failed to stop unpublished Run session: {error}"
                     ));
                 }
             }
@@ -2885,11 +2936,22 @@ fn wait_for_child(
         }
         match child.try_wait() {
             Ok(Some(status)) => {
-                control.mark_reaped();
-                return NativeWaitOutcome::Exited(RunState::Exited {
-                    code: status.exit_code(),
-                    signal: status.signal().map(str::to_owned),
-                });
+                match session.finish_after_direct_exit(
+                    child.as_mut(),
+                    status,
+                    Instant::now() + STOP_FORCED_TIMEOUT,
+                ) {
+                    Ok(status) => {
+                        control.mark_reaped();
+                        return NativeWaitOutcome::Exited(exit_state(&status));
+                    }
+                    Err(error) => {
+                        control.mark_wait_authority_lost(error.clone(), child);
+                        drop(commands);
+                        failure.record(control.run_id(), &error);
+                        return NativeWaitOutcome::AuthorityLost;
+                    }
+                }
             }
             Ok(None) => {}
             Err(error) => {
@@ -2900,6 +2962,13 @@ fn wait_for_child(
                 return NativeWaitOutcome::AuthorityLost;
             }
         }
+    }
+}
+
+fn exit_state(status: &portable_pty::ExitStatus) -> RunState {
+    RunState::Exited {
+        code: status.exit_code(),
+        signal: status.signal().map(str::to_owned),
     }
 }
 
@@ -3646,6 +3715,10 @@ async fn handle_connection(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive protocol dispatch keeps every public request variant visibly total"
+)]
 async fn execute_request(
     manager: &Arc<RunManager>,
     request: Request,
@@ -3721,6 +3794,17 @@ async fn execute_request(
                 }
             };
             Ok(short_control_response(&run, run.resize(size)))
+        }
+        Request::Signal { id, signal } => {
+            let run = match manager.pin(id) {
+                Ok(run) => run,
+                Err(error) => {
+                    return Ok(Response::ControlRejected {
+                        failure: control_not_applied(error),
+                    });
+                }
+            };
+            Ok(short_control_response(&run, run.signal(signal).await))
         }
         Request::Stop { id } => {
             let run = match manager.pin(id) {
@@ -3984,6 +4068,7 @@ mod tests {
         let outcome = wait_for_child(
             Box::new(WaitFailingChild(Arc::clone(&counts))),
             commands,
+            super::NativeSession::from_child_pid(42).unwrap(),
             &control,
             &failure,
         );
@@ -4112,6 +4197,7 @@ mod tests {
             wait_for_child(
                 Box::new(WaitFailingChild(waiter_counts)),
                 commands,
+                super::NativeSession::from_child_pid(42).unwrap(),
                 &control,
                 &wait_failure,
             )

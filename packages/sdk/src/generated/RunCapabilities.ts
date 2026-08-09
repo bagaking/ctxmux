@@ -7,6 +7,7 @@ import type { ReplayCapability } from "./ReplayCapability.js";
 export type RunCapabilities = {
   input: boolean;
   resize: boolean;
+  signal: boolean;
   stop: boolean;
   fork_level_a: boolean;
   fork_level_b: boolean;

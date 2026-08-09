@@ -11,7 +11,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -446,6 +446,7 @@ pub enum ReplayCapability {
 pub struct RunCapabilities {
     pub input: bool,
     pub resize: bool,
+    pub signal: bool,
     pub stop: bool,
     pub fork_level_a: bool,
     pub fork_level_b: bool,
@@ -457,6 +458,7 @@ impl RunCapabilities {
     pub const NATIVE: Self = Self {
         input: true,
         resize: true,
+        signal: true,
         stop: true,
         fork_level_a: true,
         fork_level_b: true,
@@ -467,6 +469,7 @@ impl RunCapabilities {
     pub const TMUX_READ_ONLY: Self = Self {
         input: false,
         resize: false,
+        signal: false,
         stop: false,
         fork_level_a: false,
         fork_level_b: false,
@@ -591,6 +594,25 @@ pub struct RecoverableInput {
     pub data: Vec<u8>,
 }
 
+/// Portable signal semantics exposed by a native Run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RunSignal {
+    /// Interrupt the foreground process group as if the terminal received
+    /// Ctrl-C, without ending Run ownership.
+    Interrupt,
+}
+
+/// How a complete native Run session reached quiescence during Stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum StopDisposition {
+    /// Every session member exited during the bounded graceful phase.
+    Graceful,
+    /// At least one session member required the forced phase.
+    Forced,
+}
+
 /// One ordered half-open PTY output byte range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct OutputChunk {
@@ -598,7 +620,7 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 8.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 9.
     pub data: Vec<u8>,
 }
 
@@ -665,7 +687,9 @@ pub enum Request {
     RecoverableInput { operation: RecoverableInput },
     /// Resize a live Run's PTY.
     Resize { id: RunId, size: TerminalSize },
-    /// Terminate a live Run.
+    /// Deliver one portable signal to a live Run.
+    Signal { id: RunId, signal: RunSignal },
+    /// Terminate the complete owned native Run session.
     Stop { id: RunId },
     /// Attach to retained output and future lifecycle events.
     Attach {
@@ -694,6 +718,11 @@ pub enum ClientFrame {
         command_id: AttachmentCommandId,
         size: TerminalSize,
     },
+    /// Deliver one portable signal through a live attachment.
+    Signal {
+        command_id: AttachmentCommandId,
+        signal: RunSignal,
+    },
     /// Stop the attached Run.
     Stop { command_id: AttachmentCommandId },
     /// Close this attachment without affecting the Run.
@@ -708,8 +737,10 @@ pub enum ControlReceipt {
     Input { written_bytes: u32 },
     /// The owning PTY reported this size after the resize attempt.
     Resize { applied_size: TerminalSize },
-    /// The direct-child control owner accepted the termination request.
-    Stop,
+    /// The native lifecycle owner delivered the requested signal.
+    Signal { signal: RunSignal },
+    /// The complete owned native Run session reached quiescence.
+    Stop { disposition: StopDisposition },
 }
 
 /// Whether a rejected control command may already have crossed its owner.
@@ -1041,8 +1072,8 @@ mod tests {
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
         MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError, RecoverableInput, Request,
-        Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState, ServerFrame,
-        TerminalSize, decode_frame, encode_frame,
+        Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState,
+        ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -1109,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_input_has_exact_generation_8_wire_shapes() {
+    fn recoverable_input_has_exact_generation_9_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1123,7 +1154,7 @@ mod tests {
             .unwrap(),
             serde_json::json!({
                 "type": "hello",
-                "protocol": 8,
+                "protocol": 9,
                 "daemon_instance": daemon_instance.to_string(),
             })
         );
@@ -1293,12 +1324,34 @@ mod tests {
             })
         );
         assert_eq!(
+            serde_json::to_value(ClientFrame::Signal {
+                command_id: later,
+                signal: RunSignal::Interrupt,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "signal",
+                "command_id": 8,
+                "signal": "interrupt"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ControlReceipt::Signal {
+                signal: RunSignal::Interrupt,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "signal", "signal": "interrupt"})
+        );
+        assert_eq!(
             serde_json::to_value(ClientFrame::Stop { command_id: later }).unwrap(),
             serde_json::json!({"type": "stop", "command_id": 8})
         );
         assert_eq!(
-            serde_json::to_value(ControlReceipt::Stop).unwrap(),
-            serde_json::json!({"type": "stop"})
+            serde_json::to_value(ControlReceipt::Stop {
+                disposition: StopDisposition::Forced,
+            })
+            .unwrap(),
+            serde_json::json!({"type": "stop", "disposition": "forced"})
         );
     }
 

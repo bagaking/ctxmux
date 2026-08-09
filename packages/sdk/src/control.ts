@@ -15,6 +15,10 @@ export type ResizeReceipt = Extract<
   { readonly type: "resize" }
 >;
 export type StopReceipt = Extract<ControlReceipt, { readonly type: "stop" }>;
+export type SignalReceipt = Extract<
+  ControlReceipt,
+  { readonly type: "signal" }
+>;
 
 /** One short-lived control accepted at its named daemon owner boundary. */
 export interface ControlAccepted<R> {
@@ -102,6 +106,8 @@ export function decodeReceipt(
       return decodeInputReceipt(receipt, inputBytes);
     case "resize":
       return decodeResizeReceipt(receipt);
+    case "signal":
+      return decodeSignalReceipt(receipt);
     case "stop":
       return decodeStopReceipt(receipt);
   }
@@ -135,6 +141,13 @@ export function decodeResizeReceipt(receipt: ControlReceipt): ResizeReceipt {
 export function decodeStopReceipt(receipt: ControlReceipt): StopReceipt {
   if (receipt.type !== "stop") {
     throw invalidReceipt("stop returned another receipt kind");
+  }
+  return receipt;
+}
+
+export function decodeSignalReceipt(receipt: ControlReceipt): SignalReceipt {
+  if (receipt.type !== "signal") {
+    throw invalidReceipt("signal returned another receipt kind");
   }
   return receipt;
 }

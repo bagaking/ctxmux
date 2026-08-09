@@ -41,6 +41,7 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         capabilities: {
           input: true,
           resize: true,
+          signal: true,
           stop: true,
           fork_level_a: true,
           fork_level_b: true,
@@ -313,6 +314,7 @@ function rootRun(): RunInfo {
     capabilities: {
       input: true,
       resize: true,
+      signal: true,
       stop: true,
       fork_level_a: true,
       fork_level_b: true,

@@ -78,7 +78,17 @@ The hook is not a public fault API and cannot change production scheduling.
 
 ## Known constraints
 
-`RunInfo` is assembled from separate state and output locks, so it is not a transactional snapshot. Concurrent writers and resizers have no product-level arbitration. Stop acknowledgement precedes terminal-state publication. Broadcast lag reports one `latest_output_bytes` but does not automatically replay; callers retain their own recovery cursor. Persistent same-epoch exited Runs are not yet collected. Shutdown now fences and drains creation and tmux control owners, while policy for live native children and other Run mutations remains unspecified.
+`RunInfo` is assembled from separate state and output locks, so it is not a
+transactional snapshot. Concurrent writers and resizers have no product-level
+arbitration. Signal admission and the Stop phase transition share the native
+owner lock, so Interrupt is either ordered before Stop or rejected without
+application. Stop acknowledgement proves direct-child reap plus an empty owned
+session but still precedes terminal-state publication. Broadcast lag reports
+one `latest_output_bytes` but does not automatically replay; callers retain
+their own recovery cursor. Persistent same-epoch exited Runs are not yet
+collected. Shutdown now fences and drains creation and tmux control owners,
+while policy for live native children and other Run mutations remains
+unspecified.
 
 Memory-only terminal Runs remain retained below the 128-record Registry ceiling
 and become eligible for exact admission-triggered replacement only after every

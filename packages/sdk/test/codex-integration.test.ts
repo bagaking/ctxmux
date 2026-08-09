@@ -205,6 +205,7 @@ test("Codex Level B planning resumes one declared native session", () => {
     capabilities: {
       input: true,
       resize: true,
+      signal: true,
       stop: true,
       fork_level_a: true,
       fork_level_b: true,
@@ -471,6 +472,7 @@ function rootRun(id: RunInfo["id"]): RunInfo {
     capabilities: {
       input: true,
       resize: true,
+      signal: true,
       stop: true,
       fork_level_a: true,
       fork_level_b: true,
