@@ -13,6 +13,11 @@ import {
   POLICY_SOURCE_PATHS,
   sameMembers,
   SNAPSHOT_FILE_PATHS,
+  validateQualificationEnvironment,
+  validateQualificationChronology,
+  validateQualificationResourceCells,
+  validateQualificationToolchain,
+  validateQualificationWorkload,
   validatePassingObservationReceipt,
   validatePassingQualificationReceipt,
   validateSourceBoundBaseline,
@@ -489,12 +494,17 @@ export function validatePassingQualificationReceiptV3({
       validTimestamp(verifiedAt) &&
       Date.parse(value.recorded_at) >= Date.parse(notBefore) &&
       Date.parse(value.recorded_at) <= Date.parse(value.completed_at) &&
-      Date.parse(value.completed_at) <= Date.parse(verifiedAt),
+      Date.parse(value.completed_at) <= Date.parse(verifiedAt) &&
+      Date.parse(value.completed_at) - Date.parse(value.recorded_at) <=
+        value.time_budget_seconds * 1000,
     "receipt is not a fresh monotonic invocation",
   );
-  expect(
-    validHost(value.environment),
-    "environment fields are not exact and non-empty",
+  validateQualificationEnvironment(
+    value.environment,
+    receiptPath,
+    errors,
+    "v3",
+    true,
   );
   expect(
     expectedProfile === "observe"
@@ -554,9 +564,14 @@ export function validatePassingQualificationReceiptV3({
       provenance.lockfiles.every(validFileIdentity),
     "file provenance is malformed",
   );
+  validateQualificationToolchain(
+    provenance?.toolchain,
+    receiptPath,
+    errors,
+    "v3",
+  );
   expect(
-    validToolchain(provenance?.toolchain) &&
-      provenance?.measurement_contract_encoding === "json-stringify-utf8" &&
+    provenance?.measurement_contract_encoding === "json-stringify-utf8" &&
       provenance?.measurement_contract_sha256 ===
         crypto
           .createHash("sha256")
@@ -602,22 +617,21 @@ export function validatePassingQualificationReceiptV3({
   );
 
   const limits = value.declared_limits;
-  expect(
-    isObject(limits) &&
-      limits.qualification_stage === "all" &&
-      isDeepStrictEqual(
-        limits.resource_counts,
-        profilePolicy?.resource_counts,
-      ) &&
-      isDeepStrictEqual(limits.resource_modes, ["idle", "active"]) &&
-      limits.resource_start_concurrency ===
-        gc.contract.bounded_churn.concurrency &&
-      limits.soak_seconds === profilePolicy?.soak_seconds &&
-      limits.global_run_quota === gc.contract.bounded_churn.run_ceiling &&
-      limits.exited_run_gc === "exact_terminal_replacement",
-    "declared workload does not match the canonical profile/GC contract",
+  validateQualificationWorkload(
+    limits,
+    receiptPath,
+    errors,
+    {
+      global_run_quota: gc.contract.bounded_churn.run_ceiling,
+      exited_run_gc: "exact_terminal_replacement",
+      qualification_stage: "all",
+      resource_counts: profilePolicy?.resource_counts,
+      soak_seconds: profilePolicy?.soak_seconds,
+      resource_start_concurrency: gc.contract.bounded_churn.concurrency,
+      seed_controls: qualificationPolicy?.seed_controls,
+    },
+    "v3",
   );
-
   const expectedStages = [
     ...V3_BASE_STAGE_IDS,
     ...(expectedProfile === "nightly" || expectedProfile === "release"
@@ -650,6 +664,13 @@ export function validatePassingQualificationReceiptV3({
     "stages are incomplete, out of order, or not passing",
   );
   validateV3Trace(value, expectedStages, provenance, preflight, expect);
+  validateQualificationChronology(
+    value,
+    receiptPath,
+    expectedStages,
+    errors,
+    "v3",
+  );
   validateV3ResourceStage(
     value.stages?.find((stage) => stage?.id === "resource-census")?.result,
     profilePolicy?.resource_counts,
@@ -658,12 +679,16 @@ export function validatePassingQualificationReceiptV3({
   );
   validateV3Soak(value, expectedProfile, profilePolicy?.soak_seconds, expect);
   if (expectedStages.includes("retained-state-plateau")) {
-    validateV3GcStage(
-      value.stages.find((stage) => stage?.id === "retained-state-plateau")
-        ?.result,
-      gc.contract,
-      expect,
+    const retainedStage = value.stages.find(
+      ({ id }) => id === "retained-state-plateau",
     );
+    expect(
+      Date.parse(retainedStage?.completed_at) -
+        Date.parse(retainedStage?.started_at) <=
+        gc.contract.replay_pressure.time_budgets_seconds.total * 1000,
+      "retained-state stage exceeded its total time budget",
+    );
+    validateV3GcStage(retainedStage?.result, gc.contract, expect);
   }
   return errors;
 }
@@ -767,24 +792,6 @@ function validateV3Trace(value, expectedStages, provenance, preflight, expect) {
       reverified[0] > indexes("stage.pass").at(-1),
     "action trace does not fence the invocation and canonical stages",
   );
-  const timestamps = trace.map(({ timestamp }) => Date.parse(timestamp));
-  expect(
-    timestamps.every(
-      (timestamp, index) =>
-        timestamp >= Date.parse(value.recorded_at) &&
-        timestamp <= Date.parse(value.completed_at) &&
-        (index === 0 || timestamp >= timestamps[index - 1]),
-    ),
-    "action trace chronology is not monotonic inside the receipt",
-  );
-  expect(
-    value.stages.every(
-      (stage) =>
-        Date.parse(stage.started_at) >= Date.parse(value.recorded_at) &&
-        Date.parse(stage.completed_at) <= Date.parse(value.completed_at),
-    ),
-    "stage chronology escapes the receipt interval",
-  );
   if (expectedStages.includes("retained-state-plateau")) {
     const turnovers = trace.filter(({ action }) => action === "gc.turnover");
     const pressure = trace.filter(
@@ -809,65 +816,25 @@ function validateV3Trace(value, expectedStages, provenance, preflight, expect) {
 }
 
 function validateV3ResourceStage(cells, expectedCounts, budgets, expect) {
-  const expected = ["idle", "active"].flatMap((mode) =>
-    (expectedCounts ?? []).map((count) => `${mode}/${String(count)}`),
+  const structuralErrors = [];
+  validateQualificationResourceCells(
+    cells,
+    "current qualification receipt",
+    structuralErrors,
+    expectedCounts ?? [],
+    "v3",
+    true,
   );
   expect(
-    Array.isArray(cells) &&
-      cells.length === expected.length &&
-      isDeepStrictEqual(
-        cells.map((cell) => `${cell?.mode}/${String(cell?.runs)}`).sort(),
-        expected.sort(),
-      ) &&
+    structuralErrors.length === 0 &&
+      Array.isArray(cells) &&
       cells.every((cell) => validV3ResourceCell(cell, expectedCounts, budgets)),
     "resource census does not cover the canonical cells, derived values, and frozen budgets",
   );
 }
 
 function validV3ResourceCell(cell, expectedCounts, budgets) {
-  const fields =
-    "mode runs baseline steady cleanup peak_rss_kib peak_rss_sample_count peak_rss_sample_interval_ms cpu_core_percent retained_output_bytes retained_output_bytes_per_run rss_kib_per_run threads_per_run fds_per_run cleanup_rss_kib_delta cleanup_fds_delta cleanup_retained_runs cleanup_live_children cleanup_attachments intentional_retained_state_without_gc".split(
-      " ",
-    );
-  if (
-    !isObject(cell) ||
-    !sameMembers(Object.keys(cell), fields) ||
-    !["idle", "active"].includes(cell.mode) ||
-    !(expectedCounts ?? []).includes(cell.runs) ||
-    ![cell.baseline, cell.steady, cell.cleanup].every(validProcessSample) ||
-    !Number.isSafeInteger(cell.peak_rss_sample_count) ||
-    cell.peak_rss_sample_count <= 0 ||
-    cell.peak_rss_sample_interval_ms !== 25 ||
-    cell.intentional_retained_state_without_gc !== true
-  ) {
-    return false;
-  }
-  const numericFields =
-    "peak_rss_kib cpu_core_percent retained_output_bytes retained_output_bytes_per_run rss_kib_per_run threads_per_run fds_per_run cleanup_rss_kib_delta cleanup_fds_delta cleanup_retained_runs cleanup_live_children cleanup_attachments".split(
-      " ",
-    );
-  if (!numericFields.every((field) => finiteNonNegative(cell[field]))) {
-    return false;
-  }
-  const divide = (value) => Math.round((value / cell.runs) * 1000) / 1000;
-  const derived = {
-    retained_output_bytes_per_run: divide(cell.retained_output_bytes),
-    rss_kib_per_run: divide(
-      Math.max(0, cell.steady.rss_kib - cell.baseline.rss_kib),
-    ),
-    threads_per_run: divide(
-      Math.max(0, cell.steady.threads - cell.baseline.threads),
-    ),
-    fds_per_run: divide(Math.max(0, cell.steady.fds - cell.baseline.fds)),
-    cleanup_live_children: cell.cleanup.descendants.length,
-  };
-  if (
-    !Object.entries(derived).every(
-      ([field, expected]) => cell[field] === expected,
-    )
-  ) {
-    return false;
-  }
+  if (!(expectedCounts ?? []).includes(cell.runs)) return false;
   const budget = budgets?.budgets?.[cell.mode]?.[String(cell.runs)];
   return (
     isObject(budget) &&
@@ -891,19 +858,23 @@ const GC_TUPLE_FIELDS =
     " ",
   );
 const GC_CHUNK_FIELDS = "seq bytes sha256".split(" ");
-const GC_TUPLE_EVIDENCE_FIELDS =
-  "count total_replay_bytes sha256 tuples".split(" ");
+const GC_TUPLE_EVIDENCE_FIELDS = "count total_replay_bytes sha256 tuples".split(
+  " ",
+);
 const CANONICAL_UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 function validateGcTupleEvidence(evidence, expected) {
   try {
-    const exactIndices = expected.firstIndex === undefined ? null : new Set(
-      Array.from(
-        { length: expected.count },
-        (_, offset) => expected.firstIndex + offset,
-      ),
-    );
+    const exactIndices =
+      expected.firstIndex === undefined
+        ? null
+        : new Set(
+            Array.from(
+              { length: expected.count },
+              (_, offset) => expected.firstIndex + offset,
+            ),
+          );
     const runIds = new Set();
     const operationKeys = new Set();
     const observedIndices = new Set();
@@ -926,8 +897,16 @@ function validateGcTupleEvidence(evidence, expected) {
           .createHash("sha256")
           .update(JSON.stringify(evidence.tuples))
           .digest("hex") &&
+      evidence.tuples.every(
+        (tuple, index) =>
+          index === 0 ||
+          evidence.tuples[index - 1].run_id.localeCompare(tuple.run_id) < 0,
+      ) &&
       evidence.tuples.every((tuple) => {
-        if (!isObject(tuple) || !sameMembers(Object.keys(tuple), GC_TUPLE_FIELDS))
+        if (
+          !isObject(tuple) ||
+          !sameMembers(Object.keys(tuple), GC_TUPLE_FIELDS)
+        )
           return false;
         const marker = /^gc-pressure:([^:]+):(\d+):([0-9a-f]{64})$/u.exec(
           tuple.operation_key,
@@ -988,15 +967,13 @@ function validateGcTupleEvidence(evidence, expected) {
             !Number.isSafeInteger(chunk.bytes) ||
             chunk.bytes <= 0 ||
             chunk.bytes > tuple.replay_bytes - replayBytes ||
+            (expected.maxChunkBytes !== undefined &&
+              chunk.bytes > expected.maxChunkBytes) ||
             !HASH_PATTERN.test(chunk.sha256 ?? "") ||
             (chunkIndex > 0 &&
               chunk.seq !== tuple.chunks[chunkIndex - 1].seq + 1) ||
             chunk.sha256 !==
-              repeatedDigestSliceSha256(
-                sourceDigest,
-                replayOffset,
-                chunk.bytes,
-              )
+              repeatedDigestSliceSha256(sourceDigest, replayOffset, chunk.bytes)
           )
             return false;
           replayOffset += chunk.bytes;
@@ -1012,7 +989,9 @@ function validateGcTupleEvidence(evidence, expected) {
             ) &&
           (!expected.exactReplay ||
             (tuple.replay_bytes === expected.payloadBytes &&
-              tuple.truncated === false)) &&
+              tuple.truncated === false &&
+              tuple.oldest_seq === 1 &&
+              tuple.head_seq === tuple.chunks.length)) &&
           recoveredTupleMatchesLive(tuple, liveByRun)
         );
       }) &&
@@ -1057,6 +1036,9 @@ const GC_REPLAY_DIGEST_CACHE = new Map();
 function recoveredTupleMatchesLive(tuple, liveByRun) {
   if (liveByRun.size === 0) return true;
   const live = liveByRun.get(tuple.run_id);
+  const liveSuffix = live?.chunks.filter(
+    (chunk) => chunk.seq >= tuple.oldest_seq,
+  );
   return (
     live !== undefined &&
     tuple.operation_key === live.operation_key &&
@@ -1065,58 +1047,73 @@ function recoveredTupleMatchesLive(tuple, liveByRun) {
     tuple.head_seq === live.head_seq &&
     tuple.durable_head_seq === live.durable_head_seq &&
     tuple.oldest_seq >= live.oldest_seq &&
-    (tuple.oldest_seq === live.oldest_seq || tuple.truncated === true)
+    tuple.truncated ===
+      (live.truncated || tuple.oldest_seq > live.oldest_seq) &&
+    isDeepStrictEqual(tuple.chunks, liveSuffix)
   );
 }
 
-function validProcessSample(value) {
+function exactGcReplayTransition(
+  before,
+  after,
+  firstReplacement,
+  lastReplacement,
+) {
+  if (!Array.isArray(before?.tuples) || !Array.isArray(after?.tuples)) {
+    return false;
+  }
+  const beforeByKey = new Map(
+    before.tuples.map((tuple) => [tuple.operation_key, tuple]),
+  );
+  const afterByKey = new Map(
+    after.tuples.map((tuple) => [tuple.operation_key, tuple]),
+  );
+  const replacementIndices = new Set(
+    Array.from(
+      { length: lastReplacement - firstReplacement + 1 },
+      (_, offset) => firstReplacement + offset,
+    ),
+  );
+  const afterReplacementIndices = new Set(
+    after.tuples.flatMap((tuple) => {
+      const match = /^gc-pressure:[^:]+:(\d+):/u.exec(tuple.operation_key);
+      const index = Number(match?.[1]);
+      return replacementIndices.has(index) ? [index] : [];
+    }),
+  );
+  const sharedKeys = [...beforeByKey.keys()].filter((key) =>
+    afterByKey.has(key),
+  );
+  const beforeRunIds = new Set(before.tuples.map(({ run_id }) => run_id));
   return (
-    isObject(value) &&
-    sameMembers(Object.keys(value), [
-      "rss_kib",
-      "cpu_seconds",
-      "threads",
-      "fds",
-      "descendants",
-    ]) &&
-    ["rss_kib", "cpu_seconds", "threads", "fds"].every((field) =>
-      finiteNonNegative(value[field]),
+    afterReplacementIndices.size === replacementIndices.size &&
+    [...replacementIndices].every((index) =>
+      afterReplacementIndices.has(index),
     ) &&
-    Number.isSafeInteger(value.threads) &&
-    Number.isSafeInteger(value.fds) &&
-    Array.isArray(value.descendants)
-  );
-}
-
-function validHost(value) {
-  return (
-    isObject(value) &&
-    sameMembers(Object.keys(value), [
-      "os",
-      "os_release",
-      "architecture",
-      "logical_cpus",
-      "cpu_model",
-    ]) &&
-    ["os", "os_release", "architecture", "cpu_model"].every(
-      (field) => typeof value[field] === "string" && value[field].trim() !== "",
+    sharedKeys.length === before.tuples.length - replacementIndices.size &&
+    sharedKeys.every((key) =>
+      isDeepStrictEqual(beforeByKey.get(key), afterByKey.get(key)),
     ) &&
-    Number.isSafeInteger(value.logical_cpus) &&
-    value.logical_cpus > 0
+    after.tuples
+      .filter(({ operation_key }) => !beforeByKey.has(operation_key))
+      .every(({ run_id }) => !beforeRunIds.has(run_id))
   );
 }
 
-function validToolchain(value) {
+function boundedGcRunIdsAreUnique(mode) {
+  const batches = [
+    mode?.fill,
+    ...(mode?.turnovers ?? []).map(({ replay }) => replay),
+  ];
+  const runIds = batches.flatMap((evidence) =>
+    Array.isArray(evidence?.tuples)
+      ? evidence.tuples.map(({ run_id }) => run_id)
+      : [],
+  );
   return (
-    isObject(value) &&
-    sameMembers(Object.keys(value), [
-      "rustc_version_verbose",
-      "cargo_version",
-      "node_version",
-    ]) &&
-    Object.values(value).every(
-      (field) => typeof field === "string" && field.trim() !== "",
-    )
+    runIds.length ===
+      batches.reduce((count, evidence) => count + (evidence?.count ?? 0), 0) &&
+    new Set(runIds).size === runIds.length
   );
 }
 
@@ -1152,28 +1149,26 @@ function validateV3GcStage(result, contract, expect) {
           contract.bounded_churn.successful_lifecycles_per_mode &&
         mode.fill_physical_start_delta ===
           contract.bounded_churn.physical_start_deltas.fill &&
-        validateGcTupleEvidence(
-          mode.retained,
-          {
-            payloadBytes,
-            exactReplay: true,
-            seed: contract.seed,
-            mode: mode.mode,
-            count: contract.bounded_churn.run_ceiling,
-            totalReplayBytes:
-              contract.bounded_churn.run_ceiling * payloadBytes,
-            firstIndex:
-              contract.bounded_churn.successful_lifecycles_per_mode -
-              contract.bounded_churn.run_ceiling,
-            minimumIndex: 0,
-            maximumIndex:
-              contract.bounded_churn.successful_lifecycles_per_mode - 1,
-          },
-        ) &&
+        boundedGcRunIdsAreUnique(mode) &&
+        validateGcTupleEvidence(mode.fill, {
+          payloadBytes,
+          exactReplay: true,
+          seed: contract.seed,
+          mode: mode.mode,
+          count: contract.bounded_churn.run_ceiling,
+          totalReplayBytes: contract.bounded_churn.run_ceiling * payloadBytes,
+          firstIndex: 0,
+          minimumIndex: 0,
+          maximumIndex:
+            contract.bounded_churn.successful_lifecycles_per_mode - 1,
+        }) &&
         Array.isArray(mode.turnovers) &&
         mode.turnovers.length === contract.bounded_churn.turnover_windows &&
-        mode.turnovers.every(
-          (window, index) =>
+        mode.turnovers.every((window, index) => {
+          const firstIndex =
+            contract.bounded_churn.fill_runs +
+            index * contract.bounded_churn.replacements_per_window;
+          return (
             window.window === index + 1 &&
             window.retained_runs === contract.bounded_churn.run_ceiling &&
             window.physical_start_delta ===
@@ -1189,32 +1184,48 @@ function validateV3GcStage(result, contract, expect) {
             window.candidate_fences_delta ===
               contract.bounded_churn.replacements_per_window &&
             window.exact_replacements_delta ===
-              contract.bounded_churn.replacements_per_window,
-        ) &&
+              contract.bounded_churn.replacements_per_window &&
+            validateGcTupleEvidence(window.replay, {
+              payloadBytes,
+              exactReplay: true,
+              seed: contract.seed,
+              mode: mode.mode,
+              count: contract.bounded_churn.run_ceiling,
+              totalReplayBytes:
+                contract.bounded_churn.run_ceiling * payloadBytes,
+              firstIndex,
+              minimumIndex: 0,
+              maximumIndex:
+                contract.bounded_churn.successful_lifecycles_per_mode - 1,
+            })
+          );
+        }) &&
         (persistent
           ? mode.restart?.after_window ===
               contract.bounded_churn.persistent_restart_after_window &&
-            isDeepStrictEqual(mode.restart.before, mode.restart.after) &&
-            validateGcTupleEvidence(
+            isDeepStrictEqual(
               mode.restart.before,
-              {
-                payloadBytes,
-                exactReplay: true,
-                seed: contract.seed,
-                mode: mode.mode,
-                count: contract.bounded_churn.run_ceiling,
-                totalReplayBytes:
-                  contract.bounded_churn.run_ceiling * payloadBytes,
-                firstIndex:
-                  contract.bounded_churn.fill_runs +
-                  (contract.bounded_churn.persistent_restart_after_window -
-                    1) *
-                    contract.bounded_churn.replacements_per_window,
-                minimumIndex: 0,
-                maximumIndex:
-                  contract.bounded_churn.successful_lifecycles_per_mode - 1,
-              },
+              mode.turnovers[
+                contract.bounded_churn.persistent_restart_after_window - 1
+              ]?.replay,
             ) &&
+            isDeepStrictEqual(mode.restart.before, mode.restart.after) &&
+            validateGcTupleEvidence(mode.restart.before, {
+              payloadBytes,
+              exactReplay: true,
+              seed: contract.seed,
+              mode: mode.mode,
+              count: contract.bounded_churn.run_ceiling,
+              totalReplayBytes:
+                contract.bounded_churn.run_ceiling * payloadBytes,
+              firstIndex:
+                contract.bounded_churn.fill_runs +
+                (contract.bounded_churn.persistent_restart_after_window - 1) *
+                  contract.bounded_churn.replacements_per_window,
+              minimumIndex: 0,
+              maximumIndex:
+                contract.bounded_churn.successful_lifecycles_per_mode - 1,
+            }) &&
             mode.restart.new_incarnation_initial_physical_starts ===
               contract.bounded_churn.physical_start_deltas
                 .new_daemon_incarnation_initial
@@ -1231,49 +1242,55 @@ function validateV3GcStage(result, contract, expect) {
       ["memory_replay_pressure", "persistent_replay_pressure"].includes(
         mode?.mode,
       ) &&
-        validateGcTupleEvidence(
-          mode.before,
-          {
-            payloadBytes,
-            exactReplay: true,
-            seed: contract.seed,
-            mode: mode.mode,
-            count:
-              contract.replay_pressure
-                .public_replay_verification_runs_before_replacement,
-            totalReplayBytes:
-              contract.replay_pressure.live_retained_payload_bytes,
-            firstIndex: contract.replay_pressure.fill_indices.first,
-            minimumIndex: contract.replay_pressure.fill_indices.first,
-            maximumIndex: contract.replay_pressure.fill_indices.last,
-          },
-        ) &&
+        validateGcTupleEvidence(mode.before, {
+          payloadBytes,
+          exactReplay: true,
+          seed: contract.seed,
+          mode: mode.mode,
+          count:
+            contract.replay_pressure
+              .public_replay_verification_runs_before_replacement,
+          totalReplayBytes:
+            contract.replay_pressure.live_retained_payload_bytes,
+          firstIndex: contract.replay_pressure.fill_indices.first,
+          minimumIndex: contract.replay_pressure.fill_indices.first,
+          maximumIndex: contract.replay_pressure.fill_indices.last,
+          maxChunkBytes: persistent
+            ? contract.replay_pressure.persistent_native_chunk_max_bytes
+            : undefined,
+        }) &&
         mode.before?.count ===
           contract.replay_pressure
             .public_replay_verification_runs_before_replacement &&
         mode.before?.total_replay_bytes ===
           contract.replay_pressure.live_retained_payload_bytes &&
-        validateGcTupleEvidence(
-          mode.after,
-          {
-            payloadBytes,
-            exactReplay: true,
-            seed: contract.seed,
-            mode: mode.mode,
-            count:
-              contract.replay_pressure
-                .public_replay_verification_runs_after_replacement,
-            totalReplayBytes:
-              contract.replay_pressure.live_retained_payload_bytes,
-            minimumIndex: contract.replay_pressure.fill_indices.first,
-            maximumIndex: contract.replay_pressure.replacement_indices.last,
-          },
-        ) &&
+        validateGcTupleEvidence(mode.after, {
+          payloadBytes,
+          exactReplay: true,
+          seed: contract.seed,
+          mode: mode.mode,
+          count:
+            contract.replay_pressure
+              .public_replay_verification_runs_after_replacement,
+          totalReplayBytes:
+            contract.replay_pressure.live_retained_payload_bytes,
+          minimumIndex: contract.replay_pressure.fill_indices.first,
+          maximumIndex: contract.replay_pressure.replacement_indices.last,
+          maxChunkBytes: persistent
+            ? contract.replay_pressure.persistent_native_chunk_max_bytes
+            : undefined,
+        }) &&
         mode.after?.count ===
           contract.replay_pressure
             .public_replay_verification_runs_after_replacement &&
         mode.after?.total_replay_bytes ===
           contract.replay_pressure.live_retained_payload_bytes &&
+        exactGcReplayTransition(
+          mode.before,
+          mode.after,
+          contract.replay_pressure.replacement_indices.first,
+          contract.replay_pressure.replacement_indices.last,
+        ) &&
         mode.fill_physical_start_delta ===
           contract.replay_pressure.owner_budgets.physical_starts_fill_delta &&
         mode.replacement_physical_start_delta ===
@@ -1308,22 +1325,20 @@ function validateV3GcStage(result, contract, expect) {
           ? mode.recovered?.replay?.count ===
               contract.replay_pressure
                 .require_exact_retained_run_and_key_count &&
-            validateGcTupleEvidence(
-              mode.recovered.replay,
-              {
-                payloadBytes,
-                exactReplay: false,
-                seed: contract.seed,
-                mode: mode.mode,
-                count:
-                  contract.replay_pressure
-                    .require_exact_retained_run_and_key_count,
-                minimumIndex: contract.replay_pressure.fill_indices.first,
-                maximumIndex:
-                  contract.replay_pressure.replacement_indices.last,
-                live: mode.after,
-              },
-            ) &&
+            validateGcTupleEvidence(mode.recovered.replay, {
+              payloadBytes,
+              exactReplay: false,
+              seed: contract.seed,
+              mode: mode.mode,
+              count:
+                contract.replay_pressure
+                  .require_exact_retained_run_and_key_count,
+              minimumIndex: contract.replay_pressure.fill_indices.first,
+              maximumIndex: contract.replay_pressure.replacement_indices.last,
+              live: mode.after,
+              maxChunkBytes:
+                contract.replay_pressure.persistent_native_chunk_max_bytes,
+            }) &&
             mode.recovered.replay.total_replay_bytes >=
               contract.replay_pressure.persistent_recovered_replay_min_bytes &&
             mode.recovered.replay.total_replay_bytes <=

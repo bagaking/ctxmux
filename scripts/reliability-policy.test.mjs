@@ -480,15 +480,10 @@ function passingNightlyV3ReceiptFixture() {
         .update(`226004:${mode}:${String(index)}`, "utf8")
         .digest("hex");
       const operationKey = `gc-pressure:${mode}:${String(index)}:${sourceDigest}`;
-      const suffixOffset =
-        (payloadBytes - replayBytes) % sourceDigest.length;
+      const suffixOffset = (payloadBytes - replayBytes) % sourceDigest.length;
       const suffix = Buffer.from(
         sourceDigest
-          .repeat(
-            Math.ceil(
-              (suffixOffset + replayBytes) / sourceDigest.length,
-            ),
-          )
+          .repeat(Math.ceil((suffixOffset + replayBytes) / sourceDigest.length))
           .slice(suffixOffset, suffixOffset + replayBytes),
         "ascii",
       );
@@ -519,35 +514,29 @@ function passingNightlyV3ReceiptFixture() {
           )
           .digest("hex"),
       });
-      const firstChunkBytes = Math.floor(replayBytes / 2);
+      const maxChunkBytes =
+        mode === "persistent_replay_pressure" ? 8192 : replayBytes;
+      const chunkCount = Math.ceil(replayBytes / maxChunkBytes);
+      const fullChunkCount = Math.ceil(payloadBytes / maxChunkBytes);
+      const firstSeq = recovered ? fullChunkCount - chunkCount + 1 : 1;
+      let chunkOffset = payloadBytes - replayBytes;
+      const chunks = Array.from({ length: chunkCount }, (_, chunkIndex) => {
+        const bytes = Math.min(maxChunkBytes, payloadBytes - chunkOffset);
+        const chunk = chunkIdentity(firstSeq + chunkIndex, chunkOffset, bytes);
+        chunkOffset += bytes;
+        return chunk;
+      });
       return {
         run_id: `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
         operation_key: operationKey,
         lineage: null,
         state: { type: "exited", code: 0, signal: null },
-        head_seq: 2,
-        durable_head_seq: mode.startsWith("persistent")
-          ? 2
-          : null,
-        oldest_seq: recovered ? 2 : 1,
+        head_seq: fullChunkCount,
+        durable_head_seq: mode.startsWith("persistent") ? fullChunkCount : null,
+        oldest_seq: firstSeq,
         replay_bytes: replayBytes,
         replay_sha256: replaySha256,
-        chunks: recovered
-          ? [
-              chunkIdentity(
-                2,
-                payloadBytes - replayBytes,
-                replayBytes,
-              ),
-            ]
-          : [
-              chunkIdentity(1, 0, firstChunkBytes),
-              chunkIdentity(
-                2,
-                firstChunkBytes,
-                replayBytes - firstChunkBytes,
-              ),
-            ],
+        chunks,
         truncated: recovered,
       };
     });
@@ -575,7 +564,11 @@ function passingNightlyV3ReceiptFixture() {
     mode,
     successful_lifecycles: 512,
     fill_physical_start_delta: 128,
-    turnovers: structuredClone(turnovers),
+    fill: digest(mode, 4096),
+    turnovers: turnovers.map((turnover, turnoverIndex) => ({
+      ...turnover,
+      replay: digest(mode, 4096, 128 * 4096, false, 128 * (turnoverIndex + 1)),
+    })),
     restart:
       mode === "persistent"
         ? {
@@ -585,7 +578,6 @@ function passingNightlyV3ReceiptFixture() {
             new_incarnation_initial_physical_starts: 0,
           }
         : null,
-    retained: digest(mode, 4096, 128 * 4096, false, 384),
     epochs: mode === "persistent" ? [epoch("1"), epoch("2")] : [epoch("3")],
   }));
   const rssSamples = [
@@ -612,7 +604,7 @@ function passingNightlyV3ReceiptFixture() {
       recovered:
         mode === "persistent_replay_pressure"
           ? {
-              replay: digest(mode, 4_194_304, 268_427_265, true, 8),
+              replay: digest(mode, 4_194_304, 268_435_456, true, 8),
               retry_physical_start_delta: 0,
               steady_rss_kib: 1,
               peak_rss_kib: 1,
@@ -1039,6 +1031,10 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       (value) => (value.provenance.workload_contract.sha256 = "f".repeat(64)),
     ],
     [
+      "declared workload envelope",
+      (value) => (value.declared_limits.frame_bytes += 1),
+    ],
+    [
       "GC stage",
       (value) =>
         value.stages
@@ -1101,6 +1097,25 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       },
     ],
     [
+      "retained-state total time budget",
+      (value) => {
+        const stage = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        );
+        stage.started_at = "2026-08-11T00:00:04.000Z";
+      },
+    ],
+    [
+      "retained-state timestamps detached from trace fence",
+      (value) => {
+        const stage = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        );
+        stage.started_at = "2026-08-11T00:19:04.000Z";
+        stage.completed_at = "2026-08-11T00:20:04.000Z";
+      },
+    ],
+    [
       "turnover transition counter",
       (value) => {
         value.stages.find(
@@ -1121,7 +1136,17 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       (value) => {
         const evidence = value.stages.find(
           ({ id }) => id === "retained-state-plateau",
-        ).result.bounded_churn[0].retained;
+        ).result.bounded_churn[0].fill;
+        evidence.tuples[0].replay_sha256 = "f".repeat(64);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "turnover replay digest",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].turnovers[0].replay;
         evidence.tuples[0].replay_sha256 = "f".repeat(64);
         rehashTupleEvidence(evidence);
       },
@@ -1131,7 +1156,7 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       (value) => {
         const evidence = value.stages.find(
           ({ id }) => id === "retained-state-plateau",
-        ).result.bounded_churn[0].retained;
+        ).result.bounded_churn[0].fill;
         evidence.tuples.pop();
         rehashTupleEvidence(evidence);
       },
@@ -1141,8 +1166,35 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       (value) => {
         const evidence = value.stages.find(
           ({ id }) => id === "retained-state-plateau",
-        ).result.bounded_churn[0].retained;
+        ).result.bounded_churn[0].fill;
         evidence.tuples[1] = structuredClone(evidence.tuples[0]);
+        rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "bounded Run identity reused across lifecycle batches",
+      (value) => {
+        const mode = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0];
+        for (const turnover of mode.turnovers) {
+          for (const [index, tuple] of turnover.replay.tuples.entries()) {
+            tuple.run_id = mode.fill.tuples[index].run_id;
+          }
+          rehashTupleEvidence(turnover.replay);
+        }
+      },
+    ],
+    [
+      "bounded live cursor origin with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.bounded_churn[0].fill;
+        const tuple = evidence.tuples[0];
+        tuple.oldest_seq += 100;
+        tuple.head_seq += 100;
+        for (const chunk of tuple.chunks) chunk.seq += 100;
         rehashTupleEvidence(evidence);
       },
     ],
@@ -1162,7 +1214,7 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
         const evidence = value.stages.find(
           ({ id }) => id === "retained-state-plateau",
         ).result.replay_pressure[0].after;
-        evidence.tuples[0].chunks[1].seq += 1;
+        evidence.tuples[0].chunks[0].seq += 1;
         rehashTupleEvidence(evidence);
       },
     ],
@@ -1172,6 +1224,28 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
         value.stages.find(
           ({ id }) => id === "retained-state-plateau",
         ).result.replay_pressure[0].after.sha256 = "f".repeat(64);
+      },
+    ],
+    [
+      "pressure replacement omitted with copied replay",
+      (value) => {
+        const mode = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0];
+        mode.after = structuredClone(mode.before);
+      },
+    ],
+    [
+      "pressure tuple order with rehashed envelope",
+      (value) => {
+        const evidence = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[0].after;
+        [evidence.tuples[0], evidence.tuples[1]] = [
+          evidence.tuples[1],
+          evidence.tuples[0],
+        ];
+        rehashTupleEvidence(evidence);
       },
     ],
     [
@@ -1194,6 +1268,93 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
         evidence.tuples[0].run_id = evidence.tuples[1].run_id;
         evidence.tuples[1].run_id = first;
         rehashTupleEvidence(evidence);
+      },
+    ],
+    [
+      "coordinated live and recovered oversized rechunk",
+      (value) => {
+        const mode = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1];
+        const live = mode.after;
+        const recovered = mode.recovered.replay;
+        const setReplay = (tuple, replayBytes, chunkBytes) => {
+          const source = tuple.operation_key.slice(-64);
+          const digestSlice = (offset, bytes) =>
+            Buffer.from(
+              source
+                .repeat(Math.ceil(((offset % 64) + bytes) / 64))
+                .slice(offset % 64, (offset % 64) + bytes),
+              "ascii",
+            );
+          let offset = 4_194_304 - replayBytes;
+          tuple.oldest_seq = 3 - chunkBytes.length;
+          tuple.replay_bytes = replayBytes;
+          tuple.replay_sha256 = crypto
+            .createHash("sha256")
+            .update(digestSlice(offset, replayBytes))
+            .digest("hex");
+          tuple.chunks = chunkBytes.map((bytes, index) => {
+            const chunk = {
+              seq: tuple.oldest_seq + index,
+              bytes,
+              sha256: crypto
+                .createHash("sha256")
+                .update(digestSlice(offset, bytes))
+                .digest("hex"),
+            };
+            offset += bytes;
+            return chunk;
+          });
+        };
+        const liveTuple = live.tuples.find(({ operation_key }) =>
+          operation_key.includes(":128:"),
+        );
+        const recoveredTuple = recovered.tuples.find(
+          ({ run_id }) => run_id === liveTuple.run_id,
+        );
+        setReplay(liveTuple, 4 * 1024 * 1024, [1024 * 1024, 3 * 1024 * 1024]);
+        setReplay(recoveredTuple, 3 * 1024 * 1024, [3 * 1024 * 1024]);
+        rehashTupleEvidence(live);
+        rehashTupleEvidence(recovered);
+      },
+    ],
+    [
+      "recovered false truncation without oldest movement",
+      (value) => {
+        const mode = value.stages.find(
+          ({ id }) => id === "retained-state-plateau",
+        ).result.replay_pressure[1];
+        const replay = mode.recovered.replay;
+        const live = mode.after.tuples[0];
+        const tuple = replay.tuples[0];
+        Object.assign(tuple, {
+          oldest_seq: live.oldest_seq,
+          replay_bytes: live.replay_bytes,
+          replay_sha256: live.replay_sha256,
+          chunks: structuredClone(live.chunks),
+          truncated: true,
+        });
+        for (const index of [1, 2]) {
+          const candidate = replay.tuples[index];
+          const source = candidate.operation_key.slice(-64);
+          const replayBytes = 1024 * 1024;
+          const offset = 4 * 1024 * 1024 - replayBytes;
+          candidate.chunks = candidate.chunks.slice(-replayBytes / 8192);
+          candidate.oldest_seq = candidate.chunks[0].seq;
+          candidate.replay_bytes = replayBytes;
+          candidate.replay_sha256 = crypto
+            .createHash("sha256")
+            .update(
+              source
+                .repeat(Math.ceil(((offset % 64) + replayBytes) / 64))
+                .slice(offset % 64, (offset % 64) + replayBytes),
+              "ascii",
+            )
+            .digest("hex");
+          candidate.truncated = true;
+        }
+        rehashTupleEvidence(replay);
       },
     ],
     [

@@ -464,6 +464,10 @@ async function qualify(options: QualificationOptions): Promise<void> {
     trace("stage.start", { id });
     try {
       const result = await run();
+      assert.ok(
+        Date.now() <= deadline,
+        `qualification time budget expired during ${id}`,
+      );
       receipt.stages.push({
         id,
         status: "pass",
@@ -541,6 +545,10 @@ async function qualify(options: QualificationOptions): Promise<void> {
       workload_contract: provenance.workload_contract,
       workload_helper: provenance.workload_helper,
     });
+    assert.ok(
+      Date.now() <= deadline,
+      "qualification time budget expired before completion",
+    );
     receipt.status = "pass";
   } catch (error) {
     receipt.status = "fail";
@@ -561,18 +569,43 @@ async function runRetainedStatePlateau(
     "nightly",
     "release",
   ]);
+  const retainedDeadline =
+    Date.now() +
+    options.gc.contract.replay_pressure.time_budgets_seconds.total * 1000;
   const boundedChurn = [];
-  for (const persistent of [false, true]) {
-    boundedChurn.push(
-      await runBoundedGcChurn(persistent, options, receipt, trace),
-    );
-  }
   const replayPressure = [];
   for (const persistent of [false, true]) {
+    const modeDeadline = Math.min(
+      retainedDeadline,
+      Date.now() +
+        options.gc.contract.replay_pressure.time_budgets_seconds[
+          persistent ? "persistent" : "memory_only"
+        ] *
+          1000,
+    );
+    boundedChurn.push(
+      await runBoundedGcChurn(
+        persistent,
+        options,
+        receipt,
+        trace,
+        modeDeadline,
+      ),
+    );
     replayPressure.push(
-      await runGcReplayPressure(persistent, options, receipt, trace),
+      await runGcReplayPressure(
+        persistent,
+        options,
+        receipt,
+        trace,
+        modeDeadline,
+      ),
     );
   }
+  assert.ok(
+    Date.now() <= retainedDeadline,
+    "retained-state plateau exceeded its total time budget",
+  );
   return { bounded_churn: boundedChurn, replay_pressure: replayPressure };
 }
 
@@ -581,6 +614,7 @@ async function runBoundedGcChurn(
   options: QualificationOptions,
   receipt: QualificationReceipt,
   trace: (action: string, detail?: Record<string, unknown>) => void,
+  phaseDeadline: number,
 ): Promise<unknown> {
   const contract = options.gc.contract.bounded_churn;
   const mode = persistent ? "persistent" : "memory_only";
@@ -593,12 +627,6 @@ async function runBoundedGcChurn(
   const epochs: Array<Record<string, unknown>> = [];
   const turnovers: Array<Record<string, unknown>> = [];
   let restart: Record<string, unknown> | null = null;
-  const phaseDeadline =
-    Date.now() +
-    options.gc.contract.replay_pressure.time_budgets_seconds[
-      persistent ? "persistent" : "memory_only"
-    ] *
-      1000;
   let retained: GcRunExpectation[] = [];
   let nextIndex = 0;
   try {
@@ -612,10 +640,9 @@ async function runBoundedGcChurn(
       contract.fill_runs,
       contract.concurrency,
     );
-    await verifyLiveGcRuns(
+    const fill = await strictLiveGcTupleDigest(
       daemon.client,
       retained,
-      options,
       contract.concurrency,
     );
     nextIndex += contract.fill_runs;
@@ -640,10 +667,9 @@ async function runBoundedGcChurn(
       );
       nextIndex += contract.replacements_per_window;
       retained = replacements;
-      await verifyLiveGcRuns(
+      const replay = await strictLiveGcTupleDigest(
         daemon.client,
         retained,
-        options,
         contract.concurrency,
       );
       await assertGcBoundary(daemon, retained, options);
@@ -697,6 +723,7 @@ async function runBoundedGcChurn(
         candidate_evaluations_delta: candidateEvaluationsDelta,
         candidate_fences_delta: candidateFencesDelta,
         exact_replacements_delta: exactReplacementsDelta,
+        replay,
       });
       trace("gc.turnover", {
         mode,
@@ -760,13 +787,9 @@ async function runBoundedGcChurn(
       mode,
       successful_lifecycles: nextIndex,
       fill_physical_start_delta: fillPhysicalStartDelta,
+      fill,
       turnovers,
       restart,
-      retained: await gcTupleDigest(
-        daemon.client,
-        retained,
-        contract.concurrency,
-      ),
       epochs,
     };
   } finally {
@@ -780,6 +803,7 @@ async function runGcReplayPressure(
   options: QualificationOptions,
   receipt: QualificationReceipt,
   trace: (action: string, detail?: Record<string, unknown>) => void,
+  phaseDeadline: number,
 ): Promise<unknown> {
   const contract = options.gc.contract.replay_pressure;
   const mode = persistent
@@ -799,10 +823,6 @@ async function runGcReplayPressure(
   const cpuStart = performance.now();
   let retained: GcRunExpectation[] = [];
   const epochs: Array<Record<string, unknown>> = [];
-  const phaseDeadline =
-    Date.now() +
-    contract.time_budgets_seconds[persistent ? "persistent" : "memory_only"] *
-      1000;
   try {
     const fillStart = (await daemon.synchronizedStats()).cumulative
       .physical_starts_total;
@@ -1054,27 +1074,6 @@ async function runGcReplayPressure(
   }
 }
 
-async function verifyLiveGcRuns(
-  client: CtxmuxClient,
-  retained: readonly GcRunExpectation[],
-  options: QualificationOptions,
-  concurrency: number,
-): Promise<void> {
-  const tuples = await mapLimit(retained, concurrency, async (expected) =>
-    gcTuple(client, expected),
-  );
-  for (let index = 0; index < tuples.length; index += 1) {
-    const tuple = tuples[index]!;
-    const expected = retained[index]!;
-    assert.equal(tuple.replay_bytes, expected.payload_bytes);
-    assert.equal(tuple.replay_sha256, expected.payload_sha256);
-    assert.equal(tuple.truncated, false);
-    if (expected.mode === "persistent") {
-      assert.equal(tuple.durable_head_seq, tuple.head_seq);
-    }
-  }
-}
-
 async function strictLiveGcTupleDigest(
   client: CtxmuxClient,
   retained: readonly GcRunExpectation[],
@@ -1093,8 +1092,16 @@ async function strictLiveGcTupleDigest(
     assert.equal(tuple.replay_bytes, expected.payload_bytes);
     assert.equal(tuple.replay_sha256, expected.payload_sha256);
     assert.equal(tuple.truncated, false);
-    if (expected.mode === "persistent_replay_pressure") {
+    assert.deepEqual(tuple.lineage, null);
+    assert.deepEqual(tuple.state, { type: "exited", code: 0, signal: null });
+    assert.equal(tuple.chunks[0]?.seq, tuple.oldest_seq);
+    assert.equal(tuple.chunks.at(-1)?.seq, tuple.head_seq);
+    assert.equal(tuple.oldest_seq, 1);
+    assert.equal(tuple.head_seq, tuple.chunks.length);
+    if (expected.mode.startsWith("persistent")) {
       assert.equal(tuple.durable_head_seq, tuple.head_seq);
+    } else {
+      assert.equal(tuple.durable_head_seq, null);
     }
   }
   return tupleSetDigest(sortedTuples(tuples.map(({ tuple }) => tuple)));
@@ -1228,24 +1235,6 @@ function tupleSetDigest(tuples: readonly GcRunTuple[]): {
     sha256: sha256(JSON.stringify(tuples)),
     tuples,
   };
-}
-
-async function gcTupleDigest(
-  client: CtxmuxClient,
-  retained: readonly GcRunExpectation[],
-  concurrency: number,
-): Promise<{
-  readonly count: number;
-  readonly total_replay_bytes: number;
-  readonly sha256: string;
-  readonly tuples: readonly GcRunTuple[];
-}> {
-  const tuples = sortedTuples(
-    await mapLimit(retained, concurrency, async (expected) =>
-      gcTuple(client, expected),
-    ),
-  );
-  return tupleSetDigest(tuples);
 }
 
 function epochReceipt(daemon: DaemonFixture): Record<string, unknown> {

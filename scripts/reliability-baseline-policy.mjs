@@ -319,8 +319,8 @@ function validateV2Receipt(
     [1, 2, 3].includes(value.observation_round),
     `v2 receipt has invalid observation round: ${receiptPath}`,
   );
-  validateHost(value.environment, receiptPath, errors);
-  validateWorkload(value.declared_limits, receiptPath, errors);
+  validateQualificationEnvironment(value.environment, receiptPath, errors);
+  validateQualificationWorkload(value.declared_limits, receiptPath, errors);
   validateProvenance(
     value.provenance,
     snapshot,
@@ -339,7 +339,12 @@ function validateV2Receipt(
     invocationNonce,
   );
   const measurements = validateStages(value.stages, receiptPath, errors);
-  validatePassingChronology(value, receiptPath, EXPECTED_STAGE_IDS, errors);
+  validateQualificationChronology(
+    value,
+    receiptPath,
+    EXPECTED_STAGE_IDS,
+    errors,
+  );
   return measurements;
 }
 
@@ -388,8 +393,8 @@ export function validatePassingQualificationReceipt({
       value.time_budget_seconds === profilePolicy?.time_budget_seconds,
     `v2 ${expectedProfile} receipt must use its canonical time budget without an observation round: ${receiptPath}`,
   );
-  validateHost(value.environment, receiptPath, errors);
-  validateWorkload(value.declared_limits, receiptPath, errors, {
+  validateQualificationEnvironment(value.environment, receiptPath, errors);
+  validateQualificationWorkload(value.declared_limits, receiptPath, errors, {
     resource_counts: profilePolicy?.resource_counts,
     soak_seconds: profilePolicy?.soak_seconds,
     resource_start_concurrency: qualificationPolicy?.resource_start_concurrency,
@@ -419,7 +424,7 @@ export function validatePassingQualificationReceipt({
     QUALIFICATION_STAGE_IDS,
     profilePolicy?.resource_counts,
   );
-  validatePassingChronology(
+  validateQualificationChronology(
     value,
     receiptPath,
     QUALIFICATION_STAGE_IDS,
@@ -564,11 +569,12 @@ function validateTrace(
   }
 }
 
-function validatePassingChronology(
+export function validateQualificationChronology(
   value,
   receiptPath,
   expectedStageIds,
   errors,
+  schemaLabel = "v2",
 ) {
   const receiptStart = Date.parse(value?.recorded_at);
   const receiptEnd = Date.parse(value?.completed_at);
@@ -598,7 +604,7 @@ function validatePassingChronology(
         timestamp <= receiptEnd &&
         (index === 0 || timestamp >= traceTimes[index - 1]),
     ),
-    `v2 action trace chronology must be monotonic inside the receipt interval: ${receiptPath}`,
+    `${schemaLabel} action trace chronology must be monotonic inside the receipt interval: ${receiptPath}`,
   );
 
   let previousStageCompletion = receiptStart;
@@ -636,16 +642,22 @@ function validatePassingChronology(
   expect(
     errors,
     stageChronologyIsValid,
-    `v2 stage chronology must stay inside the receipt interval and its trace fence: ${receiptPath}`,
+    `${schemaLabel} stage chronology must stay inside the receipt interval and its trace fence: ${receiptPath}`,
   );
 }
 
-function validateHost(environment, receiptPath, errors) {
+export function validateQualificationEnvironment(
+  environment,
+  receiptPath,
+  errors,
+  schemaLabel = "v2",
+  requireSafeIntegers = false,
+) {
   if (
     !exactObject(
       environment,
       ["os", "os_release", "architecture", "logical_cpus", "cpu_model"],
-      `v2 environment ${receiptPath}`,
+      `${schemaLabel} environment ${receiptPath}`,
       errors,
     )
   )
@@ -654,14 +666,45 @@ function validateHost(environment, receiptPath, errors) {
     errors,
     ["os", "os_release", "architecture", "cpu_model"].every((field) =>
       nonEmptyString(environment[field]),
-    ) && positiveInteger(environment.logical_cpus),
-    `v2 environment fields must be non-empty: ${receiptPath}`,
+    ) &&
+      positiveInteger(environment.logical_cpus) &&
+      (!requireSafeIntegers || Number.isSafeInteger(environment.logical_cpus)),
+    `${schemaLabel} environment fields must be non-empty: ${receiptPath}`,
   );
 }
 
-function validateWorkload(limits, receiptPath, errors, overrides = {}) {
+export function validateQualificationToolchain(
+  toolchain,
+  receiptPath,
+  errors,
+  schemaLabel = "v2",
+) {
+  expect(
+    errors,
+    exactObject(
+      toolchain,
+      ["rustc_version_verbose", "cargo_version", "node_version"],
+      `${schemaLabel} toolchain ${receiptPath}`,
+      errors,
+    ) && Object.values(toolchain).every(nonEmptyString),
+    `${schemaLabel} toolchain fields must be non-empty: ${receiptPath}`,
+  );
+}
+
+export function validateQualificationWorkload(
+  limits,
+  receiptPath,
+  errors,
+  overrides = {},
+  schemaLabel = "v2",
+) {
   if (
-    !exactObject(limits, WORKLOAD_FIELDS, `v2 workload ${receiptPath}`, errors)
+    !exactObject(
+      limits,
+      WORKLOAD_FIELDS,
+      `${schemaLabel} workload ${receiptPath}`,
+      errors,
+    )
   ) {
     return;
   }
@@ -686,7 +729,7 @@ function validateWorkload(limits, receiptPath, errors, overrides = {}) {
     Object.entries(expected).every(([field, value]) =>
       isDeepStrictEqual(limits[field], value),
     ) && nonEmptyString(limits.note),
-    `v2 workload is not the canonical qualification matrix: ${receiptPath}`,
+    `${schemaLabel} workload is not the canonical qualification matrix: ${receiptPath}`,
   );
 }
 
@@ -787,16 +830,7 @@ function validateProvenance(
     }),
     `v2 build must use the fixed locked source-bound daemon path: ${receiptPath}`,
   );
-  expect(
-    errors,
-    exactObject(
-      provenance.toolchain,
-      ["rustc_version_verbose", "cargo_version", "node_version"],
-      `v2 toolchain ${receiptPath}`,
-      errors,
-    ) && Object.values(provenance.toolchain).every(nonEmptyString),
-    `v2 toolchain fields must be non-empty: ${receiptPath}`,
-  );
+  validateQualificationToolchain(provenance.toolchain, receiptPath, errors);
   const contractHash = crypto
     .createHash("sha256")
     .update(JSON.stringify(budgets.measurement_contract))
@@ -940,7 +974,7 @@ function validateStages(
     (stage) => stage?.id === "resource-census",
   );
   return resourceStages.length === 1
-    ? validateResourceCells(
+    ? validateQualificationResourceCells(
         resourceStages[0].result,
         receiptPath,
         errors,
@@ -949,18 +983,20 @@ function validateStages(
     : undefined;
 }
 
-function validateResourceCells(
+export function validateQualificationResourceCells(
   cells,
   receiptPath,
   errors,
   expectedResourceCounts,
+  schemaLabel = "v2",
+  requireSafeIntegers = false,
 ) {
   const expectedLength = MODES.length * expectedResourceCounts.length;
   if (!Array.isArray(cells) || cells.length !== expectedLength) {
     errors.push(
       expectedLength === 6
-        ? `v2 resource census must contain exactly six cells: ${receiptPath}`
-        : `v2 resource census must contain exactly ${expectedLength} cells: ${receiptPath}`,
+        ? `${schemaLabel} resource census must contain exactly six cells: ${receiptPath}`
+        : `${schemaLabel} resource census must contain exactly ${expectedLength} cells: ${receiptPath}`,
     );
     return undefined;
   }
@@ -972,12 +1008,18 @@ function validateResourceCells(
     errors,
     sameMembers(identities, expected) &&
       new Set(identities).size === expectedLength,
-    `v2 resource cells must be unique and match the canonical mode/count matrix: ${receiptPath}`,
+    `${schemaLabel} resource cells must be unique and match the canonical mode/count matrix: ${receiptPath}`,
   );
   for (const cell of cells)
     valid =
-      validateResourceCell(cell, receiptPath, errors, expectedResourceCounts) &&
-      valid;
+      validateResourceCell(
+        cell,
+        receiptPath,
+        errors,
+        expectedResourceCounts,
+        schemaLabel,
+        requireSafeIntegers,
+      ) && valid;
   return valid ? cells : undefined;
 }
 
@@ -986,37 +1028,52 @@ function validateResourceCell(
   receiptPath,
   errors,
   expectedResourceCounts,
+  schemaLabel,
+  requireSafeIntegers,
 ) {
   const label = `${cell?.mode}/${cell?.runs} in ${receiptPath}`;
   if (
-    !exactObject(cell, RESOURCE_FIELDS, `v2 resource cell ${label}`, errors)
+    !exactObject(
+      cell,
+      RESOURCE_FIELDS,
+      `${schemaLabel} resource cell ${label}`,
+      errors,
+    )
   ) {
     return false;
   }
   let valid = expect(
     errors,
     MODES.includes(cell.mode) && expectedResourceCounts.includes(cell.runs),
-    `v2 resource cell has an unknown identity: ${label}`,
+    `${schemaLabel} resource cell has an unknown identity: ${label}`,
   );
   for (const name of ["baseline", "steady", "cleanup"]) {
     valid =
-      validateProcessSample(cell[name], `${label} ${name}`, errors) && valid;
+      validateProcessSample(
+        cell[name],
+        `${label} ${name}`,
+        errors,
+        schemaLabel,
+        requireSafeIntegers,
+      ) && valid;
   }
   for (const field of RESOURCE_NUMERIC_FIELDS) {
     valid =
       expect(
         errors,
         finiteNonNegative(cell[field]),
-        `v2 resource cell ${label} ${field} is not finite/non-negative`,
+        `${schemaLabel} resource cell ${label} ${field} is not finite/non-negative`,
       ) && valid;
   }
   valid =
     expect(
       errors,
       positiveInteger(cell.peak_rss_sample_count) &&
+        (!requireSafeIntegers ||
+          Number.isSafeInteger(cell.peak_rss_sample_count)) &&
         cell.peak_rss_sample_interval_ms === 25 &&
         cell.intentional_retained_state_without_gc === true,
-      `v2 resource cell ${label} has an invalid sampling/no-GC contract`,
+      `${schemaLabel} resource cell ${label} has an invalid sampling/no-GC contract`,
     ) && valid;
   if (!valid || !positiveInteger(cell.runs)) return false;
   const divide = (value) => Math.round((value / cell.runs) * 1000) / 1000;
@@ -1036,18 +1093,24 @@ function validateResourceCell(
       expect(
         errors,
         cell[field] === expected,
-        `v2 resource cell ${label} ${field} is not derived from samples`,
+        `${schemaLabel} resource cell ${label} ${field} is not derived from samples`,
       ) && valid;
   }
   return valid;
 }
 
-function validateProcessSample(sample, label, errors) {
+function validateProcessSample(
+  sample,
+  label,
+  errors,
+  schemaLabel,
+  requireSafeIntegers,
+) {
   if (
     !exactObject(
       sample,
       ["rss_kib", "cpu_seconds", "threads", "fds", "descendants"],
-      `v2 process sample ${label}`,
+      `${schemaLabel} process sample ${label}`,
       errors,
     )
   ) {
@@ -1058,7 +1121,12 @@ function validateProcessSample(sample, label, errors) {
   );
   valid =
     valid && Number.isInteger(sample.threads) && Number.isInteger(sample.fds);
+  valid =
+    valid &&
+    (!requireSafeIntegers ||
+      (Number.isSafeInteger(sample.threads) &&
+        Number.isSafeInteger(sample.fds)));
   valid = valid && Array.isArray(sample.descendants);
-  expect(errors, valid, `v2 process sample ${label} is malformed`);
+  expect(errors, valid, `${schemaLabel} process sample ${label} is malformed`);
   return valid;
 }
