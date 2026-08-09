@@ -8,7 +8,71 @@ use std::{
 };
 
 use serde::Serialize;
+
+#[cfg(not(target_os = "macos"))]
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+#[cfg(target_os = "macos")]
+type ProcessIdentity = ctxmux_process_stats::ProcessIdentity;
+#[cfg(not(target_os = "macos"))]
+type ProcessIdentity = u64;
+
+struct ProcessReader {
+    #[cfg(target_os = "macos")]
+    pid: u32,
+    #[cfg(not(target_os = "macos"))]
+    pid: Pid,
+    #[cfg(not(target_os = "macos"))]
+    system: System,
+    #[cfg(not(target_os = "macos"))]
+    refresh: ProcessRefreshKind,
+}
+
+impl ProcessReader {
+    fn new(pid: u32) -> Self {
+        Self {
+            #[cfg(target_os = "macos")]
+            pid,
+            #[cfg(not(target_os = "macos"))]
+            pid: Pid::from_u32(pid),
+            #[cfg(not(target_os = "macos"))]
+            system: System::new(),
+            #[cfg(not(target_os = "macos"))]
+            refresh: ProcessRefreshKind::nothing().with_memory(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read(&mut self) -> std::io::Result<(ProcessIdentity, u64)> {
+        let stats = ctxmux_process_stats::process_stats(self.pid).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("target process is unavailable: {error}"),
+            )
+        })?;
+        Ok((stats.identity, stats.resident_bytes / 1024))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn read(&mut self) -> std::io::Result<(ProcessIdentity, u64)> {
+        if self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            self.refresh,
+        ) != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "target process is unavailable",
+            ));
+        }
+        let process = self
+            .system
+            .process(self.pid)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "target vanished"))?;
+        Ok((process.start_time(), process.memory() / 1024))
+    }
+}
 
 struct RssObservation {
     started_at: Instant,
@@ -71,28 +135,16 @@ fn parse_args() -> Result<(u32, Duration, Duration), String> {
 
 fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::io::Result<()> {
     let receiver = spawn_command_reader()?;
-    let pid = Pid::from_u32(pid);
-    let mut system = System::new();
-    let refresh = ProcessRefreshKind::nothing().with_memory();
+    let mut process = ProcessReader::new(pid);
     let mut output = std::io::BufWriter::new(std::io::stdout().lock());
     let mut sequence = 0_u64;
     let mut previous_started_at = None;
     let mut target_start_time = None;
     let mut write_sample = |final_frame: bool| -> std::io::Result<Instant> {
         let observation = observe_rss(previous_started_at, maximum_gap, || {
-            if system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh)
-                != 1
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "target process is unavailable",
-                ));
-            }
-            let process = system.process(pid).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "target vanished")
-            })?;
-            pin_process_incarnation(&mut target_start_time, process.start_time())?;
-            Ok(process.memory() / 1024)
+            let (identity, rss_kib) = process.read()?;
+            pin_process_incarnation(&mut target_start_time, identity)?;
+            Ok(rss_kib)
         })?;
         sequence = sequence
             .checked_add(1)
@@ -194,9 +246,9 @@ fn await_start(receiver: &mpsc::Receiver<SamplerCommand>) -> std::io::Result<()>
     }
 }
 
-fn pin_process_incarnation(
-    expected_start_time: &mut Option<u64>,
-    observed_start_time: u64,
+fn pin_process_incarnation<T: Copy + Eq>(
+    expected_start_time: &mut Option<T>,
+    observed_start_time: T,
 ) -> std::io::Result<()> {
     match *expected_start_time {
         Some(expected) if expected != observed_start_time => Err(std::io::Error::new(
@@ -256,27 +308,20 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
     #[test]
-    fn single_pid_memory_refresh_meets_representative_cadence_and_ps_scale() {
-        let pid = Pid::from_u32(std::process::id());
-        let refresh = ProcessRefreshKind::nothing().with_memory();
-        let mut system = System::new();
+    fn single_pid_memory_read_meets_representative_cadence_and_ps_scale() {
+        let mut reader = super::ProcessReader::new(std::process::id());
         let mut maximum_refresh_ms = 0_u128;
+        let mut native_kib = 0;
         for _ in 0..200 {
             let started = Instant::now();
-            assert_eq!(
-                system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh,),
-                1
-            );
+            (_, native_kib) = reader.read().unwrap();
             maximum_refresh_ms = maximum_refresh_ms.max(started.elapsed().as_millis());
         }
         assert!(
             maximum_refresh_ms <= 100,
             "single-PID RSS refresh took {maximum_refresh_ms}ms"
         );
-        let native_kib = system.process(pid).unwrap().memory() / 1024;
         let ps = Command::new("ps")
             .args(["-o", "rss=", "-p", &std::process::id().to_string()])
             .output()

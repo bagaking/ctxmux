@@ -195,7 +195,7 @@ interface QualificationProvenance {
   readonly launcher: FileIdentity;
   readonly daemon: FileIdentity;
   readonly rss_sampler: FileIdentity;
-  readonly rss_sampler_source: FileIdentity;
+  readonly rss_sampler_sources: readonly FileIdentity[];
   readonly lockfiles: readonly FileIdentity[];
   readonly build: {
     readonly cwd: ".";
@@ -285,6 +285,10 @@ const rssSamplerBinary = resolve(
   process.env.CTXMUX_RSS_SAMPLER_BIN ?? fixedRssSamplerPath,
 );
 const rssSamplerSource = resolve(root, "crates/ctxmux-rss-sampler/src/main.rs");
+const rssSamplerLeafSource = resolve(
+  root,
+  "crates/ctxmux-process-stats/src/lib.rs",
+);
 const budgetPath = resolve(root, "reliability-budgets.json");
 
 async function main(): Promise<void> {
@@ -501,7 +505,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
     launcher_sha256: provenance.launcher.sha256,
     daemon_sha256: provenance.daemon.sha256,
     rss_sampler_sha256: provenance.rss_sampler.sha256,
-    rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
+    rss_sampler_sources: provenance.rss_sampler_sources,
     measurement_contract_sha256: provenance.measurement_contract_sha256,
     workload_contract: provenance.workload_contract,
     workload_helper: provenance.workload_helper,
@@ -547,7 +551,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
     trace("provenance.reverified", {
       daemon_sha256: provenance.daemon.sha256,
       rss_sampler_sha256: provenance.rss_sampler.sha256,
-      rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
+      rss_sampler_sources: provenance.rss_sampler_sources,
       workload_contract: provenance.workload_contract,
       workload_helper: provenance.workload_helper,
     });
@@ -2487,7 +2491,10 @@ function captureProvenance(
     launcher: fileIdentity(launcherPath),
     daemon: fileIdentity(daemonBinary),
     rss_sampler: fileIdentity(rssSamplerBinary),
-    rss_sampler_source: fileIdentity(rssSamplerSource),
+    rss_sampler_sources: [
+      fileIdentity(rssSamplerSource),
+      fileIdentity(rssSamplerLeafSource),
+    ],
     lockfiles: [
       fileIdentity(resolve(root, "Cargo.lock")),
       fileIdentity(resolve(root, "package-lock.json")),
@@ -2610,9 +2617,12 @@ function assertQualificationProvenance(
   assert.equal(provenance.launcher.path, "scripts/check-reliability.sh");
   assert.equal(provenance.daemon.path, fixedDaemonPath);
   assert.equal(provenance.rss_sampler.path, fixedRssSamplerPath);
-  assert.equal(
-    provenance.rss_sampler_source.path,
-    "crates/ctxmux-rss-sampler/src/main.rs",
+  assert.deepEqual(
+    provenance.rss_sampler_sources.map(({ path }) => path),
+    [
+      "crates/ctxmux-rss-sampler/src/main.rs",
+      "crates/ctxmux-process-stats/src/lib.rs",
+    ],
   );
   assert.deepEqual(
     provenance.lockfiles.map(({ path }) => path),
@@ -2628,10 +2638,10 @@ function assertQualificationProvenance(
   assert.deepEqual(provenance.launcher, fileIdentity(launcherPath));
   assert.deepEqual(provenance.daemon, fileIdentity(daemonBinary));
   assert.deepEqual(provenance.rss_sampler, fileIdentity(rssSamplerBinary));
-  assert.deepEqual(
-    provenance.rss_sampler_source,
+  assert.deepEqual(provenance.rss_sampler_sources, [
     fileIdentity(rssSamplerSource),
-  );
+    fileIdentity(rssSamplerLeafSource),
+  ]);
   assert.deepEqual(provenance.lockfiles, [
     fileIdentity(resolve(root, "Cargo.lock")),
     fileIdentity(resolve(root, "package-lock.json")),

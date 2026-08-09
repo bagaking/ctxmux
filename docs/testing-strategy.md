@@ -534,15 +534,16 @@ subsecond owner maxima; periodic samples prove boundary-zero and the external
 process census only.
 
 The 25 ms pressure sampler is one qualification-only native helper, not a
-daemon capability or protocol surface. It uses `sysinfo` to refresh only the
-named daemon PID, avoiding one `ps` fork/exec per observation while preserving
-the established daemon-only RSS-in-KiB scale. Its NDJSON frames carry exact
+daemon capability or protocol surface. On macOS its audited process-statistics
+leaf reads only the named daemon PID and fences identity around the RSS read;
+other platforms use `sysinfo`. Both avoid one `ps` fork/exec per observation
+while preserving the established daemon-only RSS-in-KiB scale. Its NDJSON frames carry exact
 sequence, producer timestamp, RSS, and one final marker. The harness rejects
 sequence or cadence gaps, malformed or partial output, target loss, missing
 final state, and helper failure; every stop or failure path kills when needed
-and waits for the single helper to be reaped. The locked build records the
-helper binary and source identities alongside the daemon before a receipt can
-be accepted.
+and retains the single helper's close/reap ownership until completion. The
+locked build records the helper binary and source identities alongside the
+daemon before a receipt can be accepted.
 
 ## Gate topology
 

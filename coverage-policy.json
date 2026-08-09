@@ -32,6 +32,14 @@
         "glob": "crates/ctxmux-daemon/src/tests/**",
         "reason": "Private owner tests are compiled only beneath cfg(test) and are behavioral evidence rather than shipped daemon product code.",
         "evidence": ".github/ci-evidence-map.json#creation-owner-contracts"
+      },
+      {
+        "id": "macos-process-statistics-leaf",
+        "category": "platform_impossible",
+        "language": "rust",
+        "glob": "crates/ctxmux-process-stats/src/**",
+        "reason": "The qualification-only process-statistics leaf wraps a macOS API and cannot execute in the Ubuntu coverage job.",
+        "evidence": ".github/ci-evidence-map.json#reliability-macos-process-stats"
       }
     ]
   },

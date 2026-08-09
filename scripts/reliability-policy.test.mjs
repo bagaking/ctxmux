@@ -425,10 +425,16 @@ function passingNightlyV3ReceiptFixture() {
     path: "target/reliability/provenance-build/debug/ctxmux-rss-sampler",
     sha256: "e".repeat(64),
   };
-  provenance.rss_sampler_source = {
-    path: "crates/ctxmux-rss-sampler/src/main.rs",
-    sha256: "a".repeat(64),
-  };
+  provenance.rss_sampler_sources = [
+    {
+      path: "crates/ctxmux-rss-sampler/src/main.rs",
+      sha256: "a".repeat(64),
+    },
+    {
+      path: "crates/ctxmux-process-stats/src/lib.rs",
+      sha256: "b".repeat(64),
+    },
+  ];
   provenance.build.argv.splice(
     provenance.build.argv.indexOf("--target-dir"),
     0,
@@ -726,7 +732,7 @@ function passingNightlyV3ReceiptFixture() {
     launcher_sha256: provenance.launcher.sha256,
     daemon_sha256: provenance.daemon.sha256,
     rss_sampler_sha256: provenance.rss_sampler.sha256,
-    rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
+    rss_sampler_sources: structuredClone(provenance.rss_sampler_sources),
     measurement_contract_sha256: provenance.measurement_contract_sha256,
     workload_contract: provenance.workload_contract,
     workload_helper: provenance.workload_helper,
@@ -791,7 +797,7 @@ function passingNightlyV3ReceiptFixture() {
     action: "provenance.reverified",
     daemon_sha256: provenance.daemon.sha256,
     rss_sampler_sha256: provenance.rss_sampler.sha256,
-    rss_sampler_source_sha256: provenance.rss_sampler_source.sha256,
+    rss_sampler_sources: structuredClone(provenance.rss_sampler_sources),
     workload_contract: provenance.workload_contract,
     workload_helper: provenance.workload_helper,
   });
@@ -1051,6 +1057,11 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
     [
       "RSS sampler identity",
       (value) => (value.provenance.rss_sampler.sha256 = "f".repeat(64)),
+    ],
+    [
+      "RSS sampler source identity",
+      (value) =>
+        (value.provenance.rss_sampler_sources[1].sha256 = "f".repeat(64)),
     ],
     [
       "declared workload envelope",

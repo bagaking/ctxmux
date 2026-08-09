@@ -143,6 +143,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctxmux-process-stats"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ctxmux-protocol"
 version = "0.1.0"
 dependencies = [
@@ -157,6 +164,7 @@ dependencies = [
 name = "ctxmux-rss-sampler"
 version = "0.1.0"
 dependencies = [
+ "ctxmux-process-stats",
  "serde",
  "serde_json",
  "sysinfo",

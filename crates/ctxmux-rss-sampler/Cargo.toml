@@ -10,6 +10,11 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ctxmux-process-stats = { path = "../ctxmux-process-stats" }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 sysinfo.workspace = true
 
 [lints]

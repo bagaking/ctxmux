@@ -937,6 +937,12 @@ test("checked-in policy fixes every current product owner and floor", () => {
         language: "rust",
         glob: "crates/ctxmux-daemon/src/tests/**",
       },
+      {
+        id: "macos-process-statistics-leaf",
+        category: "platform_impossible",
+        language: "rust",
+        glob: "crates/ctxmux-process-stats/src/**",
+      },
     ],
   );
 });

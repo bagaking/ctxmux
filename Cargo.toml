@@ -5,6 +5,7 @@ members = [
   "crates/ctxmux-client",
   "crates/ctxmux-daemon",
   "crates/ctxmux-inherited-fd",
+  "crates/ctxmux-process-stats",
   "crates/ctxmux-rss-sampler",
   "crates/ctxmux-protocol",
   "crates/ctxmux-sqlite-status",

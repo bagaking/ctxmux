@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -113,7 +113,9 @@ test("RSS sampling fails closed when the helper cannot start", async () => {
 });
 
 test("RSS sampling bounds a stuck first observation by one sample gap", async () => {
-  const fixture = await fixtureHelper("exec /bin/sleep 10");
+  const fixture = await fixtureHelper(
+    'printf \'%s\\n\' "$$" > "${0%/*}/pid"\nexec /bin/sleep 10',
+  );
   try {
     const prepared = await prepareRssSampler(
       fixture.executable,
@@ -122,6 +124,19 @@ test("RSS sampling bounds a stuck first observation by one sample gap", async ()
       100,
     );
     await assert.rejects(startRssSampler(prepared), /first frame in time/u);
+    const helperPid = Number(
+      await readFile(join(fixture.directory, "pid"), "utf8"),
+    );
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        process.kill(helperPid, 0);
+      } catch (error) {
+        assert.match(String(error), /ESRCH/u);
+        return;
+      }
+      await delay(10);
+    }
+    assert.fail("timed-out RSS helper was not reaped");
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
   }

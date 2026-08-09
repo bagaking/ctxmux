@@ -418,7 +418,7 @@ const V3_PROVENANCE_FIELDS = [
   "launcher",
   "daemon",
   "rss_sampler",
-  "rss_sampler_source",
+  "rss_sampler_sources",
   "lockfiles",
   "build",
   "toolchain",
@@ -563,8 +563,17 @@ export function validatePassingQualificationReceiptV3({
       provenance?.launcher,
       provenance?.daemon,
       provenance?.rss_sampler,
-      provenance?.rss_sampler_source,
     ].every(validFileIdentity) &&
+      Array.isArray(provenance?.rss_sampler_sources) &&
+      provenance.rss_sampler_sources.length === 2 &&
+      provenance.rss_sampler_sources.every(validFileIdentity) &&
+      isDeepStrictEqual(
+        provenance.rss_sampler_sources.map(({ path }) => path),
+        [
+          "crates/ctxmux-rss-sampler/src/main.rs",
+          "crates/ctxmux-process-stats/src/lib.rs",
+        ],
+      ) &&
       Array.isArray(provenance?.lockfiles) &&
       provenance.lockfiles.length === 2 &&
       provenance.lockfiles.every(validFileIdentity),
@@ -595,8 +604,8 @@ export function validatePassingQualificationReceiptV3({
         isDeepStrictEqual(provenance.daemon, current.daemon) &&
         isDeepStrictEqual(provenance.rss_sampler, current.rss_sampler) &&
         isDeepStrictEqual(
-          provenance.rss_sampler_source,
-          current.rss_sampler_source,
+          provenance.rss_sampler_sources,
+          current.rss_sampler_sources,
         ) &&
         isDeepStrictEqual(provenance.lockfiles, current.lockfiles) &&
         provenance.measurement_contract_sha256 ===
@@ -783,15 +792,19 @@ function validateV3Trace(value, expectedStages, provenance, preflight, expect) {
       trace[captured[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
       trace[captured[0]]?.rss_sampler_sha256 ===
         provenance.rss_sampler.sha256 &&
-      trace[captured[0]]?.rss_sampler_source_sha256 ===
-        provenance.rss_sampler_source.sha256 &&
+      isDeepStrictEqual(
+        trace[captured[0]]?.rss_sampler_sources,
+        provenance.rss_sampler_sources,
+      ) &&
       trace[captured[0]]?.measurement_contract_sha256 ===
         provenance.measurement_contract_sha256 &&
       trace[reverified[0]]?.daemon_sha256 === provenance.daemon.sha256 &&
       trace[reverified[0]]?.rss_sampler_sha256 ===
         provenance.rss_sampler.sha256 &&
-      trace[reverified[0]]?.rss_sampler_source_sha256 ===
-        provenance.rss_sampler_source.sha256 &&
+      isDeepStrictEqual(
+        trace[reverified[0]]?.rss_sampler_sources,
+        provenance.rss_sampler_sources,
+      ) &&
       isDeepStrictEqual(
         trace[reverified[0]]?.workload_contract,
         provenance.workload_contract,
@@ -1481,7 +1494,10 @@ function currentQualificationIdentity(root, source, budgets) {
     rss_sampler: identity(
       "target/reliability/provenance-build/debug/ctxmux-rss-sampler",
     ),
-    rss_sampler_source: identity("crates/ctxmux-rss-sampler/src/main.rs"),
+    rss_sampler_sources: [
+      identity("crates/ctxmux-rss-sampler/src/main.rs"),
+      identity("crates/ctxmux-process-stats/src/lib.rs"),
+    ],
     lockfiles: [identity("Cargo.lock"), identity("package-lock.json")],
     measurement_contract_sha256: crypto
       .createHash("sha256")

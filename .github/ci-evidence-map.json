@@ -150,6 +150,20 @@
       ]
     },
     {
+      "id": "reliability-macos-process-stats",
+      "kind": "test",
+      "path": "crates/ctxmux-process-stats/src/lib.rs",
+      "invariants": [
+        "the audited leaf is explicitly macOS-only; on macOS it reads one PID without system-wide enumeration, fences process identity around RSS, and matches the established ps scale"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "reliability-rss-sampler-lifecycle",
       "kind": "test",
       "path": "crates/ctxmux-rss-sampler/tests/lifecycle.rs",
