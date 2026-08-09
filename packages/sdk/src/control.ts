@@ -17,7 +17,7 @@ export type ResizeReceipt = Extract<
 export type StopReceipt = Extract<ControlReceipt, { readonly type: "stop" }>;
 
 /** One short-lived control accepted at its named daemon owner boundary. */
-export interface ControlAccepted<R extends ControlReceipt> {
+export interface ControlAccepted<R> {
   readonly run: RunInfo;
   readonly receipt: R;
 }

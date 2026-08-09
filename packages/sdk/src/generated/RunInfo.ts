@@ -55,4 +55,9 @@ export type RunInfo = {
    * Number of live attachment connections.
    */
   attachments: number;
+  /**
+   * Bytes successfully applied by the current native Input owner, or
+   * `None` when this Run has no current-incarnation native cursor authority.
+   */
+  applied_input_bytes: number | null;
 };

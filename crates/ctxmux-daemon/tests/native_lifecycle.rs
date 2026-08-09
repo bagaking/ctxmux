@@ -9,9 +9,9 @@ use std::{
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
-    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, MAX_FRAME_BYTES, PROTOCOL_VERSION,
-    Request, RunEvent, RunId, RunInputKind, RunInputReference, RunLineage, RunSpec, RunState,
-    ServerFrame, TerminalSize, decode_frame, encode_frame,
+    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
+    PROTOCOL_VERSION, RecoverableInput, Request, RunEvent, RunId, RunInputKind, RunInputReference,
+    RunLineage, RunSpec, RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use tempfile::TempDir;
@@ -279,7 +279,8 @@ async fn send_request_without_reading_response(client: &Client, request: Request
     assert!(matches!(
         decode_frame::<ServerFrame>(&hello).expect("decode daemon hello"),
         ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION
+            protocol: PROTOCOL_VERSION,
+            ..
         }
     ));
     wire.send(encode_frame(&ClientFrame::Request { request }).expect("encode abandoned request"))
@@ -451,7 +452,8 @@ async fn assert_malformed_request_closes(client: &Client, frame: &[u8]) {
     assert!(matches!(
         decode_frame::<ServerFrame>(&response).expect("decode fixture handshake response"),
         ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION
+            protocol: PROTOCOL_VERSION,
+            ..
         }
     ));
 
@@ -963,7 +965,8 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
     assert!(matches!(
         receive_server_frame(&mut wire, "reading attachment hello").await,
         ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION
+            protocol: PROTOCOL_VERSION,
+            ..
         }
     ));
     wire.send(
@@ -1135,6 +1138,182 @@ async fn public_start_and_fork_recover_after_the_response_is_abandoned() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(raw_capture_shell(2))
+        .await
+        .expect("start recoverable Input capture Run");
+    assert_eq!(run.applied_input_bytes, Some(0));
+    let daemon_instance = daemon
+        .client
+        .daemon_instance()
+        .await
+        .expect("read daemon incarnation");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach response-loss oracle");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let first_key = InputOperationKey::new("lost-response-input").unwrap();
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::RecoverableInput {
+            operation: RecoverableInput {
+                daemon_instance,
+                operation_key: first_key.clone(),
+                id: run.id,
+                expected_byte: 0,
+                data: b"A".to_vec(),
+            },
+        },
+    )
+    .await;
+    let recovered = daemon
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance,
+            operation_key: first_key,
+            id: run.id,
+            expected_byte: 0,
+            data: b"A".to_vec(),
+        })
+        .await
+        .expect("fresh client recovers abandoned Input result");
+    assert_eq!(recovered.receipt.start_byte, 0);
+    assert_eq!(recovered.receipt.end_byte, 1);
+    assert_eq!(recovered.run.applied_input_bytes, Some(1));
+
+    let second = daemon
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance,
+            operation_key: InputOperationKey::new("following-input").unwrap(),
+            id: run.id,
+            expected_byte: 1,
+            data: b"B".to_vec(),
+        })
+        .await
+        .expect("write following operation");
+    assert_eq!(second.receipt.start_byte, 1);
+    assert_eq!(second.receipt.end_byte, 2);
+
+    let retried_after_progress = daemon
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance,
+            operation_key: InputOperationKey::new("lost-response-input").unwrap(),
+            id: run.id,
+            expected_byte: 0,
+            data: b"A".to_vec(),
+        })
+        .await
+        .expect("retained old result remains valid after later Input");
+    assert_eq!(retried_after_progress.receipt.start_byte, 0);
+    assert_eq!(retried_after_progress.receipt.end_byte, 1);
+    assert_eq!(retried_after_progress.run.applied_input_bytes, Some(2));
+
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"CAPTURED").await;
+    let ready = observed
+        .windows(b"READY\n".len())
+        .position(|window| window == b"READY\n")
+        .expect("raw child published readiness")
+        + b"READY\n".len();
+    let captured = observed[ready..]
+        .windows(b"CAPTURED".len())
+        .position(|window| window == b"CAPTURED")
+        .expect("raw child published capture marker")
+        + ready;
+    let bytes = std::str::from_utf8(&observed[ready..captured])
+        .expect("od byte oracle is ASCII")
+        .split_ascii_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).expect("od emits hexadecimal bytes"))
+        .collect::<Vec<_>>();
+    assert_eq!(bytes, b"AB", "abandoned retry wrote the first payload once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_input_rejects_another_daemon_instance_before_pty_mutation() {
+    let first = TestDaemon::start().await;
+    let stale_instance = first
+        .client
+        .daemon_instance()
+        .await
+        .expect("read first daemon incarnation");
+    let second = TestDaemon::start().await;
+    let run = second
+        .client
+        .start(raw_capture_shell(1))
+        .await
+        .expect("start live target on replacement daemon");
+    let (mut attachment, snapshot) = second
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach replacement capture oracle");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.head_seq;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    assert_ne!(
+        stale_instance,
+        second
+            .client
+            .daemon_instance()
+            .await
+            .expect("read replacement daemon incarnation")
+    );
+
+    assert_protocol_error(
+        second
+            .client
+            .recoverable_input(RecoverableInput {
+                daemon_instance: stale_instance,
+                operation_key: InputOperationKey::new("stale-instance").unwrap(),
+                id: run.id,
+                expected_byte: 0,
+                data: b"X".to_vec(),
+            })
+            .await
+            .expect_err("old incarnation cannot mutate a live replacement Run"),
+        ErrorCode::DaemonInstanceMismatch,
+    );
+    assert_eq!(
+        second
+            .client
+            .status(run.id)
+            .await
+            .expect("read unchanged target")
+            .applied_input_bytes,
+        Some(0)
+    );
+
+    let replacement_instance = second.client.daemon_instance().await.unwrap();
+    second
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance: replacement_instance,
+            operation_key: InputOperationKey::new("current-instance").unwrap(),
+            id: run.id,
+            expected_byte: 0,
+            data: b"Y".to_vec(),
+        })
+        .await
+        .expect("current incarnation writes target once");
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"CAPTURED").await;
+    assert!(observed.windows(2).any(|bytes| bytes == b"59"));
+    assert!(!observed.windows(2).any(|bytes| bytes == b"58"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
     let daemon = TestDaemon::start().await;
     let mut spec = interactive_shell();
@@ -1284,19 +1463,19 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_5_before_request_dispatch() {
+async fn daemon_rejects_generation_6_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 6,
+        PROTOCOL_VERSION, 7,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_5_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 5 },
+    let generation_6_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 6 },
     })
-    .expect("encode generation-5 hello");
+    .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
         request: ctxmux_protocol::Request::Start {
             operation_key: CreateOperationKey::new("old-generation-must-not-run").unwrap(),
@@ -1312,7 +1491,7 @@ async fn daemon_rejects_generation_5_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_5_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_6_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -1371,7 +1550,8 @@ async fn protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation() {
     assert!(matches!(
         decode_frame::<ServerFrame>(&line).expect("decode exact-limit response"),
         ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION
+            protocol: PROTOCOL_VERSION,
+            ..
         }
     ));
     drop(wire);

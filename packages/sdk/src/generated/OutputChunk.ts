@@ -9,7 +9,7 @@ export type OutputChunk = {
    */
   seq: number;
   /**
-   * Raw PTY bytes. JSON represents these as an integer array in generation 6.
+   * Raw PTY bytes. JSON represents these as an integer array in generation 7.
    */
   data: Array<number>;
 };

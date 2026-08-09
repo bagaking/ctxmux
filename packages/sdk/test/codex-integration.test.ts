@@ -216,6 +216,7 @@ test("Codex Level B planning resumes one declared native session", () => {
     durable_head_seq: null,
     oldest_seq: 1,
     attachments: 0,
+    applied_input_bytes: 0,
   };
   const prompt = "continue 'exactly'; $(touch never)";
   const observedSession = codexIntegration
@@ -468,6 +469,7 @@ function rootRun(id: RunInfo["id"]): RunInfo {
     durable_head_seq: null,
     oldest_seq: 1,
     attachments: 0,
+    applied_input_bytes: 0,
   };
 }
 

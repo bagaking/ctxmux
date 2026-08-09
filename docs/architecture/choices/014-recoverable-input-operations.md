@@ -1,6 +1,6 @@
 # 014 — Recoverable native Input operations
 
-- Status: accepted; implementation pending
+- Status: accepted and implemented
 - Scope: same-incarnation retry of short-lived native Input after response loss
 
 ## Context
@@ -19,8 +19,8 @@ valuable ctxmux closure.
 
 ## Decision
 
-Add one recoverable short-lived native Input operation in the next protocol
-generation. Its canonical request binds:
+Generation 7 adds one recoverable short-lived native Input operation. Its
+canonical request binds:
 
 - one bounded opaque `InputOperationKey`;
 - the exact daemon-incarnation identity advertised by the handshake;
@@ -100,8 +100,8 @@ agree on the generated wire shape and failure vocabulary.
 
 ## Wrong-case corpus（错题集）
 
-- `INPUT-01` transfers the response-loss duplicate-write failure. It remains
-  `future` under T-004 until a real child proves that a dropped first response
-  followed by an exact fresh-client retry returns the original applied range
-  while the PTY observes one payload. Retained conflict, stale cursor, and a
-  replacement daemon must all fail before mutation.
+- `INPUT-01` transfers the response-loss duplicate-write failure. It is active
+  under T-004: a real child proves that a dropped first response followed by an
+  exact fresh-client retry returns the original applied range while the PTY
+  observes one payload. Focused owner and public tests cover retained conflict,
+  stale cursor, partial-write unknown, and replacement-daemon fencing.

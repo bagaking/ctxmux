@@ -6,7 +6,12 @@ on Electron, React, an editor, or the Rust implementation.
 ## Connect and start a Run
 
 ```ts
-import { CtxmuxClient, createOperationKey, defineRun } from "@ctxmux/sdk";
+import {
+  CtxmuxClient,
+  createOperationKey,
+  defineRun,
+  inputOperationKey,
+} from "@ctxmux/sdk";
 
 const client = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
 const operationKey = createOperationKey(); // retain until disposition is known
@@ -34,6 +39,37 @@ only with the Run in its memory or persistent retention class; they are not
 Session IDs, tags, credentials, or a global exactly-once claim. A call that
 omits the key gets a fresh UUID and therefore cannot be manually retried after
 an uncertain response.
+
+## Recover a native Input result
+
+Retain the complete operation until its disposition is known. If the response
+is lost, a fresh client can retry that exact operation against the same daemon
+incarnation without writing the bytes a second time:
+
+```ts
+const current = await client.status(run.id);
+if (current.applied_input_bytes === null) {
+  throw new Error("Run has no current native Input cursor");
+}
+
+const operation = {
+  daemonInstance: await client.daemonInstance(),
+  operationKey: inputOperationKey(),
+  runId: run.id,
+  expectedByte: current.applied_input_bytes,
+  data: "continue\n",
+};
+
+const reconnected = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const { receipt } = await reconnected.recoverableInput(operation);
+console.log(receipt.start_byte, receipt.end_byte);
+```
+
+The operation is recoverable only while its bounded Run-local result remains
+retained and the original daemon incarnation is still serving. Use a fresh key
+for each new logical Input. `receipt` proves the exact half-open byte range
+applied at the daemon-owned PTY write boundary; it does not prove that the
+target process read, understood, acknowledged, or replied to those bytes.
 
 ## Discover and observe a tmux-owned pane
 
@@ -63,7 +99,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 6 imports by socket path plus pane ID, an ambiguous linked
+because generation 7 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -203,7 +239,7 @@ result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterSeq)` resumes ordered output after the last observed sequence.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 6 represents cursors as
+4 MiB replay contains the complete history. Generation 7 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

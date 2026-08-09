@@ -16,6 +16,9 @@ export type ErrorCode =
   | "unsupported_capability"
   | "target_changed"
   | "creation_conflict"
+  | "input_operation_conflict"
+  | "input_cursor_mismatch"
+  | "daemon_instance_mismatch"
   | "run_capacity"
   | "control_backpressure"
   | "internal";

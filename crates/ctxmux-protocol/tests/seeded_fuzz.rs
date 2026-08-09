@@ -4,7 +4,8 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    ClientFrame, ClientHello, PROTOCOL_VERSION, ServerFrame, decode_frame, encode_frame,
+    ClientFrame, ClientHello, DaemonInstanceId, PROTOCOL_VERSION, ServerFrame, decode_frame,
+    encode_frame,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -24,6 +25,7 @@ fn seeded_native_protocol_fuzz_target_is_total_and_round_trips_valid_frames() {
     .into_bytes();
     let valid_server = encode_frame(&ServerFrame::Hello {
         protocol: PROTOCOL_VERSION,
+        daemon_instance: DaemonInstanceId::new(),
     })
     .expect("encode valid server seed")
     .into_bytes();

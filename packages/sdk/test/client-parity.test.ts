@@ -17,6 +17,7 @@ import {
   IntegrationProvenanceError,
   createOperationKey,
   defineRun,
+  inputOperationKey,
   registerIntegration,
   type IntegrationObserver,
   type RunEvent,
@@ -87,6 +88,39 @@ test(
       observed,
       lastSequence,
       "OUT:hello",
+    ));
+
+    const daemonInstance = await firstClient.daemonInstance();
+    const recoverableOperation = {
+      daemonInstance,
+      operationKey: inputOperationKey("sdk-recoverable-input"),
+      runId,
+      expectedByte: 6,
+      data: "sdk\n",
+    } as const;
+    const applied = await firstClient.recoverableInput(recoverableOperation);
+    assert.deepEqual(applied.receipt, { start_byte: 6, end_byte: 10 });
+    assert.deepEqual(await firstAttachment.input("later\n"), {
+      commandId: 2,
+      receipt: { type: "input", written_bytes: 6 },
+    });
+    const retriedApplied = await new CtxmuxClient({
+      socketPath,
+    }).recoverableInput(recoverableOperation);
+    assert.deepEqual(retriedApplied.receipt, applied.receipt);
+    assert.equal(retriedApplied.run.applied_input_bytes, 16);
+    ({ observed, lastSequence } = await waitForOutput(
+      firstAttachment,
+      observed,
+      lastSequence,
+      "OUT:sdk",
+    ));
+    assert.equal(text(observed).match(/OUT:sdk/g)?.length, 1);
+    ({ observed, lastSequence } = await waitForOutput(
+      firstAttachment,
+      observed,
+      lastSequence,
+      "OUT:later",
     ));
 
     firstAttachment.close();

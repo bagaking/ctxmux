@@ -4,6 +4,7 @@ import { Attachment } from "./attachment.js";
 import {
   asError,
   bytes,
+  commandError,
   CtxmuxCommandError,
   CtxmuxProtocolError,
   decodeInputReceipt,
@@ -18,11 +19,15 @@ import {
   type StopReceipt,
 } from "./control.js";
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
+import type { AppliedInputRange } from "./generated/AppliedInputRange.js";
 import type { ClientFrame } from "./generated/ClientFrame.js";
 import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
+import type { DaemonInstanceId } from "./generated/DaemonInstanceId.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
+import type { InputOperationKey } from "./generated/InputOperationKey.js";
 import {
   MAX_CREATE_OPERATION_KEY_BYTES,
+  MAX_INPUT_OPERATION_KEY_BYTES,
   PROTOCOL_VERSION,
 } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
@@ -44,6 +49,14 @@ export interface CtxmuxClientOptions {
   readonly socketPath: string;
 }
 
+export interface RecoverableInputOperation {
+  readonly daemonInstance: DaemonInstanceId;
+  readonly operationKey: InputOperationKey;
+  readonly runId: RunId;
+  readonly expectedByte: number;
+  readonly data: ByteInput;
+}
+
 /** Validate or generate one caller-retained Run creation operation key. */
 export function createOperationKey(
   value: string = randomUUID(),
@@ -63,6 +76,27 @@ export function createOperationKey(
   if (byteLength > MAX_CREATE_OPERATION_KEY_BYTES) {
     throw new TypeError(
       `Run creation operation key is ${String(byteLength)} bytes; maximum is ${String(MAX_CREATE_OPERATION_KEY_BYTES)}`,
+    );
+  }
+  return value;
+}
+
+/** Validate or generate one caller-retained native Input operation key. */
+export function inputOperationKey(
+  value: string = randomUUID(),
+): InputOperationKey {
+  if (typeof value !== "string" || !isWellFormedUtf16(value)) {
+    throw new TypeError(
+      "native Input operation key must be well-formed UTF-16",
+    );
+  }
+  const byteLength = new TextEncoder().encode(value).byteLength;
+  if (byteLength === 0) {
+    throw new TypeError("native Input operation key must not be empty");
+  }
+  if (byteLength > MAX_INPUT_OPERATION_KEY_BYTES) {
+    throw new TypeError(
+      `native Input operation key is ${String(byteLength)} bytes; maximum is ${String(MAX_INPUT_OPERATION_KEY_BYTES)}`,
     );
   }
   return value;
@@ -96,8 +130,14 @@ export class CtxmuxClient {
   }
 
   public async ping(): Promise<void> {
-    const wire = await this.#connect();
+    const { wire } = await this.#connect();
     wire.close();
+  }
+
+  public async daemonInstance(): Promise<DaemonInstanceId> {
+    const { wire, daemonInstance } = await this.#connect();
+    wire.close();
+    return daemonInstance;
   }
 
   public async start(
@@ -198,6 +238,52 @@ export class CtxmuxClient {
     );
   }
 
+  public async recoverableInput(
+    operation: RecoverableInputOperation,
+  ): Promise<ControlAccepted<AppliedInputRange>> {
+    validateCursor(operation.expectedByte, "expectedByte");
+    const payload = bytes(operation.data);
+    if (payload.length === 0) {
+      throw new TypeError("recoverable native Input must not be empty");
+    }
+    const response = await this.#controlRequest({
+      type: "recoverable_input",
+      operation: {
+        daemon_instance: operation.daemonInstance,
+        operation_key: inputOperationKey(operation.operationKey),
+        id: operation.runId,
+        expected_byte: operation.expectedByte,
+        data: payload,
+      },
+    });
+    if (response.type === "control_rejected") {
+      throw commandError(response.failure);
+    }
+    if (response.type !== "input_applied") {
+      throw new CtxmuxCommandError(
+        "internal",
+        `expected input_applied response, received ${response.type}`,
+        "unknown",
+      );
+    }
+    const expectedEnd = operation.expectedByte + payload.length;
+    if (
+      !Number.isSafeInteger(expectedEnd) ||
+      response.run.id !== operation.runId ||
+      response.range.start_byte !== operation.expectedByte ||
+      response.range.end_byte !== expectedEnd ||
+      response.run.applied_input_bytes === null ||
+      response.run.applied_input_bytes < expectedEnd
+    ) {
+      throw new CtxmuxCommandError(
+        "internal",
+        "recoverable Input Run, range, or cursor does not prove its request",
+        "unknown",
+      );
+    }
+    return { run: response.run, receipt: response.range };
+  }
+
   public async resize(
     id: RunId,
     size: TerminalSize,
@@ -217,7 +303,7 @@ export class CtxmuxClient {
 
   public async attach(id: RunId, afterSeq = 0): Promise<Attachment> {
     validateCursor(afterSeq, "afterSeq");
-    const wire = await this.#connect();
+    const { wire } = await this.#connect();
     try {
       await wire.send({
         type: "request",
@@ -239,7 +325,7 @@ export class CtxmuxClient {
   }
 
   async #request(request: Request): Promise<Response> {
-    const wire = await this.#connect();
+    const { wire } = await this.#connect();
     try {
       await wire.send({ type: "request", request } satisfies ClientFrame);
       const frame = serverFrame(await wire.receive());
@@ -258,7 +344,7 @@ export class CtxmuxClient {
   async #controlRequest(request: Request): Promise<Response> {
     let wire: JsonLinesConnection;
     try {
-      wire = await this.#connect();
+      ({ wire } = await this.#connect());
     } catch (error) {
       throw new CtxmuxCommandError(
         error instanceof CtxmuxProtocolError ? error.code : "io",
@@ -314,7 +400,10 @@ export class CtxmuxClient {
     }
   }
 
-  async #connect(): Promise<JsonLinesConnection> {
+  async #connect(): Promise<{
+    readonly wire: JsonLinesConnection;
+    readonly daemonInstance: DaemonInstanceId;
+  }> {
     const wire = await JsonLinesConnection.connect(this.#socketPath);
     try {
       await wire.send({
@@ -328,7 +417,7 @@ export class CtxmuxClient {
       if (frame.type !== "hello" || frame.protocol !== PROTOCOL_VERSION) {
         throw unexpected("compatible hello", frame.type);
       }
-      return wire;
+      return { wire, daemonInstance: frame.daemon_instance };
     } catch (error) {
       wire.close();
       throw error;

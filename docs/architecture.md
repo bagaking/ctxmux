@@ -8,17 +8,17 @@ This page is the architecture entrypoint. It distinguishes shipped behavior from
 
 Current guarantees are deliberately narrower than the product vision.
 
-| Area             | Current                                                                                                                                                                                                                                                                                                     | Target or open                                                                                                                                                                           |
-| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open.                                                                                             |
-| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                                                                                                            |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 6, including correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary.                                                                                              | Other SDKs appear only for a real client requirement.                                                                                                                                    |
-| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                                                                                                                |
-| Input recovery   | Input receipts prove only complete delivery to the daemon-owned PTY write boundary. Attachment command IDs are connection-local correlation, so a lost generation-6 result remains unknown.                                                                                                                 | An accepted, not-yet-implemented short-lived operation adds same-incarnation retry, exact input byte ranges, and a daemon-instance fence. Semantic acknowledgement remains above ctxmux. |
-| Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                                                                                                                         |
-| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                                                                                                            |
-| Context and fork | Level A clones a declared `RunSpec`; Codex Level B resumes a declared session; both record lineage and fidelity.                                                                                                                                                                                            | Workspace snapshots and artifact ownership remain open.                                                                                                                                  |
-| Persistence      | Optional `--state-dir` mode recovers historical metadata, lineage, terminal state, and committed replay; default mode remains memory-only.                                                                                                                                                                  | Live PTY handoff, schema migration, and online history management are open.                                                                                                              |
+| Area             | Current                                                                                                                                                                                                                                                                                                     | Target or open                                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority. | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
+| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                   | Windows transport, discovery, and daemon activation are open.                                |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 7, including daemon-incarnation fencing, recoverable native Input, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary.                                        | Other SDKs appear only for a real client requirement.                                        |
+| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                                                                                                                                                                                                                       | Screen reconstruction and a multi-writer policy are open.                                    |
+| Input recovery   | A short-lived generation-7 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                              | Cross-daemon exactly-once and semantic acknowledgement remain above or outside ctxmux.       |
+| Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                     | Wider tmux control and other Backends require separate evidence.                             |
+| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                     | Broader Integration coverage and context capture remain open.                                |
+| Context and fork | Level A clones a declared `RunSpec`; Codex Level B resumes a declared session; both record lineage and fidelity.                                                                                                                                                                                            | Workspace snapshots and artifact ownership remain open.                                      |
+| Persistence      | Optional `--state-dir` mode recovers historical metadata, lineage, terminal state, and committed replay; default mode remains memory-only.                                                                                                                                                                  | Live PTY handoff, schema migration, and online history management are open.                  |
 
 “Durable” always includes client churn. With persistent mode it additionally
 includes the declared historical recovery class across daemon restart; it does
@@ -38,7 +38,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v6)
+                    Unix domain socket (v7)
                               |
                     long-lived ctxmux daemon
                     - RunManager / RunRegistry / Run identity
@@ -206,9 +206,9 @@ the owning PTY; stop acceptance remains distinct from the later `Exited`
 event. A lost result is unknown disposition and is never permission to replay
 input.
 
-Decision 014 accepts a separate recoverable short-lived Input operation. It
-will bind one caller key to the exact Run, daemon incarnation, non-empty byte
-payload, and expected input byte cursor. A matching same-incarnation retry will
+Decision 014 defines a separate recoverable short-lived Input operation. It
+binds one caller key to the exact Run, daemon incarnation, non-empty byte
+payload, and expected input byte cursor. A matching same-incarnation retry
 return the original applied byte range without another PTY write; conflicting,
 stale-cursor, evicted, or replacement-incarnation attempts fail closed. The
 operation ledger is Run-local and bounded. It does not replace attachment
@@ -255,7 +255,7 @@ daemon-loss, and unwind restoration paths remain broader qualification work.
 The TypeScript SDK buffers fragmented or coalesced socket data into newline
 frames, enforces the frame byte limit, applies bounded inbound backpressure,
 and mirrors the Rust request and attachment operations. It runtime-validates
-every nested generation-6 server variant before exposing it. Each Rust and
+every nested generation-7 server variant before exposing it. Each Rust and
 TypeScript Attachment has one inbound router: command results resolve a
 bounded pending map while events enter a separately bounded delivery inbox, so
 a slow event consumer does not create a competing socket reader or hide a
@@ -422,7 +422,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | --------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                                        | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                                        | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 6                                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 7                                       | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                                     | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                                        | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                                        | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
@@ -433,7 +433,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | Context, artifacts, lineage, and fork | accepted                                                        | [011](architecture/choices/011-context-artifact-lineage-fork.md)    |
 | tmux Control Mode Backend             | accepted and implemented; version lanes pending                 | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
 | Retained Run resource governance      | memory and persistent owners implemented; qualification pending | [013](architecture/choices/013-retained-run-resource-governance.md) |
-| Recoverable native Input              | accepted; implementation pending                                | [014](architecture/choices/014-recoverable-input-operations.md)     |
+| Recoverable native Input              | accepted and implemented                                        | [014](architecture/choices/014-recoverable-input-operations.md)     |
 
 ## Risk-to-fixture traceability
 

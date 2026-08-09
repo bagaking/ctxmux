@@ -1,4 +1,4 @@
-# Local Protocol Generation 6
+# Local Protocol Generation 7
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -10,7 +10,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 6.
+- Raw PTY bytes are represented as integer arrays in generation 7.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -25,15 +25,16 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. Generation 6 does not yet
+The generation fence covers the wire contract only. Generation 7 does not yet
 negotiate runtime build identity, host identity, or a daemon-wide capability
 manifest; those remain separate open work.
 
-Generation 6 also has no daemon-incarnation identity and no recoverable Input
-operation. Its `input` receipt proves the PTY write boundary only when the
-response arrives; reconnecting after response loss cannot distinguish applied
-from unapplied bytes and must not retry. Decision 014 defines the accepted next
-contract without presenting it as implemented generation-6 behavior.
+Generation 7 adds one random daemon-incarnation identity to the successful
+Hello frame. It is a live retry fence, not build, host, platform, or durable
+process identity. Ordinary `input` retains the prior receipt semantics:
+when its result is lost, callers must not retry it. The separate
+`recoverable_input` operation below binds the original daemon incarnation and
+can resolve its own lost response.
 
 After the handshake, a connection has one of two shapes:
 
@@ -60,6 +61,9 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 - `list`: return all Runs retained by this daemon.
 - `status`: return current metadata for one Run.
 - `input`: write raw bytes to a live Run's PTY.
+- `recoverable_input`: write one non-empty caller-keyed native Input at an
+  expected applied-input cursor, or recover its retained exact applied range
+  after reconnect within the same daemon incarnation.
 - `resize`: request new live PTY rows and columns and report the size read back
   from the owning PTY.
 - `attach`: return retained output after a sequence cursor and follow new
@@ -77,14 +81,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 6.
+ownership in generation 7.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 6 declares `run_capacity` for the global retained-Run admission
+Generation 7 declares `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -93,7 +97,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-6 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-7 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -116,7 +120,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-6 decoding and
+The daemon compares canonical typed requests after generation-7 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -163,6 +167,35 @@ before atomic persistent publication is still outside live process recovery;
 ctxmux does not preserve a pending tombstone, adopt an unrecorded process, or
 claim that such a process cannot have survived.
 
+### Recoverable native Input
+
+`RunInfo.applied_input_bytes` is the checked byte cursor owned by a current
+native Input writer. It is `null` for tmux and recovered historical Runs. Every
+successful native Input path, including legacy short-lived and attachment
+commands, advances this one cursor after complete `write_all` plus flush.
+
+A recoverable request carries the Hello's original daemon instance, one
+per-Run `InputOperationKey`, the Run, exact non-empty bytes, and the cursor
+expected immediately before the write. Instance comparison precedes Run lookup.
+The FIFO writer checks the cursor immediately before mutation, so two unique
+operations cannot both consume the same range. Success returns
+`input_applied { run, range: { start_byte, end_byte } }`. The returned Run is
+the requested Run and its current cursor is at least `end_byte`; later FIFO
+Input may have advanced it after this operation completed.
+
+While an operation is pending or retained, an exact retry joins or returns the
+same result; another payload or expected cursor with that key returns
+`input_operation_conflict`. The Run-local ledger retains at most 256 entries and
+1 MiB of request bytes. It evicts only completed results. Clients use a fresh
+key for every new logical operation; an exact retry after eviction still has an
+old expected cursor and returns `input_cursor_mismatch` without mutation.
+
+Partial write, flush failure, or writer panic returns an `unknown` failure,
+retains that keyed unknown result, and poisons the Input lane. No applied range
+or cursor advance is invented. The ledger is memory-only. A replacement daemon
+returns `daemon_instance_mismatch`; ctxmux never claims cross-crash exactly-once
+Input.
+
 ### Control correlation and owner receipts
 
 Short-lived `input`, `resize`, and `stop` requests and the corresponding
@@ -201,9 +234,9 @@ or fatal protocol violation, the client locally marks every command without its
 unique result as disposition unknown and must not replay uncertain input unless
 a separate operation-specific deduplication contract is introduced.
 
-The planned recoverable Input operation in Decision 014 is that separate
-contract for short-lived native Input only. It does not change the meaning of
-attachment command IDs or generalize recovery to Resize, Stop, or Signal.
+The recoverable Input operation in Decision 014 is that separate contract for
+short-lived native Input only. It does not change the meaning of attachment
+command IDs or generalize recovery to Resize, Stop, or Signal.
 Its per-Run key conflict guarantee lasts only while the operation is pending or
 retained in the bounded result ledger; callers use a fresh key for new logical
 operations. An evicted exact retry remains safe because its original expected
@@ -284,7 +317,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 6 import accepts only socket path plus pane ID, so it
+associations. Generation 7 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -299,7 +332,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 6 does not claim general tmux command correlation beyond those bounded
+Generation 7 does not claim general tmux command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -344,7 +377,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-6 peer that puts `chunks` back into the header is invalid.
+generation-7 peer that puts `chunks` back into the header is invalid.
 
 `Gap { head_seq }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -398,6 +431,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-6 frame at runtime, rejects duplicate
+validates the complete nested generation-7 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

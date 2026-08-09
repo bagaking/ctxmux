@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 6
+# 003 — Unix socket and NDJSON protocol generation 7
 
-- Status: accepted for generation 6; pre-stable
+- Status: accepted for generation 7; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context

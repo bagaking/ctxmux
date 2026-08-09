@@ -76,7 +76,7 @@ at the 128-record ceiling.
 | Protocol generation and malformed frames         | Shared corpus reaches Rust decode, real daemon, and Node validation; exact frame cap plus seeded Rust and TypeScript byte targets are checked                                                          | Strong for retained and seeded cases                        | No coverage-guided continuous fuzzer, sanitizer, or Rust-produced all-variant golden matrix                           |
 | Socket path safety and mode `0600`               | Sequential targets plus forced startup and shutdown replacement prove identity recheck, live-listener preservation, and mode                                                                           | Strong for checked owner-controlled schedules               | Hostile writable-parent atomicity, renamed-original cleanup, and peer identity remain open                            |
 | SDK backpressure and close races                 | Deterministic mock socket tests, including 20,000 queued frames, plus real 8/32-way fast/slow fan-out with explicit `Gap`                                                                              | Strong for SDK queue and real lag behavior                  | Silent-peer cancellation and request deadlines are absent                                                             |
-| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-6 matrix           | Hostile parent/FD exhaustion, attachment admission, total RSS quota, and production-scale pressure remain open        |
+| Chaos, security, and resources                   | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-7 matrix           | Hostile parent/FD exhaustion, attachment admission, total RSS quota, and production-scale pressure remain open        |
 | Level A fork                                     | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control                                                                                                   | Strong                                                      | Post-spawn fork failure is not forced through the public boundary                                                     |
 | Codex Level B                                    | Source-bound receipt negatives, unrelated-Run public E2E, minimized JSONL corpus, seeded observer target, and a redacted real-Codex continuation artifact                                              | Strong supported-API owner, parser, and semantic proof      | Host-local provenance is not authentication; scheduled hosted evidence remains separate                               |
 | Interactive CLI attach                           | Checked-in controlling-PTY E2E proves raw input, `SIGWINCH`, detach, exact restoration, and same-PID survival                                                                                          | Strong for ordinary detach on Unix                          | Daemon-loss, error, unwind, and catchable-signal restoration remain open                                              |
@@ -589,7 +589,7 @@ one repository aggregate.
 
 Generated TypeScript protocol declarations are excluded from the denominator
 and remain protected by the Rust-owner drift check. The `cfg(not(unix))`
-compile failures are reported as platform-impossible because generation 6
+compile failures are reported as platform-impossible because generation 7
 declares a Unix transport. No test fixture or hand-written runtime file is
 silently excluded. Changed-line mode is explicit:
 
@@ -779,7 +779,7 @@ The current clean-consumer audit admits four bounded gaps:
   PTY readback as the applied terminal size, stop acceptance remains distinct
   from final `Exited`, and a lost result remains unknown rather than permission
   to replay input.
-- **Recoverable native Input (accepted, not yet implemented):** one real-PTY
+- **Recoverable native Input (implemented):** one real-PTY
   public test writes a non-empty operation once, drops its response, reconnects
   with the same operation, and requires the original applied byte range plus a
   child-side marker proving no second write. The same bounded vertical covers
@@ -794,7 +794,7 @@ The current clean-consumer audit admits four bounded gaps:
   semantics. It must not silently download a binary, mutate global state, bind
   ctxmux lifetime to Electron, or imply SSH/remote support.
 - **Earned streaming optimization:** freeze an incremental raw-byte consumer
-  workload before changing generation-6 integer-array encoding. Adopt a new
+  workload before changing generation-7 integer-array encoding. Adopt a new
   versioned representation only when the measured end-to-end gain exceeds its
   protocol and validation cost while exact bytes, sequence, replay, `Gap`, frame
   limits, backpressure, security, and resource bounds remain green. A measured

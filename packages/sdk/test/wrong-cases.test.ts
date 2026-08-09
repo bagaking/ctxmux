@@ -14,6 +14,7 @@ import {
   CtxmuxInvalidFrameError,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  inputOperationKey,
   type ServerFrame,
 } from "../src/index.ts";
 import { runEventSource } from "../src/attachment.ts";
@@ -21,6 +22,7 @@ import { validateServerFrame } from "../src/validation.ts";
 import { JsonLinesConnection, WireClosedError } from "../src/wire.ts";
 
 const RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114ae8";
+const DAEMON_INSTANCE = "018f47f2-9df7-7f5f-8f2d-d3353f114ae9";
 const MALFORMED_PROTOCOL_FRAMES = (
   JSON.parse(
     readFileSync(
@@ -89,6 +91,14 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
 test("SC-02 rejects malformed nested runtime frames", () => {
   const mutations: readonly [unknown, string][] = [
     [{ type: "invented" }, "$frame.type"],
+    [
+      {
+        type: "hello",
+        protocol: PROTOCOL_VERSION,
+        daemon_instance: "not-a-uuid",
+      },
+      "$frame.daemon_instance",
+    ],
     [
       { type: "response", response: { type: "invented" } },
       "$frame.response.type",
@@ -264,6 +274,28 @@ test("SC-02 rejects malformed nested runtime frames", () => {
       "$frame.response.failure.disposition",
     ],
     [
+      {
+        type: "response",
+        response: {
+          type: "input_applied",
+          run: { ...runInfo(), applied_input_bytes: 3 },
+          range: { start_byte: Number.MAX_SAFE_INTEGER + 1, end_byte: 3 },
+        },
+      },
+      "$frame.response.range.start_byte",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "input_applied",
+          run: { ...runInfo(), applied_input_bytes: 3 },
+          range: { start_byte: 3, end_byte: 3 },
+        },
+      },
+      "$frame.response.range.end_byte",
+    ],
+    [
       { type: "response", response: { type: "accepted", run: runInfo() } },
       "$frame.response.type",
     ],
@@ -285,7 +317,11 @@ test("SC-02 rejects malformed nested runtime frames", () => {
 
 test("SC-02 accepts TypeScript-authored server variants and rejects mutations", () => {
   const frames: readonly ServerFrame[] = [
-    { type: "hello", protocol: PROTOCOL_VERSION },
+    {
+      type: "hello",
+      protocol: PROTOCOL_VERSION,
+      daemon_instance: DAEMON_INSTANCE,
+    },
     { type: "response", response: { type: "started", run: runInfo() } },
     {
       type: "response",
@@ -315,6 +351,14 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
           error: { code: "control_backpressure", message: "full" },
           disposition: "not_applied",
         },
+      },
+    },
+    {
+      type: "response",
+      response: {
+        type: "input_applied",
+        run: { ...runInfo(), applied_input_bytes: 3 },
+        range: { start_byte: 1, end_byte: 3 },
       },
     },
     { type: "attached", snapshot: attachedHeader() },
@@ -379,6 +423,58 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
   assert.throws(() => validateServerFrame(malformedHello), {
     name: "CtxmuxInvalidFrameError",
   });
+});
+
+test("T-004 rejects recoverable Input receipts that do not prove the request", async (context) => {
+  for (const response of [
+    {
+      type: "input_applied" as const,
+      run: {
+        ...runInfo(),
+        id: "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
+        applied_input_bytes: 2,
+      },
+      range: { start_byte: 1, end_byte: 2 },
+    },
+    {
+      type: "input_applied" as const,
+      run: { ...runInfo(), applied_input_bytes: 1 },
+      range: { start_byte: 1, end_byte: 2 },
+    },
+  ]) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      assert.deepEqual(await peer.receive(), {
+        type: "request",
+        request: {
+          type: "recoverable_input",
+          operation: {
+            daemon_instance: DAEMON_INSTANCE,
+            operation_key: "receipt-proof",
+            id: RUN_ID,
+            expected_byte: 1,
+            data: [65],
+          },
+        },
+      });
+      peer.send({ type: "response", response });
+    });
+
+    await assert.rejects(
+      new CtxmuxClient({ socketPath: daemon.socketPath }).recoverableInput({
+        daemonInstance: DAEMON_INSTANCE,
+        operationKey: inputOperationKey("receipt-proof"),
+        runId: RUN_ID,
+        expectedByte: 1,
+        data: "A",
+      }),
+      (error: unknown) =>
+        error instanceof CtxmuxCommandError &&
+        error.code === "internal" &&
+        error.disposition === "unknown",
+    );
+  }
 });
 
 test("SC-02 validates tmux-owned and interrupted Run wire contracts", () => {
@@ -1516,7 +1612,11 @@ class MockPeer {
       type: "hello",
       hello: { protocol: PROTOCOL_VERSION },
     });
-    this.send({ type: "hello", protocol: PROTOCOL_VERSION });
+    this.send({
+      type: "hello",
+      protocol: PROTOCOL_VERSION,
+      daemon_instance: DAEMON_INSTANCE,
+    });
   }
 
   public send(frame: ServerFrame): void {
@@ -1618,6 +1718,7 @@ function runInfo() {
     durable_head_seq: null,
     oldest_seq: 1,
     attachments: 1,
+    applied_input_bytes: 0,
   };
 }
 
@@ -1659,6 +1760,7 @@ function tmuxRunInfo() {
       replay: "raw_since_import" as const,
     },
     pid: pane.pane_pid,
+    applied_input_bytes: null,
   };
 }
 

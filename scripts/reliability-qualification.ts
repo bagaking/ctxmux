@@ -2046,8 +2046,14 @@ async function openProtocolSocket(socketPath: string): Promise<Socket> {
   const hello = JSON.parse(line) as {
     readonly type?: string;
     readonly protocol?: number;
+    readonly daemon_instance?: string;
   };
-  assert.deepEqual(hello, { type: "hello", protocol: PROTOCOL_VERSION });
+  assert.equal(hello.type, "hello");
+  assert.equal(hello.protocol, PROTOCOL_VERSION);
+  assert.match(
+    hello.daemon_instance ?? "",
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+  );
   return socket;
 }
 

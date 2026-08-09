@@ -31,11 +31,11 @@ mod tmux;
 pub use persistence::PersistenceError;
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure, CreateOperationKey,
-    ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, MAX_FRAME_BYTES, OutputChunk,
-    OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunBackend, RunCapabilities,
-    RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState, ServerFrame, TerminalSize,
-    TmuxRunEvent, decode_frame, encode_frame,
+    AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
+    CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
+    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, RecoverableInput,
+    Request, Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec,
+    RunState, ServerFrame, TerminalSize, TmuxRunEvent, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
@@ -299,6 +299,7 @@ impl Drop for SocketGuard {
 }
 
 struct RunManager {
+    daemon_instance: DaemonInstanceId,
     registry: RunRegistry,
     creation_flights: CreationFlightOwner,
     unpublished_cleanups: UnpublishedCleanupOwner,
@@ -609,6 +610,7 @@ impl CreationTestHook {
 impl Default for RunManager {
     fn default() -> Self {
         Self {
+            daemon_instance: DaemonInstanceId::new(),
             registry: RunRegistry::default(),
             creation_flights: CreationFlightOwner::default(),
             unpublished_cleanups: UnpublishedCleanupOwner::default(),
@@ -657,6 +659,7 @@ impl RunManager {
             })
             .collect();
         Self {
+            daemon_instance: persistence.daemon_instance(),
             registry: RunRegistry::recovered(runs),
             creation_flights: CreationFlightOwner::default(),
             unpublished_cleanups: UnpublishedCleanupOwner::default(),
@@ -1303,6 +1306,7 @@ impl MaterializedCreation {
             durable_head_seq: Some(0),
             oldest_seq: 0,
             attachments: 0,
+            applied_input_bytes: Some(0),
         }
     }
 }
@@ -2193,6 +2197,10 @@ impl Run {
 
     fn info(&self) -> RunInfo {
         let output = mutex_lock(&self.output);
+        let applied_input_bytes = match &self.incarnation_control {
+            Some(RunControl::Native(control)) => Some(control.applied_input_bytes()),
+            Some(RunControl::Tmux(_)) | None => None,
+        };
         RunInfo {
             id: self.id,
             spec: self.spec.clone(),
@@ -2207,6 +2215,7 @@ impl Run {
                 .map(PersistentRun::durable_head),
             oldest_seq: output.oldest_seq(),
             attachments: self.attachments.load(Ordering::Acquire),
+            applied_input_bytes,
         }
     }
 
@@ -2231,6 +2240,21 @@ impl Run {
 
     async fn input(&self, data: Vec<u8>) -> ControlResult {
         self.begin_input(data)?.resolve().await
+    }
+
+    async fn recoverable_input(
+        &self,
+        operation: RecoverableInput,
+    ) -> Result<AppliedInputRange, ControlFailure> {
+        self.native_control()
+            .map_err(control_not_applied)?
+            .begin_recoverable_input(
+                operation.operation_key,
+                operation.expected_byte,
+                operation.data,
+            )?
+            .resolve()
+            .await
     }
 
     fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
@@ -3298,6 +3322,7 @@ async fn handle_connection(
                 &mut wire,
                 &ServerFrame::Hello {
                     protocol: PROTOCOL_VERSION,
+                    daemon_instance: manager.daemon_instance,
                 },
             )
             .await?;
@@ -3405,6 +3430,9 @@ async fn execute_request(
             };
             Ok(short_control_response(&run, run.input(data).await))
         }
+        Request::RecoverableInput { operation } => {
+            recoverable_input_response(manager, operation).await
+        }
         Request::Resize { id, size } => {
             let run = match manager.pin(id) {
                 Ok(run) => run,
@@ -3431,6 +3459,35 @@ async fn execute_request(
             ErrorCode::Internal,
             "attach request reached short-lived request handler",
         )),
+    }
+}
+
+async fn recoverable_input_response(
+    manager: &Arc<RunManager>,
+    operation: RecoverableInput,
+) -> Result<Response, ProtocolError> {
+    if operation.daemon_instance != manager.daemon_instance {
+        return Ok(Response::ControlRejected {
+            failure: control_not_applied(ProtocolError::new(
+                ErrorCode::DaemonInstanceMismatch,
+                "recoverable native Input belongs to another daemon incarnation",
+            )),
+        });
+    }
+    let run = match manager.pin(operation.id) {
+        Ok(run) => run,
+        Err(error) => {
+            return Ok(Response::ControlRejected {
+                failure: control_not_applied(error),
+            });
+        }
+    };
+    match run.recoverable_input(operation).await {
+        Ok(range) => Ok(Response::InputApplied {
+            run: run.info(),
+            range,
+        }),
+        Err(failure) => Ok(Response::ControlRejected { failure }),
     }
 }
 

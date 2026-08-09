@@ -105,6 +105,7 @@ test("shell Integration rejects Level B before a raw fork request", async () => 
     durable_head_seq: null,
     oldest_seq: 0,
     attachments: 0,
+    applied_input_bytes: 0,
   };
 
   await assert.rejects(

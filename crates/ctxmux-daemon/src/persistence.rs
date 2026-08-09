@@ -17,8 +17,8 @@ use std::{
 use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use ctxmux_protocol::{
-    CreateOperationKey, InterruptionReason, OutputChunk, OutputReplay, RunBackend, RunCapabilities,
-    RunId, RunInfo, RunLineage, RunSpec, RunState,
+    CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
+    RunBackend, RunCapabilities, RunId, RunInfo, RunLineage, RunSpec, RunState,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use thiserror::Error;
@@ -380,6 +380,13 @@ impl PersistentRun {
 }
 
 impl Persistence {
+    pub(crate) fn daemon_instance(&self) -> DaemonInstanceId {
+        self.inner
+            .epoch
+            .parse()
+            .expect("persistence serving epoch is a validated UUID")
+    }
+
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
@@ -3184,6 +3191,7 @@ fn decode_recovered_row(
             durable_head_seq: Some(head_seq),
             oldest_seq,
             attachments: 0,
+            applied_input_bytes: None,
         },
         replay: OutputReplay {
             chunks: load_recovered_chunks(connection, &id_text)?,
@@ -4660,6 +4668,7 @@ mod tests {
             durable_head_seq: Some(0),
             oldest_seq: 0,
             attachments: 0,
+            applied_input_bytes: Some(0),
         }
     }
 

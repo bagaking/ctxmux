@@ -361,7 +361,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-6 frames, creation keys, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
+        "generation-7 frames, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",

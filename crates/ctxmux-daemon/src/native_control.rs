@@ -1,7 +1,7 @@
 //! Current-incarnation ownership of one native Run's PTY controls.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fmt,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -11,17 +11,19 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    CommandDisposition, ControlFailure, ControlReceipt, ErrorCode, ProtocolError, RunId,
-    TerminalSize,
+    AppliedInputRange, CommandDisposition, ControlFailure, ControlReceipt, ErrorCode,
+    InputOperationKey, ProtocolError, RunId, TerminalSize,
 };
 use portable_pty::{MasterPty, PtySize};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 const INPUT_QUEUE_MAX_COMMANDS: usize = 1_024;
 const INPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const INPUT_DRAIN_MAX_ACTIVE: usize = 8;
 const INPUT_BURST_MAX_COMMANDS: usize = 64;
 const INPUT_BURST_MAX_BYTES: usize = 256 * 1024;
+const INPUT_RESULT_MAX_ENTRIES: usize = 256;
+const INPUT_RESULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 pub(crate) type ControlResult = Result<ControlReceipt, ControlFailure>;
 
@@ -29,6 +31,17 @@ pub(crate) type ControlResult = Result<ControlReceipt, ControlFailure>;
 pub(crate) struct PendingInput {
     run_id: RunId,
     reply: oneshot::Receiver<ControlResult>,
+}
+
+type RecoverableInputResult = Result<AppliedInputRange, ControlFailure>;
+
+#[derive(Debug)]
+pub(crate) enum PendingRecoverableInput {
+    Ready(RecoverableInputResult),
+    Pending {
+        run_id: RunId,
+        result: watch::Receiver<Option<RecoverableInputResult>>,
+    },
 }
 
 #[derive(Debug)]
@@ -212,6 +225,12 @@ struct NativeControlState {
     input_commands: usize,
     input_bytes: usize,
     input_scheduled: bool,
+    applied_input_bytes: u64,
+    input_operations: HashMap<InputOperationKey, InputOperationEntry>,
+    completed_input_operations: VecDeque<InputOperationKey>,
+    retained_input_request_bytes: usize,
+    input_result_max_entries: usize,
+    input_result_max_request_bytes: usize,
     child_sender: Option<mpsc::Sender<ChildCommand>>,
 }
 
@@ -223,8 +242,47 @@ enum ControlPhase {
 }
 
 struct InputCommand {
-    data: Vec<u8>,
-    reply: oneshot::Sender<ControlResult>,
+    data: Arc<[u8]>,
+    reply: InputReply,
+}
+
+enum InputReply {
+    Legacy(oneshot::Sender<ControlResult>),
+    Recoverable {
+        key: InputOperationKey,
+        completion: watch::Sender<Option<RecoverableInputResult>>,
+    },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct InputOperationRequest {
+    expected_byte: u64,
+    data: Arc<[u8]>,
+}
+
+enum InputOperationEntry {
+    Pending {
+        request: InputOperationRequest,
+        completion: watch::Sender<Option<RecoverableInputResult>>,
+    },
+    Completed {
+        request: InputOperationRequest,
+        range: AppliedInputRange,
+    },
+    Unknown {
+        request: InputOperationRequest,
+        failure: ControlFailure,
+    },
+}
+
+impl InputOperationEntry {
+    fn request(&self) -> &InputOperationRequest {
+        match self {
+            Self::Pending { request, .. }
+            | Self::Completed { request, .. }
+            | Self::Unknown { request, .. } => request,
+        }
+    }
 }
 
 trait PtyControl: Send {
@@ -265,6 +323,26 @@ impl NativeControlOwner {
         writer: Box<dyn Write + Send>,
         input_drains: InputDrainGate,
     ) -> (Self, mpsc::Receiver<ChildCommand>) {
+        Self::new_with_pty_and_input_results(
+            run_id,
+            pty,
+            writer,
+            input_drains,
+            INPUT_RESULT_MAX_ENTRIES,
+            INPUT_RESULT_MAX_REQUEST_BYTES,
+        )
+    }
+
+    fn new_with_pty_and_input_results(
+        run_id: RunId,
+        pty: Box<dyn PtyControl>,
+        writer: Box<dyn Write + Send>,
+        input_drains: InputDrainGate,
+        input_result_max_entries: usize,
+        input_result_max_request_bytes: usize,
+    ) -> (Self, mpsc::Receiver<ChildCommand>) {
+        debug_assert!(input_result_max_entries > 0);
+        debug_assert!(input_result_max_request_bytes > 0);
         let (child_sender, child_receiver) = mpsc::channel();
         (
             Self {
@@ -279,6 +357,12 @@ impl NativeControlOwner {
                         input_commands: 0,
                         input_bytes: 0,
                         input_scheduled: false,
+                        applied_input_bytes: 0,
+                        input_operations: HashMap::new(),
+                        completed_input_operations: VecDeque::new(),
+                        retained_input_request_bytes: 0,
+                        input_result_max_entries,
+                        input_result_max_request_bytes,
                         child_sender: Some(child_sender),
                     }),
                     reap: Mutex::new(ChildReapState::Pending {
@@ -322,8 +406,8 @@ impl NativeControlOwner {
             state.input_commands += 1;
             state.input_bytes += data.len();
             state.input_queue.push_back(InputCommand {
-                data,
-                reply: reply_tx,
+                data: Arc::from(data),
+                reply: InputReply::Legacy(reply_tx),
             });
             let schedule = !state.input_scheduled;
             if schedule {
@@ -339,6 +423,100 @@ impl NativeControlOwner {
             run_id: self.inner.run_id,
             reply,
         })
+    }
+
+    pub(crate) fn begin_recoverable_input(
+        &self,
+        key: InputOperationKey,
+        expected_byte: u64,
+        data: Vec<u8>,
+    ) -> Result<PendingRecoverableInput, ControlFailure> {
+        key.validate().map_err(|error| {
+            not_applied(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+            ))
+        })?;
+        if data.is_empty() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                "recoverable native Input must not be empty",
+            )));
+        }
+        let request = InputOperationRequest {
+            expected_byte,
+            data: Arc::from(data),
+        };
+        let (pending, schedule) = {
+            let mut state = mutex_lock(&self.inner.state);
+            if let Some(retained) =
+                retained_input_result(&state, &key, &request, self.inner.run_id)?
+            {
+                return Ok(retained);
+            }
+            if state.phase != ControlPhase::Open {
+                return Err(not_applied(invalid_phase_error(
+                    self.inner.run_id,
+                    state.phase,
+                    "write to",
+                )));
+            }
+            if let Some(error) = &state.input_failure {
+                return Err(not_applied(error.clone()));
+            }
+            evict_completed_input_results(&mut state, request.data.len());
+            if state.input_operations.len() >= state.input_result_max_entries
+                || request.data.len()
+                    > state
+                        .input_result_max_request_bytes
+                        .saturating_sub(state.retained_input_request_bytes)
+                || state.input_commands >= INPUT_QUEUE_MAX_COMMANDS
+                || request.data.len() > INPUT_QUEUE_MAX_BYTES.saturating_sub(state.input_bytes)
+            {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::ControlBackpressure,
+                    format!(
+                        "Run {} recoverable Input result or queue capacity is full",
+                        self.inner.run_id
+                    ),
+                )));
+            }
+
+            let (completion, result) = watch::channel(None);
+            state.input_commands += 1;
+            state.input_bytes += request.data.len();
+            state.retained_input_request_bytes += request.data.len();
+            state.input_operations.insert(
+                key.clone(),
+                InputOperationEntry::Pending {
+                    request: request.clone(),
+                    completion: completion.clone(),
+                },
+            );
+            state.input_queue.push_back(InputCommand {
+                data: Arc::clone(&request.data),
+                reply: InputReply::Recoverable { key, completion },
+            });
+            let schedule = !state.input_scheduled;
+            if schedule {
+                state.input_scheduled = true;
+            }
+            (
+                PendingRecoverableInput::Pending {
+                    run_id: self.inner.run_id,
+                    result,
+                },
+                schedule,
+            )
+        };
+        if schedule {
+            self.inner.input_drains.schedule(Arc::clone(&self.inner));
+        }
+        Ok(pending)
+    }
+
+    pub(crate) fn applied_input_bytes(&self) -> u64 {
+        mutex_lock(&self.inner.state).applied_input_bytes
     }
 
     pub(crate) fn begin_stop(&self) -> Result<PendingStop, ControlFailure> {
@@ -579,6 +757,25 @@ impl PendingInput {
     }
 }
 
+impl PendingRecoverableInput {
+    pub(crate) async fn resolve(mut self) -> RecoverableInputResult {
+        match &mut self {
+            Self::Ready(result) => result.clone(),
+            Self::Pending { run_id, result } => loop {
+                if let Some(result) = result.borrow().clone() {
+                    return result;
+                }
+                if result.changed().await.is_err() {
+                    return Err(unknown(ProtocolError::new(
+                        ErrorCode::Internal,
+                        format!("Run {run_id} recoverable Input owner ended without a result"),
+                    )));
+                }
+            },
+        }
+    }
+}
+
 impl PendingStop {
     pub(crate) async fn resolve(self, timeout: Duration) -> ControlResult {
         match tokio::time::timeout(timeout, self.reply).await {
@@ -685,6 +882,53 @@ impl NativeControlInner {
     /// Returns true when the lane failed and this worker must stop.
     fn execute_input(&self, command: InputCommand) -> bool {
         let written_bytes = command.data.len();
+        let expected_cursor = match &command.reply {
+            InputReply::Legacy(_) => None,
+            InputReply::Recoverable { key, .. } => {
+                let mut state = mutex_lock(&self.state);
+                let expected = state
+                    .input_operations
+                    .get(key)
+                    .and_then(|entry| match entry {
+                        InputOperationEntry::Pending { request, .. } => Some(request.expected_byte),
+                        InputOperationEntry::Completed { .. }
+                        | InputOperationEntry::Unknown { .. } => None,
+                    })
+                    .expect("queued recoverable Input retains one pending entry");
+                if expected != state.applied_input_bytes {
+                    release_input_capacity(&mut state, written_bytes);
+                    let failure = not_applied(ProtocolError::new(
+                        ErrorCode::InputCursorMismatch,
+                        format!(
+                            "Run {} applied-input cursor is {}, not expected {expected}",
+                            self.run_id, state.applied_input_bytes
+                        ),
+                    ));
+                    remove_input_operation(&mut state, key);
+                    drop(state);
+                    resolve_input_reply(command.reply, Err(failure));
+                    return false;
+                }
+                Some(expected)
+            }
+        };
+        let Some(end_byte) = mutex_lock(&self.state)
+            .applied_input_bytes
+            .checked_add(u64::try_from(written_bytes).expect("bounded frame length fits u64"))
+        else {
+            let mut state = mutex_lock(&self.state);
+            release_input_capacity(&mut state, written_bytes);
+            let failure = not_applied(ProtocolError::new(
+                ErrorCode::InputCursorMismatch,
+                format!("Run {} applied-input cursor is exhausted", self.run_id),
+            ));
+            if let InputReply::Recoverable { key, .. } = &command.reply {
+                remove_input_operation(&mut state, key);
+            }
+            drop(state);
+            resolve_input_reply(command.reply, Err(failure));
+            return false;
+        };
         let result = catch_unwind(AssertUnwindSafe(|| {
             let mut writer = mutex_lock(&self.writer);
             let writer = writer.as_mut().ok_or_else(|| {
@@ -695,51 +939,67 @@ impl NativeControlInner {
                 .and_then(|()| writer.flush())
         }));
 
-        let (receipt, rejected, failed) = {
-            let mut state = mutex_lock(&self.state);
-            release_input_capacity(&mut state, written_bytes);
-            match result {
-                Ok(Ok(())) => (
-                    Ok(ControlReceipt::Input {
-                        written_bytes: u32::try_from(written_bytes)
-                            .expect("bounded input frame length fits u32"),
-                    }),
-                    Vec::new(),
-                    false,
-                ),
-                Ok(Err(error)) => {
-                    let protocol_error = input_failure(
-                        &mut state,
-                        self.run_id,
-                        ErrorCode::Io,
-                        &format!("PTY input I/O failure: {error}"),
-                    );
-                    let queued_error = state
-                        .input_failure
-                        .clone()
-                        .expect("input failure was just recorded");
-                    let rejected = reject_queued_inputs(&mut state, &queued_error);
-                    (Err(unknown(protocol_error)), rejected, true)
-                }
-                Err(_) => {
-                    let protocol_error = input_failure(
-                        &mut state,
-                        self.run_id,
-                        ErrorCode::Internal,
-                        "PTY input writer panicked",
-                    );
-                    let queued_error = state
-                        .input_failure
-                        .clone()
-                        .expect("input failure was just recorded");
-                    let rejected = reject_queued_inputs(&mut state, &queued_error);
-                    (Err(unknown(protocol_error)), rejected, true)
-                }
-            }
-        };
-        let _ = command.reply.send(receipt);
+        let (receipt, rejected, failed) = self.finish_input(
+            &command.reply,
+            written_bytes,
+            expected_cursor,
+            end_byte,
+            result,
+        );
+        resolve_input_reply(command.reply, receipt);
         send_rejections(rejected);
         failed
+    }
+
+    fn finish_input(
+        &self,
+        reply: &InputReply,
+        written_bytes: usize,
+        expected_cursor: Option<u64>,
+        end_byte: u64,
+        result: std::thread::Result<io::Result<()>>,
+    ) -> (
+        RecoverableInputResult,
+        Vec<(InputReply, ControlFailure)>,
+        bool,
+    ) {
+        let mut state = mutex_lock(&self.state);
+        release_input_capacity(&mut state, written_bytes);
+        match result {
+            Ok(Ok(())) => {
+                let start_byte = state.applied_input_bytes;
+                debug_assert_eq!(expected_cursor.unwrap_or(start_byte), start_byte);
+                state.applied_input_bytes = end_byte;
+                let range = AppliedInputRange {
+                    start_byte,
+                    end_byte,
+                };
+                if let InputReply::Recoverable { key, .. } = reply {
+                    let entry = state
+                        .input_operations
+                        .get_mut(key)
+                        .expect("recoverable Input entry remains pending through write");
+                    let request = entry.request().clone();
+                    *entry = InputOperationEntry::Completed { request, range };
+                    state.completed_input_operations.push_back(key.clone());
+                }
+                (Ok(range), Vec::new(), false)
+            }
+            Ok(Err(error)) => finish_failed_input(
+                &mut state,
+                self.run_id,
+                reply,
+                ErrorCode::Io,
+                &format!("PTY input I/O failure: {error}"),
+            ),
+            Err(_) => finish_failed_input(
+                &mut state,
+                self.run_id,
+                reply,
+                ErrorCode::Internal,
+                "PTY input writer panicked",
+            ),
+        }
     }
 
     fn has_more_or_unschedule(&self) -> bool {
@@ -782,14 +1042,39 @@ fn input_failure(
     current
 }
 
+fn finish_failed_input(
+    state: &mut NativeControlState,
+    run_id: RunId,
+    reply: &InputReply,
+    code: ErrorCode,
+    detail: &str,
+) -> (
+    RecoverableInputResult,
+    Vec<(InputReply, ControlFailure)>,
+    bool,
+) {
+    let protocol_error = input_failure(state, run_id, code, detail);
+    let queued_error = state
+        .input_failure
+        .clone()
+        .expect("input failure was just recorded");
+    let rejected = reject_queued_inputs(state, &queued_error);
+    let failure = unknown(protocol_error);
+    retain_unknown_input_operation(state, reply, &failure);
+    (Err(failure), rejected, true)
+}
+
 fn reject_queued_inputs(
     state: &mut NativeControlState,
     error: &ProtocolError,
-) -> Vec<(oneshot::Sender<ControlResult>, ControlFailure)> {
+) -> Vec<(InputReply, ControlFailure)> {
     state.input_scheduled = false;
     let mut rejected = Vec::with_capacity(state.input_queue.len());
     while let Some(command) = state.input_queue.pop_front() {
         release_input_capacity(state, command.data.len());
+        if let InputReply::Recoverable { key, .. } = &command.reply {
+            remove_input_operation(state, key);
+        }
         rejected.push((command.reply, not_applied(error.clone())));
     }
     rejected
@@ -806,9 +1091,99 @@ fn release_input_capacity(state: &mut NativeControlState, bytes: usize) {
         .expect("input byte accounting remains balanced");
 }
 
-fn send_rejections(rejected: Vec<(oneshot::Sender<ControlResult>, ControlFailure)>) {
+fn send_rejections(rejected: Vec<(InputReply, ControlFailure)>) {
     for (reply, failure) in rejected {
-        let _ = reply.send(Err(failure));
+        resolve_input_reply(reply, Err(failure));
+    }
+}
+
+fn resolve_input_reply(reply: InputReply, result: RecoverableInputResult) {
+    match reply {
+        InputReply::Legacy(reply) => {
+            let receipt = result.map(|range| ControlReceipt::Input {
+                written_bytes: u32::try_from(range.end_byte - range.start_byte)
+                    .expect("bounded input frame length fits u32"),
+            });
+            let _ = reply.send(receipt);
+        }
+        InputReply::Recoverable { completion, .. } => {
+            completion.send_replace(Some(result));
+        }
+    }
+}
+
+fn retain_unknown_input_operation(
+    state: &mut NativeControlState,
+    reply: &InputReply,
+    failure: &ControlFailure,
+) {
+    let InputReply::Recoverable { key, .. } = reply else {
+        return;
+    };
+    let entry = state
+        .input_operations
+        .get_mut(key)
+        .expect("recoverable Input failure retains its pending operation");
+    let request = entry.request().clone();
+    *entry = InputOperationEntry::Unknown {
+        request,
+        failure: failure.clone(),
+    };
+}
+
+fn retained_input_result(
+    state: &NativeControlState,
+    key: &InputOperationKey,
+    request: &InputOperationRequest,
+    run_id: RunId,
+) -> Result<Option<PendingRecoverableInput>, ControlFailure> {
+    let Some(existing) = state.input_operations.get(key) else {
+        return Ok(None);
+    };
+    if existing.request() != request {
+        return Err(not_applied(ProtocolError::new(
+            ErrorCode::InputOperationConflict,
+            format!("native Input operation key is retained for another request on Run {run_id}"),
+        )));
+    }
+    let result = match existing {
+        InputOperationEntry::Pending { completion, .. } => PendingRecoverableInput::Pending {
+            run_id,
+            result: completion.subscribe(),
+        },
+        InputOperationEntry::Completed { range, .. } => PendingRecoverableInput::Ready(Ok(*range)),
+        InputOperationEntry::Unknown { failure, .. } => {
+            PendingRecoverableInput::Ready(Err(failure.clone()))
+        }
+    };
+    Ok(Some(result))
+}
+
+fn remove_input_operation(state: &mut NativeControlState, key: &InputOperationKey) {
+    if let Some(entry) = state.input_operations.remove(key) {
+        state.retained_input_request_bytes = state
+            .retained_input_request_bytes
+            .checked_sub(entry.request().data.len())
+            .expect("retained recoverable Input bytes remain balanced");
+    }
+}
+
+fn evict_completed_input_results(state: &mut NativeControlState, new_bytes: usize) {
+    while state.input_operations.len() >= state.input_result_max_entries
+        || new_bytes
+            > state
+                .input_result_max_request_bytes
+                .saturating_sub(state.retained_input_request_bytes)
+    {
+        let Some(key) = state.completed_input_operations.pop_front() else {
+            return;
+        };
+        if matches!(
+            state.input_operations.get(&key),
+            Some(InputOperationEntry::Completed { .. })
+        ) {
+            remove_input_operation(state, &key);
+        }
     }
 }
 
@@ -865,7 +1240,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use ctxmux_protocol::{CommandDisposition, ControlReceipt, ErrorCode, RunId, TerminalSize};
+    use ctxmux_protocol::{
+        AppliedInputRange, CommandDisposition, ControlReceipt, ErrorCode, InputOperationKey, RunId,
+        TerminalSize,
+    };
     use portable_pty::PtySize;
 
     use super::{InputDrainGate, NativeControlOwner, PtyControl, mutex_lock};
@@ -977,6 +1355,29 @@ mod tests {
     impl io::Write for FailingWriter {
         fn write(&mut self, _data: &[u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "fixture failure"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PrefixThenFailWriter {
+        wrote_prefix: bool,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl io::Write for PrefixThenFailWriter {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            if !self.wrote_prefix {
+                self.wrote_prefix = true;
+                mutex_lock(&self.written).push(data[0]);
+                return Ok(1);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fixture partial write",
+            ))
         }
 
         fn flush(&mut self) -> io::Result<()> {
@@ -1234,6 +1635,118 @@ mod tests {
             );
         }
         assert_eq!(*mutex_lock(&written), expected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recoverable_input_owner_deduplicates_ranges_and_fences_evicted_retries() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (owner, _child) = NativeControlOwner::new_with_pty_and_input_results(
+            RunId::new(),
+            Box::new(FakePty::new(0)),
+            Box::new(RecordingWriter(Arc::clone(&written))),
+            InputDrainGate::default(),
+            1,
+            16,
+        );
+        let first_key = InputOperationKey::new("first").expect("valid key");
+        let first = owner
+            .begin_recoverable_input(first_key.clone(), 0, b"A".to_vec())
+            .expect("admit first operation")
+            .resolve()
+            .await
+            .expect("apply first operation");
+        assert_eq!(
+            first,
+            AppliedInputRange {
+                start_byte: 0,
+                end_byte: 1,
+            }
+        );
+
+        assert_eq!(
+            owner
+                .begin_recoverable_input(first_key.clone(), 0, b"A".to_vec())
+                .expect("recover retained operation")
+                .resolve()
+                .await
+                .expect("return retained result"),
+            first
+        );
+        let conflict = owner
+            .begin_recoverable_input(first_key.clone(), 0, b"different".to_vec())
+            .expect_err("retained key rejects another request");
+        assert_eq!(conflict.error.code, ErrorCode::InputOperationConflict);
+        assert_eq!(conflict.disposition, CommandDisposition::NotApplied);
+        assert_eq!(*mutex_lock(&written), b"A");
+
+        owner
+            .begin_input(b"B".to_vec())
+            .expect("legacy input shares the cursor")
+            .resolve()
+            .await
+            .expect("legacy input applies");
+        assert_eq!(owner.applied_input_bytes(), 2);
+
+        assert_eq!(
+            owner
+                .begin_recoverable_input(
+                    InputOperationKey::new("second").expect("valid key"),
+                    2,
+                    b"C".to_vec(),
+                )
+                .expect("new operation evicts completed first result")
+                .resolve()
+                .await
+                .expect("apply second operation"),
+            AppliedInputRange {
+                start_byte: 2,
+                end_byte: 3,
+            }
+        );
+        let stale = owner
+            .begin_recoverable_input(first_key, 0, b"A".to_vec())
+            .expect("stale operation reaches FIFO cursor check")
+            .resolve()
+            .await
+            .expect_err("evicted exact retry fails closed");
+        assert_eq!(stale.error.code, ErrorCode::InputCursorMismatch);
+        assert_eq!(stale.disposition, CommandDisposition::NotApplied);
+        assert_eq!(*mutex_lock(&written), b"ABC");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recoverable_input_pending_retry_joins_one_physical_write() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let written = Arc::new(Mutex::new(0));
+        let (owner, _child) = owner(
+            Box::new(BlockingWriter {
+                started: Some(started_tx),
+                release: Arc::clone(&release),
+                written: Arc::clone(&written),
+            }),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let key = InputOperationKey::new("pending-join").unwrap();
+        let first = owner
+            .begin_recoverable_input(key.clone(), 0, b"AB".to_vec())
+            .expect("admit first caller");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first caller reaches writer");
+        let joined = owner
+            .begin_recoverable_input(key, 0, b"AB".to_vec())
+            .expect("matching pending caller joins");
+
+        release_writer(&release);
+        let expected = AppliedInputRange {
+            start_byte: 0,
+            end_byte: 2,
+        };
+        assert_eq!(first.resolve().await.unwrap(), expected);
+        assert_eq!(joined.resolve().await.unwrap(), expected);
+        assert_eq!(*mutex_lock(&written), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1534,6 +2047,38 @@ mod tests {
                 .expect("stop accepted after input failure"),
             ControlReceipt::Stop
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recoverable_partial_write_retains_unknown_without_an_applied_range() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (owner, _child) = owner(
+            Box::new(PrefixThenFailWriter {
+                wrote_prefix: false,
+                written: Arc::clone(&written),
+            }),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let key = InputOperationKey::new("partial").unwrap();
+        let first = owner
+            .begin_recoverable_input(key.clone(), 0, b"AB".to_vec())
+            .expect("admit partial write")
+            .resolve()
+            .await
+            .expect_err("partial write is ambiguous");
+        assert_eq!(first.disposition, CommandDisposition::Unknown);
+        assert_eq!(owner.applied_input_bytes(), 0);
+        assert_eq!(*mutex_lock(&written), b"A");
+
+        let retry = owner
+            .begin_recoverable_input(key, 0, b"AB".to_vec())
+            .expect("unknown operation remains retained")
+            .resolve()
+            .await
+            .expect_err("retry returns the same unknown result");
+        assert_eq!(retry, first);
+        assert_eq!(*mutex_lock(&written), b"A");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

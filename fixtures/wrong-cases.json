@@ -917,9 +917,21 @@
       "oracle": "The exact retry returns the original half-open byte range and the child observes one payload; every conflicting, stale, or replacement-incarnation request mutates no PTY bytes.",
       "platform": ["unix", "node"],
       "tags": ["input", "idempotency", "response-loss", "cursor", "pty"],
-      "disposition": "future",
-      "activation_task": "T-004",
-      "reason": "Decision 014 is accepted and T-004 owns the protocol, native owner, public clients, and real-PTY oracle."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "recoverable_input_response_loss_reconnects_without_duplicate_write"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "recoverable_input_rejects_another_daemon_instance_before_pty_mutation"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/native_control.rs",
+          "anchor": "recoverable_partial_write_retains_unknown_without_an_applied_range"
+        }
+      ]
     }
   ]
 }

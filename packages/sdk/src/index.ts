@@ -5,6 +5,7 @@ export {
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
   createOperationKey,
+  inputOperationKey,
 } from "./client.js";
 export type {
   AttachmentControlAccepted,
@@ -12,6 +13,7 @@ export type {
   ControlAccepted,
   CtxmuxClientOptions,
   InputReceipt,
+  RecoverableInputOperation,
   ResizeReceipt,
   StopReceipt,
 } from "./client.js";
@@ -39,10 +41,12 @@ export type {
 export {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_FRAME_BYTES,
+  MAX_INPUT_OPERATION_KEY_BYTES,
   PROTOCOL_VERSION,
 } from "./generated/constants.js";
 export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
+export type { AppliedInputRange } from "./generated/AppliedInputRange.js";
 export type { AttachmentCommandId } from "./generated/AttachmentCommandId.js";
 export type { ClientFrame } from "./generated/ClientFrame.js";
 export type { CommandDisposition } from "./generated/CommandDisposition.js";
@@ -50,10 +54,12 @@ export type { ControlFailure } from "./generated/ControlFailure.js";
 export type { ControlOutcome } from "./generated/ControlOutcome.js";
 export type { ControlReceipt } from "./generated/ControlReceipt.js";
 export type { CreateOperationKey } from "./generated/CreateOperationKey.js";
+export type { DaemonInstanceId } from "./generated/DaemonInstanceId.js";
 export type { ErrorCode } from "./generated/ErrorCode.js";
 export type { ForkFidelity } from "./generated/ForkFidelity.js";
 export type { ForkPlan } from "./generated/ForkPlan.js";
 export type { InterruptionReason } from "./generated/InterruptionReason.js";
+export type { InputOperationKey } from "./generated/InputOperationKey.js";
 export type { OutputChunk } from "./generated/OutputChunk.js";
 export type { OutputReplay } from "./generated/OutputReplay.js";
 export type { OutputReplayHeader } from "./generated/OutputReplayHeader.js";
@@ -96,7 +102,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 6. */
+/** Fill the portable defaults required by protocol generation 7. */
 export function defineRun(
   program: string,
   options: {

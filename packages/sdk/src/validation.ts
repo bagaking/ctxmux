@@ -14,6 +14,9 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "unsupported_capability",
   "target_changed",
   "creation_conflict",
+  "input_operation_conflict",
+  "input_cursor_mismatch",
+  "daemon_instance_mismatch",
   "run_capacity",
   "control_backpressure",
   "internal",
@@ -22,7 +25,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-6 wire contract. */
+/** A daemon frame failed the runtime half of the generation-7 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -39,6 +42,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   switch (discriminant(frame, "$frame")) {
     case "hello":
       unsignedInteger(frame.protocol, "$frame.protocol", 0xffff);
+      canonicalUuid(frame.daemon_instance, "$frame.daemon_instance");
       break;
     case "response":
       response(frame.response, "$frame.response");
@@ -64,7 +68,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-6 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-7 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -86,6 +90,10 @@ function response(value: unknown, path: string): void {
       return;
     case "control_rejected":
       controlFailure(valueRecord.failure, `${path}.failure`);
+      return;
+    case "input_applied":
+      runInfo(valueRecord.run, `${path}.run`);
+      appliedInputRange(valueRecord.range, `${path}.range`);
       return;
     case "tmux_panes":
       string(valueRecord.tmux_version, `${path}.tmux_version`);
@@ -161,6 +169,30 @@ function runInfo(value: unknown, path: string): void {
   }
   validateCursorValue(run.oldest_seq, `${path}.oldest_seq`);
   safeUnsignedInteger(run.attachments, `${path}.attachments`);
+  if (run.applied_input_bytes !== null) {
+    validateCursorValue(run.applied_input_bytes, `${path}.applied_input_bytes`);
+  }
+  if (backend === "native" && run.applied_input_bytes === null) {
+    const state = record(run.state, `${path}.state`);
+    if (state.type !== "exited" && state.type !== "interrupted") {
+      throw invalid(
+        `${path}.applied_input_bytes`,
+        "a cursor for a current-incarnation running native Run",
+      );
+    }
+  }
+  if (backend === "tmux" && run.applied_input_bytes !== null) {
+    throw invalid(`${path}.applied_input_bytes`, "null for a tmux Run");
+  }
+}
+
+function appliedInputRange(value: unknown, path: string): void {
+  const range = record(value, path);
+  validateCursorValue(range.start_byte, `${path}.start_byte`);
+  validateCursorValue(range.end_byte, `${path}.end_byte`);
+  if ((range.end_byte as number) <= (range.start_byte as number)) {
+    throw invalid(`${path}.end_byte`, "greater than start_byte");
+  }
 }
 
 function runSpec(value: unknown, path: string): void {
@@ -400,9 +432,17 @@ function protocolError(value: unknown, path: string): void {
 }
 
 function runId(value: unknown, path: string): void {
+  canonicalUuid(value, path, "a canonical UUID Run id");
+}
+
+function canonicalUuid(
+  value: unknown,
+  path: string,
+  expected = "a canonical UUID",
+): void {
   const id = string(value, path);
   if (!CANONICAL_RUN_ID.test(id)) {
-    throw invalid(path, "a canonical UUID Run id");
+    throw invalid(path, expected);
   }
 }
 

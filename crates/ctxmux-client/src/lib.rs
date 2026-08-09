@@ -13,10 +13,11 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
-    ControlFailure, ControlReceipt, CreateOperationKey, ForkPlan, FrameError, MAX_FRAME_BYTES,
-    OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, Request, Response, RunEvent, RunId,
-    RunInfo, RunSpec, ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
+    AppliedInputRange, AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello,
+    CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
+    ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
+    ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSpec,
+    ServerFrame, TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -240,6 +241,15 @@ impl Client {
         self.connect().await.map(|_| ())
     }
 
+    /// Return the identity of the currently reachable daemon incarnation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the handshake cannot complete.
+    pub async fn daemon_instance(&self) -> Result<DaemonInstanceId, ClientError> {
+        self.connect().await.map(|(_, instance)| instance)
+    }
+
     /// Start one daemon-owned native Run.
     ///
     /// # Errors
@@ -404,6 +414,64 @@ impl Client {
         )
     }
 
+    /// Execute or recover one caller-retained native Input operation.
+    ///
+    /// The operation retains its original daemon instance across retries. A
+    /// replacement daemon rejects it before Run lookup or PTY mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request is rejected or no unique
+    /// result can be received.
+    pub async fn recoverable_input(
+        &self,
+        operation: RecoverableInput,
+    ) -> Result<ControlAccepted<AppliedInputRange>, ClientError> {
+        let expected_byte = operation.expected_byte;
+        let expected_run = operation.id;
+        let expected_end = expected_byte
+            .checked_add(u64::try_from(operation.data.len()).map_err(|_| {
+                control_not_applied(ClientError::ProtocolContractViolation(
+                    "recoverable Input payload length does not fit u64",
+                ))
+            })?)
+            .ok_or_else(|| {
+                control_not_applied(ClientError::ProtocolContractViolation(
+                    "recoverable Input expected cursor overflows",
+                ))
+            })?;
+        let request = Request::RecoverableInput { operation };
+        match self.control_request(request).await? {
+            Response::InputApplied { run, range }
+                if run.id == expected_run
+                    && range.start_byte == expected_byte
+                    && range.end_byte == expected_end
+                    && run
+                        .applied_input_bytes
+                        .is_some_and(|cursor| cursor >= range.end_byte) =>
+            {
+                Ok(ControlAccepted {
+                    run,
+                    receipt: range,
+                })
+            }
+            Response::InputApplied { .. } => Err(control_request_unknown(
+                ClientError::ProtocolContractViolation(
+                    "recoverable Input Run, range, or cursor does not prove its request",
+                ),
+            )),
+            Response::ControlRejected { failure } => {
+                validate_control_failure(&failure)
+                    .map_err(ClientError::ProtocolContractViolation)
+                    .map_err(control_request_unknown)?;
+                Err(ClientError::ControlRejected { failure })
+            }
+            _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
+                "expected recoverable Input result",
+            ))),
+        }
+    }
+
     /// Resize one live Run.
     ///
     /// # Errors
@@ -444,7 +512,7 @@ impl Client {
         id: RunId,
         after_seq: u64,
     ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
-        let mut wire = self.connect().await?;
+        let (mut wire, _) = self.connect().await?;
         send(
             &mut wire,
             &ClientFrame::Request {
@@ -473,7 +541,7 @@ impl Client {
     }
 
     async fn request(&self, request: Request) -> Result<Response, ClientError> {
-        let mut wire = self.connect().await?;
+        let (mut wire, _) = self.connect().await?;
         send(&mut wire, &ClientFrame::Request { request }).await?;
         match receive(&mut wire).await? {
             ServerFrame::Response { response } => Ok(response),
@@ -483,7 +551,7 @@ impl Client {
     }
 
     async fn control_request(&self, request: Request) -> Result<Response, ClientError> {
-        let mut wire = self.connect().await.map_err(control_not_applied)?;
+        let (mut wire, _) = self.connect().await.map_err(control_not_applied)?;
         let encoded = encode_frame(&ClientFrame::Request { request })
             .map_err(ClientError::Frame)
             .map_err(control_not_applied)?;
@@ -500,7 +568,7 @@ impl Client {
         }
     }
 
-    async fn connect(&self) -> Result<Wire, ClientError> {
+    async fn connect(&self) -> Result<(Wire, DaemonInstanceId), ClientError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|source| ClientError::Connect {
@@ -518,7 +586,10 @@ impl Client {
         )
         .await?;
         match receive(&mut wire).await? {
-            ServerFrame::Hello { protocol } if protocol == PROTOCOL_VERSION => Ok(wire),
+            ServerFrame::Hello {
+                protocol,
+                daemon_instance,
+            } if protocol == PROTOCOL_VERSION => Ok((wire, daemon_instance)),
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected compatible hello")),
         }

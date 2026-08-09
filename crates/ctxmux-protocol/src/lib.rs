@@ -11,13 +11,16 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Maximum UTF-8 byte length of one caller-owned Run creation operation key.
 pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of one caller-owned native Input operation key.
+pub const MAX_INPUT_OPERATION_KEY_BYTES: usize = 128;
 
 /// Attachment-local correlation identity for one control command.
 ///
@@ -158,6 +161,132 @@ pub enum CreateOperationKeyError {
     /// The UTF-8 representation exceeds the public bound.
     #[error("Run creation operation key is {actual} bytes; maximum is {maximum}")]
     TooLong { actual: usize, maximum: usize },
+}
+
+/// Identity of one running daemon incarnation.
+///
+/// A persistent daemon uses the same freshly generated value as its serving
+/// epoch. The identity is never recovered as authority after restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct DaemonInstanceId(Uuid);
+
+impl DaemonInstanceId {
+    /// Allocate a new random daemon-incarnation identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for DaemonInstanceId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for DaemonInstanceId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for DaemonInstanceId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
+/// Caller-owned identity for one recoverable native Input operation.
+///
+/// The key namespace is one `(daemon incarnation, Run)` pair. Equality is
+/// byte-exact and conflict detection lasts only while the bounded Run-local
+/// operation result remains pending or retained.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct InputOperationKey(String);
+
+impl InputOperationKey {
+    /// Validate and retain one opaque Input operation key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputOperationKeyError`] when the key is empty or exceeds
+    /// [`MAX_INPUT_OPERATION_KEY_BYTES`] UTF-8 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, InputOperationKeyError> {
+        let key = Self(value.into());
+        key.validate()?;
+        Ok(key)
+    }
+
+    /// Generate a fresh opaque key for one logical Input operation.
+    #[must_use]
+    pub fn random() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Return the exact opaque value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validate a key received through an untrusted protocol decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InputOperationKeyError`] for an empty or oversized value.
+    pub fn validate(&self) -> Result<(), InputOperationKeyError> {
+        let bytes = self.0.len();
+        if bytes == 0 {
+            return Err(InputOperationKeyError::Empty);
+        }
+        if bytes > MAX_INPUT_OPERATION_KEY_BYTES {
+            return Err(InputOperationKeyError::TooLong {
+                actual: bytes,
+                maximum: MAX_INPUT_OPERATION_KEY_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for InputOperationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for InputOperationKey {
+    type Err = InputOperationKeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Invalid caller-owned native Input operation key.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum InputOperationKeyError {
+    /// The key has no bytes.
+    #[error("native Input operation key must not be empty")]
+    Empty,
+    /// The UTF-8 representation exceeds the public bound.
+    #[error("native Input operation key is {actual} bytes; maximum is {maximum}")]
+    TooLong { actual: usize, maximum: usize },
+}
+
+/// Exact native Input byte range applied by one recoverable operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct AppliedInputRange {
+    /// Inclusive applied-input cursor before this operation.
+    pub start_byte: u64,
+    /// Exclusive applied-input cursor after this operation.
+    pub end_byte: u64,
 }
 
 /// Stable identity of a Run for the lifetime of its owning daemon.
@@ -442,6 +571,24 @@ pub struct RunInfo {
     pub oldest_seq: u64,
     /// Number of live attachment connections.
     pub attachments: usize,
+    /// Bytes successfully applied by the current native Input owner, or
+    /// `None` when this Run has no current-incarnation native cursor authority.
+    pub applied_input_bytes: Option<u64>,
+}
+
+/// Caller-retained request for one recoverable native Input operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RecoverableInput {
+    /// Daemon incarnation originally observed by the caller.
+    pub daemon_instance: DaemonInstanceId,
+    /// Per-Run operation key retained across response loss.
+    pub operation_key: InputOperationKey,
+    /// Native Run receiving the bytes.
+    pub id: RunId,
+    /// Applied-input cursor expected immediately before this write.
+    pub expected_byte: u64,
+    /// Exact non-empty PTY bytes for this logical operation.
+    pub data: Vec<u8>,
 }
 
 /// One ordered PTY output chunk.
@@ -449,7 +596,7 @@ pub struct RunInfo {
 pub struct OutputChunk {
     /// Monotonically increasing sequence within one Run.
     pub seq: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 6.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 7.
     pub data: Vec<u8>,
 }
 
@@ -512,6 +659,8 @@ pub enum Request {
     Status { id: RunId },
     /// Write bytes to a live Run's PTY.
     Input { id: RunId, data: Vec<u8> },
+    /// Write one caller-keyed native Input whose result survives reconnect.
+    RecoverableInput { operation: RecoverableInput },
     /// Resize a live Run's PTY.
     Resize { id: RunId, size: TerminalSize },
     /// Terminate a live Run.
@@ -617,6 +766,11 @@ pub enum Response {
     },
     /// A short-lived control request failed with an explicit disposition.
     ControlRejected { failure: ControlFailure },
+    /// One recoverable native Input reached the PTY write boundary.
+    InputApplied {
+        run: RunInfo,
+        range: AppliedInputRange,
+    },
 }
 
 /// Snapshot delivered when attachment begins.
@@ -694,6 +848,12 @@ pub enum ErrorCode {
     TargetChanged,
     /// A retained Run creation key names a different canonical request.
     CreationConflict,
+    /// A retained per-Run Input key names a different canonical request.
+    InputOperationConflict,
+    /// Recoverable Input expected another applied-input cursor.
+    InputCursorMismatch,
+    /// Recoverable Input belongs to another daemon incarnation.
+    DaemonInstanceMismatch,
     /// The daemon cannot reserve a retained Run record before mutation.
     RunCapacity,
     /// The bounded live-control path has no capacity for this command.
@@ -727,7 +887,10 @@ impl ProtocolError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// Successful protocol handshake.
-    Hello { protocol: u16 },
+    Hello {
+        protocol: u16,
+        daemon_instance: DaemonInstanceId,
+    },
     /// Result of one short-lived request.
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
@@ -872,11 +1035,12 @@ impl<'de> Visitor<'de> for RejectDuplicateObjectMembers {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlFailure,
-        ControlOutcome, ControlReceipt, CreateOperationKey, ErrorCode, FrameError,
-        MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION, ProtocolError, Response,
-        RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState, ServerFrame, TerminalSize,
-        decode_frame, encode_frame,
+        AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
+        ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
+        ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
+        MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError, RecoverableInput, Request,
+        Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSpec, RunState, ServerFrame,
+        TerminalSize, decode_frame, encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -899,6 +1063,7 @@ mod tests {
             durable_head_seq: None,
             oldest_seq: 0,
             attachments: 1,
+            applied_input_bytes: Some(0),
         }
     }
 
@@ -939,6 +1104,83 @@ mod tests {
         };
         let encoded = encode_frame(&frame).expect("encode handshake");
         assert_eq!(decode_frame::<ClientFrame>(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn recoverable_input_has_exact_generation_7_wire_shapes() {
+        let daemon_instance: DaemonInstanceId =
+            "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
+        let run_id = RunId::new();
+        let operation_key = InputOperationKey::new("input-7").unwrap();
+
+        assert_eq!(
+            serde_json::to_value(ServerFrame::Hello {
+                protocol: PROTOCOL_VERSION,
+                daemon_instance,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "hello",
+                "protocol": 7,
+                "daemon_instance": daemon_instance.to_string(),
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Request::RecoverableInput {
+                operation: RecoverableInput {
+                    daemon_instance,
+                    operation_key,
+                    id: run_id,
+                    expected_byte: 4,
+                    data: vec![0, 255],
+                },
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "recoverable_input",
+                "operation": {
+                    "daemon_instance": daemon_instance.to_string(),
+                    "operation_key": "input-7",
+                    "id": run_id.to_string(),
+                    "expected_byte": 4,
+                    "data": [0, 255],
+                },
+            })
+        );
+
+        let mut run = sample_run_info();
+        run.id = run_id;
+        run.applied_input_bytes = Some(6);
+        let run_value = serde_json::to_value(&run).unwrap();
+        assert_eq!(
+            serde_json::to_value(Response::InputApplied {
+                run,
+                range: AppliedInputRange {
+                    start_byte: 4,
+                    end_byte: 6,
+                },
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "input_applied",
+                "run": run_value,
+                "range": {"start_byte": 4, "end_byte": 6},
+            })
+        );
+
+        assert_eq!(
+            serde_json::to_value([
+                ErrorCode::InputOperationConflict,
+                ErrorCode::InputCursorMismatch,
+                ErrorCode::DaemonInstanceMismatch,
+            ])
+            .unwrap(),
+            serde_json::json!([
+                "input_operation_conflict",
+                "input_cursor_mismatch",
+                "daemon_instance_mismatch",
+            ])
+        );
     }
 
     #[test]
@@ -988,6 +1230,24 @@ mod tests {
         assert!(CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3)).is_ok());
         assert!(
             CreateOperationKey::new("界".repeat(MAX_CREATE_OPERATION_KEY_BYTES / 3 + 1)).is_err()
+        );
+    }
+
+    #[test]
+    fn input_operation_keys_are_bounded_by_exact_utf8_bytes() {
+        let exact = "x".repeat(MAX_INPUT_OPERATION_KEY_BYTES);
+        let key = InputOperationKey::new(exact.clone()).expect("accept exact key ceiling");
+        assert_eq!(key.as_str(), exact);
+        assert_eq!(
+            decode_frame::<InputOperationKey>(&encode_frame(&key).unwrap()).unwrap(),
+            key
+        );
+
+        assert!(InputOperationKey::new("").is_err());
+        assert!(InputOperationKey::new("x".repeat(MAX_INPUT_OPERATION_KEY_BYTES + 1)).is_err());
+        assert!(InputOperationKey::new("界".repeat(MAX_INPUT_OPERATION_KEY_BYTES / 3)).is_ok());
+        assert!(
+            InputOperationKey::new("界".repeat(MAX_INPUT_OPERATION_KEY_BYTES / 3 + 1)).is_err()
         );
     }
 
