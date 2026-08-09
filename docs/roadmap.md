@@ -31,6 +31,7 @@ independently closable; one result must not keep an unrelated owner open.
 | tmux adapter (`f-224czneed`)            | Prove the declared public Control Mode adapter and preserve non-output observation truth across attachment lag.                                                                                 | tmux capability tasks only; no release or Kernel GC work                                                                                       |
 | Composition and release (`f-225cz7943`) | Prove public composition, activation, installation, packaging, independent release review, supported platforms, and local release gates.                                                        | composition example; package/release preparation; daemon activation; release qualification                                                     |
 | Peer performance (`f-22aczwza9`)        | Run one pre-registered, budget-bounded measure/optimize/remeasure cycle and record honest wins, ties, and losses.                                                                               | comparable harness; measured raw-byte ROI decision; bounded-cycle result                                                                       |
+| Recoverable native Input                | Make one native short-lived Input retry-safe after response loss within the same daemon incarnation and report the exact applied PTY byte range.                                                | Rust public vertical; TypeScript parity; bounded review and focused Gate                                                                       |
 
 The earlier reliability-and-performance umbrella `f-226cz5zdq` is superseded
 only after these successor plans and their dependency edges are materialized.
@@ -69,6 +70,20 @@ Acceptance:
 - a child process demonstrably survives CLI and SDK client exit;
 - reconnect receives enough state and subsequent output to continue operating;
 - unsupported or invalid lifecycle operations fail explicitly.
+
+### M1 operation hardening — recoverable native Input
+
+Close response-loss ambiguity for one independently valuable mutation before
+considering a broader control surface. The operation binds a caller-retained
+key to one daemon incarnation, Run, expected byte cursor, and exact non-empty
+payload. Matching retry returns the original byte range without another
+physical write; stale, conflicting, evicted, cross-incarnation, partial, or
+ambiguous cases fail closed.
+
+This milestone does not include durable Resize, arbitrary Signal, owned
+process-group Stop, SSH transport, release work, or Agent message semantics.
+Process-group Stop follows as a separate lifecycle Feature because its target,
+grace, force, and quiescence rules are not Input's mutation algebra.
 
 ## Architecture evidence and failure corpus
 

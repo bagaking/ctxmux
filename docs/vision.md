@@ -59,6 +59,12 @@ provided by an Integration and exposed as explicit capabilities.
 Closing an editor, terminal, or SDK process must not implicitly kill a durable
 Run. Clients can reconnect through a stable local boundary.
 
+Run operations expose only facts owned by the runtime. For input, that can
+include whether one exact byte range crossed the PTY write boundary and whether
+a lost response can be recovered without writing the bytes twice. It does not
+include whether a terminal application interpreted those bytes as a submitted
+message.
+
 ### Unsupported means unsupported
 
 ctxmux fails closed when a requested capability is unavailable. It does not
@@ -68,6 +74,9 @@ silently replace a high-fidelity operation with a weaker one.
 
 ctxmux should make parallel search, Context fork, Crucible, and MapReduce easy
 to compose. It does not own their scheduling, evaluation, or stopping policy.
+Message delivery, semantic acknowledgement, reply correlation, and task state
+likewise remain Integration or harness responsibilities rather than daemon Run
+semantics.
 
 ### Local-first and embeddable
 

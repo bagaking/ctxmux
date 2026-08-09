@@ -29,6 +29,12 @@ The generation fence covers the wire contract only. Generation 6 does not yet
 negotiate runtime build identity, host identity, or a daemon-wide capability
 manifest; those remain separate open work.
 
+Generation 6 also has no daemon-incarnation identity and no recoverable Input
+operation. Its `input` receipt proves the PTY write boundary only when the
+response arrives; reconnecting after response loss cannot distinguish applied
+from unapplied bytes and must not retry. Decision 014 defines the accepted next
+contract without presenting it as implemented generation-6 behavior.
+
 After the handshake, a connection has one of two shapes:
 
 1. A short-lived request receives one response or one explicit error.
@@ -194,6 +200,10 @@ whether a command whose result was lost took effect. On EOF, transport error,
 or fatal protocol violation, the client locally marks every command without its
 unique result as disposition unknown and must not replay uncertain input unless
 a separate operation-specific deduplication contract is introduced.
+
+The planned recoverable Input operation in Decision 014 is that separate
+contract for short-lived native Input only. It does not change the meaning of
+attachment command IDs or generalize recovery to Resize, Stop, or Signal.
 
 Receipts name the precise owner boundary reached:
 

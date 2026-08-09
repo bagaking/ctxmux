@@ -1,0 +1,93 @@
+# 014 — Recoverable native Input operations
+
+- Status: accepted; implementation pending
+- Scope: same-incarnation retry of short-lived native Input after response loss
+
+## Context
+
+Generation 6 correlates attachment controls and returns precise owner receipts,
+but its command IDs end with the connection. If a response disappears after a
+PTY write, a caller cannot tell whether retrying would inject the same bytes a
+second time. This is visible in terminal supervisors such as Orca: accepting
+characters into a PTY is useful evidence, but it is neither proof that a TUI
+submitted them nor proof that another Agent understood a message.
+
+Research under
+`.bagakit/researcher/topics/engineering/recoverable-run-operations/` found that
+the reviewed tmux, Zellij, WezTerm, and Orca public mutation surfaces expose
+actions but not a caller-keyed lost-response result lookup. The Grill decision
+under `.bagakit/grill/runs/local-operation-kernel-boundary/` selected Input as
+the smallest independently valuable ctxmux closure.
+
+## Decision
+
+Add one recoverable short-lived native Input operation in the next protocol
+generation. Its canonical request binds:
+
+- one bounded opaque `InputOperationKey`;
+- the exact daemon-incarnation identity advertised by the handshake;
+- one `RunId`;
+- one non-empty byte payload;
+- the expected applied-input byte cursor.
+
+The native Input owner remains the only physical writer. It serializes the
+operation with existing input, consumes one contiguous range only after the
+complete payload and flush cross the PTY write boundary, and returns
+`[start_byte, end_byte)`. The Run's public applied-input cursor advances for
+every successful legacy or recoverable PTY write so other input cannot be
+silently skipped.
+
+Operation identity is the tuple `(daemon incarnation, RunId, key)`. A
+byte-exact matching request for that tuple joins a pending operation or returns
+its completed result without another write. Reusing the same per-Run key with a
+different expected cursor or payload is a typed conflict. Keys on different
+Runs do not require a daemon-global index. An unexpected cursor is rejected
+before mutation. Empty recoverable input is rejected because it cannot leave
+cursor evidence after result eviction.
+
+The per-Run result ledger is bounded by both entry count and retained request
+bytes. Once a successful result is evicted, its original expected cursor is
+necessarily behind the Run cursor, so replay fails closed rather than becoming
+a new operation. A partial write, flush failure after an uncertain write, or
+writer panic consumes or fences that operation, returns `unknown`, and poisons
+the input lane; ctxmux does not invent an applied byte range.
+
+The daemon incarnation is random and changes on every daemon start. A request
+bound to an earlier incarnation is rejected before Run lookup or PTY mutation.
+Fresh clients must retain the operation's original incarnation rather than
+silently replacing it with the current handshake value. Ctxmux does not claim
+cross-crash exactly-once Input: a PTY write and a durable result ledger cannot
+be committed atomically without a cooperating target protocol.
+
+## Success boundary
+
+```text
+accepted
+  -> bytes_applied [start_byte, end_byte)  # ctxmux
+  -> acknowledged                         # Integration / target protocol
+  -> replied or settled                    # Agent harness
+```
+
+The daemon owns only admission and `bytes_applied`. It must not expose Agent,
+Message, Delivery, ACK, Reply, Task, dispatch, DAG, or UI-timeline concepts.
+
+## Rejected alternatives
+
+- Treat `accepted=true` or a completed socket write as semantic delivery. A PTY
+  has no knowledge of TUI state or message submission.
+- Replay all unknown input. This can duplicate irreversible terminal actions.
+- Persist the ledger across daemon restart. SQLite cannot share an atomic
+  commit boundary with an external PTY write.
+- Generalize Input, Resize, Stop, and Signal behind one public transaction
+  framework. Their targets, idempotence, results, and failure algebra differ.
+- Implement process-group Stop in this Feature. It is valuable but owns a
+  separate lifecycle and quiescence contract.
+
+## Evidence
+
+The representative test uses a real child and public client boundary. It drops
+the first response after one physical write, reconnects with the exact same
+operation, observes the original byte range, and proves from child output that
+the payload arrived once. Focused variants prove conflict, daemon replacement,
+and bounded-ledger stale-cursor rejection. Rust and TypeScript clients must
+agree on the generated wire shape and failure vocabulary.

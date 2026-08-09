@@ -779,6 +779,15 @@ The current clean-consumer audit admits four bounded gaps:
   PTY readback as the applied terminal size, stop acceptance remains distinct
   from final `Exited`, and a lost result remains unknown rather than permission
   to replay input.
+- **Recoverable native Input (accepted, not yet implemented):** one real-PTY
+  public test writes a non-empty operation once, drops its response, reconnects
+  with the same operation, and requires the original applied byte range plus a
+  child-side marker proving no second write. The same bounded vertical covers
+  exact-request conflict, replacement-daemon rejection, and evicted-result
+  stale-cursor rejection. These are one owner-boundary oracle, not a soak,
+  pressure matrix, metrics sink, or general mutation transaction framework.
+  `bytes_applied` proves the daemon-owned PTY boundary only; target semantic
+  acknowledgement and reply evidence remain Integration or harness tests.
 - **Race-safe local activation:** a framework-neutral consumer needs one
   explicit connect-or-activate contract with readiness, version compatibility,
   concurrent-start, socket safety, daemon ownership, logging, and cleanup
