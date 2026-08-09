@@ -2923,13 +2923,16 @@ fn wait_for_child(
                 }
             }
             Ok(ChildCommand::CleanupUnpublished) => {
-                if let Err(error) = session
-                    .stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT)
-                    .map(|_| ())
-                {
-                    control.record_cleanup_error(format!(
-                        "failed to stop unpublished Run session: {error}"
-                    ));
+                match session.stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT) {
+                    Ok((_, status)) => {
+                        control.mark_reaped();
+                        return NativeWaitOutcome::Exited(exit_state(&status));
+                    }
+                    Err(error) => {
+                        control.record_cleanup_error(format!(
+                            "failed to stop unpublished Run session: {error}"
+                        ));
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
