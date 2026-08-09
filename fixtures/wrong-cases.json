@@ -581,14 +581,18 @@
       ],
       "failure_mechanism": "Integration fields interpolated into shell text execute metacharacters or change argv boundaries.",
       "invariant": "Structured executable and argv values are exact; shell use is explicit and bounded.",
-      "preconditions": "The Integration launch-plan builder can start a recording child through the public SDK.",
+      "preconditions": "The Codex Integration launch-plan builder starts a recording child through the public SDK.",
       "action": "Build plans from metacharacter, whitespace, quote, and newline corpus values and launch a recording child.",
       "oracle": "The child observes the exact declared argv with no implicit shell evaluation.",
       "platform": ["node"],
       "tags": ["integration", "argv", "shell-injection", "launch"],
-      "disposition": "future",
-      "activation_task": "future:integration-recording-child",
-      "reason": "Structured launch planning exists, but no continuous public recording-child fixture proves exact argv at the process boundary."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/client-parity.test.ts",
+          "anchor": "Codex Integration records exact argv and leaves the raw Run usable without an observer"
+        }
+      ]
     },
     {
       "id": "INTEGRATION-02",
@@ -598,15 +602,23 @@
         "https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle"
       ],
       "failure_mechanism": "Executable presence is treated as proof of compatible semantic capability.",
-      "invariant": "Version, malformed, and hanging probes fail closed and Level B never silently becomes Level A.",
-      "preconditions": "T-004 provides Integration detection and capability probing.",
+      "invariant": "Capabilities are declared only after bounded, compatible version and help probes succeed.",
+      "preconditions": "The Codex Integration provides bounded version and capability probes.",
       "action": "Probe missing, incompatible, malformed, and silent tool implementations.",
-      "oracle": "Capabilities are declared only after a valid compatible probe and unsupported fidelity remains explicit.",
+      "oracle": "Only a valid compatible probe declares capabilities; every missing, malformed, incompatible, hanging, or failed probe returns unavailable and starts no Run.",
       "platform": ["node"],
       "tags": ["integration", "capability", "probe", "fail-closed"],
-      "disposition": "future",
-      "activation_task": "future:integration-contract",
-      "reason": "Integration capability probes do not exist."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "packages/sdk/test/codex-integration.test.ts",
+          "anchor": "Codex detection fails closed across missing, malformed, incompatible, and hanging probes"
+        },
+        {
+          "path": "packages/sdk/test/integration.test.ts",
+          "anchor": "registerIntegration fails closed before start when detection is unavailable"
+        }
+      ]
     },
     {
       "id": "FORK-01",

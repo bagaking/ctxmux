@@ -8,16 +8,16 @@ This page is the architecture entrypoint. It distinguishes shipped behavior from
 
 Current guarantees are deliberately narrower than the product vision.
 
-| Area             | Current                                                                               | Target or open                                                      |
-| ---------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.   | Restart recovery and upgrade continuity are open.                   |
-| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                             | Windows transport, discovery, and daemon activation are open.       |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 1.              | Other SDKs appear only for a real client requirement.               |
-| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`. | Screen reconstruction and a multi-writer policy are open.           |
-| Backends         | One native `portable-pty` implementation.                                             | A public-surface tmux adapter is provisional.                       |
-| Integrations     | The SDK has an explicit host binding contract and a generic shell Integration.        | The first coding-Agent Integration and semantic observer are next.  |
-| Context and fork | `RunSpec` contains launch inputs only.                                                | Level A and Level B context, artifacts, lineage, and fork are open. |
-| Persistence      | Run metadata and output live in daemon memory.                                        | Durable metadata, GC, and restart reconciliation are open.          |
+| Area             | Current                                                                                                           | Target or open                                                      |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| Run lifetime     | A native PTY child survives CLI and SDK disconnects while its daemon remains alive.                               | Restart recovery and upgrade continuity are open.                   |
+| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                         | Windows transport, discovery, and daemon activation are open.       |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 1.                                          | Other SDKs appear only for a real client requirement.               |
+| Attach           | Retained raw bytes plus ordered live events; interactive CLI raw mode and `Ctrl-b d`.                             | Screen reconstruction and a multi-writer policy are open.           |
+| Backends         | One native `portable-pty` implementation.                                                                         | A public-surface tmux adapter is provisional.                       |
+| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex has bounded probes and host-local JSONL observation. | Context capture, native resume, and fork fidelity remain open.      |
+| Context and fork | `RunSpec` contains launch inputs only.                                                                            | Level A and Level B context, artifacts, lineage, and fork are open. |
+| Persistence      | Run metadata and output live in daemon memory.                                                                    | Durable metadata, GC, and restart reconciliation are open.          |
 
 “Durable” therefore means durable across client lifetimes today. It does not yet mean durable across daemon restart, host reboot, or binary upgrade.
 
@@ -139,7 +139,7 @@ The important guarantees are behavioral, not implied by lock types.
 
 A Backend answers where and how a Run executes. An Integration answers what runs inside it and which extra context operations are honest.
 
-The current native PTY is a Backend implementation even though the public Backend interface has not been extracted. A future Codex Integration may launch through native PTY or tmux without creating two unrelated client APIs.
+The current native PTY is a Backend implementation even though the public Backend interface has not been extracted. The current Codex Integration launches a generic native Run; a future tmux Backend may execute the same Integration plan without creating a second client API.
 
 Integrations remain ordinary TypeScript modules exported by explicitly imported packages; the first-party modules currently use the SDK's `integrations` subpath. The daemon does not discover packages, embed JavaScript, launch plugin processes, or host a marketplace. If an Integration observer disappears, the raw daemon-owned Run must remain usable.
 

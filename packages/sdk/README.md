@@ -40,6 +40,11 @@ no package discovery and owns no Run state. The returned Run remains available
 through `client.status`, `client.attach`, and the rest of the raw SDK even if
 the Integration observer or its host disappears.
 
+The same subpath exports `codexIntegration`. It plans `codex exec --json` only
+after bounded version and help probes confirm JSONL support. Its optional
+observer converts complete JSONL records into host-local semantic events;
+parser diagnostics never replace or hide raw Run output.
+
 ## Attach to a Run
 
 ```ts

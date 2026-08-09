@@ -10,11 +10,17 @@ export const INTEGRATION_API_VERSION = 1 as const;
 export type IntegrationCapability = "semantic_events";
 
 /** Why a tool probe did not establish a compatible Integration. */
-export type IntegrationUnavailableReason = "not_found" | "probe_failed";
+export type IntegrationUnavailableReason =
+  | "not_found"
+  | "probe_timeout"
+  | "probe_failed"
+  | "invalid_version"
+  | "missing_capability";
 
 /** Host-local inputs for bounded tool detection. */
 export interface IntegrationDetectionOptions {
   readonly executable?: string;
+  readonly timeoutMs?: number;
 }
 
 /** A probe established the executable and its declared capabilities. */

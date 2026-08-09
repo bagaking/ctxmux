@@ -1,6 +1,6 @@
 # 010 — Explicit TypeScript Integrations
 
-- Status: provisional
+- Status: accepted
 - Scope: Agent and tool semantics above the generic Run protocol
 
 ## Context
@@ -30,31 +30,29 @@ The daemon does not discover npm packages, load JavaScript, start a plugin proce
 
 ## Known constraints
 
-The TypeScript SDK now owns the generation-1 Integration interface and explicit client binding. The generic shell Integration proves detection and structured launch planning without semantic claims. The first coding-Agent probe and semantic observer are still unimplemented, and context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
+The TypeScript SDK owns the generation-1 Integration interface and explicit client binding. The shell Integration proves detection and structured launch planning without semantic claims. The Codex Integration uses bounded `--version` and `exec --help` probes, launches `codex exec --json` with a structured prompt argument, and offers a disposable JSONL observer. Context capture, native resume, fork fidelity, secrets, and Integration implementation-version identity remain open.
 
 ## Wrong-case corpus
 
 Evidence pack: [integrations track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/integrations.md), claim `C010`.
 
 - `INTEGRATION-01` (`j01`): interpolating workspace paths, prompts, or options into one shell string permits metacharacters to become program text. Launch remains structured executable, argv, cwd, and env by default.
-- `INTEGRATION-02` (`j02`): executable presence is not semantic compatibility. Version, capability, malformed probe, hang, and unknown event paths must fail closed when Level B is requested.
+- `INTEGRATION-02` (`j02`): executable presence is not semantic compatibility. Version, capability, malformed, and hanging probe paths fail closed before launch. Later Level B fidelity remains owned by the fork capability records.
 
 MCP supports the negotiation and timeout principle only. It does not justify JSON-RPC, discovery, a marketplace, or a plugin host for explicitly imported ctxmux Integrations.
 
 ## Fixture mapping
 
-- Current: SDK tests cover explicit binding, fail-closed unavailable detection, structured shell planning, and a shell observer that makes no semantic claims.
-- Future: `INTEGRATION-01` stays inactive until a public recording-child launch proves exact argv at the process boundary; comparing `RunSpec` alone is insufficient.
+- Active: a public Codex recording-child launch proves exact argv and that the raw Run stays usable without an observer.
+- Active: the Codex probe matrix covers missing, malformed, incompatible, and hanging executables before Run launch.
+- Current: SDK tests also cover explicit binding, structured shell planning, a no-claim shell observer, partitioned Codex JSONL, gaps, and parser diagnostics.
 - Candidate activation fixture: Integration host exits while the raw child and Run remain usable.
-- Candidate activation fixture: unsupported executable version fails detection explicitly.
-- Candidate activation fixture: semantic parser failure preserves raw output and lifecycle.
 - Candidate activation fixture: unsupported Level B capability never launches a Level A fork.
 
 ## Open questions
 
 - Which context and fidelity data must later cross the daemon protocol instead of remaining host-local?
 - How are executable version and Integration version recorded for reproducibility?
-- What is the minimum capability set for the first shell and coding-Agent Integrations?
 - How are secrets redacted from plans, events, logs, and fixtures?
 
 ## Repository evidence
@@ -62,4 +60,6 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 - `AGENTS.md`: Integration boundary and project goals
 - `docs/vision.md`: Agent-neutral Run thesis
 - `docs/roadmap.md`: M2
-- `packages/sdk/`: current Integration contract, explicit binding, and shell implementation
+- `packages/sdk/src/integrations/`: current shell and Codex implementations
+- `packages/sdk/test/codex-integration.test.ts`: Codex probe and observer fixtures
+- `packages/sdk/test/client-parity.test.ts`: public Integration launch and raw Run continuity

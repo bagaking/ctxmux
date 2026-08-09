@@ -4,7 +4,7 @@ import {
   spawn,
   type ChildProcess,
 } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -15,9 +15,11 @@ import {
   CtxmuxClient,
   CtxmuxProtocolError,
   defineRun,
+  registerIntegration,
   type RunEvent,
   type RunId,
 } from "../src/index.ts";
+import { codexIntegration } from "../src/integrations/index.ts";
 
 const execFile = promisify(execFileCallback);
 const daemonBinary = requiredEnvironment("CTXMUXD_BIN");
@@ -27,23 +29,7 @@ test(
   "CLI and TypeScript SDK share one daemon-owned Run across client exits",
   { timeout: 15_000 },
   async (context) => {
-    const directory = await mkdtemp(join(tmpdir(), "ctxmux-sdk-"));
-    const socketPath = join(directory, "ctxmux.sock");
-    const daemon = spawn(daemonBinary, ["--socket", socketPath], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
-    let daemonError = "";
-    daemon.stderr?.on("data", (chunk: Buffer) => {
-      daemonError += chunk.toString("utf8");
-      process.stderr.write(chunk);
-    });
-    context.after(async () => {
-      await terminate(daemon);
-      await rm(directory, { recursive: true, force: true });
-    });
-
-    const client = new CtxmuxClient({ socketPath });
-    await waitForDaemon(client, daemon, () => daemonError);
+    const { client, socketPath } = await startTestDaemon(context);
 
     const shell = concatShell(
       "printf 'READY\\n';",
@@ -159,6 +145,84 @@ test(
     await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id));
   },
 );
+
+test(
+  "Codex Integration records exact argv and leaves the raw Run usable without an observer",
+  { timeout: 15_000 },
+  async (context) => {
+    const { client, directory } = await startTestDaemon(context);
+    const executable = join(directory, "codex.mjs");
+    await writeFile(
+      executable,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex-cli 0.144.4");
+} else if (args[0] === "exec" && args[1] === "--help") {
+  console.log("      --json  Print JSONL");
+} else if (args[0] === "exec" && args[1] === "--json" && args[2] === "--") {
+  console.log(JSON.stringify({ type: "thread.started", argv: args }));
+  setInterval(() => {}, 1_000);
+} else {
+  process.exitCode = 64;
+}
+`,
+    );
+    await chmod(executable, 0o755);
+    const prompt = "review 'quoted'; $(touch never)\nthen explain";
+
+    const run = await registerIntegration(client, codexIntegration).start(
+      { prompt, cwd: directory },
+      { executable },
+    );
+    assert.deepEqual(run.spec.args, ["exec", "--json", "--", prompt]);
+    const pid = run.pid;
+    assert.notEqual(pid, null);
+
+    const attachment = await client.attach(run.id);
+    const expectedRecord = JSON.stringify({
+      type: "thread.started",
+      argv: ["exec", "--json", "--", prompt],
+    });
+    await waitForOutput(
+      attachment,
+      replayBytes(attachment.snapshot.replay.chunks),
+      attachment.snapshot.replay.head_seq,
+      expectedRecord,
+    );
+
+    attachment.close();
+    const rawStatus = await waitForNoAttachments(client, run.id);
+    assert.equal(rawStatus.pid, pid);
+    assert.equal(rawStatus.state.type, "running");
+    await client.stop(run.id);
+  },
+);
+
+async function startTestDaemon(context: test.TestContext): Promise<{
+  client: CtxmuxClient;
+  directory: string;
+  socketPath: string;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "ctxmux-sdk-"));
+  const socketPath = join(directory, "ctxmux.sock");
+  const daemon = spawn(daemonBinary, ["--socket", socketPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let daemonError = "";
+  daemon.stderr?.on("data", (chunk: Buffer) => {
+    daemonError += chunk.toString("utf8");
+    process.stderr.write(chunk);
+  });
+  context.after(async () => {
+    await terminate(daemon);
+    await rm(directory, { recursive: true, force: true });
+  });
+
+  const client = new CtxmuxClient({ socketPath });
+  await waitForDaemon(client, daemon, () => daemonError);
+  return { client, directory, socketPath };
+}
 
 async function waitForDaemon(
   client: CtxmuxClient,
