@@ -133,6 +133,7 @@ struct PersistenceInner {
 #[cfg(test)]
 #[derive(Default)]
 struct PersistenceTestHooks {
+    append_transaction_commits: AtomicU64,
     fail_next_insert_after_commit: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
@@ -2377,9 +2378,18 @@ impl StateStore {
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
     ) -> Result<(), PersistenceError> {
+        let mut transaction_batch = Vec::new();
+        let mut transaction_payload = 0_usize;
+        let mut expected_heads = HashMap::new();
         for (id, replay, durable_head) in batch {
             let groups = split_chunks(&replay.chunks)?;
             if groups.is_empty() {
+                if !transaction_batch.is_empty() {
+                    self.append_transaction(&transaction_batch, None)?;
+                    transaction_batch.clear();
+                    transaction_payload = 0;
+                    expected_heads.clear();
+                }
                 self.append_transaction(&[(*id, replay.clone(), Arc::clone(durable_head))], None)?;
                 continue;
             }
@@ -2395,8 +2405,38 @@ impl StateStore {
                     },
                     truncated: replay.truncated,
                 };
-                self.append_transaction(&[(*id, partial, Arc::clone(durable_head))], None)?;
+                let partial_payload = replay_payload(&partial);
+                let first_seq = partial
+                    .chunks
+                    .first()
+                    .expect("a split replay group is non-empty")
+                    .seq;
+                let expected_head = expected_heads
+                    .get(id)
+                    .copied()
+                    .unwrap_or_else(|| durable_head.load(Ordering::Acquire));
+                let is_fresh_contiguous = first_seq == expected_head.saturating_add(1);
+                if !transaction_batch.is_empty()
+                    && (transaction_payload.saturating_add(partial_payload)
+                        > MAX_TRANSACTION_PAYLOAD_BYTES
+                        || !is_fresh_contiguous)
+                {
+                    self.append_transaction(&transaction_batch, None)?;
+                    transaction_batch.clear();
+                    transaction_payload = 0;
+                    expected_heads.clear();
+                }
+                if !is_fresh_contiguous {
+                    self.append_transaction(&[(*id, partial, Arc::clone(durable_head))], None)?;
+                    continue;
+                }
+                transaction_payload = transaction_payload.saturating_add(partial_payload);
+                expected_heads.insert(*id, partial.head_seq);
+                transaction_batch.push((*id, partial, Arc::clone(durable_head)));
             }
+        }
+        if !transaction_batch.is_empty() {
+            self.append_transaction(&transaction_batch, None)?;
         }
         Ok(())
     }
@@ -2556,6 +2596,10 @@ impl StateStore {
             terminal_metadata = Some((Arc::clone(metadata_owner), metadata_bytes));
         }
         transaction.commit().map_err(PersistenceError::database)?;
+        #[cfg(test)]
+        self.test_hooks
+            .append_transaction_commits
+            .fetch_add(1, Ordering::AcqRel);
         for (id, _, durable_head) in batch {
             if let Some(head) = cursor_updates.get(id) {
                 durable_head.store(*head, Ordering::Release);
@@ -4185,6 +4229,69 @@ mod tests {
             assert_eq!((oldest, head, bytes, truncated), (2, 2, 3, 1));
         }
         transaction.commit().expect("commit replay pruning");
+    }
+
+    #[test]
+    fn append_batch_commits_one_collected_payload_unit() {
+        let temp = TempDir::new().expect("create append-batch fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, recovered) =
+            StateStore::open(&state_dir, AdmissionLimits::OPERATIONAL, Arc::clone(&hooks))
+                .expect("open append-batch store");
+        assert!(recovered.is_empty());
+        let first = RunId::new();
+        let second = RunId::new();
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start append-batch fixture transaction");
+        insert_test_run(&transaction, first, "running", 1);
+        insert_test_run(&transaction, second, "running", 1);
+        transaction
+            .commit()
+            .expect("commit append-batch fixture Runs");
+
+        let first_head = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let second_head = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        store
+            .append_batch(&[
+                (
+                    first,
+                    replay(vec![chunk(1, b"aaa")]),
+                    Arc::clone(&first_head),
+                ),
+                (
+                    first,
+                    replay(vec![chunk(2, b"bbb")]),
+                    Arc::clone(&first_head),
+                ),
+                (
+                    second,
+                    replay(vec![chunk(1, b"ccc")]),
+                    Arc::clone(&second_head),
+                ),
+            ])
+            .expect("commit one collected append batch");
+
+        assert_eq!(
+            hooks.append_transaction_commits.load(Ordering::Acquire),
+            1,
+            "one actor-collected payload unit must not expand into per-command COMMITs"
+        );
+        assert_eq!(first_head.load(Ordering::Acquire), 2);
+        assert_eq!(second_head.load(Ordering::Acquire), 1);
+        for (id, expected) in [(first, (1_i64, 2_i64, 6_i64)), (second, (1, 1, 3))] {
+            let actual = store
+                .connection
+                .query_row(
+                    "SELECT durable_oldest_seq, durable_head_seq, replay_bytes FROM runs WHERE id = ?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("read append-batch durable tuple");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
