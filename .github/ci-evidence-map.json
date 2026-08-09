@@ -108,6 +108,20 @@
       ]
     },
     {
+      "id": "reliability-gc-workload-contracts",
+      "kind": "test",
+      "path": "scripts/reliability-gc-workload.test.mjs",
+      "invariants": [
+        "GC Run start and terminal publication remain bounded by the frozen absolute phase deadline rather than an unsourced per-Run timeout"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test scripts/*.test.mjs",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "reliability-rss-sampler-contracts",
       "kind": "test",
       "path": "scripts/reliability-rss-sampler.test.mjs",
