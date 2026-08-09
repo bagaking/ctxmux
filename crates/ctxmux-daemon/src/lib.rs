@@ -27,7 +27,7 @@ use ctxmux_protocol::{
     RunState, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
-use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -161,6 +161,57 @@ impl RunManager {
         runs.sort_by_key(|run| run.id.to_string());
         runs
     }
+
+    #[cfg(test)]
+    fn start_with_setup<F>(&self, spec: RunSpec, setup: F) -> Result<RunInfo, ProtocolError>
+    where
+        F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
+    {
+        let run = Run::spawn_with_setup(spec, setup)?;
+        let info = run.info();
+        write_lock(&self.runs).insert(info.id, run);
+        Ok(info)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LaunchSetupStep {
+    CloneReader,
+    TakeWriter,
+    StartOutputThread,
+    StartWaiterThread,
+}
+
+struct PendingChild {
+    child: Option<Box<dyn Child + Send + Sync>>,
+}
+
+impl PendingChild {
+    const fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child(&self) -> &(dyn Child + Send + Sync) {
+        self.child.as_deref().expect("pending child is present")
+    }
+
+    fn into_child(mut self) -> Box<dyn Child + Send + Sync> {
+        self.child.take().expect("pending child is present")
+    }
+}
+
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Err(error) = child.kill() {
+            eprintln!("ctxmuxd failed to terminate rejected child: {error}");
+        }
+        if let Err(error) = child.wait() {
+            eprintln!("ctxmuxd failed to reap rejected child: {error}");
+        }
+    }
 }
 
 struct Run {
@@ -178,6 +229,13 @@ struct Run {
 
 impl Run {
     fn spawn(spec: RunSpec) -> Result<Arc<Self>, ProtocolError> {
+        Self::spawn_with_setup(spec, |_, _| Ok(()))
+    }
+
+    fn spawn_with_setup<F>(spec: RunSpec, mut setup: F) -> Result<Arc<Self>, ProtocolError>
+    where
+        F: FnMut(LaunchSetupStep, Option<u32>) -> Result<(), ProtocolError>,
+    {
         validate_spec(&spec)?;
         let pair = native_pty_system()
             .openpty(to_pty_size(spec.size))
@@ -191,17 +249,20 @@ impl Run {
             command.env(name, value);
         }
 
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(command)
             .map_err(|error| spawn_error("spawn child", error))?;
         drop(pair.slave);
-        let pid = child.process_id();
-        let killer = child.clone_killer();
+        let pending_child = PendingChild::new(child);
+        let pid = pending_child.child().process_id();
+        let killer = pending_child.child().clone_killer();
+        setup(LaunchSetupStep::CloneReader, pid)?;
         let reader = pair
             .master
             .try_clone_reader()
             .map_err(|error| spawn_error("clone PTY reader", error))?;
+        setup(LaunchSetupStep::TakeWriter, pid)?;
         let writer = pair
             .master
             .take_writer()
@@ -222,6 +283,7 @@ impl Run {
 
         let (output_done_tx, output_done_rx) = mpsc::channel();
         let output_run = Arc::clone(&run);
+        setup(LaunchSetupStep::StartOutputThread, pid)?;
         thread::Builder::new()
             .name(format!("ctxmux-output-{}", run.id))
             .spawn(move || {
@@ -231,9 +293,15 @@ impl Run {
             .map_err(|error| spawn_error("start PTY reader", error))?;
 
         let wait_run = Arc::clone(&run);
+        setup(LaunchSetupStep::StartWaiterThread, pid)?;
+        let (child_tx, child_rx) = mpsc::channel::<PendingChild>();
         thread::Builder::new()
             .name(format!("ctxmux-wait-{}", run.id))
             .spawn(move || {
+                let Ok(pending_child) = child_rx.recv() else {
+                    return;
+                };
+                let mut child = pending_child.into_child();
                 let state = match child.wait() {
                     Ok(status) => RunState::Exited {
                         code: status.exit_code(),
@@ -249,6 +317,12 @@ impl Run {
                 let _ = wait_run.events.send(RunEvent::Exited { state });
             })
             .map_err(|error| spawn_error("start child waiter", error))?;
+        child_tx.send(pending_child).map_err(|_| {
+            spawn_error(
+                "handoff child to waiter",
+                "waiter stopped before taking ownership",
+            )
+        })?;
 
         Ok(run)
     }
@@ -668,16 +742,76 @@ use std::fmt;
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         os::unix::{
             fs::{PermissionsExt, symlink},
             net::UnixListener,
         },
+        process::{Command, Stdio},
     };
 
+    use ctxmux_protocol::{ErrorCode, RunSpec, TerminalSize};
     use tokio::sync::broadcast;
 
-    use super::{OUTPUT_RETENTION_BYTES, OutputLog, ServerError, prepare_socket_path};
+    use super::{
+        LaunchSetupStep, OUTPUT_RETENTION_BYTES, OutputLog, RunManager, ServerError,
+        prepare_socket_path, spawn_error,
+    };
+
+    #[test]
+    fn post_spawn_setup_failures_terminate_reap_and_publish_nothing() {
+        // DR-001: every rejected post-spawn transition rolls child ownership back.
+        for failed_step in [
+            LaunchSetupStep::CloneReader,
+            LaunchSetupStep::TakeWriter,
+            LaunchSetupStep::StartOutputThread,
+            LaunchSetupStep::StartWaiterThread,
+        ] {
+            let manager = RunManager::default();
+            let mut failed_pid = None;
+            let error = manager
+                .start_with_setup(long_running_spec(), |step, pid| {
+                    if step == failed_step {
+                        let pid = pid.expect("native child exposes its pid");
+                        assert!(process_exists(pid), "fixture child must start live");
+                        failed_pid = Some(pid);
+                        return Err(spawn_error("complete injected setup step", "fixture"));
+                    }
+                    Ok(())
+                })
+                .expect_err("injected setup failure rejects start");
+
+            assert_eq!(error.code, ErrorCode::SpawnFailed);
+            assert!(manager.list().is_empty(), "failed start published a Run");
+            let pid = failed_pid.expect("fixture records the rejected child pid");
+            assert!(
+                !process_exists(pid),
+                "{failed_step:?} left child {pid} live or unreaped"
+            );
+        }
+    }
+
+    fn long_running_spec() -> RunSpec {
+        RunSpec {
+            program: "/bin/cat".to_owned(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+        }
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$1\" 2>/dev/null", "ctxmux-fixture"])
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
 
     #[test]
     fn replay_marks_a_cursor_older_than_retained_output_as_truncated() {

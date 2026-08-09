@@ -16,9 +16,13 @@
       "oracle": "The request fails, the Run is absent, and the spawned process is terminated and reaped.",
       "platform": ["unix"],
       "tags": ["daemon", "ownership", "rollback", "process"],
-      "disposition": "future",
-      "activation_task": "future:daemon-launch-fault-injection",
-      "reason": "The native Backend has no deterministic post-spawn fault-injection seam yet."
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "post_spawn_setup_failures_terminate_reap_and_publish_nothing"
+        }
+      ]
     },
     {
       "id": "DR-002",

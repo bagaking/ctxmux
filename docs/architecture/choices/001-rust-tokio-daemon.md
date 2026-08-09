@@ -43,6 +43,7 @@ The Tokio pool regression and Rust child-drop contract constrain ownership and b
 
 ## Fixture mapping
 
+- Active: rejected post-spawn reader, writer, output-thread, and waiter-thread setup transitions terminate and reap the child before returning an error in `lib.rs`.
 - Covered now: client disconnect and reconnect preserve the same child PID in `native_lifecycle.rs` and `client-parity.test.ts`.
 - Candidate: daemon signal, crash, and orphan behavior.
 - Candidate: many-Run thread and memory pressure.
