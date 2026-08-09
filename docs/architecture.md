@@ -38,7 +38,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v8)
+                    Unix domain socket (v9)
                               |
                     long-lived ctxmux daemon
                     - RunManager / RunRegistry / Run identity

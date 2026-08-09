@@ -331,7 +331,7 @@
       "kind": "test",
       "path": "crates/ctxmux-client/src/lib.rs",
       "invariants": [
-        "generation-8 replay accepts an exact advertised byte boundary and rejects range overshoot, non-progress, and premature EOF before exposing a snapshot"
+        "generation-9 replay accepts an exact advertised byte boundary and rejects range overshoot, non-progress, and premature EOF before exposing a snapshot"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -515,7 +515,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-8 frames and cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
+        "generation-9 frames and cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -597,7 +597,7 @@
       "kind": "test",
       "path": "packages/sdk/test/wrong-cases.test.ts",
       "invariants": [
-        "generation-8 replay and runtime validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races"
+        "generation-9 replay and runtime validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races"
       ],
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/wrong-cases.test.ts",
