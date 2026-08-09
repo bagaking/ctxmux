@@ -52,6 +52,7 @@ import {
   type QualificationStatsSample,
 } from "./reliability-gc-stats.mts";
 import {
+  prepareRssSampler,
   startRssSampler,
   type RssSampler,
 } from "./reliability-rss-sampler.mts";
@@ -825,10 +826,12 @@ async function runGcReplayPressure(
   const epochs: Array<Record<string, unknown>> = [];
   try {
     sampler = await startRssSampler(
-      rssSamplerBinary,
-      daemon.child,
-      Number(contract.sampling.rss_interval_ms),
-      Number(contract.sampling.max_rss_sample_gap_ms),
+      await prepareRssSampler(
+        rssSamplerBinary,
+        daemon.child,
+        Number(contract.sampling.rss_interval_ms),
+        Number(contract.sampling.max_rss_sample_gap_ms),
+      ),
     );
     const baseline = sampleProcess(daemon.pid);
     const cpuStart = performance.now();
@@ -976,10 +979,12 @@ async function runGcReplayPressure(
       let recoveredSampler: RssSampler | undefined;
       try {
         recoveredSampler = await startRssSampler(
-          rssSamplerBinary,
-          daemon.child,
-          Number(contract.sampling.rss_interval_ms),
-          Number(contract.sampling.max_rss_sample_gap_ms),
+          await prepareRssSampler(
+            rssSamplerBinary,
+            daemon.child,
+            Number(contract.sampling.rss_interval_ms),
+            Number(contract.sampling.max_rss_sample_gap_ms),
+          ),
         );
         const recoveredBaseline = sampleProcess(daemon.pid);
         const initialStarts = (await daemon.synchronizedStats()).cumulative
@@ -1662,7 +1667,9 @@ async function runSoakScenario(
   const runCount = 8;
   let sampler: RssSampler | undefined;
   try {
-    sampler = await startRssSampler(rssSamplerBinary, daemon.child, 250, 750);
+    sampler = await startRssSampler(
+      await prepareRssSampler(rssSamplerBinary, daemon.child, 250, 750),
+    );
     const baseline = sampleProcess(daemon.pid);
     const runs = await mapLimit(
       Array.from({ length: runCount }, (_, index) => index),
@@ -1852,7 +1859,9 @@ async function measureResources(
   );
   let peakSampler: RssSampler | undefined;
   try {
-    peakSampler = await startRssSampler(rssSamplerBinary, daemon.child, 25, 75);
+    peakSampler = await startRssSampler(
+      await prepareRssSampler(rssSamplerBinary, daemon.child, 25, 75),
+    );
     const baseline = sampleProcess(daemon.pid);
     const startResult = await mapLimitUntilFailure(
       Array.from({ length: count }, (_, index) => index),

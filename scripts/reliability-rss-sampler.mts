@@ -19,6 +19,10 @@ export interface RssSampler {
   readonly stop: () => Promise<void>;
 }
 
+export interface PreparedRssSampler {
+  readonly start: () => Promise<RssSampler>;
+}
+
 interface NativeFrame extends TimedRssSample {
   readonly schema: "ctxmux.rss-sample.v1";
   readonly seq: number;
@@ -33,13 +37,15 @@ const FRAME_FIELDS = [
   "final_frame",
 ] as const;
 const HELPER_REAP_TIMEOUT_MS = 5_000;
+const HELPER_STARTUP_TIMEOUT_MS = 5_000;
+const HELPER_READY_LINE = "ctxmux-rss-sampler-ready-v1";
 
-export async function startRssSampler(
+export async function prepareRssSampler(
   helperBinary: string,
   target: number | ChildProcess,
   intervalMs: number,
   maximumGapMs: number,
-): Promise<RssSampler> {
+): Promise<PreparedRssSampler> {
   const pid = typeof target === "number" ? target : target.pid;
   assert.ok(
     pid !== undefined && Number.isSafeInteger(pid) && pid > 0,
@@ -53,7 +59,6 @@ export async function startRssSampler(
     Number.isSafeInteger(maximumGapMs) && maximumGapMs >= intervalMs,
     "RSS sampler maximum gap is invalid",
   );
-  const observationWindowStartedAtMs = Date.now();
   const child = spawn(
     helperBinary,
     [
@@ -66,32 +71,41 @@ export async function startRssSampler(
     ],
     { stdio: ["pipe", "pipe", "pipe"] },
   );
-  return ownNativeSampler(
+  return prepareNativeSampler(
     child,
     maximumGapMs,
-    observationWindowStartedAtMs,
     typeof target === "number" ? undefined : target,
   );
 }
 
-async function ownNativeSampler(
+export function startRssSampler(
+  prepared: PreparedRssSampler,
+): Promise<RssSampler> {
+  return prepared.start();
+}
+
+async function prepareNativeSampler(
   child: ChildProcessWithoutNullStreams,
   maximumGapMs: number,
-  observationWindowStartedAtMs: number,
   target: ChildProcess | undefined,
-): Promise<RssSampler> {
+): Promise<PreparedRssSampler> {
   const frames: NativeFrame[] = [];
   let stderr = "";
   let stdoutEndedWithNewline = true;
   let failure: Error | undefined;
   let stopping: Promise<void> | undefined;
   let stopRequested = false;
+  let observationWindowStartedAtMs: number | undefined;
+  const helperReady = Promise.withResolvers<void>();
   const ready = Promise.withResolvers<void>();
   const finalFrame = Promise.withResolvers<void>();
   const closed = Promise.withResolvers<number | null>();
   const outputClosed = Promise.withResolvers<void>();
+  void helperReady.promise.catch(() => undefined);
+  void ready.promise.catch(() => undefined);
   const fail = (error: Error): void => {
     failure ??= error;
+    helperReady.reject(failure);
     ready.reject(failure);
   };
   const onTargetExit = (): void => {
@@ -100,6 +114,13 @@ async function ownNativeSampler(
   };
   target?.once("exit", onTargetExit);
   child.stderr.setEncoding("utf8");
+  const stderrLines = createInterface({
+    input: child.stderr,
+    crlfDelay: Infinity,
+  });
+  stderrLines.on("line", (line) => {
+    if (line === HELPER_READY_LINE) helperReady.resolve();
+  });
   child.stderr.on("data", (chunk: string) => {
     stderr += chunk;
   });
@@ -131,9 +152,17 @@ async function ownNativeSampler(
         stopRequested,
       );
       if (frames.length === 0) {
+        assert.notEqual(
+          observationWindowStartedAtMs,
+          undefined,
+          "RSS sampler emitted before start",
+        );
+        const observationDeadlineMs =
+          observationWindowStartedAtMs! + maximumGapMs;
         assert.ok(
-          frame.timestamp_ms >= observationWindowStartedAtMs &&
-            frame.timestamp_ms <= observationWindowStartedAtMs + maximumGapMs,
+          frame.timestamp_ms >= observationWindowStartedAtMs! &&
+            frame.timestamp_ms <= observationDeadlineMs &&
+            Date.now() <= observationDeadlineMs,
           "RSS sampler first observation started outside its contract",
         );
       }
@@ -153,24 +182,32 @@ async function ownNativeSampler(
     }
   });
 
-  try {
-    const readinessDelayMs = Math.max(
-      0,
-      observationWindowStartedAtMs + maximumGapMs - Date.now(),
-    );
-    const readinessTimeout = setTimeout(() => {
-      fail(new Error("RSS sampler did not emit its first frame in time"));
+  const awaitBounded = async (
+    promise: Promise<void>,
+    timeoutMs: number,
+    message: string,
+  ): Promise<void> => {
+    const timeout = setTimeout(() => {
+      fail(new Error(message));
       child.kill("SIGKILL");
-    }, readinessDelayMs);
+    }, timeoutMs);
+    await promise.finally(() => clearTimeout(timeout));
+  };
+
+  try {
     await Promise.race([
-      ready.promise,
+      awaitBounded(
+        helperReady.promise,
+        HELPER_STARTUP_TIMEOUT_MS,
+        "RSS sampler helper did not become ready in time",
+      ),
       outputClosed.promise.then(async () => {
         const code = await closed.promise;
         throw new Error(
-          `RSS sampler exited before readiness with code ${String(code)}: ${stderr.trim()}`,
+          `RSS sampler exited before helper readiness with code ${String(code)}: ${stderr.trim()}`,
         );
       }),
-    ]).finally(() => clearTimeout(readinessTimeout));
+    ]);
   } catch (error) {
     if (child.exitCode === null) child.kill("SIGKILL");
     await Promise.all([closed.promise, outputClosed.promise]);
@@ -227,7 +264,37 @@ async function ownNativeSampler(
     }
   };
 
-  return {
+  const start = async (): Promise<RssSampler> => {
+    assert.equal(
+      observationWindowStartedAtMs,
+      undefined,
+      "RSS sampler preparation can start only once",
+    );
+    observationWindowStartedAtMs = Date.now();
+    child.stdin.write("start\n");
+    try {
+      await Promise.race([
+        awaitBounded(
+          ready.promise,
+          maximumGapMs,
+          "RSS sampler did not emit its first frame in time",
+        ),
+        outputClosed.promise.then(async () => {
+          const code = await closed.promise;
+          throw new Error(
+            `RSS sampler exited before first observation with code ${String(code)}: ${stderr.trim()}`,
+          );
+        }),
+      ]);
+    } catch (error) {
+      if (child.exitCode === null) child.kill("SIGKILL");
+      target?.off("exit", onTargetExit);
+      void Promise.all([closed.promise, outputClosed.promise]);
+      throw error;
+    }
+    return sampler;
+  };
+  const sampler: RssSampler = {
     peak: () =>
       frames.reduce((maximum, sample) => Math.max(maximum, sample.rss_kib), 0),
     sampleCount: () => frames.length,
@@ -239,6 +306,7 @@ async function ownNativeSampler(
       return stopping;
     },
   };
+  return { start };
 }
 
 function validateFrame(

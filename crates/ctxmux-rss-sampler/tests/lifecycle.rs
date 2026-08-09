@@ -22,6 +22,12 @@ fn helper_has_no_descendants_and_reaps_after_one_final_frame() {
         .unwrap();
     let helper_pid = helper.id();
     let mut output = BufReader::new(helper.stdout.take().unwrap());
+    helper
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"start\n")
+        .unwrap();
     let mut frames = Vec::new();
     for _ in 0..4 {
         let mut line = String::new();
@@ -87,6 +93,12 @@ fn helper_fails_when_target_disappears() {
         .spawn()
         .unwrap();
     let mut first = String::new();
+    helper
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"start\n")
+        .unwrap();
     BufReader::new(helper.stdout.take().unwrap())
         .read_line(&mut first)
         .unwrap();

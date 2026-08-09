@@ -26,9 +26,12 @@ struct RssSample {
 }
 
 enum SamplerCommand {
+    Start,
     Stop,
     Invalid(String),
 }
+
+const READY_LINE: &str = "ctxmux-rss-sampler-ready-v1";
 
 fn main() -> ExitCode {
     match parse_args().and_then(|(pid, interval, maximum_gap)| {
@@ -69,16 +72,27 @@ fn parse_args() -> Result<(u32, Duration, Duration), String> {
 fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::io::Result<()> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("ctxmux-rss-stop".to_owned())
+        .name("ctxmux-rss-command".to_owned())
         .spawn(move || {
-            let mut line = String::new();
-            let command = match std::io::stdin().lock().read_line(&mut line) {
-                Ok(_) if line == "stop\n" => SamplerCommand::Stop,
-                Ok(0) => SamplerCommand::Invalid("stdin reached EOF".to_owned()),
-                Ok(_) => SamplerCommand::Invalid("command is not exact stop line".to_owned()),
-                Err(error) => SamplerCommand::Invalid(format!("stdin failed: {error}")),
-            };
-            let _ = sender.send(command);
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            for expected in ["start\n", "stop\n"] {
+                let mut line = String::new();
+                let command = match input.read_line(&mut line) {
+                    Ok(_) if line == expected && expected == "start\n" => SamplerCommand::Start,
+                    Ok(_) if line == expected => SamplerCommand::Stop,
+                    Ok(0) => SamplerCommand::Invalid("stdin reached EOF".to_owned()),
+                    Ok(_) => SamplerCommand::Invalid(format!(
+                        "command is not exact {} line",
+                        expected.trim()
+                    )),
+                    Err(error) => SamplerCommand::Invalid(format!("stdin failed: {error}")),
+                };
+                let terminal = !matches!(command, SamplerCommand::Start);
+                if sender.send(command).is_err() || terminal {
+                    return;
+                }
+            }
         })?;
 
     let pid = Pid::from_u32(pid);
@@ -123,6 +137,28 @@ fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::
         Ok(observation.started_at)
     };
 
+    eprintln!("{READY_LINE}");
+    match receiver.recv() {
+        Ok(SamplerCommand::Start) => {}
+        Ok(SamplerCommand::Stop) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "stop arrived before start",
+            ));
+        }
+        Ok(SamplerCommand::Invalid(message)) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                message,
+            ));
+        }
+        Err(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "command owner disconnected before start",
+            ));
+        }
+    }
     let mut last_started_at = write_sample(false)?;
     loop {
         let wait = (last_started_at + interval).saturating_duration_since(Instant::now());
@@ -130,6 +166,12 @@ fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::
             Ok(SamplerCommand::Stop) => {
                 write_sample(true)?;
                 return Ok(());
+            }
+            Ok(SamplerCommand::Start) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "start command repeated",
+                ));
             }
             Ok(SamplerCommand::Invalid(message)) => {
                 return Err(std::io::Error::new(
@@ -219,23 +261,18 @@ mod tests {
         let pid = Pid::from_u32(std::process::id());
         let refresh = ProcessRefreshKind::nothing().with_memory();
         let mut system = System::new();
-        let mut previous = None;
-        let mut maximum_gap_ms = 0_u128;
+        let mut maximum_refresh_ms = 0_u128;
         for _ in 0..200 {
             let started = Instant::now();
-            if let Some(previous) = previous {
-                maximum_gap_ms = maximum_gap_ms.max(started.duration_since(previous).as_millis());
-            }
             assert_eq!(
                 system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, refresh,),
                 1
             );
-            previous = Some(started);
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            maximum_refresh_ms = maximum_refresh_ms.max(started.elapsed().as_millis());
         }
         assert!(
-            maximum_gap_ms <= 100,
-            "native RSS gap was {maximum_gap_ms}ms"
+            maximum_refresh_ms <= 100,
+            "single-PID RSS refresh took {maximum_refresh_ms}ms"
         );
         let native_kib = system.process(pid).unwrap().memory() / 1024;
         let ps = Command::new("ps")
