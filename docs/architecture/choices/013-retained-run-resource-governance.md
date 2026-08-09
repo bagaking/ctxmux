@@ -104,8 +104,7 @@ Retained
 The same `RegistryState` is the SSOT for a bounded reservation table. Each
 ticket records the preallocated new `RunId`, keyed request identity or unkeyed
 import kind, the new record and logical metadata bytes, exact candidate tickets
-with their persistence-SSOT metadata-byte snapshots, and
-`reserved | physical_started | committed` disposition; each
+with their persistence-SSOT metadata-byte snapshots; each
 `Collecting(ticket)` entry points back to that table. Candidates are exclusive
 to one ticket. For each uncommitted ticket, the projected record burden is
 `max(0, 1 - own_candidate_count)` and the projected persistent-metadata burden
@@ -118,9 +117,13 @@ its exact candidates, moves the real delta into current state, and removes its
 projected burden, so every possible ticket completion order remains within both
 ceilings without serializing ordinary launches. An optional multi-candidate
 ticket marks the one allowed metadata-pressure prefix. Abort, publication,
-persistent COMMIT, and shutdown mutate this table under the same Registry write
-lock; no atomic counter, SQLite query, or publication thread maintains parallel
-reservation truth.
+and shutdown restore or consume this table under the Registry write lock.
+Durable COMMIT occurs under the persistence owner without a Registry lock; its
+`Committed` receipt later drives one infallible Registry consume. Physical-start
+and durable COMMIT disposition remain with the creation owner and persistence
+receipt respectively; the Registry does not duplicate those states. No atomic
+counter, SQLite query, or publication thread maintains parallel reservation
+truth.
 
 A long-lived lookup pins the Run by cloning its `Arc` while the Registry lock
 still observes `Retained`. The collector acquires the Registry write lock,
@@ -648,14 +651,17 @@ or deterministic-owner fixtures.
   admission fixtures.
 - Existing native-control and tmux completion fixtures prove the Backend-local
   quiescence oracles reused by memory-only eligibility.
-- Implemented/T-029: exact multi-candidate SQLite replacement, wrong candidate
-  identity, pre-COMMIT cleanup, persistence-finalize eligibility, same-epoch
-  key replacement, restart convergence, bounded startup normalization, real
-  process crash immediately before/after ordinary COMMIT, and actor-routed
-  old/new/hybrid COMMIT-error classification. A separate process also proves a
+- Implemented/T-029: production exact replacement supports the deterministic
+  metadata-pressure candidate prefix; focused fixtures cover one exact
+  candidate's identity, pre-COMMIT cleanup, persistence-finalize eligibility,
+  same-epoch key replacement, restart convergence, bounded startup
+  normalization, real process crash immediately before/after ordinary COMMIT,
+  and actor-routed old/new/hybrid COMMIT-error classification. A separate
+  multi-candidate crash oracle remains future hardening rather than shipped
+  evidence. A separate process also proves a
   committed startup-normalization failure returns before socket publication and
-  the next open resumes to the canonical 128 records. The source-bound Task
-  Gate remains required before T-029 closes.
+  the next open resumes to the canonical 128 records. T-029 closed with its
+  source-bound Task Gate passing.
 - T-028: reduced-ceiling concurrent reservations exercise the 127-to-129
   projection invariant under reverse publication order without a production
   process census.

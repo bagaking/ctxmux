@@ -50,13 +50,14 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 6 directly replaces generation 5. It adds the narrow
-`run_capacity` error for retained-Run admission that fails before a Backend
-mutation boundary. It retains the correlated attachment controls, typed owner
-receipts, failure dispositions, and applied PTY-size readback introduced by
-generation 5, plus the bounded creation keys introduced by generation 4. An
+Protocol generation 7 directly replaces generation 6. It adds daemon-instance
+identity plus recoverable native Input operation keys and receipts. It retains
+the narrow `run_capacity` error for retained-Run admission introduced by
+generation 6, the correlated attachment controls, typed owner receipts,
+failure dispositions, and applied PTY-size readback introduced by generation
+5, plus the bounded creation keys introduced by generation 4. An
 older peer fails the exact generation handshake before request dispatch;
-ctxmux does not provide a generation-5 fallback, migration, alias, or dual
+ctxmux does not provide a generation-6 fallback, migration, alias, or dual
 encoding.
 Compatibility policy is not yet a release guarantee.
 
@@ -72,7 +73,7 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 ## Fixture mapping
 
-- Covered now: generation-5 mismatch before request dispatch, wrong lifecycle
+- Covered now: generation mismatch before request dispatch, wrong lifecycle
   requests, socket mode, active-listener refusal, non-socket and symlink
   refusal.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.

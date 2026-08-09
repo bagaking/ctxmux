@@ -35,12 +35,14 @@ The protocol is the stable client boundary. Rust ABI, N-API, and editor-process 
 ## Known constraints
 
 Daemon shutdown remains abrupt for live native children: there is no graceful
-native Run policy, live restart handoff, global retained-Run/resource quota, or
-panic isolation contract. Optional persistence recovers declared historical
-metadata and replay, but not live PTY authority. One reader thread and one
-waiter thread are created per native Run. Creation admission limits concurrent
-launches to eight, while its bounded shutdown drain cannot hard-cancel a launch
-thread that exceeds the deadline.
+native Run policy, live restart handoff, separate active-Run quota, global
+attachment quota, total RSS quota, or panic isolation contract. The shared
+Registry does enforce a 128-record retained/projected Run ceiling with
+ownership-safe exact replacement. Optional persistence recovers declared
+historical metadata and replay, but not live PTY authority. One reader thread
+and one waiter thread are created per native Run. Creation admission limits
+concurrent launches to eight, while its bounded shutdown drain cannot
+hard-cancel a launch thread that exceeds the deadline.
 
 ## Wrong-case corpus
 
@@ -60,7 +62,9 @@ The Tokio pool regression and Rust child-drop contract constrain ownership and b
 - Covered now: frozen 1/32/128 idle and active resource censuses measure
   per-Run CPU, RSS, thread, and descriptor slopes; creation launch admission is
   independently capped at eight.
-- Candidate: enforce global live/retained Run budgets and GC under pressure.
+- Covered now: memory-only and persistent Registry admission enforce the shared
+  128-record retained/projected ceiling and ownership-safe exact replacement.
+  Sustained pressure and full resource-plateau qualification remain separate.
 
 ## Open questions
 
