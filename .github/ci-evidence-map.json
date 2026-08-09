@@ -299,6 +299,20 @@
       ]
     },
     {
+      "id": "rust-client-replay-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-client/src/lib.rs",
+      "invariants": [
+        "generation-8 replay accepts an exact advertised byte boundary and rejects range overshoot, non-progress, and premature EOF before exposing a snapshot"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "daemon-attachment-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/attachment.rs",
@@ -473,7 +487,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-7 frames, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
+        "generation-8 frames and cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -555,7 +569,7 @@
       "kind": "test",
       "path": "packages/sdk/test/wrong-cases.test.ts",
       "invariants": [
-        "runtime validation, framing, backpressure, and close races reject hostile input"
+        "generation-8 replay and runtime validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races"
       ],
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/wrong-cases.test.ts",
