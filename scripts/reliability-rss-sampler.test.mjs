@@ -19,8 +19,19 @@ async function fixtureHelper(body) {
   return { directory, executable };
 }
 
-test("RSS sampling survives qualification event-loop stalls", async () => {
-  const sampler = await startRssSampler(helper, process.pid, 25, 100);
+function sampleFrame(overrides = {}) {
+  return JSON.stringify({
+    schema: "ctxmux.rss-sample.v1",
+    timestamp_ms: Date.now() + 500,
+    seq: 1,
+    rss_kib: 1,
+    final_frame: false,
+    ...overrides,
+  });
+}
+
+test("native RSS sampling continues across qualification event-loop stalls", async () => {
+  const sampler = await startRssSampler(helper, process.pid, 25, 5_000);
   const blockStartedAt = Date.now();
   Atomics.wait(
     new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)),
@@ -42,7 +53,7 @@ test("RSS sampling survives qualification event-loop stalls", async () => {
   );
   assert.ok(
     sampler.maxGapMs() <= 100,
-    `sampler gap ${String(sampler.maxGapMs())}ms crossed the frozen contract`,
+    `native sampler gap ${String(sampler.maxGapMs())}ms crossed the frozen cadence`,
   );
   await sampler.stop();
 });
@@ -53,7 +64,7 @@ test("RSS sampling fails closed when the target cannot be observed", async () =>
     /maximum gap/u,
   );
   await assert.rejects(
-    startRssSampler(helper, 99_999_999, 25, 100),
+    startRssSampler(helper, 99_999_999, 25, 500),
     /target process is unavailable/u,
   );
 });
@@ -70,7 +81,7 @@ test("RSS sampling fails closed when the helper cannot start", async () => {
   );
 });
 
-test("RSS sampling bounds a stuck first observation by the sample gap", async () => {
+test("RSS sampling bounds a stuck first observation by one sample gap", async () => {
   const fixture = await fixtureHelper("exec /bin/sleep 10");
   try {
     const startedAt = Date.now();
@@ -79,8 +90,36 @@ test("RSS sampling bounds a stuck first observation by the sample gap", async ()
       /first frame in time/u,
     );
     assert.ok(
-      Date.now() - startedAt < 1_000,
+      Date.now() - startedAt < 175,
       "first observation escaped the 100ms contract",
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("RSS sampling rejects a first observation timestamp outside the sample gap", async () => {
+  const fixture = await fixtureHelper(
+    `printf '%s\\n' '${sampleFrame({ timestamp_ms: Date.now() + 10_000 })}'`,
+  );
+  try {
+    await assert.rejects(
+      startRssSampler(fixture.executable, process.pid, 25, 5_000),
+      /first observation started outside/u,
+    );
+  } finally {
+    await rm(fixture.directory, { recursive: true, force: true });
+  }
+});
+
+test("RSS sampling rejects first-frame delivery after the sample deadline", async () => {
+  const fixture = await fixtureHelper(
+    `sleep 0.2\nprintf '%s\\n' '${sampleFrame({ timestamp_ms: Date.now() + 25 })}'`,
+  );
+  try {
+    await assert.rejects(
+      startRssSampler(fixture.executable, process.pid, 25, 100),
+      /first frame in time/u,
     );
   } finally {
     await rm(fixture.directory, { recursive: true, force: true });
@@ -89,7 +128,7 @@ test("RSS sampling bounds a stuck first observation by the sample gap", async ()
 
 test("RSS sampling rejects a final frame before readiness", async () => {
   const fixture = await fixtureHelper(
-    'printf \'%s\\n\' \'{"schema":"ctxmux.rss-sample.v1","timestamp_ms":1,"seq":1,"rss_kib":1,"final_frame":true}\'',
+    `printf '%s\\n' '${sampleFrame({ final_frame: true })}'`,
   );
   try {
     await assert.rejects(
@@ -102,8 +141,9 @@ test("RSS sampling rejects a final frame before readiness", async () => {
 });
 
 test("RSS sampling rejects an early final frame after readiness", async () => {
+  const timestamp = Date.now() + 500;
   const fixture = await fixtureHelper(
-    `printf '%s\\n' '{"schema":"ctxmux.rss-sample.v1","timestamp_ms":1,"seq":1,"rss_kib":1,"final_frame":false}' '{"schema":"ctxmux.rss-sample.v1","timestamp_ms":2,"seq":2,"rss_kib":1,"final_frame":true}'`,
+    `printf '%s\\n' '${sampleFrame({ timestamp_ms: timestamp })}' '${sampleFrame({ timestamp_ms: timestamp + 1, seq: 2, final_frame: true })}'`,
   );
   try {
     await assert.rejects(async () => {
@@ -153,7 +193,7 @@ test("RSS sampling bounds and reaps a stuck helper", async () => {
   const fakeHelper = join(directory, "sampler");
   await writeFile(
     fakeHelper,
-    '#!/bin/sh\ntrap \'\' TERM\nprintf \'%s\\n\' \'{"schema":"ctxmux.rss-sample.v1","timestamp_ms":1,"seq":1,"rss_kib":1,"final_frame":false}\'\nexec /bin/sleep 10\n',
+    `#!/bin/sh\ntrap '' TERM\nprintf '%s\\n' '${sampleFrame()}'\nexec /bin/sleep 10\n`,
     "utf8",
   );
   await chmod(fakeHelper, 0o755);
@@ -176,8 +216,9 @@ test("RSS sampling rejects sequence and timestamp gaps", async () => {
       /timestamp gap/u,
     ],
   ]) {
+    const timestamp = Date.now() + 500;
     const fixture = await fixtureHelper(
-      `printf '%s\\n' '{"schema":"ctxmux.rss-sample.v1","timestamp_ms":1,"seq":1,"rss_kib":1,"final_frame":false}' '${secondFrame}'\nexec /bin/sleep 10`,
+      `printf '%s\\n' '${sampleFrame({ timestamp_ms: timestamp })}' '${secondFrame.replace('"timestamp_ms":2', `"timestamp_ms":${String(timestamp + 1)}`).replace('"timestamp_ms":1002', `"timestamp_ms":${String(timestamp + 1001)}`)}'\nexec /bin/sleep 10`,
     );
     try {
       const sampler = await startRssSampler(
@@ -194,15 +235,13 @@ test("RSS sampling rejects sequence and timestamp gaps", async () => {
 });
 
 test("RSS sampling rejects partial EOF", async () => {
-  const fixture = await fixtureHelper(
-    'printf \'%s\' \'{"schema":"ctxmux.rss-sample.v1","timestamp_ms":1,"seq":1,"rss_kib":1,"final_frame":false}\'',
-  );
+  const fixture = await fixtureHelper(`printf '%s' '${sampleFrame()}'`);
   try {
     const sampler = await startRssSampler(
       fixture.executable,
       process.pid,
       25,
-      1_000,
+      5_000,
     );
     await assert.rejects(sampler.stop(), /partial frame/u);
   } finally {

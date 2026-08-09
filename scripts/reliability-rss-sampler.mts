@@ -53,6 +53,7 @@ export async function startRssSampler(
     Number.isSafeInteger(maximumGapMs) && maximumGapMs >= intervalMs,
     "RSS sampler maximum gap is invalid",
   );
+  const observationWindowStartedAtMs = Date.now();
   const child = spawn(
     helperBinary,
     [
@@ -68,6 +69,7 @@ export async function startRssSampler(
   return ownNativeSampler(
     child,
     maximumGapMs,
+    observationWindowStartedAtMs,
     typeof target === "number" ? undefined : target,
   );
 }
@@ -75,6 +77,7 @@ export async function startRssSampler(
 async function ownNativeSampler(
   child: ChildProcessWithoutNullStreams,
   maximumGapMs: number,
+  observationWindowStartedAtMs: number,
   target: ChildProcess | undefined,
 ): Promise<RssSampler> {
   const frames: NativeFrame[] = [];
@@ -127,6 +130,13 @@ async function ownNativeSampler(
         maximumGapMs,
         stopRequested,
       );
+      if (frames.length === 0) {
+        assert.ok(
+          frame.timestamp_ms >= observationWindowStartedAtMs &&
+            frame.timestamp_ms <= observationWindowStartedAtMs + maximumGapMs,
+          "RSS sampler first observation started outside its contract",
+        );
+      }
       frames.push(frame);
       if (frame.final_frame) finalFrame.resolve();
       if (frames.length === 1) {
@@ -144,10 +154,14 @@ async function ownNativeSampler(
   });
 
   try {
+    const readinessDelayMs = Math.max(
+      0,
+      observationWindowStartedAtMs + maximumGapMs - Date.now(),
+    );
     const readinessTimeout = setTimeout(() => {
       fail(new Error("RSS sampler did not emit its first frame in time"));
       child.kill("SIGKILL");
-    }, maximumGapMs);
+    }, readinessDelayMs);
     await Promise.race([
       ready.promise,
       outputClosed.promise.then(async () => {
