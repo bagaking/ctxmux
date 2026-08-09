@@ -70,31 +70,7 @@ fn parse_args() -> Result<(u32, Duration, Duration), String> {
 }
 
 fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::io::Result<()> {
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::Builder::new()
-        .name("ctxmux-rss-command".to_owned())
-        .spawn(move || {
-            let stdin = std::io::stdin();
-            let mut input = stdin.lock();
-            for expected in ["start\n", "stop\n"] {
-                let mut line = String::new();
-                let command = match input.read_line(&mut line) {
-                    Ok(_) if line == expected && expected == "start\n" => SamplerCommand::Start,
-                    Ok(_) if line == expected => SamplerCommand::Stop,
-                    Ok(0) => SamplerCommand::Invalid("stdin reached EOF".to_owned()),
-                    Ok(_) => SamplerCommand::Invalid(format!(
-                        "command is not exact {} line",
-                        expected.trim()
-                    )),
-                    Err(error) => SamplerCommand::Invalid(format!("stdin failed: {error}")),
-                };
-                let terminal = !matches!(command, SamplerCommand::Start);
-                if sender.send(command).is_err() || terminal {
-                    return;
-                }
-            }
-        })?;
-
+    let receiver = spawn_command_reader()?;
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
     let refresh = ProcessRefreshKind::nothing().with_memory();
@@ -137,28 +113,7 @@ fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::
         Ok(observation.started_at)
     };
 
-    eprintln!("{READY_LINE}");
-    match receiver.recv() {
-        Ok(SamplerCommand::Start) => {}
-        Ok(SamplerCommand::Stop) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "stop arrived before start",
-            ));
-        }
-        Ok(SamplerCommand::Invalid(message)) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                message,
-            ));
-        }
-        Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "command owner disconnected before start",
-            ));
-        }
-    }
+    await_start(&receiver)?;
     let mut last_started_at = write_sample(false)?;
     loop {
         let wait = (last_started_at + interval).saturating_duration_since(Instant::now());
@@ -189,6 +144,53 @@ fn run_rss_sampler(pid: u32, interval: Duration, maximum_gap: Duration) -> std::
                 ));
             }
         }
+    }
+}
+
+fn spawn_command_reader() -> std::io::Result<mpsc::Receiver<SamplerCommand>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("ctxmux-rss-command".to_owned())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            for expected in ["start\n", "stop\n"] {
+                let mut line = String::new();
+                let command = match input.read_line(&mut line) {
+                    Ok(_) if line == expected && expected == "start\n" => SamplerCommand::Start,
+                    Ok(_) if line == expected => SamplerCommand::Stop,
+                    Ok(0) => SamplerCommand::Invalid("stdin reached EOF".to_owned()),
+                    Ok(_) => SamplerCommand::Invalid(format!(
+                        "command is not exact {} line",
+                        expected.trim()
+                    )),
+                    Err(error) => SamplerCommand::Invalid(format!("stdin failed: {error}")),
+                };
+                let terminal = !matches!(command, SamplerCommand::Start);
+                if sender.send(command).is_err() || terminal {
+                    return;
+                }
+            }
+        })?;
+    Ok(receiver)
+}
+
+fn await_start(receiver: &mpsc::Receiver<SamplerCommand>) -> std::io::Result<()> {
+    eprintln!("{READY_LINE}");
+    match receiver.recv() {
+        Ok(SamplerCommand::Start) => Ok(()),
+        Ok(SamplerCommand::Stop) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stop arrived before start",
+        )),
+        Ok(SamplerCommand::Invalid(message)) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message,
+        )),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "command owner disconnected before start",
+        )),
     }
 }
 
