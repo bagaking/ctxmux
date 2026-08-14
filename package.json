@@ -2,6 +2,7 @@
   "name": "ctxmux-workspace",
   "version": "0.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "Context-aware Run multiplexer",
   "engines": {
     "node": ">=24"

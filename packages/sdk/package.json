@@ -2,6 +2,7 @@
   "name": "@ctxmux/sdk",
   "version": "0.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "TypeScript SDK for embedding ctxmux",
   "type": "module",
   "exports": {
