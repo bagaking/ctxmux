@@ -144,7 +144,22 @@ pub async fn serve_with_qualification(
     socket_path: impl Into<PathBuf>,
     qualification_stats_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
-    serve_with_persistence(socket_path.into(), None, qualification_stats_fd).await
+    serve_with_inherited_descriptors(socket_path, qualification_stats_fd, None).await
+}
+
+#[doc(hidden)]
+pub async fn serve_with_inherited_descriptors(
+    socket_path: impl Into<PathBuf>,
+    qualification_stats_fd: Option<OwnedFd>,
+    readiness_fd: Option<OwnedFd>,
+) -> Result<(), ServerError> {
+    serve_with_persistence(
+        socket_path.into(),
+        None,
+        qualification_stats_fd,
+        readiness_fd,
+    )
+    .await
 }
 
 /// Serve Runs with historical metadata and replay persisted in `state_dir`.
@@ -167,6 +182,22 @@ pub async fn serve_with_state_dir_and_qualification(
     state_dir: impl Into<PathBuf>,
     qualification_stats_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
+    serve_with_state_dir_and_inherited_descriptors(
+        socket_path,
+        state_dir,
+        qualification_stats_fd,
+        None,
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn serve_with_state_dir_and_inherited_descriptors(
+    socket_path: impl Into<PathBuf>,
+    state_dir: impl Into<PathBuf>,
+    qualification_stats_fd: Option<OwnedFd>,
+    readiness_fd: Option<OwnedFd>,
+) -> Result<(), ServerError> {
     let (persistence, recovered) = Persistence::open(state_dir)?;
     let stats = QualificationStats::from_optional_inherited_fd(
         qualification_stats_fd,
@@ -178,13 +209,14 @@ pub async fn serve_with_state_dir_and_qualification(
         recovered,
         stats,
     ));
-    serve_with_persistence_manager(socket_path.into(), manager).await
+    serve_with_persistence_manager(socket_path.into(), manager, readiness_fd).await
 }
 
 async fn serve_with_persistence(
     socket_path: PathBuf,
     persistence: Option<(Persistence, Vec<RecoveredRun>)>,
     qualification_stats_fd: Option<OwnedFd>,
+    readiness_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     let manager = if let Some((persistence, recovered)) = persistence {
         let stats = QualificationStats::from_optional_inherited_fd(
@@ -206,27 +238,42 @@ async fn serve_with_persistence(
         .map_err(|source| ServerError::io("qualification stats fd", source))?;
         Arc::new(RunManager::with_instance_and_stats(daemon_instance, stats))
     };
-    serve_with_persistence_manager(socket_path, manager).await
+    serve_with_persistence_manager(socket_path, manager, readiness_fd).await
 }
 
 async fn serve_with_persistence_manager(
     socket_path: PathBuf,
     manager: Arc<RunManager>,
+    readiness_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     prepare_socket_path(&socket_path)?;
     let listener =
         UnixListener::bind(&socket_path).map_err(|source| ServerError::io(&socket_path, source))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .map_err(|source| ServerError::io(&socket_path, source))?;
-    serve_with_manager(socket_path, listener, manager).await
+    serve_with_manager(socket_path, listener, manager, readiness_fd).await
 }
 
 async fn serve_with_manager(
     socket_path: PathBuf,
     listener: UnixListener,
     manager: Arc<RunManager>,
+    readiness_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
+    if let Some(readiness_fd) = readiness_fd {
+        let mut readiness = fs::File::from(readiness_fd);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "schema": "ctxmux.daemon-ready.v1",
+            "daemon_instance": manager.daemon_instance.to_string(),
+        }))
+        .map_err(|source| ServerError::io("<readiness-fd>", io::Error::other(source)))?;
+        readiness
+            .write_all(&record)
+            .and_then(|()| readiness.write_all(b"\n"))
+            .and_then(|()| readiness.flush())
+            .map_err(|source| ServerError::io("<readiness-fd>", source))?;
+    }
 
     loop {
         tokio::select! {
@@ -4275,6 +4322,7 @@ mod tests {
                 let result = runtime.block_on(serve_with_persistence_manager(
                     server_socket,
                     server_manager,
+                    None,
                 ));
                 drop(runtime);
                 let _ = server_result_tx.send(result);
@@ -5024,6 +5072,7 @@ mod tests {
                 socket.clone(),
                 listener,
                 Arc::clone(&manager),
+                None,
             ));
             Self {
                 directory,
@@ -5589,6 +5638,7 @@ mod tests {
             socket.clone(),
             listener,
             Arc::clone(&manager),
+            None,
         ));
         let client = Client::new(socket);
 
@@ -5834,6 +5884,7 @@ mod tests {
             target.clone(),
             listener,
             Arc::new(RunManager::default()),
+            None,
         ));
 
         client

@@ -62,7 +62,10 @@ queries the same Run through the public protocol.
 Consumers can use the same shape without saving a path dependency: install the
 tarball into their chosen staging environment with `--no-save`, place the two
 binaries in an application-owned directory, verify every manifest hash, and
-pass the chosen daemon socket to `CtxmuxClient`. Daemon activation, installation
+pass the chosen daemon socket to `CtxmuxClient`. An activator that needs exact
+spawn provenance passes one caller-owned inherited descriptor through
+`ctxmuxd --readiness-fd <fd>` and accepts the socket only when its one readiness
+record matches the public SDK hello instance. Daemon activation, installation
 location, upgrade, logging, and cleanup policy remain consumer responsibilities;
 this artifact set does not silently download or mutate global state.
 

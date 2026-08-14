@@ -1,9 +1,52 @@
-use std::{env, os::fd::RawFd, path::PathBuf, process::ExitCode};
+use std::{
+    env,
+    os::fd::{OwnedFd, RawFd},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use ctxmux_protocol::PROTOCOL_VERSION;
 
 fn usage() -> &'static str {
-    "usage: ctxmuxd --socket <path> [--state-dir <path>]\n       ctxmuxd --version"
+    "usage: ctxmuxd --socket <path> [--state-dir <path>] [--readiness-fd <fd>]\n       ctxmuxd --version"
+}
+
+fn inherited_fd(raw_fd: Option<RawFd>, label: &str) -> Result<Option<OwnedFd>, ExitCode> {
+    raw_fd
+        .map(|raw_fd| {
+            ctxmux_inherited_fd::duplicate_nonblocking_cloexec(raw_fd).map_err(|error| {
+                eprintln!("ctxmuxd: invalid {label} fd: {error}");
+                ExitCode::from(2)
+            })
+        })
+        .transpose()
+}
+
+async fn serve(
+    socket: PathBuf,
+    state_dir: Option<PathBuf>,
+    qualification_stats_fd: Option<OwnedFd>,
+    readiness_fd: Option<OwnedFd>,
+) -> Result<(), ctxmux_daemon::ServerError> {
+    match state_dir {
+        Some(state_dir) => {
+            ctxmux_daemon::serve_with_state_dir_and_inherited_descriptors(
+                socket,
+                state_dir,
+                qualification_stats_fd,
+                readiness_fd,
+            )
+            .await
+        }
+        None => {
+            ctxmux_daemon::serve_with_inherited_descriptors(
+                socket,
+                qualification_stats_fd,
+                readiness_fd,
+            )
+            .await
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -25,9 +68,15 @@ fn main() -> ExitCode {
     let mut socket = None;
     let mut state_dir = None;
     let mut qualification_stats_fd = None;
+    let mut readiness_fd = None;
     while let Some(flag) = args.next() {
-        if flag == "--qualification-stats-fd" {
-            if qualification_stats_fd.is_some() {
+        if flag == "--qualification-stats-fd" || flag == "--readiness-fd" {
+            let target = if flag == "--qualification-stats-fd" {
+                &mut qualification_stats_fd
+            } else {
+                &mut readiness_fd
+            };
+            if target.is_some() {
                 eprintln!("{}", usage());
                 return ExitCode::from(2);
             }
@@ -39,7 +88,7 @@ fn main() -> ExitCode {
                 eprintln!("{}", usage());
                 return ExitCode::from(2);
             };
-            qualification_stats_fd = Some(value);
+            *target = Some(value);
             continue;
         }
         let target = if flag == "--socket" {
@@ -64,15 +113,17 @@ fn main() -> ExitCode {
         eprintln!("{}", usage());
         return ExitCode::from(2);
     };
-    let qualification_stats_fd = match qualification_stats_fd {
-        Some(raw_fd) => match ctxmux_inherited_fd::duplicate_nonblocking_cloexec(raw_fd) {
-            Ok(owned) => Some(owned),
-            Err(error) => {
-                eprintln!("ctxmuxd: invalid qualification stats fd: {error}");
-                return ExitCode::from(2);
-            }
-        },
-        None => None,
+    if readiness_fd.is_some() && readiness_fd == qualification_stats_fd {
+        eprintln!("ctxmuxd: readiness and qualification descriptors must be distinct");
+        return ExitCode::from(2);
+    }
+    let qualification_stats_fd = match inherited_fd(qualification_stats_fd, "qualification stats") {
+        Ok(fd) => fd,
+        Err(exit) => return exit,
+    };
+    let readiness_fd = match inherited_fd(readiness_fd, "readiness") {
+        Ok(fd) => fd,
+        Err(exit) => return exit,
     };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -84,19 +135,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = runtime.block_on(async move {
-        match state_dir {
-            Some(state_dir) => {
-                ctxmux_daemon::serve_with_state_dir_and_qualification(
-                    socket,
-                    state_dir,
-                    qualification_stats_fd,
-                )
-                .await
-            }
-            None => ctxmux_daemon::serve_with_qualification(socket, qualification_stats_fd).await,
-        }
-    });
+    let result = runtime.block_on(serve(
+        socket,
+        state_dir,
+        qualification_stats_fd,
+        readiness_fd,
+    ));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

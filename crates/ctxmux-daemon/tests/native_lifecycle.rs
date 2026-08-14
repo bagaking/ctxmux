@@ -15,6 +15,7 @@ use ctxmux_protocol::{
     decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -79,6 +80,25 @@ impl TestDaemon {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn ctxmuxd with qualification descriptor");
+        Self::from_spawned(child, directory, socket).await
+    }
+
+    async fn start_with_readiness_fd(receipt: &Path) -> Self {
+        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let socket = directory.path().join("ctxmux.sock");
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec 3>\"$1\"; shift; exec \"$@\" --readiness-fd 3")
+            .arg("ctxmux-readiness-fd-fixture")
+            .arg(receipt)
+            .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn ctxmuxd with readiness descriptor");
         Self::from_spawned(child, directory, socket).await
     }
 
@@ -1803,6 +1823,49 @@ async fn native_pty_child_does_not_inherit_the_private_qualification_descriptor(
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inherited_readiness_receipt_matches_the_public_daemon_instance() {
+    let receipt_directory = tempfile::tempdir().expect("create readiness receipt directory");
+    let receipt = receipt_directory.path().join("ready.ndjson");
+    let daemon = TestDaemon::start_with_readiness_fd(&receipt).await;
+    let content = std::fs::read_to_string(&receipt).expect("read readiness receipt");
+    assert_eq!(content.lines().count(), 1);
+    let record: Value = serde_json::from_str(&content).expect("parse readiness receipt");
+    assert_eq!(record["schema"], "ctxmux.daemon-ready.v1");
+    assert_eq!(
+        record["daemon_instance"],
+        daemon
+            .client
+            .daemon_instance()
+            .await
+            .expect("read public daemon instance")
+            .to_string()
+    );
+
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "( : >&3 ) 2>/dev/null && printf LEAKED || printf CLOSED".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::default(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start readiness-descriptor probe Run");
+    wait_until_exited(&daemon.client, run.id).await;
+    let (_, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("replay readiness-descriptor probe");
+    assert_eq!(replay_bytes(&snapshot.replay.chunks), b"CLOSED");
+}
+
 #[test]
 fn closed_qualification_descriptor_fails_before_the_async_runtime_starts() {
     let directory = tempfile::tempdir().expect("create invalid descriptor fixture directory");
@@ -1824,6 +1887,63 @@ fn closed_qualification_descriptor_fails_before_the_async_runtime_starts() {
         !String::from_utf8_lossy(&output.stderr).contains("panicked")
             && !String::from_utf8_lossy(&output.stderr).contains("tokio-runtime-worker"),
         "Tokio must not start with or later lose the rejected descriptor",
+    );
+}
+
+#[test]
+fn closed_or_conflicting_readiness_descriptor_fails_before_startup() {
+    let directory = tempfile::tempdir().expect("create invalid readiness fixture directory");
+    let socket = directory.path().join("ctxmux.sock");
+    let closed = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3>&-; exec \"$1\" --socket \"$2\" --readiness-fd 3")
+        .arg("ctxmux-closed-readiness-fd-fixture")
+        .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg(&socket)
+        .output()
+        .expect("run ctxmuxd with a closed readiness descriptor");
+    assert_eq!(closed.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&closed.stderr).contains("invalid readiness fd"));
+
+    let receipt = directory.path().join("conflicting.ndjson");
+    let conflicting = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3>\"$1\"; shift; exec \"$@\" --qualification-stats-fd 3 --readiness-fd 3")
+        .arg("ctxmux-conflicting-readiness-fd-fixture")
+        .arg(&receipt)
+        .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .expect("run ctxmuxd with conflicting inherited descriptors");
+    assert_eq!(conflicting.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&conflicting.stderr)
+            .contains("readiness and qualification descriptors must be distinct")
+    );
+}
+
+#[test]
+fn readiness_write_failure_removes_the_unpublished_socket() {
+    let directory = tempfile::tempdir().expect("create readiness write fixture directory");
+    let socket = directory.path().join("ctxmux.sock");
+    let sentinel = directory.path().join("read-only");
+    std::fs::write(&sentinel, b"read-only").expect("write readiness sentinel");
+    let output = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("exec 3<\"$1\"; shift; exec \"$@\" --readiness-fd 3")
+        .arg("ctxmux-readiness-write-failure-fixture")
+        .arg(&sentinel)
+        .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg("--socket")
+        .arg(&socket)
+        .output()
+        .expect("run ctxmuxd with a read-only readiness descriptor");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("<readiness-fd>"));
+    assert!(
+        !socket.exists(),
+        "failed readiness publication must remove the socket"
     );
 }
 

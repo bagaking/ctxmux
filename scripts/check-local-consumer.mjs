@@ -312,8 +312,8 @@ const daemonVersion = (await execFile(daemonBinary, ["--version"])).stdout.trim(
 assert.equal(cliVersion, "ctxmux " + expectedVersion + " (protocol " + expectedProtocol + ")");
 assert.equal(daemonVersion, "ctxmuxd " + expectedVersion + " (protocol " + expectedProtocol + ")");
 
-const daemon = spawn(daemonBinary, ["--socket", socketPath], {
-  stdio: ["ignore", "ignore", "pipe"],
+const daemon = spawn(daemonBinary, ["--socket", socketPath, "--readiness-fd", "3"], {
+  stdio: ["ignore", "ignore", "pipe", "pipe"],
 });
 let daemonStderr = "";
 daemon.stderr.setEncoding("utf8");
@@ -321,6 +321,31 @@ daemon.stderr.on("data", (chunk) => {
   daemonStderr += chunk;
 });
 const client = new CtxmuxClient({ socketPath });
+const readinessStream = daemon.stdio[3];
+assert(readinessStream);
+
+const readiness = new Promise((resolve, reject) => {
+  let content = "";
+  const timeout = setTimeout(() => {
+    readinessStream.destroy();
+    reject(new Error("artifact daemon readiness receipt timed out"));
+  }, 5_000);
+  readinessStream.setEncoding("utf8");
+  readinessStream.on("data", (chunk) => {
+    content += chunk;
+    assert(Buffer.byteLength(content) <= 8 * 1024);
+    const newline = content.indexOf("\n");
+    if (newline < 0) return;
+    clearTimeout(timeout);
+    readinessStream.destroy();
+    assert.equal(content.slice(newline + 1).trim(), "");
+    resolve(JSON.parse(content.slice(0, newline)));
+  });
+  readinessStream.once("error", reject);
+  readinessStream.once("close", () => {
+    if (!content.includes("\n")) reject(new Error("artifact daemon readiness receipt closed early"));
+  });
+});
 
 function replayBytes(chunks) {
   return Uint8Array.from(chunks.flatMap((chunk) => [...chunk.data]));
@@ -338,6 +363,9 @@ function text(bytes) {
 }
 
 async function waitForDaemon() {
+  const receipt = await readiness;
+  assert.deepEqual(Object.keys(receipt).sort(), ["daemon_instance", "schema"]);
+  assert.equal(receipt.schema, "ctxmux.daemon-ready.v1");
   const deadline = Date.now() + 5_000;
   let lastError;
   while (Date.now() <= deadline) {
@@ -345,7 +373,7 @@ async function waitForDaemon() {
       throw new Error("artifact daemon exited before readiness: " + daemonStderr);
     }
     try {
-      await client.ping();
+      assert.equal(await client.daemonInstance(), receipt.daemon_instance);
       return;
     } catch (error) {
       lastError = error;

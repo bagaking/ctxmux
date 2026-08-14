@@ -424,6 +424,26 @@ late attachment behavior.
 
 ## Lifetime and persistent mode
 
+An embedding parent that starts `ctxmuxd` may add `--readiness-fd <fd>`. The
+descriptor must be an inherited non-standard descriptor distinct from the
+private qualification descriptor. ctxmux duplicates it with close-on-exec and,
+only after the Unix listener is bound, mode `0600` is applied, and the socket
+guard is armed, writes exactly one NDJSON record:
+
+```json
+{ "schema": "ctxmux.daemon-ready.v1", "daemon_instance": "<uuid>" }
+```
+
+The parent accepts bootstrap only when that instance equals the
+`daemon_instance` in the ordinary generation-9 public hello from the selected
+socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
+receipt write failure fails bootstrap; a requested write failure also removes
+the unpublished socket. The inherited channel proves which spawned child
+published readiness. A socket response, PID, delay, filesystem receipt, binary
+path, or matching protocol version does not. This is activation provenance,
+not Run state, discovery, persistence, cross-user authentication, or a new wire
+generation. Without the flag daemon startup is unchanged.
+
 Without `--state-dir`, Runs outlive CLI and SDK connections but not the daemon
 process. With `--state-dir <dedicated-directory>`, one owner-only SQLite store
 recovers historical Run identity, exact `RunSpec`, lineage, terminal state, and
