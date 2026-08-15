@@ -37,6 +37,8 @@ Live output is delivered through a bounded broadcast channel. A lagging receiver
 Retention is a byte target, not a hard cap when a single chunk exceeds 4 MiB. Output cursor overflow fails inside the daemon-owned log rather than wrapping. The TypeScript schema maps `u64` to JavaScript `number`, so the SDK rejects values beyond `Number.MAX_SAFE_INTEGER`. One-second final drain is bounded. CLI gap output names daemon head but does not preserve or print the client's last observed cursor.
 
 The log stores raw bytes, not the final screen of a full-screen TUI.
+Interactive `ctxmux attach` reconstructs a client view from those bytes;
+non-interactive attach and the public protocol still return raw replay.
 
 ## Wrong-case corpus
 
@@ -64,7 +66,6 @@ Short reads do not preserve application write boundaries. The core promise is by
 ## Open questions
 
 - What drain guarantee can be proved across PTY implementations?
-- When does a client request screen reconstruction instead of raw replay?
 - How are retention limits configured or capability-reported without adding premature configuration layers?
 
 ## Repository evidence

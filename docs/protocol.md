@@ -418,9 +418,9 @@ not raw ordered history. If tmux pauses delivery or the adapter detects another
 source-side discontinuity, live attachments receive an explicit gap and later
 attachments remain truncated until their cursor is beyond that source gap.
 
-This byte log does not reconstruct the current screen of a full-screen TUI. A
-future screen model must be introduced only with an acceptance test that proves
-late attachment behavior.
+This byte log does not reconstruct the current screen of a full-screen TUI.
+Interactive `ctxmux attach` reconstructs a client view from retained bytes and
+paints one still frame; the protocol and non-interactive attach remain raw.
 
 ## Lifetime and persistent mode
 

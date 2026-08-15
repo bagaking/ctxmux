@@ -9,9 +9,16 @@ The CLI is both a real client and the simplest proof of tmux-like attach and det
 
 ## Decision
 
-When stdin and stdout are terminals, `ctxmux attach` writes replay, applies terminal size, enables raw mode with a drop guard, reads input on one blocking thread, observes `SIGWINCH`, and selects between input, resize, and Run events. `Ctrl-b d` detaches. Other `Ctrl-b` combinations are forwarded byte-for-byte.
+When stdin and stdout are terminals, `ctxmux attach` reconstructs the current
+visible screen from retained raw bytes, paints that still frame under
+synchronized output (`CSI ? 2026`), applies terminal size, enables raw mode
+with a drop guard, reads input on one blocking thread, observes `SIGWINCH`,
+and selects between input, resize, and live Run events. `Ctrl-b d` detaches.
+Other `Ctrl-b` combinations are forwarded byte-for-byte. Live output after the
+initial paint remains raw passthrough.
 
-When either stream is not a terminal, attach is output-only and never changes terminal mode.
+When either stream is not a terminal, or the Run has already exited, attach
+writes retained raw bytes and never reconstructs a screen.
 
 ## Quality attributes and invariants
 
@@ -24,7 +31,8 @@ When either stream is not a terminal, attach is output-only and never changes te
 ## Alternatives
 
 - Cooked-mode input cannot faithfully drive shells and TUIs.
-- A full terminal emulator in the CLI would conflate Run transport with screen rendering.
+- Putting a terminal emulator in the daemon would replace raw replay with a
+  screen oracle. The CLI reconstructs a view; `OutputLog` stays raw bytes.
 - Reusing tmux for the native path would avoid proving ctxmux's own client boundary.
 
 ## Known constraints
@@ -55,7 +63,8 @@ Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engin
 
 - Covered now: prefix router, trailing prefix, non-detach forwarding, and zero-size fallback.
 - Covered now: checked-in controlling-PTY attach, raw input, `SIGWINCH` resize,
-  `Ctrl-b d`, terminal restoration, and surviving Run identity.
+  `Ctrl-b d`, terminal restoration, surviving Run identity, and current-screen
+  reconstruction that drops erased CSI history.
 - Future: restoration across daemon loss, recoverable errors, unwind, and the
   reviewed transient-termios policy.
 - Future: raw restoration on signals after the catchable-signal policy is defined.
@@ -72,6 +81,7 @@ Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engin
 ## Repository evidence
 
 - `crates/ctxmux/src/main.rs`: `attach`, `PrefixRouter`, `RawModeGuard`
+- `crates/ctxmux/src/screen.rs`: interactive current-screen reconstruction
 - `crates/ctxmux/tests/interactive_attach.rs`
 - `crates/ctxmux-client/src/lib.rs`: `Attachment::detach`
-- `Cargo.toml`: `crossterm`
+- `Cargo.toml`: `crossterm`, `vt100`
