@@ -13,6 +13,7 @@ crossterm.workspace = true
 ctxmux-client = { path = "../ctxmux-client" }
 ctxmux-protocol = { path = "../ctxmux-protocol" }
 tokio.workspace = true
+vt100.workspace = true
 
 [lints]
 workspace = true

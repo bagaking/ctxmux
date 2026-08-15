@@ -21,6 +21,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 crossterm = "0.29.0"
+vt100 = "0.15.2"
 futures-util = { version = "0.3.31", features = ["sink"] }
 libc = "0.2.183"
 portable-pty = "0.9.0"

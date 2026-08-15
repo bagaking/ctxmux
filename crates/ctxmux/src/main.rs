@@ -20,6 +20,8 @@ use tokio::{
     sync::mpsc,
 };
 
+mod screen;
+
 fn usage() -> &'static str {
     "ctxmux — context-aware local Run multiplexer
 
@@ -304,22 +306,31 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         );
     }
     let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(&replay_bytes(&snapshot.replay.chunks))
-        .and_then(|()| stdout.flush())
-        .map_err(|error| format!("failed to write output: {error}"))?;
-    if !snapshot.run.state.is_running() {
-        return Ok(());
-    }
-
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-    if !interactive {
+    let replay = replay_bytes(&snapshot.replay.chunks);
+    if !interactive || !snapshot.run.state.is_running() {
+        stdout
+            .write_all(&replay)
+            .and_then(|()| stdout.flush())
+            .map_err(|error| format!("failed to write output: {error}"))?;
+        if !snapshot.run.state.is_running() {
+            return Ok(());
+        }
         return follow_output(&attachment, &mut stdout).await;
     }
 
+    let size = snapshot
+        .run
+        .spec
+        .as_ref()
+        .map_or_else(TerminalSize::default, |spec| spec.size);
+    let _raw_mode = RawModeGuard::enable()?;
+    stdout
+        .write_all(&screen::reconstruct(&replay, size))
+        .and_then(|()| stdout.flush())
+        .map_err(|error| format!("failed to write output: {error}"))?;
     let input_enabled = snapshot.run.capabilities.input;
     let mut applied_size = apply_initial_terminal_size(&attachment, &snapshot.run).await?;
-    let _raw_mode = RawModeGuard::enable()?;
     let (input_tx, mut input_rx) = mpsc::channel(16);
     thread::Builder::new()
         .name("ctxmux-terminal-input".to_owned())

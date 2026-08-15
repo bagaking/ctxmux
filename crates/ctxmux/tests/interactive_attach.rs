@@ -222,6 +222,122 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(
     clippy::too_many_lines,
+    reason = "one controlling-PTY attach must keep reconstruction, detach, and cleanup auditable"
+)]
+async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
+    let directory = tempfile::tempdir().expect("create CLI screen fixture directory");
+    let socket = directory.path().join("ctxmux.sock");
+    let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
+    let client = Client::new(&socket);
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if client.ping().await.is_ok() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("daemon accepts CLI screen fixture connections");
+
+    let run = client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "trap '' WINCH; stty -echo; ",
+                    "printf 'STALE\\n'; ",
+                    "printf '\\033[2J\\033[H'; ",
+                    "printf 'READY\\n'; ",
+                    "while IFS= read -r _; do :; done"
+                )
+                .to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize { cols: 80, rows: 24 },
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start CLI screen fixture Run");
+
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open controlling PTY for CLI screen fixture");
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .expect("clone CLI screen PTY reader");
+    let mut writer = pair
+        .master
+        .take_writer()
+        .expect("take CLI screen PTY writer");
+    let observed = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+    let reader_observed = Arc::clone(&observed);
+    let reader_thread = thread::Builder::new()
+        .name("ctxmux-cli-screen-reader".to_owned())
+        .spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(read) => {
+                        let (bytes, changed) = &*reader_observed;
+                        mutex_lock(bytes).extend_from_slice(&buffer[..read]);
+                        changed.notify_all();
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return,
+                }
+            }
+        })
+        .expect("start CLI screen PTY reader");
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_ctxmux"));
+    command.arg("--socket");
+    command.arg(&socket);
+    command.arg("attach");
+    command.arg(run.id.to_string());
+    let mut cli = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn ctxmux attach in controlling PTY");
+
+    wait_for_bytes(&observed, b"READY", DEADLINE);
+    assert!(
+        !contains_bytes(&observed, b"STALE"),
+        "interactive attach replayed erased CSI history; output={}",
+        String::from_utf8_lossy(&mutex_lock(&observed.0))
+    );
+
+    writer
+        .write_all(&[0x02, b'd'])
+        .expect("send Ctrl-b d detach sequence");
+    writer.flush().expect("flush detach sequence");
+    let cli_status = wait_for_child(&mut *cli, DEADLINE);
+    assert!(cli_status.success(), "ctxmux attach failed: {cli_status:?}");
+
+    client
+        .stop(run.id)
+        .await
+        .expect("stop CLI screen fixture Run");
+    drop(writer);
+    drop(pair.slave);
+    drop(pair.master);
+    reader_thread.join().expect("join CLI screen PTY reader");
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
     reason = "one continuous read-only controlling-PTY lifecycle keeps input suppression, detach, restoration, and pane survival auditable"
 )]
 async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_input() {
