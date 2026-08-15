@@ -19,6 +19,10 @@ ctxmux does not signal from a client task or from persisted PID metadata.
 
 Raw PTY bytes are the runtime truth. UTF-8 decoding and terminal-screen interpretation remain client concerns.
 
+Native children receive `TERM=xterm-256color` and `COLORTERM=truecolor`
+unless the `RunSpec` already sets those names. The overlay is spawn identity
+so a Run does not inherit the daemon host terminal; it is not a screen model.
+
 ## Quality attributes and invariants
 
 - The daemon, not the client, retains every PTY handle required to operate the Run.
@@ -66,6 +70,7 @@ The signal-mask and descriptor bugs are fixed upstream. They justify dependency-
 
 ## Fixture mapping
 
+- Covered now: native child `TERM`/`COLORTERM` identity with explicit `RunSpec.env` override.
 - Covered now: real input, resize through `stty size`, exit, invalid dimensions,
   foreground-group Interrupt, repeated Stop, stubborn child and descendants,
   forced disposition, unrelated-process and reused-numeric-identity safety,
@@ -85,6 +90,8 @@ The signal-mask and descriptor bugs are fixed upstream. They justify dependency-
 
 ## Repository evidence
 
+- `crates/ctxmux-daemon/src/native_spawn_env.rs`: default `TERM` / `COLORTERM`
 - `crates/ctxmux-daemon/src/lib.rs`: `Run::spawn`, `read_output`, `Run::resize`, `Run::stop`
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`
+- `crates/ctxmux-daemon/tests/native_terminal_identity.rs`
 - `Cargo.toml`: `portable-pty`

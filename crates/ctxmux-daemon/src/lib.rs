@@ -26,6 +26,7 @@ mod attachment;
 mod creation;
 mod native_control;
 mod native_session;
+mod native_spawn_env;
 mod persistence;
 mod qualification_stats;
 mod run_spec;
@@ -1567,7 +1568,7 @@ impl NativeSpawnConfig {
         if let Some(cwd) = &self.spec.cwd {
             command.cwd(cwd);
         }
-        for (name, value) in &self.spec.env {
+        for (name, value) in native_spawn_env::with_native_terminal_identity(&self.spec.env) {
             command.env(name, value);
         }
         command
