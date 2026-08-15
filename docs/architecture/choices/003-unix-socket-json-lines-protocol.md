@@ -9,7 +9,7 @@ Rust and TypeScript clients need a simple local boundary that survives client re
 
 ## Decision
 
-Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The operator supplies the socket path. The daemon creates it with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
+Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The daemon operator still supplies the socket path to `ctxmuxd`. The first-party CLI may omit that path: it uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` or a process-temp fallback, and starts a sibling `ctxmuxd` when nothing is listening. Other clients, including the SDK, still select the socket explicitly and do not start the daemon. The daemon creates the socket with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
 
 The first frame is an exact protocol-generation handshake. Short-lived connections carry one request. Attachment connections carry one metadata snapshot header, bounded ordered replay-output frames through that header's replay head, then bidirectional control frames and live events. One encoded frame is limited to 1 MiB; total retained replay is not required to fit in one frame.
 
@@ -38,8 +38,8 @@ The first frame is an exact protocol-generation handshake. Short-lived connectio
 
 ## Known constraints
 
-The socket has no default discovery or activation policy, peer-credential
-check, short-request ID, timeout, cancellation, or Windows equivalent. JSON
+The socket has no peer-credential check, short-request ID, timeout,
+cancellation, or Windows equivalent. JSON
 represents bytes as integer arrays. Attachment command IDs provide correlation
 only inside one live connection. Startup revalidation closes the known
 probe-to-unlink replacement schedule. The shutdown guard retains the bound
@@ -98,7 +98,6 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 
 ## Open questions
 
-- Where does the default socket live, and how is one daemon discovered or started?
 - Is filesystem mode sufficient, or must peer credentials be checked?
 - Which protocol changes require a generation bump?
 - How will Windows transport preserve the same public behavior?
@@ -110,6 +109,8 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 - `crates/ctxmux-protocol/src/lib.rs`: frames, errors, `MAX_FRAME_BYTES`
 - `crates/ctxmux-protocol/tests/seeded_fuzz.rs`: bounded native byte target
 - `crates/ctxmux-daemon/src/lib.rs`: `prepare_socket_path`, `handle_connection`
+- `crates/ctxmux/src/daemon.rs`: CLI default socket and connect-or-spawn
+- `crates/ctxmux/tests/auto_start.rs`: sibling spawn, reuse, and `--version` skip
 - `packages/sdk/src/wire.ts`
 - `fixtures/malformed-protocol-frames.json`
 - `packages/sdk/test/parser-fuzz.test.ts`

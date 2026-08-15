@@ -6,7 +6,10 @@ fallbacks or migrations.
 
 ## Transport
 
-- Unix domain socket selected explicitly by the daemon operator.
+- Unix domain socket selected by the daemon operator, or by the first-party CLI
+  default (`$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock`, else a process-temp path).
+  `ctxmuxd` still requires `--socket`. The CLI starts a sibling `ctxmuxd` when
+  a known command needs the daemon and nothing is listening. The SDK does not.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
