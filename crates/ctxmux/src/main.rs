@@ -20,6 +20,7 @@ use tokio::{
     sync::mpsc,
 };
 
+mod daemon;
 mod screen;
 
 fn usage() -> &'static str {
@@ -27,21 +28,23 @@ fn usage() -> &'static str {
 
 usage:
   ctxmux --version
-  ctxmux --socket <path> ping
-  ctxmux --socket <path> start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
-  ctxmux --socket <path> tmux-list <tmux-socket>
-  ctxmux --socket <path> tmux-import <tmux-socket> <pane-id>
-  ctxmux --socket <path> fork [--operation-key <key>] <run-id>
-  ctxmux --socket <path> list
-  ctxmux --socket <path> status <run-id>
-  ctxmux --socket <path> input <run-id> <text>
-  ctxmux --socket <path> input <run-id> --stdin
-  ctxmux --socket <path> resize <run-id> <cols> <rows>
-  ctxmux --socket <path> interrupt <run-id>
-  ctxmux --socket <path> attach <run-id> [after-byte]
-  ctxmux --socket <path> stop <run-id>
+  ctxmux [--socket <path>] ping
+  ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
+  ctxmux [--socket <path>] tmux-list <tmux-socket>
+  ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
+  ctxmux [--socket <path>] fork [--operation-key <key>] <run-id>
+  ctxmux [--socket <path>] list
+  ctxmux [--socket <path>] status <run-id>
+  ctxmux [--socket <path>] input <run-id> <text>
+  ctxmux [--socket <path>] input <run-id> --stdin
+  ctxmux [--socket <path>] resize <run-id> <cols> <rows>
+  ctxmux [--socket <path>] interrupt <run-id>
+  ctxmux [--socket <path>] attach <run-id> [after-byte]
+  ctxmux [--socket <path>] stop <run-id>
 
-CTXMUX_SOCKET may be used instead of --socket."
+CTXMUX_SOCKET may be used instead of --socket. When neither is set, ctxmux uses
+$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock or a process-temp path, and starts ctxmuxd
+if nothing is listening."
 }
 
 #[tokio::main]
@@ -68,6 +71,24 @@ async fn run() -> Result<(), String> {
 
     let socket = take_socket(&mut args)?;
     let command = take_string(&mut args, "command")?;
+    if !matches!(
+        command.as_str(),
+        "ping"
+            | "start"
+            | "tmux-list"
+            | "tmux-import"
+            | "fork"
+            | "list"
+            | "status"
+            | "input"
+            | "resize"
+            | "interrupt"
+            | "attach"
+            | "stop"
+    ) {
+        return Err(format!("unknown command {command:?}\n\n{}", usage()));
+    }
+    daemon::ensure_listening(&socket).await?;
     let client = Client::new(socket);
     match command.as_str() {
         "ping" => {
@@ -109,7 +130,7 @@ async fn run() -> Result<(), String> {
             let accepted = client.stop(id).await.map_err(|error| error.to_string())?;
             print_run(&accepted.run);
         }
-        _ => return Err(format!("unknown command {command:?}\n\n{}", usage())),
+        _ => unreachable!("known commands are enumerated before connect-or-spawn"),
     }
     Ok(())
 }
@@ -124,9 +145,7 @@ fn take_socket(args: &mut Vec<OsString>) -> Result<PathBuf, String> {
         args.remove(0);
         return Ok(PathBuf::from(value));
     }
-    env::var_os("CTXMUX_SOCKET")
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("--socket or CTXMUX_SOCKET is required\n\n{}", usage()))
+    Ok(env::var_os("CTXMUX_SOCKET").map_or_else(daemon::default_socket_path, PathBuf::from))
 }
 
 async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {

@@ -6,22 +6,12 @@ tmux multiplexes terminals. ctxmux multiplexes **Runs**—local processes that
 keep running after you close the client.
 
 You can use it by itself. The daemon and CLI are enough. No Node, no SDK, and
-no editor. Unix only, with an explicit socket path; the CLI does not start the
-daemon for you.
+no editor. Unix only. `ctxmux` starts `ctxmuxd` when nothing is listening.
 
 ## Standalone quick start
 
-Build both binaries, then run the daemon in one terminal:
-
 ```bash
 cargo build --workspace
-target/debug/ctxmuxd --socket target/ctxmux.sock
-```
-
-In another terminal:
-
-```bash
-export CTXMUX_SOCKET=target/ctxmux.sock
 run_id=$(target/debug/ctxmux start -- sh)
 target/debug/ctxmux attach "$run_id"
 ```
@@ -30,7 +20,12 @@ That attach is a real terminal session. Type as usual. `Ctrl-b d` detaches.
 The shell keeps running. `ctxmux attach "$run_id"` comes back to the current
 screen; it does not replay the CSI history of every redraw.
 
-Other CLI commands on the same socket:
+The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` when that directory is set,
+otherwise a process-temp path. `--socket` or `CTXMUX_SOCKET` selects a
+different daemon. Closing the CLI never stops the Run; only `stop` (or daemon
+exit, in memory-only mode) does.
+
+Other commands:
 
 ```bash
 target/debug/ctxmux list
@@ -38,11 +33,14 @@ target/debug/ctxmux status "$run_id"
 target/debug/ctxmux stop "$run_id"
 ```
 
-`--socket` can replace `CTXMUX_SOCKET` on any command. Closing the CLI never
-stops the Run; only `stop` (or daemon exit, in memory-only mode) does.
+To keep historical Run metadata across daemon restart, start the daemon
+yourself with `--state-dir`:
 
-Add `--state-dir target/ctxmux-state` to `ctxmuxd` to keep historical Run
-metadata, lineage, terminal state, and committed replay across daemon restart.
+```bash
+target/debug/ctxmuxd --socket target/ctxmux.sock --state-dir target/ctxmux-state
+export CTXMUX_SOCKET=target/ctxmux.sock
+```
+
 Live PTY control is not adopted after restart; a previously running Run is
 reported as interrupted.
 

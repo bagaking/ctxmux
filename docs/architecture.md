@@ -11,7 +11,7 @@ Current guarantees are deliberately narrower than the product vision.
 | Area             | Current                                                                                                                                                                                                                                                                                                                 | Target or open                                                                               |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority.             | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
-| Transport        | Versioned NDJSON over an explicitly selected Unix socket.                                                                                                                                                                                                                                                               | Windows transport, discovery, and daemon activation are open.                                |
+| Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                      | Windows transport and multi-daemon discovery are open.                                       |
 | Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 9, including daemon-incarnation fencing, recoverable native Input, foreground-group Interrupt, complete-session Stop, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary. | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                     | Multi-writer policy remains open.                                                            |
 | Input recovery   | A short-lived generation-9 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                          | Cross-daemon exactly-once and semantic acknowledgement remain above or outside ctxmux.       |
@@ -124,7 +124,7 @@ Each package has one reason to change.
 | `ctxmux-protocol` | Rust wire types, generation constant, frame limit, serialization, and TypeScript export.  | Live processes or client policy.              |
 | `ctxmux-client`   | Rust connector, request lifecycle, attachment connection, and typed public errors.        | Daemon state.                                 |
 | `ctxmux-daemon`   | Unix listener, Run manager, PTYs, children, replay, events, and socket lifecycle.         | Agent-specific semantics or UI.               |
-| `ctxmux`          | Human CLI, raw terminal mode, resize forwarding, and detach prefix.                       | Direct access to daemon internals.            |
+| `ctxmux`          | Human CLI, raw terminal mode, resize forwarding, detach prefix, and connect-or-spawn of `ctxmuxd`. | Direct access to daemon internals.            |
 | `@ctxmux/sdk`     | Node connector, request and attachment APIs, and explicit host-local Integration binding. | Electron, React, an editor, or Run ownership. |
 
 ### Stable boundary
@@ -137,8 +137,10 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 
 ### Start a native Run
 
-1. The CLI or SDK constructs a `RunSpec`, retains or generates one bounded
-   creation operation key, and opens a Unix-socket connection.
+1. The CLI ensures a daemon is listening (reusing one, or starting sibling
+   `ctxmuxd` at the requested or default socket), then the CLI or SDK
+   constructs a `RunSpec`, retains or generates one bounded creation operation
+   key, and opens a Unix-socket connection.
 2. The connection exchanges an exact protocol-generation handshake.
 3. `Request::Start` reaches the daemon-private creation owner. A fixed,
    asynchronously acquired key stripe serializes only possible key collisions;
