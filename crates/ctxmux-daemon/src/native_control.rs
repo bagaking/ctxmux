@@ -1994,6 +1994,28 @@ mod tests {
         // Reading the fd must be idempotent and non-consuming: the control still
         // holds the live master and hands back the very same descriptor number.
         assert_eq!(owner.master_raw_fd(), expected);
+
+        // The exposed fd is the *live* master, not a stale integer snapshot: a
+        // resize round-trips through the same descriptor (ioctl on the real
+        // master) and the fd number is unchanged afterward. A cached number
+        // could not carry a resize; only an open master fd can.
+        let applied = owner
+            .resize(TerminalSize { rows: 40, cols: 132 })
+            .expect("resize the live master exposed for handoff");
+        assert_eq!(
+            applied,
+            ControlReceipt::Resize {
+                applied_size: TerminalSize {
+                    rows: 40,
+                    cols: 132,
+                },
+            },
+        );
+        assert_eq!(
+            owner.master_raw_fd(),
+            expected,
+            "the master fd number is stable across a resize on the live descriptor"
+        );
     }
 
     #[test]

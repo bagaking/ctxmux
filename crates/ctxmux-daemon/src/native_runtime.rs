@@ -1671,6 +1671,18 @@ mod tests {
             );
         }
 
+        // Handoff extraction is single-shot: it relinquishes each live Run
+        // (Watching -> Done, forgetting the child and control handles), so a
+        // second extraction on the same owner surfaces nothing. This pins the
+        // "descriptors transfer exactly once" contract the incoming image
+        // relies on — a Run cannot be handed to two successors.
+        let second = owner.extract_for_handoff();
+        assert!(
+            second.is_empty(),
+            "a second extraction relinquishes nothing; got {} descriptors",
+            second.len()
+        );
+
         for pid in &pids {
             let _ = Command::new("kill")
                 .args(["-KILL", &pid.to_string()])
