@@ -180,8 +180,23 @@ enum OwnerState {
     Failed(String),
 }
 
+/// Live descriptors of one native Run, paired for exec-in-place handoff: the
+/// pty master fd number and the child pid that a post-exec daemon re-adopts.
+/// The fields have no production reader until the SIGHUP path lands; they are
+/// read only through the `#[cfg(test)]` handoff test today.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LiveDescriptors {
+    pub run_id: RunId,
+    pub child_pid: u32,
+    pub master_fd: std::os::fd::RawFd,
+}
+
 enum OwnerCommand {
     Register(NativeRunRegistration),
+    ExtractForHandoff {
+        respond: mpsc::Sender<Vec<LiveDescriptors>>,
+    },
     Shutdown,
 }
 
@@ -360,7 +375,7 @@ impl NativeRunOwner {
                     message: "daemon-wide native owner stopped before registration".to_owned(),
                     registration: Box::new(match error.0 {
                         OwnerCommand::Register(registration) => registration,
-                        OwnerCommand::Shutdown => {
+                        OwnerCommand::ExtractForHandoff { .. } | OwnerCommand::Shutdown => {
                             unreachable!("registration send returns its registration")
                         }
                     }),
@@ -371,6 +386,30 @@ impl NativeRunOwner {
                 registration: Box::new(registration),
             }),
         }
+    }
+
+    /// Return the live pty master fd and child pid for every watched native
+    /// Run, relinquishing the owner's reap/close authority for each so the
+    /// child survives (unreaped) and its master fd stays open past a future
+    /// exec-in-place. No production caller exists until the SIGHUP path lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn extract_for_handoff(&self) -> Vec<LiveDescriptors> {
+        let commands = {
+            let state = mutex_lock(&self.inner.state);
+            match &*state {
+                OwnerState::Running { commands, .. } => commands.clone(),
+                OwnerState::Failed(_) => return Vec::new(),
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        if commands
+            .send(OwnerCommand::ExtractForHandoff { respond: tx })
+            .is_err()
+        {
+            return Vec::new();
+        }
+        self.inner.wake.wake();
+        rx.recv().unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -695,10 +734,52 @@ fn drain_commands(
                 entries.push(registration.into_entry());
                 diagnostics.registrations.fetch_add(1, Ordering::AcqRel);
             }
+            Ok(OwnerCommand::ExtractForHandoff { respond }) => {
+                let _ = respond.send(extract_live_descriptors(entries));
+            }
             Ok(OwnerCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => return true,
             Err(mpsc::TryRecvError::Empty) => return false,
         }
     }
+}
+
+/// Collect the live pty master fd + child pid for every watched Run and
+/// relinquish the owner's reap/close authority so both survive a future exec.
+/// Mirrors `retain_unwaited_child`'s authority discipline (`mem::forget` the
+/// control), but handoff is not a failure: no `wait_failure.record` and no
+/// `mark_wait_authority_lost` — just forget child and control so each lives on.
+fn extract_live_descriptors(entries: &mut [NativeEntry]) -> Vec<LiveDescriptors> {
+    let mut descriptors = Vec::new();
+    for entry in entries {
+        // Peek before replacing: only Runs that are actually live for handoff
+        // (still watching, master fd present, child pid known) are relinquished.
+        let Lifecycle::Watching(watching) = &entry.lifecycle else {
+            continue;
+        };
+        let Some(master_fd) = watching.control.master_raw_fd() else {
+            continue;
+        };
+        let Some(child_pid) = watching.child.process_id() else {
+            continue;
+        };
+        descriptors.push(LiveDescriptors {
+            run_id: entry.run_id,
+            child_pid,
+            master_fd,
+        });
+        let Lifecycle::Watching(watching) =
+            std::mem::replace(&mut entry.lifecycle, Lifecycle::Done)
+        else {
+            unreachable!("lifecycle was Watching under the same borrow")
+        };
+        // Retain both across the future exec: forgetting the child stops
+        // portable_pty's `Child::drop` from reaping/killing it, and forgetting
+        // the control keeps an `Arc<NativeControlInner>` clone alive forever so
+        // the pty master box is never dropped and the master fd stays open.
+        std::mem::forget(watching.child);
+        std::mem::forget(watching.control);
+    }
+    descriptors
 }
 
 #[allow(
@@ -1498,5 +1579,105 @@ mod tests {
             probe_calls <= lifecycle_ticks.saturating_add(1) * RUNS,
             "one output chunk triggered more than one complete lifecycle pass"
         );
+    }
+
+    #[test]
+    fn extract_for_handoff_returns_live_descriptors_and_leaves_children_running() {
+        use std::{collections::HashSet, process::Command};
+
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+        use crate::native_control::InputDrainGate;
+
+        let owner = NativeRunOwner::default();
+        let mut expected_run_ids = Vec::new();
+        let mut pids = Vec::new();
+        let mut runs = Vec::new();
+        // Keep the slave ends alive so the real pty pairs are not torn down.
+        let mut slaves = Vec::new();
+
+        for _ in 0..2 {
+            let id = RunId::new();
+            let failure = NativeWaitFailure::default();
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("open real pty for handoff fixture");
+            let writer = pair.master.take_writer().expect("take real pty writer");
+            let mut command = CommandBuilder::new("/bin/sleep");
+            command.arg("30");
+            let child = pair
+                .slave
+                .spawn_command(command)
+                .expect("spawn /bin/sleep on the pty slave");
+            let pid = child.process_id().expect("real child exposes a pid");
+            let session = NativeSession::from_child_pid(pid).expect("session from real child pid");
+            let control = NativeControlOwner::new(
+                id,
+                pair.master,
+                writer,
+                InputDrainGate::default(),
+                owner.owner_wake(),
+            );
+            let run =
+                Run::new_native_for_owner_test(id, control.clone(), owner.clone(), failure.clone());
+            owner
+                .register_for_test(&run, child, session, control, failure, || {})
+                .map_err(|error| error.into_parts().0)
+                .expect("register real handoff fixture");
+            expected_run_ids.push(id);
+            pids.push(pid);
+            runs.push(run);
+            slaves.push(pair.slave);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.diagnostic_snapshot().registrations < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "owner did not drain the two registrations"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let descriptors = owner.extract_for_handoff();
+        assert_eq!(descriptors.len(), 2, "one descriptor per live native Run");
+        for descriptor in &descriptors {
+            assert!(
+                descriptor.child_pid != 0,
+                "handoff descriptor carries a pid"
+            );
+            assert!(
+                descriptor.master_fd >= 0,
+                "handoff descriptor carries a live master fd"
+            );
+        }
+        let returned_ids: HashSet<RunId> = descriptors.iter().map(|d| d.run_id).collect();
+        let expected_ids: HashSet<RunId> = expected_run_ids.iter().copied().collect();
+        assert_eq!(returned_ids, expected_ids, "descriptors cover both Runs");
+
+        for pid in &pids {
+            assert!(
+                Command::new("kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .expect("probe child liveness with kill -0")
+                    .success(),
+                "child {pid} must survive the handoff extraction"
+            );
+        }
+
+        for pid in &pids {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .expect("shut down owner after handoff");
     }
 }
