@@ -443,7 +443,12 @@ Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread
 commits starts, contiguous output batches, pruning/accounting, and terminal
 transitions; a bounded actor queue backpressures the PTY reader instead of
-accumulating an unbounded durable-output backlog. Startup performs journal
+accumulating an unbounded durable-output backlog. If SQLite reports typed
+`DiskFull` while appending output or finalizing a Run, that actor keeps the
+exact command at the head of the queue and retries after a short delay; later
+durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
+other storage, replay, budget, integrity, and owner-invariant failure remains
+fail-stop for later durable mutations. Startup performs journal
 recovery and exact schema/application validation against the schema-3 format
 envelope, then uses bounded, restartable page-admitted transactions to
 reconcile old running rows, normalize retained history to 128, and finally

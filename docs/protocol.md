@@ -449,6 +449,16 @@ process. With `--state-dir <dedicated-directory>`, one owner-only SQLite store
 recovers historical Run identity, exact `RunSpec`, lineage, terminal state, and
 the committed bounded replay window across daemon restart.
 
+An output append or terminal finalize that receives SQLite's typed `DiskFull`
+does not permanently poison the serving daemon. The persistence actor retries
+that same ordered unit after a short delay and admits no later durable mutation
+ahead of it. Its bounded queue applies backpressure while storage is unavailable;
+daemon shutdown cancels the wait. Other database, I/O, replay-conflict,
+file-budget, integrity, and owner-invariant failures still latch persistence and
+reject later durable mutations. This changes no wire frame or error code: a
+client may observe output progress stall until storage recovers, and a client
+restart alone neither owns nor resets the daemon-side wait.
+
 Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
 state lock. Exact schema version, SQLite integrity, typed JSON, a required
