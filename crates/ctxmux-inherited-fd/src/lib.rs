@@ -56,6 +56,37 @@ pub fn duplicate_nonblocking_cloexec(raw_fd: RawFd) -> std::io::Result<OwnedFd> 
     Ok(owned)
 }
 
+/// Take ownership of an already-open inherited descriptor as an `OwnedFd`.
+///
+/// The returned `OwnedFd` closes the descriptor on drop. Unlike
+/// `duplicate_cloexec`, this claims the caller's own descriptor number rather
+/// than duplicating it, so exactly one owner exists afterward. Intended for
+/// single-use descriptors the parent set up for this process (e.g. an
+/// exec-handoff pipe read end).
+///
+/// # Errors
+///
+/// Rejects standard descriptors and returns an operating-system error when the
+/// descriptor is not open.
+#[allow(unsafe_code)]
+pub fn owned_from_raw(raw_fd: RawFd) -> std::io::Result<OwnedFd> {
+    if raw_fd < 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "descriptor must be at least 3",
+        ));
+    }
+    // Probe first so a closed descriptor fails as EBADF before any owner claims
+    // it, matching the validation the sibling helpers perform.
+    if unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the caller guarantees it holds sole ownership of this open,
+    // inherited descriptor and transfers that ownership here; the probe above
+    // confirmed it is open, so exactly one owner (the returned OwnedFd) exists.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
+}
+
 /// Clear the close-on-exec flag on a descriptor so it survives `execve`.
 ///
 /// The caller retains ownership; this only mutates the descriptor's flags.
@@ -92,7 +123,7 @@ mod tests {
         pipe::pipe,
     };
 
-    use super::{duplicate_cloexec, duplicate_nonblocking_cloexec};
+    use super::{duplicate_cloexec, duplicate_nonblocking_cloexec, owned_from_raw};
 
     #[test]
     fn blocking_duplicate_preserves_shared_status_flags() {
@@ -157,6 +188,34 @@ mod tests {
         );
         assert_eq!(
             super::clear_cloexec(1_000_000).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn owned_from_raw_claims_the_descriptor_without_duplicating() {
+        let (reader, writer) = pipe().unwrap();
+        let raw = writer.as_raw_fd();
+        let owned = owned_from_raw(raw).unwrap();
+        // No dup: the returned owner claims the caller's own descriptor number.
+        assert_eq!(owned.as_raw_fd(), raw);
+        // Ownership moved to `owned`; forget the original so only one owner drops.
+        std::mem::forget(writer);
+        rustix::io::write(&owned, b"handoff").unwrap();
+        drop(owned);
+        let mut bytes = Vec::new();
+        std::fs::File::from(reader).read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"handoff");
+    }
+
+    #[test]
+    fn owned_from_raw_rejects_standard_and_closed_descriptors() {
+        assert_eq!(
+            owned_from_raw(2).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            owned_from_raw(1_000_000).unwrap_err().raw_os_error(),
             Some(libc::EBADF)
         );
     }
