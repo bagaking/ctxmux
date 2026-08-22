@@ -693,7 +693,13 @@ impl NativeControlOwner {
     pub(crate) fn begin_signal(&self, signal: RunSignal) -> Result<PendingSignal, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
-            let state = mutex_lock(&self.inner.state);
+            // The non-macOS arm below pushes onto `state.child_commands`, so the
+            // guard is a mutable borrow. macOS signals via the pty owner and only
+            // reads `state`, so `mut` is unused there — which is why a darwin-only
+            // build never catches a missing `mut`. Bind `mut` unconditionally and
+            // silence the macOS-only `unused_mut` rather than duplicate the line.
+            #[cfg_attr(target_os = "macos", allow(unused_mut))]
+            let mut state = mutex_lock(&self.inner.state);
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
                     self.inner.run_id,
