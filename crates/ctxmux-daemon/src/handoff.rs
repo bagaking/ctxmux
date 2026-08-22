@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use std::os::fd::RawFd;
+use std::os::fd::{OwnedFd, RawFd};
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,34 @@ impl HandoffManifest {
     }
 }
 
+/// Read and validate one handoff manifest from an inherited descriptor.
+///
+/// Takes ownership of `fd` (closing it on return) and reads the single NDJSON
+/// manifest line the outgoing image wrote. Fails closed on an unreadable
+/// descriptor or a manifest whose schema is not the current [`HANDOFF_SCHEMA`],
+/// so a mismatched upgrade never misreads fd numbers.
+///
+/// # Errors
+///
+/// Returns an error if the descriptor cannot be read or the content is not a
+/// current-schema manifest.
+pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::from(fd);
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let line = buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
+    let manifest: HandoffManifest = serde_json::from_slice(line).map_err(std::io::Error::other)?;
+    if manifest.schema != HANDOFF_SCHEMA {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unknown handoff manifest schema",
+        ));
+    }
+    Ok(manifest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +103,52 @@ mod tests {
         assert_eq!(parsed, manifest);
         assert_eq!(parsed.all_fds(), vec![7, 9]);
         assert_eq!(parsed.schema, HANDOFF_SCHEMA);
+    }
+
+    #[test]
+    fn reads_manifest_from_a_pipe_fd() {
+        use std::io::Write;
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        let manifest = HandoffManifest::new(
+            "epoch-1".to_string(),
+            vec![HandoffRun {
+                run_id: RunId::new(),
+                child_pid: 4321,
+                master_fd: 7,
+            }],
+        );
+        writer
+            .write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        writer.write_all(b"\n").unwrap();
+        drop(writer); // EOF so read_to_end returns
+        let parsed = read_manifest(reader).unwrap(); // reader is an OwnedFd → moved in
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn rejects_unknown_schema() {
+        use std::io::Write;
+        let manifest = HandoffManifest::new(
+            "epoch-1".to_string(),
+            vec![HandoffRun {
+                run_id: RunId::new(),
+                child_pid: 4321,
+                master_fd: 7,
+            }],
+        );
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        value["schema"] = serde_json::Value::String("ctxmux.daemon-handoff.v99".to_string());
+        let (reader, writer) = rustix::pipe::pipe().unwrap();
+        let mut writer = std::fs::File::from(writer);
+        writer
+            .write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        writer.write_all(b"\n").unwrap();
+        drop(writer);
+        let error = read_manifest(reader).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }
