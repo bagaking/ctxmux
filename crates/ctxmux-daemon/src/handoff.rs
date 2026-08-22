@@ -3,6 +3,12 @@
 //! Serialized to a single inherited descriptor by the outgoing image and read
 //! back by the incoming image. Versioned so a mismatched upgrade fails closed
 //! rather than misreading fd numbers.
+//!
+//! Only the pty master fd is carried per Run. The reader and writer fds of a
+//! native Run both refer to the same open file description as the master, so
+//! the incoming image re-derives them from the master fd after exec (re-dup a
+//! cloexec reader, write input directly to the master) exactly as the spawn
+//! path does.
 
 #![allow(dead_code)]
 
@@ -26,8 +32,6 @@ pub struct HandoffRun {
     pub run_id: RunId,
     pub child_pid: i32,
     pub master_fd: RawFd,
-    pub writer_fd: RawFd,
-    pub reader_fd: RawFd,
 }
 
 impl HandoffManifest {
@@ -41,10 +45,7 @@ impl HandoffManifest {
 
     /// Every fd number this manifest expects to survive the exec.
     pub fn all_fds(&self) -> Vec<RawFd> {
-        self.runs
-            .iter()
-            .flat_map(|r| [r.master_fd, r.writer_fd, r.reader_fd])
-            .collect()
+        self.runs.iter().map(|r| r.master_fd).collect()
     }
 }
 
@@ -60,14 +61,12 @@ mod tests {
                 run_id: RunId::new(),
                 child_pid: 4321,
                 master_fd: 7,
-                writer_fd: 8,
-                reader_fd: 9,
             }],
         );
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: HandoffManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, manifest);
-        assert_eq!(parsed.all_fds(), vec![7, 8, 9]);
+        assert_eq!(parsed.all_fds(), vec![7]);
         assert_eq!(parsed.schema, HANDOFF_SCHEMA);
     }
 }
