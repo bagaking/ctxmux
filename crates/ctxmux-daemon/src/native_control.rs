@@ -355,6 +355,10 @@ impl InputOperationEntry {
 trait PtyControl: Send {
     fn resize(&self, size: PtySize) -> io::Result<()>;
     fn get_size(&self) -> io::Result<PtySize>;
+    // Exercised through the owner accessor's test today; the exec-in-place
+    // handoff that carries this fd across the re-exec lands in a later task.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn master_raw_fd(&self) -> Option<std::os::fd::RawFd>;
     #[cfg(target_os = "macos")]
     fn interrupt_foreground(&self) -> io::Result<()>;
     #[cfg(not(target_os = "macos"))]
@@ -370,6 +374,10 @@ impl PtyControl for PortablePtyControl {
 
     fn get_size(&self) -> io::Result<PtySize> {
         self.0.get_size().map_err(io::Error::other)
+    }
+
+    fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.0.as_raw_fd()
     }
 
     #[cfg(target_os = "macos")]
@@ -392,6 +400,15 @@ impl PtyControl for PortablePtyControl {
 impl NativeControlOwner {
     pub(crate) fn run_id(&self) -> RunId {
         self.inner.run_id
+    }
+
+    /// Raw fd number of the live PTY master, or `None` once the pty has been
+    /// detached. Borrowed number only — no dup, no ownership transfer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        mutex_lock(&self.inner.pty)
+            .as_ref()
+            .and_then(|pty| pty.master_raw_fd())
     }
 
     pub(crate) fn new(
@@ -421,6 +438,10 @@ impl NativeControlOwner {
 
             fn get_size(&self) -> io::Result<PtySize> {
                 Ok(PtySize::default())
+            }
+
+            fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+                None
             }
 
             #[cfg(target_os = "macos")]
@@ -1620,7 +1641,8 @@ mod tests {
     use portable_pty::PtySize;
 
     use super::{
-        ChildCommand, InputDrainGate, NativeControlOwner, PtyControl, StopOwnerResult, mutex_lock,
+        ChildCommand, InputDrainGate, NativeControlOwner, PortablePtyControl, PtyControl,
+        StopOwnerResult, mutex_lock,
     };
     use crate::native_runtime::NativeRunOwner;
 
@@ -1647,6 +1669,10 @@ mod tests {
 
         fn get_size(&self) -> io::Result<PtySize> {
             Ok(*mutex_lock(&self.size))
+        }
+
+        fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
         }
 
         #[cfg(target_os = "macos")]
@@ -1690,6 +1716,10 @@ mod tests {
             Ok(PtySize::default())
         }
 
+        fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
+        }
+
         #[cfg(target_os = "macos")]
         fn interrupt_foreground(&self) -> io::Result<()> {
             Ok(())
@@ -1714,6 +1744,10 @@ mod tests {
 
         fn get_size(&self) -> io::Result<PtySize> {
             Ok(PtySize::default())
+        }
+
+        fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+            None
         }
 
         fn interrupt_foreground(&self) -> io::Result<()> {
@@ -1926,6 +1960,34 @@ mod tests {
         let (released, wake) = &**release;
         *mutex_lock(released) = true;
         wake.notify_all();
+    }
+
+    #[test]
+    fn master_raw_fd_exposes_the_live_master_without_closing() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        // Keep the slave end alive so the pty pair is not torn down mid-test.
+        let _slave = pair.slave;
+
+        let expected = pair.master.as_raw_fd();
+        assert!(
+            matches!(expected, Some(fd) if fd >= 0),
+            "real pty master should expose a non-negative raw fd"
+        );
+
+        let pty: Box<dyn PtyControl> = Box::new(PortablePtyControl(pair.master));
+        let (owner, _child) = owner(Box::new(io::sink()), pty, InputDrainGate::default());
+
+        assert_eq!(owner.master_raw_fd(), expected);
+        // Reading the fd must be idempotent and non-consuming: the control still
+        // holds the live master and hands back the very same descriptor number.
+        assert_eq!(owner.master_raw_fd(), expected);
     }
 
     #[test]
