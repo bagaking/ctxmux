@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::{self, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
@@ -261,12 +261,37 @@ async fn serve_with_persistence_manager(
     readiness_fd: Option<OwnedFd>,
     handoff: Option<crate::handoff::HandoffManifest>,
 ) -> Result<(), ServerError> {
-    prepare_socket_path(&socket_path)?;
-    let listener =
-        UnixListener::bind(&socket_path).map_err(|source| ServerError::io(&socket_path, source))?;
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|source| ServerError::io(&socket_path, source))?;
+    // On the exec-in-place path, reconstruct the listener from the inherited
+    // socket fd. Re-binding would unlink and recreate the socket inode, dropping
+    // every connected client and tripping our own AlreadyRunning guard, so the
+    // adopted path must skip prepare_socket_path / bind / set_permissions.
+    let listener = if let Some(manifest) = &handoff {
+        adopt_listener(manifest.listener_fd)?
+    } else {
+        prepare_socket_path(&socket_path)?;
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|source| ServerError::io(&socket_path, source))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| ServerError::io(&socket_path, source))?;
+        listener
+    };
     serve_with_manager(socket_path, listener, manager, readiness_fd, handoff).await
+}
+
+/// Reconstruct the local listener from an inherited socket fd without binding.
+///
+/// The incoming exec-in-place image claims ownership of the descriptor the
+/// outgoing image left (its CLOEXEC bit cleared just before exec) and wraps it
+/// through the safe `From<OwnedFd>` impl, so the socket inode is unchanged.
+fn adopt_listener(listener_fd: RawFd) -> Result<UnixListener, ServerError> {
+    let owned = ctxmux_inherited_fd::owned_from_raw(listener_fd)
+        .map_err(|source| ServerError::io("<handoff listener fd>", source))?;
+    let std_listener = std::os::unix::net::UnixListener::from(owned); // safe From<OwnedFd>
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|source| ServerError::io("<handoff listener fd>", source))?;
+    UnixListener::from_std(std_listener)
+        .map_err(|source| ServerError::io("<handoff listener fd>", source))
 }
 
 async fn serve_with_manager(
@@ -278,10 +303,11 @@ async fn serve_with_manager(
 ) -> Result<(), ServerError> {
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
     if let Some(handoff) = &handoff {
+        // A12 wires manifest.state_lock_fd into the incoming-image startup path.
         eprintln!(
-            "ctxmuxd: received handoff manifest for {} run(s) (epoch {}); adoption wiring pending",
-            handoff.runs.len(),
-            handoff.epoch
+            "ctxmuxd: adopted inherited listener for handoff (epoch {}, {} run(s))",
+            handoff.epoch,
+            handoff.runs.len()
         );
     }
     if let Some(readiness_fd) = readiness_fd {
@@ -6273,5 +6299,42 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn adopt_listener_reuses_the_socket_inode_without_rebinding() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        use std::os::unix::fs::MetadataExt;
+
+        // AL-01: adopting an inherited listener fd must reuse the live socket
+        // inode, not rebind/replace it — a rebind would drop connected clients
+        // and trip the daemon's own AlreadyRunning guard.
+        let directory = tempfile::tempdir().expect("create adopt-listener fixture directory");
+        let socket = directory.path().join("ctxmux.sock");
+        let bound = UnixListener::bind(&socket).expect("bind the pre-exec listener");
+        let before = fs::symlink_metadata(&socket).expect("stat the bound socket");
+
+        // Dup first so `owned_from_raw` inside `adopt_listener` can claim exactly
+        // one owner; keep `bound` alive so the inode is never unlinked.
+        let dup =
+            ctxmux_inherited_fd::duplicate_cloexec(bound.as_raw_fd()).expect("dup the listener fd");
+        let raw = dup.into_raw_fd();
+        let adopted = super::adopt_listener(raw).expect("adopt the inherited listener");
+
+        let after = fs::symlink_metadata(&socket).expect("stat the socket after adoption");
+        assert_eq!(before.ino(), after.ino(), "adoption must not replace inode");
+        assert_eq!(before.dev(), after.dev(), "adoption must not replace device");
+
+        // Prove it is the live socket, not a dead fd: a client connect is
+        // accepted on the adopted listener.
+        let accept = tokio::spawn(async move { adopted.accept().await });
+        let _client = tokio::net::UnixStream::connect(&socket)
+            .await
+            .expect("connect to the adopted listener");
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), accept)
+            .await
+            .expect("adopted listener accepts before timeout")
+            .expect("accept task joins");
+        accepted.expect("adopted listener yields the connection");
     }
 }

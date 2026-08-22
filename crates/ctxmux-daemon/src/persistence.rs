@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io,
+    os::fd::OwnedFd,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -126,6 +127,11 @@ pub(crate) struct RecoveredRun {
 pub(crate) struct HandoffHint {
     pub(crate) epoch: String,
     pub(crate) live_set: HashSet<RunId>,
+    /// The advisory state lock the outgoing image still holds, inherited on this
+    /// descriptor across exec. `None` means acquire the lock normally (a fresh
+    /// open + `try_lock`); `Some` means adopt it and skip the self-deadlocking
+    /// re-lock. Owned so the actor thread closes it correctly.
+    pub(crate) state_lock_fd: Option<OwnedFd>,
 }
 
 #[derive(Clone)]
@@ -404,6 +410,17 @@ impl Persistence {
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL, None)
+    }
+
+    /// Incoming-image startup seam for exec-in-place: reuse the handed-off epoch,
+    /// exclude the live Run set from reconciliation, and adopt the inherited
+    /// state-lock descriptor instead of re-locking. A12 calls this.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn open_with_handoff(
+        state_dir: impl Into<PathBuf>,
+        hint: HandoffHint,
+    ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL, Some(hint))
     }
 
     fn open_with_admission_limits(
@@ -1174,6 +1191,13 @@ impl StateLockGuard {
             Err(fs::TryLockError::Error(source)) => Err(PersistenceError::io(lock_path, source)),
         }
     }
+
+    /// Adopt a state lock already held on an inherited descriptor (exec-in-place).
+    /// The flock is per open-file-description and survived the exec on this fd, so
+    /// re-locking would self-deadlock; we take ownership and skip the lock call.
+    fn adopt(lock: File) -> Self {
+        Self(lock)
+    }
 }
 
 impl Drop for StateLockGuard {
@@ -1188,24 +1212,32 @@ impl StateStore {
     fn open(
         state_dir: &Path,
         admission_limits: AdmissionLimits,
-        handoff: Option<HandoffHint>,
+        mut handoff: Option<HandoffHint>,
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         prepare_state_dir(state_dir)?;
-        let lock_path = state_dir.join(LOCK_FILE);
-        validate_optional_state_file(&lock_path)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&lock_path)
-            .map_err(|source| PersistenceError::io(&lock_path, source))?;
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
-            .map_err(|source| PersistenceError::io(&lock_path, source))?;
-        validate_state_file(&lock_path)?;
-        let state_lock = StateLockGuard::acquire(lock, state_dir, &lock_path)?;
+        // On the exec-in-place path the process already holds the advisory lock
+        // on this descriptor; adopt it (the flock is per open-file-description,
+        // so a fresh open + try_lock would self-deadlock against our own lock).
+        let inherited_lock_fd = handoff.as_mut().and_then(|hint| hint.state_lock_fd.take());
+        let state_lock = if let Some(inherited_lock_fd) = inherited_lock_fd {
+            StateLockGuard::adopt(File::from(inherited_lock_fd))
+        } else {
+            let lock_path = state_dir.join(LOCK_FILE);
+            validate_optional_state_file(&lock_path)?;
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .map_err(|source| PersistenceError::io(&lock_path, source))?;
+            fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+                .map_err(|source| PersistenceError::io(&lock_path, source))?;
+            validate_state_file(&lock_path)?;
+            StateLockGuard::acquire(lock, state_dir, &lock_path)?
+        };
 
         let database_path = state_dir.join(DATABASE_FILE);
         let wal_path = state_dir.join(format!("{DATABASE_FILE}-wal"));
@@ -4997,6 +5029,7 @@ mod tests {
             Some(super::HandoffHint {
                 epoch: original_epoch.clone(),
                 live_set: HashSet::from([row_a]),
+                state_lock_fd: None,
             }),
             Arc::clone(&hooks),
         )
@@ -5128,6 +5161,7 @@ mod tests {
             Some(super::HandoffHint {
                 epoch: epoch.clone(),
                 live_set: HashSet::from([live_id]),
+                state_lock_fd: None,
             }),
             Arc::clone(&hooks),
         )
@@ -5149,5 +5183,51 @@ mod tests {
             .expect("count retained rows after over-budget handoff");
         assert_eq!(retained, i64::try_from(MAX_RETAINED_RUNS).unwrap());
         assert_eq!(store.epoch, epoch);
+    }
+
+    #[test]
+    fn reopening_with_inherited_lock_fd_does_not_self_deadlock() {
+        use std::os::fd::OwnedFd;
+
+        // The outgoing image still holds its advisory flock across exec-in-place;
+        // the incoming image inherits that same descriptor and must reuse it.
+        let handed = TempDir::new().expect("create inherited-lock fixture");
+        let state_dir = handed.path().join("state");
+        let (row_a, _row_b, epoch) = seed_two_running_rows(&state_dir);
+
+        let lock_path = state_dir.join(super::LOCK_FILE);
+        let held = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open the inherited lock file");
+        held.try_lock().expect("hold the pre-exec state lock");
+
+        // Contrast: the naive path (no inherited fd) freshly opens the lock and
+        // re-locks, which self-blocks against the held lock and fails closed.
+        let blocked = Persistence::open(&state_dir);
+        assert!(
+            matches!(blocked, Err(PersistenceError::StateInUse(_))),
+            "a fresh open + try_lock must self-block against the held lock"
+        );
+
+        // Adopt path: a dup shares the same open file description (and its lock),
+        // so the incoming image reuses it and skips the self-deadlocking re-lock.
+        let inherited: OwnedFd = held
+            .try_clone()
+            .expect("model an exec-inherited lock descriptor")
+            .into();
+        let (persistence, _recovered) = Persistence::open_with_handoff(
+            &state_dir,
+            super::HandoffHint {
+                epoch: epoch.clone(),
+                live_set: HashSet::from([row_a]),
+                state_lock_fd: Some(inherited),
+            },
+        )
+        .expect("adopt the inherited state lock without self-deadlocking");
+        assert_eq!(persistence.daemon_instance().to_string(), epoch);
+        drop(persistence);
+        drop(held);
     }
 }
