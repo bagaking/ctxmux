@@ -113,10 +113,15 @@ or torn WAL recovery therefore yields the previous or next complete unit, never
 a lifecycle/cursor/chunk hybrid. A start or fork that cannot reserve one new
 record within the immutable record and metadata budgets rejects only that
 unpublished Run; because no row was written, the actor continues serving
-existing Runs and later admissible starts. Every append or finalize error, and
-every serialization, database, I/O, commit, integrity, or owner-invariant
-failure still latches the actor, freezes the durable cursor, and rejects later
-mutations with a typed persistence error. A post-commit start check also
+existing Runs and later admissible starts. A typed SQLite `DiskFull` from an
+output append or terminal finalize is the one retryable storage condition: the
+single actor keeps that exact unit at the head of its ordered work, waits 50 ms,
+and tries again. Its bounded queue then backpressures the PTY reader and child
+rather than admitting an unbounded in-memory durability gap. Daemon shutdown
+cancels the wait. The actor does not retry generic I/O, corruption, replay
+conflict, file-budget, integrity, owner-invariant, or any other database error;
+those failures still latch the actor, freeze the durable cursor, and reject
+later mutations with a typed persistence error. A post-commit start check also
 latches the actor, but its reply carries the committed outcome so the daemon
 must publish that Run and key before returning the error; treating it as an
 uncommitted rollback would permit a second physical child. Already-owned live
@@ -255,6 +260,9 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - Active / `PERSIST-02`: a parseable cursor/chunk mixed generation returns a
   typed startup corruption failure before socket publication or partial Run
   exposure; SQLite transactions own old-or-new commit recovery.
+- Active: deterministic actor faults translate SQLite `DiskFull`, retry the
+  same append/finalize before later mutation, and stop waiting on shutdown;
+  the replay-conflict fixture still latches the actor.
 - Active: the 4 MiB per-Run replay boundary, state lock, exact schema version,
   owner-only directory/sidecar modes, and symlink rejection are executable.
 - Qualification constants and admission checks cover the 256 MiB replay, 64
