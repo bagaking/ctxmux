@@ -3,6 +3,11 @@
 - Status: accepted, implementation pending
 - Scope: keeping live PTY control across an intentional daemon upgrade or
   restart, in persistent mode
+- Supersedes: the two-process transactional direction of Feature **f-228**
+  (`.bagakit/.../f-228cz55vj`), after the Herdr comparison
+  (`f-226.../artifacts/herdr-transfer-review.md`) showed ctxmux's
+  SQLite-backed replay does not need Herdr's process-coexistence fd transfer.
+  See Alternatives for the accepted cost (no mid-transaction rollback).
 
 ## Context
 
@@ -130,15 +135,37 @@ re-exec changes no frame.
 
 ## Alternatives
 
+- **Spawn a successor process and pass fds with `SCM_RIGHTS`.** This is the
+  two-process transactional direction proposed in Feature **f-228** ("preserve
+  live Runs across controlled daemon replacement"), modeled on Herdr's live
+  handoff (`tests/live_handoff.rs` spawns a replacement server and waits for the
+  new pid while the old one still owns the pty). Rejected in favor of
+  exec-in-place, and this record **supersedes that direction**: Herdr *must* use
+  two processes because its pty actor holds heavy in-process terminal state
+  (`src/pty/actor/unix.rs`: grids, terminal responses, render state) that cannot
+  be rebuilt from a store, so its fds must cross a process boundary while both
+  live. ctxmux keeps replay in SQLite, not in heavy in-process terminal state,
+  so `execve` is cheap and removes the process-coexistence window that is the
+  entire reason `SCM_RIGHTS` exists.
+  - **Accepted cost.** f-228's acceptance boundary required "failure before
+    commit restores the old owner" — a rollback to a still-live quiesced
+    predecessor. Exec-in-place **cannot offer that**, and does not try to: once
+    `execve` fires the old image is gone, so there is no predecessor to roll
+    back to. Its failure model is instead a *pre-exec* guarantee plus atomicity:
+    any failure **before** `execve` leaves the current daemon fully owning every
+    fd and simply continuing to serve; `execve` itself is atomic; an `execve`
+    that returns (only on error) degrades to today's shutdown fail-stop. We
+    accept losing f-228's mid-transaction rollback in exchange for no second
+    process, no `SCM_RIGHTS`, and no dual-owner window — the properties that made
+    the two-process transaction expensive. f-228's other invariants
+    (exactly-one-owner, unchanged Run/PID/PTY identity, ordered output
+    continuity, explicit disposition for crossing controls) are preserved and
+    are implemented as A11 requirements, not weakened.
 - **A standing per-Run owner or shim** that always holds the fd so control also
   survives a *crash*. Rejected: one extra process and supervision boundary per
   Run, reversing the daemon-wide-owner performance work and breaking the frozen
   per-Run budget slopes, for the crash case operators do not deliberately
   trigger.
-- **Spawn a successor process and pass fds with `SCM_RIGHTS`.** Rejected in
-  favor of exec-in-place: ctxmux keeps replay in SQLite, not in heavy in-process
-  terminal state, so `execve` is cheap and removes the process-coexistence window
-  that is the entire reason `SCM_RIGHTS` exists.
 - **Migrate tokio connection state across the exec.** Rejected: high complexity
   for no benefit over reconnect-from-cursor, which already exists and is tested.
 - **A `Request::Upgrade` protocol operation as the trigger.** Rejected: forces a
@@ -158,8 +185,18 @@ raw fd, so the master fd is wrapped in a local adapter that implements resize,
 size query, and raw-fd access; the writer is either recovered as its own fd or
 written through a fresh handle over the bidirectional master fd.
 
-Recoverable-Input operation history is connection-local and is lost across the
-exec, consistent with its existing same-incarnation contract.
+Recoverable-Input operation history is **connection-local**, and per-connection
+tokio state does not cross the exec (see above), so the in-memory ledger is lost
+when the connection drops. This is in genuine tension with the preserved epoch:
+because exec-in-place keeps the daemon-instance identity, a reconnecting client
+believes it is still the same incarnation and may **retry** an input operation
+whose accepted/applied receipt it never received. The same-incarnation contract
+would normally let the retained ledger answer that retry idempotently; across
+the exec the ledger is gone. The incoming image must therefore not silently
+double-apply: an operation key it cannot find in a rebuilt ledger is treated as
+first-seen, and A9/A11 own the reconnect handling that keeps "unknown input is
+never replayed" true (f-228 Transfer Check). Durable replay and the byte cursor
+are unaffected — only the connection-local operation-key memory is rebuilt.
 
 ## Wrong-case corpus
 

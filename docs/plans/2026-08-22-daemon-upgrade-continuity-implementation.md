@@ -453,11 +453,12 @@ git commit -m "feat(daemon): adopt a child by pid and reap it via waitid"
 **Files:**
 - Create: `crates/ctxmux-daemon/src/adopted_pty.rs`
 - Modify: `crates/ctxmux-daemon/src/native_control.rs` (accept the adapter where it holds `PortablePtyControl`)
+- Modify: root `Cargo.toml` (enable rustix's `termios` feature — see Step 3)
 - Test: inline + `native_lifecycle.rs`
 
 **Step 1: Write the failing test**
 
-Open a real pty pair (via portable-pty's `native_pty_system().openpty(...)` — lib.rs already does this ~:2183), take the master's raw fd, drop the original master, wrap the raw fd in `AdoptedMasterPty::from_raw_fd(fd)`, then assert: `resize()` succeeds, `get_size()` returns the set size, `as_raw_fd()` matches, and a write reaches the slave.
+Open a real pty pair (via portable-pty's `native_pty_system().openpty(...)` — lib.rs already does this ~:2183), take the master's raw fd and wrap it in an owned handle **without** consuming the original (dup it: `ctxmux_inherited_fd::duplicate_cloexec`), construct `AdoptedMasterPty::from_owned_fd(owned)`, then assert: `resize()` succeeds, `get_size()` returns the set size (round-trip, mirroring the A4 floor test), `master_raw_fd()` returns the fd, and a write reaches the slave. Keep the original master and the slave alive for the duration so the pair is not torn down.
 
 **Step 2: Run test to verify it fails**
 
@@ -466,18 +467,23 @@ Expected: FAIL — module/type not found.
 
 **Step 3: Write minimal implementation**
 
-Implement `AdoptedMasterPty` holding an `OwnedFd`, using `rustix::termios`/`ioctl` `TIOCSWINSZ`/`TIOCGWINSZ` for resize/size and `write`/`read` on the fd for I/O. Implement whatever trait `NativeControlInner` requires (mirror `PortablePtyControl`'s surface at native_control.rs:364-379). All raw ioctl/unsafe goes in this file behind a tight `#[allow(unsafe_code)]` audit comment, or delegate to `ctxmux-inherited-fd`.
+⚠️ **Constraint (do not violate):** the daemon crate inherits `unsafe_code = "forbid"` from the workspace root (`Cargo.toml [workspace.lints.rust] unsafe_code = "forbid"`, applied via `[lints] workspace = true`). `forbid` **cannot** be re-permitted with `#[allow(unsafe_code)]` — the earlier draft of this step was wrong. All fd/ioctl work must go through **safe** wrappers:
+
+- `AdoptedMasterPty` holds an `OwnedFd` (constructed by the caller via the audited `ctxmux-inherited-fd` seam — `owned_from_raw` / `duplicate_cloexec` — never `unsafe { OwnedFd::from_raw_fd(..) }` in the daemon). Constructor is `from_owned_fd(OwnedFd)`, not `from_raw_fd`.
+- resize / size use **rustix's safe termios wrappers** `rustix::termios::{tcgetwinsize, tcsetwinsize}` (returning/taking `Winsize`), not raw `ioctl`. These require the `termios` feature on the rustix dependency, which is **not currently enabled** — add `features = ["termios", …existing]` to the root `Cargo.toml` rustix entry. Map `Winsize ↔ PtySize`: `ws_row↔rows, ws_col↔cols, ws_xpixel↔pixel_width, ws_ypixel↔pixel_height`.
+- I/O uses `std::fs::File`/`rustix::io::{read,write}` over the fd — all safe.
+- Implement the **`PtyControl` trait** (native_control.rs:355-366), which is **platform-split**: both platforms need `resize`, `get_size`, `master_raw_fd`; additionally macOS needs `interrupt_foreground(&self) -> io::Result<()>` (delegate to `ctxmux_pty_signal::interrupt_foreground(raw_fd)`) and non-macOS needs `foreground_process_group(&self) -> Option<u32>` (via `rustix::termios::tcgetpgrp(fd)`). Mirror `PortablePtyControl`'s exact cfg split, or the adapter won't satisfy the trait on both targets.
 
 **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p ctxmux-daemon adopted_pty`
-Expected: PASS.
+Run: `cargo test -p ctxmux-daemon adopted_pty` and `cargo clippy -p ctxmux-daemon --all-targets --all-features -- -D warnings`
+Expected: PASS, clippy clean (no `unsafe_code` violation).
 
 **Step 5: Commit**
 
 ```bash
-git add crates/ctxmux-daemon/src/adopted_pty.rs crates/ctxmux-daemon/src/native_control.rs crates/ctxmux-daemon/src/lib.rs
-git commit -m "feat(daemon): MasterPty adapter over an inherited raw master fd"
+git add crates/ctxmux-daemon/src/adopted_pty.rs crates/ctxmux-daemon/src/native_control.rs Cargo.toml crates/ctxmux-daemon/src/lib.rs
+git commit -m "feat(daemon): MasterPty adapter over an inherited owned master fd"
 ```
 
 ---
@@ -611,6 +617,11 @@ Add the arm. On SIGHUP:
 - if memory-only (no persistence) → log `"SIGHUP ignored: upgrade continuity requires --state-dir"` and continue the loop;
 - else: stop accepting new connections; quiesce tmux control owners as shutdown does; call owner `extract_for_handoff()` (A5); build `HandoffManifest` (A2) with the current epoch and the extracted descriptors; `clear_cloexec` (A1) on every manifest fd + listener fd + state-lock fd + the handoff pipe's write end; write the manifest to the handoff pipe; then `execve` via `std::os::unix::process::CommandExt::exec` on `std::env::current_exe()` with argv `--socket … --state-dir … --handoff-fd <n>` (+ readiness/qualification fds if present).
 - On `execve` returning an error (it only returns on failure): fall back to today's shutdown fail-stop (`shutdown_owned_controls`, record incarnation failure) — never leak un-waited children.
+
+**Verified-finding constraints (from the A1–A6 adversarial review; each is a required behavior, not a nicety):**
+- **Output barrier before extract (f04).** `extract_for_handoff` swaps `Watching→Done` and `mem::forget`s the control, so the owner's output-reader loop stops draining the master the instant extraction runs. Any bytes buffered in the reader but not yet committed to the durable replay cursor at that moment would be a silent gap the incoming image cannot recover (it resumes from the persisted cursor). **Before** extracting, drive a final durable-commit barrier so the persisted cursor covers every byte read so far; only then extract. Assert in A13 that a fresh attach from the pre-upgrade cursor shows contiguous output with no gap and no duplicate.
+- **Extract-then-exec-failure is fail-stop, never dual-ownership (f10).** Once `extract_for_handoff` has run, the children/controls are `mem::forget`-ed — the outgoing image no longer owns them and their fds are marked to survive the exec. If `execve` then fails, there is **no in-image owner to roll back to**; the only correct outcome is fail-stop (record incarnation failure and exit) so the fds are reclaimed by process death, never a path that resumes serving with forgotten controls. Do the fallible, reversible work (drain, barrier, manifest build, cloexec clear, manifest write) **before** extract where possible; treat extract as the point of no return that must be immediately followed by `execve`.
+- **CLOEXEC clear ordering + drain (f14).** Clearing CLOEXEC must happen *after* the manifest is finalized and *immediately before* `execve`, on exactly {manifest master fds, listener, state-lock, handoff write end} — nothing else. `duplicate_cloexec` re-sets CLOEXEC on the original fd, so any dup taken for the manifest must not leave the intended-to-survive fd close-on-exec; clear it last. The handoff pipe's write end must be closed by the time `read_manifest` runs in the incoming image (it blocks in `read_to_end` on EOF) — but since `execve` replaces this image, the write end survives into the new image and must be closed there after the manifest is read, or the read hangs. A14 owns the second fd-hygiene boundary that proves no ambient non-CLOEXEC fd leaks in.
 
 **Step 4: Run test to verify it passes**
 
