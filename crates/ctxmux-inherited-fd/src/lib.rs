@@ -1,7 +1,8 @@
-//! Narrow audited duplication for a harness-inherited descriptor.
+//! Narrow audited raw-descriptor operations for the process-spawn and exec
+//! contract: duplication and close-on-exec control.
 //!
 //! The daemon crate keeps `unsafe_code = "forbid"`. This private leaf owns the
-//! one raw-descriptor conversion that the process-spawn contract requires.
+//! raw-descriptor conversions and flag mutations those contracts require.
 
 #![deny(unsafe_code)]
 
@@ -153,6 +154,10 @@ mod tests {
         assert_eq!(
             super::clear_cloexec(2).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            super::clear_cloexec(1_000_000).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
         );
     }
 }
