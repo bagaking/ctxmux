@@ -9,12 +9,24 @@ A Run must survive the client that started or viewed it. An in-process library c
 
 ## Decision
 
-One Rust daemon owns every live native Run. Tokio owns the Unix listener,
-connection tasks, signals, bounded broadcast delivery, and cancellable launch
-admission. Blocking PTY reads and child waits run on named operating-system
-threads because the selected PTY interfaces are blocking. Unique Run creation
-uses a separate maximum of eight admitted short-lived threads; this bounds
-simultaneous launch work, not the steady-state two-thread-per-native-Run model.
+One Rust daemon owns every live native Run. The production daemon uses an
+explicit two-worker Tokio runtime for the Unix listener, connection tasks,
+signals, bounded broadcast delivery, and cancellable launch admission.
+
+Blocking native ownership stays outside those workers without allocating a
+reader and waiter thread for every Run. One daemon-wide native
+owner polls all blocking PTY reader descriptors for readiness, performs one
+bounded read for each ready Run, observes direct-child status without reaping,
+and owns the per-Run child command receivers. A ready descriptor remains
+blocking: the duplicate shares the PTY master open-file description with the
+writer, so setting `O_NONBLOCK` on it would also change writer semantics.
+Readiness therefore precedes every read under one unique owner.
+
+Stop and direct-exit descendant cleanup may block. The native owner hands those
+jobs FIFO to at most eight transient cleanup threads, which return the reap or
+fail-stop result before terminal publication. Unique Run creation separately
+uses a maximum of eight admitted short-lived threads. Neither bound grows with
+the number of ordinary live Runs.
 
 The protocol is the stable client boundary. Rust ABI, N-API, and editor-process lifetime are not product boundaries.
 
@@ -23,6 +35,9 @@ The protocol is the stable client boundary. Rust ABI, N-API, and editor-process 
 - Client disconnect cannot drop daemon-owned Run state.
 - The daemon remains Agent-neutral and has no JavaScript runtime.
 - Async connection work does not perform blocking PTY reads on Tokio workers.
+- An ordinary live native Run adds no permanent operating-system thread.
+- PTY EOF or the existing one-second bounded drain precedes terminal-state
+  publication, so retained output remains ordered before the terminal event.
 - Unsafe Rust is forbidden at the workspace lint boundary.
 
 ## Alternatives
@@ -39,10 +54,15 @@ native Run policy, live restart handoff, separate active-Run quota, global
 attachment quota, total RSS quota, or panic isolation contract. The shared
 Registry does enforce a 128-record retained/projected Run ceiling with
 ownership-safe exact replacement. Optional persistence recovers declared
-historical metadata and replay, but not live PTY authority. One reader thread
-and one waiter thread are created per native Run. Creation admission limits
-concurrent launches to eight, while its bounded shutdown drain cannot
-hard-cancel a launch thread that exceeds the deadline.
+historical metadata and replay, but not live PTY authority. One daemon-wide
+owner thread is part of the fresh-daemon fixed census, so adding ordinary live
+Runs does not change the thread count; blocking cleanup can temporarily add at
+most eight bounded workers. A stalled cleanup can retain one of those slots.
+Creation admission independently limits concurrent launches to eight,
+while its bounded shutdown drain cannot hard-cancel a launch thread that
+exceeds the deadline. Shutdown joins already-started native cleanup work and
+retains unresolved child authority fail-stop; it does not invent a graceful
+live-native-Run shutdown policy.
 
 ## Wrong-case corpus
 
@@ -52,15 +72,20 @@ Evidence pack: [daemon-runtime track](../../../.bagakit/researcher/topics/engine
 - `DR-002` (`a02`, `a03`): blocking PTY work inside an async connection task can make unrelated requests or shutdown unbounded. A deterministic blocked-operation fixture must prove isolation before this becomes a guarantee.
 - `DR-003` (`a01`): attachment lifetime must not become child lifetime. The existing same-id and same-PID reconnect test is the permanent regression.
 
-The Tokio pool regression and Rust child-drop contract constrain ownership and blocking boundaries. They do not prove that dedicated per-Run threads are universally superior or supply a safe global thread quota.
+The Tokio pool regression and Rust child-drop contract constrain ownership and
+blocking boundaries. They do not by themselves prove native-owner throughput,
+panic isolation, or a general daemon resource quota.
 
 ## Fixture mapping
 
-- Active: rejected post-spawn reader, writer, output-thread, and waiter-thread setup transitions terminate and reap the child before returning an error in `lib.rs`.
+- Active: rejected post-spawn reader, writer, output-owner, and wait-owner
+  registration transitions terminate and reap the child before returning an
+  error in `lib.rs`.
 - Covered now: client disconnect and reconnect preserve the same child PID in `native_lifecycle.rs` and `client-parity.test.ts`.
 - Candidate: daemon signal, crash, and orphan behavior.
 - Covered now: frozen 1/32/128 idle and active resource censuses measure
-  per-Run CPU, RSS, thread, and descriptor slopes; creation launch admission is
+  per-Run CPU, RSS, thread, and descriptor slopes; ordinary native Runs add
+  zero permanent threads, while creation and cleanup admission are each
   independently capped at eight.
 - Covered now: memory-only and persistent Registry admission enforce the shared
   128-record retained/projected ceiling and ownership-safe exact replacement.
@@ -75,7 +100,10 @@ The Tokio pool regression and Rust child-drop contract constrain ownership and b
 
 ## Repository evidence
 
+- `crates/ctxmux-daemon/src/main.rs`: explicit two-worker production runtime
 - `crates/ctxmux-daemon/src/lib.rs`: `serve`, `RunManager`, `Run::spawn`
+- `crates/ctxmux-daemon/src/native_runtime.rs`: daemon-wide native owner and
+  bounded cleanup handoff
 - `Cargo.toml`: product crates, including the daemon, inherit
   `unsafe_code = "forbid"`; the private `ctxmux-sqlite-status` FFI leaf is the
   audited exception required by Decision 013 and exposes no raw handle

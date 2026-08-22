@@ -6,7 +6,7 @@ compile_error!("the first ctxmux native transport currently requires Unix socket
 use std::{
     collections::VecDeque,
     fs,
-    io::{self, Read, Write},
+    io::{self, Write},
     os::fd::OwnedFd,
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
@@ -25,6 +25,7 @@ use std::{
 mod attachment;
 mod creation;
 mod native_control;
+mod native_runtime;
 mod native_session;
 mod native_spawn_env;
 mod persistence;
@@ -58,9 +59,10 @@ use crate::creation::{
     UnpublishedCleanupReservation,
 };
 use crate::native_control::{
-    ChildCommand, ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner,
-    PendingInput, PendingSignal, PendingStop,
+    ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner, PendingInput,
+    PendingSignal, PendingStop,
 };
+use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
 use crate::native_session::NativeSession;
 use crate::persistence::{
     CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
@@ -72,7 +74,6 @@ use crate::tmux::{
 };
 
 const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
-const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 const LIVE_EVENT_CAPACITY: usize = 256;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -405,6 +406,7 @@ struct RunManager {
     unpublished_cleanups: UnpublishedCleanupOwner,
     terminal_publications: TerminalPublicationOwner,
     native_input_drains: InputDrainGate,
+    native_runs: NativeRuntimeOwner,
     qualification_stats: QualificationStats,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
@@ -760,6 +762,7 @@ impl RunManager {
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
             terminal_publications: TerminalPublicationOwner::default(),
             native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
+            native_runs: NativeRuntimeOwner::default(),
             qualification_stats,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
@@ -818,6 +821,7 @@ impl RunManager {
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
             terminal_publications,
             native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
+            native_runs: NativeRuntimeOwner::default(),
             qualification_stats,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
@@ -935,6 +939,7 @@ impl RunManager {
                 persistence_mode,
                 live_event_capacity: self.live_event_capacity,
                 input_drains: self.native_input_drains.clone(),
+                native_runs: self.native_runs.clone(),
                 terminal_publications: self.terminal_publications.clone(),
                 wait_failure: NativeWaitFailure {
                     creation_flights: self.creation_flights.clone(),
@@ -1398,6 +1403,7 @@ impl RunManager {
                 persistence_mode: self.persistence_mode(),
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
+                native_runs: self.native_runs.clone(),
                 terminal_publications: self.terminal_publications.clone(),
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: self.qualification_stats.clone(),
@@ -1440,8 +1446,8 @@ impl RunManager {
 enum LaunchSetupStep {
     CloneReader,
     TakeWriter,
-    StartOutputThread,
-    StartWaiterThread,
+    RegisterOutputOwner,
+    RegisterWaitOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1457,6 +1463,7 @@ struct NativeSpawnConfig {
     persistence_mode: PersistenceMode,
     live_event_capacity: usize,
     input_drains: InputDrainGate,
+    native_runs: NativeRuntimeOwner,
     terminal_publications: TerminalPublicationOwner,
     wait_failure: NativeWaitFailure,
     qualification_stats: QualificationStats,
@@ -1681,6 +1688,7 @@ struct Run {
     state: Mutex<RunState>,
     output: Mutex<OutputLog>,
     incarnation_control: Option<RunControl>,
+    native_runs: Option<NativeRuntimeOwner>,
     persistence_mode: PersistenceMode,
     persistence_transition: Mutex<()>,
     persistence: Mutex<PersistenceBinding>,
@@ -1688,7 +1696,21 @@ struct Run {
     qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
-    events: broadcast::Sender<RunEvent>,
+    events: LiveEventOwner,
+}
+
+struct LiveEventOwner {
+    capacity: usize,
+    sender: Mutex<Option<broadcast::Sender<RunEvent>>>,
+}
+
+impl LiveEventOwner {
+    const fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            sender: Mutex::new(None),
+        }
+    }
 }
 
 /// Native persistence publication stays private until both durable COMMIT and
@@ -1990,11 +2012,6 @@ enum TmuxWaitCause {
     ChildStatusFailed(String),
 }
 
-enum NativeWaitOutcome {
-    Exited(RunState),
-    AuthorityLost,
-}
-
 struct TmuxWaitOutcome {
     cause: TmuxWaitCause,
     cleanup: Result<(), String>,
@@ -2002,8 +2019,12 @@ struct TmuxWaitOutcome {
 
 impl Run {
     #[cfg(test)]
-    fn new_native_for_wait_test(id: RunId, control: NativeControlOwner) -> Arc<Self> {
-        let (events, _) = broadcast::channel(LIVE_EVENT_CAPACITY);
+    fn new_native_for_owner_test(
+        id: RunId,
+        control: NativeControlOwner,
+        native_runs: NativeRuntimeOwner,
+        wait_failure: NativeWaitFailure,
+    ) -> Arc<Self> {
         Self::new_native(
             NativeSpawnConfig {
                 id,
@@ -2019,14 +2040,14 @@ impl Run {
                 persistence_mode: PersistenceMode::MemoryOnly,
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
+                native_runs,
                 terminal_publications: TerminalPublicationOwner::default(),
-                wait_failure: NativeWaitFailure::default(),
+                wait_failure,
                 qualification_stats: QualificationStats::default(),
             },
             id,
             Some(42),
             control,
-            events,
         )
     }
 
@@ -2046,6 +2067,7 @@ impl Run {
                 persistence_mode,
                 live_event_capacity,
                 input_drains,
+                native_runs: NativeRuntimeOwner::default(),
                 terminal_publications: TerminalPublicationOwner::default(),
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: QualificationStats::default(),
@@ -2116,6 +2138,7 @@ impl Run {
                 persistence_mode,
                 live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
+                native_runs: NativeRuntimeOwner::default(),
                 terminal_publications,
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: QualificationStats::default(),
@@ -2164,10 +2187,16 @@ impl Run {
         // exists, native control and PendingPublication can be built without a
         // setup error window that lacks exact-key cleanup ownership.
         setup(LaunchSetupStep::CloneReader, None)?;
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| spawn_error("clone PTY reader", error))?;
+        let reader_fd = pair.master.as_raw_fd().ok_or_else(|| {
+            spawn_error(
+                "identify PTY reader",
+                "native PTY master does not expose a raw descriptor",
+            )
+        })?;
+        let reader = fs::File::from(
+            ctxmux_inherited_fd::duplicate_cloexec(reader_fd)
+                .map_err(|error| spawn_error("clone PTY reader", error))?,
+        );
         setup(LaunchSetupStep::TakeWriter, None)?;
         let writer = pair
             .master
@@ -2190,82 +2219,59 @@ impl Run {
                 spawn_error("identify native session", "child PID is unavailable")
             })?)
             .map_err(|error| spawn_error("identify native session", error))?;
-        let (events, _) = broadcast::channel(config.live_event_capacity);
         let id = config.id;
-        let (native_control, child_command_rx) =
-            NativeControlOwner::new(id, pair.master, writer, config.input_drains.clone());
+        let owner_wake = config.native_runs.owner_wake();
+        let native_control = NativeControlOwner::new(
+            id,
+            pair.master,
+            writer,
+            config.input_drains.clone(),
+            owner_wake,
+        );
         pending_child.bind_reap_control(native_control.clone());
         let wait_failure = config.wait_failure.clone();
-        let owner = make_owner(Self::new_native(config, id, pid, native_control, events));
+        let owner = make_owner(Self::new_native(config, id, pid, native_control));
         let run = Arc::clone(owner.run());
-
-        // Start the waiter first, but do not hand it the child until the output
-        // reader also exists. A reader setup failure therefore drops the child
-        // sender, lets the empty waiter exit, and leaves `PendingChild` to
-        // synchronously kill/reap without an orphaned output owner.
-        let (output_done_tx, output_done_rx) = mpsc::channel();
-        let wait_run = Arc::clone(&run);
-        let wait_control = run
+        let registration_control = run
             .native_control()
             .expect("spawned Run retains native control")
             .clone();
-        if let Err(error) = setup(LaunchSetupStep::StartWaiterThread, pid) {
-            run.native_control()
-                .expect("spawned Run retains native control")
-                .mark_closed();
-            return Err(error);
+
+        // Both fallible owner-registration seams run before the single atomic
+        // handoff. Any injected failure therefore leaves `PendingChild` as the
+        // synchronous kill/reap owner and publishes no partial reactor entry.
+        for step in [
+            LaunchSetupStep::RegisterWaitOwner,
+            LaunchSetupStep::RegisterOutputOwner,
+        ] {
+            if let Err(error) = setup(step, pid) {
+                registration_control.mark_closed();
+                drop(pending_child);
+                return Err(error);
+            }
         }
-        let (child_tx, child_rx) = mpsc::channel::<PendingChild>();
-        let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
-        thread::Builder::new()
-            .name(format!("ctxmux-wait-{}", run.id))
-            .spawn(move || {
-                let _waiter_guard = waiter_guard;
-                let Ok(pending_child) = child_rx.recv() else {
-                    wait_control.mark_closed();
-                    return;
-                };
-                let child = pending_child.into_child();
-                match wait_for_child(
-                    child,
-                    child_command_rx,
-                    session,
-                    &wait_control,
-                    &wait_failure,
-                ) {
-                    NativeWaitOutcome::Exited(state) => {
-                        wait_control.mark_closed();
-                        after_wait();
-                        let _ = output_done_rx.recv_timeout(Duration::from_secs(1));
-                        wait_run.publish_terminal(state);
-                    }
-                    NativeWaitOutcome::AuthorityLost => {}
-                }
-            })
-            .map_err(|error| {
-                run.native_control()
-                    .expect("spawned Run retains native control")
-                    .mark_closed();
-                spawn_error("start child waiter", error)
-            })?;
-
-        let output_run = Arc::clone(&run);
         let reader_guard = qualification_stats.guard(QualificationGauge::Readers);
-        setup(LaunchSetupStep::StartOutputThread, pid)?;
-        thread::Builder::new()
-            .name(format!("ctxmux-output-{}", run.id))
-            .spawn(move || {
-                let _reader_guard = reader_guard;
-                read_output(&output_run, reader);
-                let _ = output_done_tx.send(());
-            })
-            .map_err(|error| spawn_error("start PTY reader", error))?;
-
-        child_tx.send(pending_child).map_err(|_| {
-            spawn_error(
-                "handoff child to waiter",
-                "waiter stopped before taking ownership",
-            )
+        let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
+        let native_runs = run
+            .native_runs
+            .as_ref()
+            .expect("native Run retains its daemon-wide owner")
+            .clone();
+        let registration = NativeRunRegistration::new(
+            &run,
+            reader,
+            pending_child,
+            session,
+            registration_control,
+            wait_failure,
+            after_wait,
+            reader_guard,
+            waiter_guard,
+        );
+        native_runs.register(registration).map_err(|error| {
+            let (message, registration) = error.into_parts();
+            drop(registration);
+            spawn_error("register native Run owner", message)
         })?;
 
         Ok(owner)
@@ -2276,7 +2282,6 @@ impl Run {
         id: RunId,
         pid: Option<u32>,
         native_control: NativeControlOwner,
-        events: broadcast::Sender<RunEvent>,
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
@@ -2288,6 +2293,7 @@ impl Run {
             state: Mutex::new(RunState::Running),
             output: Mutex::new(OutputLog::default()),
             incarnation_control: Some(RunControl::Native(native_control)),
+            native_runs: Some(config.native_runs),
             persistence_mode: config.persistence_mode,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(match config.persistence_mode {
@@ -2300,7 +2306,7 @@ impl Run {
             qualification_stats: config.qualification_stats,
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
-            events,
+            events: LiveEventOwner::new(config.live_event_capacity),
         })
     }
 
@@ -2327,7 +2333,6 @@ impl Run {
         let stdout = pending.take_stdout();
         let (commands_tx, commands_rx) = mpsc::channel();
         let (completion_tx, completion_rx) = mpsc::sync_channel(1);
-        let (events, _) = broadcast::channel(config.live_event_capacity);
         let run = Arc::new(Self {
             id: config.id,
             spec: None,
@@ -2350,6 +2355,7 @@ impl Run {
                 commands: commands_tx,
                 completion: Mutex::new(TmuxCompletion::Pending(completion_rx)),
             })),
+            native_runs: None,
             persistence_mode: PersistenceMode::MemoryOnly,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Disabled),
@@ -2357,7 +2363,7 @@ impl Run {
             qualification_stats: config.qualification_stats.clone(),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
-            events,
+            events: LiveEventOwner::new(config.live_event_capacity),
         });
         let pending_publication = PendingTmuxPublication::new(run, cleanup_reservation);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -2474,7 +2480,6 @@ impl Run {
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
     ) -> Arc<Self> {
-        let (events, _) = broadcast::channel(live_event_capacity);
         let terminal_ordinal = OnceLock::new();
         terminal_publications.recover(&terminal_ordinal);
         Arc::new(Self {
@@ -2487,6 +2492,7 @@ impl Run {
             state: Mutex::new(recovered.info.state),
             output: Mutex::new(OutputLog::from_replay(recovered.replay)),
             incarnation_control: None,
+            native_runs: None,
             persistence_mode: PersistenceMode::PersistentCapable,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
@@ -2494,7 +2500,7 @@ impl Run {
             qualification_stats,
             terminal_publications,
             terminal_ordinal,
-            events,
+            events: LiveEventOwner::new(live_event_capacity),
         })
     }
 
@@ -2621,15 +2627,22 @@ impl Run {
                 chunk
             }
         };
-        let _ = self.events.send(RunEvent::Output { chunk });
+        self.publish_event(RunEvent::Output { chunk });
     }
 
     fn mark_output_source_gap(&self) -> u64 {
         mutex_lock(&self.output).mark_source_gap()
     }
 
-    fn attach(self: &Arc<Self>, after_byte: u64) -> (AttachmentGuard, AttachedSnapshot) {
+    fn subscribe(self: &Arc<Self>) -> (AttachmentGuard, broadcast::Receiver<RunEvent>) {
+        let mut sender = mutex_lock(&self.events.sender);
         self.attachments.fetch_add(1, Ordering::AcqRel);
+        let receiver = sender
+            .get_or_insert_with(|| {
+                let (sender, _) = broadcast::channel(self.events.capacity);
+                sender
+            })
+            .subscribe();
         let qualification_guard = self
             .qualification_stats
             .guard(QualificationGauge::Attachments);
@@ -2637,16 +2650,24 @@ impl Run {
             run: Arc::clone(self),
             _qualification_guard: qualification_guard,
         };
-        let replay = mutex_lock(&self.output).replay(after_byte);
-        let snapshot = AttachedSnapshot {
-            run: self.info(),
-            replay,
-        };
-        (guard, snapshot)
+        (guard, receiver)
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<RunEvent> {
-        self.events.subscribe()
+    fn attachment_snapshot(&self, after_byte: u64) -> AttachedSnapshot {
+        let replay = mutex_lock(&self.output).replay(after_byte);
+        AttachedSnapshot {
+            run: self.info(),
+            replay,
+        }
+    }
+
+    fn publish_event(&self, event: RunEvent) {
+        if self.attachments.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if let Some(sender) = mutex_lock(&self.events.sender).as_ref() {
+            let _ = sender.send(event);
+        }
     }
 
     fn native_control(&self) -> Result<&NativeControlOwner, ProtocolError> {
@@ -2834,7 +2855,7 @@ impl Run {
                 terminal.clone(),
             );
             self.publish_terminal_state(terminal.clone());
-            let _ = self.events.send(RunEvent::Exited { state: terminal });
+            self.publish_event(RunEvent::Exited { state: terminal });
         } else {
             persistence.append(self.id, replay);
         }
@@ -2843,7 +2864,7 @@ impl Run {
     fn publish_terminal(&self, terminal: RunState) {
         if self.persistence_mode == PersistenceMode::MemoryOnly {
             self.publish_terminal_state(terminal.clone());
-            let _ = self.events.send(RunEvent::Exited { state: terminal });
+            self.publish_event(RunEvent::Exited { state: terminal });
             return;
         }
         let _transition = mutex_lock(&self.persistence_transition);
@@ -2873,12 +2894,12 @@ impl Run {
         );
         let _output = mutex_lock(&self.output);
         self.publish_terminal_state(terminal.clone());
-        let _ = self.events.send(RunEvent::Exited { state: terminal });
+        self.publish_event(RunEvent::Exited { state: terminal });
     }
 
     fn publish_interrupted(&self, reason: InterruptionReason) {
         self.publish_terminal_state(RunState::Interrupted { reason });
-        let _ = self.events.send(RunEvent::Interrupted { reason });
+        self.publish_event(RunEvent::Interrupted { reason });
     }
 
     fn publish_terminal_state(&self, terminal: RunState) {
@@ -2939,108 +2960,6 @@ impl Run {
             ));
         }
         Ok(())
-    }
-}
-
-fn wait_for_child(
-    mut child: Box<dyn Child + Send + Sync>,
-    commands: mpsc::Receiver<ChildCommand>,
-    mut session: NativeSession,
-    control: &NativeControlOwner,
-    failure: &NativeWaitFailure,
-) -> NativeWaitOutcome {
-    loop {
-        match commands.recv_timeout(CHILD_CONTROL_POLL) {
-            #[cfg(not(target_os = "macos"))]
-            Ok(ChildCommand::Signal {
-                signal: ctxmux_protocol::RunSignal::Interrupt,
-                foreground_group,
-                reply,
-            }) => {
-                let _ = reply.send(session.interrupt(foreground_group));
-            }
-            Ok(ChildCommand::Stop(reply)) => {
-                match session.stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT) {
-                    Ok((disposition, status)) => {
-                        control.mark_reaped();
-                        let _ = reply.send(Ok(disposition));
-                        return NativeWaitOutcome::Exited(exit_state(&status));
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(error));
-                    }
-                }
-            }
-            Ok(ChildCommand::CleanupUnpublished) => {
-                match session.stop(child.as_mut(), STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT) {
-                    Ok((_, status)) => {
-                        control.mark_reaped();
-                        return NativeWaitOutcome::Exited(exit_state(&status));
-                    }
-                    Err(error) => {
-                        control.record_cleanup_error(format!(
-                            "failed to stop unpublished Run session: {error}"
-                        ));
-                    }
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
-        }
-        match session.leader_is_terminal() {
-            Ok(true) => {
-                // Fence admission before draining. Any command admitted before
-                // this lock transition completed its channel send under the
-                // same owner lock and is therefore visible to try_recv below.
-                control.mark_closed();
-                let mut pending_stop = None;
-                while let Ok(command) = commands.try_recv() {
-                    match command {
-                        #[cfg(not(target_os = "macos"))]
-                        ChildCommand::Signal { reply, .. } => {
-                            let _ = reply.send(Err(
-                                "native session leader exited before interrupt".to_owned(),
-                            ));
-                        }
-                        ChildCommand::Stop(reply) => {
-                            if let Some(previous) = pending_stop.replace(reply) {
-                                let _ = previous.send(Err(
-                                    "multiple Stop commands crossed one native owner fence"
-                                        .to_owned(),
-                                ));
-                            }
-                        }
-                        ChildCommand::CleanupUnpublished => {}
-                    }
-                }
-                match session
-                    .finish_after_direct_exit(child.as_mut(), Instant::now() + STOP_FORCED_TIMEOUT)
-                {
-                    Ok((status, disposition)) => {
-                        control.mark_reaped();
-                        if let Some(reply) = pending_stop {
-                            let _ = reply.send(Ok(disposition));
-                        }
-                        return NativeWaitOutcome::Exited(exit_state(&status));
-                    }
-                    Err(error) => {
-                        if let Some(reply) = pending_stop {
-                            let _ = reply.send(Err(error.clone()));
-                        }
-                        control.mark_wait_authority_lost(error.clone(), child);
-                        drop(commands);
-                        failure.record(control.run_id(), &error);
-                        return NativeWaitOutcome::AuthorityLost;
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(error) => {
-                control.mark_wait_authority_lost(error.clone(), child);
-                drop(commands);
-                failure.record(control.run_id(), &error);
-                return NativeWaitOutcome::AuthorityLost;
-            }
-        }
     }
 }
 
@@ -3382,7 +3301,7 @@ fn handle_tmux_control_item(
             );
         }
         ControlItem::SessionRenamed { session_id, name } if session_id == target.session_id => {
-            let _ = run.events.send(RunEvent::Tmux {
+            run.publish_event(RunEvent::Tmux {
                 event: TmuxRunEvent::SessionRenamed { name },
             });
         }
@@ -3397,10 +3316,10 @@ fn handle_tmux_control_item(
         }
         ControlItem::Paused { pane_id } if pane_id == target.pane_id => {
             let latest_output_bytes = run.mark_output_source_gap();
-            let _ = run.events.send(RunEvent::Tmux {
+            run.publish_event(RunEvent::Tmux {
                 event: TmuxRunEvent::Paused,
             });
-            let _ = run.events.send(RunEvent::Gap {
+            run.publish_event(RunEvent::Gap {
                 latest_output_bytes,
             });
             let command = format!("refresh-client -A {pane_id}:continue\n");
@@ -3414,7 +3333,7 @@ fn handle_tmux_control_item(
             }
         }
         ControlItem::Continued { pane_id } if pane_id == target.pane_id => {
-            let _ = run.events.send(RunEvent::Tmux {
+            run.publish_event(RunEvent::Tmux {
                 event: TmuxRunEvent::Continued,
             });
         }
@@ -3552,7 +3471,15 @@ struct AttachmentGuard {
 
 impl Drop for AttachmentGuard {
     fn drop(&mut self) {
-        self.run.attachments.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.run.attachments.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "attachment count cannot underflow");
+        if previous != 1 {
+            return;
+        }
+        let mut sender = mutex_lock(&self.run.events.sender);
+        if self.run.attachments.load(Ordering::Acquire) == 0 {
+            sender.take();
+        }
     }
 }
 
@@ -3650,21 +3577,6 @@ fn retained_after(chunk: &OutputChunk, after_byte: u64) -> Option<OutputChunk> {
         end_byte: chunk.end_byte,
         data: chunk.data.get(offset..)?.to_vec(),
     })
-}
-
-fn read_output(run: &Run, mut reader: Box<dyn Read + Send>) {
-    let mut buffer = vec![0; OUTPUT_READ_BUFFER_BYTES];
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => return,
-            Ok(read) => run.record_output(buffer[..read].to_vec()),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => {
-                eprintln!("ctxmuxd PTY read failed for {}: {error}", run.id);
-                return;
-            }
-        }
-    }
 }
 
 fn invalid_run_spec(error: run_spec::RunSpecValidationError) -> ProtocolError {
@@ -4040,8 +3952,8 @@ mod tests {
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, NativeWaitFailure,
-        NativeWaitOutcome, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
+        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, NativeRuntimeOwner,
+        NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
         Persistence, PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager,
         ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
         TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
@@ -4049,7 +3961,7 @@ mod tests {
         TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
         TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
         prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager,
-        serve_with_persistence_manager, spawn_error, wait_for_child,
+        serve_with_persistence_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
     use crate::native_control::NativeControlOwner;
@@ -4151,17 +4063,34 @@ mod tests {
     fn native_wait_error_fail_stops_once_without_dropping_or_signalling_child() {
         let run_id = RunId::new();
         let counts = Arc::new(WaitFailureCounts::default());
-        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let native_runs = NativeRuntimeOwner::default();
+        let control = NativeControlOwner::new_for_wait_test(run_id, native_runs.owner_wake());
         let failure = NativeWaitFailure::default();
-
-        let outcome = wait_for_child(
-            Box::new(WaitFailingChild(Arc::clone(&counts))),
-            commands,
-            wait_failing_session(&counts),
-            &control,
-            &failure,
+        let run = Run::new_native_for_owner_test(
+            run_id,
+            control.clone(),
+            native_runs.clone(),
+            failure.clone(),
         );
-        assert!(matches!(outcome, NativeWaitOutcome::AuthorityLost));
+        native_runs
+            .register_for_test(
+                &run,
+                Box::new(WaitFailingChild(Arc::clone(&counts))),
+                wait_failing_session(&counts),
+                control.clone(),
+                failure.clone(),
+                || {},
+            )
+            .map_err(|error| error.into_parts().0)
+            .expect("register production native owner fixture");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !control.retains_failed_child() {
+            assert!(
+                Instant::now() < deadline,
+                "production owner did not fail-stop"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(counts.try_wait.load(Ordering::Acquire), 1);
         assert_eq!(counts.kill.load(Ordering::Acquire), 0);
         assert_eq!(counts.wait.load(Ordering::Acquire), 0);
@@ -4207,9 +4136,7 @@ mod tests {
         assert!(message.contains("fixture wait authority lost"));
 
         let manager = RunManager::default();
-        manager
-            .registry
-            .publish_unkeyed_for_test(Run::new_native_for_wait_test(run_id, control.clone()));
+        manager.registry.publish_unkeyed_for_test(run);
         let shutdown = manager
             .shutdown_owned_controls(Duration::ZERO)
             .expect_err("shutdown reports retained wait-authority failure");
@@ -4224,6 +4151,7 @@ mod tests {
         assert_eq!(counts.dropped.load(Ordering::Acquire), 0);
 
         drop(manager);
+        drop(native_runs);
         drop(control);
         assert_eq!(counts.dropped.load(Ordering::Acquire), 1);
     }
@@ -4232,7 +4160,8 @@ mod tests {
     async fn admitted_stop_receives_natural_exit_reap_after_the_receiver_poll_gap() {
         let run_id = RunId::new();
         let counts = Arc::new(WaitFailureCounts::default());
-        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let native_runs = NativeRuntimeOwner::default();
+        let control = NativeControlOwner::new_for_wait_test(run_id, native_runs.owner_wake());
         let probe_reached = Arc::new(std::sync::Barrier::new(2));
         let release_probe = Arc::new(std::sync::Barrier::new(2));
         let probe_calls = Arc::new(AtomicUsize::new(0));
@@ -4250,17 +4179,24 @@ mod tests {
                     Ok(true)
                 }
             }));
-        let waiter_control = control.clone();
-        let waiter_counts = Arc::clone(&counts);
-        let waiter = std::thread::spawn(move || {
-            wait_for_child(
-                Box::new(WaitFailingChild(waiter_counts)),
-                commands,
+        let failure = NativeWaitFailure::default();
+        let run = Run::new_native_for_owner_test(
+            run_id,
+            control.clone(),
+            native_runs.clone(),
+            failure.clone(),
+        );
+        native_runs
+            .register_for_test(
+                &run,
+                Box::new(WaitFailingChild(Arc::clone(&counts))),
                 session,
-                &waiter_control,
-                &NativeWaitFailure::default(),
+                control.clone(),
+                failure,
+                || {},
             )
-        });
+            .map_err(|error| error.into_parts().0)
+            .expect("register production natural-exit fixture");
 
         // The waiter has already observed an empty receive poll and is paused
         // immediately before publishing natural terminal ownership.
@@ -4279,13 +4215,19 @@ mod tests {
                 disposition: StopDisposition::Graceful
             }
         );
-        assert!(matches!(
-            waiter.join().expect("join natural-exit waiter"),
-            NativeWaitOutcome::Exited(RunState::Exited {
-                code: 91,
-                signal: None
-            })
-        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !matches!(
+                run.info().state,
+                RunState::Exited {
+                    code: 91,
+                    signal: None
+                }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("production owner publishes the natural terminal state");
         assert_eq!(counts.kill.load(Ordering::Acquire), 0);
         assert_eq!(counts.wait.load(Ordering::Acquire), 1);
         control
@@ -4300,14 +4242,19 @@ mod tests {
         let manager = Arc::new(RunManager::default());
         let run_id = RunId::new();
         let counts = Arc::new(WaitFailureCounts::default());
-        let (control, commands) = NativeControlOwner::new_for_wait_test(run_id);
+        let control =
+            NativeControlOwner::new_for_wait_test(run_id, manager.native_runs.owner_wake());
         let wait_failure = NativeWaitFailure {
             creation_flights: manager.creation_flights.clone(),
             incarnation_failure: manager.incarnation_failure.clone(),
         };
-        manager
-            .registry
-            .publish_unkeyed_for_test(Run::new_native_for_wait_test(run_id, control.clone()));
+        let run = Run::new_native_for_owner_test(
+            run_id,
+            control.clone(),
+            manager.native_runs.clone(),
+            wait_failure.clone(),
+        );
+        manager.registry.publish_unkeyed_for_test(Arc::clone(&run));
 
         let server_manager = Arc::clone(&manager);
         let server_socket = socket.clone();
@@ -4347,17 +4294,18 @@ mod tests {
             .expect("attach through the public client before wait authority fails");
         assert_eq!(snapshot.run.state, RunState::Running);
 
-        let waiter_counts = Arc::clone(&counts);
-        let waiter = std::thread::spawn(move || {
-            let session = wait_failing_session(&waiter_counts);
-            wait_for_child(
-                Box::new(WaitFailingChild(waiter_counts)),
-                commands,
-                session,
-                &control,
-                &wait_failure,
+        manager
+            .native_runs
+            .register_for_test(
+                &run,
+                Box::new(WaitFailingChild(Arc::clone(&counts))),
+                wait_failing_session(&counts),
+                control,
+                wait_failure,
+                || {},
             )
-        });
+            .map_err(|error| error.into_parts().0)
+            .expect("register production wait-authority fixture");
         let event = tokio::time::timeout(Duration::from_secs(2), attachment.next_event())
             .await
             .expect("daemon failure closes the public attachment");
@@ -4365,10 +4313,6 @@ mod tests {
             matches!(event, Err(ClientError::Closed)),
             "pre-terminal daemon exit must not look like a clean terminal EOF: {event:?}"
         );
-        assert!(matches!(
-            waiter.join().expect("join fixture child waiter"),
-            NativeWaitOutcome::AuthorityLost
-        ));
         assert_eq!(counts.try_wait.load(Ordering::Acquire), 1);
 
         let result = server_result_rx
@@ -4578,7 +4522,6 @@ mod tests {
         std::sync::mpsc::Receiver<super::TmuxControlCommand>,
     ) {
         let (commands, command_rx) = std::sync::mpsc::channel();
-        let (events, _) = broadcast::channel(1);
         let run = Arc::new(Run {
             id: RunId::new(),
             spec: None,
@@ -4601,6 +4544,7 @@ mod tests {
                 commands,
                 completion: Mutex::new(TmuxCompletion::Pending(completion)),
             })),
+            native_runs: None,
             persistence_mode: PersistenceMode::MemoryOnly,
             persistence_transition: Mutex::new(()),
             persistence: Mutex::new(PersistenceBinding::Disabled),
@@ -4608,7 +4552,7 @@ mod tests {
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
-            events,
+            events: super::LiveEventOwner::new(1),
         });
         (run, command_rx)
     }
@@ -4858,8 +4802,8 @@ mod tests {
         for failed_step in [
             LaunchSetupStep::CloneReader,
             LaunchSetupStep::TakeWriter,
-            LaunchSetupStep::StartOutputThread,
-            LaunchSetupStep::StartWaiterThread,
+            LaunchSetupStep::RegisterOutputOwner,
+            LaunchSetupStep::RegisterWaitOwner,
         ] {
             let manager = RunManager::default();
             let operation_key =
@@ -4897,7 +4841,7 @@ mod tests {
             assert!(manager.list().is_empty(), "failed start published a Run");
             if matches!(
                 failed_step,
-                LaunchSetupStep::StartOutputThread | LaunchSetupStep::StartWaiterThread
+                LaunchSetupStep::RegisterOutputOwner | LaunchSetupStep::RegisterWaitOwner
             ) {
                 let pid = failed_pid.expect("post-spawn fixture records the rejected child pid");
                 assert!(
@@ -5363,7 +5307,10 @@ mod tests {
                     MutationOperation::Stop => match result {
                         Ok(()) => accepted_stops += 1,
                         Err(ClientError::ControlRejected { failure })
-                            if failure.error.code == ErrorCode::InvalidRunState =>
+                            if matches!(
+                                failure.error.code,
+                                ErrorCode::InvalidRunState | ErrorCode::ControlBackpressure
+                            ) =>
                         {
                             rejected_stops += 1;
                         }
@@ -5609,6 +5556,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             b"abcd"
         );
+    }
+
+    #[test]
+    fn live_event_ring_exists_only_while_an_attachment_owns_it() {
+        let id = RunId::new();
+        let native_runs = NativeRuntimeOwner::default();
+        let control = NativeControlOwner::new_for_wait_test(id, native_runs.owner_wake());
+        let run =
+            Run::new_native_for_owner_test(id, control, native_runs, NativeWaitFailure::default());
+        assert!(mutex_lock(&run.events.sender).is_none());
+
+        let (first, mut first_events) = run.subscribe();
+        let (second, _second_events) = run.subscribe();
+        assert_eq!(run.attachments.load(Ordering::Acquire), 2);
+        assert!(mutex_lock(&run.events.sender).is_some());
+
+        run.publish_event(RunEvent::Gap {
+            latest_output_bytes: 7,
+        });
+        assert!(matches!(
+            first_events.try_recv(),
+            Ok(RunEvent::Gap {
+                latest_output_bytes: 7
+            })
+        ));
+
+        drop(first);
+        assert!(mutex_lock(&run.events.sender).is_some());
+        drop(second);
+        assert_eq!(run.attachments.load(Ordering::Acquire), 0);
+        assert!(mutex_lock(&run.events.sender).is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

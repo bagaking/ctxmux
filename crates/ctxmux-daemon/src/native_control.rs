@@ -5,7 +5,7 @@ use std::{
     fmt,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex, Weak, mpsc},
+    sync::{Arc, Condvar, Mutex, Weak},
     thread,
     time::{Duration, Instant},
 };
@@ -17,6 +17,7 @@ use ctxmux_protocol::{
 use portable_pty::{Child, MasterPty, PtySize};
 use tokio::sync::{oneshot, watch};
 
+use crate::native_runtime::OwnerWake;
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
 const INPUT_QUEUE_MAX_COMMANDS: usize = 1_024;
@@ -26,6 +27,7 @@ const INPUT_BURST_MAX_COMMANDS: usize = 64;
 const INPUT_BURST_MAX_BYTES: usize = 256 * 1024;
 const INPUT_RESULT_MAX_ENTRIES: usize = 256;
 const INPUT_RESULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const STOP_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) type ControlResult = Result<ControlReceipt, ControlFailure>;
 
@@ -49,7 +51,14 @@ pub(crate) enum PendingRecoverableInput {
 #[derive(Debug)]
 pub(crate) struct PendingStop {
     run_id: RunId,
-    reply: oneshot::Receiver<Result<StopDisposition, String>>,
+    reply: oneshot::Receiver<StopOwnerResult>,
+}
+
+#[derive(Debug)]
+pub(crate) enum StopOwnerResult {
+    Accepted(StopDisposition),
+    Rejected(ControlFailure),
+    Unknown(String),
 }
 
 #[derive(Debug)]
@@ -59,7 +68,7 @@ pub(crate) struct PendingSignal {
     reply: oneshot::Receiver<Result<(), String>>,
 }
 
-/// One direct-child command handled by the existing waiter thread.
+/// One direct-child command handled by the daemon-wide native lifecycle owner.
 pub(crate) enum ChildCommand {
     #[cfg(not(target_os = "macos"))]
     Signal {
@@ -67,7 +76,10 @@ pub(crate) enum ChildCommand {
         foreground_group: u32,
         reply: oneshot::Sender<Result<(), String>>,
     },
-    Stop(oneshot::Sender<Result<StopDisposition, String>>),
+    Stop {
+        reply: oneshot::Sender<StopOwnerResult>,
+        deadline: Instant,
+    },
     CleanupUnpublished,
 }
 
@@ -235,6 +247,7 @@ struct NativeControlInner {
     reap: Mutex<ChildReapState>,
     reap_changed: Condvar,
     input_drains: InputDrainGate,
+    owner_wake: OwnerWake,
 }
 
 /// Descriptor handles detached from a closed native incarnation after the
@@ -282,7 +295,9 @@ struct NativeControlState {
     retained_input_request_bytes: usize,
     input_result_max_entries: usize,
     input_result_max_request_bytes: usize,
-    child_sender: Option<mpsc::Sender<ChildCommand>>,
+    child_open: bool,
+    stop_pending: bool,
+    child_commands: VecDeque<ChildCommand>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -384,17 +399,19 @@ impl NativeControlOwner {
         master: Box<dyn MasterPty + Send>,
         writer: Box<dyn Write + Send>,
         input_drains: InputDrainGate,
-    ) -> (Self, mpsc::Receiver<ChildCommand>) {
+        owner_wake: OwnerWake,
+    ) -> Self {
         Self::new_with_pty(
             run_id,
             Box::new(PortablePtyControl(master)),
             writer,
             input_drains,
+            owner_wake,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn new_for_wait_test(run_id: RunId) -> (Self, mpsc::Receiver<ChildCommand>) {
+    pub(crate) fn new_for_wait_test(run_id: RunId, owner_wake: OwnerWake) -> Self {
         struct TestPty;
 
         impl PtyControl for TestPty {
@@ -422,6 +439,7 @@ impl NativeControlOwner {
             Box::new(TestPty),
             Box::new(io::sink()),
             InputDrainGate::default(),
+            owner_wake,
         )
     }
 
@@ -445,12 +463,14 @@ impl NativeControlOwner {
         pty: Box<dyn PtyControl>,
         writer: Box<dyn Write + Send>,
         input_drains: InputDrainGate,
-    ) -> (Self, mpsc::Receiver<ChildCommand>) {
+        owner_wake: OwnerWake,
+    ) -> Self {
         Self::new_with_pty_and_input_results(
             run_id,
             pty,
             writer,
             input_drains,
+            owner_wake,
             INPUT_RESULT_MAX_ENTRIES,
             INPUT_RESULT_MAX_REQUEST_BYTES,
         )
@@ -461,43 +481,43 @@ impl NativeControlOwner {
         pty: Box<dyn PtyControl>,
         writer: Box<dyn Write + Send>,
         input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
         input_result_max_entries: usize,
         input_result_max_request_bytes: usize,
-    ) -> (Self, mpsc::Receiver<ChildCommand>) {
+    ) -> Self {
         debug_assert!(input_result_max_entries > 0);
         debug_assert!(input_result_max_request_bytes > 0);
-        let (child_sender, child_receiver) = mpsc::channel();
-        (
-            Self {
-                inner: Arc::new(NativeControlInner {
-                    run_id,
-                    pty: Mutex::new(Some(pty)),
-                    writer: Mutex::new(Some(writer)),
-                    state: Mutex::new(NativeControlState {
-                        phase: ControlPhase::Open,
-                        input_failure: None,
-                        input_queue: VecDeque::new(),
-                        input_commands: 0,
-                        input_bytes: 0,
-                        input_scheduled: false,
-                        applied_input_bytes: 0,
-                        input_operations: HashMap::new(),
-                        completed_input_operations: VecDeque::new(),
-                        retained_input_request_bytes: 0,
-                        input_result_max_entries,
-                        input_result_max_request_bytes,
-                        child_sender: Some(child_sender),
-                    }),
-                    reap: Mutex::new(ChildReapState::Pending {
-                        cleanup_error: None,
-                        wait_error: None,
-                    }),
-                    reap_changed: Condvar::new(),
-                    input_drains,
+        Self {
+            inner: Arc::new(NativeControlInner {
+                run_id,
+                pty: Mutex::new(Some(pty)),
+                writer: Mutex::new(Some(writer)),
+                state: Mutex::new(NativeControlState {
+                    phase: ControlPhase::Open,
+                    input_failure: None,
+                    input_queue: VecDeque::new(),
+                    input_commands: 0,
+                    input_bytes: 0,
+                    input_scheduled: false,
+                    applied_input_bytes: 0,
+                    input_operations: HashMap::new(),
+                    completed_input_operations: VecDeque::new(),
+                    retained_input_request_bytes: 0,
+                    input_result_max_entries,
+                    input_result_max_request_bytes,
+                    child_open: true,
+                    stop_pending: false,
+                    child_commands: VecDeque::new(),
                 }),
-            },
-            child_receiver,
-        )
+                reap: Mutex::new(ChildReapState::Pending {
+                    cleanup_error: None,
+                    wait_error: None,
+                }),
+                reap_changed: Condvar::new(),
+                input_drains,
+                owner_wake,
+            }),
+        }
     }
 
     pub(crate) fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
@@ -660,7 +680,7 @@ impl NativeControlOwner {
                     "signal",
                 )));
             }
-            if state.child_sender.is_none() {
+            if !state.child_open {
                 return Err(not_applied(ProtocolError::new(
                     ErrorCode::InvalidRunState,
                     format!("cannot signal exited Run {}", self.inner.run_id),
@@ -679,10 +699,6 @@ impl NativeControlOwner {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let sender = state
-                    .child_sender
-                    .as_ref()
-                    .expect("checked live child sender remains present under owner lock");
                 let foreground_group = mutex_lock(&self.inner.pty)
                     .as_ref()
                     .and_then(|pty| pty.foreground_process_group())
@@ -695,21 +711,14 @@ impl NativeControlOwner {
                             ),
                         ))
                     })?;
-                sender
-                    .send(ChildCommand::Signal {
-                        signal,
-                        foreground_group,
-                        reply: reply_tx,
-                    })
-                    .map_err(|_| {
-                        not_applied(invalid_phase_error(
-                            self.inner.run_id,
-                            state.phase,
-                            "signal",
-                        ))
-                    })?;
+                state.child_commands.push_back(ChildCommand::Signal {
+                    signal,
+                    foreground_group,
+                    reply: reply_tx,
+                });
             }
         }
+        self.inner.owner_wake.wake();
         Ok(PendingSignal {
             run_id: self.inner.run_id,
             signal,
@@ -717,24 +726,24 @@ impl NativeControlOwner {
         })
     }
 
-    /// Ask the child-handle waiter to clean up a Run rejected before durable
-    /// publication. Completion remains a separate waiter-owned reap receipt.
+    /// Ask the daemon-wide child owner to clean up a Run rejected before durable
+    /// publication. Completion remains a separate cleanup-owned reap receipt.
     pub(crate) fn cleanup_unpublished(&self) -> Result<(), String> {
-        let (sender, rejected) = {
+        let rejected = {
             let mut state = mutex_lock(&self.inner.state);
             match state.phase {
                 ControlPhase::Open => state.phase = ControlPhase::Stopping,
                 ControlPhase::Stopping => return Ok(()),
                 ControlPhase::Closed | ControlPhase::Failed => return self.reap_result(),
             }
-            let Some(sender) = state.child_sender.clone() else {
+            if !state.child_open {
                 let error = format!(
                     "Run {} child owner channel closed before unpublished cleanup",
                     self.inner.run_id
                 );
                 self.record_cleanup_error(error.clone());
                 return Err(error);
-            };
+            }
             let rejected = reject_queued_inputs(
                 &mut state,
                 &ProtocolError::new(
@@ -742,24 +751,19 @@ impl NativeControlOwner {
                     format!("cannot write to stopping Run {}", self.inner.run_id),
                 ),
             );
-            (sender, rejected)
+            state
+                .child_commands
+                .push_back(ChildCommand::CleanupUnpublished);
+            rejected
         };
         send_rejections(rejected);
-        sender.send(ChildCommand::CleanupUnpublished).map_err(|_| {
-            let error = format!(
-                "Run {} child owner channel closed before unpublished cleanup",
-                self.inner.run_id
-            );
-            self.record_cleanup_error(error.clone());
-            error
-        })
+        self.inner.owner_wake.wake();
+        Ok(())
     }
 
-    fn begin_stop_inner(
-        &self,
-    ) -> Result<oneshot::Receiver<Result<StopDisposition, String>>, ControlFailure> {
+    fn begin_stop_inner(&self) -> Result<oneshot::Receiver<StopOwnerResult>, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        let (rejected, sent, phase) = {
+        {
             let mut state = mutex_lock(&self.inner.state);
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
@@ -768,58 +772,106 @@ impl NativeControlOwner {
                     "stop",
                 )));
             }
-            let Some(sender) = state.child_sender.clone() else {
+            if !state.child_open {
                 state.phase = ControlPhase::Closed;
                 return Err(not_applied(ProtocolError::new(
                     ErrorCode::InvalidRunState,
                     format!("cannot stop exited Run {}", self.inner.run_id),
                 )));
-            };
+            }
+            if state.stop_pending {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::ControlBackpressure,
+                    format!(
+                        "Run {} already has one pending Stop admission",
+                        self.inner.run_id
+                    ),
+                )));
+            }
+            state.stop_pending = true;
+            state.child_commands.push_back(ChildCommand::Stop {
+                reply: reply_tx,
+                deadline: Instant::now() + STOP_ADMISSION_TIMEOUT,
+            });
+        }
+        self.inner.owner_wake.wake();
+        Ok(reply_rx)
+    }
+
+    pub(crate) fn commit_pending_stop(&self) -> Result<(), ControlFailure> {
+        let rejected = {
+            let mut state = mutex_lock(&self.inner.state);
+            if state.phase != ControlPhase::Open || !state.stop_pending || !state.child_open {
+                state.stop_pending = false;
+                return Err(not_applied(invalid_phase_error(
+                    self.inner.run_id,
+                    state.phase,
+                    "stop",
+                )));
+            }
+            state.stop_pending = false;
             state.phase = ControlPhase::Stopping;
-            let rejected = reject_queued_inputs(
+            reject_queued_inputs(
                 &mut state,
                 &ProtocolError::new(
                     ErrorCode::InvalidRunState,
                     format!("cannot write to stopping Run {}", self.inner.run_id),
                 ),
-            );
-            // Stop admission and command publication share this owner lock
-            // with `mark_closed`. Once admission returns, the waiter either
-            // observes this command or the send has already failed closed.
-            let sent = sender.send(ChildCommand::Stop(reply_tx)).is_ok();
-            if !sent {
-                state.phase = ControlPhase::Closed;
-                state.child_sender = None;
-            }
-            (rejected, sent, state.phase)
+            )
         };
         send_rejections(rejected);
-        if !sent {
-            return Err(not_applied(invalid_phase_error(
-                self.inner.run_id,
-                phase,
-                "stop",
-            )));
+        Ok(())
+    }
+
+    pub(crate) fn reject_pending_stop(&self) {
+        let mut state = mutex_lock(&self.inner.state);
+        if state.phase == ControlPhase::Open {
+            state.stop_pending = false;
         }
-        Ok(reply_rx)
     }
 
     /// Fence all future live control as soon as the waiter loses child
     /// authority, before terminal `RunState` publication can lag behind it.
     pub(crate) fn mark_closed(&self) {
-        let rejected = {
+        let (rejected, commands) = {
             let mut state = mutex_lock(&self.inner.state);
             if state.phase != ControlPhase::Failed {
                 state.phase = ControlPhase::Closed;
             }
-            state.child_sender = None;
+            state.child_open = false;
+            state.stop_pending = false;
             let phase = state.phase;
-            reject_queued_inputs(
+            let rejected = reject_queued_inputs(
                 &mut state,
                 &invalid_phase_error(self.inner.run_id, phase, "write to"),
-            )
+            );
+            (rejected, std::mem::take(&mut state.child_commands))
         };
         send_rejections(rejected);
+        reject_child_commands(commands, "native child owner is closed");
+    }
+
+    pub(crate) fn drain_child_commands(&self) -> VecDeque<ChildCommand> {
+        std::mem::take(&mut mutex_lock(&self.inner.state).child_commands)
+    }
+
+    pub(crate) fn fence_child_commands(&self) -> VecDeque<ChildCommand> {
+        let (rejected, commands) = {
+            let mut state = mutex_lock(&self.inner.state);
+            if state.phase != ControlPhase::Failed {
+                state.phase = ControlPhase::Closed;
+            }
+            state.child_open = false;
+            state.stop_pending = false;
+            let phase = state.phase;
+            let rejected = reject_queued_inputs(
+                &mut state,
+                &invalid_phase_error(self.inner.run_id, phase, "write to"),
+            );
+            (rejected, std::mem::take(&mut state.child_commands))
+        };
+        send_rejections(rejected);
+        commands
     }
 
     /// Irreversibly fence live control after the child waiter can no longer
@@ -842,16 +894,19 @@ impl NativeControlOwner {
                 unreachable!("child wait authority is lost at most once");
             }
         }
-        let rejected = {
+        let (rejected, commands) = {
             let mut state = mutex_lock(&self.inner.state);
             state.phase = ControlPhase::Failed;
-            state.child_sender = None;
-            reject_queued_inputs(
+            state.child_open = false;
+            state.stop_pending = false;
+            let rejected = reject_queued_inputs(
                 &mut state,
                 &ProtocolError::new(ErrorCode::BackendUnavailable, error),
-            )
+            );
+            (rejected, std::mem::take(&mut state.child_commands))
         };
         send_rejections(rejected);
+        reject_child_commands(commands, "native child wait authority was lost");
     }
 
     pub(crate) fn has_continuation_authority(&self) -> bool {
@@ -967,7 +1022,9 @@ impl NativeControlOwner {
         self.reap_result()?;
         let state = mutex_lock(&self.inner.state);
         if state.phase != ControlPhase::Closed
-            || state.child_sender.is_some()
+            || state.child_open
+            || state.stop_pending
+            || !state.child_commands.is_empty()
             || state.input_scheduled
             || state.input_commands != 0
             || state.input_bytes != 0
@@ -1045,8 +1102,13 @@ impl PendingRecoverableInput {
 impl PendingStop {
     pub(crate) async fn resolve(self, timeout: Duration) -> ControlResult {
         match tokio::time::timeout(timeout, self.reply).await {
-            Ok(Ok(Ok(disposition))) => Ok(ControlReceipt::Stop { disposition }),
-            Ok(Ok(Err(error))) => Err(unknown(ProtocolError::new(ErrorCode::Io, error))),
+            Ok(Ok(StopOwnerResult::Accepted(disposition))) => {
+                Ok(ControlReceipt::Stop { disposition })
+            }
+            Ok(Ok(StopOwnerResult::Rejected(failure))) => Err(failure),
+            Ok(Ok(StopOwnerResult::Unknown(error))) => {
+                Err(unknown(ProtocolError::new(ErrorCode::Io, error)))
+            }
             Ok(Err(_)) => Err(unknown(ProtocolError::new(
                 ErrorCode::InvalidRunState,
                 format!(
@@ -1381,6 +1443,24 @@ fn send_rejections(rejected: Vec<(InputReply, ControlFailure)>) {
     }
 }
 
+fn reject_child_commands(commands: VecDeque<ChildCommand>, reason: &str) {
+    for command in commands {
+        match command {
+            #[cfg(not(target_os = "macos"))]
+            ChildCommand::Signal { reply, .. } => {
+                let _ = reply.send(Err(reason.to_owned()));
+            }
+            ChildCommand::Stop { reply, deadline: _ } => {
+                let _ = reply.send(StopOwnerResult::Rejected(not_applied(ProtocolError::new(
+                    ErrorCode::InvalidRunState,
+                    reason,
+                ))));
+            }
+            ChildCommand::CleanupUnpublished => {}
+        }
+    }
+}
+
 fn resolve_input_reply(reply: InputReply, result: RecoverableInputResult) {
     match reply {
         InputReply::Legacy(reply) => {
@@ -1521,9 +1601,10 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         io,
         sync::{
-            Arc, Condvar, Mutex,
+            Arc, Condvar, Mutex, Weak,
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
@@ -1538,7 +1619,10 @@ mod tests {
     };
     use portable_pty::PtySize;
 
-    use super::{InputDrainGate, NativeControlOwner, PtyControl, mutex_lock};
+    use super::{
+        ChildCommand, InputDrainGate, NativeControlOwner, PtyControl, StopOwnerResult, mutex_lock,
+    };
+    use crate::native_runtime::NativeRunOwner;
 
     struct FakePty {
         size: Mutex<PtySize>,
@@ -1785,12 +1869,57 @@ mod tests {
         }
     }
 
+    struct TestChildCommands {
+        owner: Weak<super::NativeControlInner>,
+        _runtime: NativeRunOwner,
+        pending: Mutex<VecDeque<ChildCommand>>,
+    }
+
+    impl TestChildCommands {
+        fn try_recv(&self) -> Result<ChildCommand, mpsc::TryRecvError> {
+            let mut pending = mutex_lock(&self.pending);
+            let owner = self
+                .owner
+                .upgrade()
+                .map(|inner| NativeControlOwner { inner })
+                .ok_or(mpsc::TryRecvError::Disconnected)?;
+            pending.extend(owner.drain_child_commands());
+            pending.pop_front().ok_or(mpsc::TryRecvError::Empty)
+        }
+
+        fn recv_timeout(&self, timeout: Duration) -> Result<ChildCommand, mpsc::RecvTimeoutError> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.try_recv() {
+                    Ok(command) => return Ok(command),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        return Err(mpsc::RecvTimeoutError::Disconnected);
+                    }
+                    Err(mpsc::TryRecvError::Empty) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {
+                        return Err(mpsc::RecvTimeoutError::Timeout);
+                    }
+                }
+            }
+        }
+    }
+
     fn owner(
         writer: Box<dyn io::Write + Send>,
         pty: Box<dyn PtyControl>,
         gate: InputDrainGate,
-    ) -> (NativeControlOwner, mpsc::Receiver<super::ChildCommand>) {
-        NativeControlOwner::new_with_pty(RunId::new(), pty, writer, gate)
+    ) -> (NativeControlOwner, TestChildCommands) {
+        let runtime = NativeRunOwner::default();
+        let owner_wake = runtime.owner_wake();
+        let owner = NativeControlOwner::new_with_pty(RunId::new(), pty, writer, gate, owner_wake);
+        let commands = TestChildCommands {
+            owner: Arc::downgrade(&owner.inner),
+            _runtime: runtime,
+            pending: Mutex::new(VecDeque::new()),
+        };
+        (owner, commands)
     }
 
     fn release_writer(release: &Arc<(Mutex<bool>, Condvar)>) {
@@ -1865,14 +1994,17 @@ mod tests {
         owner
             .detach_closed_descriptors_after_owner_fence()
             .expect_err("stopping control cannot lose descriptors");
-        let super::ChildCommand::Stop(reply) = child
+        let super::ChildCommand::Stop { reply, deadline: _ } = child
             .recv_timeout(Duration::from_secs(1))
             .expect("fixture receives stop")
         else {
             panic!("public stop sends the stop command variant");
         };
+        owner
+            .commit_pending_stop()
+            .expect("production owner commits admitted Stop");
         reply
-            .send(Ok(StopDisposition::Graceful))
+            .send(StopOwnerResult::Accepted(StopDisposition::Graceful))
             .expect("acknowledge fixture stop");
         drop(stop);
 
@@ -2000,11 +2132,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn recoverable_input_owner_deduplicates_ranges_and_fences_evicted_retries() {
         let written = Arc::new(Mutex::new(Vec::new()));
-        let (owner, _child) = NativeControlOwner::new_with_pty_and_input_results(
+        let runtime = NativeRunOwner::default();
+        let owner_wake = runtime.owner_wake();
+        let owner = NativeControlOwner::new_with_pty_and_input_results(
             RunId::new(),
             Box::new(FakePty::new(0)),
             Box::new(RecordingWriter(Arc::clone(&written))),
             InputDrainGate::default(),
+            owner_wake,
             1,
             16,
         );
@@ -2328,14 +2463,17 @@ mod tests {
         let queued = owner.begin_input(vec![2]).expect("queue second input");
 
         let stop = owner.begin_stop().expect("stop uses independent lane");
-        let super::ChildCommand::Stop(reply) = child
+        let super::ChildCommand::Stop { reply, deadline: _ } = child
             .recv_timeout(Duration::from_secs(2))
             .expect("waiter receives stop without writer release")
         else {
             panic!("public stop sends the stop command variant");
         };
+        owner
+            .commit_pending_stop()
+            .expect("production owner commits independent Stop lane");
         reply
-            .send(Ok(StopDisposition::Graceful))
+            .send(StopOwnerResult::Accepted(StopDisposition::Graceful))
             .expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))
@@ -2398,14 +2536,17 @@ mod tests {
             }
         );
         let stop = owner.begin_stop().expect("stop remains available");
-        let super::ChildCommand::Stop(reply) = child
+        let super::ChildCommand::Stop { reply, deadline: _ } = child
             .recv_timeout(Duration::from_secs(2))
             .expect("stop reaches child waiter")
         else {
             panic!("public stop sends the stop command variant");
         };
+        owner
+            .commit_pending_stop()
+            .expect("production owner commits Stop after input failure");
         reply
-            .send(Ok(StopDisposition::Graceful))
+            .send(StopOwnerResult::Accepted(StopDisposition::Graceful))
             .expect("acknowledge stop");
         assert_eq!(
             stop.resolve(Duration::from_secs(1))

@@ -346,7 +346,7 @@ The important guarantees are behavioral, not implied by lock types.
   releases the parent pin, so admission never carries a hidden long-lived
   lookup owner. The retained Run and successful key mapping share one registry lock;
   a failed unpublished launch releases its private Run and exact-key fence only
-  after the child-handle waiter proves reap and all reader, waiter, control,
+  after the daemon-wide cleanup owner proves reap and all output, lifecycle, control,
   input, and Run owners are quiescent. Until then, a matching retry reports
   temporary Backend unavailability, conflicting reuse reports
   `creation_conflict`, and unrelated keys can use released stripes and launch
@@ -357,7 +357,7 @@ The important guarantees are behavioral, not implied by lock types.
   deadline. Fencing closes launch admission and wakes queued unbound waiters;
   matching retained-key lookups remain resolvable. After creation flights
   drain, shutdown also waits for transferred unpublished-child cleanup and
-  reports every exact-key fence owner and waiter-owned failure reason without
+  reports every exact-key fence owner and cleanup-owned failure reason without
   echoing the caller-owned key. A
   creation thread has no hard-cancellation mechanism: if it exceeds the
   shutdown deadline, shutdown reports failure but cannot reap that detached

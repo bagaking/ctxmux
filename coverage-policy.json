@@ -61,6 +61,7 @@
         "crates/ctxmux-daemon/src/attachment.rs",
         "crates/ctxmux-daemon/src/creation.rs",
         "crates/ctxmux-daemon/src/native_control.rs",
+        "crates/ctxmux-daemon/src/native_runtime.rs",
         "crates/ctxmux-daemon/src/native_session.rs",
         "crates/ctxmux-daemon/src/qualification_stats.rs",
         "crates/ctxmux-daemon/src/main.rs",

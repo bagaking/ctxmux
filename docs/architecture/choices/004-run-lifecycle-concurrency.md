@@ -9,9 +9,29 @@ Multiple short requests and long-lived attachments may act on the same Run while
 
 ## Decision
 
-`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow standard locks for lifecycle state, output log, PTY master, input writer, and the child-command sender; an atomic counter tracks attachments. The waiter thread exclusively owns the child handle, processes stop there, and uses non-reaping `waitid` until the complete owned session is empty. It then reaps the leader and disables the sender before terminal publication. If non-reaping status observation itself fails, the waiter instead transfers the actual handle once into the native control owner's irreversible fail-stop state. The blocking reader and waiter update the Run, while a Tokio broadcast channel feeds each attachment task.
+`RunManager` retains `Arc<Run>` values behind an `RwLock`. A Run uses narrow
+standard locks for lifecycle state, output log, PTY master, input writer, and
+the child-command sender; an atomic counter tracks attachments. One
+daemon-wide native owner exclusively holds every live native child handle,
+command receiver, and PTY output reader. It polls output readiness, performs
+non-reaping `waitid` observation, and transfers only blocking Stop or
+direct-exit cleanup to a daemon-wide maximum of eight transient workers. A
+cleanup worker reaps the leader and disables the sender before terminal
+publication. If status observation or cleanup authority fails, the actual
+handle instead transfers once into the native control owner's irreversible
+fail-stop state. The native owner updates the Run, while the unchanged Tokio
+broadcast capacity and fan-out contract feeds each attachment task. The
+channel ring is owned by the current attachment set rather than retained by an
+unobserved Run: the first attachment allocates it and the last
+`AttachmentGuard` releases it. With no current receiver, a live notification
+is discarded exactly as before; the Run's replay, Backend metadata, and
+lifecycle state remain authoritative for reattachment.
 
-Attachment subscribes before taking its replay snapshot. An `AttachmentGuard` decrements the counter on every return path, including transport failure.
+Attachment subscribes before taking its replay snapshot. Subscription and ring
+creation share one lock with last-guard release, so a first subscriber cannot
+miss a concurrent publication between subscription and snapshot. An
+`AttachmentGuard` decrements the counter on every return path, including
+transport failure.
 
 Test builds can pause the attachment owner at three private points: after
 subscribe, after snapshot, and after receiving detach but before acknowledgement.
@@ -52,15 +72,18 @@ The hook is not a public fault API and cannot change production scheduling.
   Request cancellation cannot abandon launch.
 - Creation prepares every fallible PTY reader and writer view before physical
   launch. Immediately after launch it constructs native control and arms one
-  private publication owner before waiter or output-reader worker setup can
-  fail or unwind. A persistence rejection before `COMMIT` asks that same Run's
-  child-handle waiter to terminate the unpublished child. The waiter's
-  final `child.wait()` receipt proves reap, but the key reopens only after
-  reader, waiter, control, input, and Run owners are also quiescent. Until then
-  the publication owner transfers an exact-key fence to one private globally
-  eight-slot-bounded cleanup owner before releasing the random stripe and
-  launch permit. The same transfer covers worker-setup failure and
-  creation-owner unwind. The fence owns no public or durable Run identity.
+  private publication owner before native output/wait owner registration can
+  fail or unwind. Both injected registration seams precede one atomic handoff;
+  rejection leaves the launch owner to terminate and reap the unpublished
+  child without publishing a partial reactor entry. A persistence rejection
+  before `COMMIT` asks that same Run's daemon-wide child owner to terminate the
+  unpublished child. Its final `child.wait()` receipt proves reap, but the key
+  reopens only after output, lifecycle, control, input, and Run owners are also
+  quiescent. Until then the publication owner transfers an exact-key fence to
+  one private globally eight-slot-bounded cleanup owner before releasing the
+  random stripe and launch permit. The same transfer covers owner-registration
+  failure and creation-owner unwind. The fence owns no public or durable Run
+  identity.
 - Shutdown fences new unbound creation flights before Backend cleanup, then
   drains active creation threads, transferred unpublished-child cleanup, and
   tmux control owners against one bounded deadline. The fence closes semaphore
@@ -85,7 +108,7 @@ owner lock, so Interrupt is either ordered before Stop or rejected without
 application. Stop acknowledgement proves direct-child reap plus an empty owned
 session but still precedes terminal-state publication. The natural-exit path
 closes command admission under that same lock before draining the channel, so a
-Stop sent after a waiter receive timeout but before the exit fence reuses the
+Stop sent after one native-owner poll but before the exit fence reuses the
 final cleanup/reap receipt instead of becoming unknown. Broadcast lag reports
 one `latest_output_bytes` but does not automatically replay; callers retain
 their own recovery cursor. Persistent same-epoch exited Runs are not yet
@@ -105,9 +128,9 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
 
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered byte can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
-- `LC-003` (`d03`): the waiter can reap a child before public state changes;
+- `LC-003` (`d03`): the native lifecycle owner can reap a child before public state changes;
   signalling through a cached numeric PID risks a reused process identity. The
-  waiter preserves the waitable leader as a session-ID anchor through
+  owner preserves the waitable leader as a session-ID anchor through
   descendant cleanup, then removes signalling authority before publication.
   On macOS, foreground Interrupt instead uses retained-PTY `TIOCSIG`. Stop
   immediately revalidates each ordinary member SID before numeric signalling,
@@ -115,7 +138,7 @@ Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics
   incarnation operation. Fixtures prove the reaped-leader and observed foreign-
   member fences; they do not claim to eliminate the residual PID-reuse TOCTOU.
 - `LC-004`: retrying an unclassified child-status error every 20 ms can retain
-  one busy waiter forever, while treating it as exit would fabricate reap and
+  busy native-owner authority forever, while treating it as exit would fabricate reap and
   permit unsafe key reuse. The first error now transfers the handle into a
   non-collectable fail-stop owner and fails the daemon incarnation.
 
@@ -124,6 +147,9 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
 ## Fixture mapping
 
 - Covered now: disconnect and reattach, attachment count release, invalid operations after exit, and exact retained final bytes followed by one terminal event on late attach.
+- Covered now: the live-event ring exists only while at least one Attachment
+  owns it; two subscribers share the same fan-out owner, dropping one preserves
+  delivery, and dropping the last releases the ring without changing replay.
 - Covered now: output produced exactly between subscribe and snapshot appears
   once in replay and is suppressed once from the already-subscribed live queue.
 - Covered now: output produced after detach is received but before its
@@ -135,8 +161,8 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   stops. Exactly one stop is accepted; other results are limited to the
   protocol's declared success, exited-state, and owner-I/O outcomes without
   inventing writer or resize arbitration.
-- Covered now: a deterministic leader probe pauses after an empty waiter receive
-  poll; a Stop admitted in that gap is drained after the natural-exit fence and
+- Covered now: a deterministic leader probe pauses after an empty native-owner
+  command poll; a Stop admitted in that gap is drained after the natural-exit fence and
   receives the same graceful reap evidence.
 - Candidate: broader stop races with hostile output, natural exit, and a
   controllable process/PTY seam under sustained load.
@@ -157,7 +183,7 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
   active flight guard to release.
 - Covered now: real Start and Level B Fork children cross a deterministic
   post-spawn barrier before an oversized metadata record is rejected before
-  `COMMIT`. The waiter-owned reap receipt plus full native-owner quiescence gate
+  `COMMIT`. The daemon-wide cleanup reap receipt plus full native-owner quiescence gate
   exact-key reuse; pending matching and conflicting retries launch nothing,
   unrelated keys progress, one later 32-way retry elects one physical leader,
   shutdown reports an unresolved fence owner without echoing its key, the
@@ -177,5 +203,7 @@ Tokio's historical lag and close bugs are fixed. The transferred risk is ctxmux'
 ## Repository evidence
 
 - `crates/ctxmux-daemon/src/lib.rs`: `RunManager`, `Run`, `AttachmentGuard`, `handle_attachment`
+- `crates/ctxmux-daemon/src/native_runtime.rs`: shared native lifecycle and
+  output ownership
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`
 - `packages/sdk/test/client-parity.test.ts`

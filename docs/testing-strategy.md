@@ -292,6 +292,15 @@ intentional memory-only retention at or below the 128-record ceiling and
 persistent same-epoch retention without Registry GC remain visible rather than
 being subtracted from the result.
 
+Each cell's reported `rss_kib_per_run` is the exact fresh-baseline delta divided
+by that cell's Run count; it deliberately includes fixed runtime and allocator
+activation and remains the absolute budget input. When an optimization needs
+to distinguish that fixed cost from a true marginal Run owner, use the same
+candidate's complete 1/32/128 curve to fit `F + N * P` and report both the cell
+values and marginal `P`. That diagnostic may explain a cell, but it cannot
+subtract owners post hoc, replace a frozen cell, relax its budget, or combine
+measurements from different source trees or binaries.
+
 `reliability-budgets.json` freezes the six idle/active × 1/32/128 cells from
 three Darwin arm64 observation rounds before optimization. CPU is percent of
 one logical core; RSS peak is sampled every 25 ms. Resource census starts Runs
@@ -810,8 +819,8 @@ The current clean-consumer audit admits four bounded gaps:
   a held key stripe, both fast-terminal/persistence activation orders, and an
   after-commit postcheck failure. A published key follows Run retention and
   recovery. When persistence rejects an already-started child before `COMMIT`,
-  the waiter-owned reap receipt, an external dead-PID oracle, and full native
-  reader/waiter/control/input/Run quiescence gate key reuse; until then one
+  the cleanup-owned reap receipt, an external dead-PID oracle, and full native
+  output/lifecycle/control/input/Run quiescence gate key reuse; until then one
   globally eight-slot-bounded private cleanup owner retains the unpublished Run
   and exact-key fence without holding its random stripe or launch permit. Real
   Start and Level B Fork fixtures cover pending matching and conflicting retry,

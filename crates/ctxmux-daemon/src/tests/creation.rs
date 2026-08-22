@@ -862,6 +862,10 @@ fn durable_terminal_handoff_finalizes_when_publication_precedes_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one continuous paused-finalize fixture proves all unrelated production owner lanes"
+)]
 async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     let temp = tempfile::tempdir().expect("create finalize response fixture");
     let state_dir = temp.path().join("state");
@@ -875,8 +879,18 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .start(long_running_spec())
         .await
         .expect("start finalize response Run");
+    let control_run = server
+        .client
+        .start(long_running_spec())
+        .await
+        .expect("start independent control Run before finalize");
+    let signal_run = server
+        .client
+        .start(long_running_spec())
+        .await
+        .expect("start independent signal Run before finalize");
     let recorded = manager.get(run.id).expect("resolve finalize response Run");
-    let mut events = recorded.subscribe();
+    let (event_guard, mut events) = recorded.subscribe();
     let initial_head = recorded.info().latest_output_bytes;
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
 
@@ -888,6 +902,67 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     finalize_reached
         .recv_timeout(Duration::from_secs(5))
         .expect("persistence actor reaches finalize barrier");
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        server.client.input(control_run.id, b"still-live".to_vec()),
+    )
+    .await
+    .expect("another Run input is not blocked by finalize")
+    .expect("another Run input reaches its PTY");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        server
+            .client
+            .resize(control_run.id, TerminalSize { rows: 31, cols: 99 }),
+    )
+    .await
+    .expect("another Run resize is not blocked by finalize")
+    .expect("another Run resize reaches its PTY");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        server.client.interrupt(signal_run.id),
+    )
+    .await
+    .expect("another Run Signal is not blocked by finalize")
+    .expect("another Run Signal reaches its owner");
+    tokio::time::timeout(Duration::from_secs(2), server.client.stop(control_run.id))
+        .await
+        .expect("another Run Stop receipt stays bounded during finalize")
+        .expect("another Run Stop retains exact cleanup admission");
+
+    let registration_before = manager.native_runs.diagnostic_snapshot().registrations;
+    let registration_id = RunId::new();
+    let registration_control =
+        NativeControlOwner::new_for_wait_test(registration_id, manager.native_runs.owner_wake());
+    let registration_failure = NativeWaitFailure::default();
+    let registration_run = Run::new_native_for_owner_test(
+        registration_id,
+        registration_control.clone(),
+        manager.native_runs.clone(),
+        registration_failure.clone(),
+    );
+    manager
+        .native_runs
+        .register_for_test(
+            &registration_run,
+            Box::new(WaitFailingChild(Arc::new(WaitFailureCounts::default()))),
+            crate::native_session::NativeSession::from_child_pid(42)
+                .unwrap()
+                .with_leader_probe_for_test(Arc::new(|| Ok(false))),
+            registration_control.clone(),
+            registration_failure,
+            || {},
+        )
+        .map_err(|error| error.into_parts().0)
+        .expect("submit production registration during finalize");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.native_runs.diagnostic_snapshot().registrations <= registration_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("native registration remains responsive during finalize");
 
     assert_finalize_reads_responsive(&server, run.id, initial_head).await;
     record_late_output_after_finalize(&recorded, &finalize_release).await;
@@ -929,7 +1004,23 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     let sentinel = insert_persistence_sentinel(&persistence, &recorded, "late-output-sentinel");
     assert!(!persistence.is_failed());
     assert_ne!(sentinel, run.id);
+    if server
+        .client
+        .status(signal_run.id)
+        .await
+        .is_ok_and(|status| status.state.is_running())
+    {
+        server
+            .client
+            .stop(signal_run.id)
+            .await
+            .expect("stop signal responsiveness fixture");
+    }
+    drop(events);
+    drop(event_guard);
     drop(recorded);
+    drop(registration_run);
+    drop(registration_control);
     wait_for_run_workers(&manager).await;
     drop(server);
     drop(manager);
@@ -946,6 +1037,50 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     assert!(durable.replay.chunks.is_empty());
     assert_recovered_exit(&recovered, sentinel);
     drop(reopened);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
+    let temp = tempfile::tempdir().expect("create finalize shutdown fixture");
+    let (persistence, recovered) =
+        Persistence::open(temp.path().join("state")).expect("open finalize shutdown persistence");
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let server = InProcessServer::start(Arc::clone(&manager));
+    let run = server
+        .client
+        .start(long_running_spec())
+        .await
+        .expect("start finalize shutdown Run");
+    let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
+    server
+        .client
+        .stop(run.id)
+        .await
+        .expect("Stop receipt precedes durable finalize");
+    finalize_reached
+        .recv_timeout(Duration::from_secs(5))
+        .expect("terminal finalizer reaches persistence barrier");
+
+    let started = Instant::now();
+    manager
+        .native_runs
+        .shutdown(Instant::now() + Duration::from_millis(250))
+        .expect("owner shutdown detaches an active durable finalizer");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "active finalizer escaped the native owner shutdown deadline"
+    );
+    finalize_release
+        .send(())
+        .expect("release detached terminal finalizer");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while manager.get(run.id).unwrap().info().state.is_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached finalizer still publishes durable terminal truth");
+    drop(server);
 }
 
 async fn assert_finalize_reads_responsive(

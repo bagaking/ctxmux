@@ -31,12 +31,12 @@ pub(super) async fn handle(
             return Ok(());
         }
     };
-    let mut events = run.subscribe();
+    let (_guard, mut events) = run.subscribe();
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSubscribe).await;
     }
-    let (_guard, snapshot) = run.attach(after_byte);
+    let snapshot = run.attachment_snapshot(after_byte);
     let (header, replay_chunks, terminal_state) = split_snapshot(snapshot);
     let mut sent_through_byte = header.replay.latest_output_bytes;
     send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;

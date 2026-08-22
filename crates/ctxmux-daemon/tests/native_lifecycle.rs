@@ -2060,6 +2060,86 @@ async fn interrupt_reaches_the_foreground_group_without_stopping_the_run() {
     daemon.client.stop(run.id).await.expect("stop fixture");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
+    const CLEANUP_OWNERS: usize = 8;
+
+    let daemon = TestDaemon::start().await;
+    let stubborn = RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "trap '' HUP TERM; printf 'READY\n'; while :; do IFS= read -r line || :; done"
+                .to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::new(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    };
+    let mut runs = Vec::new();
+    for _ in 0..=CLEANUP_OWNERS {
+        let run = daemon
+            .client
+            .start(stubborn.clone())
+            .await
+            .expect("start stubborn cleanup fixture");
+        let (mut attachment, snapshot) = daemon
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("attach stubborn cleanup fixture");
+        let mut output = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        if !output.windows(5).any(|window| window == b"READY") {
+            wait_for_output(&mut attachment, &mut output, &mut cursor, b"READY").await;
+        }
+        drop(attachment);
+        runs.push(run);
+    }
+
+    let mut accepted = Vec::new();
+    for run in runs.iter().take(CLEANUP_OWNERS) {
+        let client = daemon.client.clone();
+        let id = run.id;
+        accepted.push(tokio::spawn(async move {
+            timeout(Duration::from_secs(3), client.stop(id))
+                .await
+                .expect("accepted stubborn Stop stays inside its receipt fence")
+        }));
+    }
+    sleep(Duration::from_millis(100)).await;
+
+    let ninth = runs[CLEANUP_OWNERS].id;
+    let error = daemon
+        .client
+        .stop(ninth)
+        .await
+        .expect_err("ninth Stop cannot enter Stopping without cleanup capacity");
+    assert!(matches!(
+        error,
+        ClientError::ControlRejected { failure }
+            if failure.error.code == ErrorCode::ControlBackpressure
+                && failure.disposition == CommandDisposition::NotApplied
+    ));
+    daemon
+        .client
+        .input(ninth, b"still-open\n".to_vec())
+        .await
+        .expect("capacity rejection leaves the ninth Run open");
+
+    for result in join_all(accepted).await {
+        result
+            .expect("join accepted stubborn Stop")
+            .expect("accepted stubborn Stop has an exact receipt");
+    }
+    daemon
+        .client
+        .stop(ninth)
+        .await
+        .expect("ninth Stop succeeds after cleanup capacity returns");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_forces_stubborn_descendants_and_preserves_unrelated_processes() {
     let daemon = TestDaemon::start().await;
