@@ -31,6 +31,8 @@ pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v1";
 pub struct HandoffManifest {
     pub schema: String,
     pub epoch: String,
+    pub listener_fd: RawFd,
+    pub state_lock_fd: RawFd,
     pub runs: Vec<HandoffRun>,
 }
 
@@ -42,17 +44,27 @@ pub struct HandoffRun {
 }
 
 impl HandoffManifest {
-    pub fn new(epoch: String, runs: Vec<HandoffRun>) -> Self {
+    pub fn new(
+        epoch: String,
+        listener_fd: RawFd,
+        state_lock_fd: RawFd,
+        runs: Vec<HandoffRun>,
+    ) -> Self {
         Self {
             schema: HANDOFF_SCHEMA.to_string(),
             epoch,
+            listener_fd,
+            state_lock_fd,
             runs,
         }
     }
 
-    /// Every fd number this manifest expects to survive the exec.
+    /// Every fd number this manifest expects to survive the exec: the process
+    /// listener and state-lock descriptors first, then each Run's pty master.
     pub fn all_fds(&self) -> Vec<RawFd> {
-        self.runs.iter().map(|r| r.master_fd).collect()
+        let mut fds = vec![self.listener_fd, self.state_lock_fd];
+        fds.extend(self.runs.iter().map(|r| r.master_fd));
+        fds
     }
 }
 
@@ -95,6 +107,8 @@ mod tests {
     fn round_trips_through_json_and_lists_all_fds() {
         let manifest = HandoffManifest::new(
             "epoch-xyz".to_string(),
+            3,
+            4,
             vec![
                 HandoffRun {
                     run_id: RunId::new(),
@@ -111,7 +125,10 @@ mod tests {
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: HandoffManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, manifest);
-        assert_eq!(parsed.all_fds(), vec![7, 9]);
+        assert_eq!(parsed.listener_fd, 3);
+        assert_eq!(parsed.state_lock_fd, 4);
+        // listener_fd and state_lock_fd lead, then each run's master_fd in order.
+        assert_eq!(parsed.all_fds(), vec![3, 4, 7, 9]);
         assert_eq!(parsed.schema, HANDOFF_SCHEMA);
     }
 
@@ -122,6 +139,8 @@ mod tests {
         let mut writer = std::fs::File::from(writer);
         let manifest = HandoffManifest::new(
             "epoch-1".to_string(),
+            3,
+            4,
             vec![HandoffRun {
                 run_id: RunId::new(),
                 child_pid: 4321,
@@ -142,6 +161,8 @@ mod tests {
         use std::io::Write;
         let manifest = HandoffManifest::new(
             "epoch-1".to_string(),
+            3,
+            4,
             vec![HandoffRun {
                 run_id: RunId::new(),
                 child_pid: 4321,
