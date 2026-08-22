@@ -598,6 +598,18 @@ git add crates/ctxmux-daemon/src/lib.rs crates/ctxmux-daemon/src/persistence.rs 
 git commit -m "feat(daemon): adopt inherited listener and state-lock across exec"
 ```
 
+**Landed (2026-08-23):** `b89dd62`. Adversarial review (fd-safety / spec / test-integrity / end-state lenses) returned **0 findings** — clean, no fix needed (contrast with A9, which took a follow-up fix).
+
+- **Plan inaccuracies corrected (as with A9):**
+  - **Tests live inline, not in `native_lifecycle.rs`.** `adopt_listener` (lib.rs) and `StateLockGuard`/`open_with_handoff` (persistence.rs) are private, so the integration-test crate cannot reach them. The listener test `adopt_listener_reuses_the_socket_inode_without_rebinding` is inline in lib.rs's `#[cfg(test)] mod tests`; the state-lock test `reopening_with_inherited_lock_fd_does_not_self_deadlock` is inline in persistence.rs's test module.
+  - **No "adopted, do-not-recreate SocketGuard mode" was added.** The plan (Step 3) called for one, but `SocketGuard::new` already only stats+records identity — it never unlinks/recreates on construction — so it is correct for the adopted path as-is; its `Drop` still unlinks on a genuine final shutdown. Over-specification dropped (避免过度设计).
+  - **Listener reconstruction uses the safe `From<OwnedFd>`, not `from_raw_fd`.** The plan's `UnixListener::from_raw_fd` is an `unsafe fn` — forbidden here (`unsafe_code = "forbid"`). The audited path is leaf `owned_from_raw` → `std::os::unix::net::UnixListener::from(OwnedFd)` → `set_nonblocking` → `tokio::from_std`.
+  - **`handoff.rs` was extended too** (not in the plan's file list): `HandoffManifest` gains top-level `listener_fd` + `state_lock_fd`, and `all_fds()` returns `[listener_fd, state_lock_fd, ...run master_fds]` so A11 clears CLOEXEC on the full set and A14 can census it.
+
+- **State-lock adoption is the load-bearing subtlety.** `flock` is per open-file-description: the outgoing image's lock survives exec on the inherited fd, so a fresh `open()` + `try_lock()` (today's `StateStore::open` path) self-deadlocks (`WouldBlock` → `StateInUse`) against the process's *own* lock. Adoption threads `state_lock_fd: Option<OwnedFd>` through the existing `HandoffHint` channel and, when `Some`, builds `File::from(fd)` + `StateLockGuard::adopt` (skips the re-lock). The deadlock test proves **both** halves — the contrast (`Persistence::open` while held → `StateInUse`) and the adopt path (`open_with_handoff` with a dup'd, OFD-sharing fd → `Ok`) — so it goes red against a naive re-lock adopt. The pre-existing `state_lock_release_does_not_wait_for_an_inherited_file_description` (persistence.rs) confirms `Drop`'s explicit `File::unlock` releases the OFD lock even with a live `try_clone`'d sibling, so adopt-path teardown is sound.
+
+- **Deferred to A11/A12 by design (verified as correct scope, not gaps):** surfacing the *outgoing* state-lock raw fd is A11's job — the lock `File` is sealed inside the persistence actor thread as `StateStore._state_lock` with no raw-fd accessor. Constructing the incoming `HandoffHint` (epoch + live_set + `owned_from_raw(manifest.state_lock_fd)`) and calling `open_with_handoff`, plus feeding `manifest.listener_fd` to `adopt_listener`, is A12's wiring. `Persistence::open_with_handoff` is the seam A12 calls; it is `#[cfg_attr(not(test), allow(dead_code))]` until then.
+
 ---
 
 ## Task A11: SIGHUP arm — drain, extract, clear CLOEXEC, write manifest, execve
