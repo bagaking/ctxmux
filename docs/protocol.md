@@ -162,10 +162,10 @@ after its parent becomes historical or is no longer retained.
 A spawn failure before a child exists does not consume its key. The daemon
 prepares every fallible PTY reader and writer view before physical launch.
 Immediately after launch it constructs native control and arms one private
-publication owner before waiter or output-reader worker setup can fail or
-unwind. Persistence rejection before durable `COMMIT` asks the child-handle
-waiter to clean up; only the final waiter-owned `child.wait()` proves child reap, and the key
-becomes reusable only after the reader, waiter, control, input, and Run owners
+publication owner before output/wait owner registration can fail or unwind.
+Persistence rejection before durable `COMMIT` asks the daemon-wide child owner
+to clean up; only the final cleanup-owned `child.wait()` proves child reap, and the key
+becomes reusable only after the output, lifecycle, control, input, and Run owners
 are also quiescent. Until then the first request reports `persistence` with an
 explicit rollback-pending detail, while setup failure or creation-owner unwind
 reports its original error, and one bounded daemon-private cleanup owner

@@ -12,10 +12,17 @@ Interactive shells and coding Agents require terminal semantics: a PTY, terminal
 The native Backend uses `portable-pty`. The daemon opens a platform-native PTY,
 configures a `CommandBuilder`, spawns the child on the slave, and retains the
 master and writer. On POSIX, `portable-pty` calls `setsid()` before exec, making
-the direct child the Run session leader. The waiter thread retains the actual
-child handle, uses non-reaping `waitid` to keep its terminal incarnation as the
-session anchor through descendant cleanup, and receives Signal and Stop through one owner-local channel;
+the direct child the Run session leader. The daemon-wide native owner retains
+the actual child handle, uses non-reaping `waitid` to keep its terminal
+incarnation as the session anchor through descendant cleanup, and receives
+Signal and Stop through one owner-local channel. Blocking Stop and natural-exit
+cleanup transfer the handle to one of at most eight transient cleanup workers;
 ctxmux does not signal from a client task or from persisted PID metadata.
+
+PTY output uses a blocking close-on-exec duplicate registered with the same
+daemon-wide owner. The owner polls readiness before a unique blocking read and
+never sets `O_NONBLOCK`, because the duplicate and writer share one open-file
+description.
 
 Raw PTY bytes are the runtime truth. UTF-8 decoding and terminal-screen interpretation remain client concerns.
 
@@ -56,7 +63,8 @@ authority exists.
 Exit-code and signal mapping still depend on `portable-pty`. Windows is excluded
 by the current Unix-socket transport before PTY portability is exercised.
 
-The waiter allows the reader one second to finish. This is a bounded drain, not an unbounded final-output guarantee.
+After reap, the native owner allows the PTY reader one second to reach EOF.
+This is a bounded drain, not an unbounded final-output guarantee.
 
 ## Wrong-case corpus
 
@@ -91,7 +99,9 @@ The signal-mask and descriptor bugs are fixed upstream. They justify dependency-
 ## Repository evidence
 
 - `crates/ctxmux-daemon/src/native_spawn_env.rs`: default `TERM` / `COLORTERM`
-- `crates/ctxmux-daemon/src/lib.rs`: `Run::spawn`, `read_output`, `Run::resize`, `Run::stop`
+- `crates/ctxmux-daemon/src/lib.rs`: `Run::spawn`, `Run::resize`, `Run::stop`
+- `crates/ctxmux-daemon/src/native_runtime.rs`: readiness, output, child, and
+  bounded cleanup ownership
 - `crates/ctxmux-daemon/tests/native_lifecycle.rs`
 - `crates/ctxmux-daemon/tests/native_terminal_identity.rs`
 - `Cargo.toml`: `portable-pty`

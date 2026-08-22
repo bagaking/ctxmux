@@ -46,6 +46,21 @@ report is task truth for multiple Features. The performance Feature remains
 `proposal_only` until explicitly scheduled, and no planning transition grants
 authority to publish packages, Git refs, hosted releases, or benchmark results.
 
+On 2026-08-17, the already frozen AgentMux consumer comparison exposed one
+bounded native-owner gap before the broader peer cycle: a fresh daemon used a
+host-sized Tokio worker pool, and every live native Run permanently owned one
+reader thread plus one waiter thread. Three existing ctxmux resource censuses
+independently reproduced approximately 142--145 KiB and two threads per live
+Run. `f-22aczwza9/T-004` owns this consumer-triggered remediation before the
+broader T-001--T-003 cycle: use a fixed small daemon worker pool and replace
+per-Run permanent native workers with daemon-wide owners while preserving
+ordered output, direct-child wait/reap authority, Stop, failure disposition,
+shutdown, and existing resource budgets. It must not change output event
+fan-out, protocol encoding, thresholds, compatibility behavior, or tmux
+attachment semantics; those remain with their existing owners. The external
+comparison activates the work but does not become a second ctxmux benchmark
+truth or authorize publication.
+
 ## M0 — Repository foundation
 
 Establish the smallest Rust and TypeScript workspaces, shared quality commands,
@@ -116,7 +131,7 @@ published for that failed launch.
 Acceptance:
 
 - deterministic owner-controlled failure points cover post-spawn reader,
-  writer, output-thread, and waiter-thread setup transitions;
+  writer, output-owner, and wait-owner registration transitions;
 - every rejected launch leaves no live child, zombie, or Run in the manager;
 - the fix stays inside the native launch owner and does not extract a public
   Backend framework, plugin surface, or general fault-injection system.
@@ -156,7 +171,13 @@ Acceptance:
 ## M3.5 — Persistence and restart recovery
 
 Status: implemented for the declared historical recovery class; live PTY
-handoff and process adoption remain unsupported.
+handoff and process adoption remain unsupported. Upgrade continuity and
+semantic resume are design-accepted and implementation-pending
+([015](architecture/choices/015-exec-in-place-upgrade-continuity.md) keeps live
+control across a planned `execve`-in-place upgrade in persistent mode;
+[016](architecture/choices/016-semantic-resume.md) reconstructs a crashed or
+rebooted Run semantically). Crash-time live handoff and PID adoption stay
+unsupported.
 
 First accept a recovery contract that distinguishes durable metadata, replay,
 and live PTY ownership. Then implement only the recovery class that can be

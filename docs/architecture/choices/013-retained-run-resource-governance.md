@@ -37,24 +37,34 @@ The value 128 preserves the already qualified 1/32/128 live-Run matrix while
 avoiding the false safety of reusing SQLite's historical 4,096-row format
 envelope. The existing 4 MiB per-Run retention contract therefore derives a
 512 MiB live memory-only `OutputLog` payload ceiling without another hot-path
-byte quota. Up to 128 live native readers separately hold one 8 KiB read buffer
-each. Persistent mode uses the same live bound while its 256 MiB durable SQLite
+byte quota. Up to 128 live native Runs retain one reader descriptor each; the
+daemon-wide owner uses one 8 KiB stack buffer for each sequential ready read,
+not one permanent buffer or thread per Run. Persistent mode uses the same live
+bound while its 256 MiB durable SQLite
 logical replay limit remains independently authoritative.
+
+A retained Run always owns its replay and lifecycle truth, but it does not
+retain an empty live-event ring for a viewer that does not exist. The existing
+256-event Tokio broadcast ring is allocated on the first Attachment and
+released by the last `AttachmentGuard`; concurrent Attachments still share the
+same capacity, lag, and fan-out semantics. This removes an unobserved per-Run
+allocation without inventing attachment admission or changing the replay
+payload bound.
 
 One daemon-private eight-slot overlap owner is shared by native Start/Fork,
 tmux import, and transferred T-026 unpublished-child cleanup. A slot is held
 from immediately before the physical child or Control client starts until
 publication, complete rollback, or transferred cleanup proves full
 Backend-local quiescence. Native cleanup requires child reap, closed control,
-empty input accounting, and no additional reader, waiter, input-drain, control,
+empty input accounting, and no additional output, lifecycle, input-drain, control,
 or Run owner. The exact cleanup-held `Arc<Run>` and its Run-held
 `Arc<NativeControlInner>` each retain a base strong count of one. Tmux requires
 its corresponding Control child, reader, waiter, and writer completion receipt
 to succeed and the cleanup entry to become the sole remaining `Arc<Run>` owner.
 Thus at most eight not-yet-published or private-cleanup Runs can overlap the 128
 Registry records. Their additional `OutputLog` payload is
-bounded by 32 MiB, for a 544 MiB retained-plus-overlap payload bound. Native
-readers use an 8 KiB buffer. A tmux reader separately bounds both its Control
+bounded by 32 MiB, for a 544 MiB retained-plus-overlap payload bound. The native
+owner uses an 8 KiB read buffer. A tmux reader separately bounds both its Control
 line and command-block output at 1 MiB, and may briefly hold decoded
 notification or output clones; those independent allocations must not be
 collapsed into one false per-Run number. The 128-plus-eight owner bounds
@@ -180,7 +190,7 @@ receipts.
 
 The publication reservation is an RAII owner of its projected slot, every
 candidate ticket, and the exact metadata delta. Its Drop path restores all
-candidates on validation, spawn/setup, thread-start, tmux readiness, panic, or
+candidates on validation, spawn/setup, owner-registration, tmux readiness, panic, or
 other exit that has not received a persistence COMMIT disposition. A memory
 publication consumes the reservation in the same Registry write that removes
 its exact candidates and inserts the new entry. A persistent COMMIT consumes
@@ -196,8 +206,8 @@ After a native child or tmux Control child starts, publication releases the
 permit only after the new Registry entry consumes the projection. A rejected
 launch releases it only after full Backend-local quiescence; otherwise the Run
 and permit transfer together to the bounded private cleanup owner and remain
-visible to shutdown. Native combines the T-026 waiter-owned reap receipt with
-closed control, empty input accounting, and no additional reader, waiter,
+visible to shutdown. Native combines the daemon-wide cleanup owner's reap receipt with
+closed control, empty input accounting, and no additional output, lifecycle,
 input-drain, control, or Run owners beyond the cleanup-held Run and its
 Run-held native control. Tmux uses its Control-child, reader, waiter, and writer
 completion receipts. Neither path grows into descendant or process-tree
@@ -206,9 +216,9 @@ ownership.
 A candidate must be exited or interrupted, unfenced, and owned only by the
 Registry. Terminal state is necessary but not sufficient:
 
-- native child wait has proven reap, the control phase is closed, queued input
+- native child cleanup has proven reap, the control phase is closed, queued input
   and byte accounting are zero, no input drain owns `NativeControlInner`, and
-  the output reader and waiter have exited;
+  the daemon-wide output and lifecycle registrations have closed;
 - tmux writer, output reader, waiter, and Control child have all closed;
 - the terminal event and any persistence finalize have completed;
 - no attachment, control, fresh Fork, or other lookup pin remains;
@@ -216,7 +226,7 @@ Registry. Terminal state is necessary but not sufficient:
 
 After those checks and the Registry fence linearize, a native candidate may
 irreversibly compact its closed PTY master and writer before the replacement
-spawn. The waiter has already proved reap, no input worker remains, and every
+spawn. The native cleanup owner has already proved reap, no input worker remains, and every
 public terminal operation already rejects, so these descriptors have no
 remaining public semantics and are not restored if the reservation later
 aborts. The candidate's RunInfo, replay, lineage, key, persistence binding, and
