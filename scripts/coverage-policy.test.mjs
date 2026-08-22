@@ -848,6 +848,8 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "crates/ctxmux-daemon/src/native_control.rs",
           "crates/ctxmux-daemon/src/native_runtime.rs",
           "crates/ctxmux-daemon/src/native_session.rs",
+          "crates/ctxmux-daemon/src/native_spawn_env.rs",
+          "crates/ctxmux-daemon/src/handoff.rs",
           "crates/ctxmux-daemon/src/qualification_stats.rs",
           "crates/ctxmux-daemon/src/main.rs",
           "crates/ctxmux-inherited-fd/src/lib.rs",
@@ -855,6 +857,8 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "crates/ctxmux-client/src/lib.rs",
           "crates/ctxmux-client/src/attachment.rs",
           "crates/ctxmux/src/main.rs",
+          "crates/ctxmux/src/daemon.rs",
+          "crates/ctxmux/src/screen.rs",
         ],
       },
       {
