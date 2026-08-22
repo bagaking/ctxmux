@@ -4,6 +4,13 @@
 //! back by the incoming image. Versioned so a mismatched upgrade fails closed
 //! rather than misreading fd numbers.
 //!
+//! Writer contract for the outgoing-image task: write the manifest as a single
+//! line of COMPACT JSON followed by `\n`, then CLOSE every copy of the write
+//! end. [`read_manifest`] blocks in `read_to_end` until the pipe reaches EOF,
+//! so an unclosed write end hangs the incoming image; and because the reader
+//! consumes only the first line, pretty-printed multi-line JSON parses just its
+//! opening brace and fails closed rather than adopting anything.
+//!
 //! Only the pty master fd is carried per Run. The reader and writer fds of a
 //! native Run both refer to the same open file description as the master, so
 //! the incoming image re-derives them from the master fd after exec (re-dup a
@@ -66,8 +73,11 @@ pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
     let mut file = std::fs::File::from(fd);
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
+    // `split` always yields at least one slice, so an empty buffer becomes an
+    // empty first line that fails the parse below — a fail-closed InvalidData.
     let line = buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let manifest: HandoffManifest = serde_json::from_slice(line).map_err(std::io::Error::other)?;
+    let manifest: HandoffManifest = serde_json::from_slice(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if manifest.schema != HANDOFF_SCHEMA {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
