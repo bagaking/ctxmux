@@ -458,6 +458,30 @@ impl NativeControlOwner {
         )
     }
 
+    /// Rebind current-incarnation control onto a PTY master inherited across an
+    /// exec-in-place upgrade.
+    ///
+    /// The spawn seam wraps a freshly opened `portable_pty` master
+    /// ([`new`](Self::new)); the exec-in-place recovery path instead adopts a
+    /// bare master fd via [`AdoptedMasterPty`], which already satisfies the same
+    /// private `PtyControl` surface — so this is only a boxing shim, carrying no
+    /// new state.
+    pub(crate) fn new_adopted(
+        run_id: RunId,
+        adopted: AdoptedMasterPty,
+        writer: Box<dyn Write + Send>,
+        input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
+    ) -> Self {
+        Self::new_with_pty(
+            run_id,
+            Box::new(adopted),
+            writer,
+            input_drains,
+            owner_wake,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new_for_wait_test(run_id: RunId, owner_wake: OwnerWake) -> Self {
         struct TestPty;

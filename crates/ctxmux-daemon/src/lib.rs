@@ -7,7 +7,7 @@ use std::{
     collections::VecDeque,
     fs,
     io::{self, Write},
-    os::fd::OwnedFd,
+    os::fd::{AsRawFd, OwnedFd},
     os::unix::{
         fs::{FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
@@ -54,6 +54,7 @@ use tokio::{
 };
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
+use crate::adopted_pty::AdoptedMasterPty;
 use crate::creation::{
     CommitUnknownReservation, CreationFlight, CreationFlightOwner, CreationRequest,
     PendingPublication, PersistentCollectionCandidate, PublicationReservation, RunRegistry,
@@ -65,7 +66,7 @@ use crate::native_control::{
     PendingSignal, PendingStop,
 };
 use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
-use crate::native_session::NativeSession;
+use crate::native_session::{AdoptedChild, NativeSession};
 use crate::persistence::{
     CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
     PersistentStartFailure, RecoveredRun, StagedPersistentStart, StartDisposition,
@@ -2524,6 +2525,130 @@ impl Run {
         })
     }
 
+    /// Re-bind live native control onto a freshly recovered Run whose child and
+    /// PTY master crossed an exec-in-place daemon upgrade.
+    ///
+    /// This is the live counterpart of [`recover`](Self::recover): it reuses the
+    /// same recovered persistence binding and replay — so the durable output
+    /// cursor continues from the committed head rather than resetting to zero
+    /// (a reset would trip persistence gap-rejection on the next append) — but
+    /// populates the two control fields `recover` leaves `None`. The child is
+    /// adopted by pid and the master by descriptor; nothing is respawned.
+    ///
+    /// Returns `Err` when the inherited descriptor cannot be duplicated, the pid
+    /// cannot be adopted, or the daemon-wide owner rejects registration.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    fn readopt(
+        recovered: RecoveredRun,
+        persistence: PersistentRun,
+        master_fd: OwnedFd,
+        child_pid: u32,
+        native_runs: NativeRuntimeOwner,
+        live_event_capacity: usize,
+        terminal_publications: TerminalPublicationOwner,
+        qualification_stats: QualificationStats,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        let id = recovered.info.id;
+
+        // Derive the reader and writer as independent CLOEXEC dups of the
+        // inherited master BEFORE it is moved into the control adapter. Reading
+        // from / writing to a PTY master is plain read(2)/write(2), so each end
+        // is a distinct `fs::File` over its own owned descriptor — never the
+        // same fd aliased. `duplicate_cloexec` borrows the raw number without
+        // consuming `master_fd`, keeping ownership clean: `master_fd` moves into
+        // the adapter, and each dup is a fresh `OwnedFd` closed exactly once.
+        let master_raw = master_fd.as_raw_fd();
+        let reader = fs::File::from(
+            ctxmux_inherited_fd::duplicate_cloexec(master_raw)
+                .map_err(|error| spawn_error("clone re-adopted PTY reader", error))?,
+        );
+        let writer: Box<dyn Write + Send> = Box::new(fs::File::from(
+            ctxmux_inherited_fd::duplicate_cloexec(master_raw)
+                .map_err(|error| spawn_error("clone re-adopted PTY writer", error))?,
+        ));
+        let adopted = AdoptedMasterPty::from_owned_fd(master_fd);
+
+        // The child already exists and crossed the exec, so it is adopted by
+        // pid rather than spawned: `AdoptedChild` reaps it through `waitid`, and
+        // `NativeSession` routes its reap/signal authority through the same pid.
+        let child: Box<dyn Child + Send + Sync> = Box::new(
+            AdoptedChild::from_pid(child_pid)
+                .map_err(|error| spawn_error("adopt re-adopted child", error))?,
+        );
+        let session = NativeSession::from_child_pid(child_pid)
+            .map_err(|error| spawn_error("identify re-adopted native session", error))?;
+
+        let owner_wake = native_runs.owner_wake();
+        let native_control = NativeControlOwner::new_adopted(
+            id,
+            adopted,
+            writer,
+            InputDrainGate::with_stats(qualification_stats.clone()),
+            owner_wake,
+        );
+        // Mirror the spawn seam: bind the reap control so that if registration
+        // fails, `PendingChild::drop` records the kill/reap outcome against the
+        // control. On success, `NativeRunRegistration::into_entry` clears the
+        // bound control before taking the child, so the owner is the sole reaper
+        // and the child is never double-owned.
+        let mut pending_child = PendingChild::new(child);
+        pending_child.bind_reap_control(native_control.clone());
+        let reader_guard = qualification_stats.guard(QualificationGauge::Readers);
+        let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
+
+        let terminal_ordinal = OnceLock::new();
+        terminal_publications.recover(&terminal_ordinal);
+        let run = Arc::new(Self {
+            id,
+            spec: recovered.info.spec,
+            lineage: recovered.info.lineage,
+            backend: recovered.info.backend,
+            capabilities: recovered.info.capabilities,
+            pid: recovered.info.pid,
+            state: Mutex::new(recovered.info.state),
+            output: Mutex::new(OutputLog::from_replay(recovered.replay)),
+            incarnation_control: Some(RunControl::Native(native_control)),
+            native_runs: Some(native_runs),
+            persistence_mode: PersistenceMode::PersistentCapable,
+            persistence_transition: Mutex::new(()),
+            persistence: Mutex::new(PersistenceBinding::Active(persistence)),
+            attachments: AtomicUsize::new(0),
+            qualification_stats,
+            terminal_publications,
+            terminal_ordinal,
+            events: LiveEventOwner::new(live_event_capacity),
+        });
+
+        let registration_control = run
+            .native_control()
+            .expect("re-adopted Run retains native control")
+            .clone();
+        let native_runs = run
+            .native_runs
+            .as_ref()
+            .expect("re-adopted Run retains its daemon-wide owner")
+            .clone();
+        let registration = NativeRunRegistration::new(
+            &run,
+            reader,
+            pending_child,
+            session,
+            registration_control,
+            NativeWaitFailure::default(),
+            || {},
+            reader_guard,
+            waiter_guard,
+        );
+        native_runs.register(registration).map_err(|error| {
+            let (message, registration) = error.into_parts();
+            drop(registration);
+            spawn_error("register re-adopted native Run owner", message)
+        })?;
+
+        Ok(run)
+    }
+
     fn info(&self) -> RunInfo {
         let output = mutex_lock(&self.output);
         let applied_input_bytes = match &self.incarnation_control {
@@ -3964,8 +4089,8 @@ mod tests {
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
         CommandDisposition, ControlReceipt, CreateOperationKey, ErrorCode, ForkPlan,
-        InterruptionReason, ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunSpec,
-        RunState, StopDisposition, TerminalSize,
+        InterruptionReason, ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo,
+        RunSpec, RunState, StopDisposition, TerminalSize,
     };
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
@@ -4174,6 +4299,122 @@ mod tests {
         drop(native_runs);
         drop(control);
         assert_eq!(counts.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readopt_rebinds_live_control_and_continues_the_durable_cursor() {
+        // A non-zero durable head is the continuity pivot: a from-scratch
+        // reconstruction would show 0 and the next append would trip
+        // persistence gap-rejection.
+        const DURABLE_HEAD: u64 = 4096;
+
+        // A live pty pair with a real child on the slave stands in for the
+        // descriptors that crossed an exec-in-place upgrade: `cat` blocks
+        // reading its stdin, so the pid stays live to be re-adopted, and the
+        // slave stays owned by `pair` so the kernel pair is not torn down.
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open readopt pty pair");
+        let child = pair
+            .slave
+            .spawn_command(portable_pty::CommandBuilder::new("/bin/cat"))
+            .expect("spawn re-adopted child fixture");
+        let child_pid = child.process_id().expect("re-adopted child exposes a pid");
+
+        // Duplicate the master into an owned handle without consuming
+        // `pair.master`, the same move the SIGHUP handoff makes over the
+        // inherited descriptor.
+        let master_fd = ctxmux_inherited_fd::duplicate_cloexec(
+            pair.master.as_raw_fd().expect("pty master exposes a raw fd"),
+        )
+        .expect("dup inherited master fd");
+
+        // A persistence recovered at the non-zero durable head above.
+        let directory = tempfile::tempdir().expect("create readopt persistence directory");
+        let (persistence, _recovered) = Persistence::open(directory.path().join("state"))
+            .expect("open readopt persistence");
+        let persistence_run = persistence.recovered_run(DURABLE_HEAD, 0);
+
+        let run_id = RunId::new();
+        let recovered = RecoveredRun {
+            operation_key: CreateOperationKey::new("readopt-fixture")
+                .expect("valid readopt operation key"),
+            info: RunInfo {
+                id: run_id,
+                spec: None,
+                lineage: None,
+                backend: RunBackend::Native,
+                capabilities: RunCapabilities::NATIVE,
+                pid: Some(child_pid),
+                state: RunState::Running,
+                latest_output_bytes: DURABLE_HEAD,
+                durable_output_bytes: Some(DURABLE_HEAD),
+                first_available_byte: DURABLE_HEAD,
+                attachments: 0,
+                applied_input_bytes: Some(0),
+            },
+            // Committed durable bytes with none retained in memory: the honest
+            // replay of a Run whose output crossed the exec on disk only.
+            replay: OutputReplay {
+                chunks: Vec::new(),
+                first_available_byte: DURABLE_HEAD,
+                latest_output_bytes: DURABLE_HEAD,
+                truncated: true,
+            },
+            metadata_bytes: 0,
+        };
+
+        let native_runs = NativeRuntimeOwner::default();
+        let run = Run::readopt(
+            recovered,
+            persistence_run,
+            master_fd,
+            child_pid,
+            native_runs.clone(),
+            LIVE_EVENT_CAPACITY,
+            TerminalPublicationOwner::default(),
+            crate::qualification_stats::QualificationStats::default(),
+        )
+        .expect("readopt rebinds live control onto the recovered Run");
+
+        // Snapshot before any I/O so the durable assertion cannot be perturbed
+        // by echoed output committing asynchronously.
+        let info = run.info();
+        assert_eq!(info.state, RunState::Running);
+        assert_eq!(info.pid, Some(child_pid));
+        // Live native control is bound (`recover` leaves this `None`).
+        assert!(run.native_control().is_ok());
+        // Continuity proof: the durable cursor reuses the recovered head — it
+        // does NOT reset to zero.
+        assert_eq!(info.durable_output_bytes, Some(DURABLE_HEAD));
+
+        // The master fd is live: a resize round-trips through the adopted
+        // adapter (a non-tty fd would return ENOTTY here).
+        run.resize(TerminalSize { rows: 40, cols: 132 })
+            .expect("resize the re-adopted live master");
+
+        // The input path is live end to end: bytes reach the real pty master
+        // and the applied cursor advances by exactly the bytes written.
+        run.input(b"readopt\n".to_vec())
+            .await
+            .expect("drive input through the re-adopted control");
+        assert_eq!(run.info().applied_input_bytes, Some(8));
+
+        // Teardown: Stop drives TERM + reap through the owner (the sole reaper,
+        // via waitid), so no zombie survives. Our own `child` handle never
+        // waits — `std::process::Child::drop` does not reap — so there is no
+        // double-reap race.
+        run.stop().await.expect("stop reaps the re-adopted child");
+        drop(child);
+        drop(run);
+        drop(native_runs);
+        // The pty pair stayed alive through every round-trip above.
+        drop(pair);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
