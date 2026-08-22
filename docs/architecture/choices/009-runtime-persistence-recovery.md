@@ -243,7 +243,13 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 ## Open questions
 
 - Does a later product milestone justify a stable per-Run owner or another
-  platform mechanism for live PTY handoff? This decision does not pre-design it.
+  platform mechanism for live PTY handoff? Answered: no standing per-Run owner.
+  [015](015-exec-in-place-upgrade-continuity.md) keeps live control across a
+  *planned* upgrade by carrying the master fd across an `execve`-in-place — the
+  same process, so no metadata-named re-adoption and no broker — and
+  [016](016-semantic-resume.md) reconstructs a crashed Run *semantically* rather
+  than re-adopting its dead PTY. Crash-time live handoff and PID adoption remain
+  unsupported.
 - Which user-facing inspection or deletion command should manage durable history
   once a real client requires it?
 - A future schema revision must decide migration and rollback before changing
