@@ -22,6 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod adopted_pty;
 mod attachment;
 mod creation;
 mod handoff;

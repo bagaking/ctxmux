@@ -17,6 +17,7 @@ use ctxmux_protocol::{
 use portable_pty::{Child, MasterPty, PtySize};
 use tokio::sync::{oneshot, watch};
 
+use crate::adopted_pty::AdoptedMasterPty;
 use crate::native_runtime::OwnerWake;
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
@@ -394,6 +395,36 @@ impl PtyControl for PortablePtyControl {
         self.0
             .process_group_leader()
             .and_then(|pid| u32::try_from(pid).ok())
+    }
+}
+
+/// Bridge the inherited-fd adapter onto this module's private `PtyControl`
+/// surface. Kept here — rather than in `adopted_pty` — so the trait stays
+/// private to `native_control` while the adapter carries only pure fd
+/// operations. The exec-in-place recovery path (a later task) builds a
+/// `Box<dyn PtyControl>` from a recovered master through this impl.
+#[cfg_attr(not(test), allow(dead_code))]
+impl PtyControl for AdoptedMasterPty {
+    fn resize(&self, size: PtySize) -> io::Result<()> {
+        AdoptedMasterPty::resize(self, size)
+    }
+
+    fn get_size(&self) -> io::Result<PtySize> {
+        AdoptedMasterPty::get_size(self)
+    }
+
+    fn master_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        Some(AdoptedMasterPty::master_raw_fd(self))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn interrupt_foreground(&self) -> io::Result<()> {
+        AdoptedMasterPty::interrupt_foreground(self)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn foreground_process_group(&self) -> Option<u32> {
+        AdoptedMasterPty::foreground_process_group(self)
     }
 }
 
@@ -2000,7 +2031,10 @@ mod tests {
         // master) and the fd number is unchanged afterward. A cached number
         // could not carry a resize; only an open master fd can.
         let applied = owner
-            .resize(TerminalSize { rows: 40, cols: 132 })
+            .resize(TerminalSize {
+                rows: 40,
+                cols: 132,
+            })
             .expect("resize the live master exposed for handoff");
         assert_eq!(
             applied,
