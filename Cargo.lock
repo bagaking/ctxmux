@@ -135,6 +135,7 @@ dependencies = [
  "portable-pty",
  "rusqlite",
  "rustix",
+ "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
