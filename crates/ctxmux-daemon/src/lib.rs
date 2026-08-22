@@ -2548,6 +2548,8 @@ impl Run {
         live_event_capacity: usize,
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
+        input_drains: InputDrainGate,
+        wait_failure: NativeWaitFailure,
     ) -> Result<Arc<Self>, ProtocolError> {
         let id = recovered.info.id;
 
@@ -2584,7 +2586,7 @@ impl Run {
             id,
             adopted,
             writer,
-            InputDrainGate::with_stats(qualification_stats.clone()),
+            input_drains,
             owner_wake,
         );
         // Mirror the spawn seam: bind the reap control so that if registration
@@ -2635,7 +2637,7 @@ impl Run {
             pending_child,
             session,
             registration_control,
-            NativeWaitFailure::default(),
+            wait_failure,
             || {},
             reader_guard,
             waiter_guard,
@@ -4302,6 +4304,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one continuous re-adoption proof carrying both threaded-value probes is easier to audit whole"
+    )]
     async fn readopt_rebinds_live_control_and_continues_the_durable_cursor() {
         // A non-zero durable head is the continuity pivot: a from-scratch
         // reconstruction would show 0 and the next append would trip
@@ -4370,6 +4376,40 @@ mod tests {
         };
 
         let native_runs = NativeRuntimeOwner::default();
+
+        // The two manager-shared values now flow in from the caller — matching
+        // the production spawn seam — instead of being fabricated inside
+        // `readopt`. Each is wired to a probe so the threading is load-bearing:
+        //
+        // * `input_drains` carries a probe `QualificationStats` sink. The spawn
+        //   path threads the DAEMON-WIDE gate so every run shares one input
+        //   concurrency budget; a re-adopted run must join THAT gate, not a
+        //   fresh one. Passing a DISTINCT no-sink `qualification_stats` param
+        //   below is the crux: the only way this probe sink can ever observe an
+        //   `InputDrains` gauge pulse is if `readopt` actually schedules input
+        //   through the gate we pass here. The pre-fix code discarded this gate
+        //   and rebuilt one from `qualification_stats`, leaving the probe silent.
+        let (input_drain_frames, input_drain_sink) =
+            UnixStream::pair().expect("open input-drain probe stats stream");
+        let input_drain_stats = crate::qualification_stats::QualificationStats::from_sink(
+            input_drain_sink.into(),
+            "readopt-input-drain-probe",
+        )
+        .expect("open input-drain probe stats");
+        let input_drains =
+            crate::native_control::InputDrainGate::with_stats(input_drain_stats.clone());
+
+        // `wait_failure` carries a probe `IncarnationFailure` — the value the
+        // serve loop's fail-stop arm watches — wired exactly as the manager
+        // wires it (mirrors `native_wait_failure_exits_daemon_without_a_terminal_
+        // event`). A pre-fix `NativeWaitFailure::default()` would record wait-
+        // authority loss into a DETACHED incarnation the daemon never watches.
+        let incarnation = super::IncarnationFailure::default();
+        let wait_failure = NativeWaitFailure {
+            creation_flights: crate::creation::CreationFlightOwner::default(),
+            incarnation_failure: incarnation.clone(),
+        };
+
         let run = Run::readopt(
             recovered,
             persistence_run,
@@ -4379,6 +4419,8 @@ mod tests {
             LIVE_EVENT_CAPACITY,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
+            input_drains,
+            wait_failure,
         )
         .expect("readopt rebinds live control onto the recovered Run");
 
@@ -4404,6 +4446,56 @@ mod tests {
             .await
             .expect("drive input through the re-adopted control");
         assert_eq!(run.info().applied_input_bytes, Some(8));
+
+        // Defect 2 (resource governance) — the load-bearing proof of the fix.
+        // The re-adopted run scheduled its input through the manager-shared
+        // `InputDrainGate` we passed in, shown by the gauge pulse landing on
+        // THAT gate's probe stats sink. `begin_input` sets the `InputDrains`
+        // gauge synchronously before the `PendingInput` is returned, so the
+        // pulse is already recorded by the time the await above resolves. The
+        // pre-fix code discarded the passed gate and rebuilt a fresh one from
+        // the SEPARATE no-sink `qualification_stats` param, so this probe sink
+        // could never pulse — making the assertion below genuinely load-bearing
+        // against the old fabricated gate (it goes red without the fix).
+        input_drain_stats.finish();
+        let observed_input_drain_gauge = {
+            use std::io::BufRead;
+            std::io::BufReader::new(input_drain_frames)
+                .lines()
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(&line.expect("probe frame line"))
+                        .expect("probe frame parses")
+                })
+                .filter_map(|frame| {
+                    frame["high_water"]
+                        [crate::qualification_stats::Gauge::InputDrains as usize]
+                        .as_u64()
+                })
+                .max()
+                .expect("probe stats emitted at least one frame")
+        };
+        assert!(
+            observed_input_drain_gauge >= 1,
+            "re-adopted input must schedule through the manager-shared gate we passed in, \
+             not a fresh gate rebuilt from the separate qualification_stats"
+        );
+
+        // Defect 1 (reliability) guard. The strongest discriminator would be
+        // observing a wait-authority-loss record land in this probe
+        // `incarnation_failure` (proving `readopt` used the passed-in one, not a
+        // detached `NativeWaitFailure::default()`). But `readopt` builds its own
+        // real `AdoptedChild` from the live pid, so there is no wait-failing
+        // child seam here: forcing a `record()` would need a reap-race or a
+        // worker-spawn-failure injection that leaves the child unreaped — either
+        // one regresses the clean-reap / no-zombie assertions below. Per the
+        // "avoid over-validation" directive we do not contort the test for it;
+        // the shared-gate observation above is the load-bearing proof that the
+        // caller-threaded values reach the seam. Here we only assert the clean
+        // re-adoption never spuriously fenced the daemon.
+        assert!(
+            incarnation.message().is_none(),
+            "a successful re-adoption must not record an incarnation failure"
+        );
 
         // Teardown: Stop drives TERM + reap through the owner (the sole reaper,
         // via waitid), so no zombie survives. Our own `child` handle never
