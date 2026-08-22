@@ -118,7 +118,9 @@ git commit -m "feat(inherited-fd): add clear_cloexec for execve fd survival"
 
 ## Task A2: Handoff manifest type + serialization
 
-**Why:** The upgrade must carry `{RunId → (child_pid, master_fd, writer_fd, reader_fd)}` plus the epoch string across the exec. Keep it a small, self-describing, versioned struct serialized to a single inherited fd (not argv — argv length is bounded and fd numbers leak into `ps`).
+**Why:** The upgrade must carry `{RunId → (child_pid, master_fd)}` plus the epoch string across the exec. Keep it a small, self-describing, versioned struct serialized to a single inherited fd (not argv — argv length is bounded and fd numbers leak into `ps`).
+
+> **Architecture finding (2026-08-22, confirmed by live-substrate exploration):** For a native Run the master, the output reader, and the input writer are three fd *numbers* over ONE open file description (the pty master OFD): `reader = duplicate_cloexec(master)` and `writer = master.take_writer()`. So the manifest carries ONLY the master fd per Run — the incoming image re-derives the reader (re-dup cloexec) and writer (write to the master) exactly as the spawn seam does. Carrying `reader_fd` would be redundant; carrying `writer_fd` is impossible anyway (the portable_pty writer is a `Box<dyn Write + Send>` with no recoverable raw fd). This is the lower-entropy shape and is what shipped.
 
 **Files:**
 - Create: `crates/ctxmux-daemon/src/handoff.rs`
@@ -156,8 +158,6 @@ pub struct HandoffRun {
     pub run_id: RunId,
     pub child_pid: i32,
     pub master_fd: RawFd,
-    pub writer_fd: RawFd,
-    pub reader_fd: RawFd,
 }
 
 impl HandoffManifest {
@@ -167,10 +167,7 @@ impl HandoffManifest {
 
     /// Every fd number this manifest expects to survive the exec.
     pub fn all_fds(&self) -> Vec<RawFd> {
-        self.runs
-            .iter()
-            .flat_map(|r| [r.master_fd, r.writer_fd, r.reader_fd])
-            .collect()
+        self.runs.iter().map(|r| r.master_fd).collect()
     }
 }
 
@@ -186,14 +183,12 @@ mod tests {
                 run_id: RunId::new(),
                 child_pid: 4321,
                 master_fd: 7,
-                writer_fd: 8,
-                reader_fd: 9,
             }],
         );
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: HandoffManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, manifest);
-        assert_eq!(parsed.all_fds(), vec![7, 8, 9]);
+        assert_eq!(parsed.all_fds(), vec![7]);
         assert_eq!(parsed.schema, HANDOFF_SCHEMA);
     }
 }
@@ -313,12 +308,14 @@ git commit -m "feat(daemon): parse --handoff-fd and read the upgrade manifest"
 
 ---
 
-## Task A4: Extract live raw fds from an Open native control
+## Task A4: Extract the live master fd from an Open native control
 
-**Why:** Step 3 of the Track A flow needs `{child_pid, master_fd, writer_fd, reader_fd}` from each *live* Run without terminating it. Today `detach_closed_descriptors_after_owner_fence` (native_control.rs) only works once the Run's phase is `Closed`. We need a peer API that reads the raw fds from an `Open` control.
+**Why:** Step 3 of the Track A flow needs `{child_pid, master_fd}` from each *live* Run without terminating it. Per the A2 architecture finding, only the master fd is carried — the incoming image re-derives the reader and writer from it. Today `detach_closed_descriptors_after_owner_fence` (native_control.rs) only works once the Run's phase is `Closed`, and the `PtyControl` trait (native_control.rs:355) exposes **no** raw-fd accessor. We need (a) a new trait method to surface the master fd from an open control, and (b) a peer API that returns it plus the child pid without closing anything.
+
+> **Fd-flow facts (from live-substrate exploration):** the `PtyControl` trait has no `as_raw_fd`; the concrete `PortablePtyControl(Box<dyn MasterPty + Send>)` wraps a `MasterPty` whose `as_raw_fd()` *is* available. So A4 adds a `master_raw_fd(&self) -> Option<RawFd>` method to the `PtyControl` trait (returning `self.0.as_raw_fd()` for `PortablePtyControl`, and later `Some(fd)` for the A7 adapter). The writer fd is unrecoverable (boxed `dyn Write`) and the reader fd lives on `OutputOwner.reader` in native_runtime.rs, not on the control — neither is needed, because only the master fd is handed off.
 
 **Files:**
-- Modify: `crates/ctxmux-daemon/src/native_control.rs` (add `live_descriptors(&self) -> Option<LiveDescriptors>` on the control owner; `LiveDescriptors { child_pid, master_fd, writer_fd, reader_fd }`)
+- Modify: `crates/ctxmux-daemon/src/native_control.rs` (add `master_raw_fd()` to the `PtyControl` trait + `PortablePtyControl` impl; add `live_descriptors(&self) -> Option<LiveDescriptors>` on the control owner; `LiveDescriptors { child_pid: u32, master_fd: RawFd }`)
 - Test: `crates/ctxmux-daemon/src/tests/creation.rs` or a new `tests/` submodule that starts a native Run and reads its live descriptors
 
 **Step 1: Write the failing test**
@@ -327,7 +324,7 @@ In the daemon's in-crate test module that already spins up a native Run (see `sr
 
 ```rust
 #[tokio::test]
-async fn live_descriptors_expose_master_writer_reader_without_closing() {
+async fn live_descriptors_expose_master_fd_without_closing() {
     // Arrange: start a real native Run (reuse the harness helper already used
     // by creation.rs — e.g. spawn `sh`).
     let run = /* start a native run via the existing test helper */;
@@ -335,8 +332,6 @@ async fn live_descriptors_expose_master_writer_reader_without_closing() {
 
     let live = control.live_descriptors().expect("open control has descriptors");
     assert!(live.master_fd >= 0);
-    assert!(live.writer_fd >= 0);
-    assert!(live.reader_fd >= 0);
     assert!(live.child_pid > 0);
 
     // The Run is still alive and controllable afterward.
@@ -353,15 +348,13 @@ Expected: FAIL — `live_descriptors` not found.
 
 **Step 3: Write minimal implementation**
 
-In `native_control.rs`, add a `LiveDescriptors` struct and a method on the control owner that borrows the pty master, writer, and reader and returns their `as_raw_fd()` values plus the child pid. Use the existing `PortablePtyControl`'s `as_raw_fd` (native_control.rs already exposes it around line 379) and the child pid already tracked on the Run. Do **not** dup — return the borrowed raw fd numbers; the caller clears CLOEXEC on them just before exec, which is correct because after exec the same fd table entry persists.
+In `native_control.rs`: add `fn master_raw_fd(&self) -> Option<std::os::fd::RawFd>` to the `PtyControl` trait (native_control.rs:355), implemented for `PortablePtyControl` by delegating to the inner `MasterPty::as_raw_fd()`. Then add a `LiveDescriptors` struct and a `live_descriptors()` method on the control owner that reads the master fd through the pty mutex and pairs it with the child pid already tracked on the Run. Do **not** dup — return the borrowed raw fd number; the caller clears CLOEXEC on it just before exec, which is correct because after exec the same fd-table entry persists. (The writer/reader fds are intentionally not returned — they are re-derived from the master fd in the incoming image.)
 
 ```rust
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LiveDescriptors {
-    pub child_pid: i32,
+    pub child_pid: u32,
     pub master_fd: std::os::fd::RawFd,
-    pub writer_fd: std::os::fd::RawFd,
-    pub reader_fd: std::os::fd::RawFd,
 }
 ```
 
@@ -374,7 +367,7 @@ Expected: PASS.
 
 ```bash
 git add crates/ctxmux-daemon/src/native_control.rs crates/ctxmux-daemon/src/tests/creation.rs
-git commit -m "feat(daemon): read live raw descriptors from an open native control"
+git commit -m "feat(daemon): read the live master fd from an open native control"
 ```
 
 ---
@@ -525,12 +518,12 @@ git commit -m "feat(daemon): exclude handed-off runs from reconciliation, reuse 
 **Why:** A recovered Run is built with `incarnation_control: None` / `native_runs: None` (lib.rs `Run::recover` ~:2476). Handed-off Runs must instead get live control re-bound from the inherited fds, with the durable replay cursor re-attached so `append`/`finalize` continue from the true committed byte (never 0, which trips gap-rejection).
 
 **Files:**
-- Modify: `crates/ctxmux-daemon/src/lib.rs` (add `Run::readopt(...)` building control from `AdoptedMasterPty` + writer + reader + `AdoptedChild` + `NativeSession::from_child_pid`)
+- Modify: `crates/ctxmux-daemon/src/lib.rs` (add `Run::readopt(...)` building control from `AdoptedMasterPty` (over the single inherited master fd) + `AdoptedChild` + `NativeSession::from_child_pid`)
 - Test: `crates/ctxmux-daemon/tests/native_lifecycle.rs` (unit-level: construct a recovered Run, readopt from a live pty pair, assert it reports `running` and accepts input)
 
 **Step 1: Write the failing test**
 
-Construct a recovered Run row, open a real pty with a live child, and call `Run::readopt` with the fds. Assert `status()` is `running` with the child's pid, `input()` echoes, and the durable cursor is non-zero (continues, no gap).
+Construct a recovered Run row, open a real pty with a live child, and call `Run::readopt` with the master fd + child pid. Assert `status()` is `running` with the child's pid, `input()` echoes, and the durable cursor is non-zero (continues, no gap).
 
 **Step 2: Run test to verify it fails**
 
@@ -539,7 +532,7 @@ Expected: FAIL — `readopt` not found.
 
 **Step 3: Write minimal implementation**
 
-Implement `Run::readopt` composing A6 (`AdoptedChild`), A7 (`AdoptedMasterPty`), and the existing reader/writer plumbing, registering the Run with the daemon-wide owner exactly like a fresh Run but without spawning. Re-attach the durable cursor from the recovered row.
+Implement `Run::readopt` composing A6 (`AdoptedChild`) and A7 (`AdoptedMasterPty` over the single inherited master fd), re-deriving the reader and writer from that master exactly as the spawn seam does (reader = `duplicate_cloexec(master)`, writer = the adapter's write path over the master) — the writer and reader are **not** separately inherited fds. Register the Run with the daemon-wide owner exactly like a fresh Run but without spawning. Re-attach the durable cursor from the recovered row.
 
 **Step 4: Run test to verify it passes**
 
