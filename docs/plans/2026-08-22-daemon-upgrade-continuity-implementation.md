@@ -308,15 +308,17 @@ git commit -m "feat(daemon): parse --handoff-fd and read the upgrade manifest"
 
 ---
 
-## Task A4: Extract the live master fd from an Open native control
+## Task A4: Surface the live master fd from an Open native control
 
-**Why:** Step 3 of the Track A flow needs `{child_pid, master_fd}` from each *live* Run without terminating it. Per the A2 architecture finding, only the master fd is carried — the incoming image re-derives the reader and writer from it. Today `detach_closed_descriptors_after_owner_fence` (native_control.rs) only works once the Run's phase is `Closed`, and the `PtyControl` trait (native_control.rs:355) exposes **no** raw-fd accessor. We need (a) a new trait method to surface the master fd from an open control, and (b) a peer API that returns it plus the child pid without closing anything.
+**Why:** The upgrade must read each live Run's pty master fd without terminating it. Per the A2 architecture finding, only the master fd is carried — the incoming image re-derives the reader and writer from it. Today `detach_closed_descriptors_after_owner_fence` (native_control.rs) only works once the Run's phase is `Closed`, and the `PtyControl` trait (native_control.rs:355) exposes **no** raw-fd accessor. This task adds exactly that accessor and surfaces it from the open control.
 
-> **Fd-flow facts (from live-substrate exploration):** the `PtyControl` trait has no `as_raw_fd`; the concrete `PortablePtyControl(Box<dyn MasterPty + Send>)` wraps a `MasterPty` whose `as_raw_fd()` *is* available. So A4 adds a `master_raw_fd(&self) -> Option<RawFd>` method to the `PtyControl` trait (returning `self.0.as_raw_fd()` for `PortablePtyControl`, and later `Some(fd)` for the A7 adapter). The writer fd is unrecoverable (boxed `dyn Write`) and the reader fd lives on `OutputOwner.reader` in native_runtime.rs, not on the control — neither is needed, because only the master fd is handed off.
+> **Ownership boundary (from live-substrate exploration — corrects the original plan):** the child PID is **not** reachable from `NativeControlOwner`. It lives on the daemon-wide owner's `Watching { child, session, control }` (native_runtime.rs:529-533) — `NativeSession` holds the pid, and the `Child` trait exposes `process_id() -> Option<u32>`. The control owner holds only the pty + writer + reap state. Therefore A4 surfaces **only the master fd** at the control level; pairing it with the child pid is A5's job (the owner is the only actor that sees child + session + control together). Do not try to return a `child_pid` from `NativeControlOwner` — it does not have one.
+>
+> **Fd-flow facts:** the `PtyControl` trait has no `as_raw_fd`; the concrete `PortablePtyControl(Box<dyn MasterPty + Send>)` wraps a `MasterPty` whose `as_raw_fd() -> Option<RawFd>` *is* available (already used for macOS `interrupt_foreground` at native_control.rs:377-381). So A4 adds a `master_raw_fd(&self) -> Option<RawFd>` method to the `PtyControl` trait (delegating to `self.0.as_raw_fd()` for `PortablePtyControl`; the A7 adapter will return `Some(fd)`), plus a `NativeControlOwner::master_raw_fd()` accessor that reads it through the pty mutex. The writer fd is unrecoverable (boxed `dyn Write`) and the reader fd lives on `OutputOwner.reader` in native_runtime.rs — neither is needed.
 
 **Files:**
-- Modify: `crates/ctxmux-daemon/src/native_control.rs` (add `master_raw_fd()` to the `PtyControl` trait + `PortablePtyControl` impl; add `live_descriptors(&self) -> Option<LiveDescriptors>` on the control owner; `LiveDescriptors { child_pid: u32, master_fd: RawFd }`)
-- Test: `crates/ctxmux-daemon/src/tests/creation.rs` or a new `tests/` submodule that starts a native Run and reads its live descriptors
+- Modify: `crates/ctxmux-daemon/src/native_control.rs` (add `master_raw_fd()` to the `PtyControl` trait + `PortablePtyControl`/`TestPty` impls; add `pub(crate) fn master_raw_fd(&self) -> Option<RawFd>` on `NativeControlOwner`)
+- Test: `crates/ctxmux-daemon/src/tests/creation.rs` (start a native Run, read its master fd through the owner, assert it is valid and the Run stays controllable)
 
 **Step 1: Write the failing test**
 
@@ -324,65 +326,67 @@ In the daemon's in-crate test module that already spins up a native Run (see `sr
 
 ```rust
 #[tokio::test]
-async fn live_descriptors_expose_master_fd_without_closing() {
+async fn master_raw_fd_exposes_the_live_master_without_closing() {
     // Arrange: start a real native Run (reuse the harness helper already used
     // by creation.rs — e.g. spawn `sh`).
     let run = /* start a native run via the existing test helper */;
     let control = /* obtain &NativeControlOwner for run */;
 
-    let live = control.live_descriptors().expect("open control has descriptors");
-    assert!(live.master_fd >= 0);
-    assert!(live.child_pid > 0);
+    let master_fd = control.master_raw_fd().expect("open control exposes its master fd");
+    assert!(master_fd >= 0);
 
-    // The Run is still alive and controllable afterward.
+    // The Run is still alive and controllable afterward (the fd was only read).
     control.write_input(b"echo hi\n").await.expect("still writable");
 }
 ```
 
-> Fill the `/* ... */` from the existing helper in `src/tests/creation.rs`. Read that file first to copy the exact setup idiom.
+> Fill the `/* ... */` from the existing helper in `src/tests/creation.rs`. Read that file first to copy the exact setup idiom (how it obtains the `NativeControlOwner` for a started Run).
 
 **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p ctxmux-daemon live_descriptors_expose`
-Expected: FAIL — `live_descriptors` not found.
+Run: `cargo test -p ctxmux-daemon master_raw_fd_exposes`
+Expected: FAIL — `master_raw_fd` not found.
 
 **Step 3: Write minimal implementation**
 
-In `native_control.rs`: add `fn master_raw_fd(&self) -> Option<std::os::fd::RawFd>` to the `PtyControl` trait (native_control.rs:355), implemented for `PortablePtyControl` by delegating to the inner `MasterPty::as_raw_fd()`. Then add a `LiveDescriptors` struct and a `live_descriptors()` method on the control owner that reads the master fd through the pty mutex and pairs it with the child pid already tracked on the Run. Do **not** dup — return the borrowed raw fd number; the caller clears CLOEXEC on it just before exec, which is correct because after exec the same fd-table entry persists. (The writer/reader fds are intentionally not returned — they are re-derived from the master fd in the incoming image.)
-
-```rust
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct LiveDescriptors {
-    pub child_pid: u32,
-    pub master_fd: std::os::fd::RawFd,
-}
-```
+In `native_control.rs`: add `fn master_raw_fd(&self) -> Option<std::os::fd::RawFd>` to the `PtyControl` trait (native_control.rs:355), implemented for `PortablePtyControl` by delegating to the inner `MasterPty::as_raw_fd()`, and for the `#[cfg(test)] TestPty` (native_control.rs:417) returning `None`. Then add `pub(crate) fn master_raw_fd(&self) -> Option<RawFd>` on `NativeControlOwner` that locks the pty mutex and calls the trait method on the `Some` control (returns `None` if the pty is already detached). Do **not** dup — return the borrowed raw fd number; the caller (A5→A11) clears CLOEXEC on it just before exec, which is correct because after exec the same fd-table entry persists.
 
 **Step 4: Run test to verify it passes**
 
-Run: `cargo test -p ctxmux-daemon live_descriptors_expose`
+Run: `cargo test -p ctxmux-daemon master_raw_fd_exposes`
 Expected: PASS.
 
 **Step 5: Commit**
 
 ```bash
 git add crates/ctxmux-daemon/src/native_control.rs crates/ctxmux-daemon/src/tests/creation.rs
-git commit -m "feat(daemon): read the live master fd from an open native control"
+git commit -m "feat(daemon): surface the live master fd from an open native control"
 ```
 
 ---
 
 ## Task A5: Native-owner `ExtractForHandoff` command
 
-**Why:** The daemon-wide native owner (native_runtime.rs) is the only actor that can walk every live native Run. Add a command that, distinct from `Shutdown` (which fail-stops via `mem::forget`), returns the `LiveDescriptors` for every live Run *without terminating anything*, and — critically — relinquishes the owner's reap/close authority so the fds survive into the exec instead of being closed when the owner thread later drops.
+**Why:** The daemon-wide native owner (native_runtime.rs) is the only actor that can walk every live native Run *and* the only actor that sees `Watching { child, session, control }` together — so it is the only place the master fd (from `control.master_raw_fd()`, A4) can be paired with the child pid (from `session`/`child.process_id()`). A4 deliberately does not return a pid; this task assembles the full `{child_pid, master_fd}` record. Add a command that, distinct from `Shutdown` (which fail-stops via `mem::forget`), returns the `LiveDescriptors` for every live Run *without terminating anything*, and — critically — relinquishes the owner's reap/close authority so the fds survive into the exec instead of being closed when the owner thread later drops.
+
+> **This task defines `LiveDescriptors`** (A4 only exposes the fd; the pid is not visible there):
+> ```rust
+> #[derive(Debug, Clone, Copy)]
+> pub(crate) struct LiveDescriptors {
+>     pub run_id: RunId,
+>     pub child_pid: u32,
+>     pub master_fd: std::os::fd::RawFd,
+> }
+> ```
+> Each field's source is a different member of the same `Watching`: `run_id` from the registration key, `child_pid` from `session`/`child.process_id()`, `master_fd` from `control.master_raw_fd()`. A Run whose `master_raw_fd()` returns `None` (pty already detached) is skipped — it is not live for handoff purposes.
 
 **Files:**
-- Modify: `crates/ctxmux-daemon/src/native_runtime.rs` (owner command enum, handler, `preserve_shutdown_authority`/`mem::forget` analogue)
+- Modify: `crates/ctxmux-daemon/src/native_runtime.rs` (owner command enum, handler, `LiveDescriptors` struct, `preserve_shutdown_authority`/`mem::forget` analogue)
 - Test: `crates/ctxmux-daemon/tests/native_lifecycle.rs`
 
 **Step 1: Write the failing test**
 
-In `crates/ctxmux-daemon/tests/native_lifecycle.rs`, add a test that starts two native Runs, calls the new `extract_for_handoff()` on the owner handle, and asserts it returns two `LiveDescriptors` and both child PIDs are still alive (`kill(pid, 0)` succeeds) afterward.
+In `crates/ctxmux-daemon/tests/native_lifecycle.rs`, add a test that starts two native Runs, calls the new `extract_for_handoff()` on the owner handle, and asserts it returns two `LiveDescriptors` — each with a nonzero `child_pid`, a `master_fd >= 0`, and the two `run_id`s matching the started Runs — and that both child PIDs are still alive (`kill(pid, 0)` succeeds) afterward.
 
 **Step 2: Run test to verify it fails**
 
@@ -391,7 +395,7 @@ Expected: FAIL — method not found.
 
 **Step 3: Write minimal implementation**
 
-Add an `OwnerCommand::ExtractForHandoff { respond }` variant. Its handler collects `LiveDescriptors` for each registered live Run, then transitions each registration into a "handed-off" state that, on owner-thread teardown, does **not** close the fds and does **not** reap the child — the same `mem::forget`/authority-preservation discipline `preserve_shutdown_authority` already uses (native_runtime.rs ~:1248). Return the vector to the caller.
+Add an `OwnerCommand::ExtractForHandoff { respond }` variant. Its handler walks each live `Watching`, building one `LiveDescriptors` per Run by pairing `control.master_raw_fd()` (A4) with the child pid read from `session`/`child.process_id()` and the registration's `run_id` (skip any Run whose `master_raw_fd()` is `None`). It then transitions each registration into a "handed-off" state that, on owner-thread teardown, does **not** close the fds and does **not** reap the child — the same `mem::forget`/authority-preservation discipline `preserve_shutdown_authority` already uses (native_runtime.rs ~:1248). Return the vector to the caller.
 
 **Step 4: Run test to verify it passes**
 
