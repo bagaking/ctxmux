@@ -2310,3 +2310,52 @@ async fn concurrent_interrupt_stop_and_natural_exit_leave_no_signal_or_process_s
     let after = std::fs::read(marker.with_extension("interrupts")).unwrap_or_default();
     assert_eq!(after, before, "post-Stop Interrupt produced a side effect");
 }
+
+#[tokio::test]
+async fn sighup_memory_only_noop() {
+    // A memory-only daemon (no --state-dir) cannot do exec-in-place continuity,
+    // so SIGHUP must be a no-op: the daemon keeps serving and live runs are
+    // unaffected (same child pid), rather than taking the default-terminate
+    // disposition that would kill the daemon.
+    let daemon = TestDaemon::start().await; // memory-only
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start native Run");
+    let pid = run.pid.expect("shell exposes a process id");
+    assert!(process_exists(pid), "child should be running before SIGHUP");
+
+    let delivered = Command::new("kill")
+        .arg("-HUP")
+        .arg(daemon.child.id().to_string())
+        .status()
+        .expect("send SIGHUP to ctxmuxd")
+        .success();
+    assert!(delivered, "SIGHUP should be delivered to ctxmuxd");
+
+    // Give the daemon a moment to handle the signal (a default-terminate
+    // disposition would have exited the process by now).
+    sleep(Duration::from_millis(200)).await;
+
+    // The daemon survived SIGHUP and still answers requests.
+    daemon
+        .client
+        .ping()
+        .await
+        .expect("daemon still serves after a no-op SIGHUP");
+
+    // The live run is untouched: same PID, still running.
+    let status = daemon
+        .client
+        .status(run.id)
+        .await
+        .expect("read Run status after SIGHUP");
+    assert_eq!(status.pid, Some(pid), "SIGHUP must not replace the child");
+    assert_eq!(
+        status.state,
+        RunState::Running,
+        "SIGHUP must not interrupt the live run"
+    );
+    assert!(process_exists(pid), "child should still be running after SIGHUP");
+}
