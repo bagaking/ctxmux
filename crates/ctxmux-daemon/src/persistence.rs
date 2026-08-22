@@ -20,7 +20,7 @@ use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
     RunBackend, RunCapabilities, RunId, RunInfo, RunLineage, RunSpec, RunState,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, params_from_iter};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -114,6 +114,18 @@ pub(crate) struct RecoveredRun {
     pub(crate) info: RunInfo,
     pub(crate) replay: OutputReplay,
     pub(crate) metadata_bytes: u64,
+}
+
+/// Continuity hint passed to persistence startup by an exec-in-place upgrade:
+/// the Runs whose live control crossed the exec (excluded from reconciliation)
+/// and the daemon epoch to reuse instead of minting a fresh one.
+///
+/// When absent (the crash-recovery path), startup is byte-identical to a cold
+/// restart: every `running` row is reconciled to `interrupted{daemon_restart}`
+/// and a fresh epoch is minted.
+pub(crate) struct HandoffHint {
+    pub(crate) epoch: String,
+    pub(crate) live_set: HashSet<RunId>,
 }
 
 #[derive(Clone)]
@@ -391,12 +403,13 @@ impl Persistence {
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
-        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL)
+        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL, None)
     }
 
     fn open_with_admission_limits(
         state_dir: PathBuf,
         admission_limits: AdmissionLimits,
+        handoff: Option<HandoffHint>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         #[cfg(test)]
         let test_hooks = mutex_lock(&NEXT_OPEN_TEST_HOOKS)
@@ -405,6 +418,7 @@ impl Persistence {
         Self::open_with_admission_limits_and_hooks(
             state_dir,
             admission_limits,
+            handoff,
             #[cfg(test)]
             test_hooks,
         )
@@ -413,6 +427,7 @@ impl Persistence {
     fn open_with_admission_limits_and_hooks(
         state_dir: PathBuf,
         admission_limits: AdmissionLimits,
+        handoff: Option<HandoffHint>,
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
@@ -427,6 +442,7 @@ impl Persistence {
                 actor_main(
                     &state_dir,
                     admission_limits,
+                    handoff,
                     &command_rx,
                     &init_tx,
                     &actor_failure,
@@ -664,6 +680,7 @@ impl Persistence {
                 run_records,
                 metadata_bytes,
             },
+            None,
         )
     }
 
@@ -833,6 +850,7 @@ enum StageCompletion {
 fn actor_main(
     state_dir: &Path,
     admission_limits: AdmissionLimits,
+    handoff: Option<HandoffHint>,
     receiver: &mpsc::Receiver<Command>,
     init: &mpsc::SyncSender<Result<(String, Vec<RecoveredRun>), PersistenceError>>,
     failure: &Mutex<Option<String>>,
@@ -843,6 +861,7 @@ fn actor_main(
     let (mut store, recovered) = match StateStore::open(
         state_dir,
         admission_limits,
+        handoff,
         #[cfg(test)]
         store_test_hooks,
     ) {
@@ -1131,6 +1150,11 @@ struct StateStore {
     shm_path: PathBuf,
     connection: Connection,
     epoch: String,
+    /// Runs handed off live across an exec-in-place upgrade: excluded from
+    /// reconciliation so they stay `running`, and their count is the relaxed
+    /// target for the post-normalization "running must be zero" guards. Empty
+    /// on the crash-recovery path, where every `running` row is reconciled.
+    live_set: HashSet<RunId>,
     admission_limits: AdmissionLimits,
     // Fields drop in declaration order: close SQLite before releasing ownership.
     _state_lock: StateLockGuard,
@@ -1164,6 +1188,7 @@ impl StateStore {
     fn open(
         state_dir: &Path,
         admission_limits: AdmissionLimits,
+        handoff: Option<HandoffHint>,
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         prepare_state_dir(state_dir)?;
@@ -1189,7 +1214,12 @@ impl StateStore {
             validate_optional_state_file(path)?;
         }
         let database_existed = database_path.exists();
-        let epoch = Uuid::new_v4().to_string();
+        // Reuse the handed-off epoch on the exec-in-place path (so reconnecting
+        // clients keep passing the instance fence); mint a fresh one otherwise.
+        let (epoch, live_set) = match handoff {
+            Some(hint) => (hint.epoch, hint.live_set),
+            None => (Uuid::new_v4().to_string(), HashSet::new()),
+        };
         if database_existed
             && fs::metadata(&database_path)
                 .map_err(|source| PersistenceError::io(&database_path, source))?
@@ -1248,6 +1278,7 @@ impl StateStore {
             shm_path,
             connection,
             epoch,
+            live_set,
             admission_limits,
             _state_lock: state_lock,
             #[cfg(test)]
@@ -1296,28 +1327,50 @@ impl StateStore {
         };
         let state_json =
             serde_json::to_string(&interrupted).map_err(PersistenceError::serialization)?;
-        let mut statement = self
-            .connection
-            .prepare(
+        let limit = i64::try_from(limit).expect("startup batch limit fits SQLite");
+        // Handed-off live Runs are excluded from reconciliation so they stay
+        // `running`. rusqlite has no array binding (carray is not compiled in),
+        // so we splice one `?` placeholder per live RunId. An empty live-set
+        // keeps the query clause-free — byte-identical to a cold restart, and
+        // avoiding an invalid dangling `NOT IN ()`.
+        let (sql, bindings): (String, Vec<rusqlite::types::Value>) = if self.live_set.is_empty() {
+            (
                 "SELECT id, creation_key, spec_json, lineage_json, source_epoch, updated_at_ms
                  FROM runs WHERE state_kind = 'running'
-                 ORDER BY created_at_ms, id LIMIT ?1",
+                 ORDER BY created_at_ms, id LIMIT ?"
+                    .to_owned(),
+                vec![rusqlite::types::Value::Integer(limit)],
             )
+        } else {
+            let placeholders = vec!["?"; self.live_set.len()].join(", ");
+            let sql = format!(
+                "SELECT id, creation_key, spec_json, lineage_json, source_epoch, updated_at_ms
+                 FROM runs WHERE state_kind = 'running' AND id NOT IN ({placeholders})
+                 ORDER BY created_at_ms, id LIMIT ?"
+            );
+            let mut bindings = self
+                .live_set
+                .iter()
+                .map(|id| rusqlite::types::Value::Text(id.to_string()))
+                .collect::<Vec<_>>();
+            bindings.push(rusqlite::types::Value::Integer(limit));
+            (sql, bindings)
+        };
+        let mut statement = self
+            .connection
+            .prepare(&sql)
             .map_err(PersistenceError::database)?;
         let rows = statement
-            .query_map(
-                [i64::try_from(limit).expect("startup batch limit fits SQLite")],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
+            .query_map(params_from_iter(bindings), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
             .map_err(PersistenceError::database)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(PersistenceError::database)?;
@@ -1365,7 +1418,10 @@ impl StateStore {
             .map_err(PersistenceError::database)?;
         let records = nonnegative_u64(records, "record count")?;
         let metadata = nonnegative_u64(metadata, "metadata total")?;
-        if running != 0 {
+        // Handed-off live Runs are legitimately still `running` after
+        // reconciliation; the crash path passes an empty live-set so this
+        // stays the historical "must be zero" check.
+        if running != live_count(&self.live_set) {
             return Err(PersistenceError::Corrupt(
                 "startup retention ran before every prior running row was interrupted".to_owned(),
             ));
@@ -1379,7 +1435,13 @@ impl StateStore {
         let mut statement = self
             .connection
             .prepare(
+                // The candidate pool must agree with the `state_kind != 'running'`
+                // eviction DELETE guard: live handed-off Runs are the point of
+                // continuity and must never be evicted regardless of budget.
+                // (Without this filter a long-quiet live child sorts early by its
+                // old updated_at_ms and the DELETE aborts, hitting 0 rows.)
                 "SELECT id, metadata_bytes FROM runs
+                 WHERE state_kind != 'running'
                  ORDER BY coalesce(terminal_at_ms, updated_at_ms), created_at_ms, id",
             )
             .map_err(PersistenceError::database)?;
@@ -1654,7 +1716,7 @@ impl StateStore {
             .map_err(PersistenceError::database)?;
         if nonnegative_u64(records, "record count")? > self.admission_limits.run_records
             || nonnegative_u64(metadata, "metadata total")? > self.admission_limits.metadata_bytes
-            || running != 0
+            || running != live_count(&self.live_set)
             || current_epoch != self.epoch
         {
             return Err(PersistenceError::Corrupt(
@@ -3638,6 +3700,14 @@ fn nonnegative_u64(value: i64, label: &str) -> Result<u64, PersistenceError> {
         .map_err(|_| PersistenceError::Corrupt(format!("negative {label} in durable state")))
 }
 
+/// Expected count of surviving `running` rows after startup normalization: the
+/// number of Runs handed off live across an exec-in-place upgrade. Zero on the
+/// crash-recovery path, where the live-set is empty and every `running` row is
+/// reconciled. Typed to match the `SQLite` `count`-derived `i64` guards.
+fn live_count(live_set: &HashSet<RunId>) -> i64 {
+    i64::try_from(live_set.len()).expect("handoff live-set fits SQLite")
+}
+
 fn now_millis() -> i64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3694,7 +3764,7 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashSet},
         env,
         fs::{self, OpenOptions},
         os::unix::{fs::MetadataExt, process::ExitStatusExt},
@@ -4049,9 +4119,12 @@ mod tests {
                     .force_startup_over_budget_once
                     .store(true, Ordering::Release);
             }
-            let Err(error) =
-                StateStore::open(&state_dir, AdmissionLimits::OPERATIONAL, Arc::clone(&hooks))
-            else {
+            let Err(error) = StateStore::open(
+                &state_dir,
+                AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::clone(&hooks),
+            ) else {
                 panic!("injected startup {expected_phase} interruption unexpectedly opened");
             };
             assert!(error.to_string().contains("injected interruption"));
@@ -4281,9 +4354,13 @@ mod tests {
         let temp = TempDir::new().expect("create append-batch fixture");
         let state_dir = temp.path().join("state");
         let hooks = Arc::new(PersistenceTestHooks::default());
-        let (mut store, recovered) =
-            StateStore::open(&state_dir, AdmissionLimits::OPERATIONAL, Arc::clone(&hooks))
-                .expect("open append-batch store");
+        let (mut store, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open append-batch store");
         assert!(recovered.is_empty());
         let first = RunId::new();
         let second = RunId::new();
@@ -4348,7 +4425,7 @@ mod tests {
             metadata_bytes: METADATA_BYTES,
         };
         let (persistence, recovered) =
-            Persistence::open_with_admission_limits(state_dir.clone(), limits)
+            Persistence::open_with_admission_limits(state_dir.clone(), limits, None)
                 .expect("open small-capacity persistence actor");
         assert!(recovered.is_empty());
 
@@ -4418,7 +4495,7 @@ mod tests {
             metadata_bytes: METADATA_BYTES,
         };
         let (persistence, recovered) =
-            Persistence::open_with_admission_limits(state_dir.clone(), limits)
+            Persistence::open_with_admission_limits(state_dir.clone(), limits, None)
                 .expect("open exact-candidate store");
         assert!(recovered.is_empty());
 
@@ -4672,6 +4749,7 @@ mod tests {
         let (persistence, recovered) = Persistence::open_with_admission_limits(
             state_dir.to_path_buf(),
             AdmissionLimits::FORMAT,
+            None,
         )
         .expect("open format-envelope persistence");
         assert!(recovered.is_empty());
@@ -4851,5 +4929,225 @@ mod tests {
             end_byte: start_byte + data.len() as u64,
             data: data.to_vec(),
         }
+    }
+
+    fn seed_two_running_rows(state_dir: &Path) -> (RunId, RunId, String) {
+        let (persistence, recovered) =
+            Persistence::open(state_dir).expect("open two-running handoff fixture");
+        assert!(recovered.is_empty());
+        let row_a = RunId::new();
+        let row_b = RunId::new();
+        for id in [row_a, row_b] {
+            let info = running_info(id);
+            let key = test_operation_key(id);
+            persistence
+                .insert_start(&key, &info)
+                .expect("seed running handoff row");
+        }
+        let epoch = persistence.daemon_instance().to_string();
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        // Stamp a live PID on row_a: an exec-in-place handoff keeps the running
+        // Run's PID, and reconciling it would trip the interrupted-with-PID
+        // corruption guard. Excluding it from reconciliation must retain both.
+        let connection =
+            Connection::open(state_dir.join(DATABASE_FILE)).expect("open handoff pid fixture");
+        connection
+            .execute(
+                "UPDATE runs SET pid = 42 WHERE id = ?1 AND state_kind = 'running'",
+                [row_a.to_string()],
+            )
+            .expect("stamp handed-off Run pid");
+        drop(connection);
+        (row_a, row_b, epoch)
+    }
+
+    fn row_state_kind(connection: &Connection, id: RunId) -> String {
+        connection
+            .query_row(
+                "SELECT state_kind FROM runs WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("read handoff row state kind")
+    }
+
+    fn published_epoch(connection: &Connection) -> String {
+        connection
+            .query_row(
+                "SELECT current_epoch FROM runtime_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read published handoff epoch")
+    }
+
+    #[test]
+    fn handoff_hint_excludes_live_runs_and_reuses_epoch() {
+        // Exec-in-place path: the handed-off Run stays running and the epoch is reused.
+        let handed = TempDir::new().expect("create handoff fixture");
+        let handed_dir = handed.path().join("state");
+        let (row_a, row_b, original_epoch) = seed_two_running_rows(&handed_dir);
+
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (store, recovered) = StateStore::open(
+            &handed_dir,
+            AdmissionLimits::OPERATIONAL,
+            Some(super::HandoffHint {
+                epoch: original_epoch.clone(),
+                live_set: HashSet::from([row_a]),
+            }),
+            Arc::clone(&hooks),
+        )
+        .expect("reopen with handoff hint");
+
+        assert_eq!(row_state_kind(&store.connection, row_a), "running");
+        assert_eq!(row_state_kind(&store.connection, row_b), "interrupted");
+        assert_eq!(store.epoch, original_epoch);
+        assert_eq!(published_epoch(&store.connection), original_epoch);
+
+        let run_a = recovered
+            .iter()
+            .find(|run| run.info.id == row_a)
+            .expect("handed-off Run recovered");
+        assert_eq!(run_a.info.state, RunState::Running);
+        assert_eq!(run_a.info.pid, Some(42));
+        let run_b = recovered
+            .iter()
+            .find(|run| run.info.id == row_b)
+            .expect("reconciled Run recovered");
+        assert_eq!(
+            run_b.info.state,
+            RunState::Interrupted {
+                reason: InterruptionReason::DaemonRestart
+            }
+        );
+        assert_eq!(run_b.info.pid, None);
+        drop(store);
+
+        // Crash path (None): every running row is reconciled and a fresh epoch is minted.
+        let crashed = TempDir::new().expect("create crash-path fixture");
+        let crashed_dir = crashed.path().join("state");
+        let (crash_a, crash_b, crash_epoch) = seed_two_running_rows(&crashed_dir);
+
+        let crash_hooks = Arc::new(PersistenceTestHooks::default());
+        let (crash_store, _) = StateStore::open(
+            &crashed_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&crash_hooks),
+        )
+        .expect("reopen crash path without a hint");
+
+        assert_eq!(
+            row_state_kind(&crash_store.connection, crash_a),
+            "interrupted"
+        );
+        assert_eq!(
+            row_state_kind(&crash_store.connection, crash_b),
+            "interrupted"
+        );
+        assert_ne!(crash_store.epoch, crash_epoch);
+        assert_eq!(published_epoch(&crash_store.connection), crash_store.epoch);
+    }
+
+    fn seed_startup_overflow_with_live_row(state_dir: &Path) -> (RunId, String) {
+        // Over-budget DB whose sole live (handed-off) Run carries the OLDEST
+        // updated_at_ms, so it sorts FIRST in the eviction candidate scan. This
+        // is the exec-in-place upgrade shape A8 must keep openable: the earlier
+        // A8 fixture used only two rows, so eviction never ran and the bug hid.
+        let (persistence, recovered) = Persistence::open_with_admission_limits(
+            state_dir.to_path_buf(),
+            AdmissionLimits::FORMAT,
+            None,
+        )
+        .expect("open format-envelope persistence");
+        assert!(recovered.is_empty());
+        let count = MAX_RETAINED_RUNS + 3;
+        let mut seeded = Vec::with_capacity(count);
+        let mut live_id = None;
+        for index in 0..count {
+            let id = RunId::new();
+            let key = CreateOperationKey::new(format!("overflow-{index:03}")).unwrap();
+            let durable = persistence
+                .insert_start(&key, &running_info(id))
+                .expect("insert overflow fixture row");
+            if index == 0 {
+                // Leave the earliest row un-finalized: it stays `running` and
+                // becomes the live handed-off Run once we reopen with a hint.
+                live_id = Some(id);
+            } else {
+                durable.append(id, replay(Vec::new()));
+                durable.finalize(id, 42, replay(Vec::new()), exited_state());
+            }
+            drop(durable);
+            seeded.push(id);
+        }
+        let epoch = persistence.daemon_instance().to_string();
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let mut connection = Connection::open(state_dir.join(DATABASE_FILE))
+            .expect("open overflow fixture timestamps");
+        let transaction = connection
+            .transaction()
+            .expect("start overflow timestamp transaction");
+        for (index, id) in seeded.iter().enumerate() {
+            let timestamp = i64::try_from(index).expect("fixture index fits SQLite");
+            transaction
+                .execute(
+                    "UPDATE runs SET created_at_ms = ?2, updated_at_ms = ?2,
+                     terminal_at_ms = CASE WHEN state_kind = 'running' THEN NULL ELSE ?2 END
+                     WHERE id = ?1",
+                    params![id.to_string(), timestamp],
+                )
+                .expect("set deterministic overflow order");
+        }
+        transaction
+            .commit()
+            .expect("commit overflow fixture timestamps");
+        (live_id.expect("live row seeded"), epoch)
+    }
+
+    #[test]
+    fn over_budget_handoff_evicts_terminal_history_not_the_live_run() {
+        // Regression (A8): an over-budget DB whose live handed-off Run has the
+        // OLDEST updated_at_ms sorts that Run FIRST in the eviction candidate
+        // scan. The candidate pool must agree with the `state_kind != 'running'`
+        // DELETE guard, or opening aborts trying to evict a live row it can
+        // never delete ("startup terminal Run {id} changed before eviction").
+        let fixture = TempDir::new().expect("create over-budget handoff fixture");
+        let state_dir = fixture.path().join("state");
+        let (live_id, epoch) = seed_startup_overflow_with_live_row(&state_dir);
+
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (store, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            Some(super::HandoffHint {
+                epoch: epoch.clone(),
+                live_set: HashSet::from([live_id]),
+            }),
+            Arc::clone(&hooks),
+        )
+        .expect("over-budget handoff open evicts terminal history, not the live run");
+
+        // The live row survived eviction and is still running.
+        assert_eq!(row_state_kind(&store.connection, live_id), "running");
+        let live_run = recovered
+            .iter()
+            .find(|run| run.info.id == live_id)
+            .expect("live handed-off Run recovered");
+        assert_eq!(live_run.info.state, RunState::Running);
+
+        // Eviction actually ran: the DB is trimmed to the operational cap while
+        // the live row is retained, proving the path was exercised, not skipped.
+        let retained: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+            .expect("count retained rows after over-budget handoff");
+        assert_eq!(retained, i64::try_from(MAX_RETAINED_RUNS).unwrap());
+        assert_eq!(store.epoch, epoch);
     }
 }
