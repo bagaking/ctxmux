@@ -30,7 +30,7 @@ pub struct HandoffManifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffRun {
     pub run_id: RunId,
-    pub child_pid: i32,
+    pub child_pid: u32,
     pub master_fd: RawFd,
 }
 
@@ -57,16 +57,23 @@ mod tests {
     fn round_trips_through_json_and_lists_all_fds() {
         let manifest = HandoffManifest::new(
             "epoch-xyz".to_string(),
-            vec![HandoffRun {
-                run_id: RunId::new(),
-                child_pid: 4321,
-                master_fd: 7,
-            }],
+            vec![
+                HandoffRun {
+                    run_id: RunId::new(),
+                    child_pid: 4321,
+                    master_fd: 7,
+                },
+                HandoffRun {
+                    run_id: RunId::new(),
+                    child_pid: 8765,
+                    master_fd: 9,
+                },
+            ],
         );
         let bytes = serde_json::to_vec(&manifest).unwrap();
         let parsed: HandoffManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, manifest);
-        assert_eq!(parsed.all_fds(), vec![7]);
+        assert_eq!(parsed.all_fds(), vec![7, 9]);
         assert_eq!(parsed.schema, HANDOFF_SCHEMA);
     }
 }
