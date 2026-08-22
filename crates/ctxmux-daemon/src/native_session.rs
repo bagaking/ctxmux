@@ -5,12 +5,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use portable_pty::{Child, ExitStatus};
+use portable_pty::{Child, ChildKiller, ExitStatus};
 #[cfg(not(target_os = "macos"))]
 use rustix::process::{getpgid, kill_process_group};
 use rustix::{
     io::Errno,
-    process::{Pid, Signal, WaitId, WaitIdOptions, getsid, kill_process, waitid},
+    process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, getsid, kill_process, waitid},
 };
 #[cfg(not(target_os = "macos"))]
 use sysinfo::{ProcessesToUpdate, System};
@@ -329,6 +329,123 @@ impl NativeSession {
     }
 }
 
+/// A live child inherited across an exec-in-place upgrade, addressable only by
+/// its bare PID.
+///
+/// `portable_pty::Child` has no "construct from a PID" path, so after the
+/// daemon re-execs itself a surviving direct child is just a number. This
+/// `Child` implementation reaps that number through `waitid`, letting an
+/// adopted child route through the same `NativeSession` reap machinery as a
+/// freshly spawned one.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct AdoptedChild {
+    pid: Pid,
+    reaped: Option<ExitStatus>,
+}
+
+impl AdoptedChild {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_pid(pid: u32) -> Result<Self, String> {
+        let raw = i32::try_from(pid)
+            .map_err(|_| format!("adopted child PID {pid} does not fit a POSIX process ID"))?;
+        let pid = Pid::from_raw(raw)
+            .ok_or_else(|| format!("adopted child PID {pid} is not a positive process ID"))?;
+        Ok(Self { pid, reaped: None })
+    }
+}
+
+impl Child for AdoptedChild {
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        if let Some(status) = &self.reaped {
+            return Ok(Some(status.clone()));
+        }
+        // REAPING, non-blocking: no NOWAIT here, so a terminal child is
+        // actually collected rather than left waitable.
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG;
+        match waitid(WaitId::Pid(self.pid), options).map_err(errno_to_io)? {
+            Some(status) => {
+                let status = exit_status_from_waitid(&status);
+                self.reaped = Some(status.clone());
+                Ok(Some(status))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        if let Some(status) = &self.reaped {
+            return Ok(status.clone());
+        }
+        // REAPING, blocking: a terminal child is collected before returning.
+        let status = waitid(WaitId::Pid(self.pid), WaitIdOptions::EXITED)
+            .map_err(errno_to_io)?
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "blocking wait on adopted child {} returned no status",
+                    self.pid.as_raw_pid()
+                ))
+            })?;
+        let status = exit_status_from_waitid(&status);
+        self.reaped = Some(status.clone());
+        Ok(status)
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        u32::try_from(self.pid.as_raw_pid()).ok()
+    }
+
+    #[cfg(windows)]
+    fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        None
+    }
+}
+
+impl ChildKiller for AdoptedChild {
+    fn kill(&mut self) -> std::io::Result<()> {
+        kill_process(self.pid, Signal::KILL).map_err(errno_to_io)
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(AdoptedChildKiller(self.pid))
+    }
+}
+
+/// The signal-only half of an [`AdoptedChild`], safe to hold while another
+/// thread blocks in [`AdoptedChild::wait`].
+#[derive(Debug)]
+struct AdoptedChildKiller(Pid);
+
+impl ChildKiller for AdoptedChildKiller {
+    fn kill(&mut self) -> std::io::Result<()> {
+        kill_process(self.0, Signal::KILL).map_err(errno_to_io)
+    }
+
+    fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
+        Box::new(AdoptedChildKiller(self.0))
+    }
+}
+
+fn errno_to_io(error: Errno) -> std::io::Error {
+    std::io::Error::from_raw_os_error(error.raw_os_error())
+}
+
+/// Encode a `waitid` result as a `portable_pty::ExitStatus`, preferring the
+/// normal exit code and falling back to the conventional `128 + signal`.
+///
+/// The final `1` is a defensive default: reaped with `WEXITED`, a terminal
+/// child is always `CLD_EXITED` or `CLD_KILLED`/`CLD_DUMPED`, so one of the two
+/// branches above fires — this arm should never surface in practice.
+fn exit_status_from_waitid(status: &WaitIdStatus) -> ExitStatus {
+    if let Some(code) = status.exit_status() {
+        ExitStatus::with_exit_code(code.unsigned_abs())
+    } else if let Some(signal) = status.terminating_signal() {
+        ExitStatus::with_exit_code(128 + signal.unsigned_abs())
+    } else {
+        ExitStatus::with_exit_code(1)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn process_ids() -> Result<Vec<u32>, String> {
     ctxmux_process_stats::process_ids()
@@ -352,7 +469,103 @@ mod tests {
 
     use rustix::{io::Errno, process::Pid};
 
-    use super::NativeSession;
+    use super::{AdoptedChild, NativeSession};
+
+    #[test]
+    fn adopted_child_probes_then_reaps_by_pid_with_latch() {
+        // A child that stays alive briefly, then exits 7. We forget std's
+        // handle so `AdoptedChild` (via waitid) is the sole reaper.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2; exit 7"])
+            .spawn()
+            .expect("spawn adoptable child");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        let mut session = NativeSession::from_child_pid(pid).unwrap();
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+
+        // (d) The freshly built session is not pre-authorized as reaped: the
+        // non-reaping probe succeeds instead of erroring on the lost anchor.
+        assert!(
+            !session
+                .leader_is_terminal()
+                .expect("fresh session retains its waitable anchor"),
+            "child is still in its sleep, so it is not terminal yet"
+        );
+
+        // Poll (bounded) until the probe observes the exit without reaping it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !session
+            .leader_is_terminal()
+            .expect("non-reaping probe keeps working while the child lives")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adopted child never became terminal within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // (b) After exit, the probe reports terminal and the reap yields 7.
+        assert!(session.leader_is_terminal().unwrap());
+        let status = session
+            .reap_leader(&mut adopted)
+            .expect("terminal adopted child reaps cleanly");
+        assert_eq!(status.exit_code(), 7);
+
+        // (c) The latch flips: a second reap is refused with the anchor error.
+        let error = session
+            .reap_leader(&mut adopted)
+            .expect_err("a reaped session cannot be reaped again");
+        assert!(
+            error.contains("lost its waitable leader incarnation anchor"),
+            "unexpected second-reap error: {error}"
+        );
+    }
+
+    #[test]
+    fn adopted_child_reap_is_idempotent_through_the_cache() {
+        use portable_pty::Child;
+
+        // Child exits 7 quickly; forget std's handle so `AdoptedChild` (via
+        // waitid) is the sole reaper.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2; exit 7"])
+            .spawn()
+            .expect("spawn adoptable child");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+
+        // The reaping non-blocking poll collects the zombie exactly once. Every
+        // later wait/try_wait must answer from the cache and never fire a second
+        // `waitid` — the zombie is gone, so an uncached call would `ECHILD`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let first = loop {
+            if let Some(status) = adopted.try_wait().expect("non-blocking reap keeps working") {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "adopted child never exited within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(first.exit_code(), 7);
+
+        // Cached answers: a blocking wait and a second try_wait both return 7.
+        assert_eq!(adopted.wait().expect("cached blocking wait").exit_code(), 7);
+        assert_eq!(
+            adopted
+                .try_wait()
+                .expect("cached non-blocking wait")
+                .expect("cache retains the reaped status")
+                .exit_code(),
+            7
+        );
+    }
 
     #[test]
     fn reaped_numeric_session_identity_cannot_regain_census_authority() {
