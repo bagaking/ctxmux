@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io,
-    os::fd::OwnedFd,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
@@ -144,6 +144,10 @@ struct PersistenceInner {
     failure: Arc<Mutex<Option<String>>>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
     epoch: String,
+    /// Raw fd of the advisory state lock held by the persistence actor thread.
+    /// Surfaced so an exec-in-place upgrade can record it in the handoff manifest
+    /// and have the incoming image adopt the still-held lock instead of re-locking.
+    state_lock_fd: RawFd,
     #[cfg(test)]
     test_hooks: Arc<PersistenceTestHooks>,
 }
@@ -406,6 +410,36 @@ impl Persistence {
             .expect("persistence serving epoch is a validated UUID")
     }
 
+    /// Raw fd of the advisory state lock this persistence instance holds. An
+    /// exec-in-place upgrade records it in the handoff manifest so the incoming
+    /// image adopts the still-held lock across exec instead of re-locking
+    /// (which would self-deadlock on the same open file description).
+    pub(crate) fn state_lock_fd(&self) -> RawFd {
+        self.inner.state_lock_fd
+    }
+
+    /// Drive a synchronous durable-commit barrier: block until every Append
+    /// enqueued before this call has been committed. FIFO ordering guarantees
+    /// that when the reply returns, the persisted cursor covers all prior
+    /// appends. Surfaces a persistence failure (an append that failed to commit)
+    /// so the caller can fail-stop instead of exec-ing into a replay gap.
+    pub(crate) fn barrier(&self) -> Result<(), PersistenceError> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        if self
+            .inner
+            .sender
+            .send(Command::Barrier { reply: reply_tx })
+            .is_err()
+        {
+            return Err(PersistenceError::ActorStopped);
+        }
+        reply_rx.recv().map_err(|_| PersistenceError::ActorStopped)?;
+        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
+            return Err(PersistenceError::Mutation(message));
+        }
+        Ok(())
+    }
+
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
@@ -468,7 +502,7 @@ impl Persistence {
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
-        let (epoch, recovered) = match init_rx.recv() {
+        let (epoch, state_lock_fd, recovered) = match init_rx.recv() {
             Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -485,6 +519,7 @@ impl Persistence {
                 failure,
                 join: Mutex::new(Some(join)),
                 epoch,
+                state_lock_fd,
                 #[cfg(test)]
                 test_hooks,
             }),
@@ -840,6 +875,9 @@ enum Command {
         metadata_bytes: Arc<AtomicU64>,
         reply: mpsc::SyncSender<Result<(), PersistenceError>>,
     },
+    Barrier {
+        reply: mpsc::SyncSender<()>,
+    },
     Shutdown,
 }
 
@@ -864,12 +902,17 @@ enum StageCompletion {
     CommitUnknown(PersistenceError),
 }
 
+/// The persistence actor's startup handshake payload: the serving epoch, the
+/// raw fd its state lock is held on (surfaced for exec-in-place handoff), and
+/// the reconciled recovered Runs.
+type ActorInit = Result<(String, RawFd, Vec<RecoveredRun>), PersistenceError>;
+
 fn actor_main(
     state_dir: &Path,
     admission_limits: AdmissionLimits,
     handoff: Option<HandoffHint>,
     receiver: &mpsc::Receiver<Command>,
-    init: &mpsc::SyncSender<Result<(String, Vec<RecoveredRun>), PersistenceError>>,
+    init: &mpsc::SyncSender<ActorInit>,
     failure: &Mutex<Option<String>>,
     #[cfg(test)] test_hooks: &Arc<PersistenceTestHooks>,
 ) {
@@ -888,7 +931,8 @@ fn actor_main(
             return;
         }
     };
-    if init.send(Ok((store.epoch.clone(), recovered))).is_err() {
+    let init_payload = Ok((store.epoch.clone(), store.state_lock_raw_fd(), recovered));
+    if init.send(init_payload).is_err() {
         return;
     }
 
@@ -964,6 +1008,13 @@ fn actor_main(
                     remember_failure(failure, error);
                 }
                 let _ = reply.send(result);
+            }
+            Command::Barrier { reply } => {
+                // No store work: FIFO ordering means every prior Append was
+                // already committed by append_batch before this command was
+                // dequeued. The reply just unblocks the caller, which then
+                // inspects the shared failure slot for any commit error.
+                let _ = reply.send(());
             }
             Command::Shutdown => return,
         }
@@ -1198,6 +1249,13 @@ impl StateLockGuard {
     fn adopt(lock: File) -> Self {
         Self(lock)
     }
+
+    /// The raw fd this lock is held on. An exec-in-place upgrade records it in the
+    /// handoff manifest so the inherited flock (per open-file-description, kept
+    /// across exec) is adopted by the incoming image rather than re-acquired.
+    fn as_raw_fd(&self) -> RawFd {
+        self.0.as_raw_fd()
+    }
 }
 
 impl Drop for StateLockGuard {
@@ -1209,6 +1267,14 @@ impl Drop for StateLockGuard {
 }
 
 impl StateStore {
+    // `_state_lock` is underscore-prefixed to document that it is held for its
+    // Drop side effect (releasing the flock); reading its raw fd for the
+    // exec-in-place handoff is a deliberate, narrow exception.
+    #[allow(clippy::used_underscore_binding)]
+    fn state_lock_raw_fd(&self) -> RawFd {
+        self._state_lock.as_raw_fd()
+    }
+
     fn open(
         state_dir: &Path,
         admission_limits: AdmissionLimits,

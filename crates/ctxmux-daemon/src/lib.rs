@@ -212,7 +212,8 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
         ),
         None => None,
     };
-    let (persistence, recovered) = Persistence::open(state_dir)?;
+    let state_dir = state_dir.into();
+    let (persistence, recovered) = Persistence::open(state_dir.clone())?;
     let stats = QualificationStats::from_optional_inherited_fd(
         qualification_stats_fd,
         persistence.daemon_instance().to_string(),
@@ -223,7 +224,14 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
         recovered,
         stats,
     ));
-    serve_with_persistence_manager(socket_path.into(), manager, readiness_fd, handoff).await
+    serve_with_persistence_manager(
+        socket_path.into(),
+        manager,
+        readiness_fd,
+        handoff,
+        Some(state_dir),
+    )
+    .await
 }
 
 async fn serve_with_persistence(
@@ -252,7 +260,7 @@ async fn serve_with_persistence(
         .map_err(|source| ServerError::io("qualification stats fd", source))?;
         Arc::new(RunManager::with_instance_and_stats(daemon_instance, stats))
     };
-    serve_with_persistence_manager(socket_path, manager, readiness_fd, None).await
+    serve_with_persistence_manager(socket_path, manager, readiness_fd, None, None).await
 }
 
 async fn serve_with_persistence_manager(
@@ -260,6 +268,7 @@ async fn serve_with_persistence_manager(
     manager: Arc<RunManager>,
     readiness_fd: Option<OwnedFd>,
     handoff: Option<crate::handoff::HandoffManifest>,
+    state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
     // On the exec-in-place path, reconstruct the listener from the inherited
     // socket fd. Re-binding would unlink and recreate the socket inode, dropping
@@ -275,7 +284,7 @@ async fn serve_with_persistence_manager(
             .map_err(|source| ServerError::io(&socket_path, source))?;
         listener
     };
-    serve_with_manager(socket_path, listener, manager, readiness_fd, handoff).await
+    serve_with_manager(socket_path, listener, manager, readiness_fd, handoff, state_dir).await
 }
 
 /// Reconstruct the local listener from an inherited socket fd without binding.
@@ -300,6 +309,7 @@ async fn serve_with_manager(
     manager: Arc<RunManager>,
     readiness_fd: Option<OwnedFd>,
     handoff: Option<crate::handoff::HandoffManifest>,
+    state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
     if let Some(handoff) = &handoff {
@@ -324,6 +334,9 @@ async fn serve_with_manager(
             .map_err(|source| ServerError::io("<readiness-fd>", source))?;
     }
 
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|source| ServerError::io("<sighup>", source))?;
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -341,6 +354,45 @@ async fn serve_with_manager(
                 manager.qualification_stats.finish();
                 return Ok(());
             }
+            _ = sighup.recv() => {
+                if manager.persistence.is_none() {
+                    eprintln!(
+                        "ctxmuxd: SIGHUP ignored: upgrade continuity requires --state-dir"
+                    );
+                    continue;
+                }
+                let Some(state_dir) = state_dir.as_deref() else {
+                    eprintln!(
+                        "ctxmuxd: SIGHUP ignored: no state directory recorded for re-exec"
+                    );
+                    continue;
+                };
+                match perform_exec_upgrade(&socket_path, state_dir, &listener, &manager) {
+                    Ok(()) => unreachable!(
+                        "a successful exec-in-place replaces the process image and never returns"
+                    ),
+                    Err(UpgradeAbort::BeforeExtract(error)) => {
+                        // Reversible failure: nothing has been extracted, all
+                        // controls are still owned. Abort the upgrade and keep
+                        // serving by falling through to the next loop iteration.
+                        eprintln!(
+                            "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
+                        );
+                    }
+                    Err(UpgradeAbort::AfterExtract(error)) => {
+                        // Point of no return passed: native children/controls were
+                        // forgotten and their fds marked to survive exec, but exec
+                        // did not happen. There is no in-image owner to roll back
+                        // to — fail-stop so process death reclaims the fds (never
+                        // resume serving with forgotten controls).
+                        let message = format!("exec-in-place upgrade failed after extract: {error}");
+                        manager.incarnation_failure.record(message.clone());
+                        let _ = manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT);
+                        manager.qualification_stats.finish();
+                        return Err(ServerError::Shutdown { failures: message });
+                    }
+                }
+            }
             failure = manager.incarnation_failure.wait() => {
                 let cleanup = manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT);
                 let failures = match cleanup {
@@ -352,6 +404,145 @@ async fn serve_with_manager(
             }
         }
     }
+}
+
+/// Which side of the extract point-of-no-return an aborted exec-in-place upgrade
+/// failed on. Before extract the daemon can keep serving; after extract it must
+/// fail-stop (never resume with forgotten controls).
+enum UpgradeAbort {
+    BeforeExtract(ServerError),
+    AfterExtract(ServerError),
+}
+
+/// Perform an exec-in-place upgrade: drain, extract the live native runs, write
+/// the handoff manifest, clear CLOEXEC on exactly the descriptors that must
+/// survive, and execve this binary. On success this replaces the process image
+/// and never returns. `manager.persistence` MUST be `Some` (the caller checks).
+fn perform_exec_upgrade(
+    socket_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    listener: &UnixListener,
+    manager: &RunManager,
+) -> Result<(), UpgradeAbort> {
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    // --- Reversible phase (before the point of no return) ---
+
+    // Create the handoff pipe. `rustix::pipe::pipe_with(PipeFlags::CLOEXEC)` is
+    // gated out on Apple, so create a plain pipe and set close-on-exec on both
+    // ends explicitly (a safe rustix flag mutation). Both ends start CLOEXEC so
+    // they never leak into a concurrent spawn on another runtime worker; the
+    // read end's CLOEXEC is cleared just before execve so it survives as
+    // --handoff-fd, and the write end stays CLOEXEC and is closed by us before
+    // exec so the reader gets EOF.
+    let (read_end, write_end) = rustix::pipe::pipe().map_err(|errno| {
+        UpgradeAbort::BeforeExtract(ServerError::io(
+            "<handoff pipe>",
+            std::io::Error::from(errno),
+        ))
+    })?;
+    for end in [&read_end, &write_end] {
+        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).map_err(|errno| {
+            UpgradeAbort::BeforeExtract(ServerError::io(
+                "<handoff pipe cloexec>",
+                std::io::Error::from(errno),
+            ))
+        })?;
+    }
+
+    // Quiesce tmux control owners exactly as shutdown does. Native runs are
+    // untouched here (they are handed off live below); tmux runs cannot be
+    // handed off and are reconciled fresh by the incoming image from state.
+    manager
+        .shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)
+        .map_err(UpgradeAbort::BeforeExtract)?;
+
+    // --- POINT OF NO RETURN: extract relinquishes reap/close authority for
+    // every live native child; from here, any failure is fail-stop. ---
+    let live = manager.native_runs.extract_for_handoff();
+
+    // Durable-commit barrier AFTER extract (corrected order): extract has
+    // stopped the owner's reader, so every byte ever read is now enqueued as an
+    // Append. Draining the FIFO here guarantees the persisted cursor covers all
+    // of them before we exec. A barrier *before* extract would race the still-
+    // running reader and could leave a replay gap.
+    manager
+        .persistence_barrier()
+        .map_err(UpgradeAbort::AfterExtract)?;
+
+    // Build the manifest from the extracted descriptors + the process listener
+    // and state-lock fds.
+    let runs: Vec<crate::handoff::HandoffRun> = live
+        .into_iter()
+        .map(|d| crate::handoff::HandoffRun {
+            run_id: d.run_id,
+            child_pid: d.child_pid,
+            master_fd: d.master_fd,
+        })
+        .collect();
+    let epoch = manager.daemon_instance.to_string();
+    let listener_fd = listener.as_raw_fd();
+    let state_lock_fd = manager
+        .persistence
+        .as_ref()
+        .expect("perform_exec_upgrade requires persistent mode (verified by caller)")
+        .state_lock_fd();
+    let manifest = crate::handoff::HandoffManifest::new(epoch, listener_fd, state_lock_fd, runs);
+
+    // Serialize + write one NDJSON line, then close the write end so the incoming
+    // image's read_to_end sees EOF after the buffered bytes.
+    let mut bytes = serde_json::to_vec(&manifest).map_err(|source| {
+        UpgradeAbort::AfterExtract(ServerError::io(
+            "<handoff manifest>",
+            std::io::Error::other(source),
+        ))
+    })?;
+    bytes.push(b'\n');
+    let read_fd = read_end.as_raw_fd();
+    {
+        let mut writer = std::fs::File::from(write_end);
+        writer
+            .write_all(&bytes)
+            .and_then(|()| writer.flush())
+            .map_err(|source| {
+                UpgradeAbort::AfterExtract(ServerError::io("<handoff manifest>", source))
+            })?;
+    } // writer (write_end) dropped here → pipe write end closed → reader gets EOF
+
+    // Clear CLOEXEC LAST, immediately before execve, on exactly the fds that
+    // must survive: the manifest's fds ([listener, state_lock, ...masters]) plus
+    // the handoff pipe read end. Nothing else.
+    for fd in manifest.all_fds() {
+        ctxmux_inherited_fd::clear_cloexec(fd).map_err(|source| {
+            UpgradeAbort::AfterExtract(ServerError::io("<handoff fd cloexec>", source))
+        })?;
+    }
+    ctxmux_inherited_fd::clear_cloexec(read_fd).map_err(|source| {
+        UpgradeAbort::AfterExtract(ServerError::io("<handoff-fd cloexec>", source))
+    })?;
+
+    // Re-exec this same binary with the inherited descriptors. exec() returns
+    // ONLY on failure; on success the image is replaced here.
+    let exe = std::env::current_exe().map_err(|source| {
+        UpgradeAbort::AfterExtract(ServerError::io("<current_exe>", source))
+    })?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("--socket")
+        .arg(socket_path)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .arg("--handoff-fd")
+        .arg(read_fd.to_string());
+    let exec_error = command.exec(); // only returns on failure
+    // Keep read_end alive until here so the fd is not closed before exec.
+    drop(read_end);
+    Err(UpgradeAbort::AfterExtract(ServerError::io(
+        "<exec-in-place>",
+        exec_error,
+    )))
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), ServerError> {
@@ -1292,6 +1483,13 @@ impl RunManager {
             ErrorCode::UnsupportedCapability,
             "tmux pane import is not persisted; use a memory-only ctxmux daemon",
         ))
+    }
+
+    fn persistence_barrier(&self) -> Result<(), ServerError> {
+        match &self.persistence {
+            Some(persistence) => persistence.barrier().map_err(ServerError::from),
+            None => Ok(()),
+        }
     }
 
     fn shutdown_owned_controls(&self, timeout: Duration) -> Result<(), ServerError> {
@@ -4651,6 +4849,7 @@ mod tests {
                     server_manager,
                     None,
                     None,
+                    None,
                 ));
                 drop(runtime);
                 let _ = server_result_tx.send(result);
@@ -5399,6 +5598,7 @@ mod tests {
                 Arc::clone(&manager),
                 None,
                 None,
+                None,
             ));
             Self {
                 directory,
@@ -6000,6 +6200,7 @@ mod tests {
             Arc::clone(&manager),
             None,
             None,
+            None,
         ));
         let client = Client::new(socket);
 
@@ -6245,6 +6446,7 @@ mod tests {
             target.clone(),
             listener,
             Arc::new(RunManager::default()),
+            None,
             None,
             None,
         ));
