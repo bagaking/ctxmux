@@ -1919,7 +1919,7 @@ fn closed_or_conflicting_readiness_descriptor_fails_before_startup() {
     assert_eq!(conflicting.status.code(), Some(2));
     assert!(
         String::from_utf8_lossy(&conflicting.stderr)
-            .contains("readiness and qualification descriptors must be distinct")
+            .contains("inherited descriptors must be distinct")
     );
 }
 
