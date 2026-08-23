@@ -21,7 +21,7 @@ Run itself.
 
 ## Decision
 
-Generation 11 replaces native Stop's Run-only request with one
+Generation 12 requires every native Stop path to carry one
 `RecoverableStop` containing the original daemon incarnation, a caller-retained
 opaque `StopOperationKey`, and the exact `RunId`. Keys are non-empty UTF-8 of at
 most 128 bytes and are compared byte-exactly.
@@ -35,9 +35,10 @@ The Registry lock atomically orders three facts before mutation:
 An exact same-key/same-Run retry joins the in-flight result cell or replays its
 settled receipt. Another key for that Run or the same key for another Run
 returns `stop_operation_conflict` with `not_applied` before entering Stop.
-Daemon-incarnation mismatch is checked before Run lookup. Short requests and
-attachment commands call this same admission boundary; attachment command IDs
-remain connection-local correlation only.
+Daemon-incarnation mismatch is checked before Run lookup. Short requests,
+attachment commands, and the explicit `attach_recoverable_stop` composite call
+this same admission boundary; attachment command IDs remain connection-local
+correlation only.
 
 The existing complete-session Stop implementation remains the only signal,
 process census, cleanup, direct-child reap, and session-quiescence owner. This
@@ -71,9 +72,14 @@ Stop or adopt a live process from persisted metadata.
 
 The Runtime advertises `native.recoverable_stop: 1` only with the complete
 contract. Rust and TypeScript clients prepare a caller-retainable operation and
-require it on both short and attachment Stop calls. The CLI accepts an explicit
-daemon instance plus operation key for retry, or generates a fresh operation
-for one-shot use, and prints the owner-authored Stop disposition.
+require it on short Stop, live attachment Stop, and the explicit composite
+recover-and-attach call. Ordinary late attachment remains observation-only and
+closes after its one terminal event. A caller that must recover through a fresh
+attachment carries the complete retained operation in the initial composite
+request, so the daemon can resolve the ledger before establishing snapshot,
+replay, terminal event, and EOF without a timing window. The CLI accepts an
+explicit daemon instance plus operation key for retry, or generates a fresh
+operation for one-shot use, and prints the owner-authored Stop disposition.
 
 This is a narrow Stop contract, not a generic recoverable-mutation framework.
 Resize and Interrupt remain non-recoverable. AgentSession, Provider, permission,
@@ -83,6 +89,10 @@ message, and Desktop Workbench close transactions remain outside ctxmux.
 
 - Treat attachment command ID or socket write completion as retry evidence.
   Both end with the connection and cannot prove owner settlement.
+- Keep every terminal attachment open in case a later Stop command arrives.
+  That removes terminal EOF, pins retained Runs, and cannot distinguish an
+  ordinary observer from a recovery caller. Recovery intent must be present in
+  the initial request.
 - Make repeated ordinary Stop return success. That loses operation identity and
   can disguise another caller's Stop or natural exit.
 - Reuse Recoverable Input's ledger abstraction. Its cursor, eviction proof, and
@@ -97,6 +107,7 @@ message, and Desktop Workbench close transactions remain outside ctxmux.
 Real native-process tests drop the first response, replace the client, retry the
 same operation, and prove one physical Stop effect plus the original receipt.
 Focused variants cover concurrent join, different-key and cross-Run conflict,
-short/attachment convergence, forced disposition, daemon replacement, planned
-exec continuity, collection pinning, and post-collection key reuse. Generated
-TypeScript, CLI, and packed-consumer tests exercise the same public protocol.
+short/live-attachment/composite convergence, ordinary terminal EOF, forced
+disposition, daemon replacement, planned exec continuity, collection pinning,
+and post-collection key reuse. Generated TypeScript, CLI, and packed-consumer
+tests exercise the same public protocol.

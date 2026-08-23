@@ -6,7 +6,7 @@ import type { RunInfo } from "./RunInfo.js";
 import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
 
 /**
- * Response to a short-lived request.
+ * Result of one request or the control phase of one composite attachment.
  */
 export type Response =
   | { type: "started"; run: RunInfo }

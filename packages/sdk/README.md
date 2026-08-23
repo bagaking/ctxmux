@@ -198,6 +198,22 @@ const { receipt, commandId } = await attachment.stop(stopOperation);
 loses the result, retry `client.stop(stopOperation)` with a fresh client; never
 turn the attachment command ID into a retry key.
 
+If the Run may already be terminal and the caller needs both the retained Stop
+receipt and a fresh attachment, carry the operation in the initial composite
+request:
+
+```ts
+const { attachment, stop } = await client.attachRecoverableStop(stopOperation);
+console.log(stop.receipt.disposition);
+for await (const event of attachment.events()) {
+  // retained replay is in attachment.snapshot; this stream ends after terminal
+}
+```
+
+Ordinary `attach()` stays observation-only and reaches EOF after its one
+terminal event. It never waits for a possible later Stop command. The explicit
+composite is the race-free path when recovery intent must exist before that EOF.
+
 ## Discover and observe a tmux-owned pane
 
 Tmux discovery and import use the same public daemon protocol as native Runs:
@@ -226,7 +242,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 11 imports by socket path plus pane ID, an ambiguous linked
+because generation 12 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -338,7 +354,7 @@ result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterByte)` resumes ordered output after the last observed cumulative byte cursor.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 11 represents cursors as
+4 MiB replay contains the complete history. Generation 12 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

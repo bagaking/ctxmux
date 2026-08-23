@@ -94,6 +94,12 @@ export interface RecoverableInputOperation {
   readonly data: ByteInput;
 }
 
+/** One explicit recoverable Stop followed by an attachment to its exact Run. */
+export interface RecoverableStopAttachment {
+  readonly attachment: Attachment;
+  readonly stop: ControlAccepted<StopReceipt>;
+}
+
 /** Validate or generate one caller-retained Run creation operation key. */
 export function createOperationKey(
   value: string = randomUUID(),
@@ -417,6 +423,125 @@ export class CtxmuxClient {
     } catch (error) {
       wire.close();
       throw error;
+    }
+  }
+
+  /**
+   * Apply or recover one Stop operation and attach to its exact Run without
+   * racing the ordinary terminal attachment EOF.
+   */
+  public async attachRecoverableStop(
+    operation: RecoverableStopOperation,
+    afterByte = 0,
+  ): Promise<RecoverableStopAttachment> {
+    validateCursor(afterByte, "afterByte");
+    let wire: JsonLinesConnection;
+    try {
+      ({ wire } = await this.#connectForDispatch());
+    } catch (error) {
+      if (error instanceof CtxmuxUnsupportedCapabilityError) {
+        throw error;
+      }
+      throw new CtxmuxCommandError(
+        error instanceof CtxmuxProtocolError ? error.code : "io",
+        asError(error).message,
+        "not_applied",
+      );
+    }
+
+    let encodedFrame: string;
+    try {
+      encodedFrame = encodeJsonLine({
+        type: "request",
+        request: {
+          type: "attach_recoverable_stop",
+          operation: encodeRecoverableStop(operation),
+          after_byte: afterByte,
+        },
+      } satisfies ClientFrame);
+    } catch (error) {
+      wire.close();
+      throw new CtxmuxCommandError(
+        "invalid_request",
+        asError(error).message,
+        "not_applied",
+      );
+    }
+
+    try {
+      await wire.sendEncoded(encodedFrame);
+      const first = serverFrame(await wire.receive());
+      if (first.type === "response") {
+        decodeShortControl(first.response, decodeStopReceipt);
+        throw new CtxmuxCommandError(
+          "internal",
+          "recoverable Stop was accepted without an attachment snapshot",
+          "unknown",
+        );
+      }
+      if (first.type === "error") {
+        throw new CtxmuxCommandError(
+          first.error.code,
+          first.error.message,
+          "unknown",
+        );
+      }
+      if (first.type !== "attached") {
+        throw new CtxmuxCommandError(
+          "internal",
+          `expected recoverable Stop attachment snapshot, received ${first.type}`,
+          "unknown",
+        );
+      }
+
+      const snapshot = await receiveReplay(wire, afterByte, first.snapshot);
+      const result = serverFrame(await wire.receive());
+      if (result.type === "error") {
+        throw new CtxmuxCommandError(
+          result.error.code,
+          result.error.message,
+          "unknown",
+        );
+      }
+      if (result.type !== "response") {
+        throw new CtxmuxCommandError(
+          "internal",
+          `expected recoverable Stop result, received ${result.type}`,
+          "unknown",
+        );
+      }
+      if (result.response.type !== "control_accepted") {
+        throw new CtxmuxCommandError(
+          "internal",
+          "recoverable Stop attachment was rejected after its snapshot",
+          "unknown",
+        );
+      }
+      const stop = decodeShortControl(result.response, decodeStopReceipt);
+      if (
+        stop.run.id !== operation.runId ||
+        snapshot.run.id !== operation.runId
+      ) {
+        throw new CtxmuxCommandError(
+          "internal",
+          "recoverable Stop attachment names another Run",
+          "unknown",
+        );
+      }
+      return {
+        attachment: new Attachment(wire, snapshot),
+        stop,
+      };
+    } catch (error) {
+      wire.close();
+      if (error instanceof CtxmuxCommandError) {
+        throw error;
+      }
+      throw new CtxmuxCommandError(
+        error instanceof CtxmuxInvalidFrameError ? "internal" : "io",
+        asError(error).message,
+        "unknown",
+      );
     }
   }
 

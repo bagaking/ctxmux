@@ -4,8 +4,8 @@ use std::{collections::HashSet, sync::Arc};
 
 use ctxmux_protocol::{
     AttachedHeader, AttachedSnapshot, AttachmentCommandId, ClientFrame, ControlOutcome, ErrorCode,
-    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RecoverableStop, RunEvent, RunId,
-    RunSignal, RunState, ServerFrame, TerminalSize,
+    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RecoverableStop, Response,
+    RunEvent, RunId, RunSignal, RunState, ServerFrame, TerminalSize,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{net::UnixStream, sync::broadcast};
@@ -34,6 +34,17 @@ pub(super) async fn handle(
             return Ok(());
         }
     };
+    handle_pinned(wire, manager, run, after_byte, request_permit, None).await
+}
+
+pub(super) async fn handle_pinned(
+    mut wire: Framed<UnixStream, LinesCodec>,
+    manager: Arc<RunManager>,
+    run: Arc<Run>,
+    after_byte: u64,
+    request_permit: UpgradeRequestPermit,
+    initial_response: Option<Response>,
+) -> Result<(), ConnectionError> {
     let (_guard, mut events) = run.subscribe();
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
@@ -44,17 +55,18 @@ pub(super) async fn handle(
     let mut sent_through_byte = header.replay.latest_output_bytes;
     send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;
     send_replay(&mut wire, replay_chunks).await?;
+    if let Some(response) = initial_response {
+        send(&mut wire, &ServerFrame::Response { response }).await?;
+    }
     // Attach setup is one admitted request, but a long-lived attachment is only
-    // a view. Release its request permit after the replay snapshot; each later
-    // mutating command acquires its own permit through `handle_frame`.
+    // a view. Release its request permit after replay plus any composite Stop
+    // result; each later mutation acquires its own permit through `handle_frame`.
     drop(request_permit);
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSnapshot).await;
     }
-    let running = terminal_state.is_running();
-    let terminal_recovery = !running && manager.has_recoverable_stop(run.id);
-    if !running {
+    if !terminal_state.is_running() {
         send(
             &mut wire,
             &ServerFrame::Event {
@@ -62,9 +74,7 @@ pub(super) async fn handle(
             },
         )
         .await?;
-        if !terminal_recovery {
-            return Ok(());
-        }
+        return Ok(());
     }
 
     let mut command_results = PendingResults::new();
@@ -78,14 +88,12 @@ pub(super) async fn handle(
             Some((command_id, outcome, permit)) = command_results.next(), if !command_results.is_empty() => {
                 send_command_result(&mut wire, command_id, outcome).await?;
                 drop(permit);
-                if controls.pending_stops.remove(&command_id) && controls.pending_stops.is_empty() {
-                    if let Some(event) = controls.held_terminal.take() {
-                        send(&mut wire, &ServerFrame::Event { event }).await?;
-                        return Ok(());
-                    }
-                    if terminal_recovery {
-                        return Ok(());
-                    }
+                if controls.pending_stops.remove(&command_id)
+                    && controls.pending_stops.is_empty()
+                    && let Some(event) = controls.held_terminal.take()
+                {
+                    send(&mut wire, &ServerFrame::Event { event }).await?;
+                    return Ok(());
                 }
             }
             incoming = receive(&mut wire) => {
@@ -103,7 +111,7 @@ pub(super) async fn handle(
                     return Ok(());
                 }
             }
-            event = events.recv(), if running => {
+            event = events.recv() => {
                 match event {
                     Ok(RunEvent::Output { chunk }) if chunk.end_byte <= sent_through_byte => {}
                     Ok(RunEvent::Output { chunk }) => {

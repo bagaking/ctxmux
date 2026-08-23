@@ -246,6 +246,16 @@ pub struct AttachmentControlAccepted<R> {
     pub receipt: R,
 }
 
+/// One explicit recoverable Stop followed by an attachment to its exact Run.
+pub struct RecoverableStopAttachment {
+    /// Live event stream established after the Stop result was resolved.
+    pub attachment: Attachment,
+    /// Snapshot joined without a gap before the live event stream.
+    pub snapshot: AttachedSnapshot,
+    /// Exact retained Stop result returned by the daemon owner.
+    pub stop: ControlAccepted<StopReceipt>,
+}
+
 impl From<ProtocolError> for ClientError {
     fn from(error: ProtocolError) -> Self {
         Self::Protocol {
@@ -685,6 +695,96 @@ impl Client {
         }
     }
 
+    /// Apply or recover one Stop operation and attach to its exact Run without
+    /// racing a terminal attachment EOF.
+    ///
+    /// Ordinary terminal attachments close immediately after their one
+    /// terminal event. This composite request carries the retained operation
+    /// in the initial request so the daemon can resolve it before establishing
+    /// the attachment snapshot and event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the Stop is rejected, its unique result is
+    /// lost, or the subsequent attachment cannot be established.
+    pub async fn attach_recoverable_stop(
+        &self,
+        operation: RecoverableStop,
+        after_byte: u64,
+    ) -> Result<RecoverableStopAttachment, ClientError> {
+        let expected_run = operation.id;
+        let (mut wire, _) = self
+            .connect_for_dispatch()
+            .await
+            .map_err(control_not_applied)?;
+        let encoded = encode_frame(&ClientFrame::Request {
+            request: Request::AttachRecoverableStop {
+                operation,
+                after_byte,
+            },
+        })
+        .map_err(ClientError::Frame)
+        .map_err(control_not_applied)?;
+        send_encoded_sink(&mut wire, encoded)
+            .await
+            .map_err(control_request_unknown)?;
+
+        let first = receive(&mut wire).await.map_err(control_request_unknown)?;
+        match first {
+            ServerFrame::Response { response } => {
+                let error = match decode_short_control(response, decode_stop_receipt) {
+                    Err(error) => error,
+                    Ok(_) => control_request_unknown(ClientError::UnexpectedFrame(
+                        "attach recoverable Stop accepted without an attachment snapshot",
+                    )),
+                };
+                Err(error)
+            }
+            ServerFrame::Attached { snapshot: header } => {
+                let mut snapshot = AttachedSnapshot {
+                    run: header.run,
+                    replay: OutputReplay {
+                        chunks: Vec::new(),
+                        first_available_byte: header.replay.first_available_byte,
+                        latest_output_bytes: header.replay.latest_output_bytes,
+                        truncated: header.replay.truncated,
+                    },
+                };
+                receive_replay(&mut wire, after_byte, &mut snapshot)
+                    .await
+                    .map_err(control_request_unknown)?;
+                let response = match receive(&mut wire).await.map_err(control_request_unknown)? {
+                    ServerFrame::Response { response } => response,
+                    ServerFrame::Error { error } => {
+                        return Err(control_request_unknown(error.into()));
+                    }
+                    _ => {
+                        return Err(control_request_unknown(ClientError::UnexpectedFrame(
+                            "expected recoverable Stop result after attached snapshot",
+                        )));
+                    }
+                };
+                let stop = decode_recoverable_stop_attachment_response(response)?;
+                if stop.run.id != expected_run || snapshot.run.id != expected_run {
+                    return Err(control_request_unknown(
+                        ClientError::ProtocolContractViolation(
+                            "recoverable Stop attachment names another Run",
+                        ),
+                    ));
+                }
+                Ok(RecoverableStopAttachment {
+                    attachment: Attachment::from_wire(wire),
+                    snapshot,
+                    stop,
+                })
+            }
+            ServerFrame::Error { error } => Err(control_request_unknown(error.into())),
+            _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
+                "expected recoverable Stop attachment snapshot",
+            ))),
+        }
+    }
+
     async fn request(&self, request: Request) -> Result<Response, ClientError> {
         let (mut wire, _) = self.connect_for_dispatch().await?;
         send(&mut wire, &ClientFrame::Request { request }).await?;
@@ -805,6 +905,24 @@ fn decode_short_control<R>(
         }
         _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
             "expected correlated control response",
+        ))),
+    }
+}
+
+fn decode_recoverable_stop_attachment_response(
+    response: Response,
+) -> Result<ControlAccepted<StopReceipt>, ClientError> {
+    match response {
+        accepted @ Response::ControlAccepted { .. } => {
+            decode_short_control(accepted, decode_stop_receipt)
+        }
+        Response::ControlRejected { .. } => Err(control_request_unknown(
+            ClientError::ProtocolContractViolation(
+                "recoverable Stop attachment was rejected after its snapshot",
+            ),
+        )),
+        _ => Err(control_request_unknown(ClientError::UnexpectedFrame(
+            "expected recoverable Stop result after attached snapshot",
         ))),
     }
 }
@@ -1008,7 +1126,8 @@ pub fn replay_bytes(chunks: &[OutputChunk]) -> Vec<u8> {
 #[cfg(test)]
 mod runtime_tests {
     use ctxmux_protocol::{
-        DaemonInstanceId, RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity,
+        CommandDisposition, ControlFailure, DaemonInstanceId, ErrorCode, ProtocolError, Response,
+        RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity,
     };
 
     use super::{ClientError, PROTOCOL_VERSION};
@@ -1022,6 +1141,27 @@ mod runtime_tests {
         assert!(matches!(
             super::validate_runtime_identity(&runtime),
             Err(ClientError::UnexpectedFrame("expected compatible hello"))
+        ));
+    }
+
+    #[test]
+    fn recoverable_stop_attachment_rejects_a_late_control_rejection_as_unknown() {
+        let error = super::decode_recoverable_stop_attachment_response(Response::ControlRejected {
+            failure: ControlFailure {
+                error: ProtocolError::new(ErrorCode::InvalidRunState, "already terminal"),
+                disposition: CommandDisposition::NotApplied,
+            },
+        })
+        .expect_err("Attached followed by ControlRejected must violate the composite contract");
+        assert!(matches!(
+            error,
+            ClientError::ControlRequestUnknown { source }
+                if matches!(
+                    *source,
+                    ClientError::ProtocolContractViolation(
+                        "recoverable Stop attachment was rejected after its snapshot"
+                    )
+                )
         ));
     }
 

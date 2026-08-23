@@ -1895,7 +1895,7 @@ async fn recoverable_stop_attachment_to_short_survives_attachment_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recoverable_stop_fresh_terminal_attachment_replays_settled_receipt() {
+async fn recoverable_stop_terminal_attach_eofs_and_explicit_composite_replays() {
     let daemon = TestDaemon::start().await;
     let marker = daemon.directory.path().join("terminal-attachment-stop.log");
     let run = daemon
@@ -1933,23 +1933,125 @@ async fn recoverable_stop_fresh_terminal_attachment_replays_settled_receipt() {
         .await
         .expect("attach after recoverable Stop settlement");
     assert_eq!(snapshot.run.state, terminal);
-    let replayed = timeout(Duration::from_secs(2), attachment.stop(operation))
-        .await
-        .expect("terminal attachment keeps the recovery lane available")
-        .expect("terminal attachment replays the retained Stop receipt");
-    assert_eq!(replayed.receipt, settled.receipt);
     assert_eq!(
         attachment.next_event().await.expect("read terminal event"),
-        Some(RunEvent::Exited { state: terminal })
+        Some(RunEvent::Exited {
+            state: terminal.clone(),
+        })
     );
     assert_eq!(
-        attachment
+        timeout(Duration::from_secs(2), attachment.next_event())
+            .await
+            .expect("terminal attachment reaches EOF without a recovery command")
+            .expect("read terminal attachment EOF"),
+        None
+    );
+    timeout(Duration::from_secs(2), async {
+        loop {
+            if daemon
+                .client
+                .status(run.id)
+                .await
+                .expect("read terminal Run after attachment EOF")
+                .attachments
+                == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal attachment releases its daemon-owned Run pin");
+
+    let recovered = Client::new(daemon.client.socket_path())
+        .attach_recoverable_stop(operation, 0)
+        .await
+        .expect("explicit composite request replays Stop and attaches");
+    assert_eq!(recovered.stop.receipt, settled.receipt);
+    assert_eq!(recovered.snapshot.run.id, run.id);
+    assert_eq!(recovered.snapshot.run.state, terminal);
+    assert_eq!(
+        recovered
+            .attachment
             .next_event()
             .await
-            .expect("read terminal attachment EOF after replay"),
+            .expect("read composite attachment terminal event"),
+        Some(RunEvent::Exited {
+            state: terminal.clone(),
+        })
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), recovered.attachment.next_event())
+            .await
+            .expect("composite terminal attachment reaches EOF")
+            .expect("read composite terminal attachment EOF"),
         None
     );
     assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_composite_rejects_wrong_identity_before_attachment() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start composite rejection fixture");
+    let mut wrong_daemon = fresh_stop(&daemon.client, run.id).await;
+    wrong_daemon.daemon_instance = ctxmux_protocol::DaemonInstanceId::new();
+    assert_control_failure(
+        daemon
+            .client
+            .attach_recoverable_stop(wrong_daemon, 0)
+            .await
+            .err()
+            .expect("wrong daemon composite Stop fails closed"),
+        ErrorCode::DaemonInstanceMismatch,
+        CommandDisposition::NotApplied,
+    );
+    assert_eq!(
+        daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("wrong daemon request leaves Run observable")
+            .attachments,
+        0
+    );
+
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    let different_run = RunId::new();
+    let mut wrong_run = operation.clone();
+    wrong_run.id = different_run;
+    assert_control_failure(
+        daemon
+            .client
+            .attach_recoverable_stop(wrong_run, 0)
+            .await
+            .err()
+            .expect("unknown Run composite Stop fails closed"),
+        ErrorCode::RunNotFound,
+        CommandDisposition::NotApplied,
+    );
+    assert!(
+        daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("wrong Run request leaves owner running")
+            .state
+            .is_running()
+    );
+    stop_run(&daemon.client, run.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2150,11 +2252,29 @@ async fn recoverable_stop_planned_exec_replays_the_settled_same_incarnation_resu
     assert_eq!(after.daemon_instance_id, before.daemon_instance_id);
 
     let recovered = Client::new(daemon.client.socket_path())
-        .stop(operation)
+        .attach_recoverable_stop(operation, 0)
         .await
-        .expect("incoming image replays handed-off Stop result");
-    assert_eq!(recovered.run.id, run.id);
-    assert_eq!(recovered.receipt.disposition, StopDisposition::Forced);
+        .expect("incoming image replays and attaches the handed-off Stop result");
+    assert_eq!(recovered.stop.run.id, run.id);
+    assert_eq!(recovered.stop.receipt.disposition, StopDisposition::Forced);
+    let terminal = recovered.snapshot.run.state.clone();
+    assert!(!terminal.is_running());
+    assert_eq!(
+        recovered
+            .attachment
+            .next_event()
+            .await
+            .expect("read handed-off Stop terminal event"),
+        Some(RunEvent::Exited { state: terminal })
+    );
+    assert_eq!(
+        recovered
+            .attachment
+            .next_event()
+            .await
+            .expect("read handed-off Stop attachment EOF"),
+        None
+    );
     assert_eq!(
         std::fs::read_to_string(&marker)
             .expect("read planned-exec Stop marker")
@@ -2715,17 +2835,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_10_before_request_dispatch() {
+async fn daemon_rejects_generation_11_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 11,
+        PROTOCOL_VERSION, 12,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_10_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 10 },
+    let generation_11_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 11 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -2743,7 +2863,7 @@ async fn daemon_rejects_generation_10_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_10_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_11_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
