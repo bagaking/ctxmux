@@ -1,4 +1,4 @@
-# Local Protocol Generation 10
+# Local Protocol Generation 11
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -13,7 +13,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 10.
+- Raw PTY bytes are represented as integer arrays in generation 11.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -28,7 +28,7 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. A successful generation-10
+The generation fence covers the wire contract only. A successful generation-11
 Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
 ```ts
@@ -99,6 +99,7 @@ The initial availability record is:
 | ------------------------------------------ | -------: | ----------: |
 | `native.start`                             |        1 |           1 |
 | `native.recoverable_input`                 |        1 |           1 |
+| `native.recoverable_stop`                  |        1 |           1 |
 | `native.fork_level_a`                      |        1 |           1 |
 | `native.execute_materialized_level_b`      |        1 |           1 |
 | `tmux.discover`                            |        1 |           1 |
@@ -129,7 +130,7 @@ them from platform or executable state.
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
 only configured capability requirements; framing, the exact identity shape,
-and protocol generation are still validated. Generation 10 adds no
+and protocol generation are still validated. Generation 11 adds no
 version-range or capability negotiation, endpoint discovery, dynamic registry,
 Provider catalog, plugin discovery, or host/credential identity.
 
@@ -175,7 +176,8 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   Interrupt does not enter Stop or end Run ownership.
 - `attach`: return retained output after a cumulative byte cursor and follow new
   output and exit events.
-- `stop`: terminate every process in the daemon-owned native Run session. The
+- `stop`: apply or recover one caller-keyed termination of every process in the
+  daemon-owned native Run session. The
   waiter normally sends `SIGTERM`, waits for a bounded graceful phase, then
   sends `SIGKILL` to revalidated session members. If Stop is admitted after a
   receive poll but before the natural-exit fence, the waiter drains that queued
@@ -205,14 +207,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 10.
+ownership in generation 11.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 10 retains `run_capacity` for the global retained-Run admission
+Generation 11 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -221,7 +223,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-10 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-11 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -244,7 +246,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-10 decoding and
+The daemon compares canonical typed requests after generation-11 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -322,6 +324,48 @@ retains that keyed unknown result, and poisons the Input lane. No applied range
 or cursor advance is invented. A cold replacement daemon returns
 `daemon_instance_mismatch`; ctxmux never claims cross-crash exactly-once Input.
 
+### Recoverable native Stop
+
+Every native Stop carries one caller-retained operation:
+
+```ts
+type RecoverableStop = {
+  daemon_instance: string;
+  operation_key: string;
+  id: string;
+};
+```
+
+The caller first retains the current Hello's `daemonInstanceId`, one fresh
+`StopOperationKey`, and the exact `RunId`. The key is an opaque, byte-exact,
+non-empty UTF-8 string of at most 128 bytes. Instance validation precedes Run
+lookup and mutation. A request naming another daemon incarnation returns
+`daemon_instance_mismatch`; it never probes or stops the named Run.
+
+The first admitted operation atomically binds its key and Run before native
+Stop mutation. Concurrent or later retries with the same key and Run join the
+in-flight result or replay the settled `stop { disposition }` receipt. This
+works across short connections, attachment connections, response loss, and a
+fresh client. The attachment command ID remains correlation-only; recovery
+comes from resending the complete retained Stop operation.
+
+A different key for a Run that already owns a Stop operation, or reuse of the
+same key for another retained Run, returns `stop_operation_conflict` before
+mutation. The Runtime retains at most one Stop record per retained Run and one
+global key binding for that record. A `not_applied` owner result releases the
+record; an accepted or `unknown` result remains replayable until that exact Run
+is collected. Collection cannot cross an in-flight settlement and atomically
+removes both the Run record and key binding; only after that boundary may the
+same key identify a Stop for another Run.
+
+A validated planned exec carries settled accepted and unknown Stop records
+with the preserved daemon incarnation. Pending Stop settlement prevents the
+reversible handoff from proceeding. A cold daemon replacement receives a new
+incarnation and deliberately does not recover this ledger, so an old retained
+operation fails at the instance fence. This is the narrow
+`native.recoverable_stop: 1` contract, not a generic mutation framework,
+cross-crash process adoption, or authorization mechanism.
+
 ### Control correlation and owner receipts
 
 Short-lived `input`, `resize`, and `stop` requests and the corresponding
@@ -354,19 +398,20 @@ consumed, the client waits for its pending results, detaches cleanly, and uses a
 new attachment for future commands.
 
 For each structurally and sequentially valid command, the daemon sends exactly
-one `command_result` or the connection terminates. Reconnecting does not resolve
-whether a command whose result was lost took effect. On EOF, transport error,
-or fatal protocol violation, the client locally marks every command without its
-unique result as disposition unknown and must not replay uncertain input unless
-a separate operation-specific deduplication contract is introduced.
+one `command_result` or the connection terminates. Reconnecting with only an
+attachment command ID does not resolve whether a command whose result was lost
+took effect. On EOF, transport error, or fatal protocol violation, the client
+locally marks every command without its unique result as disposition unknown.
+Uncertain ordinary Input, Resize, and Signal must not be replayed. Recoverable
+Input and Recoverable Stop are separate, narrow operation contracts: their
+complete caller-retained operations may be retried as specified above, but
+their keys do not change attachment command-ID semantics or generalize recovery
+to Resize or Signal.
 
-The recoverable Input operation in Decision 014 is that separate contract for
-short-lived native Input only. It does not change the meaning of attachment
-command IDs or generalize recovery to Resize, Stop, or Signal.
-Its per-Run key conflict guarantee lasts only while the operation is pending or
-retained in the bounded result ledger; callers use a fresh key for new logical
-operations. An evicted exact retry remains safe because its original expected
-cursor is stale and fails before mutation.
+Recoverable Input's per-Run key conflict guarantee lasts only while the
+operation is pending or retained in its bounded result ledger; callers use a
+fresh key for new logical operations. An evicted exact retry remains safe
+because its original expected cursor is stale and fails before mutation.
 
 Receipts name the precise owner boundary reached:
 
@@ -509,7 +554,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-10 peer that puts `chunks` back into the header is invalid.
+generation-11 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -540,7 +585,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemonInstanceId` in the ordinary generation-10 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-11 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -568,7 +613,7 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 10 gains no upgrade wire
+strictly bounded, unique, and validated; generation 11 gains no upgrade wire
 operation.
 
 Persistent startup requires a real same-owner `0700` directory, regular
@@ -602,6 +647,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-10 frame at runtime, rejects duplicate
+validates the complete nested generation-11 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

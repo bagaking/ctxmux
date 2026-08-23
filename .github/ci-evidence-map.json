@@ -56,7 +56,8 @@
       "kind": "test",
       "path": "crates/ctxmux/tests/auto_start.rs",
       "invariants": [
-        "the public CLI auto-starts one daemon and a later client reconnects to the same daemon-owned Run"
+        "the public CLI auto-starts one daemon and a later client reconnects to the same daemon-owned Run",
+        "explicit daemon-instance and operation-key Stop inputs replay one graceful/forced receipt while the child records one physical Stop effect"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -443,7 +444,7 @@
       "kind": "test",
       "path": "crates/ctxmux-client/src/lib.rs",
       "invariants": [
-        "generation-10 replay accepts an exact advertised byte boundary and rejects range overshoot, non-progress, and premature EOF before exposing a snapshot"
+        "generation-11 replay accepts an exact advertised byte boundary and rejects range overshoot, non-progress, and premature EOF before exposing a snapshot"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -599,6 +600,7 @@
       "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
       "invariants": [
         "real daemon, process, PTY, replay, stop, and fork behavior cross the public boundary, including exact Interrupt, Stop, and natural-exit races with no process survivor or post-Stop signal effect",
+        "recoverable Stop joins or replays one same-incarnation complete-session result across response loss, attachment replacement, and planned exec while conflicts and cold replacement fail before mutation",
         "memory-only and persistent RuntimeIdentity lifecycles expose exact persistence, target, and capability facts, while unsupported client requirements create no Run",
         "abandoned Start and Fork responses converge on exact Run and PID sets while atomic process markers prove one execution per retained key"
       ],
@@ -643,7 +645,7 @@
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-10 frames and the exact RuntimeIdentity shape, cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact",
+        "generation-11 frames and the exact RuntimeIdentity shape, cumulative output byte ranges, creation, Input, and Stop operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact",
         "Runtime capability versions preserve exact JSON numeric meaning across integer, decimal, and exponent spellings and reject fractional, zero, negative, overflow, and unsafe values"
       ],
       "selection_ref": "scripts/check.sh",
@@ -712,7 +714,8 @@
       "kind": "test",
       "path": "packages/sdk/test/wrong-cases.test.ts",
       "invariants": [
-        "generation-10 replay and exact RuntimeIdentity validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races",
+        "generation-11 replay and exact RuntimeIdentity validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races",
+        "recoverable Stop exact wire shape, capability gate, conflicts, response binding, and pre-command-ID validation fail closed",
         "TypeScript Runtime capability versions preserve exact JSON numeric meaning, and unsupported client requirements reject before every business frame while runtimeInfo remains raw"
       ],
       "selection_ref": "packages/sdk/package.json",
@@ -742,6 +745,7 @@
       "path": "packages/sdk/test/client-parity.test.ts",
       "invariants": [
         "CLI and SDK share one exact daemon-authored RuntimeIdentity and daemon-owned Run identity, while a host-owned Provider materializes fail-closed public Level B without entering the SDK publication",
+        "a raw lost Stop response followed by a fresh TypeScript client retry returns one retained receipt while a real child records one Stop effect",
         "TypeScript SDK discovers, imports, attaches, and detaches one real read-only tmux pane without taking ownership"
       ],
       "selection_ref": "packages/sdk/package.json",
@@ -771,6 +775,7 @@
       "path": "scripts/check-local-consumer.mjs",
       "invariants": [
         "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public RuntimeIdentity inspection, start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies",
+        "the packed SDK prepares and retains one recoverable Stop, loses the first response, and a fresh isolated client recovers the receipt without a second physical Stop effect",
         "the packed SDK declarations and runtime exports preserve exact RuntimeIdentity and capability-requirement types, reject unsupported requirements before dispatch, and support an external TypeScript Provider Integration with fail-closed Level B and no Agent-specific publication dependency"
       ],
       "selection_ref": "scripts/check.sh",

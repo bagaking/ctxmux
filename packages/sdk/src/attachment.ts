@@ -21,6 +21,10 @@ import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunId } from "./generated/RunId.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
+import {
+  encodeRecoverableStop,
+  type RecoverableStopOperation,
+} from "./stop-operation.js";
 import { CtxmuxInvalidFrameError, validateServerFrame } from "./validation.js";
 import { encodeJsonLine, WireClosedError } from "./wire.js";
 
@@ -117,10 +121,13 @@ export class Attachment {
     }));
   }
 
-  public stop(): Promise<AttachmentControlAccepted<StopReceipt>> {
+  public stop(
+    operation: RecoverableStopOperation,
+  ): Promise<AttachmentControlAccepted<StopReceipt>> {
     return this.#command<StopReceipt>("stop", 0, (commandId) => ({
       type: "stop",
       command_id: commandId,
+      operation: encodeRecoverableStop(operation),
     }));
   }
 

@@ -8,6 +8,7 @@ export {
   createOperationKey,
   inputOperationKey,
 } from "./client.js";
+export { stopOperationKey } from "./stop-operation.js";
 export type {
   AttachmentControlAccepted,
   ByteInput,
@@ -20,6 +21,7 @@ export type {
   SignalReceipt,
   StopReceipt,
 } from "./client.js";
+export type { RecoverableStopOperation } from "./stop-operation.js";
 export {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
@@ -48,12 +50,14 @@ export {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_FRAME_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
+  MAX_STOP_OPERATION_KEY_BYTES,
   MAX_RUNTIME_BUILD_ID_BYTES,
   MAX_RUNTIME_CAPABILITY_VERSION,
   PROTOCOL_VERSION,
   RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
   RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
@@ -80,6 +84,7 @@ export type { OutputChunk } from "./generated/OutputChunk.js";
 export type { OutputReplay } from "./generated/OutputReplay.js";
 export type { OutputReplayHeader } from "./generated/OutputReplayHeader.js";
 export type { ProtocolError } from "./generated/ProtocolError.js";
+export type { RecoverableStop } from "./generated/RecoverableStop.js";
 export type { ReplayCapability } from "./generated/ReplayCapability.js";
 export type { Request } from "./generated/Request.js";
 export type { Response } from "./generated/Response.js";
@@ -99,6 +104,7 @@ export type { RuntimeIdPersistence } from "./generated/RuntimeIdPersistence.js";
 export type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 export type { RunSignal } from "./generated/RunSignal.js";
 export type { StopDisposition } from "./generated/StopDisposition.js";
+export type { StopOperationKey } from "./generated/StopOperationKey.js";
 export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { TerminalSize } from "./generated/TerminalSize.js";
 export type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
@@ -124,7 +130,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 10. */
+/** Fill the portable defaults required by protocol generation 11. */
 export function defineRun(
   program: string,
   options: {

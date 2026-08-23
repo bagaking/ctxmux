@@ -17,6 +17,7 @@ export type ErrorCode =
   | "target_changed"
   | "creation_conflict"
   | "input_operation_conflict"
+  | "stop_operation_conflict"
   | "input_cursor_mismatch"
   | "daemon_instance_mismatch"
   | "run_capacity"
