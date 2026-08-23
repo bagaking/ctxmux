@@ -1,10 +1,9 @@
 {
-  "version": 2,
-  "feat_id": "f-229cz9szm",
-  "plan_status": "reviewed",
-  "plan_revision": 3,
-  "supersedes_revision": 2,
-  "review_ref": ".bagakit/feature-tracker/features/f-229cz9szm/artifacts/revision-3-pool-review.md",
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-229cz9szm/artifacts/revision-3-pool-review.md"
+  },
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -17,83 +16,10 @@
     ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md",
     ".bagakit/feature-tracker/features/f-229cz9szm/artifacts/revision-3-pool-review.md"
   ],
-  "plan_history": [
-    {
-      "revision": 1,
-      "supersedes_revision": null,
-      "review_ref": ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
-        "docs/testing-strategy.md",
-        "packages/sdk/README.md",
-        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/herdr-transfer-review.md",
-        ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 2,
-      "supersedes_revision": 1,
-      "review_ref": ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
-        "docs/testing-strategy.md",
-        "packages/sdk/README.md",
-        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/herdr-transfer-review.md",
-        ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 3,
-      "supersedes_revision": 2,
-      "review_ref": ".bagakit/feature-tracker/features/f-229cz9szm/artifacts/revision-3-pool-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
-        "docs/testing-strategy.md",
-        "packages/sdk/README.md",
-        ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md",
-        ".bagakit/feature-tracker/features/f-229cz9szm/artifacts/revision-3-pool-review.md"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    }
-  ],
+  "supersedes": {
+    "revision": 2,
+    "reason": "Replace named AgentMux examples in the unstarted current plan with a generic authorized external client or embedding host while preserving the same ctxmux-owned artifact boundary."
+  },
   "tasks": [
     {
       "id": "T-001",
@@ -126,12 +52,7 @@
         "docs/architecture/choices/011-context-artifact-lineage-fork.md",
         ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-002",
@@ -165,12 +86,7 @@
         "docs/testing-strategy.md#security-and-local-boundary-tests",
         ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-003",
@@ -203,12 +119,7 @@
         "packages/sdk/README.md",
         ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-004",
@@ -241,12 +152,7 @@
         "docs/architecture/choices/013-client-authorized-artifact-ingress.md",
         ".bagakit/feature-tracker/features/f-229cz9szm/proposal.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     }
   ]
 }

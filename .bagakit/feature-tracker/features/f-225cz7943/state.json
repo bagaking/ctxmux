@@ -65,6 +65,14 @@
     {
       "action": "task_plan_set",
       "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=4; supersedes_revision=3"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed,f-22bczhydf,f-227czdavj,f-22ecztapc,f-22gcz4t8v"
     }
   ],
   "depends_on": [
@@ -72,7 +80,8 @@
     "f-224czneed",
     "f-22bczhydf",
     "f-227czdavj",
-    "f-22ecztapc"
+    "f-22ecztapc",
+    "f-22gcz4t8v"
   ],
   "goal_contract": {
     "schema": "bagakit.feature-goal.v1",

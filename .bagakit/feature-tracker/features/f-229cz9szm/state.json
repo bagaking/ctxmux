@@ -45,6 +45,10 @@
     {
       "action": "dag_dependencies_updated",
       "detail": "depends_on=f-22bczhydf"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
     }
   ],
   "depends_on": [

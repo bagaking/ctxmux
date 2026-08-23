@@ -3,7 +3,7 @@
   "generated_by": "bagakit-feature-tracker",
   "feature_id_issuance": {
     "scheme": "feature-tracker-id-v1-c3n2g4",
-    "next_cursor": 15
+    "next_cursor": 16
   },
   "features": [
     {
@@ -97,12 +97,12 @@
     {
       "feat_id": "f-22aczwza9",
       "title": "Run one bounded ctxmux peer-performance cycle",
-      "status": "blocked",
+      "status": "ready",
       "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "internal_blocker",
+      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -152,7 +152,7 @@
     {
       "feat_id": "f-22fczqx4j",
       "title": "Extend Runtime reach and interrupted derivation",
-      "status": "proposal",
+      "status": "discarded",
       "workspace_mode": "proposal_only",
       "branch": "",
       "worktree_name": "",
@@ -165,6 +165,17 @@
       "title": "Make native Stop recoverable across response loss",
       "status": "archived",
       "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22hjbhvt8",
+      "title": "Carry Runs through an owner-host Remote Runtime",
+      "status": "proposal",
+      "workspace_mode": "proposal_only",
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",

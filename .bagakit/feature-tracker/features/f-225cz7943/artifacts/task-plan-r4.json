@@ -1,10 +1,9 @@
 {
-  "version": 2,
-  "feat_id": "f-225cz7943",
-  "plan_status": "reviewed",
-  "plan_revision": 4,
-  "supersedes_revision": 3,
-  "review_ref": ".bagakit/feature-tracker/features/f-225cz7943/artifacts/revision-4-pool-review.md",
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-225cz7943/artifacts/revision-4-pool-review.md"
+  },
   "source_refs": [
     "AGENTS.md",
     "README.md",
@@ -16,93 +15,10 @@
     ".bagakit/feature-tracker/features/f-22gcz4t8v/tasks.json",
     ".bagakit/feature-tracker/features/f-225cz7943/artifacts/revision-4-pool-review.md"
   ],
-  "plan_history": [
-    {
-      "revision": 1,
-      "supersedes_revision": null,
-      "review_ref": "docs/roadmap.md",
-      "source_refs": [
-        "AGENTS.md",
-        "README.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/roadmap.md"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002"
-      ],
-      "superseded_task_ids": []
-    },
-    {
-      "revision": 2,
-      "supersedes_revision": 1,
-      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
-      "source_refs": [
-        "AGENTS.md",
-        "README.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/roadmap.md",
-        "docs/testing-strategy.md",
-        "docs/roadmap.md#program-ownership-and-convergence"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 3,
-      "supersedes_revision": 2,
-      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
-      "source_refs": [
-        "AGENTS.md",
-        "README.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/roadmap.md",
-        "docs/testing-strategy.md",
-        ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 4,
-      "supersedes_revision": 3,
-      "review_ref": ".bagakit/feature-tracker/features/f-225cz7943/artifacts/revision-4-pool-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "README.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/roadmap.md",
-        "docs/testing-strategy.md",
-        ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json",
-        ".bagakit/feature-tracker/features/f-22gcz4t8v/tasks.json",
-        ".bagakit/feature-tracker/features/f-225cz7943/artifacts/revision-4-pool-review.md"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    }
-  ],
+  "supersedes": {
+    "revision": 3,
+    "reason": "Remove external AgentMux receipt and repin requirements from unstarted release tasks, consume only ctxmux-owned Phase 1 and Recoverable Stop evidence, and make the current upstream dependency explicit."
+  },
   "tasks": [
     {
       "id": "T-001",
@@ -125,12 +41,7 @@
         "docs/vision.md#composition-stays-above-the-mux",
         "docs/roadmap.md#m5--composition-proof-and-release"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-002",
@@ -158,12 +69,7 @@
         "README.md",
         "docs/roadmap.md#m5--composition-proof-and-release"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-003",
@@ -196,12 +102,7 @@
         "packages/sdk/README.md",
         ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 2,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-004",
@@ -240,12 +141,7 @@
         ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json",
         ".bagakit/feature-tracker/features/f-22gcz4t8v/tasks.json"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 2,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     }
   ]
 }

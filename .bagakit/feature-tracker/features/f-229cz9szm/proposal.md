@@ -4,7 +4,7 @@
 
 - A Run may need an image, patch, fixture, or other bounded byte object that a client currently holds in memory. PTY input can carry a reference but cannot materialize those bytes on the Run host.
 - If every embedding client creates temporary files independently, path safety, atomicity, quotas, retry disposition, lifetime, and cleanup drift into multiple insecure implementations.
-- AgentMux is a concrete consumer, but its clipboard consent, preview, Agent capability, prompt construction, and SSH deployment policy must remain above ctxmux. ctxmux should expose only a generic Run-host artifact capability.
+- An authorized external client or embedding host is the consumer. Its source selection, consent, preview, application semantics, and transport policy remain above ctxmux; ctxmux exposes only a generic Run-host artifact capability.
 
 ## Goal
 
@@ -17,9 +17,9 @@
 - Intended generalization: clipboard images, dropped files, generated patches, screenshots, fixtures, and other bounded opaque inputs for native Runs; another Backend may support placement only after it proves the same contract.
 - Failure boundary: ctxmux never reads clipboard state, decides consent, interprets media, builds prompts, deploys over SSH, moves artifacts between hosts or Runs, or claims isolation from hostile same-UID processes.
 - Behavior examples:
-  - AgentMux obtains user authorization and sends PNG bytes through `@ctxmux/sdk` to the remote or local ctxmuxd that already owns the target Run;
+  - an embedding host obtains caller authorization and sends bounded bytes through `@ctxmux/sdk` to the ctxmuxd that already owns the target Run;
   - ctxmux validates the live Run and capability before upload, atomically publishes into a daemon-private area, and returns `ArtifactId + RunHostPath`;
-  - AgentMux separately sends that path through correlated Run input and later releases the artifact;
+  - the embedding host separately sends that path through correlated Run input and later releases the artifact;
   - a terminal-state Run, imported tmux Run, incompatible daemon, or unsupported Backend rejects before consuming bytes.
 - Evidence refs:
   - `docs/vision.md`
@@ -45,7 +45,7 @@
 ## Transfer Checks
 
 - PNG, arbitrary binary, fragmented non-UTF-8, misleading extensions and Unicode logical names use the same envelope and integrity rules.
-- User denial in AgentMux produces no ctxmux request; user approval cannot relax daemon bounds or permissions.
+- Caller denial in the embedding host produces no ctxmux request; caller approval cannot relax daemon bounds or permissions.
 - Disconnect before commit publishes nothing; disconnect after commit preserves the documented lease and permits operation-status recovery.
 - Wrong digest, duplicate operation key with different content, traversal, symlink replacement, expired Run, quota pressure and late frames fail closed.
 - Provider-native resume creates a new Run: an artifact scoped to the old Run is not silently carried forward; the client must ensure the target Run first and then stage.
