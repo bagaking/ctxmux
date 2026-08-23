@@ -16,9 +16,9 @@ use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello,
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
     ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
-    ProtocolError, RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, Response,
-    RunEvent, RunId, RunInfo, RunSignal, RunSpec, RuntimeDescription, ServerFrame, StopDisposition,
-    TerminalSize, TmuxPaneInfo, decode_frame, encode_frame,
+    ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSignal,
+    RunSpec, RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize, TmuxPaneInfo,
+    decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -258,7 +258,7 @@ impl Client {
     ///
     /// Returns [`ClientError`] when the handshake cannot complete or reports
     /// an incompatible protocol generation.
-    pub async fn runtime_info(&self) -> Result<RuntimeDescription, ClientError> {
+    pub async fn runtime_info(&self) -> Result<RuntimeIdentity, ClientError> {
         self.connect().await.map(|(_, runtime)| runtime)
     }
 
@@ -611,7 +611,7 @@ impl Client {
         }
     }
 
-    async fn connect(&self) -> Result<(Wire, RuntimeDescription), ClientError> {
+    async fn connect(&self) -> Result<(Wire, RuntimeIdentity), ClientError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(|source| ClientError::Connect {
@@ -630,7 +630,7 @@ impl Client {
         .await?;
         match receive(&mut wire).await? {
             ServerFrame::Hello { runtime } => {
-                validate_runtime_description(&runtime)?;
+                validate_runtime_identity(&runtime)?;
                 Ok((wire, runtime))
             }
             ServerFrame::Error { error } => Err(error.into()),
@@ -639,10 +639,8 @@ impl Client {
     }
 }
 
-fn validate_runtime_description(runtime: &RuntimeDescription) -> Result<(), ClientError> {
-    if runtime.protocol_generation != PROTOCOL_VERSION
-        || runtime.capabilities.version != RUNTIME_CAPABILITY_MANIFEST_VERSION
-    {
+fn validate_runtime_identity(runtime: &RuntimeIdentity) -> Result<(), ClientError> {
+    if runtime.protocol_generation != PROTOCOL_VERSION {
         return Err(ClientError::UnexpectedFrame("expected compatible hello"));
     }
     Ok(())
@@ -864,47 +862,33 @@ pub fn replay_bytes(chunks: &[OutputChunk]) -> Vec<u8> {
 #[cfg(test)]
 mod runtime_tests {
     use ctxmux_protocol::{
-        DaemonInstanceId, NativeRuntimeCapabilities, RuntimeBuildId, RuntimeCapabilityManifest,
-        RuntimeDescription, RuntimeId, RuntimeServiceCapabilities, TmuxRuntimeCapabilities,
+        DaemonInstanceId, RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity,
     };
 
-    use super::{ClientError, PROTOCOL_VERSION, RUNTIME_CAPABILITY_MANIFEST_VERSION};
+    use super::{ClientError, PROTOCOL_VERSION};
 
     #[test]
-    fn client_rejects_unknown_runtime_manifest_versions() {
-        let mut runtime = runtime_description();
-        super::validate_runtime_description(&runtime).expect("accept current Runtime manifest");
+    fn client_rejects_an_incompatible_runtime_protocol_generation() {
+        let mut runtime = runtime_identity();
+        super::validate_runtime_identity(&runtime).expect("accept current Runtime identity");
 
-        runtime.capabilities.version = RUNTIME_CAPABILITY_MANIFEST_VERSION + 1;
+        runtime.protocol_generation = PROTOCOL_VERSION + 1;
         assert!(matches!(
-            super::validate_runtime_description(&runtime),
+            super::validate_runtime_identity(&runtime),
             Err(ClientError::UnexpectedFrame("expected compatible hello"))
         ));
     }
 
-    fn runtime_description() -> RuntimeDescription {
-        RuntimeDescription {
-            runtime_id: RuntimeId::new(),
+    fn runtime_identity() -> RuntimeIdentity {
+        RuntimeIdentity {
             daemon_instance_id: DaemonInstanceId::new(),
+            runtime_id: RuntimeId::new(),
+            runtime_id_persistence: RuntimeIdPersistence::Daemon,
             build_id: RuntimeBuildId::new("ctxmuxd/test").unwrap(),
             protocol_generation: PROTOCOL_VERSION,
-            capabilities: RuntimeCapabilityManifest {
-                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-                native: NativeRuntimeCapabilities {
-                    start: true,
-                    recoverable_input: true,
-                    fork_level_a: true,
-                    execute_materialized_level_b: true,
-                },
-                tmux: TmuxRuntimeCapabilities {
-                    discover: true,
-                    import: true,
-                },
-                services: RuntimeServiceCapabilities {
-                    persistent_state_active: false,
-                    planned_exec_upgrade_continuity: false,
-                },
-            },
+            platform: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            capabilities: std::collections::BTreeMap::from([("native.start".to_owned(), 1)]),
         }
     }
 }

@@ -37,7 +37,7 @@ import type { Response } from "./generated/Response.js";
 import type { RunId } from "./generated/RunId.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
-import type { RuntimeDescription } from "./generated/RuntimeDescription.js";
+import type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
 import type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
@@ -138,10 +138,10 @@ export class CtxmuxClient {
   }
 
   public async daemonInstance(): Promise<DaemonInstanceId> {
-    return (await this.runtimeInfo()).daemon_instance_id;
+    return (await this.runtimeInfo()).daemonInstanceId;
   }
 
-  public async runtimeInfo(): Promise<RuntimeDescription> {
+  public async runtimeInfo(): Promise<RuntimeIdentity> {
     const { wire, runtime } = await this.#connect();
     wire.close();
     return runtime;
@@ -420,7 +420,7 @@ export class CtxmuxClient {
 
   async #connect(): Promise<{
     readonly wire: JsonLinesConnection;
-    readonly runtime: RuntimeDescription;
+    readonly runtime: RuntimeIdentity;
   }> {
     const wire = await JsonLinesConnection.connect(this.#socketPath);
     try {
@@ -434,7 +434,7 @@ export class CtxmuxClient {
       }
       if (
         frame.type !== "hello" ||
-        frame.runtime.protocol_generation !== PROTOCOL_VERSION
+        frame.runtime.protocolGeneration !== PROTOCOL_VERSION
       ) {
         throw unexpected("compatible hello", frame.type);
       }

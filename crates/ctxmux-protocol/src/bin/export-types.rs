@@ -9,7 +9,11 @@ use std::{
 use ctxmux_protocol::{
     AttachedSnapshot, ClientFrame, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
     MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_BUILD_ID_BYTES, PROTOCOL_VERSION,
-    RUNTIME_CAPABILITY_MANIFEST_VERSION, RunSignal, ServerFrame, StopDisposition,
+    RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_START,
+    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RunSignal, ServerFrame,
+    StopDisposition,
 };
 use ts_rs::{Config, TS};
 
@@ -46,14 +50,28 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
                 "export const MAX_CREATE_OPERATION_KEY_BYTES = {} as const;\n",
                 "export const MAX_INPUT_OPERATION_KEY_BYTES = {} as const;\n",
                 "export const MAX_RUNTIME_BUILD_ID_BYTES = {} as const;\n",
-                "export const RUNTIME_CAPABILITY_MANIFEST_VERSION = {} as const;\n"
+                "export const RUNTIME_CAPABILITY_NATIVE_START = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_TMUX_DISCOVER = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_TMUX_IMPORT = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_PERSISTENT_STATE = {:?} as const;\n",
+                "export const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY = {:?} as const;\n"
             ),
             PROTOCOL_VERSION,
             MAX_FRAME_BYTES,
             MAX_CREATE_OPERATION_KEY_BYTES,
             MAX_INPUT_OPERATION_KEY_BYTES,
             MAX_RUNTIME_BUILD_ID_BYTES,
-            RUNTIME_CAPABILITY_MANIFEST_VERSION,
+            RUNTIME_CAPABILITY_NATIVE_START,
+            RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+            RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
+            RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+            RUNTIME_CAPABILITY_TMUX_DISCOVER,
+            RUNTIME_CAPABILITY_TMUX_IMPORT,
+            RUNTIME_CAPABILITY_PERSISTENT_STATE,
+            RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
         ),
     )?;
     Ok(())

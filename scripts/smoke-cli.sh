@@ -95,26 +95,33 @@ CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run"
     const runtime = JSON.parse(process.env.CTXMUX_SMOKE_RUNTIME);
     const runId = process.env.CTXMUX_SMOKE_RUN_ID;
     const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-    assert.match(runtime.runtime_id, uuid);
-    assert.match(runtime.daemon_instance_id, uuid);
-    assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
-    assert.notEqual(runtime.runtime_id, runId);
-    assert.notEqual(runtime.daemon_instance_id, runId);
-    assert.match(runtime.build_id, /^ctxmuxd\/[^/]+$/u);
-    assert.equal(runtime.protocol_generation, 10);
+    assert.deepEqual(Object.keys(runtime).sort(), [
+      "arch",
+      "buildId",
+      "capabilities",
+      "daemonInstanceId",
+      "platform",
+      "protocolGeneration",
+      "runtimeId",
+      "runtimeIdPersistence",
+    ]);
+    assert.match(runtime.runtimeId, uuid);
+    assert.match(runtime.daemonInstanceId, uuid);
+    assert.equal(runtime.runtimeIdPersistence, "daemon");
+    assert.notEqual(runtime.runtimeId, runtime.daemonInstanceId);
+    assert.notEqual(runtime.runtimeId, runId);
+    assert.notEqual(runtime.daemonInstanceId, runId);
+    assert.match(runtime.buildId, /^ctxmuxd\/[^/]+$/u);
+    assert.equal(runtime.protocolGeneration, 10);
+    assert.notEqual(runtime.platform, "");
+    assert.notEqual(runtime.arch, "");
     assert.deepEqual(runtime.capabilities, {
-      version: 1,
-      native: {
-        start: true,
-        recoverable_input: true,
-        fork_level_a: true,
-        execute_materialized_level_b: true,
-      },
-      tmux: { discover: true, import: true },
-      services: {
-        persistent_state_active: false,
-        planned_exec_upgrade_continuity: false,
-      },
+      "native.execute_materialized_level_b": 1,
+      "native.fork_level_a": 1,
+      "native.recoverable_input": 1,
+      "native.start": 1,
+      "tmux.discover": 1,
+      "tmux.import": 1,
     });
   '
 

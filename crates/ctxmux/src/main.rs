@@ -107,7 +107,7 @@ async fn run() -> Result<(), String> {
             println!(
                 "{}",
                 serde_json::to_string(&runtime)
-                    .map_err(|error| format!("failed to encode Runtime description: {error}"))?
+                    .map_err(|error| format!("failed to encode Runtime identity: {error}"))?
             );
         }
         "start" => start(&client, args).await?,
