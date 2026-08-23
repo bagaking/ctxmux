@@ -588,7 +588,13 @@ sequence, producer timestamp, RSS, and one final marker. The harness rejects
 sequence or cadence gaps, malformed or partial output, target loss, missing
 final state, and helper failure; every stop or failure path kills when needed
 and retains the single helper's close/reap ownership until completion. The
-locked build records the helper binary and source identities alongside the
+critical script runner executes test files serially so unrelated contract-test
+workers cannot turn fixture cold-start scheduling into RSS product evidence;
+this does not extend helper startup, first-observation, sequence, or timestamp
+deadlines. Scripted sampler fixtures publish their process identity before
+readiness so the reap oracle refers to the exact process admitted for the
+one-sample-gap test.
+The locked build records the helper binary and source identities alongside the
 daemon before a receipt can be accepted.
 
 ## Gate topology

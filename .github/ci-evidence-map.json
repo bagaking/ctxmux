@@ -142,7 +142,7 @@
       "path": "scripts/check-fixtures.test.mjs",
       "invariants": ["wrong-case anchors are executable and gate-reachable"],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -156,7 +156,7 @@
         "seven coverage owner groups remain fail-closed while changed-line ordinary, explicit retained-evidence, and CI-auto N/A modes stay semantically distinct"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -172,7 +172,7 @@
         "required critical and coverage commands bind canonical tmux lanes plus fuzz and model case counts"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -186,7 +186,7 @@
         "frozen 1/32/128 CPU, RSS, retention, slope, and cleanup budgets remain complete and gate-reachable"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -200,7 +200,7 @@
         "T-027 payload, replay-pressure, resource, owner, time-budget, and PTY-stable helper contracts are source-bound before implementation"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -214,7 +214,7 @@
         "qualification owner artifacts reject gaps, drops, rollback, malformed frames, partial EOF, and missing final state"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -228,7 +228,7 @@
         "GC Run start and terminal publication remain bounded by the frozen absolute phase deadline rather than an unsourced per-Run timeout"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -242,7 +242,7 @@
         "qualification RSS sampling remains independent of harness event-loop stalls, preserves exact cadence and final-frame evidence, and reaps its single helper without descendants"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -312,7 +312,7 @@
         "T-027 canonical GC and maximum replay-pressure freeze surface has machine-checked arithmetic and helper source parity before implementation"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
@@ -763,7 +763,7 @@
         "the local artifact command binds one canonical clean Git identity and rejects dirty source before creating output"
       ],
       "selection_ref": "scripts/check.sh",
-      "selection_anchor": "node --test scripts/*.test.mjs",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
         { "job": "coverage", "platforms": ["ubuntu-24.04"] }
