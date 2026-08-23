@@ -1,4 +1,5 @@
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 
 const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
@@ -73,6 +74,12 @@ export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
   }
+}
+
+/** Validate one complete executable Run specification before client mutation. */
+export function validateRunSpec(value: unknown, path = "$runSpec"): RunSpec {
+  runSpec(value, path);
+  return value as RunSpec;
 }
 
 function response(value: unknown, path: string): void {
@@ -203,7 +210,9 @@ function appliedInputRange(value: unknown, path: string): void {
 
 function runSpec(value: unknown, path: string): void {
   const spec = record(value, path);
-  string(spec.program, `${path}.program`);
+  if (string(spec.program, `${path}.program`).length === 0) {
+    throw invalid(`${path}.program`, "a non-empty string");
+  }
   array(spec.args, `${path}.args`).forEach((argument, index) =>
     string(argument, `${path}.args[${index}]`),
   );
@@ -214,7 +223,7 @@ function runSpec(value: unknown, path: string): void {
   for (const [name, environmentValue] of Object.entries(environment)) {
     string(environmentValue, `${path}.env.${name}`);
   }
-  terminalSize(spec.size, `${path}.size`);
+  terminalSize(spec.size, `${path}.size`, true);
   array(spec.declared_inputs, `${path}.declared_inputs`).forEach(
     (input, index) =>
       runInputReference(input, `${path}.declared_inputs[${index}]`),
@@ -305,7 +314,9 @@ function runInputReference(value: unknown, path: string): void {
   if (kind !== "workspace" && kind !== "artifact" && kind !== "context") {
     throw invalid(`${path}.kind`, "a known Run input kind");
   }
-  string(input.reference, `${path}.reference`);
+  if (string(input.reference, `${path}.reference`).length === 0) {
+    throw invalid(`${path}.reference`, "a non-empty string");
+  }
 }
 
 function runLineage(value: unknown, path: string): void {

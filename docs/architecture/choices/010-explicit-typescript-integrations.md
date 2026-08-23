@@ -1,6 +1,6 @@
 # 010 — Explicit TypeScript Integrations
 
-- Status: accepted; ownership clarified
+- Status: accepted and implemented
 - Scope: optional host-side Integration contract above the generic Run protocol
 
 ## Context
@@ -81,17 +81,19 @@ MCP supports the negotiation and timeout principle only. It does not justify JSO
 
 - Active: SDK tests cover explicit binding, structured shell planning, a
   no-claim shell observer, and raw Run continuity after observer loss.
-- Required: a synthetic host-owned Provider binds provenance to one exact
+- Covered: a synthetic host-owned Provider binds provenance to one exact
   parent, materializes a generic Level B `RunSpec`, and creates one child with
   the declared lineage through the public SDK.
-- Required: copied, unbound, cross-registration, parent-mismatched, and
+- Covered: copied, unbound, cross-registration, parent-mismatched, and
   unrelated-Run provenance are rejected before planner or daemon mutation.
-- Required: Integration host exits while the raw child and Run remain usable.
+- Covered: Integration observer loss leaves the raw parent and child usable
+  through ordinary SDK operations.
 - Covered: an Integration that does not declare Level B capability or a planner
   fails before any raw fork request.
 - Covered: an Integration that declares Level B but omits a provenance hook
   fails before planner or raw fork; the raw fork count remains zero.
-- Required: the standalone shell and raw-Run SDK tests remain green without
+- Covered: the standalone shell, clean packaged consumer, and raw-Run SDK tests
+  remain green without
   Agent-specific modules in the ctxmux publication.
 
 ## Open questions

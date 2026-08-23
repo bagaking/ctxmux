@@ -62,7 +62,7 @@ const commands = [
       "real socket clients racing input, resize, and direct-child stop against one daemon Run; no writer or resize arbitration claim",
   },
   {
-    id: "typescript-wire-codex-fuzz",
+    id: "typescript-wire-fuzz",
     command: process.execPath,
     args: [
       "--import",
@@ -71,7 +71,7 @@ const commands = [
       "packages/sdk/test/parser-fuzz.test.ts",
     ],
     boundary:
-      "TypeScript NDJSON framing/runtime validation and Codex JSONL observation; no external Codex semantic-continuation claim",
+      "TypeScript NDJSON framing and runtime validation across arbitrary seeded byte streams; no Provider semantic claim",
   },
 ];
 

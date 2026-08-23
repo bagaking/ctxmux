@@ -17,14 +17,13 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:codex-canary": "tsx scripts/codex-semantic-canary.ts",
     "test:e2e": "cargo build --quiet --package ctxmux --package ctxmux-daemon && CTXMUX_BIN=\"$PWD/target/debug/ctxmux\" CTXMUXD_BIN=\"$PWD/target/debug/ctxmuxd\" npm run test:e2e --workspace @ctxmux/sdk",
     "test:local-consumer": "node scripts/check-local-consumer.mjs",
     "test:reliability": "scripts/check-reliability.sh",
     "test:seeded-qualification": "node scripts/run-seeded-qualification.mjs",
     "test:unit": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:scripts",
-    "typecheck:scripts": "tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --allowImportingTsExtensions --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes scripts/codex-semantic-canary.ts scripts/reliability-qualification.ts"
+    "typecheck:scripts": "tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --allowImportingTsExtensions --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes scripts/reliability-qualification.ts"
   },
   "devDependencies": {
     "@types/node": "24.13.3",
