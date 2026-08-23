@@ -7,8 +7,8 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachmentCommandId, ClientFrame, ControlFailure, ControlOutcome, ControlReceipt, RunEvent,
-    RunSignal, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    AttachmentCommandId, ClientFrame, ControlFailure, ControlOutcome, ControlReceipt,
+    RecoverableStop, RunEvent, RunSignal, ServerFrame, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{
     StreamExt,
@@ -147,16 +147,21 @@ impl Attachment {
         })
     }
 
-    /// Stop the attached Run and await complete owned-session quiescence.
+    /// Apply or recover one caller-retained Stop operation through this
+    /// attachment and await complete owned-session quiescence.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] when local admission, the live owner, or the
     /// attachment transport cannot produce a unique correlated result.
-    pub async fn stop(&self) -> Result<AttachmentControlAccepted<StopReceipt>, ClientError> {
+    pub async fn stop(
+        &self,
+        operation: RecoverableStop,
+    ) -> Result<AttachmentControlAccepted<StopReceipt>, ClientError> {
         let (command_id, receipt) = self
             .issue_command(PendingKind::Stop, |command_id| ClientFrame::Stop {
                 command_id,
+                operation,
             })
             .await?;
         let ValidatedReceipt::Stop(receipt) = receipt else {

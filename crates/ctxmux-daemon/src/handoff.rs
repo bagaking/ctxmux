@@ -26,9 +26,12 @@ use serde::{Deserialize, Serialize};
 
 use ctxmux_protocol::{DaemonInstanceId, RunId};
 
-use crate::{creation::MAX_RETAINED_RUNS, native_control::HandoffInputState};
+use crate::{
+    creation::{HandoffStopOperation, MAX_RETAINED_RUNS},
+    native_control::HandoffInputState,
+};
 
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v2";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v3";
 // 128 retained Runs can each carry 1 MiB of recoverable Input request bytes.
 // Those payloads use base64 in JSON, while operation keys and bounded
 // diagnostics may expand under JSON escaping. Keep the read ceiling above the
@@ -42,6 +45,7 @@ pub struct HandoffManifest {
     pub listener_fd: RawFd,
     pub state_lock_fd: RawFd,
     pub runs: Vec<HandoffRun>,
+    pub stop_operations: Vec<HandoffStopOperation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,12 +63,23 @@ impl HandoffManifest {
         state_lock_fd: RawFd,
         runs: Vec<HandoffRun>,
     ) -> Self {
+        Self::new_with_stop_operations(epoch, listener_fd, state_lock_fd, runs, Vec::new())
+    }
+
+    pub fn new_with_stop_operations(
+        epoch: String,
+        listener_fd: RawFd,
+        state_lock_fd: RawFd,
+        runs: Vec<HandoffRun>,
+        stop_operations: Vec<HandoffStopOperation>,
+    ) -> Self {
         Self {
             schema: HANDOFF_SCHEMA.to_string(),
             epoch,
             listener_fd,
             state_lock_fd,
             runs,
+            stop_operations,
         }
     }
 
@@ -92,6 +107,15 @@ impl HandoffManifest {
                 ),
             ));
         }
+        if self.stop_operations.len() > MAX_RETAINED_RUNS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "handoff contains {} native Stop operations; maximum is {MAX_RETAINED_RUNS}",
+                    self.stop_operations.len()
+                ),
+            ));
+        }
         let mut fds = HashSet::new();
         for fd in self.all_fds() {
             if fd < 3 || fd == manifest_fd || !fds.insert(fd) {
@@ -112,6 +136,21 @@ impl HandoffManifest {
             run.input_state
                 .validate()
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        let mut stop_runs = HashSet::new();
+        let mut stop_keys = HashSet::new();
+        for operation in &self.stop_operations {
+            operation
+                .validate()
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if !stop_runs.insert(operation.run_id)
+                || !stop_keys.insert(operation.operation_key.clone())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "handoff native Stop operations must have unique Runs and keys",
+                ));
+            }
         }
         Ok(())
     }
@@ -160,9 +199,15 @@ pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
 
 #[cfg(test)]
 mod tests {
-    use ctxmux_protocol::{AppliedInputRange, ErrorCode, InputOperationKey, ProtocolError};
+    use ctxmux_protocol::{
+        AppliedInputRange, ErrorCode, InputOperationKey, ProtocolError, StopDisposition,
+        StopOperationKey,
+    };
 
-    use crate::native_control::HandoffInputOperation;
+    use crate::{
+        creation::{HandoffStopOperation, HandoffStopOutcome},
+        native_control::HandoffInputOperation,
+    };
 
     use super::*;
 
@@ -271,6 +316,28 @@ mod tests {
             serde_json::from_slice::<HandoffManifest>(&bytes).unwrap(),
             manifest
         );
+    }
+
+    #[test]
+    fn settled_stop_ledger_round_trips_in_the_versioned_manifest() {
+        let operation = HandoffStopOperation {
+            run_id: RunId::new(),
+            operation_key: StopOperationKey::new("handoff-stop-result").unwrap(),
+            outcome: HandoffStopOutcome::Accepted {
+                disposition: StopDisposition::Forced,
+            },
+        };
+        let manifest = HandoffManifest::new_with_stop_operations(
+            DaemonInstanceId::new().to_string(),
+            100,
+            101,
+            Vec::new(),
+            vec![operation.clone()],
+        );
+
+        let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v3");
+        assert_eq!(parsed.stop_operations, [operation]);
     }
 
     #[test]

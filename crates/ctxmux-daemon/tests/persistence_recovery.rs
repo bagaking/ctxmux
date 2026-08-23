@@ -12,10 +12,10 @@ use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, PROTOCOL_VERSION,
     RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
-    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_START,
-    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
-    RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent, RunId, RunInfo, RunSpec, RunState,
-    RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+    RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
+    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent,
+    RunId, RunInfo, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -169,6 +169,7 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
         BTreeMap::from([
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
             (
                 RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
@@ -316,7 +317,11 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
             .resize(parent.id, TerminalSize { cols: 90, rows: 30 })
             .await,
     );
-    assert_invalid_state(&client.stop(parent.id).await);
+    let parent_stop = client
+        .prepare_stop(parent.id)
+        .await
+        .expect("prepare recovered parent Stop");
+    assert_invalid_state(&client.stop(parent_stop).await);
     assert_invalid_state(&client.interrupt(parent.id).await);
 
     let child = client
@@ -424,7 +429,11 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
             .resize(live.id, TerminalSize { cols: 81, rows: 25 })
             .await,
     );
-    assert_invalid_state(&client.stop(live.id).await);
+    let live_stop = client
+        .prepare_stop(live.id)
+        .await
+        .expect("prepare recovered live Stop");
+    assert_invalid_state(&client.stop(live_stop).await);
     assert_invalid_state(&client.interrupt(live.id).await);
     assert_invalid_state(
         &client
