@@ -12,8 +12,10 @@ partial earlier milestone to pretend it provides capabilities it does not.
 M0 through M3 form the runtime foundation and close as one delivery boundary.
 Persistence and recovery, the tmux adapter, and composition/release each use a
 separate Feature after the foundation because they have different owners,
-failure models, and rollback boundaries. The release Feature depends on those
-capability Features; it does not absorb their implementation work.
+failure models, and rollback boundaries. The release Feature depends on the
+local Runtime and Recoverable Stop capability owners and consumes their exact
+ctxmux evidence; it does not absorb their implementation work or require a
+downstream product repository.
 
 Research and the wrong-case corpus are closed baseline work. New cases are
 added only when a real implementation decision or observed failure creates a
@@ -29,11 +31,12 @@ independently closable; one result must not keep an unrelated owner open.
 | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
 | Run-Kernel correctness (`f-22bczhydf`)  | Bound memory-only and persistent retained state, dispose of unclassified native waiter failure without inventing exit truth, close Kernel P0/P1 findings, and prove the retained-state plateau. | memory-only Registry GC; bounded waiter-failure disposition; persistent exact replacement; bounded Kernel review; retained-state qualification |
 | tmux adapter (`f-224czneed`)            | Prove the declared public Control Mode adapter and preserve non-output observation truth across attachment lag.                                                                                 | tmux capability tasks only; no release or Kernel GC work                                                                                       |
-| Composition and release (`f-225cz7943`) | Prove public composition, activation, installation, packaging, independent release review, supported platforms, and local release gates.                                                        | composition example; package/release preparation; daemon activation; release qualification                                                     |
-| Peer performance (`f-22aczwza9`)        | Run one pre-registered, budget-bounded measure/optimize/remeasure cycle and record honest wins, ties, and losses.                                                                               | comparable harness; measured raw-byte ROI decision; bounded-cycle result                                                                       |
+| Composition and release (`f-225cz7943`) | Consume exact ctxmux Phase 1 and Recoverable Stop evidence, then prove public composition, activation, installation, packaging, supported platforms, independent review, and local release gates. | composition example; package/release preparation; ctxmux-owned activation consumption; clean-consumer release qualification                    |
+| Peer performance (`f-22aczwza9`)        | Finish ctxmux native-owner census and reliability qualification, then run one pre-registered, budget-bounded measure/optimize/remeasure cycle with honest wins, ties, and losses.                | daemon-owner qualification; comparable harness; measured raw-byte ROI decision; bounded-cycle result                                           |
 | Recoverable native Input                | Make one native short-lived Input retry-safe after response loss within the same daemon incarnation and report the exact applied PTY byte range.                                                | Rust public vertical; TypeScript parity; bounded review and focused Gate                                                                       |
 | Recoverable native Stop (`f-22gcz4t8v`) | Recover one complete-session Stop result after response loss without entering the existing Stop owner twice, and keep the operation record bounded by retained Run lifetime.                    | frozen Stop/SSOT baseline; Rust owner vertical; attachment/TS/CLI/exec/GC parity; exact-commit qualification                                   |
 | Public Local consumer (`f-22dczvf38`)   | Close only the exact-commit local embedding gaps without absorbing consumer semantics or Remote transport.                                                                                      | cumulative output byte cursors; public interrupt and complete process-tree Stop; exact-commit artifacts and required CI qualification          |
+| Remote Runtime (`f-22hjbhvt8`)          | Reuse the public protocol through system OpenSSH StreamLocal forwarding while the owner-host ctxmuxd keeps lifecycle, replay, and process truth.                                                  | minimal tunnel/reconnect vertical; identity, remote Stop receipt, and mixed-capability qualification                                            |
 
 The earlier reliability-and-performance umbrella `f-226cz5zdq` is superseded
 only after these successor plans and their dependency edges are materialized.
@@ -43,24 +46,23 @@ correctness or release completion condition.
 
 Each owner writes its own Feature-local `verification.md`. A release summary
 may cite already closed successor evidence, but no shared mutable qualification
-report is task truth for multiple Features. The performance Feature remains
-`proposal_only` until explicitly scheduled, and no planning transition grants
-authority to publish packages, Git refs, hosted releases, or benchmark results.
+report is task truth for multiple Features. The broader peer cycle remains
+unscheduled until its owner starts T-001; the current-tree Feature first owns
+only T-005 qualification. No planning transition grants authority to publish
+packages, Git refs, hosted releases, or benchmark results.
 
-The frozen AgentMux consumer comparison exposed one
-bounded native-owner gap before the broader peer cycle: a fresh daemon used a
-host-sized Tokio worker pool, and every live native Run permanently owned one
-reader thread plus one waiter thread. Three existing ctxmux resource censuses
-independently reproduced approximately 142--145 KiB and two threads per live
-Run. `f-22aczwza9/T-004` owns this consumer-triggered remediation before the
-broader T-001--T-003 cycle: use a fixed small daemon worker pool and replace
-per-Run permanent native workers with daemon-wide owners while preserving
-ordered output, direct-child wait/reap authority, Stop, failure disposition,
-shutdown, and existing resource budgets. It must not change output event
-fan-out, protocol encoding, thresholds, compatibility behavior, or tmux
-attachment semantics; those remain with their existing owners. The external
-comparison activates the work but does not become a second ctxmux benchmark
-truth or authorize publication.
+A frozen external embedding comparison exposed one bounded native-owner gap
+before the broader peer cycle: a fresh daemon used a host-sized Tokio worker
+pool, and every live native Run permanently owned one reader thread plus one
+waiter thread. Three existing ctxmux resource censuses independently reproduced
+approximately 142--145 KiB and two threads per live Run. Historical T-004 owns
+the delivered substrate and its blocker evidence. `f-22aczwza9/T-005` now owns
+only the remaining ctxmux qualification: the frozen 1/32/128 census,
+fresh-daemon and zero-per-Run permanent-worker truth, clean reliability gate,
+independent owner-boundary review, and exact commit. It must not change output
+fan-out, protocol encoding, thresholds, compatibility behavior, tmux semantics,
+or add a downstream product pin. The external comparison explains priority but
+does not become ctxmux benchmark truth or authorize publication.
 
 ## M0 — Repository foundation
 
@@ -272,11 +274,18 @@ Prove embeddability with a deliberately small reference client or example that
 forks Runs and combines results without moving scheduling or evaluation policy
 into the core.
 
+Feature `f-225cz7943` starts release qualification only after
+`f-22ecztapc` and `f-22gcz4t8v` provide their exact ctxmux owner evidence. It
+uses ctxmux-owned clean consumers and does not require an Agent product checkout,
+receipt, pin, or repin.
+
 Acceptance:
 
 - the example can express a bounded Crucible- or MapReduce-like workflow using
   only public APIs;
 - orchestration and evaluation remain client-owned;
+- daemon activation and Recoverable Stop are consumed from their ctxmux owners
+  rather than reimplemented or re-proven through a downstream repository;
 - packages and binaries have installation, compatibility, and release
   documentation;
 - the public positioning remains accurate for every shipped capability.
@@ -327,19 +336,29 @@ Phase 1 acceptance is executable and has zero higher-client dependency. An
 external package consumer may add evidence, but cannot replace the standalone
 gate or move its policy into ctxmux.
 
-## Remote Runtime and bounded derivation — Phase 2
+## Remote Runtime transport — Phase 2
 
-Status: reviewed proposal only; depends on complete Phase 1 evidence and must
-not be mixed into the current implementation.
+Status: reviewed proposal only under Feature `f-22hjbhvt8`; depends on complete
+Phase 1 evidence from `f-22ecztapc` and must not be mixed into the current local
+Runtime implementation.
 
-- **T5 — Remote Runtime transport.** Carry the same public protocol to an
-  owner-host Runtime, preserving owner-side lifecycle truth and reporting
-  transport loss as unverifiable. Do not introduce a hosted control plane,
-  Relay, account/environment federation, or remote scheduling policy.
-- **T6 — Provider-neutral derivation metadata.** Add a generic derivation kind
-  only when a real consumer needs to distinguish fork/restart/resume beyond the
-  existing parent/fidelity lineage. Provider session selection, transcript
-  trimming, summaries, and native-resume construction remain outside ctxmux.
+1. Use the maintained system OpenSSH client and StreamLocal forwarding to map
+   the owner-host ctxmuxd Unix socket to one bounded local Unix socket, reusing
+   the existing protocol and SDK instead of adding Relay or another product RPC
+   layer.
+2. Prove the local client and tunnel can disappear while the remote child keeps
+   running; reconnect binds exact `runtimeId + runId`, preserves the remote PID,
+   and replays output from the caller cursor or reports explicit truncation.
+3. Treat transport loss as endpoint reachability `unverifiable`, never as
+   `exited` or `interrupted`. Only the remote daemon owner may publish lifecycle
+   truth or a successful Stop receipt.
+4. Reject wrong OpenSSH host trust, Runtime identity, Run identity, and missing
+   capabilities before attach or mutation. Exercise newer-local/older-remote
+   and older-local/newer-remote capability asymmetry without fallback.
+
+Relay deployment, account or environment federation, hosted control planes,
+remote scheduling, orchestration, Provider sessions, and derivation metadata
+are not part of this Feature.
 
 ## Explicitly deferred
 
@@ -348,4 +367,7 @@ not be mixed into the current implementation.
   scheduling platform;
 - plugin discovery, marketplace, or untrusted plugin sandbox;
 - arbitrary live-process state cloning;
+- Provider-neutral derivation metadata until a real consumer needs a distinction
+  beyond existing parent and fidelity lineage; that work requires a separate
+  reviewed Feature rather than sharing the Remote transport owner;
 - broad Integration coverage beyond the one proven Level B path.
