@@ -42,10 +42,11 @@ use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
     MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError,
     RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
-    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_START,
-    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
-    RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request,
-    Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+    RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
+    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER,
+    RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, RecoverableStop, Request, Response,
+    RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
     RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalSize,
     TmuxRunEvent, decode_frame, encode_frame,
 };
@@ -62,9 +63,10 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use crate::adopted_pty::AdoptedMasterPty;
 use crate::creation::{
     CommitUnknownReservation, CreationFlight, CreationFlightOwner, CreationRequest,
-    PendingPublication, PersistentCollectionCandidate, PublicationReservation, RunRegistry,
-    TerminalOrdinal, TerminalPublicationOwner, TmuxCleanupReservation, UnpublishedCleanupOwner,
-    UnpublishedCleanupReservation,
+    HandoffStopOperation, PendingPublication, PersistentCollectionCandidate,
+    PublicationReservation, RecoverableStopAdmission, RecoverableStopFlight,
+    RecoverableStopSettlement, RunRegistry, TerminalOrdinal, TerminalPublicationOwner,
+    TmuxCleanupReservation, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
 };
 use crate::native_control::{
     ControlResult, DetachedNativeDescriptors, HandoffInputState, InputDrainGate,
@@ -260,8 +262,14 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
         )
         .map_err(|source| ServerError::io("qualification stats fd", source))?;
         Arc::new(
-            RunManager::persistent_with_handoff_and_stats(persistence, recovered, stats, adopt)
-                .map_err(|error| ServerError::Adopt(error.message))?,
+            RunManager::persistent_with_handoff_and_stats(
+                persistence,
+                recovered,
+                stats,
+                adopt,
+                manifest.stop_operations.clone(),
+            )
+            .map_err(|error| ServerError::Adopt(error.message))?,
         )
     } else {
         let (persistence, recovered) = Persistence::open(state_dir.clone())?;
@@ -480,6 +488,15 @@ enum UpgradeAbort {
     AfterExtract(ServerError),
 }
 
+fn snapshot_stop_operations_for_upgrade(
+    manager: &RunManager,
+) -> Result<Vec<HandoffStopOperation>, UpgradeAbort> {
+    manager
+        .registry
+        .handoff_stop_operations()
+        .map_err(|failures| UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures }))
+}
+
 /// Perform an exec-in-place upgrade: drain, extract the live native runs, write
 /// the handoff manifest, clear CLOEXEC on exactly the descriptors that must
 /// survive, and execve this binary. On success this replaces the process image
@@ -529,6 +546,8 @@ fn perform_exec_upgrade(
             UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures: failure })
         })?;
 
+    let stop_operations = snapshot_stop_operations_for_upgrade(manager)?;
+
     // --- POINT OF NO RETURN: extract relinquishes reap/close authority for
     // every live native child; from here, any failure is fail-stop. ---
     let live = manager
@@ -567,7 +586,13 @@ fn perform_exec_upgrade(
         .as_ref()
         .expect("perform_exec_upgrade requires persistent mode (verified by caller)")
         .state_lock_fd();
-    let manifest = crate::handoff::HandoffManifest::new(epoch, listener_fd, state_lock_fd, runs);
+    let manifest = crate::handoff::HandoffManifest::new_with_stop_operations(
+        epoch,
+        listener_fd,
+        state_lock_fd,
+        runs,
+        stop_operations,
+    );
 
     // Serialize directly into the unlinked file, append one NDJSON newline, and
     // rewind it for the incoming image. This keeps transient memory bounded by
@@ -732,6 +757,51 @@ struct RunManager {
     attachment_hook: Option<Arc<AttachmentTestHook>>,
     #[cfg(test)]
     creation_hook: Option<Arc<CreationTestHook>>,
+}
+
+/// Keeps the first recoverable Stop settlement independent of any request or
+/// attachment connection. Dropping the daemon-owned task records an unknown
+/// terminal result instead of leaving every retry blocked on an empty cell.
+struct RecoverableStopSettlementOwner {
+    manager: Arc<RunManager>,
+    settlement: Option<RecoverableStopSettlement>,
+}
+
+impl RecoverableStopSettlementOwner {
+    async fn run(mut self) {
+        let result = self
+            .settlement
+            .as_mut()
+            .expect("daemon Stop settlement remains owned")
+            .wait()
+            .await;
+        self.finish(result);
+    }
+
+    fn finish(&mut self, result: ControlResult) {
+        let settlement = self
+            .settlement
+            .take()
+            .expect("daemon Stop settlement finishes once");
+        self.manager
+            .registry
+            .settle_recoverable_stop(settlement, result);
+    }
+}
+
+impl Drop for RecoverableStopSettlementOwner {
+    fn drop(&mut self) {
+        let Some(settlement) = self.settlement.take() else {
+            return;
+        };
+        self.manager.registry.settle_recoverable_stop(
+            settlement,
+            Err(control_unknown(ProtocolError::new(
+                ErrorCode::Internal,
+                "recoverable native Stop settlement owner ended without a result",
+            ))),
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1228,6 +1298,7 @@ impl RunManager {
         let mut capabilities = BTreeMap::from([
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
             (
                 RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
@@ -1339,6 +1410,7 @@ impl RunManager {
         recovered: Vec<RecoveredRun>,
         qualification_stats: QualificationStats,
         mut adopt: HashMap<RunId, (OwnedFd, u32, HandoffInputState)>,
+        stop_operations: Vec<HandoffStopOperation>,
     ) -> Result<Self, ProtocolError> {
         let terminal_publications = TerminalPublicationOwner::default();
         let native_runs = NativeRuntimeOwner::default();
@@ -1388,7 +1460,11 @@ impl RunManager {
             runtime_id: persistence.runtime_id(),
             daemon_instance: persistence.daemon_instance(),
             build_id: runtime_build_id(),
-            registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
+            registry: RunRegistry::recovered_with_handoff_and_stats(
+                runs,
+                stop_operations,
+                qualification_stats.clone(),
+            )?,
             creation_flights,
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
             terminal_publications,
@@ -1938,6 +2014,47 @@ impl RunManager {
         self.registry.info(id).ok_or_else(|| {
             ProtocolError::new(ErrorCode::RunNotFound, format!("Run {id} does not exist"))
         })
+    }
+
+    fn validate_recoverable_stop(
+        &self,
+        operation: &RecoverableStop,
+        attached_run: Option<RunId>,
+    ) -> Result<(), ControlFailure> {
+        if operation.daemon_instance != self.daemon_instance {
+            return Err(control_not_applied(ProtocolError::new(
+                ErrorCode::DaemonInstanceMismatch,
+                "recoverable native Stop belongs to another daemon incarnation",
+            )));
+        }
+        if attached_run.is_some_and(|attached_run| attached_run != operation.id) {
+            return Err(control_not_applied(ProtocolError::new(
+                ErrorCode::StopOperationConflict,
+                "attachment Stop operation names another Run",
+            )));
+        }
+        Ok(())
+    }
+
+    fn begin_recoverable_stop(
+        self: &Arc<Self>,
+        operation: RecoverableStop,
+    ) -> Result<RecoverableStopFlight, ControlFailure> {
+        self.validate_recoverable_stop(&operation, None)?;
+        match self
+            .registry
+            .begin_recoverable_stop(operation.id, operation.operation_key)?
+        {
+            RecoverableStopAdmission::Retry(flight) => Ok(flight),
+            RecoverableStopAdmission::Owner { flight, settlement } => {
+                let owner = RecoverableStopSettlementOwner {
+                    manager: Arc::clone(self),
+                    settlement: Some(settlement),
+                };
+                tokio::spawn(owner.run());
+                Ok(flight)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -3312,6 +3429,7 @@ impl Run {
         }
     }
 
+    #[cfg(test)]
     async fn stop(&self) -> ControlResult {
         self.begin_stop()?.resolve(STOP_ACK_TIMEOUT).await
     }
@@ -4366,6 +4484,13 @@ fn control_not_applied(error: ProtocolError) -> ControlFailure {
     }
 }
 
+fn control_unknown(error: ProtocolError) -> ControlFailure {
+    ControlFailure {
+        error,
+        disposition: CommandDisposition::Unknown,
+    }
+}
+
 async fn handle_connection(
     stream: UnixStream,
     manager: Arc<RunManager>,
@@ -4529,17 +4654,7 @@ async fn execute_request(
             };
             Ok(short_control_response(&run, run.signal(signal).await))
         }
-        Request::Stop { id } => {
-            let run = match manager.pin(id) {
-                Ok(run) => run,
-                Err(error) => {
-                    return Ok(Response::ControlRejected {
-                        failure: control_not_applied(error),
-                    });
-                }
-            };
-            Ok(short_control_response(&run, run.stop().await))
-        }
+        Request::Stop { operation } => recoverable_stop_response(manager, operation).await,
         Request::Attach { .. } => Err(ProtocolError::new(
             ErrorCode::Internal,
             "attach request reached short-lived request handler",
@@ -4574,6 +4689,21 @@ async fn recoverable_input_response(
         }),
         Err(failure) => Ok(Response::ControlRejected { failure }),
     }
+}
+
+async fn recoverable_stop_response(
+    manager: &Arc<RunManager>,
+    operation: RecoverableStop,
+) -> Result<Response, ProtocolError> {
+    let flight = match manager.begin_recoverable_stop(operation) {
+        Ok(flight) => flight,
+        Err(failure) => return Ok(Response::ControlRejected { failure }),
+    };
+    let (run, result) = flight.resolve().await;
+    Ok(match result {
+        Ok(receipt) => Response::ControlAccepted { run, receipt },
+        Err(failure) => Response::ControlRejected { failure },
+    })
 }
 
 fn short_control_response(run: &Run, result: ControlResult) -> Response {
@@ -4676,8 +4806,8 @@ mod tests {
     use ctxmux_client::{Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
         CommandDisposition, ControlReceipt, CreateOperationKey, ErrorCode, ForkPlan,
-        InterruptionReason, ProtocolError, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo,
-        RunSpec, RunState, StopDisposition, TerminalSize,
+        InterruptionReason, ProtocolError, RecoverableStop, RunBackend, RunCapabilities, RunEvent,
+        RunId, RunInfo, RunSpec, RunState, StopDisposition, TerminalSize,
     };
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
@@ -4696,6 +4826,13 @@ mod tests {
         resolve_tmux_termination, serve_with_manager, serve_with_persistence_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
+
+    async fn fresh_stop(client: &Client, id: RunId) -> RecoverableStop {
+        client
+            .prepare_stop(id)
+            .await
+            .expect("prepare recoverable Stop operation")
+    }
     use crate::native_control::NativeControlOwner;
 
     mod creation;
@@ -6091,6 +6228,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recoverable_stop_owner_drop_settles_unknown_and_retains_the_fence() {
+        let server = InProcessServer::start(Arc::new(RunManager::default()));
+        let run = server
+            .client
+            .start(long_running_spec())
+            .await
+            .expect("start owner-drop Stop fixture");
+        let operation = fresh_stop(&server.client, run.id).await;
+        let admission = server
+            .manager
+            .registry
+            .begin_recoverable_stop(run.id, operation.operation_key.clone())
+            .expect("first Stop enters the owner");
+        let super::RecoverableStopAdmission::Owner { flight, settlement } = admission else {
+            panic!("first Stop admission must create one settlement owner");
+        };
+
+        drop(super::RecoverableStopSettlementOwner {
+            manager: Arc::clone(&server.manager),
+            settlement: Some(settlement),
+        });
+
+        let (_, result) = flight.resolve().await;
+        let failure = result.expect_err("dropped daemon owner settles an unknown result");
+        assert_eq!(failure.error.code, ErrorCode::Internal);
+        assert_eq!(failure.disposition, CommandDisposition::Unknown);
+
+        let replay = server
+            .manager
+            .begin_recoverable_stop(operation.clone())
+            .expect("same operation replays the retained unknown result");
+        let (_, replayed) = replay.resolve().await;
+        let replayed = replayed.expect_err("unknown result remains unknown on retry");
+        assert_eq!(replayed.error.code, ErrorCode::Internal);
+        assert_eq!(replayed.disposition, CommandDisposition::Unknown);
+
+        let different_key = fresh_stop(&server.client, run.id).await;
+        let Err(conflict) = server.manager.begin_recoverable_stop(different_key) else {
+            panic!("unknown Stop must retain its exact Run fence");
+        };
+        assert_eq!(conflict.error.code, ErrorCode::StopOperationConflict);
+        assert_eq!(conflict.disposition, CommandDisposition::NotApplied);
+        wait_for_exit(&server.client, run.id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscribe_snapshot_join_delivers_interleaved_output_exactly_once() {
         let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSubscribe);
         let run = server
@@ -6133,7 +6316,12 @@ mod tests {
         assert_eq!(chunk.data, b"after");
 
         attachment.detach().await.expect("detach joined attachment");
-        server.client.stop(run.id).await.expect("stop joined Run");
+        let stop_operation = fresh_stop(&server.client, run.id).await;
+        server
+            .client
+            .stop(stop_operation)
+            .await
+            .expect("stop joined Run");
         wait_for_exit(&server.client, run.id).await;
     }
 
@@ -6188,7 +6376,12 @@ mod tests {
             .detach()
             .await
             .expect("detach recovered attachment");
-        server.client.stop(run.id).await.expect("stop detached Run");
+        let stop_operation = fresh_stop(&server.client, run.id).await;
+        server
+            .client
+            .stop(stop_operation)
+            .await
+            .expect("stop detached Run");
         wait_for_exit(&server.client, run.id).await;
     }
 
@@ -6309,7 +6502,10 @@ mod tests {
                             .resize(id, TerminalSize { cols, rows: 24 })
                             .await
                             .map(|_| ()),
-                        MutationOperation::Stop => client.stop(id).await.map(|_| ()),
+                        MutationOperation::Stop => {
+                            let operation = fresh_stop(&client, id).await;
+                            client.stop(operation).await.map(|_| ())
+                        }
                     };
                     (operation, result)
                 }));
@@ -6328,7 +6524,9 @@ mod tests {
                         Err(ClientError::ControlRejected { failure })
                             if matches!(
                                 failure.error.code,
-                                ErrorCode::InvalidRunState | ErrorCode::ControlBackpressure
+                                ErrorCode::InvalidRunState
+                                    | ErrorCode::ControlBackpressure
+                                    | ErrorCode::StopOperationConflict
                             ) =>
                         {
                             rejected_stops += 1;
@@ -6750,7 +6948,11 @@ mod tests {
             .detach()
             .await
             .expect("detach recovered attachment");
-        client.stop(run.id).await.expect("stop controlled Gap Run");
+        let stop_operation = fresh_stop(&client, run.id).await;
+        client
+            .stop(stop_operation)
+            .await
+            .expect("stop controlled Gap Run");
         tokio::time::timeout(Duration::from_secs(5), async {
             while client
                 .status(run.id)

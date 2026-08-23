@@ -14,11 +14,12 @@ use ctxmux_protocol::{
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
     PROTOCOL_VERSION, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
     RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
-    RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
-    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER,
-    RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request, RunEvent, RunId, RunInputKind,
-    RunInputReference, RunLineage, RunSignal, RunSpec, RunState, RuntimeIdPersistence,
-    RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
+    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
+    RecoverableStop, Request, RunEvent, RunId, RunInputKind, RunInputReference, RunLineage,
+    RunSignal, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, ServerFrame,
+    StopDisposition, StopOperationKey, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde_json::Value;
@@ -37,6 +38,18 @@ struct TestDaemon {
     /// Lines captured from a stderr-piped daemon, shared with a drain thread.
     /// `None` for the inherit-stderr constructors, which do not scan stderr.
     stderr_lines: Option<Arc<Mutex<Vec<String>>>>,
+}
+
+async fn fresh_stop(client: &Client, id: RunId) -> RecoverableStop {
+    client
+        .prepare_stop(id)
+        .await
+        .expect("prepare recoverable Stop operation")
+}
+
+async fn stop_run(client: &Client, id: RunId) {
+    let operation = fresh_stop(client, id).await;
+    client.stop(operation).await.expect("stop Run");
 }
 
 impl TestDaemon {
@@ -444,6 +457,48 @@ fn marker_shell(marker: &Path) -> RunSpec {
     }
 }
 
+fn recoverable_stop_marker_shell(marker: &Path, exit_on_term: bool) -> RunSpec {
+    let action = if exit_on_term {
+        "printf \"TERM\\n\" >> \"$CTXMUX_STOP_MARKER\"; exit 0"
+    } else {
+        "printf \"TERM\\n\" >> \"$CTXMUX_STOP_MARKER\""
+    };
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            format!(
+                "trap '{action}' TERM; printf 'READY\\n'; while :; do sleep 0.01; wait $!; done"
+            ),
+        ],
+        cwd: None,
+        env: BTreeMap::from([(
+            "CTXMUX_STOP_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+async fn wait_for_stop_marker_lines(marker: &Path, expected: usize) -> Vec<String> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let lines = std::fs::read_to_string(marker)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if lines.len() == expected {
+                return lines;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Stop marker reaches the expected physical signal count")
+}
+
 async fn wait_for_marker_pids(marker: &Path, expected: usize) -> Vec<u32> {
     timeout(Duration::from_secs(5), async {
         loop {
@@ -755,6 +810,22 @@ fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
     }
 }
 
+fn assert_control_failure(
+    error: ClientError,
+    expected_code: ErrorCode,
+    expected_disposition: CommandDisposition,
+) {
+    match error {
+        ClientError::ControlRejected { failure } => {
+            assert_eq!(failure.error.code, expected_code);
+            assert_eq!(failure.disposition, expected_disposition);
+        }
+        other => panic!(
+            "expected {expected_code:?}/{expected_disposition:?} control failure, got {other:?}"
+        ),
+    }
+}
+
 fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
     assert_eq!(
@@ -768,6 +839,7 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
         BTreeMap::from([
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
             (
                 RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
@@ -793,6 +865,7 @@ fn assert_memory_only_runtime_identity(runtime: &RuntimeIdentity) {
         BTreeMap::from([
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
             (
                 RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
@@ -1215,7 +1288,8 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
         "real PTY preserved every opaque input byte"
     );
 
-    let mut stop = Box::pin(attachment.stop());
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
+    let mut stop = Box::pin(attachment.stop(stop_operation));
     let mut stop_command_id = None;
     let mut after_stop_output = Vec::new();
     let terminal = timeout(Duration::from_secs(5), async {
@@ -1337,7 +1411,8 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
         .expect("resize reaches the PTY owner");
     assert_eq!(resize.command_id.get(), 1);
     assert_eq!(resize.receipt.applied_size, requested_size);
-    let stop = timeout(Duration::from_secs(3), control.stop())
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
+    let stop = timeout(Duration::from_secs(3), control.stop(stop_operation))
         .await
         .expect("stop is not starved by saturated input")
         .expect("stop reaches the child owner");
@@ -1503,7 +1578,11 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
             .any(|bytes| bytes == b"OUT:AB"),
         "backward command mutated the PTY before the fatal fence"
     );
-    attachment.stop().await.expect("stop command-id fence Run");
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
+    attachment
+        .stop(stop_operation)
+        .await
+        .expect("stop command-id fence Run");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1583,9 +1662,405 @@ async fn public_start_and_fork_recover_after_the_response_is_abandoned() {
     );
     assert!(process_exists(unrelated.pid()));
 
-    daemon.client.stop(child.id).await.expect("stop child");
-    daemon.client.stop(parent.id).await.expect("stop parent");
+    let child_stop = fresh_stop(&daemon.client, child.id).await;
+    daemon.client.stop(child_stop).await.expect("stop child");
+    let parent_stop = fresh_stop(&daemon.client, parent.id).await;
+    daemon.client.stop(parent_stop).await.expect("stop parent");
     assert!(process_exists(unrelated.pid()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recoverable_stop_concurrent_duplicate_joins_and_conflicts_before_mutation() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("concurrent-stop-signals.log");
+    let first = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, true))
+        .await
+        .expect("start duplicate Stop fixture");
+    let second = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start conflict sentinel Run");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(first.id, 0)
+        .await
+        .expect("attach duplicate Stop fixture");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    attachment
+        .detach()
+        .await
+        .expect("detach duplicate Stop readiness observer");
+
+    let operation = fresh_stop(&daemon.client, first.id).await;
+    let first_client = daemon.client.clone();
+    let second_client = daemon.client.clone();
+    let (left, right) = tokio::join!(
+        first_client.stop(operation.clone()),
+        second_client.stop(operation.clone()),
+    );
+    let left = left.expect("first duplicate receives the owner result");
+    let right = right.expect("concurrent duplicate joins the owner result");
+    assert_eq!(left.run.id, first.id);
+    assert_eq!(right.run.id, first.id);
+    assert_eq!(left.receipt, right.receipt);
+    assert_eq!(
+        wait_for_stop_marker_lines(&marker, 1).await,
+        vec!["TERM"],
+        "concurrent duplicate entered the physical Stop owner more than once"
+    );
+
+    let different_key = fresh_stop(&daemon.client, first.id).await;
+    assert_control_failure(
+        daemon
+            .client
+            .stop(different_key)
+            .await
+            .expect_err("another key cannot replace a retained Stop result"),
+        ErrorCode::StopOperationConflict,
+        CommandDisposition::NotApplied,
+    );
+
+    let mut cross_run = operation;
+    cross_run.id = second.id;
+    assert_control_failure(
+        daemon
+            .client
+            .stop(cross_run)
+            .await
+            .expect_err("one Stop key cannot name another Run"),
+        ErrorCode::StopOperationConflict,
+        CommandDisposition::NotApplied,
+    );
+    assert!(
+        daemon
+            .client
+            .status(second.id)
+            .await
+            .expect("conflict sentinel remains queryable")
+            .state
+            .is_running(),
+        "conflicting key reuse entered the second Run Stop owner"
+    );
+
+    let second_stop = fresh_stop(&daemon.client, second.id).await;
+    daemon
+        .client
+        .stop(second_stop)
+        .await
+        .expect("stop conflict sentinel with its own key");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_response_loss_recovers_from_a_fresh_client() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon
+        .directory
+        .path()
+        .join("response-loss-stop-signals.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start response-loss Stop fixture");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach response-loss Stop readiness observer");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    attachment
+        .detach()
+        .await
+        .expect("detach response-loss Stop readiness observer");
+    let operation = fresh_stop(&daemon.client, run.id).await;
+
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::Stop {
+            operation: operation.clone(),
+        },
+    )
+    .await;
+
+    let fresh_client = Client::new(daemon.client.socket_path());
+    let recovered = timeout(Duration::from_secs(5), fresh_client.stop(operation.clone()))
+        .await
+        .expect("daemon-owned Stop settlement remains live after response loss")
+        .expect("fresh client recovers the exact Stop result");
+    let replayed = fresh_client
+        .stop(operation)
+        .await
+        .expect("settled Stop result remains replayable");
+    assert_eq!(recovered.run.id, run.id);
+    assert_eq!(replayed.run.id, run.id);
+    assert_eq!(replayed.receipt, recovered.receipt);
+    assert_eq!(
+        wait_for_stop_marker_lines(&marker, 1).await,
+        vec!["TERM"],
+        "response-loss retry entered the physical Stop owner more than once"
+    );
+    assert!(!process_exists(run.pid.expect("native Run exposes a PID")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_attachment_short_to_attachment_recovers_one_result() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("short-to-attachment-stop.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start short-to-attachment Stop fixture");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach cross-path recovery client");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::Stop {
+            operation: operation.clone(),
+        },
+    )
+    .await;
+
+    let recovered = attachment
+        .stop(operation)
+        .await
+        .expect("attachment joins the abandoned short Stop");
+    assert_eq!(recovered.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_attachment_to_short_survives_attachment_disconnect() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("attachment-to-short-stop.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start attachment-to-short Stop fixture");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach abandoned Stop client");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    let attachment = Arc::new(attachment);
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    let abandoned = {
+        let attachment = Arc::clone(&attachment);
+        let operation = operation.clone();
+        tokio::spawn(async move { attachment.stop(operation).await })
+    };
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+    abandoned.abort();
+    let _ = abandoned.await;
+    drop(attachment);
+
+    let recovered = Client::new(daemon.client.socket_path())
+        .stop(operation)
+        .await
+        .expect("short request recovers the disconnected attachment Stop");
+    assert_eq!(recovered.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("read attachment disconnect marker")
+            .lines()
+            .collect::<Vec<_>>(),
+        ["TERM"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_planned_exec_replays_the_settled_same_incarnation_result() {
+    let daemon = TestDaemon::start_persistent().await;
+    let marker = daemon
+        .directory
+        .path()
+        .join("planned-exec-stop-signals.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start planned-exec Stop fixture");
+    let before = daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("read Runtime identity before Stop handoff");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach planned-exec Stop readiness observer");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    attachment
+        .detach()
+        .await
+        .expect("detach planned-exec Stop readiness observer");
+    let operation = fresh_stop(&daemon.client, run.id).await;
+
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::Stop {
+            operation: operation.clone(),
+        },
+    )
+    .await;
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
+
+    daemon.sighup();
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(resume.contains(" 0 run(s)"), "unexpected resume: {resume}");
+    let after = daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("read Runtime identity after Stop handoff");
+    assert_eq!(after.runtime_id, before.runtime_id);
+    assert_eq!(after.daemon_instance_id, before.daemon_instance_id);
+
+    let recovered = Client::new(daemon.client.socket_path())
+        .stop(operation)
+        .await
+        .expect("incoming image replays handed-off Stop result");
+    assert_eq!(recovered.run.id, run.id);
+    assert_eq!(recovered.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(
+        std::fs::read_to_string(&marker)
+            .expect("read planned-exec Stop marker")
+            .lines()
+            .collect::<Vec<_>>(),
+        ["TERM"],
+        "planned-exec retry must not execute Stop again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_not_applied_does_not_retain_an_operation() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "exit 0".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start naturally exiting Stop fixture");
+    assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
+
+    let first = fresh_stop(&daemon.client, run.id).await;
+    assert_control_failure(
+        daemon
+            .client
+            .stop(first.clone())
+            .await
+            .expect_err("terminal Run rejects Stop before admission"),
+        ErrorCode::InvalidRunState,
+        CommandDisposition::NotApplied,
+    );
+    assert_control_failure(
+        daemon
+            .client
+            .stop(first)
+            .await
+            .expect_err("same key is not retained after not-applied admission"),
+        ErrorCode::InvalidRunState,
+        CommandDisposition::NotApplied,
+    );
+
+    let different_key = fresh_stop(&daemon.client, run.id).await;
+    assert_control_failure(
+        daemon
+            .client
+            .stop(different_key)
+            .await
+            .expect_err("another key is not fenced by a not-applied Stop"),
+        ErrorCode::InvalidRunState,
+        CommandDisposition::NotApplied,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_rejects_another_daemon_before_run_lookup_or_mutation() {
+    let first = TestDaemon::start().await;
+    let stale_instance = first
+        .client
+        .daemon_instance()
+        .await
+        .expect("read stale daemon incarnation");
+    let second = TestDaemon::start().await;
+    let run = second
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start replacement daemon Stop target");
+    let operation_key = StopOperationKey::new("replacement-fence-stop").unwrap();
+    assert_control_failure(
+        second
+            .client
+            .stop(RecoverableStop {
+                daemon_instance: stale_instance,
+                operation_key: operation_key.clone(),
+                id: run.id,
+            })
+            .await
+            .expect_err("old daemon operation cannot Stop a replacement target"),
+        ErrorCode::DaemonInstanceMismatch,
+        CommandDisposition::NotApplied,
+    );
+    assert!(
+        second
+            .client
+            .status(run.id)
+            .await
+            .expect("replacement target remains queryable")
+            .state
+            .is_running()
+    );
+
+    let current_instance = second.client.daemon_instance().await.unwrap();
+    second
+        .client
+        .stop(RecoverableStop {
+            daemon_instance: current_instance,
+            operation_key,
+            id: run.id,
+        })
+        .await
+        .expect("same key remains available to the current daemon incarnation");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1989,12 +2464,8 @@ async fn level_a_fork_clones_declared_inputs_and_runs_independently() {
     assert!(!parent_output.windows(9).any(|bytes| bytes == b"OUT:child"));
     assert!(!child_output.windows(10).any(|bytes| bytes == b"OUT:parent"));
 
-    daemon
-        .client
-        .stop(parent.id)
-        .await
-        .expect("stop parent Run");
-    daemon.client.stop(child.id).await.expect("stop child Run");
+    stop_run(&daemon.client, parent.id).await;
+    stop_run(&daemon.client, child.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2043,17 +2514,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_9_before_request_dispatch() {
+async fn daemon_rejects_generation_10_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 10,
+        PROTOCOL_VERSION, 11,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_9_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 9 },
+    let generation_10_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 10 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -2071,7 +2542,7 @@ async fn daemon_rejects_generation_9_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_9_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_10_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -2479,7 +2950,7 @@ fn readiness_write_failure_removes_the_unpublished_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
+async fn recoverable_stop_replays_settled_forced_result() {
     let daemon = TestDaemon::start().await;
     let run = daemon
         .client
@@ -2518,9 +2989,10 @@ async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
             .attachments,
         0
     );
-    daemon
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
+    let first_stop = daemon
         .client
-        .stop(run.id)
+        .stop(stop_operation.clone())
         .await
         .expect("stop HUP-ignoring Run");
     assert!(!wait_until_exited(&daemon.client, run.id).await.is_running());
@@ -2528,14 +3000,12 @@ async fn stop_escalates_past_ignored_hup_and_rejects_repeated_stop() {
         !process_exists(pid),
         "stopped direct child {pid} remained live"
     );
-    assert_protocol_error(
-        daemon
-            .client
-            .stop(run.id)
-            .await
-            .expect_err("repeated stop is rejected"),
-        ErrorCode::InvalidRunState,
-    );
+    let replayed_stop = daemon
+        .client
+        .stop(stop_operation)
+        .await
+        .expect("exact repeated Stop replays its result");
+    assert_eq!(replayed_stop.receipt, first_stop.receipt);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2588,7 +3058,12 @@ async fn interrupt_reaches_the_foreground_group_without_stopping_the_run() {
             .state
             .is_running()
     );
-    daemon.client.stop(run.id).await.expect("stop fixture");
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
+    daemon
+        .client
+        .stop(stop_operation)
+        .await
+        .expect("stop fixture");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2634,7 +3109,8 @@ async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
         let client = daemon.client.clone();
         let id = run.id;
         accepted.push(tokio::spawn(async move {
-            timeout(Duration::from_secs(3), client.stop(id))
+            let operation = fresh_stop(&client, id).await;
+            timeout(Duration::from_secs(3), client.stop(operation))
                 .await
                 .expect("accepted stubborn Stop stays inside its receipt fence")
         }));
@@ -2642,9 +3118,10 @@ async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
     sleep(Duration::from_millis(100)).await;
 
     let ninth = runs[CLEANUP_OWNERS].id;
+    let rejected_operation = fresh_stop(&daemon.client, ninth).await;
     let error = daemon
         .client
-        .stop(ninth)
+        .stop(rejected_operation)
         .await
         .expect_err("ninth Stop cannot enter Stopping without cleanup capacity");
     assert!(matches!(
@@ -2664,9 +3141,10 @@ async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
             .expect("join accepted stubborn Stop")
             .expect("accepted stubborn Stop has an exact receipt");
     }
+    let admitted_operation = fresh_stop(&daemon.client, ninth).await;
     daemon
         .client
-        .stop(ninth)
+        .stop(admitted_operation)
         .await
         .expect("ninth Stop succeeds after cleanup capacity returns");
 }
@@ -2708,9 +3186,10 @@ async fn stop_forces_stubborn_descendants_and_preserves_unrelated_processes() {
         .await
         .expect("start hostile descendant fixture");
     let descendants = wait_for_marker_pids(&marker, 2).await;
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
     let accepted = daemon
         .client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop complete session");
     assert_eq!(accepted.receipt.disposition, StopDisposition::Forced);
@@ -2746,8 +3225,11 @@ async fn concurrent_interrupt_and_stop_have_only_owner_declared_outcomes() {
         .expect("start concurrency fixture");
     let interrupt_client = daemon.client.clone();
     let stop_client = daemon.client.clone();
-    let (interrupt, stop) =
-        tokio::join!(interrupt_client.interrupt(run.id), stop_client.stop(run.id),);
+    let stop_operation = fresh_stop(&stop_client, run.id).await;
+    let (interrupt, stop) = tokio::join!(
+        interrupt_client.interrupt(run.id),
+        stop_client.stop(stop_operation),
+    );
     assert!(
         stop.is_ok(),
         "Stop must retain the unique terminal owner: {stop:?}"
@@ -2804,8 +3286,11 @@ async fn concurrent_interrupt_stop_and_natural_exit_leave_no_signal_or_process_s
     let pids = wait_for_marker_pids(&marker, 2).await;
     let interrupt_client = daemon.client.clone();
     let stop_client = daemon.client.clone();
-    let (interrupt, stop) =
-        tokio::join!(interrupt_client.interrupt(run.id), stop_client.stop(run.id),);
+    let stop_operation = fresh_stop(&stop_client, run.id).await;
+    let (interrupt, stop) = tokio::join!(
+        interrupt_client.interrupt(run.id),
+        stop_client.stop(stop_operation),
+    );
     if let Err(error) = interrupt {
         assert!(matches!(
             error,
@@ -2962,12 +3447,18 @@ async fn failed_upgrade_before_extract_restores_complete_service() {
         .start(interactive_shell())
         .await
         .expect("creation admission is fully restored after abort");
+    let second_stop = fresh_stop(&daemon.client, second.id).await;
     daemon
         .client
-        .stop(second.id)
+        .stop(second_stop)
         .await
         .expect("stop second Run");
-    daemon.client.stop(run.id).await.expect("stop original Run");
+    let original_stop = fresh_stop(&daemon.client, run.id).await;
+    daemon
+        .client
+        .stop(original_stop)
+        .await
+        .expect("stop original Run");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3132,9 +3623,10 @@ async fn upgrade_drains_crossing_input_through_its_ack_response() {
             .any(|window| window == INPUT_BYTES.to_string().as_bytes()),
         "child confirms the complete crossing payload"
     );
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
     daemon
         .client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop crossing fixture");
 }
@@ -3207,9 +3699,10 @@ async fn repeated_upgrades_have_zero_settled_fd_and_thread_delta() {
         );
     }
 
+    let stop_operation = fresh_stop(&daemon.client, run.id).await;
     daemon
         .client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop resource-census Run");
 }

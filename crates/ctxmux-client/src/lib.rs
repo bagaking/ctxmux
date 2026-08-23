@@ -17,9 +17,10 @@ use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, AttachmentCommandId, ClientFrame, ClientHello,
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
     ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
-    ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSignal,
-    RunSpec, RuntimeCapabilityVersionError, RuntimeIdentity, ServerFrame, StopDisposition,
-    TerminalSize, TmuxPaneInfo, decode_frame, encode_frame, validate_runtime_capability_version,
+    ProtocolError, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RecoverableInput, RecoverableStop,
+    Request, Response, RunEvent, RunId, RunInfo, RunSignal, RunSpec, RuntimeCapabilityVersionError,
+    RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey, TerminalSize, TmuxPaneInfo,
+    decode_frame, encode_frame, validate_runtime_capability_version,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -588,16 +589,61 @@ impl Client {
         )
     }
 
-    /// Terminate one live Run.
+    /// Apply or recover one caller-retained complete-session Stop operation.
+    ///
+    /// The operation retains its original daemon incarnation, exact Run, and
+    /// key across retries. A replacement daemon rejects it before Stop
+    /// admission.
     ///
     /// # Errors
     ///
-    /// Returns [`ClientError`] when the Run is not live or termination fails.
-    pub async fn stop(&self, id: RunId) -> Result<ControlAccepted<StopReceipt>, ClientError> {
-        decode_short_control(
-            self.control_request(Request::Stop { id }).await?,
+    /// Returns [`ClientError`] when the operation is rejected or no unique
+    /// result can be received.
+    pub async fn stop(
+        &self,
+        operation: RecoverableStop,
+    ) -> Result<ControlAccepted<StopReceipt>, ClientError> {
+        let expected_run = operation.id;
+        let accepted = decode_short_control(
+            self.control_request(Request::Stop { operation }).await?,
             decode_stop_receipt,
-        )
+        )?;
+        if accepted.run.id != expected_run {
+            return Err(control_request_unknown(
+                ClientError::ProtocolContractViolation(
+                    "recoverable Stop response names another Run",
+                ),
+            ));
+        }
+        Ok(accepted)
+    }
+
+    /// Prepare one fresh caller-owned Stop operation without applying it.
+    ///
+    /// The returned value is the retry credential. Retain it until Stop has a
+    /// unique result; do not generate a replacement key after response loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the Runtime identity cannot be obtained.
+    pub async fn prepare_stop(&self, id: RunId) -> Result<RecoverableStop, ClientError> {
+        let runtime = self.runtime_info().await?;
+        let advertised_version = runtime
+            .capabilities
+            .get(RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP)
+            .copied();
+        if advertised_version.is_none_or(|version| version < 1) {
+            return Err(ClientError::UnsupportedCapability {
+                capability: RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(),
+                required_version: 1,
+                advertised_version,
+            });
+        }
+        Ok(RecoverableStop {
+            daemon_instance: runtime.daemon_instance_id,
+            operation_key: StopOperationKey::random(),
+            id,
+        })
     }
 
     /// Attach after the cumulative output byte cursor already observed by the caller.

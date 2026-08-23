@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry, hash_map::RandomState},
+    collections::{HashMap, HashSet, hash_map::Entry, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
@@ -10,11 +10,15 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec,
+    CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, ErrorCode,
+    ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec, StopDisposition,
+    StopOperationKey,
 };
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
-use super::{Run, RunControl, read_lock, write_lock};
+use super::{Run, RunControl, STOP_ACK_TIMEOUT, control_not_applied, read_lock, write_lock};
+use crate::native_control::{ControlResult, PendingStop};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
 const CREATION_STRIPES: usize = 64;
@@ -968,6 +972,138 @@ pub(crate) enum CreationRequest {
     Fork { parent: RunId, plan: ForkPlan },
 }
 
+struct StopOperationCell {
+    result: watch::Sender<Option<ControlResult>>,
+}
+
+impl StopOperationCell {
+    fn new() -> Self {
+        let (result, _) = watch::channel(None);
+        Self { result }
+    }
+
+    async fn wait(&self) -> ControlResult {
+        let mut result = self.result.subscribe();
+        loop {
+            if let Some(result) = result.borrow().clone() {
+                return result;
+            }
+            result
+                .changed()
+                .await
+                .expect("retained Stop operation keeps its result owner");
+        }
+    }
+
+    fn settle(&self, result: ControlResult) {
+        let previous = self.result.send_replace(Some(result));
+        debug_assert!(previous.is_none(), "one Stop operation settles once");
+    }
+
+    fn from_settled(result: ControlResult) -> Self {
+        let (result, _) = watch::channel(Some(result));
+        Self { result }
+    }
+
+    fn settled(&self) -> Option<ControlResult> {
+        self.result.borrow().clone()
+    }
+}
+
+struct StopOperationRecord {
+    key: StopOperationKey,
+    cell: Arc<StopOperationCell>,
+}
+
+/// Settled recoverable Stop truth carried only across a same-incarnation
+/// exec-in-place handoff. Cold restart never loads this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandoffStopOperation {
+    pub(crate) run_id: RunId,
+    pub(crate) operation_key: StopOperationKey,
+    pub(crate) outcome: HandoffStopOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum HandoffStopOutcome {
+    Accepted { disposition: StopDisposition },
+    Unknown { failure: ControlFailure },
+}
+
+impl HandoffStopOperation {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        self.operation_key
+            .validate()
+            .map_err(|error| format!("invalid handoff native Stop key: {error}"))?;
+        if let HandoffStopOutcome::Unknown { failure } = &self.outcome {
+            if failure.disposition != CommandDisposition::Unknown {
+                return Err("handoff native Stop failure has a non-unknown disposition".to_owned());
+            }
+            if failure.error.message.len()
+                > crate::native_control::HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
+            {
+                return Err("handoff native Stop diagnostic exceeds its bounded size".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl HandoffStopOutcome {
+    fn into_result(self) -> ControlResult {
+        match self {
+            HandoffStopOutcome::Accepted { disposition } => {
+                Ok(ControlReceipt::Stop { disposition })
+            }
+            HandoffStopOutcome::Unknown { failure } => Err(failure),
+        }
+    }
+}
+
+pub(crate) struct RecoverableStopFlight {
+    run: Arc<Run>,
+    cell: Arc<StopOperationCell>,
+}
+
+impl RecoverableStopFlight {
+    pub(crate) async fn resolve(self) -> (RunInfo, ControlResult) {
+        let result = self.cell.wait().await;
+        (self.run.info(), result)
+    }
+}
+
+/// Daemon-owned settlement work created only for the first Stop admission.
+///
+/// Connections receive only [`RecoverableStopFlight`]. Keeping the native
+/// owner receiver here prevents attachment EOF or a dropped short response
+/// from cancelling settlement.
+pub(crate) struct RecoverableStopSettlement {
+    id: RunId,
+    key: StopOperationKey,
+    cell: Arc<StopOperationCell>,
+    _run: Arc<Run>,
+    pending: Option<PendingStop>,
+}
+
+impl RecoverableStopSettlement {
+    pub(crate) async fn wait(&mut self) -> ControlResult {
+        self.pending
+            .take()
+            .expect("one recoverable Stop settlement waits once")
+            .resolve(STOP_ACK_TIMEOUT)
+            .await
+    }
+}
+
+pub(crate) enum RecoverableStopAdmission {
+    Owner {
+        flight: RecoverableStopFlight,
+        settlement: RecoverableStopSettlement,
+    },
+    Retry(RecoverableStopFlight),
+}
+
 impl CreationRequest {
     fn matches_run(&self, run: &Run) -> bool {
         match (self, run.spec.as_ref(), run.lineage.as_ref()) {
@@ -1000,6 +1136,7 @@ impl CreationRequest {
 struct RegistryState {
     runs: HashMap<RunId, RegistryEntry>,
     creation_runs: HashMap<CreateOperationKey, RunId>,
+    stop_runs: HashMap<StopOperationKey, RunId>,
     reservations: HashMap<PublicationTicket, RegistryReservation>,
     next_ticket: u64,
     record_capacity: usize,
@@ -1010,6 +1147,7 @@ impl Default for RegistryState {
         Self {
             runs: HashMap::new(),
             creation_runs: HashMap::new(),
+            stop_runs: HashMap::new(),
             reservations: HashMap::new(),
             next_ticket: 0,
             record_capacity: MAX_RETAINED_RUNS,
@@ -1021,6 +1159,7 @@ impl Default for RegistryState {
 struct RegistryEntry {
     run: Arc<Run>,
     operation_key: Option<CreateOperationKey>,
+    stop_operation: Option<StopOperationRecord>,
     metadata_bytes: Option<Arc<AtomicU64>>,
     residency: RegistryResidency,
 }
@@ -1171,6 +1310,13 @@ fn projected_metadata_bytes(state: &RegistryState) -> u64 {
     retained.saturating_add(reserved)
 }
 
+fn stop_operation_conflict(message: &'static str) -> ControlFailure {
+    control_not_applied(ProtocolError::new(
+        ErrorCode::StopOperationConflict,
+        message,
+    ))
+}
+
 fn reserve_registry_insertion_capacity(state: &mut RegistryState) -> Result<(), ProtocolError> {
     let pending_capacity = state.reservations.len().saturating_add(1);
     state.runs.try_reserve(pending_capacity).map_err(|error| {
@@ -1256,6 +1402,7 @@ impl RunRegistry {
                     RegistryEntry {
                         run,
                         operation_key: Some(operation_key.clone()),
+                        stop_operation: None,
                         metadata_bytes: Some(metadata_bytes),
                         residency: RegistryResidency::Retained,
                     },
@@ -1267,6 +1414,75 @@ impl RunRegistry {
         }
         registry.sync_stats();
         registry
+    }
+
+    pub(crate) fn recovered_with_handoff_and_stats(
+        runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>,
+        stop_operations: Vec<HandoffStopOperation>,
+        qualification_stats: QualificationStats,
+    ) -> Result<Self, ProtocolError> {
+        let registry = Self::recovered_with_stats(runs, qualification_stats);
+        registry.restore_handoff_stop_operations(stop_operations)?;
+        Ok(registry)
+    }
+
+    fn restore_handoff_stop_operations(
+        &self,
+        stop_operations: Vec<HandoffStopOperation>,
+    ) -> Result<(), ProtocolError> {
+        let invalid = |message: String| ProtocolError::new(ErrorCode::InvalidRequest, message);
+        let mut run_ids = HashSet::with_capacity(stop_operations.len());
+        let mut keys = HashSet::with_capacity(stop_operations.len());
+        let mut state = write_lock(&self.state);
+        for operation in &stop_operations {
+            operation.validate().map_err(invalid)?;
+            if !run_ids.insert(operation.run_id) {
+                return Err(invalid(
+                    "handoff native Stop ledger contains a duplicate Run".to_owned(),
+                ));
+            }
+            if !keys.insert(operation.operation_key.clone()) {
+                return Err(invalid(
+                    "handoff native Stop ledger contains a duplicate key".to_owned(),
+                ));
+            }
+            let entry = state.runs.get(&operation.run_id).ok_or_else(|| {
+                invalid("handoff native Stop ledger names an unknown retained Run".to_owned())
+            })?;
+            if entry.stop_operation.is_some() {
+                return Err(invalid(
+                    "handoff native Stop ledger duplicates a restored operation".to_owned(),
+                ));
+            }
+        }
+        state
+            .stop_runs
+            .try_reserve(stop_operations.len())
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to reserve handed-off native Stop keys: {error}"),
+                )
+            })?;
+        for operation in stop_operations {
+            let HandoffStopOperation {
+                run_id: id,
+                operation_key: key,
+                outcome,
+            } = operation;
+            let cell = Arc::new(StopOperationCell::from_settled(outcome.into_result()));
+            state
+                .runs
+                .get_mut(&id)
+                .expect("validated handed-off Stop Run remains retained")
+                .stop_operation = Some(StopOperationRecord {
+                key: key.clone(),
+                cell,
+            });
+            let previous = state.stop_runs.insert(key, id);
+            debug_assert!(previous.is_none());
+        }
+        Ok(())
     }
 
     fn sync_stats(&self) {
@@ -1502,6 +1718,7 @@ impl RunRegistry {
             RegistryEntry {
                 run,
                 operation_key: entry_operation_key,
+                stop_operation: None,
                 metadata_bytes: publication_run.persistent_metadata_owner(),
                 residency: RegistryResidency::Retained,
             },
@@ -1533,6 +1750,7 @@ impl RunRegistry {
             RegistryEntry {
                 run,
                 operation_key: None,
+                stop_operation: None,
                 metadata_bytes: None,
                 residency: RegistryResidency::Retained,
             },
@@ -1543,6 +1761,198 @@ impl RunRegistry {
         sync_registry_stats(&self.qualification_stats, &state);
         drop(state);
         drop(removed);
+    }
+
+    /// Atomically bind or recover one native Stop operation while the exact
+    /// retained Run remains pinned. The Registry lock is the sole order
+    /// between the Runtime-global key index, the per-Run record, and native
+    /// Stop admission.
+    pub(crate) fn begin_recoverable_stop(
+        &self,
+        id: RunId,
+        key: StopOperationKey,
+    ) -> Result<RecoverableStopAdmission, ControlFailure> {
+        key.validate().map_err(|error| {
+            control_not_applied(ProtocolError::new(
+                ErrorCode::InvalidRequest,
+                error.to_string(),
+            ))
+        })?;
+
+        let mut state = write_lock(&self.state);
+        if let Some(bound_id) = state.stop_runs.get(&key).copied() {
+            if bound_id != id {
+                return Err(stop_operation_conflict(
+                    "native Stop operation key is already bound to another Run",
+                ));
+            }
+            let entry = state.runs.get(&id).ok_or_else(|| {
+                control_not_applied(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "native Stop key index lost its retained Run",
+                ))
+            })?;
+            if entry.residency != RegistryResidency::Retained {
+                return Err(control_not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    format!("Run {id} is being collected"),
+                )));
+            }
+            let record = entry.stop_operation.as_ref().ok_or_else(|| {
+                control_not_applied(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "native Stop key index lost its per-Run operation",
+                ))
+            })?;
+            if record.key != key {
+                return Err(control_not_applied(ProtocolError::new(
+                    ErrorCode::Internal,
+                    "native Stop key index disagrees with its per-Run operation",
+                )));
+            }
+            return Ok(RecoverableStopAdmission::Retry(RecoverableStopFlight {
+                run: Arc::clone(&entry.run),
+                cell: Arc::clone(&record.cell),
+            }));
+        }
+
+        let entry = state.runs.get(&id).ok_or_else(|| {
+            control_not_applied(ProtocolError::new(
+                ErrorCode::RunNotFound,
+                format!("Run {id} does not exist"),
+            ))
+        })?;
+        if entry.residency != RegistryResidency::Retained {
+            return Err(control_not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                format!("Run {id} is being collected"),
+            )));
+        }
+        if entry.stop_operation.is_some() {
+            return Err(stop_operation_conflict(
+                "Run already belongs to another native Stop operation",
+            ));
+        }
+        state.stop_runs.try_reserve(1).map_err(|error| {
+            control_not_applied(ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to reserve native Stop key ownership: {error}"),
+            ))
+        })?;
+
+        let entry = state
+            .runs
+            .get_mut(&id)
+            .expect("validated retained Run remains Registry-owned");
+        let pending = entry.run.begin_stop()?;
+        let cell = Arc::new(StopOperationCell::new());
+        entry.stop_operation = Some(StopOperationRecord {
+            key: key.clone(),
+            cell: Arc::clone(&cell),
+        });
+        let run = Arc::clone(&entry.run);
+        let previous = state.stop_runs.insert(key.clone(), id);
+        debug_assert!(previous.is_none());
+        Ok(RecoverableStopAdmission::Owner {
+            flight: RecoverableStopFlight {
+                run: Arc::clone(&run),
+                cell: Arc::clone(&cell),
+            },
+            settlement: RecoverableStopSettlement {
+                id,
+                key,
+                cell,
+                _run: run,
+                pending: Some(pending),
+            },
+        })
+    }
+
+    pub(crate) fn settle_recoverable_stop(
+        &self,
+        settlement: RecoverableStopSettlement,
+        result: ControlResult,
+    ) {
+        let RecoverableStopSettlement {
+            id,
+            key,
+            cell,
+            _run,
+            pending: _,
+        } = settlement;
+        let remove = matches!(
+            &result,
+            Err(failure) if failure.disposition == CommandDisposition::NotApplied
+        );
+        let mut state = write_lock(&self.state);
+        let entry = state
+            .runs
+            .get_mut(&id)
+            .expect("in-flight Stop operation pins its retained Run");
+        let record = entry
+            .stop_operation
+            .as_ref()
+            .expect("in-flight Stop operation keeps its per-Run record");
+        assert_eq!(record.key, key, "Stop settlement retains its exact key");
+        assert!(
+            Arc::ptr_eq(&record.cell, &cell),
+            "Stop settlement retains its exact result cell"
+        );
+        if remove {
+            entry.stop_operation = None;
+            let mapped = state.stop_runs.remove(&key);
+            debug_assert_eq!(mapped, Some(id));
+        }
+        cell.settle(result);
+    }
+
+    /// Snapshot only complete Stop operations for a same-incarnation planned
+    /// exec. The request drain must have settled every admitted owner first;
+    /// a pending cell aborts the reversible handoff phase.
+    pub(crate) fn handoff_stop_operations(&self) -> Result<Vec<HandoffStopOperation>, String> {
+        let state = read_lock(&self.state);
+        let mut operations = Vec::with_capacity(state.stop_runs.len());
+        for (id, entry) in &state.runs {
+            let Some(record) = &entry.stop_operation else {
+                continue;
+            };
+            if entry.residency != RegistryResidency::Retained {
+                return Err(format!(
+                    "Run {id} native Stop operation is crossing collection at handoff"
+                ));
+            }
+            let result = record
+                .cell
+                .settled()
+                .ok_or_else(|| format!("Run {id} has a pending recoverable Stop at handoff"))?;
+            let outcome = match result {
+                Ok(ControlReceipt::Stop { disposition }) => {
+                    HandoffStopOutcome::Accepted { disposition }
+                }
+                Ok(_) => {
+                    return Err(format!(
+                        "Run {id} native Stop ledger retained another receipt kind"
+                    ));
+                }
+                Err(failure) if failure.disposition == CommandDisposition::Unknown => {
+                    HandoffStopOutcome::Unknown { failure }
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "Run {id} native Stop ledger retained a not-applied result"
+                    ));
+                }
+            };
+            let operation = HandoffStopOperation {
+                run_id: *id,
+                operation_key: record.key.clone(),
+                outcome,
+            };
+            operation.validate()?;
+            operations.push(operation);
+        }
+        operations.sort_by_key(|operation| operation.run_id.to_string());
+        Ok(operations)
     }
 
     /// Atomically clone a long-lived owner while the Registry still owns it.
@@ -1628,6 +2038,7 @@ impl RunRegistry {
             RegistryEntry {
                 run,
                 operation_key: None,
+                stop_operation: None,
                 metadata_bytes: None,
                 residency: RegistryResidency::Retained,
             },
@@ -1766,6 +2177,10 @@ fn consume_reservation(
         debug_assert_eq!(removed.residency, RegistryResidency::Collecting(ticket));
         if let Some(candidate_key) = &removed.operation_key {
             let mapped = state.creation_runs.remove(candidate_key);
+            debug_assert_eq!(mapped, Some(candidate));
+        }
+        if let Some(stop_operation) = &removed.stop_operation {
+            let mapped = state.stop_runs.remove(&stop_operation.key);
             debug_assert_eq!(mapped, Some(candidate));
         }
         reservation_owner.removed.push(removed);
