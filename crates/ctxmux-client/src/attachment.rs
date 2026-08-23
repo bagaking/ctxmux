@@ -583,6 +583,7 @@ struct EventInboxState {
     pending_gap: Option<u64>,
     terminal: Option<RunEvent>,
     saw_terminal: bool,
+    saw_observation_discontinuity: bool,
     closed: bool,
     error: Option<ClientError>,
 }
@@ -596,6 +597,7 @@ impl EventInbox {
                 pending_gap: None,
                 terminal: None,
                 saw_terminal: false,
+                saw_observation_discontinuity: false,
                 closed: false,
                 error: None,
             }),
@@ -611,6 +613,14 @@ impl EventInbox {
         }
         if state.saw_terminal {
             return Err("daemon sent an event after terminal lifecycle");
+        }
+        if state.saw_observation_discontinuity
+            && !matches!(
+                &event,
+                RunEvent::Exited { .. } | RunEvent::Interrupted { .. }
+            )
+        {
+            return Err("daemon sent a non-terminal event after observation discontinuity");
         }
 
         match event {
@@ -648,7 +658,10 @@ impl EventInbox {
                     return Err("daemon sent more than one terminal lifecycle event");
                 }
             }
-            event @ RunEvent::Tmux { .. } => {
+            event @ (RunEvent::Tmux { .. } | RunEvent::ObservationDiscontinuity) => {
+                if matches!(&event, RunEvent::ObservationDiscontinuity) {
+                    state.saw_observation_discontinuity = true;
+                }
                 let bytes = event_bytes(&event);
                 let required_slots = 1 + usize::from(state.pending_gap.is_some());
                 if state.queue.len().saturating_add(required_slots) > MAX_QUEUED_EVENTS
@@ -673,8 +686,9 @@ impl EventInbox {
         Ok(())
     }
 
-    fn saw_terminal(&self) -> bool {
-        lock(&self.state).saw_terminal
+    fn accepts_clean_eof(&self) -> bool {
+        let state = lock(&self.state);
+        state.saw_terminal || state.saw_observation_discontinuity
     }
 
     fn close(&self, error: Option<ClientError>) {
@@ -746,6 +760,7 @@ fn event_bytes(event: &RunEvent) -> usize {
         RunEvent::Exited { .. }
         | RunEvent::Interrupted { .. }
         | RunEvent::Tmux { .. }
+        | RunEvent::ObservationDiscontinuity
         | RunEvent::Gap { .. } => 0,
     }
 }
@@ -788,7 +803,8 @@ async fn reader_loop(mut stream: WireStream, shared: Arc<AttachmentShared>) {
                 return;
             }
             None => {
-                let event_error = (!shared.events.saw_terminal()).then_some(ClientError::Closed);
+                let event_error =
+                    (!shared.events.accepts_clean_eof()).then_some(ClientError::Closed);
                 shared.terminate(AttachmentUnknownReason::TransportTerminated, event_error);
                 return;
             }
@@ -1045,6 +1061,40 @@ mod tests {
             Some(RunEvent::Tmux {
                 event: TmuxRunEvent::Paused
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_output_gaps_coalesce_but_observation_loss_fails_closed() {
+        let gaps = EventInbox::new();
+        gaps.push(RunEvent::Gap {
+            latest_output_bytes: 1,
+        })
+        .expect("accept first output Gap");
+        gaps.push(RunEvent::Gap {
+            latest_output_bytes: 7,
+        })
+        .expect("coalesce later output Gap");
+        assert_eq!(
+            gaps.next().await.unwrap(),
+            Some(RunEvent::Gap {
+                latest_output_bytes: 7,
+            })
+        );
+
+        let observations = EventInbox::new();
+        for _ in 0..MAX_QUEUED_EVENTS {
+            observations
+                .push(RunEvent::Tmux {
+                    event: TmuxRunEvent::Paused,
+                })
+                .expect("retain bounded non-output observation");
+        }
+        assert_eq!(
+            observations.push(RunEvent::Tmux {
+                event: TmuxRunEvent::Paused,
+            }),
+            Err("bounded event inbox cannot represent a non-output event loss")
         );
     }
 

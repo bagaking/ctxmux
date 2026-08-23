@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects. Optional `--state-dir` mode recovers historical Run state and committed replay after cold restart and preserves live PTY control across a planned exec-in-place `SIGHUP` upgrade. Existing attachments reconnect.                                                                                                                                                                                                                            | Crash-time PTY adoption and host-reboot process continuity remain unsupported.                                                   |
 | Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                                                                                                                                                                                     | Windows transport and multi-daemon discovery are open.                                                                           |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 12, including a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 13, including a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                                                                                                                                                                                                                                                      | Multi-writer policy remains open.                                                                                                |
 | Input recovery   | A native operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. The cursor and complete settled ledger cross a planned exec-in-place upgrade with the preserved instance. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                                                                                                   | Cold-restart exactly-once and semantic acknowledgement remain above or outside ctxmux.                                           |
 | Stop recovery    | One caller-retained operation joins or replays the complete-session Stop receipt across connection loss. A Runtime-global key binding and one per-Run record fence conflicts before mutation, survive planned exec, and end at exact Run collection.                                                                                                                                                                                                                                     | Cold-restart exactly-once and recoverable Resize/Interrupt remain unsupported.                                                   |
@@ -41,7 +41,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v12)
+                    Unix domain socket (v13)
                               |
                     long-lived ctxmux daemon
                     - RunManager / RunRegistry / Run identity
@@ -312,6 +312,9 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 4. Rust and TypeScript clients reassemble those bounded frames before returning
    the public snapshot. Live chunks already covered by that snapshot are
    deduplicated by cumulative byte range.
+   If terminal state becomes authoritative in the subscribe/snapshot join
+   window after an unreplayable tmux observation, the attachment emits
+   `ObservationDiscontinuity` before its single snapshot-derived terminal event.
 5. Clean detach returns `Detached`; abrupt socket closure drops the attachment guard. Both leave the Run in `RunManager`.
 6. A later attachment resumes from its last observed byte cursor or detects that retained output was evicted.
 
@@ -406,7 +409,7 @@ daemon-loss, and unwind restoration paths remain broader qualification work.
 The TypeScript SDK buffers fragmented or coalesced socket data into newline
 frames, enforces the frame byte limit, applies bounded inbound backpressure,
 and mirrors the Rust request and attachment operations. It runtime-validates
-every nested generation-12 server variant before exposing it. Each Rust and
+every nested generation-13 server variant before exposing it. Each Rust and
 TypeScript Attachment has one inbound router: command results resolve a
 bounded pending map while events enter a separately bounded delivery inbox, so
 a slow event consumer does not create a competing socket reader or hide a
@@ -426,7 +429,7 @@ The important guarantees are behavioral, not implied by lock types.
 
 - Output byte ranges are allocated under the output-log mutex before broadcast.
 - Attachment subscribes before snapshot and suppresses live chunks whose byte range is already in replay.
-- A slow attachment that overruns the Tokio broadcast buffer receives `Gap { latest_output_bytes }`; the client must reattach from its own last observed byte cursor.
+- A slow attachment that loses only raw output receives `Gap { latest_output_bytes }`; the client must reattach from its own last observed byte cursor. If the skipped interval contains a tmux observation, it receives cursor-free `ObservationDiscontinuity` and ends because byte replay cannot repair that semantic loss. A skipped terminal publication is reconstructed once from authoritative `RunState` before EOF rather than mislabeled as tmux observation loss.
 - Attachment command IDs start at one and increase within one connection.
   They provide correlation, not deduplication. A non-increasing ID is fatal
   before mutation; reconnect starts a new ID scope and cannot settle old work.
@@ -604,7 +607,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 12                                     | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 13                                     | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                                    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                                       | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |

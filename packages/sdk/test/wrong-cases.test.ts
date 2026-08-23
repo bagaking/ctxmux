@@ -2371,7 +2371,7 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
     for (let sequence = 1; sequence <= 257; sequence += 1) {
       peer.send({
         type: "event",
-        event: { type: "gap", latest_output_bytes: sequence },
+        event: { type: "tmux", event: { type: "paused" } },
       });
     }
   });
@@ -2382,8 +2382,8 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
   await delay(50);
   for (let expected = 1; expected <= 256; expected += 1) {
     assert.deepEqual(await attachment.nextEvent(), {
-      type: "gap",
-      latest_output_bytes: expected,
+      type: "tmux",
+      event: { type: "paused" },
     });
   }
   await assert.rejects(
@@ -2391,6 +2391,53 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
     (error: unknown) =>
       error instanceof CtxmuxInvalidFrameError && error.path === "$frame.event",
   );
+});
+
+test("SDK-02 treats observation discontinuity EOF as a clean attachment end", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    peer.send({
+      type: "event",
+      event: { type: "observation_discontinuity" },
+    });
+    socket.end();
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "observation_discontinuity",
+  });
+  assert.equal(await attachment.nextEvent(), undefined);
+});
+
+test("SDK-02 coalesces daemon output Gaps at the latest byte cursor", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      peer.send({
+        type: "event",
+        event: { type: "gap", latest_output_bytes: sequence },
+      });
+    }
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  await delay(50);
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "gap",
+    latest_output_bytes: 257,
+  });
+  attachment.close();
 });
 
 async function testRequestClose(
