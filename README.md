@@ -110,6 +110,38 @@ const attachment = await client.attach(run.id);
 
 See [`packages/sdk/README.md`](packages/sdk/README.md).
 
+### Fence dispatch to one Runtime
+
+Automation that must not mutate a replacement Runtime should retain the exact
+`RuntimeIdentity` observed on a trusted connection and require it on later
+business calls:
+
+```ts
+import {
+  CtxmuxClient,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+} from "@ctxmux/sdk";
+
+const socketPath = "target/ctxmux.sock";
+const observed = await new CtxmuxClient({ socketPath }).runtimeInfo();
+const guarded = new CtxmuxClient({
+  socketPath,
+  expectedRuntimeIdentity: observed,
+  requiredCapabilities: {
+    [RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP]: 1,
+  },
+});
+
+await guarded.list();
+```
+
+The TypeScript and Rust clients compare the complete expected identity and
+capability requirements against Hello on the same connection that would carry
+the Request or Attach frame. A mismatch returns a typed client-local error and
+sends no business frame. `runtimeInfo()` remains a raw diagnostic path; the
+Rust equivalents are `Client::with_expected_runtime_identity` and
+`Client::with_required_capabilities`.
+
 ## Read-only tmux import
 
 ```bash
@@ -135,7 +167,11 @@ are rejected. Closing the ctxmux client leaves the tmux pane running.
 
 Pre-alpha. The daemon owns a real native PTY Run. The CLI and SDK are both
 clients of that Run. Interactive attach reconstructs the current screen;
-the protocol still carries raw bytes. Transport is Unix sockets. Persistent
-mode recovers committed history after cold restart and preserves live PTY
-control across a planned exec-in-place `SIGHUP` upgrade. Crash-time adoption and
-host-reboot process continuity remain unsupported.
+the generation-13 protocol still carries raw bytes. A raw-output `Gap` can be
+recovered by reattaching from the caller's last observed byte cursor; a
+non-output observation discontinuity ends that attachment because byte replay
+cannot restore the missing semantics. Persistent mode recovers committed
+history after cold restart, retries an exact ordered mutation while SQLite
+reports `DiskFull`, and preserves live PTY control across a planned
+exec-in-place `SIGHUP` upgrade. Crash-time adoption and host-reboot process
+continuity remain unsupported.
