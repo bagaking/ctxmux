@@ -2040,10 +2040,21 @@ mod tests {
     use portable_pty::PtySize;
 
     use super::{
-        ChildCommand, HandoffInputOperation, InputDrainGate, NativeControlOwner,
+        ChildCommand, HandoffInputOperation, HandoffInputState, InputDrainGate, NativeControlOwner,
         PortablePtyControl, PtyControl, StopOwnerResult, mutex_lock,
     };
     use crate::native_runtime::NativeRunOwner;
+
+    async fn wait_for_handoff_input_state(owner: &NativeControlOwner) -> HandoffInputState {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match owner.handoff_input_state() {
+                Ok(state) => return state,
+                Err(_) if Instant::now() < deadline => tokio::task::yield_now().await,
+                Err(error) => panic!("native Input owner did not become handoff-ready: {error}"),
+            }
+        }
+    }
 
     struct FakePty {
         size: Mutex<PtySize>,
@@ -2710,9 +2721,7 @@ mod tests {
             .resolve()
             .await
             .expect("apply original operation");
-        let snapshot = original
-            .handoff_input_state()
-            .expect("settled ledger is handoff-ready");
+        let snapshot = wait_for_handoff_input_state(&original).await;
         assert_eq!(snapshot.applied_input_bytes, 1);
         assert!(matches!(
             snapshot.operations.as_slice(),
@@ -2775,9 +2784,7 @@ mod tests {
             .resolve()
             .await
             .expect_err("partial write is unknown");
-        let snapshot = original
-            .handoff_input_state()
-            .expect("settled unknown ledger is handoff-ready");
+        let snapshot = wait_for_handoff_input_state(&original).await;
         assert_eq!(snapshot.applied_input_bytes, 0);
         assert!(snapshot.input_failure.is_some());
 
@@ -2838,9 +2845,7 @@ mod tests {
         );
         release_writer(&release);
         pending.resolve().await.expect("crossing operation settles");
-        owner
-            .handoff_input_state()
-            .expect("settled operation becomes handoff-ready");
+        wait_for_handoff_input_state(&owner).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
