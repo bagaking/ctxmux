@@ -16,8 +16,8 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    AttachedSnapshot, ErrorCode, ForkPlan, InterruptionReason, ReplayCapability, RunBackend,
-    RunCapabilities, RunEvent, RunId, RunSpec, RunState, TerminalSize, TmuxRunEvent,
+    AttachedSnapshot, ErrorCode, ForkPlan, InterruptionReason, RecoverableStop, ReplayCapability,
+    RunBackend, RunCapabilities, RunEvent, RunId, RunSpec, RunState, TerminalSize, TmuxRunEvent,
 };
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -36,6 +36,13 @@ const FIXTURE_SHELL: &str = concat!(
     "*) printf 'OUT:%s\\n' \"$line\" ;; ",
     "esac; done"
 );
+
+async fn fresh_stop(client: &Client, id: RunId) -> RecoverableStop {
+    client
+        .prepare_stop(id)
+        .await
+        .expect("prepare recoverable Stop operation")
+}
 
 struct TestDaemon {
     child: Child,
@@ -2198,6 +2205,7 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
     let client = daemon.client();
     let (run, pane_process_id) = import_only_pane(&client, &server).await;
 
+    let attachment_stop = fresh_stop(&client, run.id).await;
     let (attachment, _) = attach_with_timeout(&client, run.id, 0).await;
     assert_protocol_error(
         attachment
@@ -2217,7 +2225,7 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
         ErrorCode::UnsupportedCapability,
     );
     assert_protocol_error(
-        attachment.stop().await.unwrap_err(),
+        attachment.stop(attachment_stop).await.unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
     assert_protocol_error(
@@ -2246,8 +2254,9 @@ async fn unsupported_controls_and_persistent_import_fail_closed() {
             .unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
+    let short_stop = fresh_stop(&client, run.id).await;
     assert_protocol_error(
-        client.stop(run.id).await.unwrap_err(),
+        client.stop(short_stop).await.unwrap_err(),
         ErrorCode::UnsupportedCapability,
     );
     assert_protocol_error(

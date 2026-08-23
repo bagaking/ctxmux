@@ -894,9 +894,10 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     let initial_head = recorded.info().latest_output_bytes;
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
 
+    let stop_operation = fresh_stop(&server.client, run.id).await;
     server
         .client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop finalize response Run");
     finalize_reached
@@ -926,7 +927,8 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     .await
     .expect("another Run Signal is not blocked by finalize")
     .expect("another Run Signal reaches its owner");
-    tokio::time::timeout(Duration::from_secs(2), server.client.stop(control_run.id))
+    let control_stop = fresh_stop(&server.client, control_run.id).await;
+    tokio::time::timeout(Duration::from_secs(2), server.client.stop(control_stop))
         .await
         .expect("another Run Stop receipt stays bounded during finalize")
         .expect("another Run Stop retains exact cleanup admission");
@@ -1010,9 +1012,10 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .await
         .is_ok_and(|status| status.state.is_running())
     {
+        let stop_operation = fresh_stop(&server.client, signal_run.id).await;
         server
             .client
-            .stop(signal_run.id)
+            .stop(stop_operation)
             .await
             .expect("stop signal responsiveness fixture");
     }
@@ -1052,9 +1055,10 @@ async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
         .await
         .expect("start finalize shutdown Run");
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
+    let stop_operation = fresh_stop(&server.client, run.id).await;
     server
         .client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("Stop receipt precedes durable finalize");
     finalize_reached
@@ -1900,10 +1904,11 @@ async fn assert_collecting_public_matrix(
             .expect_err("Collecting Run rejects Resize"),
         ErrorCode::BackendUnavailable,
     );
+    let stop_operation = fresh_stop(&server.client, id).await;
     assert_control_not_applied(
         server
             .client
-            .stop(id)
+            .stop(stop_operation)
             .await
             .expect_err("Collecting Run rejects Stop"),
         ErrorCode::BackendUnavailable,
@@ -1975,10 +1980,11 @@ async fn assert_removed_public_matrix(server: &InProcessServer, id: RunId) {
             .expect_err("removed Run rejects Resize"),
         ErrorCode::RunNotFound,
     );
+    let stop_operation = fresh_stop(&server.client, id).await;
     assert_control_not_applied(
         server
             .client
-            .stop(id)
+            .stop(stop_operation)
             .await
             .expect_err("removed Run rejects Stop"),
         ErrorCode::RunNotFound,
@@ -2035,6 +2041,91 @@ fn capacity_test_manager(record_capacity: usize) -> (Arc<RunManager>, Arc<Creati
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recoverable_stop_collection_blocks_in_flight_and_reuses_key_after_exact_removal() {
+    let (manager, _hook) = capacity_test_manager(1);
+    let server = InProcessServer::start(Arc::clone(&manager));
+    let marker = server
+        .directory
+        .path()
+        .join("recoverable-stop-collection.log");
+    let first = server
+        .client
+        .start(term_ignoring_marker_spec(&marker))
+        .await
+        .expect("start the only retained Stop candidate");
+    assert_eq!(
+        wait_for_marker_pids(&marker, 1).await,
+        [first.pid.expect("native Stop candidate has a PID")]
+    );
+
+    let operation = fresh_stop(&server.client, first.id).await;
+    let stop_client = server.client.clone();
+    let stop_operation = operation.clone();
+    let stopping = tokio::spawn(async move { stop_client.stop(stop_operation).await });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if manager
+                .registry
+                .handoff_stop_operations()
+                .is_err_and(|failure| failure.contains("pending recoverable Stop"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recoverable Stop reaches daemon-owned settlement");
+
+    let rejected = server
+        .client
+        .start(short_lived_spec())
+        .await
+        .expect_err("an in-flight Stop settlement cannot be collected");
+    assert_protocol_code(rejected, ErrorCode::RunCapacity);
+    assert_eq!(
+        server.client.list().await.unwrap()[0].id,
+        first.id,
+        "failed replacement leaves the exact Stop owner retained"
+    );
+
+    let settled = stopping
+        .await
+        .expect("Stop settlement task remains live")
+        .expect("Stop reaches one terminal result");
+    assert_eq!(settled.receipt.disposition, StopDisposition::Forced);
+    wait_for_run_terminal_async(&manager.get(first.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    let replacement = server
+        .client
+        .start(long_running_spec())
+        .await
+        .expect("settled Stop candidate can fund exact replacement");
+    assert_protocol_code(
+        server
+            .client
+            .status(first.id)
+            .await
+            .expect_err("collected Stop Run is no longer retained"),
+        ErrorCode::RunNotFound,
+    );
+
+    let reused = RecoverableStop {
+        id: replacement.id,
+        ..operation
+    };
+    let replacement_stop = server
+        .client
+        .stop(reused)
+        .await
+        .expect("exact collection releases the old Stop key for a new Run");
+    assert_eq!(replacement_stop.run.id, replacement.id);
+    wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_creation_retries_publish_exactly_one_run() {
     let server = InProcessServer::start(Arc::new(RunManager::default()));
     let marker = server.directory.path().join("concurrent-starts.log");
@@ -2082,7 +2173,12 @@ async fn concurrent_creation_retries_publish_exactly_one_run() {
     assert_eq!(wait_for_marker_pids(&marker, 1).await, vec![pid]);
     assert!(process_exists(pid), "the one published child remains live");
     assert!(process_exists(unrelated.pid()));
-    server.client.stop(first.id).await.expect("stop one Run");
+    let stop_operation = fresh_stop(&server.client, first.id).await;
+    server
+        .client
+        .stop(stop_operation)
+        .await
+        .expect("stop one Run");
     assert!(process_exists(unrelated.pid()));
 }
 
@@ -2155,9 +2251,10 @@ async fn response_loss_retry_returns_the_published_run_without_respawn() {
     );
     assert!(process_exists(retried.pid.expect("native Run PID")));
     assert!(process_exists(unrelated.pid()));
+    let stop_operation = fresh_stop(&server.client, retried.id).await;
     server
         .client
-        .stop(retried.id)
+        .stop(stop_operation)
         .await
         .expect("stop retried Run");
     assert!(process_exists(unrelated.pid()));
@@ -2206,9 +2303,10 @@ async fn conflicting_creation_key_reuse_is_typed_and_does_not_spawn() {
     );
     assert!(process_exists(original.pid.expect("original PID")));
     assert!(process_exists(unrelated.pid()));
+    let stop_operation = fresh_stop(&server.client, original.id).await;
     server
         .client
-        .stop(original.id)
+        .stop(stop_operation)
         .await
         .expect("stop original Run");
     assert!(process_exists(unrelated.pid()));
@@ -2240,9 +2338,10 @@ async fn failed_unpublished_creation_does_not_consume_the_key() {
         .await
         .expect("uncommitted failure releases its key");
     assert_eq!(server.client.list().await.unwrap().len(), 1);
+    let stop_operation = fresh_stop(&server.client, retried.id).await;
     server
         .client
-        .stop(retried.id)
+        .stop(stop_operation)
         .await
         .expect("stop retry Run");
 }
@@ -2848,6 +2947,24 @@ fn hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
         args: vec![
             "-c".to_owned(),
             "trap '' HUP; printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; exec /bin/sleep 30"
+                .to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::from([(
+            "CTXMUX_CREATION_MARKER".to_owned(),
+            marker.to_string_lossy().into_owned(),
+        )]),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn term_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "trap '' TERM; printf '%s\\n' \"$$\" >> \"$CTXMUX_CREATION_MARKER\"; exec /bin/sleep 30"
                 .to_owned(),
         ],
         cwd: None,

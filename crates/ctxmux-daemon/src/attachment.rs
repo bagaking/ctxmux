@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use ctxmux_protocol::{
     AttachedHeader, AttachedSnapshot, AttachmentCommandId, ClientFrame, ControlOutcome, ErrorCode,
-    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RunEvent, RunId, RunSignal,
-    RunState, ServerFrame, TerminalSize,
+    OutputChunk, OutputReplay, OutputReplayHeader, ProtocolError, RecoverableStop, RunEvent, RunId,
+    RunSignal, RunState, ServerFrame, TerminalSize,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{net::UnixStream, sync::broadcast};
@@ -14,8 +14,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 #[cfg(test)]
 use super::AttachmentHookPoint;
 use super::{
-    ConnectionError, ControlResult, Run, RunManager, STOP_ACK_TIMEOUT, UpgradeRequestAdmission,
-    UpgradeRequestPermit, control_not_applied, invalid_request, receive, send, upgrade_retry_error,
+    ConnectionError, ControlResult, Run, RunManager, UpgradeRequestAdmission, UpgradeRequestPermit,
+    control_not_applied, invalid_request, receive, send, upgrade_retry_error,
 };
 
 pub(super) async fn handle(
@@ -157,12 +157,64 @@ enum ControlCommand {
     Input(Vec<u8>),
     Resize(TerminalSize),
     Signal(RunSignal),
-    Stop,
+    Stop(RecoverableStop),
+}
+
+impl ControlState {
+    async fn handle_stop_command(
+        &mut self,
+        wire: &mut Framed<UnixStream, LinesCodec>,
+        manager: &Arc<RunManager>,
+        attached_run: RunId,
+        results: &mut PendingResults,
+        command: (AttachmentCommandId, RecoverableStop),
+        permit: UpgradeRequestPermit,
+    ) -> Result<(), ConnectionError> {
+        let (command_id, operation) = command;
+        if let Err(failure) = manager.validate_recoverable_stop(&operation, Some(attached_run)) {
+            send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+            drop(permit);
+            return Ok(());
+        }
+        if self.pending_stop.is_some() {
+            send_command_result(
+                wire,
+                command_id,
+                ControlOutcome::Rejected {
+                    failure: control_not_applied(ProtocolError::new(
+                        ErrorCode::ControlBackpressure,
+                        "attachment already has one pending Stop result",
+                    )),
+                },
+            )
+            .await?;
+            drop(permit);
+            return Ok(());
+        }
+
+        match manager.begin_recoverable_stop(operation) {
+            Ok(pending) => {
+                self.pending_stop = Some(command_id);
+                results.push(
+                    async move {
+                        let (_, result) = pending.resolve().await;
+                        (command_id, outcome(result), permit)
+                    }
+                    .boxed(),
+                );
+            }
+            Err(failure) => {
+                send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+                drop(permit);
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn handle_frame(
     wire: &mut Framed<UnixStream, LinesCodec>,
-    manager: &RunManager,
+    manager: &Arc<RunManager>,
     run: &Arc<Run>,
     controls: &mut ControlState,
     results: &mut PendingResults,
@@ -174,7 +226,10 @@ async fn handle_frame(
         ClientFrame::Input { command_id, data } => (command_id, ControlCommand::Input(data)),
         ClientFrame::Resize { command_id, size } => (command_id, ControlCommand::Resize(size)),
         ClientFrame::Signal { command_id, signal } => (command_id, ControlCommand::Signal(signal)),
-        ClientFrame::Stop { command_id } => (command_id, ControlCommand::Stop),
+        ClientFrame::Stop {
+            command_id,
+            operation,
+        } => (command_id, ControlCommand::Stop(operation)),
         ClientFrame::Detach => {
             #[cfg(test)]
             if let Some(hook) = &manager.attachment_hook {
@@ -240,25 +295,18 @@ async fn handle_frame(
                 drop(permit);
             }
         },
-        ControlCommand::Stop => match run.begin_stop() {
-            Ok(pending) => {
-                controls.pending_stop = Some(command_id);
-                results.push(
-                    async move {
-                        (
-                            command_id,
-                            outcome(pending.resolve(STOP_ACK_TIMEOUT).await),
-                            permit,
-                        )
-                    }
-                    .boxed(),
-                );
-            }
-            Err(failure) => {
-                send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
-                drop(permit);
-            }
-        },
+        ControlCommand::Stop(operation) => {
+            controls
+                .handle_stop_command(
+                    wire,
+                    manager,
+                    run.id,
+                    results,
+                    (command_id, operation),
+                    permit,
+                )
+                .await?;
+        }
     }
     Ok(false)
 }

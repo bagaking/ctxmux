@@ -12,13 +12,16 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 10;
+pub const PROTOCOL_VERSION: u16 = 11;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
 
 /// Apply or recover one caller-keyed native Input operation.
 pub const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT: &str = "native.recoverable_input";
+
+/// Apply or recover one caller-keyed native complete-session Stop operation.
+pub const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP: &str = "native.recoverable_stop";
 
 /// Execute a portable Level A fork from a compatible retained Run.
 pub const RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A: &str = "native.fork_level_a";
@@ -48,6 +51,9 @@ pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
 
 /// Maximum UTF-8 byte length of one caller-owned native Input operation key.
 pub const MAX_INPUT_OPERATION_KEY_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of one caller-owned native Stop operation key.
+pub const MAX_STOP_OPERATION_KEY_BYTES: usize = 128;
 
 /// Maximum UTF-8 byte length of one daemon-authored build identity.
 pub const MAX_RUNTIME_BUILD_ID_BYTES: usize = 128;
@@ -476,6 +482,85 @@ pub enum InputOperationKeyError {
     TooLong { actual: usize, maximum: usize },
 }
 
+/// Caller-owned identity for one recoverable native Stop operation.
+///
+/// Equality is byte-exact. The daemon binds one key to one retained Run and
+/// one daemon incarnation until that exact Run is collected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct StopOperationKey(String);
+
+impl StopOperationKey {
+    /// Validate and retain one opaque Stop operation key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StopOperationKeyError`] when the key is empty or exceeds
+    /// [`MAX_STOP_OPERATION_KEY_BYTES`] UTF-8 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, StopOperationKeyError> {
+        let key = Self(value.into());
+        key.validate()?;
+        Ok(key)
+    }
+
+    /// Generate a fresh opaque key for one logical Stop operation.
+    #[must_use]
+    pub fn random() -> Self {
+        Self(Uuid::new_v4().to_string())
+    }
+
+    /// Return the exact opaque value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validate a key received through an untrusted protocol decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StopOperationKeyError`] for an empty or oversized value.
+    pub fn validate(&self) -> Result<(), StopOperationKeyError> {
+        let bytes = self.0.len();
+        if bytes == 0 {
+            return Err(StopOperationKeyError::Empty);
+        }
+        if bytes > MAX_STOP_OPERATION_KEY_BYTES {
+            return Err(StopOperationKeyError::TooLong {
+                actual: bytes,
+                maximum: MAX_STOP_OPERATION_KEY_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for StopOperationKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for StopOperationKey {
+    type Err = StopOperationKeyError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Invalid caller-owned native Stop operation key.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum StopOperationKeyError {
+    /// The key has no bytes.
+    #[error("native Stop operation key must not be empty")]
+    Empty,
+    /// The UTF-8 representation exceeds the public bound.
+    #[error("native Stop operation key is {actual} bytes; maximum is {maximum}")]
+    TooLong { actual: usize, maximum: usize },
+}
+
 /// Exact native Input byte range applied by one recoverable operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct AppliedInputRange {
@@ -790,6 +875,17 @@ pub struct RecoverableInput {
     pub data: Vec<u8>,
 }
 
+/// Caller-retained request for one recoverable native Stop operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RecoverableStop {
+    /// Daemon incarnation originally observed by the caller.
+    pub daemon_instance: DaemonInstanceId,
+    /// Runtime-global operation key retained across response loss.
+    pub operation_key: StopOperationKey,
+    /// Exact native Run whose complete owned session will be stopped.
+    pub id: RunId,
+}
+
 /// Portable signal semantics exposed by a native Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -1049,8 +1145,8 @@ pub enum Request {
     Resize { id: RunId, size: TerminalSize },
     /// Deliver one portable signal to a live Run.
     Signal { id: RunId, signal: RunSignal },
-    /// Terminate the complete owned native Run session.
-    Stop { id: RunId },
+    /// Apply or recover one complete-session native Stop operation.
+    Stop { operation: RecoverableStop },
     /// Attach to retained output and future lifecycle events.
     Attach {
         id: RunId,
@@ -1083,8 +1179,11 @@ pub enum ClientFrame {
         command_id: AttachmentCommandId,
         signal: RunSignal,
     },
-    /// Stop the attached Run.
-    Stop { command_id: AttachmentCommandId },
+    /// Apply or recover one Stop operation for the attached Run.
+    Stop {
+        command_id: AttachmentCommandId,
+        operation: RecoverableStop,
+    },
     /// Close this attachment without affecting the Run.
     Detach,
 }
@@ -1243,6 +1342,8 @@ pub enum ErrorCode {
     CreationConflict,
     /// A retained per-Run Input key names a different canonical request.
     InputOperationConflict,
+    /// A retained native Stop key or Run names another Stop operation.
+    StopOperationConflict,
     /// Recoverable Input expected another applied-input cursor.
     InputCursorMismatch,
     /// Recoverable Input belongs to another daemon incarnation.
@@ -1428,14 +1529,15 @@ mod tests {
         AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION, PROTOCOL_VERSION,
-        ProtocolError, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+        MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION,
+        MAX_STOP_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError,
+        RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
-        RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_TMUX_DISCOVER,
-        RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request, Response, RunBackend,
-        RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState, RuntimeBuildId, RuntimeId,
-        RuntimeIdPersistence, RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize,
-        decode_frame, encode_frame,
+        RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
+        RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
+        RecoverableStop, Request, Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSignal,
+        RunSpec, RunState, RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity,
+        ServerFrame, StopDisposition, StopOperationKey, TerminalSize, decode_frame, encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -1476,6 +1578,7 @@ mod tests {
             capabilities: std::collections::BTreeMap::from([
                 (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
                 (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+                (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
                 (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
                 (
                     RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
@@ -1527,7 +1630,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_input_have_exact_generation_10_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_11_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1545,12 +1648,13 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 10,
+                    "protocolGeneration": 11,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
                         "native.start": 1,
                         "native.recoverable_input": 1,
+                        "native.recoverable_stop": 1,
                         "native.fork_level_a": 1,
                         "native.execute_materialized_level_b": 1,
                         "tmux.discover": 1,
@@ -1581,7 +1685,6 @@ mod tests {
                 },
             })
         );
-
         let mut run = sample_run_info();
         run.id = run_id;
         run.applied_input_bytes = Some(6);
@@ -1614,6 +1717,31 @@ mod tests {
                 "input_cursor_mismatch",
                 "daemon_instance_mismatch",
             ])
+        );
+    }
+
+    #[test]
+    fn recoverable_stop_request_has_exact_generation_11_wire_shape() {
+        let daemon_instance: DaemonInstanceId =
+            "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
+        let run_id = RunId::new();
+        assert_eq!(
+            serde_json::to_value(Request::Stop {
+                operation: RecoverableStop {
+                    daemon_instance,
+                    operation_key: StopOperationKey::new("stop-8").unwrap(),
+                    id: run_id,
+                },
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "stop",
+                "operation": {
+                    "daemon_instance": daemon_instance.to_string(),
+                    "operation_key": "stop-8",
+                    "id": run_id.to_string(),
+                },
+            })
         );
     }
 
@@ -1786,6 +1914,22 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_stop_operation_keys_are_bounded_by_exact_utf8_bytes() {
+        let exact = "x".repeat(MAX_STOP_OPERATION_KEY_BYTES);
+        let key = StopOperationKey::new(exact.clone()).expect("accept exact key ceiling");
+        assert_eq!(key.as_str(), exact);
+        assert_eq!(
+            decode_frame::<StopOperationKey>(&encode_frame(&key).unwrap()).unwrap(),
+            key
+        );
+
+        assert!(StopOperationKey::new("").is_err());
+        assert!(StopOperationKey::new("x".repeat(MAX_STOP_OPERATION_KEY_BYTES + 1)).is_err());
+        assert!(StopOperationKey::new("界".repeat(MAX_STOP_OPERATION_KEY_BYTES / 3)).is_ok());
+        assert!(StopOperationKey::new("界".repeat(MAX_STOP_OPERATION_KEY_BYTES / 3 + 1)).is_err());
+    }
+
+    #[test]
     fn attachment_command_ids_enforce_the_u32_nonzero_boundary() {
         let last = AttachmentCommandId::new(u32::MAX).expect("accept maximum command id");
         assert!(AttachmentCommandId::new(1).is_ok());
@@ -1804,6 +1948,8 @@ mod tests {
     fn attachment_control_commands_have_exact_correlated_wire_shapes() {
         let first = AttachmentCommandId::new(1).unwrap();
         let later = AttachmentCommandId::new(8).unwrap();
+        let daemon_instance = DaemonInstanceId::new();
+        let run_id = RunId::new();
         assert_eq!(
             serde_json::to_value(ClientFrame::Input {
                 command_id: first,
@@ -1844,8 +1990,24 @@ mod tests {
             serde_json::json!({"type": "signal", "signal": "interrupt"})
         );
         assert_eq!(
-            serde_json::to_value(ClientFrame::Stop { command_id: later }).unwrap(),
-            serde_json::json!({"type": "stop", "command_id": 8})
+            serde_json::to_value(ClientFrame::Stop {
+                command_id: later,
+                operation: RecoverableStop {
+                    daemon_instance,
+                    operation_key: StopOperationKey::new("stop-attachment-8").unwrap(),
+                    id: run_id,
+                },
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "stop",
+                "command_id": 8,
+                "operation": {
+                    "daemon_instance": daemon_instance.to_string(),
+                    "operation_key": "stop-attachment-8",
+                    "id": run_id.to_string(),
+                },
+            })
         );
         assert_eq!(
             serde_json::to_value(ControlReceipt::Stop {
