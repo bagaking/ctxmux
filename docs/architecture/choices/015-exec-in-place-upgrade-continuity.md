@@ -117,10 +117,15 @@ by definition the same live-control owner.
 
 The logical Runtime ID is also preserved. It is reloaded from schema-4
 `runtime_meta` through the existing SQLite owner; it is not copied into the
-version-2 handoff manifest. The incoming image constructs its own build label
-and capability manifest from that image and the active persistence mode. The
-build label may therefore stay equal or change without affecting Runtime or
-daemon-instance continuity, and it is not handoff authority or attestation.
+version-2 handoff manifest. Public Hello remains
+`runtimeIdPersistence: "state_dir"`. The incoming image constructs its own
+build label, Rust target `platform` and `arch`, and advertised capability
+record from that image and the active persistence mode. These facts may remain
+equal or change without affecting Runtime or daemon-instance continuity; they
+are not handoff authority or attestation. A persistent image that fully
+implements this decision advertises
+`services.planned_exec_upgrade_continuity: 1` under the protocol-owned numeric
+capability contract.
 
 ### State lock continuity
 
@@ -164,8 +169,9 @@ re-exec changes no frame.
 - A preserved daemon instance requires preservation of the complete settled
   recoverable-Input ledger and cursor. A response-loss retry after upgrade
   returns the original range without another physical write.
-- The public Runtime ID and daemon instance remain equal before and after the
-  exec. Build and manifest facts are reconstructed by the incoming image rather
+- The public Runtime ID, daemon instance, and `state_dir` persistence
+  discriminator remain equal before and after the exec. Build-target and
+  advertised capability facts are reconstructed by the incoming image rather
   than copied as hidden continuity state.
 
 ## Alternatives
@@ -254,7 +260,7 @@ owner preflight must drain them first or abort before extraction.
 - Covered: a response-loss recoverable Input crosses a real exec and returns its
   original range without a duplicate child-visible write; public Hello before
   and after the exec reports the same Runtime ID and daemon instance and the
-  persistent service manifest.
+  exact persistent-mode capability record.
 - Covered: a blocked real PTY Input crosses `SIGHUP`; a same-attachment command
   observes the drain retry result, the Input ACK precedes resume, and the
   incoming cursor advances exactly once.

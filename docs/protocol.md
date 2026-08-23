@@ -29,26 +29,42 @@ matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
 The generation fence covers the wire contract only. A successful generation-10
-Hello carries one Provider-neutral `RuntimeDescription`:
+Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
-```text
-runtime_id
-daemon_instance_id
-build_id
-protocol_generation
-capabilities { version, native, tmux, services }
+```ts
+type RuntimeIdentity = {
+  daemonInstanceId: string;
+  runtimeId: string;
+  runtimeIdPersistence: "daemon" | "state_dir";
+  buildId: string;
+  protocolGeneration: number;
+  platform: string;
+  arch: string;
+  capabilities: Record<string, number>;
+};
 ```
 
-`runtime_id` names the logical Runtime or persistent-store lineage. In
-persistent mode it is stored in the existing SQLite owner: a cold replacement
-using that state directory keeps the Runtime ID but receives a new daemon
-instance. A validated planned exec keeps both identities. A memory-only daemon
-allocates both identities at startup, so neither survives cold replacement. A
-different state directory creates a different Runtime. It is not derived from
-the serving epoch and is distinct from a Run ID, daemon incarnation, build,
-host, Provider, or credential identity.
+These are the public camelCase wire, generated TypeScript, and CLI JSON names.
+Rust uses ordinary snake_case identifiers internally. Missing or extra identity
+fields, the obsolete snake_case shape, and the obsolete nested-boolean
+capability shape fail closed; there is no alias or fallback.
+`protocolGeneration` repeats the exact wire-generation fence; capability
+versions are per-key contract versions, not another manifest schema version.
 
-`daemon_instance_id` is the live retry and authority fence. It is not a Run,
+`runtimeId` names the logical Runtime or persistent-store lineage.
+`runtimeIdPersistence` states its lifetime:
+
+- `daemon`: a memory-only daemon allocates both `runtimeId` and
+  `daemonInstanceId` at startup, so cold replacement changes both;
+- `state_dir`: the selected state-directory lineage preserves `runtimeId`
+  across cold replacement while the new daemon receives another
+  `daemonInstanceId`; another state directory is another Runtime.
+
+A validated planned exec preserves both identities. `runtimeId` is not derived
+from the serving epoch and is distinct from a Run ID, daemon incarnation,
+build, host, Provider, or credential identity.
+
+`daemonInstanceId` is the live retry and authority fence. It is not a Run,
 build, host, platform, Provider, credential, socket, PID, or durable process
 identity. A persistent planned exec preserves it together with the complete
 settled recoverable-Input ledger and cursor. Ordinary `input` retains the prior
@@ -56,38 +72,72 @@ receipt semantics: when its result is lost, callers must not retry it. The
 separate `recoverable_input` operation below binds the original daemon instance
 and can resolve its own lost response.
 
-`build_id` is an opaque daemon-authored build label. The current implementation
+`buildId` is an opaque daemon-authored build label. The current implementation
 derives it from the package version as `ctxmuxd/<CARGO_PKG_VERSION>`; clients
 compare its exact bytes and must not parse that format. It may change when a
 planned exec loads another image and is suitable only for equality and
-diagnostics. It is not a Git
-commit, binary hash, signature, source attestation, host identity, or
-authorization credential.
+diagnostics. It is not a Git commit, binary hash, signature, source
+attestation, host identity, or authorization credential.
 
-The fixed capability manifest has schema version 1. Its independently declared
-boolean operation classes are:
+`platform` and `arch` are serving-build target facts copied exactly from
+`std::env::consts::OS` and `std::env::consts::ARCH`. For example, an Apple
+Silicon macOS build reports `macos` and `aarch64`, not the Node/release names
+`darwin` and `arm64` and not a target triple. They do not probe or fingerprint
+the host running the daemon.
+
+`capabilities` is a flat record. Each value is the highest fully implemented
+public contract version for that exact key. Both advertisements and client
+requirements accept only numeric JavaScript-safe positive integer values in
+`1..=9_007_199_254_740_991`; integer-valued JSON spellings such as `1`, `1.0`,
+and `1e0` have the same value. Zero, negative, fractional, boolean, string,
+`null`, array, nested-object, and overflow values fail closed. An absent key is
+unsupported; neither `0` nor `false` represents absence.
+
+The initial availability record is:
+
+| Exact key                                  | `daemon` | `state_dir` |
+| ------------------------------------------ | -------: | ----------: |
+| `native.start`                             |        1 |           1 |
+| `native.recoverable_input`                 |        1 |           1 |
+| `native.fork_level_a`                      |        1 |           1 |
+| `native.execute_materialized_level_b`      |        1 |           1 |
+| `tmux.discover`                            |        1 |           1 |
+| `tmux.import`                              |        1 |      absent |
+| `services.persistent_state`                |   absent |           1 |
+| `services.planned_exec_upgrade_continuity` |   absent |           1 |
+
+An advertised endpoint capability does not promise that a particular Run,
+target, external tmux server, or caller-supplied plan is currently usable.
+`RunInfo.capabilities` remains the per-Run Backend truth, and Integration
+capabilities remain host-process truth. No layer is inferred from another.
+
+Rust and TypeScript clients may carry a local exact-key requirement record.
+Requirements do not cross the wire and do not add a negotiation frame:
 
 ```text
-native: start, recoverable_input, fork_level_a, execute_materialized_level_b
-tmux: discover, import
-services: persistent_state_active, planned_exec_upgrade_continuity
+connect -> send ClientHello(protocol only) -> validate RuntimeIdentity
+        -> compare configured requirements -> send Request or Attach
 ```
 
-All four native classes and tmux discovery are implemented. Tmux import is
-available only in memory-only mode. The two service flags are true only when a
-persistent state directory is active. `true` means this endpoint implements the
-operation class; `false` means the endpoint makes no such claim in the current
-activation. A true operation class does not promise that a particular Run, target, external
-tmux server, or caller-supplied plan is currently usable. `RunInfo.capabilities`
-remains the per-Run Backend truth. Unsupported capability requests fail
-explicitly and never infer support from a platform or executable name. Service
-flags are observed activation facts, not additional request kinds.
+An advertised version satisfies a requirement only when it is greater than or
+equal to the required version. A missing key or lower version produces the
+client-local typed `unsupported_capability` error, closes the connection before
+any business frame, and never falls back. Keys are compared byte-exactly: the
+clients do not whitelist, normalize, case-fold, map from operations, or infer
+them from platform or executable state.
 
-Rust and TypeScript clients reject an unknown protocol or manifest version
-before exposing the description. The manifest is declaration, not negotiation.
-Generation 10 adds no version-range or capability negotiation, endpoint discovery, dynamic
-capability registry, Provider catalog, plugin discovery, or host/credential
-identity.
+Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
+connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
+only configured capability requirements; framing, the exact identity shape,
+and protocol generation are still validated. Generation 10 adds no
+version-range or capability negotiation, endpoint discovery, dynamic registry,
+Provider catalog, plugin discovery, or host/credential identity.
+
+Changing the confirmed RuntimeIdentity fields or persistence discriminators,
+the initial flat keys, the JavaScript-safe positive-integer version semantics,
+the Rust target vocabulary, or the client-local pre-dispatch boundary requires
+explicit user confirmation and a later reviewed Feature Tracker plan revision
+before implementation.
 
 After the handshake, a connection has one of two shapes:
 
@@ -490,7 +540,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemon_instance_id` in the ordinary generation-10 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-10 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -507,8 +557,9 @@ replay window across cold daemon restart. On intentional `SIGHUP`, the daemon
 instead performs an exec-in-place upgrade: its PID, listener inode, state lock,
 live child and PTY masters, Runtime ID, daemon instance, input cursors and
 settled ledgers survive; attachments reconnect from their own output cursors.
-The incoming image reconstructs its build ID and manifest from the new image
-and active persistence mode; they are not handoff authority.
+The incoming image reconstructs its build ID, `platform`, `arch`, and advertised
+capability record from the new image and active persistence mode; they are not
+handoff authority or attestation.
 
 Before extraction, the daemon's upgrade request gate is reversible. Requests
 already admitted retain their permit through owner completion and response

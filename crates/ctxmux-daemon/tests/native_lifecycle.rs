@@ -2,13 +2,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader},
     os::unix::fs::{MetadataExt, PermissionsExt},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
+use ctxmux_client::{Attachment, Client, ClientError, RuntimeCapabilityRequirements, replay_bytes};
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
@@ -16,9 +16,9 @@ use ctxmux_protocol::{
     RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
     RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
     RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER,
-    RecoverableInput, Request, RunEvent, RunId, RunInputKind, RunInputReference, RunLineage,
-    RunSignal, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, ServerFrame,
-    StopDisposition, TerminalSize, decode_frame, encode_frame,
+    RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request, RunEvent, RunId, RunInputKind,
+    RunInputReference, RunLineage, RunSignal, RunSpec, RunState, RuntimeIdPersistence,
+    RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde_json::Value;
@@ -32,7 +32,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 
 struct TestDaemon {
     child: Child,
-    directory: TempDir,
+    directory: Arc<TempDir>,
     client: Client,
     /// Lines captured from a stderr-piped daemon, shared with a drain thread.
     /// `None` for the inherit-stderr constructors, which do not scan stderr.
@@ -41,8 +41,12 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start() -> Self {
-        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
+        Self::start_memory_only_at(directory, socket).await
+    }
+
+    async fn start_memory_only_at(directory: Arc<TempDir>, socket: PathBuf) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
@@ -55,7 +59,7 @@ impl TestDaemon {
     }
 
     async fn start_with_inherited_fd(sentinel: &Path) -> Self {
-        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
             .arg("-c")
@@ -74,7 +78,7 @@ impl TestDaemon {
     }
 
     async fn start_with_qualification_stats_fd(sentinel: &Path) -> Self {
-        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
             .arg("-c")
@@ -93,7 +97,7 @@ impl TestDaemon {
     }
 
     async fn start_with_readiness_fd(receipt: &Path) -> Self {
-        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
             .arg("-c")
@@ -113,8 +117,8 @@ impl TestDaemon {
 
     async fn from_spawned(
         child: Child,
-        directory: TempDir,
-        socket: impl Into<std::path::PathBuf>,
+        directory: Arc<TempDir>,
+        socket: impl Into<PathBuf>,
     ) -> Self {
         Self::from_spawned_with_stderr(child, directory, socket, None).await
     }
@@ -125,7 +129,7 @@ impl TestDaemon {
     /// never blocked on the synchronous pipe. The thread ends when the daemon
     /// dies and closes the pipe (see `Drop`).
     async fn start_persistent() -> Self {
-        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let state_dir = directory.path().join("state");
         let mut child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
@@ -165,8 +169,8 @@ impl TestDaemon {
 
     async fn from_spawned_with_stderr(
         child: Child,
-        directory: TempDir,
-        socket: impl Into<std::path::PathBuf>,
+        directory: Arc<TempDir>,
+        socket: impl Into<PathBuf>,
         stderr_lines: Option<Arc<Mutex<Vec<String>>>>,
     ) -> Self {
         let socket = socket.into();
@@ -192,6 +196,38 @@ impl TestDaemon {
         .await
         .expect("ctxmuxd should accept connections");
         daemon
+    }
+
+    fn stop_and_wait(mut self) {
+        self.wait_for_interrupt_shutdown()
+            .unwrap_or_else(|error| panic!("stop ctxmuxd before replacement: {error}"));
+    }
+
+    fn wait_for_interrupt_shutdown(&mut self) -> Result<(), String> {
+        if self
+            .child
+            .try_wait()
+            .map_err(|error| format!("poll ctxmuxd before shutdown: {error}"))?
+            .is_some()
+        {
+            return Ok(());
+        }
+        let interrupted = Command::new("kill")
+            .arg("-INT")
+            .arg(self.child.id().to_string())
+            .status()
+            .map_err(|error| format!("send SIGINT to ctxmuxd: {error}"))?;
+        if !interrupted.success() {
+            return Err(format!("SIGINT command failed with {interrupted}"));
+        }
+        for _ in 0..100 {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+                Err(error) => return Err(format!("wait for ctxmuxd shutdown: {error}")),
+            }
+        }
+        Err("ctxmuxd did not exit within the interrupt shutdown deadline".to_owned())
     }
 
     /// Deliver a real `SIGHUP` to the daemon process and assert delivery.
@@ -267,21 +303,7 @@ impl TestDaemon {
 
 impl Drop for TestDaemon {
     fn drop(&mut self) {
-        if self.child.try_wait().ok().flatten().is_none() {
-            let interrupted = Command::new("kill")
-                .arg("-INT")
-                .arg(self.child.id().to_string())
-                .status()
-                .is_ok_and(|status| status.success());
-            if interrupted {
-                for _ in 0..100 {
-                    match self.child.try_wait() {
-                        Ok(Some(_)) => return,
-                        Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-                        Err(_) => break,
-                    }
-                }
-            }
+        if self.wait_for_interrupt_shutdown().is_err() {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();
@@ -761,6 +783,60 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     );
 }
 
+fn assert_memory_only_runtime_identity(runtime: &RuntimeIdentity) {
+    assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
+    assert_eq!(runtime.runtime_id_persistence, RuntimeIdPersistence::Daemon);
+    assert_eq!(runtime.platform, std::env::consts::OS);
+    assert_eq!(runtime.arch, std::env::consts::ARCH);
+    assert_eq!(
+        runtime.capabilities,
+        BTreeMap::from([
+            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+                1,
+            ),
+            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+            (RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1),
+        ])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_only_cold_replacement_changes_both_runtime_identities() {
+    let directory = Arc::new(tempfile::tempdir().expect("create replacement temp directory"));
+    let socket = directory.path().join("ctxmux.sock");
+    let first = TestDaemon::start_memory_only_at(Arc::clone(&directory), socket.clone()).await;
+    assert_eq!(first.client.socket_path(), socket);
+    let first_runtime = first
+        .client
+        .runtime_info()
+        .await
+        .expect("read first memory-only Runtime identity");
+    assert_memory_only_runtime_identity(&first_runtime);
+    first.stop_and_wait();
+
+    let replacement =
+        TestDaemon::start_memory_only_at(Arc::clone(&directory), socket.clone()).await;
+    assert_eq!(replacement.client.socket_path(), socket);
+    let replacement_runtime = replacement
+        .client
+        .runtime_info()
+        .await
+        .expect("read replacement memory-only Runtime identity");
+    assert_memory_only_runtime_identity(&replacement_runtime);
+    assert_ne!(
+        replacement_runtime.runtime_id, first_runtime.runtime_id,
+        "memory-only cold replacement allocates a new logical Runtime"
+    );
+    assert_ne!(
+        replacement_runtime.daemon_instance_id, first_runtime.daemon_instance_id,
+        "memory-only cold replacement allocates a new daemon incarnation"
+    );
+}
+
 fn process_exists(pid: u32) -> bool {
     Command::new("kill")
         .arg("-0")
@@ -837,6 +913,73 @@ async fn stable_process_resources(pid: u32) -> (usize, usize) {
     })
     .await
     .expect("daemon resource census settles")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_requirements_reject_before_a_real_memory_only_run_is_created() {
+    let daemon = TestDaemon::start().await;
+    assert!(
+        daemon
+            .client
+            .list()
+            .await
+            .expect("list initial Runs")
+            .is_empty()
+    );
+
+    for (capability, required_version, expected_advertised) in [
+        (RUNTIME_CAPABILITY_PERSISTENT_STATE, 1, None),
+        (RUNTIME_CAPABILITY_NATIVE_START, 2, Some(1)),
+    ] {
+        let guarded = Client::new(daemon.client.socket_path())
+            .with_required_capabilities(RuntimeCapabilityRequirements::from([(
+                capability.to_owned(),
+                required_version,
+            )]))
+            .expect("construct guarded client");
+
+        guarded.ping().await.expect("guarded ping stays raw");
+        let runtime = guarded
+            .runtime_info()
+            .await
+            .expect("guarded runtime_info stays raw");
+        assert_eq!(runtime.runtime_id_persistence, RuntimeIdPersistence::Daemon);
+
+        let error = guarded
+            .start(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            })
+            .await
+            .expect_err("unsupported requirement rejects start locally");
+        assert_eq!(
+            error.control_disposition(),
+            Some(CommandDisposition::NotApplied)
+        );
+        assert!(matches!(
+            error,
+            ClientError::UnsupportedCapability {
+                capability: actual_capability,
+                required_version: actual_required,
+                advertised_version,
+            } if actual_capability == capability
+                && actual_required == required_version
+                && advertised_version == expected_advertised
+        ));
+        assert!(
+            daemon
+                .client
+                .list()
+                .await
+                .expect("list Runs after local rejection")
+                .is_empty(),
+            "a rejected capability requirement must not create a Run"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1563,7 +1706,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         .client
         .runtime_info()
         .await
-        .expect("read pre-upgrade Runtime description");
+        .expect("read pre-upgrade Runtime identity");
     assert_persistent_runtime_identity(&before_runtime);
     let daemon_instance = before_runtime.daemon_instance_id;
     let (mut attachment, snapshot) = daemon
@@ -1616,7 +1759,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         .client
         .runtime_info()
         .await
-        .expect("read post-upgrade Runtime description");
+        .expect("read post-upgrade Runtime identity");
     assert_persistent_runtime_identity(&after_runtime);
     assert_eq!(
         after_runtime.runtime_id, before_runtime.runtime_id,

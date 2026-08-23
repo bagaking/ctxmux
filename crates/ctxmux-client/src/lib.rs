@@ -8,6 +8,7 @@ mod attachment;
 pub use attachment::Attachment;
 
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
 };
@@ -17,8 +18,8 @@ use ctxmux_protocol::{
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
     ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
     ProtocolError, RecoverableInput, Request, Response, RunEvent, RunId, RunInfo, RunSignal,
-    RunSpec, RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize, TmuxPaneInfo,
-    decode_frame, encode_frame,
+    RunSpec, RuntimeCapabilityVersionError, RuntimeIdentity, ServerFrame, StopDisposition,
+    TerminalSize, TmuxPaneInfo, decode_frame, encode_frame, validate_runtime_capability_version,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -26,6 +27,9 @@ use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 type Wire = Framed<UnixStream, LinesCodec>;
+
+/// Exact Runtime capability versions required before business dispatch.
+pub type RuntimeCapabilityRequirements = BTreeMap<String, u64>;
 
 /// Failure observed at the public Rust client boundary.
 #[derive(Debug, Error)]
@@ -55,6 +59,33 @@ pub enum ClientError {
         code: ctxmux_protocol::ErrorCode,
         /// Human-readable detail.
         message: String,
+    },
+    /// A configured client-local capability requirement is outside the public
+    /// JavaScript-safe positive-integer domain.
+    #[error(
+        "invalid required Runtime capability version {required_version} for {capability:?}: {source}"
+    )]
+    InvalidCapabilityRequirement {
+        /// Exact capability key supplied by the caller.
+        capability: String,
+        /// Rejected required version.
+        required_version: u64,
+        /// Why the version is not representable in the public contract.
+        #[source]
+        source: RuntimeCapabilityVersionError,
+    },
+    /// The reachable Runtime does not advertise the exact required capability
+    /// version.
+    #[error(
+        "unsupported Runtime capability {capability:?}: required {required_version}, advertised {advertised_version:?}"
+    )]
+    UnsupportedCapability {
+        /// Exact required capability key.
+        capability: String,
+        /// Minimum version required by the caller.
+        required_version: u64,
+        /// Highest advertised version, or `None` when the key is absent.
+        advertised_version: Option<u64>,
     },
     /// A correlated control request was rejected with a known application
     /// boundary.
@@ -125,12 +156,14 @@ impl ClientError {
             }
             Self::ControlNotApplied { .. }
             | Self::AttachmentBackpressure { .. }
-            | Self::AttachmentUnavailable { .. } => Some(CommandDisposition::NotApplied),
+            | Self::AttachmentUnavailable { .. }
+            | Self::UnsupportedCapability { .. } => Some(CommandDisposition::NotApplied),
             Self::Connect { .. }
             | Self::Closed
             | Self::Transport(_)
             | Self::Frame(_)
             | Self::Protocol { .. }
+            | Self::InvalidCapabilityRequirement { .. }
             | Self::ConcurrentEventRead
             | Self::ProtocolContractViolation(_)
             | Self::UnexpectedFrame(_) => None,
@@ -225,6 +258,7 @@ impl From<ProtocolError> for ClientError {
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
+    required_capabilities: RuntimeCapabilityRequirements,
 }
 
 impl Client {
@@ -233,7 +267,29 @@ impl Client {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            required_capabilities: BTreeMap::new(),
         }
+    }
+
+    /// Require exact Runtime capability versions before every business
+    /// Request or Attach frame.
+    ///
+    /// Requirements are client-local compatibility preconditions. They are
+    /// not sent on the wire, and raw [`Self::ping`] and [`Self::runtime_info`]
+    /// remain available for diagnosing an incompatible live Runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::InvalidCapabilityRequirement`] when a required
+    /// version is zero or cannot be represented exactly by public JavaScript
+    /// clients.
+    pub fn with_required_capabilities(
+        mut self,
+        requirements: RuntimeCapabilityRequirements,
+    ) -> Result<Self, ClientError> {
+        validate_required_capabilities(&requirements)?;
+        self.required_capabilities = requirements;
+        Ok(self)
     }
 
     /// Socket path used by this connector.
@@ -252,7 +308,7 @@ impl Client {
         self.connect().await.map(|_| ())
     }
 
-    /// Return the Provider-neutral description of the reachable Runtime.
+    /// Return the Provider-neutral identity of the reachable Runtime.
     ///
     /// # Errors
     ///
@@ -555,7 +611,7 @@ impl Client {
         id: RunId,
         after_byte: u64,
     ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
-        let (mut wire, _) = self.connect().await?;
+        let (mut wire, _) = self.connect_for_dispatch().await?;
         send(
             &mut wire,
             &ClientFrame::Request {
@@ -584,7 +640,7 @@ impl Client {
     }
 
     async fn request(&self, request: Request) -> Result<Response, ClientError> {
-        let (mut wire, _) = self.connect().await?;
+        let (mut wire, _) = self.connect_for_dispatch().await?;
         send(&mut wire, &ClientFrame::Request { request }).await?;
         match receive(&mut wire).await? {
             ServerFrame::Response { response } => Ok(response),
@@ -594,7 +650,10 @@ impl Client {
     }
 
     async fn control_request(&self, request: Request) -> Result<Response, ClientError> {
-        let (mut wire, _) = self.connect().await.map_err(control_not_applied)?;
+        let (mut wire, _) = self
+            .connect_for_dispatch()
+            .await
+            .map_err(control_not_applied)?;
         let encoded = encode_frame(&ClientFrame::Request { request })
             .map_err(ClientError::Frame)
             .map_err(control_not_applied)?;
@@ -637,11 +696,49 @@ impl Client {
             _ => Err(ClientError::UnexpectedFrame("expected compatible hello")),
         }
     }
+
+    async fn connect_for_dispatch(&self) -> Result<(Wire, RuntimeIdentity), ClientError> {
+        let (wire, runtime) = self.connect().await?;
+        validate_runtime_capability_requirements(&runtime, &self.required_capabilities)?;
+        Ok((wire, runtime))
+    }
 }
 
 fn validate_runtime_identity(runtime: &RuntimeIdentity) -> Result<(), ClientError> {
     if runtime.protocol_generation != PROTOCOL_VERSION {
         return Err(ClientError::UnexpectedFrame("expected compatible hello"));
+    }
+    Ok(())
+}
+
+fn validate_required_capabilities(
+    requirements: &RuntimeCapabilityRequirements,
+) -> Result<(), ClientError> {
+    for (capability, required_version) in requirements {
+        validate_runtime_capability_version(*required_version).map_err(|source| {
+            ClientError::InvalidCapabilityRequirement {
+                capability: capability.clone(),
+                required_version: *required_version,
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_capability_requirements(
+    runtime: &RuntimeIdentity,
+    requirements: &RuntimeCapabilityRequirements,
+) -> Result<(), ClientError> {
+    for (capability, required_version) in requirements {
+        let advertised_version = runtime.capabilities.get(capability).copied();
+        if advertised_version.is_none_or(|version| version < *required_version) {
+            return Err(ClientError::UnsupportedCapability {
+                capability: capability.clone(),
+                required_version: *required_version,
+                advertised_version,
+            });
+        }
     }
     Ok(())
 }
@@ -673,8 +770,11 @@ fn control_request_unknown(source: ClientError) -> ClientError {
 }
 
 fn control_not_applied(source: ClientError) -> ClientError {
-    ClientError::ControlNotApplied {
-        source: Box::new(source),
+    match source {
+        unsupported @ ClientError::UnsupportedCapability { .. } => unsupported,
+        source => ClientError::ControlNotApplied {
+            source: Box::new(source),
+        },
     }
 }
 

@@ -299,12 +299,15 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   CtxmuxClient,
+  CtxmuxUnsupportedCapabilityError,
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_START,
+  RUNTIME_CAPABILITY_PERSISTENT_STATE,
   defineRun,
   registerIntegration,
 } from "@ctxmux/sdk";
@@ -330,7 +333,10 @@ daemon.stderr.setEncoding("utf8");
 daemon.stderr.on("data", (chunk) => {
   daemonStderr += chunk;
 });
-const client = new CtxmuxClient({ socketPath });
+const client = new CtxmuxClient({
+  socketPath,
+  requiredCapabilities: { [RUNTIME_CAPABILITY_NATIVE_START]: 1 },
+});
 const readinessStream = daemon.stdio[3];
 assert(readinessStream);
 
@@ -527,6 +533,43 @@ try {
     ),
     runtime,
   );
+  assert.deepEqual(await client.list(), []);
+  for (const [requirements, expectedCapability, expectedAdvertised] of [
+    [
+      { [RUNTIME_CAPABILITY_PERSISTENT_STATE]: 1 },
+      RUNTIME_CAPABILITY_PERSISTENT_STATE,
+      undefined,
+    ],
+    [
+      { [RUNTIME_CAPABILITY_NATIVE_START]: 2 },
+      RUNTIME_CAPABILITY_NATIVE_START,
+      1,
+    ],
+  ]) {
+    const incompatibleClient = new CtxmuxClient({
+      socketPath,
+      requiredCapabilities: requirements,
+    });
+    assert.deepEqual(
+      await incompatibleClient.runtimeInfo(),
+      runtime,
+      "guarded runtimeInfo remains raw identity inspection",
+    );
+    await assert.rejects(
+      incompatibleClient.start(defineRun("/bin/true")),
+      (error) =>
+        error instanceof CtxmuxUnsupportedCapabilityError &&
+        error.code === "unsupported_capability" &&
+        error.capability === expectedCapability &&
+        error.requiredVersion === requirements[expectedCapability] &&
+        error.advertisedVersion === expectedAdvertised,
+    );
+    assert.deepEqual(
+      await client.list(),
+      [],
+      "a packaged client-local capability rejection must not create a Run",
+    );
+  }
   const run = await client.start(
     defineRun("/bin/sh", {
       args: [
@@ -733,16 +776,20 @@ process.stdout.write("isolated artifact consumer passed\n");
 const CONSUMER_TYPESCRIPT_SOURCE = String.raw`
 import {
   CtxmuxClient,
+  CtxmuxUnsupportedCapabilityError,
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
+  MAX_RUNTIME_CAPABILITY_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_START,
   registerIntegration,
   type Integration,
   type IntegrationSemanticEvent,
   type RunInfo,
   type RunSpec,
+  type RuntimeCapabilityRequirements,
   type RuntimeIdentity,
 } from "@ctxmux/sdk";
 import { shellIntegration } from "@ctxmux/sdk/integrations";
@@ -793,6 +840,18 @@ const runtimeInfo: Promise<RuntimeIdentity> = client.runtimeInfo();
 const capabilities: RuntimeIdentity["capabilities"] = {
   "native.start": 1,
 };
+const requirements: RuntimeCapabilityRequirements = {
+  [RUNTIME_CAPABILITY_NATIVE_START]: MAX_RUNTIME_CAPABILITY_VERSION,
+};
+const guardedClient = new CtxmuxClient({
+  socketPath: "target/ctxmux.sock",
+  requiredCapabilities: requirements,
+});
+const unsupportedCapability: Error = new CtxmuxUnsupportedCapabilityError(
+  RUNTIME_CAPABILITY_NATIVE_START,
+  2,
+  1,
+);
 const registered = registerIntegration(client, provider);
 const child: Promise<RunInfo> = registered.forkLevelB(parent, config);
 const publicErrors: readonly Error[] = [
@@ -809,6 +868,8 @@ void child;
 void publicErrors;
 void runtimeInfo;
 void capabilities;
+void guardedClient;
+void unsupportedCapability;
 void shellIntegration;
 `;
 
