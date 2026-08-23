@@ -10,20 +10,21 @@ Current guarantees are deliberately narrower than the product vision.
 
 | Area             | Current                                                                                                                                                                                                                                                                                                                 | Target or open                                                                               |
 | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| Run lifetime     | A native child survives client disconnects, while ctxmux control of that child and its PTY lasts only for the owning daemon lifetime. Optional `--state-dir` mode recovers historical Run state and committed replay across daemon restart; a prior running row becomes interrupted without live authority.             | Live PTY handoff, process adoption, host-reboot continuity, and upgrade continuity are open. |
+| Run lifetime     | A native child survives client disconnects. Optional `--state-dir` mode recovers historical Run state and committed replay after cold restart and preserves live PTY control across a planned exec-in-place `SIGHUP` upgrade. Existing attachments reconnect. | Crash-time PTY adoption and host-reboot process continuity remain unsupported. |
 | Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                      | Windows transport and multi-daemon discovery are open.                                       |
 | Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 9, including daemon-incarnation fencing, recoverable native Input, foreground-group Interrupt, complete-session Stop, correlated attachment controls, typed owner receipts, and the shared memory-only/persistent retained-Run capacity boundary. | Other SDKs appear only for a real client requirement.                                        |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                     | Multi-writer policy remains open.                                                            |
-| Input recovery   | A short-lived generation-9 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                          | Cross-daemon exactly-once and semantic acknowledgement remain above or outside ctxmux.       |
+| Input recovery   | A short-lived generation-9 operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. The cursor and complete settled ledger cross a planned exec-in-place upgrade with the preserved instance. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown. | Cold-restart exactly-once and semantic acknowledgement remain above or outside ctxmux. |
 | Backends         | Native `portable-pty`; an implemented read-only public-Control-Mode tmux pane adapter with required version-lane qualification pending.                                                                                                                                                                                 | Wider tmux control and other Backends require separate evidence.                             |
-| Integrations     | The SDK explicitly binds shell and Codex Integrations; Codex probes and executes native session resume.                                                                                                                                                                                                                 | Broader Integration coverage and context capture remain open.                                |
-| Context and fork | Level A clones a declared `RunSpec`; Codex Level B resumes a declared session; both record lineage and fidelity.                                                                                                                                                                                                        | Workspace snapshots and artifact ownership remain open.                                      |
-| Persistence      | Optional `--state-dir` mode recovers historical metadata, lineage, terminal state, and committed replay; default mode remains memory-only.                                                                                                                                                                              | Live PTY handoff, schema migration, and online history management are open.                  |
+| Integrations     | Explicit Provider-neutral Integration binding and a shell Integration are part of the Runtime embedding surface. | Provider-specific sessions, semantic replay, native resume, working-state, permission, and A2A policy live in embedding clients. |
+| Context and fork | Level A clones a declared `RunSpec`; the Runtime executes an explicitly caller-materialized Level B `RunSpec` and records lineage and the executed plan class. Missing Level B provenance fails closed without Level A fallback. | Provider-neutral derivation metadata remains open; provider session recovery is outside the Runtime. |
+| Persistence      | Optional `--state-dir` mode recovers historical metadata, lineage, terminal state, and committed replay and supports planned exec-in-place live continuity; default mode remains memory-only. | Schema migration and online history management are open. |
 
 “Durable” always includes client churn. With persistent mode it additionally
-includes the declared historical recovery class across daemon restart; it does
-not include live PTY control continuity, process adoption, host-reboot process
-continuity, or schema migration.
+includes the declared historical recovery class across cold daemon restart and
+live ownership continuity across a planned exec-in-place upgrade. It does not
+include crash-time process adoption, host-reboot process continuity, or schema
+migration.
 
 ## System and ownership model
 
@@ -112,7 +113,7 @@ reconciliation.
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Runtime core | Run identity and capabilities, native launch and PTY ownership, tmux observation clients, ordered raw output, attachment and reconnect behavior, public errors, and the persistence required by declared guarantees. |
 | tmux         | Imported server, session, window, pane, PTY, process, layout, persistence, and their native lifecycle.                                                                                                               |
-| Integration  | Tool detection, structured launch and Level B fork planning, capability declaration, and optional host-local semantic events. Shell and Codex native resume are current.                                             |
+| Integration  | Provider-neutral detection, structured launch or RunRecipe materialization, capability declaration, and optional host-local observation. Provider session and resume semantics belong to a higher client. |
 | Client       | Terminal rendering, editing UI, user workflow, multi-Run composition, Agent scheduling and evaluation, and Crucible or MapReduce policy.                                                                             |
 
 ## Components and stable boundaries
@@ -130,6 +131,67 @@ Each package has one reason to change.
 ### Stable boundary
 
 The stable product boundary is the local protocol, not a Rust ABI or Node native addon. Rust and TypeScript clients can evolve independently while exercising the same daemon path.
+
+### Standalone runtime boundary
+
+The daemon, CLI, protocol, and SDK form one independently releasable local
+Runtime. Their acceptance cannot depend on an editor, Agent harness, provider
+CLI, or another repository. A clean installation must be able to activate or
+connect to a compatible daemon, start an arbitrary command, detach and
+reattach, apply input and resize, replay ordered output or report a gap, wait
+for lifecycle change, stop the owned process scope, and inspect the runtime and
+Run identity exposed by the current protocol.
+
+Runtime identity and capability negotiation, authoritative Run revisions and
+timestamps, lost-wakeup-safe wait helpers, and an embeddable activation helper
+belong to this boundary. Until the current-guarantees table marks them shipped,
+they remain target capabilities rather than implied behavior.
+
+The dependency direction is one-way:
+
+```text
+standalone CLI          SDK host          editor / Agent product
+      |                    |                       |
+      +---------- public protocol / SDK ----------+
+                              |
+                           ctxmuxd
+                              |
+                    PTY / process / replay
+```
+
+`ctxmuxd` never imports or calls an embedding product. A Run remains operable
+when an Integration host, editor, or Agent client exits.
+
+Use this ownership test for new capabilities:
+
+> A fact belongs to ctxmux when it is valid for shells, servers, tests,
+> benchmarks, scripts, and Agents, and only the PTY, process, Backend, or daemon
+> owner can prove it. A claim belongs to the embedding product when it requires
+> understanding a Provider, Agent session, permission, message, task, workspace
+> policy, or UI.
+
+| ctxmux owns | Embedding products own |
+| --- | --- |
+| Runtime endpoint and daemon-incarnation identity | Provider installation, detection, configuration, and catalog |
+| Run identity, lifecycle, timestamps, revision, and owner receipts | Agent session identity, provider-native identity, and semantic resume policy |
+| PTY/process ownership, ordered bytes, replay, gaps, input, resize, interrupt, and stop | Prompt readiness, message parsing, permissions, tool calls, Agent status, and evidence interpretation |
+| Persistence, retention, attachment, reconnect, and transport reachability | Worktree/context selection, product artifacts, scheduling, collaboration, and UI |
+| Generic `RunSpec`, declared references, lineage, and execution of an explicit fork or resume plan | Provider-specific provenance derivation and materialization of native launch, fork, or resume plans |
+| CLI and SDK activation of a compatible daemon | Product packaging, account/authentication policy, and product endpoint selection |
+
+Runtime evidence must not be promoted into a semantic claim by naming alone.
+
+| Runtime can prove | Runtime cannot prove |
+| --- | --- |
+| bytes crossed the PTY write boundary | the target interpreted them as a submitted prompt |
+| ordered output bytes were observed | an output fragment is a complete Agent message |
+| the owned process scope exited or was interrupted | the Agent completed its task successfully |
+| one declared Run plan derived from another | a provider conversation retained its meaning or hidden context |
+| an endpoint is reachable, replaced, or unverifiable | an unreachable remote Run has exited |
+
+Agent semantic events may cite ctxmux byte ranges, Run revisions, and lineage as
+evidence. Their interpretation and settlement remain owned by the client that
+understands the Agent.
 
 ## Core scenarios and end-to-end paths
 
@@ -222,6 +284,31 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    deduplicated by cumulative byte range.
 5. Clean detach returns `Detached`; abrupt socket closure drops the attachment guard. Both leave the Run in `RunManager`.
 6. A later attachment resumes from its last observed byte cursor or detects that retained output was evicted.
+
+### Planned exec-in-place upgrade
+
+1. Persistent-mode `SIGHUP` creates an owner-only, immediately unlinked handoff
+   file and resolves the current executable before changing daemon admission.
+2. One reversible request gate changes `Open -> Draining`. Already-admitted
+   requests retain a permit through owner completion and response write;
+   commands arriving on an existing attachment receive an explicit
+   `backend_unavailable` / `not_applied` retry result. New mutations cannot
+   cross the extraction boundary.
+3. After the active count reaches zero, the daemon preflights every native Run
+   together. Every lifecycle must still be watching and every input, child
+   command, cursor, and bounded operation-ledger snapshot must be complete. Any
+   failure here drops the fence and restores full service before ownership is
+   relinquished.
+4. Extraction is the point of no return. The old native owner stops its reader,
+   relinquishes exactly one child/control owner per Run, flushes the durable
+   output barrier, writes the version-2 manifest, clears close-on-exec only on
+   the manifest, listener, state lock, and PTY masters, then calls `execve`.
+5. The incoming image reuses the daemon instance, listener and state lock,
+   reconciles only non-handed-off running rows, re-adopts the live masters and
+   child wait authority, and restores each input cursor and complete settled
+   ledger. Existing attachment transports end; clients reconnect from their
+   own output cursor. Failure after extraction is fail-stop, never a partial
+   return to service.
 
 ### Input, resize, output, and exit
 
@@ -363,6 +450,10 @@ The important guarantees are behavioral, not implied by lock types.
   shutdown deadline, shutdown reports failure but cannot reap that detached
   thread independently. This does not turn shutdown into a general native
   process-tree policy.
+- Planned upgrade uses a separate reversible request fence rather than shutdown
+  admission. A permit covers dispatch, the owned mutation result, and the final
+  response write. Drain timeout or all-owner preflight failure reopens service;
+  after extraction, the gate is sealed and any failure is daemon fail-stop.
 - Malformed or oversized transport frames can close the connection before a structured protocol error is sent. Explicit error categories cover validly decoded requests and lifecycle failures.
 - Native Stop owns one `portable-pty`-created POSIX session. It terminates and
   revalidates every visible local, same-user, non-elevated member while the
@@ -382,11 +473,16 @@ The important guarantees are behavioral, not implied by lock types.
 A Backend answers where and how a Run executes. An Integration answers what runs inside it and which extra context operations are honest.
 
 The native PTY and tmux pane adapter are Backend implementations even though a
-public Backend interface has not been extracted. The current Codex Integration
-launches a generic native Run; importing an existing tmux pane is a distinct
-public runtime operation rather than an Integration or plugin mechanism.
+public Backend interface has not been extracted. Importing an existing tmux
+pane is a distinct public runtime operation rather than an Integration or
+plugin mechanism.
 
-Integrations remain ordinary TypeScript modules exported by explicitly imported packages; the first-party modules currently use the SDK's `integrations` subpath. The daemon does not discover packages, embed JavaScript, launch plugin processes, or host a marketplace. If an Integration observer disappears, the raw daemon-owned Run must remain usable.
+Integrations remain ordinary TypeScript modules exported by explicitly imported
+packages; the provider-neutral contract and shell implementation remain in the
+Runtime SDK. Agent-specific modules belong to the embedding product that owns
+the Provider. The daemon does not discover packages, embed JavaScript, launch
+plugin processes, or host a marketplace. If an Integration observer
+disappears, the raw daemon-owned Run remains usable.
 
 ## Context, fork, and tmux targets
 
@@ -396,7 +492,16 @@ Fork fidelity is capability-declared.
 - Level B adds Integration-provided workspace, artifact, lineage, and native resume or fork information.
 - Level C, arbitrary process-memory or undeclared-state cloning, is out of scope.
 
-Level A is implemented by cloning the retained parent's complete immutable `RunSpec`; references are recorded once in `RunSpec.declared_inputs`, while `RunInfo.lineage` records only the immediate parent and actual fidelity. For Codex Level B, the SDK Attachment owner records the source Run of every live event and replay chunk in a host-local object registry. A parent-scoped registered observer accepts only event/chunk objects issued for that parent, maps its emitted `thread.started` receipt back to the same Run, and rejects missing, unowned, copied-chunk, or cross-Run input before planning or raw fork. Every Integration that advertises Level B must implement both a planner and `levelBForkProvenance`; omission fails closed. The verified receipt materializes `codex exec resume --json` with declared workspace, artifact, and session references, while the real semantic canary proves happy-path continuation. This is accidental-misrouting protection inside the supported SDK API, not authentication against a malicious JavaScript host that can call the raw fork protocol. Shell exposes no Level B capability and rejects the request rather than falling back to Level A. Neither path claims a workspace snapshot or owned artifact store.
+Level A is implemented by cloning the retained parent's complete immutable
+`RunSpec`; references are recorded once in `RunSpec.declared_inputs`, while
+`RunInfo.lineage` records only the immediate parent and actual fidelity. Level B
+is a caller-materialized execution contract: the provider-neutral host boundary
+must produce source-bound provenance and the exact `RunSpec` before raw fork.
+Missing, unowned, copied, or cross-Run provenance returns a structured
+unsupported result before planner or daemon mutation; it never falls back to
+Level A. Provider event parsing, session identifiers, replay interpretation,
+and native-resume commands are not daemon or generic SDK truth. Neither level
+claims a workspace snapshot or owned artifact store.
 
 tmux compatibility follows the public-adapter boundary. One imported Run maps
 to one pane selected through the tmux executable and public Control Mode while
@@ -475,6 +580,8 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | tmux Control Mode Backend             | accepted and implemented; version lanes pending                | [012](architecture/choices/012-tmux-control-mode-backend.md)        |
 | Retained Run resource governance      | accepted, implemented, and qualified for the declared workload | [013](architecture/choices/013-retained-run-resource-governance.md) |
 | Recoverable native Input              | accepted and implemented                                       | [014](architecture/choices/014-recoverable-input-operations.md)     |
+| Exec-in-place upgrade continuity      | accepted and implemented in persistent mode                    | [015](architecture/choices/015-exec-in-place-upgrade-continuity.md) |
+| Interrupted-Run derivation            | accepted                                                        | [016](architecture/choices/016-interrupted-run-derivation.md)       |
 
 ## Risk-to-fixture traceability
 

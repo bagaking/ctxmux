@@ -13,7 +13,7 @@ The release question is:
 > owner boundary, failure behavior, concurrency behavior, resource bound, and
 > supported platform?
 
-This document records the 2026-08-10 audit and the target evidence system. It is
+This document records the baseline audit and the target evidence system. It is
 a testing policy and adoption sequence, not a claim that every target lane is
 already implemented.
 
@@ -54,7 +54,7 @@ test owners under Rust and TypeScript instrumentation.
 The checked-in coverage ratchet and CI reachability map are implemented. The
 critical gate now includes owner-local subscribe/snapshot, detach/output, and
 wait/exit barriers, a seeded public multi-client mutation model, shared parser
-regression corpora, and bounded seeded Rust/TypeScript/Integration parser
+regression corpora, and bounded seeded Rust/TypeScript/Integration contract
 targets. The same harness now covers Integration-host exit, child and daemon
 kill, hostile frames and launch inputs, high-volume final drain, fan-out lag,
 concurrent start, lifecycle churn, and idle/active resource census. The
@@ -68,7 +68,7 @@ at the 128-record ceiling.
 
 | Contract area                                            | Strongest current evidence                                                                                                                                                                             | Confidence                                                        | Important gap                                                                                                         |
 | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Daemon-owned Run survives client disconnect              | Real Rust daemon/PTY E2E plus CLI/TypeScript cross-language E2E and Integration-host process exit; same PID is controlled after reconnect                                                              | Strong for current daemon lifetime                                | Daemon restart remains a separately owned, unshipped guarantee                                                        |
+| Daemon-owned Run survives client disconnect              | Real Rust daemon/PTY E2E plus CLI/TypeScript cross-language E2E and Integration-host process exit; same PID is controlled after reconnect                                                              | Strong for current daemon lifetime                                | Cold daemon replacement remains a separate recovery class                                                             |
 | Start, input, resize, output, exit, detach, signal, stop | Real shell child, foreground-group Interrupt, stubborn child and descendants, graceful/forced Stop receipts, unrelated-process sentinel, owner barriers, and public concurrency races                  | Strong for the declared POSIX session lifecycle and complete Stop | Session-escaping descendants, undefined writer/resize arbitration, and non-POSIX owner scopes remain open             |
 | Rejected post-spawn setup                                | Deterministic owner seam with a real child proves kill, reap, and no published Run                                                                                                                     | Strong owner-level evidence                                       | Not driven through a public request; final handoff failure is not forced                                              |
 | Ordered binary replay after exit                         | Real PTY replay, forced public `Gap`, caller-cursor reattach, and multi-frame native/SDK replay preserve exact ordered bytes                                                                           | Strong for retained replay and live lag                           | Incremental raw-byte encoding performance remains unqualified                                                         |
@@ -78,9 +78,10 @@ at the 128-record ceiling.
 | SDK backpressure and close races                         | Deterministic mock socket tests, including 20,000 queued frames, plus real 8/32-way fast/slow fan-out with explicit `Gap`                                                                              | Strong for SDK queue and real lag behavior                        | Silent-peer cancellation and request deadlines are absent                                                             |
 | Chaos, security, and resources                           | Named process kills, malformed/oversized/long-lived frames, argv/env/secret negatives, concurrent start, churn, and idle/active 1/32/128 census                                                        | Strong for the bounded native generation-9 matrix                 | Hostile parent/FD exhaustion, attachment admission, total RSS quota, and production-scale pressure remain open        |
 | Level A fork                                             | Real daemon proves copied `RunSpec`, declared inputs, lineage, distinct PID, and independent control                                                                                                   | Strong                                                            | Post-spawn fork failure is not forced through the public boundary                                                     |
-| Codex Level B                                            | Source-bound receipt negatives, unrelated-Run public E2E, minimized JSONL corpus, seeded observer target, and a redacted real-Codex continuation artifact                                              | Strong supported-API owner, parser, and semantic proof            | Host-local provenance is not authentication; scheduled hosted evidence remains separate                               |
+| Generic Level B handoff                                  | Existing SDK provenance negatives and unrelated-Run public E2E exercise the generic boundary; a standalone Provider-neutral Level B fixture remains pending                                           | Partial: public path and failure boundary exist                    | Provider-specific semantic continuity remains an embedding-client claim                                                |
 | Interactive CLI attach                                   | Checked-in controlling-PTY E2E proves raw input, `SIGWINCH`, detach, exact restoration, and same-PID survival                                                                                          | Strong for ordinary detach on Unix                                | Daemon-loss, error, unwind, and catchable-signal restoration remain open                                              |
-| Persistent historical recovery                           | Real daemon restart restores exited replay/lineage and Level A fork; live rows become interrupted; stale unrelated PID, lock, schema, corrupt generation, modes, symlinks, and retention fail closed   | Strong for the declared historical class                          | Kill-at-every-SQLite-transition injection, power-loss filesystems, live PTY handoff, and migration remain unsupported |
+| Persistent historical recovery                           | Real cold daemon restart restores exited replay/lineage and Level A fork; live rows become interrupted; stale unrelated PID, lock, schema, corrupt generation, modes, symlinks, and retention fail closed | Strong for the declared historical class                          | Kill-at-every-SQLite-transition injection, power-loss filesystems, cross-process live PTY handoff, and migration remain unsupported |
+| Planned exec-in-place upgrade continuity                 | Real persistent daemon SIGHUP fixtures preserve daemon/child PID and listener inode; prove ordered replay, Run-local Input cursor/ledger response-loss retry, crossing Input ACK before reconnect, draining rejection as `not_applied`, reversible pre-extract abort, signal-exit identity, and repeated settled fd/thread/path census | Strong for same-process generation-9 exec upgrade                 | Cold/crash continuity and compatibility across a future protocol/schema change remain separate claims                 |
 | Read-only tmux pane adapter                              | Transcript parser; real-session discovery/import and exact post-import bytes; complete tuple, corruption, pause/late-replay, ownership and detach fixtures; TypeScript and controlling-PTY CLI clients | Implemented; required version lanes pending                       | Ubuntu minimum and macOS current CI must produce their asserted server-version evidence before Feature archive        |
 
 Exact suite reach is machine-checked by `.github/ci-evidence-map.json`; test
@@ -104,7 +105,7 @@ not publish, install globally, choose an application activation policy, or
 claim cross-toolchain binary reproducibility. The manifest records the current
 platform, architecture, Rust target and toolchain instead.
 
-The 2026-08-14 hosted-CI audit is intentionally separate from local Gate truth.
+The hosted-CI audit is intentionally separate from local Gate truth.
 The latest remote run, `31722805068` on `0f7f598`, failed only inside the three
 required check steps after dependency/tmux setup succeeded. Public annotations
 expose exit 1 on macOS and exit 101 on Ubuntu critical and coverage, but GitHub
@@ -229,7 +230,6 @@ Keep versioned corpora for:
 - native request/response/event frames;
 - arbitrary fragmentation, coalescing, invalid UTF-8, duplicate keys, extreme
   numbers, nesting, exact size limits, and early close;
-- Codex and future Agent JSONL/event reduction;
 - tmux Control Mode guards, notifications, escaping, interleaving, malformed
   post-readiness records, and qualified-version behavior.
 
@@ -599,12 +599,15 @@ daemon before a receipt can be accepted.
 | PR changed-platform   | Changes to platform, PTY, protocol, SDK, Integration, or Backend paths | The owning platform and contract subset selected through explicit path/job mapping                                                                                                    | Blocking                                                                      |
 | Nightly reliability   | Scheduled                                                              | Seeded fuzz/model receipt plus Linux/macOS chaos, full 1/32/128 resource matrix, and 30-minute load/leak soak; sanitizer and benchmark trend remain open                              | Blocking for release readiness; preserve seeds and artifacts                  |
 | Release qualification | Explicit release dispatch                                              | Linux/macOS two-hour soak plus the same frozen budgets; external-tool, recovery, and upgrade qualification remain with their owning tasks                                             | Blocks release                                                                |
-| External canary       | Scheduled and credential-controlled                                    | Real Codex/Agent semantic continuation and other vendor-dependent contracts                                                                                                           | Never substitutes for hermetic adapter tests; narrows claims when unavailable |
 
 The full critical lifecycle suite should remain on pull requests even if the
 nightly suite grows. Tmux is a warning here: its broad regression suite is
 excellent, but upstream tmux's inspected workflow reaches it only daily or
 manually.
+
+Embedding products may run Provider-specific continuation canaries against
+their own credentials and release gates. Those results qualify the embedding
+product, not ctxmux, and cannot replace ctxmux's hermetic Runtime evidence.
 
 ### Code-coverage ratchet
 
@@ -741,8 +744,8 @@ fixtures.
    budgets.
 6. Generate Rust-authored protocol goldens consumed by the TypeScript SDK.
 
-The deterministic owner barriers, public mutation model, native/TypeScript/
-Codex seeded targets, minimized corpora, high-volume replay/fan-out, named chaos
+The deterministic owner barriers, public mutation model, native/TypeScript
+seeded targets, minimized corpora, high-volume replay/fan-out, named chaos
 matrix, resource census, frozen budgets, and scheduled soak profiles implement
 the bounded portions of items 1 through 4. Coverage-guided fuzzing, sanitizer
 coverage, the broader controllable PTY seam, benchmark trends, high-volume
@@ -759,18 +762,13 @@ inferred from this lane.
    tmux 3.4 and asserts the selected server version; the macOS lane installs
    the current package and records/asserts the selected server version. This
    qualifies those two versions, not every future 3.x release.
-3. Close Level B provenance before broadening the claim: a continuation must
-   bind to a session created for the declared parent Run, and an unrelated or
-   unverifiable session must fail before a raw fork request can create a Run.
+3. Close the generic Level B handoff before broadening the claim: provenance
+   must bind to the exact parent Run, the caller must supply the complete
+   replacement `RunSpec`, and missing or unrelated provenance must fail before
+   a raw fork request can create a Run.
 4. Keep hermetic recording executables for exact argv, protocol, lineage, and
-   failure regressions, and add a credential-controlled real Codex canary that
-   proves a unique fact established in the parent session remains observable in
-   the Level B continuation.
-5. Measure real Codex cold-start behavior and make the default availability
-   probe tolerant of the supported startup envelope. An explicit timeout must
-   still fail closed deterministically; retries must not turn a semantic or
-   availability failure green.
-6. Expand architecture and release matrices only when ctxmux declares support
+   failure regressions without adding a Provider parser to ctxmux.
+5. Expand architecture and release matrices only when ctxmux declares support
    for those platforms or backends.
 
 ### Capability Feature closure before final qualification
@@ -845,7 +843,7 @@ The current clean-consumer audit admits four bounded gaps:
   stale-cursor rejection. These are one owner-boundary oracle, not a soak,
   pressure matrix, metrics sink, or general mutation transaction framework.
   `bytes_applied` proves the daemon-owned PTY boundary only; target semantic
-  acknowledgement and reply evidence remain Integration or harness tests.
+  acknowledgement and reply evidence remain embedding Provider or harness tests.
 - **Race-safe local activation:** a framework-neutral consumer needs one
   explicit connect-or-activate contract with readiness, version compatibility,
   concurrent-start, socket safety, daemon ownership, logging, and cleanup

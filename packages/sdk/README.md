@@ -138,59 +138,12 @@ Registered `start` and `forkLevelB` accept one narrow optional object containing
 generic Run client; the Integration does not own or reinterpret creation
 identity.
 
-The same subpath exports `codexIntegration`. It plans `codex exec --json` only
-after bounded version and help probes confirm JSONL support. The default probe
-budget is five seconds; callers may supply a smaller positive integer timeout
-when their own fail-fast boundary is stricter. Its optional observer converts
-complete JSONL records into host-local semantic events; parser diagnostics
-never replace or hide raw Run output.
-
-When `exec resume --help` also exposes JSON support, the registered Codex
-Integration can materialize an explicit Level B child from a session receipt
-issued when a parent-scoped observer sees `thread.started`:
-
-```ts
-import {
-  codexIntegration,
-  isCodexSessionProvenance,
-} from "@ctxmux/sdk/integrations";
-
-const codex = registerIntegration(client, codexIntegration);
-const observer = codex.createObserver(parent);
-let session;
-for await (const rawEvent of parentAttachment.events()) {
-  session = observer.observe(rawEvent).find(isCodexSessionProvenance);
-  if (session !== undefined) break;
-}
-if (session === undefined) throw new Error("Codex session was not observed");
-const child = await codex.forkLevelB(parent, {
-  session,
-  prompt: "continue from the parent",
-  cwd: process.cwd(),
-  artifactReferences: ["artifact://review-plan.json"],
-});
-```
-
-The child records its parent, `level_b` fidelity, and declared workspace,
-artifact, and session references. The receipt is host-local and source-bound:
-the `Attachment` records every live event and replay chunk against its Run, and
-the parent observer rejects missing, copied-chunk, or unrelated-Run input before
-semantic parsing. Copied, unbound, cross-registration, and parent-mismatched
-receipt objects likewise fail before planner or raw fork. Every Level B
-Integration must implement `levelBForkProvenance`; omission fails closed. This
-protects supported SDK use from accidental fabrication or misrouting, but it is
-not authentication against a malicious host that can bypass the Integration
-and call `client.fork` directly. A Level B call on `shellIntegration` raises
-`IntegrationCapabilityError`; neither path falls back to Level A.
-
-The real semantic canary requires `OPENAI_API_KEY` or `CODEX_API_KEY`. A local
-operator may instead opt in to an already authenticated Codex CLI for one run
-with `CTXMUX_ALLOW_CODEX_LOGIN_AUTH=1`; login state is never used implicitly.
-The scheduled workflow continues to require its repository secret.
-Because native Runs merge PTY output, real Codex may emit non-JSON lines beside
-valid JSONL. The canary retains their diagnostic and line-class counts;
-`output_gap`, invalid UTF-8, or an oversized semantic record is fatal and cannot
-produce a passing artifact.
+The Integration contract is Provider-neutral. Agent products keep Provider
+session identifiers, semantic replay parsing, permissions, Agent status, and
+native resume construction in their own Provider modules. A Level B-capable
+host binds provenance to the exact parent and supplies a complete generic
+replacement `RunSpec`; ctxmux executes that plan and records lineage. Missing
+provenance fails before mutation and never becomes a Level A request.
 
 ## Attach to a Run
 

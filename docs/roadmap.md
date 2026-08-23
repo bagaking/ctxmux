@@ -1,7 +1,7 @@
 # Implementation Roadmap
 
 - Status: reviewed
-- Review basis: user and Agent design discussion completed on 2026-08-09
+- Review basis: completed user and Agent design discussion
 - Scope: ctxmux runtime foundation and reference embedding surfaces
 
 This roadmap is ordered by end-to-end proof. A later milestone must not force a
@@ -21,8 +21,8 @@ new invariant; future cases are not expanded speculatively.
 
 ## Program ownership and convergence
 
-Reviewed on 2026-08-12 after the reliability program grew beyond one finite
-Feature boundary. Correctness, release qualification, and peer performance are
+The reliability program grew beyond one finite Feature boundary. Correctness,
+release qualification, and peer performance are
 independently closable; one result must not keep an unrelated owner open.
 
 | Owner                                   | Finite closure                                                                                                                                                                                  | Reviewed task topology                                                                                                                         |
@@ -46,7 +46,7 @@ report is task truth for multiple Features. The performance Feature remains
 `proposal_only` until explicitly scheduled, and no planning transition grants
 authority to publish packages, Git refs, hosted releases, or benchmark results.
 
-On 2026-08-17, the already frozen AgentMux consumer comparison exposed one
+The frozen AgentMux consumer comparison exposed one
 bounded native-owner gap before the broader peer cycle: a fresh daemon used a
 host-sized Tokio worker pool, and every live native Run permanently owned one
 reader thread plus one waiter thread. Three existing ctxmux resource censuses
@@ -138,46 +138,56 @@ Acceptance:
 
 ## M2 — Integration contract and first Agent
 
-Introduce explicit in-process Integration registration only after the generic
-Run lifecycle works. Prove the boundary with a generic shell Integration and
-one mainstream coding Agent Integration.
+Keep explicit in-process Integration registration above the generic Run
+lifecycle. The durable ctxmux surface owns the Provider-neutral contract and a
+generic shell implementation. Agent-specific Provider modules belong to their
+embedding product and materialize generic Run plans for ctxmux.
 
 Acceptance:
 
-- adding the Agent Integration does not add Agent-specific fields to the
-  daemon's foundational Run types;
+- adding an Agent to an embedding product does not add Agent-specific fields to
+  the daemon's foundational Run types or require a ctxmux protocol change;
 - the host explicitly imports and registers Integrations;
-- detect, launch planning, capabilities, and normalized events work through
+- Provider-neutral detection, launch planning, and capabilities work through
   the TypeScript SDK;
 - the raw Run remains usable when no semantic Integration observer is attached.
+- removing a co-located Agent-specific module does not weaken standalone CLI,
+  raw SDK, shell Integration, or Level A conformance.
 
 ## M3 — Context, artifacts, lineage, and fork
 
-Status: implemented for declared references and Codex-native continuation;
-workspace snapshots and artifact storage remain explicitly deferred.
+Status: declared references and Level A are implemented. The generic Level B
+submission path exists; a Provider-neutral conformance fixture, workspace
+snapshots, and artifact storage remain explicitly deferred.
 
-Add portable Level A fork, then prove Level B with the first Agent Integration.
-Keep capability requests explicit and fail closed.
+Add portable Level A fork, then prove that a host can submit one fully
+materialized Level B plan through the generic contract. Keep capability
+requests explicit and fail closed.
 
 Acceptance:
 
 - Level A forks reproduce only the documented portable Run specification and
   declared inputs;
 - each fork records parentage and declared context/artifact references;
-- one Integration demonstrates a genuine Level B resume or fork;
+- one host-owned Provider or Integration demonstrates a genuine Level B resume
+  or fork without adding provider fields or parsing to the daemon;
 - requesting Level B from a Level A-only Integration returns an explicit
   unsupported-capability result.
 
 ## M3.5 — Persistence and restart recovery
 
-Status: implemented for the declared historical recovery class; live PTY
-handoff and process adoption remain unsupported. Upgrade continuity and
-semantic resume are design-accepted and implementation-pending
-([015](architecture/choices/015-exec-in-place-upgrade-continuity.md) keeps live
-control across a planned `execve`-in-place upgrade in persistent mode;
-[016](architecture/choices/016-semantic-resume.md) reconstructs a crashed or
-rebooted Run semantically). Crash-time live handoff and PID adoption stay
-unsupported.
+Status: historical recovery and planned exec-in-place continuity are
+implemented. In persistent mode, [015](architecture/choices/015-exec-in-place-upgrade-continuity.md)
+keeps the daemon PID, listener identity, live Run processes, PTY control,
+ordered replay, and recoverable-Input truth across a planned `execve` upgrade.
+Cold replacement, daemon crash, and host reboot still interrupt live Runs;
+cross-process fd handoff and PID adoption remain unsupported.
+
+[016](architecture/choices/016-interrupted-run-derivation.md) defines explicit
+interrupted-parent derivation: ctxmux may clone a portable Level A plan or
+execute a complete caller-materialized Level B plan, but it does not parse
+Provider sessions, construct native-resume commands, or silently change
+fidelity.
 
 First accept a recovery contract that distinguishes durable metadata, replay,
 and live PTY ownership. Then implement only the recovery class that can be
@@ -195,6 +205,8 @@ Acceptance:
 - real restart fixtures prove the accepted recovery class and activate the
   applicable persistence wrong cases;
 - retention, cleanup, and orphan policy are explicit for every persisted item.
+- a Level B request without host-owned provenance and a complete replacement
+  `RunSpec` creates no Run and never falls back to Level A.
 
 ## M4 — tmux adapter
 
@@ -235,10 +247,67 @@ Acceptance:
   documentation;
 - the public positioning remains accurate for every shipped capability.
 
+## Standalone Runtime convergence — Phase 1
+
+Status: accepted for current-tree execution. The Feature Tracker owns live task
+state; this roadmap owns delivery order and acceptance.
+
+The phase closes ctxmux as a complete standalone Runtime product before adding
+another execution location or Provider-adjacent metadata:
+
+1. **T-000 — delivered baseline.** Bind the current daemon, CLI, SDK,
+   persistence, tmux adapter, Level A fork, and planned exec-in-place upgrade to
+   one final code/document gate and evidence receipt.
+2. **T-001 / T0 — Integration boundary.** Keep Provider-neutral
+   `Integration`/`RunRecipe` and shell conformance in ctxmux; remove any
+   co-located Agent Provider, session parser, and native-resume implementation
+   from the publication. Level B remains explicit and fail-closed.
+3. **T-002 / T1 — Runtime identity and capabilities.** Publish a persistent
+   `runtimeId`, a `daemonInstanceId` that changes on cold replacement but not a
+   same-process planned exec, a build identity that may change on exec, and a
+   versioned capability manifest. `runtimeId` must not reuse the serving epoch.
+4. **T-003 / T2 — authoritative Run observations.** Add Run state revision,
+   owner-recorded UTC timestamps, and a typed observation envelope. State
+   revision, output byte cursor, and delivery-gap position remain separate
+   facts, including when an accepted interrupt does not change `RunState`.
+5. **T-004 / T3 — race-free waits.** Provide lost-wakeup-safe Rust and
+   TypeScript wait helpers over the existing attach-before-snapshot boundary;
+   make CLI `wait` reuse the Rust helper. Results distinguish completion,
+   timeout/cancel, output gap, and runtime replacement.
+6. **T-005 / T4 — activation helper.** Provide a TypeScript-first
+   connect-or-activate helper with readiness/Hello identity agreement,
+   caller-supplied expected identity/build/capabilities, bounded cleanup of only
+   the process it spawned, and client-only disposal. Higher products retain
+   artifact pinning, private directories, and product policy.
+7. **T-006 — clean-environment independence.** In an isolated environment with
+   no Agent client or Provider CLI, install only ctxmux and prove daemon
+   activation, start, detach/attach/replay, input, resize, wait, inspect, stop,
+   identity/capability reporting, and portable Level A fork/restart through
+   public CLI and SDK surfaces.
+
+Phase 1 acceptance is executable and has zero higher-client dependency. An
+external package consumer may add evidence, but cannot replace the standalone
+gate or move its policy into ctxmux.
+
+## Remote Runtime and bounded derivation — Phase 2
+
+Status: reviewed proposal only; depends on complete Phase 1 evidence and must
+not be mixed into the current implementation.
+
+- **T5 — Remote Runtime transport.** Carry the same public protocol to an
+  owner-host Runtime, preserving owner-side lifecycle truth and reporting
+  transport loss as unverifiable. Do not introduce a hosted control plane,
+  Relay, account/environment federation, or remote scheduling policy.
+- **T6 — Provider-neutral derivation metadata.** Add a generic derivation kind
+  only when a real consumer needs to distinguish fork/restart/resume beyond the
+  existing parent/fidelity lineage. Provider session selection, transcript
+  trimming, summaries, and native-resume construction remain outside ctxmux.
+
 ## Explicitly deferred
 
 - a complete editor;
-- a hosted or distributed control plane;
+- a hosted control plane, Relay, account/environment federation, or remote
+  scheduling platform;
 - plugin discovery, marketplace, or untrusted plugin sandbox;
 - arbitrary live-process state cloning;
 - broad Integration coverage beyond the one proven Level B path.
