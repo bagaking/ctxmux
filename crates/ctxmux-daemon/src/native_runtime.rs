@@ -195,6 +195,10 @@ pub(crate) struct LiveDescriptors {
 
 enum OwnerCommand {
     Register(NativeRunRegistration),
+    HandoffReady {
+        run_id: RunId,
+        respond: mpsc::Sender<bool>,
+    },
     ExtractForHandoff {
         respond: mpsc::Sender<Result<Vec<LiveDescriptors>, String>>,
     },
@@ -376,7 +380,9 @@ impl NativeRunOwner {
                     message: "daemon-wide native owner stopped before registration".to_owned(),
                     registration: Box::new(match error.0 {
                         OwnerCommand::Register(registration) => registration,
-                        OwnerCommand::ExtractForHandoff { .. } | OwnerCommand::Shutdown => {
+                        OwnerCommand::HandoffReady { .. }
+                        | OwnerCommand::ExtractForHandoff { .. }
+                        | OwnerCommand::Shutdown => {
                             unreachable!("registration send returns its registration")
                         }
                     }),
@@ -413,6 +419,26 @@ impl NativeRunOwner {
         rx.recv().map_err(|_| {
             "daemon-wide native owner stopped without a handoff extraction result".to_owned()
         })?
+    }
+
+    pub(crate) fn handoff_ready(&self, run_id: RunId) -> Result<bool, String> {
+        let commands = {
+            let state = mutex_lock(&self.inner.state);
+            match &*state {
+                OwnerState::Running { commands, .. } => commands.clone(),
+                OwnerState::Failed(message) => return Err(message.clone()),
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+        commands
+            .send(OwnerCommand::HandoffReady {
+                run_id,
+                respond: tx,
+            })
+            .map_err(|_| "daemon-wide native owner stopped before handoff probe".to_owned())?;
+        self.inner.wake.wake();
+        rx.recv()
+            .map_err(|_| "daemon-wide native owner dropped the handoff probe".to_owned())
     }
 
     #[cfg(test)]
@@ -736,6 +762,13 @@ fn drain_commands(
             Ok(OwnerCommand::Register(registration)) => {
                 entries.push(registration.into_entry());
                 diagnostics.registrations.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(OwnerCommand::HandoffReady { run_id, respond }) => {
+                let ready = entries
+                    .iter()
+                    .find(|entry| entry.run_id == run_id)
+                    .is_none_or(|entry| matches!(entry.lifecycle, Lifecycle::Watching(_)));
+                let _ = respond.send(ready);
             }
             Ok(OwnerCommand::ExtractForHandoff { respond }) => {
                 let _ = respond.send(extract_live_descriptors(entries));
