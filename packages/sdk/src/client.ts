@@ -57,12 +57,29 @@ import {
 
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
+  /** Exact Runtime identity required before business dispatch. */
+  readonly expectedRuntimeIdentity?: RuntimeIdentity;
   /** Exact Runtime capability versions required before business dispatch. */
   readonly requiredCapabilities?: RuntimeCapabilityRequirements;
 }
 
 /** Exact Runtime capability versions required before business dispatch. */
 export type RuntimeCapabilityRequirements = Readonly<Record<string, number>>;
+
+/** The dispatch connection reached a different Runtime than the caller retained. */
+export class CtxmuxRuntimeIdentityMismatchError extends Error {
+  public readonly expected: RuntimeIdentity;
+  public readonly actual: RuntimeIdentity;
+
+  public constructor(expected: RuntimeIdentity, actual: RuntimeIdentity) {
+    super(
+      `reachable Runtime identity ${actual.runtimeId}/${actual.daemonInstanceId} does not match expected ${expected.runtimeId}/${expected.daemonInstanceId}`,
+    );
+    this.name = "CtxmuxRuntimeIdentityMismatchError";
+    this.expected = copyRuntimeIdentity(expected);
+    this.actual = copyRuntimeIdentity(actual);
+  }
+}
 
 /** A client-local Runtime capability precondition is not satisfied. */
 export class CtxmuxUnsupportedCapabilityError extends CtxmuxProtocolError {
@@ -164,6 +181,7 @@ function isWellFormedUtf16(value: string): boolean {
 /** Stateless connector to one local ctxmux daemon. */
 export class CtxmuxClient {
   readonly #socketPath: string;
+  readonly #expectedRuntimeIdentity: RuntimeIdentity | undefined;
   readonly #requiredCapabilities: ReadonlyMap<string, number>;
 
   public constructor(options: CtxmuxClientOptions) {
@@ -171,6 +189,9 @@ export class CtxmuxClient {
       throw new TypeError("socketPath must not be empty");
     }
     this.#socketPath = options.socketPath;
+    this.#expectedRuntimeIdentity = copyExpectedRuntimeIdentity(
+      options.expectedRuntimeIdentity,
+    );
     this.#requiredCapabilities = copyRequiredRuntimeCapabilities(
       options.requiredCapabilities,
     );
@@ -439,7 +460,7 @@ export class CtxmuxClient {
     try {
       ({ wire } = await this.#connectForDispatch());
     } catch (error) {
-      if (error instanceof CtxmuxUnsupportedCapabilityError) {
+      if (isDispatchPreconditionError(error)) {
         throw error;
       }
       throw new CtxmuxCommandError(
@@ -567,7 +588,7 @@ export class CtxmuxClient {
     try {
       ({ wire } = await this.#connectForDispatch());
     } catch (error) {
-      if (error instanceof CtxmuxUnsupportedCapabilityError) {
+      if (isDispatchPreconditionError(error)) {
         throw error;
       }
       throw new CtxmuxCommandError(
@@ -657,6 +678,18 @@ export class CtxmuxClient {
   }> {
     const connection = await this.#connect();
     try {
+      if (
+        this.#expectedRuntimeIdentity !== undefined &&
+        !runtimeIdentitiesEqual(
+          connection.runtime,
+          this.#expectedRuntimeIdentity,
+        )
+      ) {
+        throw new CtxmuxRuntimeIdentityMismatchError(
+          this.#expectedRuntimeIdentity,
+          connection.runtime,
+        );
+      }
       for (const [capability, requiredVersion] of this.#requiredCapabilities) {
         const advertisedVersion = Object.hasOwn(
           connection.runtime.capabilities,
@@ -681,6 +714,58 @@ export class CtxmuxClient {
       throw error;
     }
   }
+}
+
+function copyExpectedRuntimeIdentity(
+  expected: RuntimeIdentity | undefined,
+): RuntimeIdentity | undefined {
+  if (expected === undefined) {
+    return undefined;
+  }
+  const frame = validateServerFrame({ type: "hello", runtime: expected });
+  if (frame.type !== "hello") {
+    throw new TypeError("expectedRuntimeIdentity must be a Runtime identity");
+  }
+  return copyRuntimeIdentity(frame.runtime);
+}
+
+function copyRuntimeIdentity(runtime: RuntimeIdentity): RuntimeIdentity {
+  return {
+    ...runtime,
+    capabilities: { ...runtime.capabilities },
+  };
+}
+
+function runtimeIdentitiesEqual(
+  actual: RuntimeIdentity,
+  expected: RuntimeIdentity,
+): boolean {
+  const actualCapabilities = Object.entries(actual.capabilities);
+  return (
+    actual.daemonInstanceId === expected.daemonInstanceId &&
+    actual.runtimeId === expected.runtimeId &&
+    actual.runtimeIdPersistence === expected.runtimeIdPersistence &&
+    actual.buildId === expected.buildId &&
+    actual.protocolGeneration === expected.protocolGeneration &&
+    actual.platform === expected.platform &&
+    actual.arch === expected.arch &&
+    actualCapabilities.length === Object.keys(expected.capabilities).length &&
+    actualCapabilities.every(
+      ([capability, version]) =>
+        Object.hasOwn(expected.capabilities, capability) &&
+        expected.capabilities[capability] === version,
+    )
+  );
+}
+
+function isDispatchPreconditionError(
+  error: unknown,
+): error is
+  CtxmuxRuntimeIdentityMismatchError | CtxmuxUnsupportedCapabilityError {
+  return (
+    error instanceof CtxmuxRuntimeIdentityMismatchError ||
+    error instanceof CtxmuxUnsupportedCapabilityError
+  );
 }
 
 async function receiveReplay(

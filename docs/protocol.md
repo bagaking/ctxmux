@@ -1,4 +1,4 @@
-# Local Protocol Generation 12
+# Local Protocol Generation 13
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -13,7 +13,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 12.
+- Raw PTY bytes are represented as integer arrays in generation 13.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -28,7 +28,7 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. A successful generation-12
+The generation fence covers the wire contract only. A successful generation-13
 Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
 ```ts
@@ -112,13 +112,21 @@ target, external tmux server, or caller-supplied plan is currently usable.
 `RunInfo.capabilities` remains the per-Run Backend truth, and Integration
 capabilities remain host-process truth. No layer is inferred from another.
 
-Rust and TypeScript clients may carry a local exact-key requirement record.
-Requirements do not cross the wire and do not add a negotiation frame:
+Rust and TypeScript clients may carry one caller-retained exact
+`RuntimeIdentity` expectation plus a local exact-key capability requirement
+record. Neither precondition crosses the wire or adds a negotiation frame:
 
 ```text
 connect -> send ClientHello(protocol only) -> validate RuntimeIdentity
-        -> compare configured requirements -> send Request or Attach
+        -> compare expected identity -> compare capability requirements
+        -> send Request or Attach
 ```
+
+The identity comparison uses Hello on the same connection that would carry the
+business frame. Any field or capability-record mismatch returns a typed local
+identity-mismatch error and closes before dispatch, so a separate
+`runtime_info`/`runtimeInfo()` preflight is not required and cannot create an
+endpoint-replacement race.
 
 An advertised version satisfies a requirement only when it is greater than or
 equal to the required version. A missing key or lower version produces the
@@ -129,8 +137,8 @@ them from platform or executable state.
 
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
-only configured capability requirements; framing, the exact identity shape,
-and protocol generation are still validated. Generation 12 adds no
+configured identity and capability requirements; framing, the exact identity shape,
+and protocol generation are still validated. Generation 13 adds no
 version-range or capability negotiation, endpoint discovery, dynamic registry,
 Provider catalog, plugin discovery, or host/credential identity.
 
@@ -212,14 +220,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 12.
+ownership in generation 13.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 12 retains `run_capacity` for the global retained-Run admission
+Generation 13 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -228,7 +236,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-12 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-13 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -251,7 +259,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-12 decoding and
+The daemon compares canonical typed requests after generation-13 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -541,7 +549,8 @@ and receives:
 - retained bytes after that cursor, slicing the first range when it falls inside a retained chunk;
 - the first retained byte and total output bytes allocated;
 - a `truncated` flag when required output was already evicted;
-- future ordered output, Backend observation, gap, and exit events.
+- future ordered output, Backend observation, raw-output gap, explicit
+  observation discontinuity, and exit events.
 
 The daemon subscribes an attachment before taking its replay snapshot and
 deduplicates live events already covered by that snapshot. Before publishing an
@@ -569,19 +578,36 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-12 peer that puts `chunks` back into the header is invalid.
+generation-13 peer that puts `chunks` back into the header is invalid.
 
-`Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
-fell behind. It is not a recovery cursor: the caller must reattach using its own
-last successfully observed byte cursor. Replay then returns an exact retained
-continuation or sets `truncated` when the required history was evicted.
+`Gap { latest_output_bytes }` reports raw-output delivery discontinuity only.
+It is not a recovery cursor: the caller must reattach using its own last
+successfully observed byte cursor. Replay then returns an exact retained
+continuation or sets `truncated` when the required history was evicted or the
+source itself could not provide a continuous raw stream.
+
+`ObservationDiscontinuity` is a separate, cursor-free fail-closed marker: one
+or more non-output observations did not reach this attachment, and byte replay
+cannot reconstruct their meaning. The daemon's private live-event stamp
+distinguishes output-only broadcast lag from lag that crossed tmux observations;
+it is delivery metadata, not a durable journal or a public event sequence. The
+daemon ends that attachment after the marker (or after one authoritative
+terminal event when the Run is already terminal). A new attachment establishes
+a new observation boundary; it does not claim to recover prior tmux events.
+First-party clients retain this marker as a non-output event and close rather
+than silently dropping it when their bounded local queue cannot represent it.
 
 Imported tmux replay begins at the Control Mode import boundary. The initial
 replay is therefore `truncated` even when no retained chunk has been evicted.
 ctxmux does not call `capture-pane` to fill that prefix: a screen snapshot is
 not raw ordered history. If tmux pauses delivery or the adapter detects another
-source-side discontinuity, live attachments receive an explicit gap and later
-attachments remain truncated until their cursor is beyond that source gap.
+source-side discontinuity, live attachments receive an output `Gap` and later
+attachments remain output-truncated until their cursor is beyond that source
+gap. `Paused` and `Continued` remain ordinary live observations when they are
+delivered. Only attachment delivery that cannot preserve one of them—through
+broadcast lag or a terminal subscribe/snapshot join—produces
+`ObservationDiscontinuity`; no sticky Backend state or observation replay is
+synthesized for a later attachment.
 
 This byte log does not reconstruct the current screen of a full-screen TUI.
 Interactive `ctxmux attach` reconstructs a client view from retained bytes and
@@ -600,7 +626,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemonInstanceId` in the ordinary generation-12 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-13 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -628,8 +654,18 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 12 gains no upgrade wire
+strictly bounded, unique, and validated; generation 13 gains no upgrade wire
 operation.
+
+An output append or terminal finalize that receives SQLite's typed `DiskFull`
+does not permanently poison the serving daemon. The persistence actor retries
+that same ordered unit after a short delay and admits no later durable mutation
+ahead of it. Its bounded queue applies backpressure while storage is unavailable;
+daemon shutdown cancels the wait. Other database, I/O, replay-conflict,
+file-budget, integrity, and owner-invariant failures still latch persistence and
+reject later durable mutations. This changes no wire frame or error code: a
+client may observe output progress stall until storage recovers, and a client
+restart alone neither owns nor resets the daemon-side wait.
 
 Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
@@ -662,6 +698,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-12 frame at runtime, rejects duplicate
+validates the complete nested generation-13 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

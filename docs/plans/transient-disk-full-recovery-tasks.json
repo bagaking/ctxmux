@@ -1,0 +1,57 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/plans/transient-disk-full-recovery.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/architecture/choices/009-runtime-persistence-recovery.md",
+    "docs/architecture/choices/013-retained-run-resource-governance.md",
+    "docs/plans/transient-disk-full-recovery.md"
+  ],
+  "supersedes_revision": null,
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Backpressure and retry transient SQLite DiskFull",
+      "objective": "Keep an exact failed durable output or finalize unit in the single persistence actor and retry only typed SQLite DiskFull until storage or daemon shutdown resolves the wait.",
+      "outcome": "A temporary full disk no longer poisons every later Run mutation for the whole daemon incarnation, while durability ordering and bounded memory remain intact.",
+      "acceptance": [
+        "Typed SQLite DiskFull remains distinguishable from all other database and persistence failures after error translation.",
+        "The actor retries the same append/finalize unit before later commands and the existing bounded channel applies PTY backpressure instead of accumulating another backlog.",
+        "Daemon shutdown can stop the retry loop without waiting for storage recovery.",
+        "Conflicting replay, corruption, invariant, file-budget, and non-DiskFull failures still latch the actor and freeze the durable cursor.",
+        "Decision 009, the architecture entrypoint, protocol text, focused owner tests, and the ordinary Gate agree on the behavior."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "package.json#scripts.check",
+          "proves": "Formatting, static analysis, unit, lifecycle, protocol, SDK, and local consumer checks pass together."
+        },
+        {
+          "kind": "command",
+          "ref": "crates/ctxmux-daemon/src/persistence.rs",
+          "proves": "Deterministic actor tests force DiskFull recovery and preserve fatal replay-conflict behavior."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/plans/transient-disk-full-recovery.md",
+          "proves": "The retry boundary, backpressure owner, non-goals, and old-daemon limit are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/plans/transient-disk-full-recovery.md"
+      ],
+      "supersedes": []
+    }
+  ]
+}

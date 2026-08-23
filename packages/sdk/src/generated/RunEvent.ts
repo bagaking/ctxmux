@@ -12,4 +12,5 @@ export type RunEvent =
   | { type: "exited"; state: RunState }
   | { type: "interrupted"; reason: InterruptionReason }
   | { type: "tmux"; event: TmuxRunEvent }
+  | { type: "observation_discontinuity" }
   | { type: "gap"; latest_output_bytes: number };

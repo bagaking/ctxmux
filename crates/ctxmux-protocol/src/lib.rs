@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 13;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -913,7 +913,7 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 12.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 13.
     pub data: Vec<u8>,
 }
 
@@ -1303,7 +1303,13 @@ pub enum RunEvent {
     /// Backend-specific observable event that does not change generic Run
     /// ownership semantics.
     Tmux { event: TmuxRunEvent },
-    /// The attachment lagged behind live delivery and should request replay.
+    /// One or more non-output observations that have no authoritative snapshot
+    /// were not delivered. Output replay cannot reconstruct the missing
+    /// semantics.
+    ObservationDiscontinuity,
+    /// Raw output delivery was discontinuous. The caller can reattach from its
+    /// last observed byte cursor to obtain retained bytes or explicit
+    /// truncation.
     Gap { latest_output_bytes: u64 },
 }
 
@@ -1542,9 +1548,10 @@ mod tests {
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
         RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
         RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
-        RecoverableStop, Request, Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSignal,
-        RunSpec, RunState, RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity,
-        ServerFrame, StopDisposition, StopOperationKey, TerminalSize, decode_frame, encode_frame,
+        RecoverableStop, Request, Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo,
+        RunSignal, RunSpec, RunState, RuntimeBuildId, RuntimeId, RuntimeIdPersistence,
+        RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey, TerminalSize,
+        decode_frame, encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -1637,7 +1644,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_12_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_13_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1655,7 +1662,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 12,
+                    "protocolGeneration": 13,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -1728,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_stop_requests_have_exact_generation_12_wire_shapes() {
+    fn recoverable_stop_requests_have_exact_generation_13_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1766,6 +1773,14 @@ mod tests {
                 },
                 "after_byte": 17,
             })
+        );
+    }
+
+    #[test]
+    fn observation_discontinuity_is_cursor_free_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(RunEvent::ObservationDiscontinuity).unwrap(),
+            serde_json::json!({"type": "observation_discontinuity"})
         );
     }
 

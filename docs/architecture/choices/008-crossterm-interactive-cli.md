@@ -48,6 +48,9 @@ interactive loop while stdout is written.
 On `Gap`, the CLI tells the user the daemon's latest output byte but does not
 track and print the last successfully displayed byte cursor needed for a
 precise reattach command.
+On `ObservationDiscontinuity`, it exits nonzero with a distinct diagnostic:
+byte replay cannot reconstruct the missing non-output semantics. The raw-mode
+guard still owns ordinary terminal restoration on that error path.
 
 ## Wrong-case corpus
 

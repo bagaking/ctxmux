@@ -32,7 +32,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-12 wire contract. */
+/** A daemon frame failed the runtime half of the generation-13 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -217,7 +217,7 @@ function nonEmptyString(value: unknown, path: string): string {
   return result;
 }
 
-/** Reject a generation-12 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-13 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -288,6 +288,8 @@ function runEvent(value: unknown, path: string): void {
       return;
     case "tmux":
       tmuxRunEvent(event.event, `${path}.event`);
+      return;
+    case "observation_discontinuity":
       return;
     case "gap":
       validateCursorValue(

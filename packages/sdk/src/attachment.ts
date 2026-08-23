@@ -74,6 +74,7 @@ export class Attachment {
   #pendingOutputGap: Extract<RunEvent, { readonly type: "gap" }> | undefined;
   #terminalEvent: RunEvent | undefined;
   #terminalSeen = false;
+  #observationDiscontinuitySeen = false;
   #eventStreamEnded = false;
   #eventError: Error | undefined;
   #pendingDrainedResolve: (() => void) | undefined;
@@ -365,7 +366,8 @@ export class Attachment {
             terminalError instanceof SyntaxError
             ? "internal"
             : "io",
-          this.#terminalSeen && terminalError instanceof WireClosedError,
+          (this.#terminalSeen || this.#observationDiscontinuitySeen) &&
+            terminalError instanceof WireClosedError,
         );
       }
     }
@@ -463,10 +465,25 @@ export class Attachment {
       );
       return false;
     }
+    if (this.#observationDiscontinuitySeen) {
+      this.#protocolViolation(
+        "attachment delivered a non-terminal event after observation discontinuity",
+        "$frame.event",
+      );
+      return false;
+    }
+    if (event.type === "observation_discontinuity") {
+      this.#observationDiscontinuitySeen = true;
+    }
     if (this.#events.length === 0 && this.#eventWaiter !== undefined) {
       const waiter = this.#eventWaiter;
       this.#eventWaiter = undefined;
       waiter.resolve(event);
+      return true;
+    }
+
+    if (event.type === "gap") {
+      this.#extendPendingOutputGap(event.latest_output_bytes);
       return true;
     }
 

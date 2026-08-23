@@ -88,6 +88,15 @@ pub enum ClientError {
         /// Highest advertised version, or `None` when the key is absent.
         advertised_version: Option<u64>,
     },
+    /// The Runtime reached by this dispatch connection is not the exact
+    /// Runtime identity retained by the caller.
+    #[error("reachable Runtime identity does not match the caller's expected identity")]
+    RuntimeIdentityMismatch {
+        /// Exact identity required before business dispatch.
+        expected: Box<RuntimeIdentity>,
+        /// Identity returned by Hello on the rejected connection.
+        actual: Box<RuntimeIdentity>,
+    },
     /// A correlated control request was rejected with a known application
     /// boundary.
     #[error("ctxmux control request was rejected: {failure:?}")]
@@ -158,7 +167,8 @@ impl ClientError {
             Self::ControlNotApplied { .. }
             | Self::AttachmentBackpressure { .. }
             | Self::AttachmentUnavailable { .. }
-            | Self::UnsupportedCapability { .. } => Some(CommandDisposition::NotApplied),
+            | Self::UnsupportedCapability { .. }
+            | Self::RuntimeIdentityMismatch { .. } => Some(CommandDisposition::NotApplied),
             Self::Connect { .. }
             | Self::Closed
             | Self::Transport(_)
@@ -270,6 +280,7 @@ impl From<ProtocolError> for ClientError {
 pub struct Client {
     socket_path: PathBuf,
     required_capabilities: RuntimeCapabilityRequirements,
+    expected_runtime_identity: Option<RuntimeIdentity>,
 }
 
 impl Client {
@@ -279,7 +290,21 @@ impl Client {
         Self {
             socket_path: socket_path.into(),
             required_capabilities: BTreeMap::new(),
+            expected_runtime_identity: None,
         }
+    }
+
+    /// Require one exact Runtime identity before every business Request or
+    /// Attach frame.
+    ///
+    /// The comparison occurs against Hello on the same connection that would
+    /// carry the business frame, closing the endpoint-replacement race of a
+    /// separate [`Self::runtime_info`] preflight. Raw [`Self::ping`] and
+    /// [`Self::runtime_info`] remain available for diagnostics.
+    #[must_use]
+    pub fn with_expected_runtime_identity(mut self, expected: RuntimeIdentity) -> Self {
+        self.expected_runtime_identity = Some(expected);
+        self
     }
 
     /// Require exact Runtime capability versions before every business
@@ -845,6 +870,14 @@ impl Client {
 
     async fn connect_for_dispatch(&self) -> Result<(Wire, RuntimeIdentity), ClientError> {
         let (wire, runtime) = self.connect().await?;
+        if let Some(expected) = &self.expected_runtime_identity
+            && runtime != *expected
+        {
+            return Err(ClientError::RuntimeIdentityMismatch {
+                expected: Box::new(expected.clone()),
+                actual: Box::new(runtime),
+            });
+        }
         validate_runtime_capability_requirements(&runtime, &self.required_capabilities)?;
         Ok((wire, runtime))
     }
@@ -935,7 +968,8 @@ fn control_request_unknown(source: ClientError) -> ClientError {
 
 fn control_not_applied(source: ClientError) -> ClientError {
     match source {
-        unsupported @ ClientError::UnsupportedCapability { .. } => unsupported,
+        preflight @ (ClientError::UnsupportedCapability { .. }
+        | ClientError::RuntimeIdentityMismatch { .. }) => preflight,
         source => ClientError::ControlNotApplied {
             source: Box::new(source),
         },

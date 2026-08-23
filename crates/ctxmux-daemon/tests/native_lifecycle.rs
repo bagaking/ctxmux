@@ -648,6 +648,9 @@ async fn wait_for_output(
                     panic!("Run was interrupted before expected output: {reason:?}")
                 }
                 RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("unexpected non-output observation discontinuity")
+                }
             }
         }
     })
@@ -673,6 +676,9 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                     panic!("live Run was unexpectedly interrupted: {reason:?}")
                 }
                 RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("unexpected non-output observation discontinuity")
+                }
             }
         }
     })
@@ -1317,6 +1323,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
                         RunEvent::Gap { latest_output_bytes } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
                         RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                         RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+                        RunEvent::ObservationDiscontinuity => panic!("unexpected non-output observation discontinuity"),
                     }
                 }
             }
@@ -1433,6 +1440,9 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
                 } => panic!("unexpected saturation gap at {latest_output_bytes}"),
                 RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                 RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("unexpected non-output observation discontinuity")
+                }
             }
         }
     })
@@ -2835,17 +2845,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_11_before_request_dispatch() {
+async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 12,
+        PROTOCOL_VERSION, 13,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_11_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 11 },
+    let generation_12_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 12 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -2863,7 +2873,7 @@ async fn daemon_rejects_generation_11_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_11_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_12_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));

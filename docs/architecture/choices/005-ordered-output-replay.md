@@ -14,7 +14,11 @@ Each non-empty PTY read becomes one `OutputChunk` carrying its contiguous half-o
 The metadata header and reassembled snapshot are different protocol types.
 `AttachedHeader` has no chunks field; `AttachedSnapshot` is a client API result.
 
-Live output is delivered through a bounded broadcast channel. A lagging receiver gets `Gap { latest_output_bytes }` and must reattach using the client's last successfully observed byte cursor.
+Live output is delivered through a bounded broadcast channel. A receiver that
+loses raw output gets `Gap { latest_output_bytes }` and must reattach using the
+client's last successfully observed byte cursor. `Gap` proves nothing about
+non-output observations: losing one of those produces cursor-free
+`ObservationDiscontinuity` at the attachment boundary instead.
 
 ## Quality attributes and invariants
 
@@ -22,7 +26,9 @@ Live output is delivered through a bounded broadcast channel. A lagging receiver
 - Replay contains only bytes after `after_byte`; it slices a retained chunk when necessary.
 - Eviction is explicit through `truncated`; missing history never looks complete.
 - Subscribe-before-snapshot plus deduplication prevents replay/live duplication.
-- Exited Runs remain attachable for replay and one terminal state event.
+- Exited Runs remain attachable for replay and one terminal state event. If
+  broadcast lag overwrites that one publication, the daemon reconstructs it
+  once from authoritative `RunState` before attachment EOF.
 - Retained history larger than one transport frame remains exact because replay
   uses the same bounded output-frame representation as live delivery.
 
@@ -58,7 +64,7 @@ Short reads do not preserve application write boundaries. The core promise is by
   reassembled exactly across native and TypeScript public clients.
 - Candidate: cursors at zero, `oldest - 1`, oldest, head, and future.
 - Candidate: retention eviction across many chunks and one oversized chunk.
-- Covered now: a real attachment observes `Gap`, disconnects, replays from the caller-owned cursor, and proves contiguous byte ranges plus exact raw-byte continuation through the public protocol.
+- Covered now: a real attachment observes `Gap`, disconnects, replays from the caller-owned cursor, and proves contiguous byte ranges plus exact raw-byte continuation through the public protocol. Tiny-channel fixtures separately prove non-output discontinuity and terminal resnapshot after late output overwrites the original terminal publication.
 - Covered now: a 5 MiB final-output workload retains the bounded tail, marks
   truncation, preserves the final marker, and remains attachable.
 - Candidate: attach to an already-exited Run.
