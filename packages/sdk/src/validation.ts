@@ -1,7 +1,11 @@
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
-import { MAX_RUNTIME_BUILD_ID_BYTES } from "./generated/constants.js";
+import {
+  MAX_RUNTIME_BUILD_ID_BYTES,
+  MAX_RUNTIME_CAPABILITY_VERSION,
+} from "./generated/constants.js";
+import { isParsedJsonObject, jsonNumberSource } from "./wire.js";
 
 const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "version_mismatch",
@@ -87,10 +91,7 @@ function runtimeIdentity(value: unknown, path: string): void {
     runtime.runtimeIdPersistence !== "daemon" &&
     runtime.runtimeIdPersistence !== "state_dir"
   ) {
-    throw invalid(
-      `${path}.runtimeIdPersistence`,
-      '"daemon" or "state_dir"',
-    );
+    throw invalid(`${path}.runtimeIdPersistence`, '"daemon" or "state_dir"');
   }
   const buildId = string(runtime.buildId, `${path}.buildId`);
   const buildIdBytes = new TextEncoder().encode(buildId).byteLength;
@@ -112,15 +113,99 @@ function runtimeIdentity(value: unknown, path: string): void {
 
 function runtimeCapabilities(value: unknown, path: string): void {
   const capabilities = record(value, path);
+  const parsedFromWire = isParsedJsonObject(capabilities);
   for (const [key, version] of Object.entries(capabilities)) {
+    const source = parsedFromWire
+      ? jsonNumberSource(capabilities, key)
+      : undefined;
     if (
-      typeof version !== "number" ||
-      !Number.isSafeInteger(version) ||
-      version <= 0
+      !isRuntimeCapabilityVersion(version) ||
+      (parsedFromWire &&
+        (source === undefined ||
+          parseRuntimeCapabilityVersionSource(source) !== version))
     ) {
       throw invalid(`${path}.${key}`, "a positive safe integer version");
     }
   }
+}
+
+/** Validate and snapshot client-local Runtime capability requirements. */
+export function copyRequiredRuntimeCapabilities(
+  value: unknown,
+): ReadonlyMap<string, number> {
+  if (value === undefined) {
+    return new Map();
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new TypeError(
+      "requiredCapabilities must be a string-to-number record",
+    );
+  }
+  const result = new Map<string, number>();
+  for (const [capability, version] of Object.entries(value)) {
+    if (!isRuntimeCapabilityVersion(version)) {
+      throw new TypeError(
+        `requiredCapabilities.${capability} must be a positive safe integer version`,
+      );
+    }
+    result.set(capability, version);
+  }
+  return result;
+}
+
+function isRuntimeCapabilityVersion(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value > 0 &&
+    value <= MAX_RUNTIME_CAPABILITY_VERSION
+  );
+}
+
+function parseRuntimeCapabilityVersionSource(
+  source: string,
+): number | undefined {
+  const match = /^(0|[1-9]\d*)(?:\.(\d+))?(?:[eE]([+-]?)(\d+))?$/u.exec(source);
+  if (match === null) {
+    return undefined;
+  }
+
+  const integer = match[1] ?? "";
+  const fraction = match[2] ?? "";
+  const exponentDigits = match[4] ?? "0";
+  let exponent = Number(exponentDigits);
+  if (!Number.isSafeInteger(exponent)) {
+    return undefined;
+  }
+  if (match[3] === "-") {
+    exponent = -exponent;
+  }
+
+  let digits = `${integer}${fraction}`;
+  if (!/[1-9]/u.test(digits)) {
+    return undefined;
+  }
+  const decimalShift = exponent - fraction.length;
+  if (decimalShift < 0) {
+    const removed = -decimalShift;
+    if (
+      removed >= digits.length ||
+      !/^0*$/u.test(digits.slice(digits.length - removed))
+    ) {
+      return undefined;
+    }
+    digits = digits.slice(0, digits.length - removed);
+  } else {
+    digits = digits.replace(/^0+/u, "");
+    if (digits.length + decimalShift > 16) {
+      return undefined;
+    }
+    digits += "0".repeat(decimalShift);
+  }
+
+  const normalized = digits.replace(/^0+/u, "");
+  const version = Number(normalized);
+  return isRuntimeCapabilityVersion(version) ? version : undefined;
 }
 
 function nonEmptyString(value: unknown, path: string): string {

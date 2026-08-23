@@ -12,19 +12,26 @@ Rust and TypeScript clients need a simple local boundary that survives client re
 Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The daemon operator still supplies the socket path to `ctxmuxd`. The first-party CLI may omit that path: it uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` or a process-temp fallback, and starts a sibling `ctxmuxd` when nothing is listening. Other clients, including the SDK, still select the socket explicitly and do not start the daemon. The daemon creates the socket with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
 
 The first frame is an exact protocol-generation handshake. A successful Hello
-returns one typed `RuntimeDescription`: logical Runtime ID, daemon instance,
-opaque serving build ID, exact protocol generation, and a fixed versioned
-capability manifest. Short-lived connections carry one request. Attachment
-connections carry one metadata snapshot header, bounded ordered replay-output
-frames through that header's replay head, then bidirectional control frames and
-live events. One encoded frame is limited to 1 MiB; total retained replay is not
-required to fit in one frame.
+returns one exact camelCase `RuntimeIdentity`: logical Runtime ID and explicit
+persistence class, daemon instance, opaque serving build ID, Rust build-target
+OS and architecture, exact protocol generation, and a flat JavaScript-safe
+positive-integer capability record. Short-lived connections carry one request.
+Attachment connections carry one metadata snapshot header, bounded ordered
+replay-output frames through that header's replay head, then bidirectional
+control frames and live events. One encoded frame is limited to 1 MiB; total
+retained replay is not required to fit in one frame.
+
+Optional capability requirements remain client-local. The only client
+compatibility value sent in the handshake is `ClientHello.protocol`; a public
+client validates RuntimeIdentity and compares its exact requirements before it
+sends any Request or Attach frame. A mismatch closes locally with
+`unsupported_capability`, so this decision adds no negotiation frame.
 
 ## Quality attributes and invariants
 
 - Version mismatch fails before a request is executed.
-- Unknown Runtime manifest versions and malformed or extra Runtime fields fail
-  before a public client exposes endpoint facts.
+- Malformed or extra RuntimeIdentity fields and invalid capability values fail
+  before a public client exposes endpoint facts or dispatches business work.
 - A decoded invalid request receives a typed protocol error.
 - Startup stale cleanup and shutdown never intentionally replace or remove an
   ordinary file, symlink, or independently substituted listener.
@@ -59,8 +66,10 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 10 directly replaces generation 9. It adds the typed
-Runtime description and capability manifest without a compatibility layer.
+Protocol generation 10 directly replaces generation 9. It adds the exact
+RuntimeIdentity and flat numeric capability record without a compatibility
+layer. The pre-stable contract directly rejects the obsolete snake_case and
+nested-boolean draft; it has no alias or dual encoding.
 Generation 9 introduced native Signal plus complete-session Stop disposition;
 generation 8 introduced cumulative half-open output byte cursors. Generation 7
 introduced daemon-instance identity plus recoverable native Input operation
@@ -88,8 +97,9 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
   requests, socket mode, active-listener refusal, non-socket and symlink
   refusal.
 - Covered now: exact Runtime Hello shape, Runtime/daemon/Run identity
-  separation, Rust/TypeScript/CLI parity, unknown manifest rejection, and
-  malformed or forbidden discovery fields failing closed.
+  separation, Rust/TypeScript/CLI parity, invalid numeric capability rejection,
+  client-local pre-dispatch requirements, and malformed or forbidden fields
+  failing closed.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.
 - Covered now: retained replay larger than one frame is sent as bounded ordered
   output events and reassembled exactly by both public clients.

@@ -4,6 +4,7 @@ export {
   CtxmuxCommandError,
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
+  CtxmuxUnsupportedCapabilityError,
   createOperationKey,
   inputOperationKey,
 } from "./client.js";
@@ -15,6 +16,7 @@ export type {
   InputReceipt,
   RecoverableInputOperation,
   ResizeReceipt,
+  RuntimeCapabilityRequirements,
   SignalReceipt,
   StopReceipt,
 } from "./client.js";
@@ -47,7 +49,16 @@ export {
   MAX_FRAME_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
   MAX_RUNTIME_BUILD_ID_BYTES,
+  MAX_RUNTIME_CAPABILITY_VERSION,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+  RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+  RUNTIME_CAPABILITY_NATIVE_START,
+  RUNTIME_CAPABILITY_PERSISTENT_STATE,
+  RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+  RUNTIME_CAPABILITY_TMUX_DISCOVER,
+  RUNTIME_CAPABILITY_TMUX_IMPORT,
 } from "./generated/constants.js";
 export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";

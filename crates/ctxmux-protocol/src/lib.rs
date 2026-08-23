@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, fmt};
 use serde::{
     Deserialize, Serialize,
     de::{DeserializeOwned, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor},
+    ser::Error as _,
 };
 use thiserror::Error;
 use ts_rs::TS;
@@ -50,6 +51,50 @@ pub const MAX_INPUT_OPERATION_KEY_BYTES: usize = 128;
 
 /// Maximum UTF-8 byte length of one daemon-authored build identity.
 pub const MAX_RUNTIME_BUILD_ID_BYTES: usize = 128;
+
+/// Largest Runtime capability version that every public JavaScript client can
+/// represent without rounding.
+pub const MAX_RUNTIME_CAPABILITY_VERSION: u64 = 9_007_199_254_740_991;
+
+/// Why one Runtime capability version is outside the public cross-language
+/// numeric domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum RuntimeCapabilityVersionError {
+    /// Zero never names an implemented contract version.
+    #[error("Runtime capability version must be greater than zero")]
+    Zero,
+    /// JavaScript cannot represent the value without rounding.
+    #[error("Runtime capability version {actual} exceeds the safe-integer maximum {maximum}")]
+    ExceedsSafeInteger {
+        /// Rejected version.
+        actual: u64,
+        /// Largest accepted version.
+        maximum: u64,
+    },
+}
+
+/// Validate one Runtime capability version shared by advertisements and
+/// client-local requirements.
+///
+/// # Errors
+///
+/// Returns [`RuntimeCapabilityVersionError::Zero`] for zero and
+/// [`RuntimeCapabilityVersionError::ExceedsSafeInteger`] for a value greater
+/// than [`MAX_RUNTIME_CAPABILITY_VERSION`].
+pub const fn validate_runtime_capability_version(
+    version: u64,
+) -> Result<(), RuntimeCapabilityVersionError> {
+    if version == 0 {
+        return Err(RuntimeCapabilityVersionError::Zero);
+    }
+    if version > MAX_RUNTIME_CAPABILITY_VERSION {
+        return Err(RuntimeCapabilityVersionError::ExceedsSafeInteger {
+            actual: version,
+            maximum: MAX_RUNTIME_CAPABILITY_VERSION,
+        });
+    }
+    Ok(())
+}
 
 /// Attachment-local correlation identity for one control command.
 ///
@@ -832,9 +877,12 @@ pub struct RuntimeIdentity {
     #[serde(deserialize_with = "deserialize_non_empty_runtime_string")]
     pub arch: String,
     /// Highest implemented public contract version for each exact flat key.
-    #[serde(deserialize_with = "deserialize_runtime_capabilities")]
+    #[serde(
+        serialize_with = "serialize_runtime_capabilities",
+        deserialize_with = "deserialize_runtime_capabilities"
+    )]
     #[ts(type = "Record<string, number>")]
-    pub capabilities: BTreeMap<String, u16>,
+    pub capabilities: BTreeMap<String, u64>,
 }
 
 fn deserialize_non_empty_runtime_string<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -852,17 +900,112 @@ where
 
 fn deserialize_runtime_capabilities<'de, D>(
     deserializer: D,
-) -> Result<BTreeMap<String, u16>, D::Error>
+) -> Result<BTreeMap<String, u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let capabilities = BTreeMap::<String, u16>::deserialize(deserializer)?;
-    if let Some((key, _)) = capabilities.iter().find(|(_, version)| **version == 0) {
-        return Err(D::Error::custom(format!(
-            "Runtime capability {key:?} must have a positive integer version"
-        )));
+    BTreeMap::<String, serde_json::Number>::deserialize(deserializer)?
+        .into_iter()
+        .map(|(key, raw_version)| {
+            let version =
+                parse_runtime_capability_version(raw_version.as_str()).map_err(|error| {
+                    D::Error::custom(format_args!("Runtime capability {key:?}: {error}"))
+                })?;
+            Ok((key, version))
+        })
+        .collect()
+}
+
+fn parse_runtime_capability_version(source: &str) -> Result<u64, String> {
+    if source.starts_with('-') {
+        return Err("Runtime capability version must be greater than zero".to_owned());
     }
-    Ok(capabilities)
+
+    let (significand, exponent) = source
+        .split_once(['e', 'E'])
+        .map_or((source, "0"), |parts| parts);
+    let exponent = exponent
+        .parse::<i128>()
+        .map_err(|_| "Runtime capability version exponent is outside the supported domain")?;
+    let (integer, fraction) = significand
+        .split_once('.')
+        .map_or((significand, ""), |parts| parts);
+    if integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("Runtime capability version must be a JSON number".to_owned());
+    }
+
+    let mut digits = String::with_capacity(integer.len() + fraction.len());
+    digits.push_str(integer);
+    digits.push_str(fraction);
+    if digits.bytes().all(|byte| byte == b'0') {
+        return Err("Runtime capability version must be greater than zero".to_owned());
+    }
+
+    let fraction_digits = i128::try_from(fraction.len())
+        .map_err(|_| "Runtime capability version is outside the supported domain")?;
+    let decimal_shift = exponent
+        .checked_sub(fraction_digits)
+        .ok_or_else(|| "Runtime capability version is outside the supported domain".to_owned())?;
+    let integer_digits = if decimal_shift < 0 {
+        let removed = decimal_shift
+            .checked_neg()
+            .and_then(|digits| usize::try_from(digits).ok())
+            .ok_or_else(|| "Runtime capability version must be an integer".to_owned())?;
+        if removed >= digits.len()
+            || !digits[digits.len() - removed..]
+                .bytes()
+                .all(|byte| byte == b'0')
+        {
+            return Err("Runtime capability version must be an integer".to_owned());
+        }
+        digits.truncate(digits.len() - removed);
+        digits
+    } else {
+        let significant_digits = digits.trim_start_matches('0').len();
+        let appended = usize::try_from(decimal_shift).map_err(|_| {
+            format!(
+                "Runtime capability version exceeds the safe-integer maximum {MAX_RUNTIME_CAPABILITY_VERSION}"
+            )
+        })?;
+        if significant_digits.saturating_add(appended) > 16 {
+            return Err(format!(
+                "Runtime capability version exceeds the safe-integer maximum {MAX_RUNTIME_CAPABILITY_VERSION}"
+            ));
+        }
+        digits.extend(std::iter::repeat_n('0', appended));
+        digits
+    };
+
+    let normalized = integer_digits.trim_start_matches('0');
+    let version = normalized.parse::<u64>().map_err(|_| {
+        format!(
+            "Runtime capability version exceeds the safe-integer maximum {MAX_RUNTIME_CAPABILITY_VERSION}"
+        )
+    })?;
+    validate_runtime_capability_version(version).map_err(|error| error.to_string())?;
+    Ok(version)
+}
+
+fn serialize_runtime_capabilities<S>(
+    capabilities: &BTreeMap<String, u64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    validate_runtime_capabilities(capabilities).map_err(S::Error::custom)?;
+    capabilities.serialize(serializer)
+}
+
+fn validate_runtime_capabilities(capabilities: &BTreeMap<String, u64>) -> Result<(), String> {
+    for (key, version) in capabilities {
+        validate_runtime_capability_version(*version)
+            .map_err(|source| format!("Runtime capability {key:?}: {source}"))?;
+    }
+    Ok(())
 }
 
 /// First message sent by every client connection.
@@ -1285,8 +1428,8 @@ mod tests {
         AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError,
-        RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+        MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION, PROTOCOL_VERSION,
+        ProtocolError, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
         RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_TMUX_DISCOVER,
         RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request, Response, RunBackend,
@@ -1471,6 +1614,106 @@ mod tests {
                 "input_cursor_mismatch",
                 "daemon_instance_mismatch",
             ])
+        );
+    }
+
+    #[test]
+    fn runtime_capability_versions_use_the_javascript_safe_positive_integer_domain() {
+        let daemon_instance = DaemonInstanceId::new();
+        let mut runtime = sample_runtime_identity(daemon_instance);
+        runtime.capabilities = std::collections::BTreeMap::from([(
+            "candidate".to_owned(),
+            MAX_RUNTIME_CAPABILITY_VERSION,
+        )]);
+        let frame = ServerFrame::Hello { runtime };
+        let encoded = encode_frame(&frame).expect("encode maximum safe capability version");
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encoded).expect("decode maximum safe capability version"),
+            frame
+        );
+
+        let mut integral_runtime = sample_runtime_identity(daemon_instance);
+        integral_runtime.capabilities =
+            std::collections::BTreeMap::from([("candidate".to_owned(), 1)]);
+        let integral_frame = ServerFrame::Hello {
+            runtime: integral_runtime,
+        };
+        let integer_encoded = encode_frame(&integral_frame).expect("encode integer capability");
+        for (spelling, expected_version) in [
+            ("1", 1),
+            ("1.0", 1),
+            ("1e0", 1),
+            ("10e-1", 1),
+            ("9007199254740991", MAX_RUNTIME_CAPABILITY_VERSION),
+            ("9007199254740991.0", MAX_RUNTIME_CAPABILITY_VERSION),
+            ("90071992547409910e-1", MAX_RUNTIME_CAPABILITY_VERSION),
+        ] {
+            let encoded =
+                integer_encoded.replace("\"candidate\":1", &format!("\"candidate\":{spelling}"));
+            let ServerFrame::Hello { runtime } = decode_frame::<ServerFrame>(&encoded)
+                .unwrap_or_else(|error| panic!("decode {spelling} capability: {error}"))
+            else {
+                panic!("capability fixture must remain a Hello frame");
+            };
+            assert_eq!(
+                runtime.capabilities.get("candidate"),
+                Some(&expected_version),
+                "integer-valued JSON numbers share one cross-language domain: {spelling}"
+            );
+        }
+
+        for spelling in [
+            "-0",
+            "0",
+            "1.0000000000000001",
+            "0.99999999999999999",
+            "9007199254740990.5",
+            "9007199254740989.5",
+            "9007199254740991.1",
+            "9007199254740992",
+            "9007199254740992.0",
+            "9007199254740992e0",
+            "1e400",
+            "1e-400",
+        ] {
+            let encoded =
+                integer_encoded.replace("\"candidate\":1", &format!("\"candidate\":{spelling}"));
+            assert!(
+                decode_frame::<ServerFrame>(&encoded).is_err(),
+                "fractional source token was rounded into the accepted domain: {spelling}"
+            );
+        }
+
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+            serde_json::json!("1"),
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!(MAX_RUNTIME_CAPABILITY_VERSION + 1),
+        ] {
+            let mut value = serde_json::to_value(&frame).expect("encode valid Runtime identity");
+            value["runtime"]["capabilities"]["candidate"] = invalid.clone();
+            assert!(
+                serde_json::from_value::<ServerFrame>(value).is_err(),
+                "invalid Runtime capability version was accepted: {invalid}"
+            );
+        }
+
+        let mut invalid_runtime = sample_runtime_identity(daemon_instance);
+        invalid_runtime.capabilities = std::collections::BTreeMap::from([(
+            "candidate".to_owned(),
+            MAX_RUNTIME_CAPABILITY_VERSION + 1,
+        )]);
+        assert!(
+            serde_json::to_value(ServerFrame::Hello {
+                runtime: invalid_runtime,
+            })
+            .is_err(),
+            "an out-of-domain capability must not be serialized"
         );
     }
 

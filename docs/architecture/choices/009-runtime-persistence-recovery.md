@@ -67,7 +67,13 @@ cursors, and quota accounting. Schema 4 additionally stores one valid
 the state-directory lineage and survives cold replacement while the serving
 epoch changes; a planned exec reloads both preserved identities from this
 existing owner. It is not derived from the state path, socket, PID, host, or
-serving epoch. Schema-4 validation accepts its 4,096-record format envelope,
+serving epoch. Public Hello therefore reports
+`runtimeIdPersistence: "state_dir"`: cold replacement preserves `runtimeId`
+and changes `daemonInstanceId`, while validated planned exec preserves both.
+The persistent-mode advertised capability record includes the two implemented
+`services.*` keys and omits memory-only `tmux.import`; the exact catalog and
+numeric semantics remain owned by [the protocol](../../protocol.md#connection-state).
+Schema-4 validation accepts its 4,096-record format envelope,
 then startup normalization uses bounded,
 spill-disabled transactions to reconcile prior running rows and evict the
 canonical terminal prefix to the operational 128-record ceiling. Each batch
@@ -241,7 +247,8 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
   attachments reconnect.
 - Active: public Hello observations prove that a cold replacement on the same
   state directory keeps the Runtime ID and changes the daemon instance; both
-  endpoints report the persistent capability manifest.
+  endpoints report `runtimeIdPersistence: "state_dir"`, the Rust build target,
+  and the exact persistent-mode capability record.
 - Active / `PERSIST-01`: a stored running row naming an unrelated live PID is
   reconciled to interrupted; the unrelated process and old orphan are neither
   opened nor signalled.

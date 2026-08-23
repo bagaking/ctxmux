@@ -115,7 +115,7 @@ standalone lifecycle in a clean environment with no higher-level client or
 provider CLI installed. It additionally succeeds as an embedding surface when
 a new client can install an SDK, connect to the local runtime, and manage local
 Runs without reimplementing activation, PTY transport, lifecycle, reconnect,
-output, identity, or capability negotiation.
+output, identity, or client-local capability compatibility checks.
 
 The strongest proof is behavioral: real Runs survive client exit, can be
 reattached, and preserve only the context fidelity their capabilities promise.

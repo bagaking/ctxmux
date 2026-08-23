@@ -123,6 +123,7 @@ version = "0.1.0"
 dependencies = [
  "ctxmux-protocol",
  "futures-util",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

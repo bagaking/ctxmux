@@ -82,7 +82,7 @@ done
 ctxmux_cli_runtime=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" runtime)
 ctxmux_cli_runtime_again=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" runtime)
 [[ "$ctxmux_cli_runtime_again" == "$ctxmux_cli_runtime" ]] ||
-  fail "Runtime description changed within one daemon lifetime"
+  fail "Runtime identity changed within one daemon lifetime"
 
 ctxmux_cli_run=$(
   "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c \

@@ -915,6 +915,10 @@ enum StageCompletion {
 /// the reconciled recovered Runs.
 type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one FIFO actor loop keeps batching, failure latching, barriers, and shutdown ordering explicit"
+)]
 fn actor_main(
     state_dir: &Path,
     admission_limits: AdmissionLimits,

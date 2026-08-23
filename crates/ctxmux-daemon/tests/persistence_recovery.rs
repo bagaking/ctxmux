@@ -336,6 +336,10 @@ async fn exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one causal fixture joins persistent cold replacement, stale-PID safety, and identity evidence"
+)]
 async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_pid() {
     let temp = TempDir::new().expect("create stale PID fixture directory");
     let state_dir = temp.path().join("state");
@@ -345,7 +349,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
     let first_runtime = first_client
         .runtime_info()
         .await
-        .expect("read first Runtime description");
+        .expect("read first Runtime identity");
     assert_persistent_runtime_identity(&first_runtime);
     let live = first_client
         .start(shell_spec(
@@ -392,7 +396,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
     let replacement_runtime = client
         .runtime_info()
         .await
-        .expect("read replacement Runtime description");
+        .expect("read replacement Runtime identity");
     assert_persistent_runtime_identity(&replacement_runtime);
     assert_eq!(replacement_runtime.runtime_id, first_runtime.runtime_id);
     assert_ne!(

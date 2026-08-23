@@ -19,6 +19,12 @@ interface PendingWrite {
 const MAX_QUEUED_LINES = 256;
 const MAX_QUEUED_BYTES = MAX_FRAME_BYTES;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const PARSED_JSON_OBJECTS = new WeakSet<object>();
+const JSON_NUMBER_SOURCES = new WeakMap<object, Map<string, string>>();
+
+interface JsonParseContext {
+  readonly source?: string;
+}
 
 export class WireClosedError extends Error {
   public constructor(message = "ctxmux daemon closed the connection") {
@@ -246,12 +252,45 @@ export function encodeJsonLine(value: unknown): string {
 export function parseJsonFrame(line: string): unknown {
   try {
     rejectDuplicateObjectMembers(line);
-    return JSON.parse(line) as unknown;
+    return JSON.parse(
+      line,
+      function (
+        this: object,
+        key: string,
+        value: unknown,
+        context?: JsonParseContext,
+      ): unknown {
+        if (typeof value === "number" && context?.source !== undefined) {
+          let sources = JSON_NUMBER_SOURCES.get(this);
+          if (sources === undefined) {
+            sources = new Map();
+            JSON_NUMBER_SOURCES.set(this, sources);
+          }
+          sources.set(key, context.source);
+        } else if (typeof value === "object" && value !== null) {
+          PARSED_JSON_OBJECTS.add(value);
+        }
+        return value;
+      },
+    ) as unknown;
   } catch (error) {
     throw new SyntaxError(
       `invalid ctxmux JSON frame: ${asError(error).message}`,
     );
   }
+}
+
+/** @internal Whether an object came from the exact JSON wire parser. */
+export function isParsedJsonObject(value: object): boolean {
+  return PARSED_JSON_OBJECTS.has(value);
+}
+
+/** @internal Exact source token for one parsed JSON numeric member. */
+export function jsonNumberSource(
+  container: object,
+  key: string,
+): string | undefined {
+  return JSON_NUMBER_SOURCES.get(container)?.get(key);
 }
 
 function rejectDuplicateObjectMembers(value: string): void {
