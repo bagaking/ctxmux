@@ -30,7 +30,6 @@ The second command must print
 
 - Command: `scripts/check.sh`
 - Result: pass (exit 0)
-- Tracker Gate record mtime: `2026-08-10T19:31:04+0800`
 - Execution platform: `Darwin arm64`
 - Toolchain observations: `rustc 1.96.0`, `node v24.14.1`, `tmux 3.6b`
 - Tracker Gate log SHA-256:
