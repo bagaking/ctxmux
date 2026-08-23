@@ -309,10 +309,12 @@ another execution location or Provider-adjacent metadata:
    `runtimeId`, a `daemonInstanceId` that changes on cold replacement but not a
    same-process planned exec, an explicit identity-persistence discriminator,
    serving-build target facts, and a flat numeric capability record. Clients
-   may enforce exact local requirements after Hello and before business
-   dispatch. `runtimeId` must not reuse the serving epoch: persistent mode
-   binds it to the state-directory lineage, while memory-only mode promises
-   stability only for one daemon lifetime.
+   may enforce a caller-retained exact Runtime identity and exact local
+   capability requirements against Hello on the same dispatch connection;
+   mismatch must close before any business frame is sent. `runtimeId` must not
+   reuse the serving epoch: persistent mode binds it to the state-directory
+   lineage, while memory-only mode promises stability only for one daemon
+   lifetime.
 4. **T-003 / T2 — authoritative Run observations.** Add Run state revision,
    owner-recorded UTC timestamps, and a typed observation envelope. State
    revision, output byte cursor, and delivery-gap position remain separate

@@ -74,11 +74,13 @@ caller-supplied plan validity, external tmux availability, or Integration
 capabilities. The exact catalog, mode availability, and numeric domain have one
 public owner in [the protocol contract](protocol.md#connection-state).
 
-Capability requirements are client-local policy. The Rust and TypeScript
-clients validate Hello, compare exact key/version pairs, and only then send a
-business Request or Attach frame. The daemon owns no capability negotiation;
-raw identity and readiness paths remain available for diagnostics. This is
-typed endpoint inspection, not Provider discovery or a dynamic registry.
+Runtime identity expectations and capability requirements are client-local
+policy. The Rust and TypeScript clients validate Hello on the same connection,
+compare the complete caller-retained identity followed by exact key/version
+pairs, and only then send a business Request or Attach frame. A mismatch sends
+no business frame. The daemon owns no capability negotiation; raw identity and
+readiness paths remain available for diagnostics. This is typed endpoint
+inspection, not Provider discovery or a dynamic registry.
 
 ### Run domain model
 
