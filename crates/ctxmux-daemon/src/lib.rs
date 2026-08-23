@@ -2948,14 +2948,13 @@ impl Run {
         let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
 
         let terminal_ordinal = OnceLock::new();
-        terminal_publications.recover(&terminal_ordinal);
         let run = Arc::new(Self {
             id,
             spec: recovered.info.spec,
             lineage: recovered.info.lineage,
             backend: recovered.info.backend,
             capabilities: recovered.info.capabilities,
-            pid: recovered.info.pid,
+            pid: Some(child_pid),
             state: Mutex::new(recovered.info.state),
             output: Mutex::new(OutputLog::from_replay(recovered.replay)),
             incarnation_control: Some(RunControl::Native(native_control)),
@@ -4704,7 +4703,10 @@ mod tests {
                 lineage: None,
                 backend: RunBackend::Native,
                 capabilities: RunCapabilities::NATIVE,
-                pid: Some(child_pid),
+                // A recovered `running` row's DB pid column is NULL (the pid is
+                // only written at `finalize`), so `readopt` must derive the live
+                // pid from the `child_pid` manifest parameter, not from the row.
+                pid: None,
                 state: RunState::Running,
                 latest_output_bytes: DURABLE_HEAD,
                 durable_output_bytes: Some(DURABLE_HEAD),
