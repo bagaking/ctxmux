@@ -4,7 +4,7 @@
   "title": "Run one bounded ctxmux peer-performance cycle",
   "slug": "bounded-peer-performance-cycle",
   "goal": "Execute one pre-registered and budget-bounded performance cycle over genuinely comparable ctxmux, tmux, and Zellij workloads; preserve correctness and raw evidence, accept wins, ties, and losses honestly, and stop after the fixed cycle with the best valid result and an explicit next-cycle decision.",
-  "status": "blocked",
+  "status": "ready",
   "workspace_mode": "current_tree",
   "base_ref": "main",
   "branch": "",
@@ -12,7 +12,7 @@
   "worktree_path": "",
   "current_task_id": null,
   "runtime_role": "standalone",
-  "blocked_reason_class": "internal_blocker",
+  "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
     "gate_fail_streak": 0,
@@ -57,13 +57,15 @@
     {
       "action": "blocked_reason_set",
       "detail": "T-004 => internal_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
     }
   ],
   "goal_contract": {
     "schema": "bagakit.feature-goal.v1",
     "ref": ".bagakit/feature-tracker/features/f-22aczwza9/goal.md",
     "revision": "bf21a5f3af082ffa29d189c8b3e8ab0da03b4d49dc4b087cddc9a92375fa3084"
-  },
-  "blocked_reason": "Commit c2f8d4a is only a substrate checkpoint; T-004 still lacks the frozen 1/32/128 resource census, a clean reliability gate, independent owner-boundary review, and the AgentMux consumer repin. The task may be restarted when those acceptance conditions are owned together.",
-  "blocked_task_id": "T-004"
+  }
 }

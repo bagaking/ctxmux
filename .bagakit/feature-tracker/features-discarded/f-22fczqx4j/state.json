@@ -4,7 +4,7 @@
   "title": "Extend Runtime reach and interrupted derivation",
   "slug": "remote-runtime-interrupted-derivation",
   "goal": "After the local Runtime embedding contract is qualified, define and prove Remote Runtime execution plus the smallest Provider-neutral derivation metadata for interrupted Runs while keeping Provider-native resume, credentials, scheduling, and orchestration outside ctxmux.",
-  "status": "proposal",
+  "status": "discarded",
   "workspace_mode": "proposal_only",
   "base_ref": "main",
   "branch": "",
@@ -33,9 +33,16 @@
     {
       "action": "dag_dependencies_updated",
       "detail": "depends_on=f-22ecztapc"
+    },
+    {
+      "action": "feat_discarded",
+      "detail": "reason=superseded; replacement=f-22hjbhvt8"
     }
   ],
   "depends_on": [
     "f-22ecztapc"
-  ]
+  ],
+  "closed_from_status": "proposal",
+  "discard_reason": "superseded",
+  "replacement_feat_id": "f-22hjbhvt8"
 }

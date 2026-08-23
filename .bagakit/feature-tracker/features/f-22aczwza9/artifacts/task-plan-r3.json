@@ -1,10 +1,9 @@
 {
-  "version": 2,
-  "feat_id": "f-22aczwza9",
-  "plan_status": "reviewed",
-  "plan_revision": 3,
-  "supersedes_revision": 2,
-  "review_ref": ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/revision-3-pool-review.md",
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/revision-3-pool-review.md"
+  },
   "source_refs": [
     "AGENTS.md",
     "docs/architecture.md",
@@ -15,78 +14,10 @@
     "docs/roadmap.md#program-ownership-and-convergence",
     ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/revision-3-pool-review.md"
   ],
-  "plan_history": [
-    {
-      "revision": 1,
-      "supersedes_revision": null,
-      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/testing-strategy.md",
-        "docs/roadmap.md#program-ownership-and-convergence"
-      ],
-      "task_ids": [
-        "T-001",
-        "T-002",
-        "T-003"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 2,
-      "supersedes_revision": 1,
-      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/testing-strategy.md",
-        "docs/architecture/choices/001-rust-tokio-daemon.md",
-        "docs/architecture/choices/013-retained-run-resource-governance.md",
-        "docs/roadmap.md#program-ownership-and-convergence"
-      ],
-      "task_ids": [
-        "T-004",
-        "T-001",
-        "T-002",
-        "T-003"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 3,
-      "supersedes_revision": 2,
-      "review_ref": ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/revision-3-pool-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/testing-strategy.md",
-        "docs/architecture/choices/001-rust-tokio-daemon.md",
-        "docs/architecture/choices/013-retained-run-resource-governance.md",
-        "docs/roadmap.md#program-ownership-and-convergence",
-        ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/revision-3-pool-review.md"
-      ],
-      "task_ids": [
-        "T-005",
-        "T-001",
-        "T-002",
-        "T-003"
-      ],
-      "superseded_task_ids": [
-        "T-004"
-      ],
-      "supersedes_by_task": {
-        "T-005": [
-          "T-004"
-        ]
-      }
-    }
-  ],
+  "supersedes": {
+    "revision": 2,
+    "reason": "Preserve the blocked T-004 implementation evidence and replace it with a successor that owns only the remaining ctxmux census, reliability, review, and exact-commit qualification without an AgentMux repin."
+  },
   "tasks": [
     {
       "id": "T-005",
@@ -128,12 +59,7 @@
       ],
       "supersedes": [
         "T-004"
-      ],
-      "introduced_in_revision": 3,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      ]
     },
     {
       "id": "T-001",
@@ -161,12 +87,7 @@
       "source_refs": [
         "docs/testing-strategy.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-002",
@@ -195,12 +116,7 @@
         "docs/protocol.md#output-and-reconnect",
         "docs/testing-strategy.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-003",
@@ -230,65 +146,7 @@
       "source_refs": [
         "docs/testing-strategy.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
-    },
-    {
-      "id": "T-004",
-      "title": "Eliminate permanent per-Run native workers",
-      "objective": "Remove the fresh-daemon and live-native-Run owner costs exposed by the frozen AgentMux consumer comparison without changing ctxmux protocol, event fan-out, or lifecycle truth.",
-      "outcome": "A small fixed daemon runtime and daemon-wide native output/reap owners preserve exact Run semantics while an ordinary live native Run adds no permanent OS thread and its measured owner RSS slope is competitive with the frozen tmux resource checkpoint.",
-      "acceptance": [
-        "The daemon Tokio runtime uses an explicit fixed two-worker pool instead of sizing itself from host CPU count; activation, shutdown, sockets, persistence, and public latency remain correct.",
-        "Native output readiness and direct-child wait/reap work use daemon-wide bounded owners; an ordinary idle or active native Run adds zero permanent reader or waiter OS threads, while blocking Stop or cleanup work remains explicitly bounded and observable.",
-        "Natural exit, ordered byte output, output-before-terminal publication, exact child reap, process-tree Stop, signal, unpublished rollback, wait-authority loss, persistence activation, Registry collection, and shutdown retain their current fail-closed semantics under concurrency and injected failures.",
-        "The existing 1/32/128 native resource census proves zero threads per Run and a 32-live-Run RSS slope below 32 KiB per Run without changing the frozen census workload, sampling, budgets, or subtracting post-hoc owners; a fresh daemon also records the fixed worker census for the external consumer recheck.",
-        "Per-Run broadcast capacity, output encoding, replay, attachment lag, tmux control, Backend or Integration boundaries, compatibility aliases, fallback paths, and new dependencies are unchanged.",
-        "A clean candidate passes the complete repository and reliability gates, receives an independent owner-boundary review, and is committed before the AgentMux consumer repins it; publishing packages or releases remains out of scope."
-      ],
-      "verification": [
-        {
-          "kind": "command",
-          "ref": "scripts/check.sh",
-          "proves": "Native lifecycle, protocol, SDK, failure, shutdown, and repository regressions pass on the shared-owner implementation."
-        },
-        {
-          "kind": "command",
-          "ref": "scripts/check-reliability.sh",
-          "proves": "The frozen 1/32/128 owner and resource census preserves correctness and demonstrates the new thread/RSS slope without budget relaxation."
-        },
-        {
-          "kind": "artifact",
-          "ref": "docs/architecture/choices/001-rust-tokio-daemon.md",
-          "proves": "The daemon-wide native owner boundary, blocking disposition, residual limits, and non-goals replace the obsolete two-thread-per-Run architecture truth."
-        }
-      ],
-      "source_refs": [
-        "docs/roadmap.md#program-ownership-and-convergence",
-        "docs/architecture/choices/001-rust-tokio-daemon.md",
-        "docs/architecture/choices/013-retained-run-resource-governance.md",
-        "docs/testing-strategy.md",
-        "crates/ctxmux-daemon/src/main.rs",
-        "crates/ctxmux-daemon/src/lib.rs",
-        "crates/ctxmux-daemon/src/native_control.rs"
-      ],
-      "supersedes": [],
-      "introduced_in_revision": 2,
-      "status": "blocked",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": [],
-      "last_blocker": {
-        "class": "internal_blocker",
-        "reason": "Commit c2f8d4a is only a substrate checkpoint; T-004 still lacks the frozen 1/32/128 resource census, a clean reliability gate, independent owner-boundary review, and the AgentMux consumer repin. The task may be restarted when those acceptance conditions are owned together."
-      },
-      "superseded_by": [
-        "T-005"
-      ]
+      "supersedes": []
     }
   ]
 }

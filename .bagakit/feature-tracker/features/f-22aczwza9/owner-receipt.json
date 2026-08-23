@@ -2,14 +2,11 @@
   "schema": "bagakit.execution-owner-receipt.v1",
   "owner_kind": "feature_tracker",
   "owner_id": "f-22aczwza9",
-  "semantic_revision": "46aa9fac097a38dcd60827bb2659dfacd439bd4fbb5ea6bf59a36fc9bdd5eb5a",
-  "lifecycle_status": "blocked",
-  "continuation": "blocked",
+  "semantic_revision": "adcf2d03cc54b9d09124716853763a1a9b9b213139f316082811d6df640440b3",
+  "lifecycle_status": "ready",
+  "continuation": "continue",
   "current_item_id": null,
-  "blocker": {
-    "class": "internal_blocker",
-    "reason": "Commit c2f8d4a is only a substrate checkpoint; T-004 still lacks the frozen 1/32/128 resource census, a clean reliability gate, independent owner-boundary review, and the AgentMux consumer repin. The task may be restarted when those acceptance conditions are owned together."
-  },
+  "blocker": null,
   "replacement_ref": null,
   "evidence_refs": [
     ".bagakit/feature-tracker/features/f-22aczwza9/state.json",
@@ -17,8 +14,8 @@
     ".bagakit/feature-tracker/features/f-22aczwza9/goal.md"
   ],
   "evidence_hashes": {
-    ".bagakit/feature-tracker/features/f-22aczwza9/state.json": "a1f9c6f1f5c871853ce8163989873f5f85f29b43925f00219d99c83f67e56976",
-    ".bagakit/feature-tracker/features/f-22aczwza9/tasks.json": "9a2b33d99f66a6adda79be48d947ec0b511ef6a239129c86d49369499071ca0f",
+    ".bagakit/feature-tracker/features/f-22aczwza9/state.json": "8525b720bda9078fadc55c7543ccba415750ca6e33645d9e7bd48dc57198a39f",
+    ".bagakit/feature-tracker/features/f-22aczwza9/tasks.json": "d4a8676d8f90937d46fa49b6ec31f8d0cc437407e4236bb62c047fc135a6f037",
     ".bagakit/feature-tracker/features/f-22aczwza9/goal.md": "bf21a5f3af082ffa29d189c8b3e8ab0da03b4d49dc4b087cddc9a92375fa3084"
   }
 }

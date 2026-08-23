@@ -1,0 +1,91 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Prove the minimal owner-host Remote Runtime vertical",
+      "objective": "Carry the existing public protocol through system OpenSSH StreamLocal forwarding and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
+      "outcome": "A local public client can start or attach to an owner-host Run, lose transport, recreate the tunnel, recover the same Runtime, Run, and PID, and replay missing output or receive explicit truncation without publishing a false exit.",
+      "acceptance": [
+        "A reviewed architecture decision keeps Integrations as what-runs semantics and adds only a transport or Backend path to an owner-host ctxmuxd; the remote daemon remains the sole PTY, child, lifecycle, output, replay, and process-control owner.",
+        "The first implementation uses the maintained system OpenSSH client and StreamLocal forwarding to map the remote daemon Unix socket to a bounded local Unix socket, then reuses the existing protocol and Rust or TypeScript client boundary without Relay or a second product RPC layer.",
+        "The local client and tunnel can terminate while the remote child continues; transport loss changes endpoint reachability to `unverifiable` and does not publish `exited`, `interrupted`, or any synthetic RunState transition.",
+        "A recreated tunnel attaches only to the exact expected `runtimeId + runId`; the same remote PID remains owner evidence, and output generated while disconnected is replayed from the caller cursor or reports explicit truncation.",
+        "OpenSSH owns host-key trust, credentials, and connection policy. Wrong SSH host trust, another Runtime, another Run, or mismatched expected identity fails closed before attach, resume, or process mutation.",
+        "Real end-to-end fixtures use an actual remote owner boundary or isolated SSH host, kill the local tunnel and client, prove remote child survival, reconnect, verify identity and PID continuity, and observe replay or truncation through public APIs."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-remote-runtime.sh --stage vertical",
+          "proves": "System OpenSSH forwarding, transport-loss non-terminal truth, exact identity reconnect, PID continuity, and replay or truncation pass end to end."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture.md",
+          "proves": "Owner-host lifecycle truth, reachability, identity, transport ownership, and non-goals are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#architecture-direction",
+        "docs/vision.md#non-goals",
+        "docs/architecture.md#runtime-can-prove",
+        "docs/protocol.md#connection-state",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Qualify remote identity, Stop receipts, and mixed capabilities",
+      "objective": "Harden the minimal Remote Runtime vertical with fail-closed identity, remote owner receipts, bidirectional mixed-capability evidence, security, resources, and supported-platform qualification.",
+      "outcome": "Remote Runtime has an auditable owner-host contract: transport uncertainty never becomes lifecycle truth, the wrong owner cannot be controlled, Stop has a remote daemon receipt, and mixed versions fail explicitly without fallback.",
+      "acceptance": [
+        "Expected Runtime identity and OpenSSH host trust are both required. Wrong Runtime, Run, endpoint, or host trust fails before attach, replay, input, resize, signal, stop, fork, or resume; no local Runtime fallback is attempted.",
+        "Stop completion is accepted only from the remote daemon owner and names its actual disposition. Tunnel loss or local process exit cannot synthesize a Stop receipt or terminal state, and a reconnect observes the remote owner's final truth.",
+        "Mixed capability tests cover a newer local client against an older remote daemon and an older local client against a newer remote daemon; absent or lower capabilities produce explicit unsupported results and never silently downgrade transport, lifecycle, or fork fidelity.",
+        "Disconnect output is replayed from an exact caller cursor when retained and otherwise reports truncation or gap without inventing bytes; reconnect does not reuse a similarly named Run or external label.",
+        "Security and resource review covers temporary socket location and cleanup, OpenSSH argument ownership, host-key enforcement, forwarding collisions, tunnel process cleanup, descriptor and task bounds, slow or lost transport, and daemon independence from the tunnel owner.",
+        "The complete repository and Remote qualification gates pass on supported platforms with no Relay, account, environment, control-plane, deployment, remote scheduling, orchestration, provider, or derivation subsystem."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-remote-runtime.sh --stage qualification",
+          "proves": "Wrong identity, remote Stop receipt, replay limits, bidirectional mixed capabilities, transport failure, security, and resource boundaries pass together."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "Remote Runtime and the complete supported public contract pass without fallback or hidden skips."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/verification.md",
+          "proves": "The exact candidate, owner-boundary review, mixed-version matrix, supported platforms, and residual limits are auditable."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#runtime-can-prove",
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/protocol.md#control-correlation-and-owner-receipts",
+        "docs/testing-strategy.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md"
+      ],
+      "supersedes": []
+    }
+  ]
+}
