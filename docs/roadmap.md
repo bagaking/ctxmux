@@ -128,10 +128,13 @@ add a general mutation framework, or absorb Agent, Provider, Permission,
 message, Desktop Workbench close, Remote Runtime, crash-adoption, or release
 semantics.
 
-The AgentMux entropy-reduction work is a separate downstream Feature in its own
-repository. It may delete unknown-Stop handling only after consuming the exact
-qualified ctxmux commit and `native.recoverable_stop: 1`; its View-close
-transaction and AgentSession behavior remain AgentMux/Desktop ownership.
+This Feature ends at one exact ctxmux commit whose Rust, TypeScript, CLI,
+attachment, and real-consumer evidence qualifies
+`native.recoverable_stop: 1`. That public boundary makes integration possible;
+whether, when, and how an external consumer adopts it remains with that
+consumer's owner. ctxmux does not create, plan, or modify external consumer
+Features or code. AgentSession, Provider, and Desktop Workbench close
+transaction semantics remain outside ctxmux.
 
 ## Architecture evidence and failure corpus
 
