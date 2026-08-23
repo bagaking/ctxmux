@@ -61,8 +61,9 @@ Imported panes are deliberately read-only in this slice:
 - replay is `raw_since_import`, never raw-from-process-start;
 - the first attachment reports `truncated` because pre-import bytes are
   unavailable;
-- pause or source loss remains visible to late attachments as truncation and
-  to live attachments as an explicit `Gap`;
+- pause or source loss remains visible to late attachments as raw replay
+  truncation and to live attachments as an output `Gap`; only actual fan-out
+  loss of a tmux observation produces `ObservationDiscontinuity`;
 - import is memory-only and is rejected when ctxmux runs with `--state-dir`.
 
 The adapter does not use `capture-pane` to manufacture raw history. A screen
@@ -101,7 +102,8 @@ daemon.
   before publishing `Interrupted`. Historical Run status and terminal attachment
   remain available without retaining a live Control descriptor, and cleanup does
   not terminate a still-live tmux-owned pane.
-- A paused or lagged source never becomes a falsely continuous replay.
+- A paused or lagged source never becomes a falsely continuous replay, and a
+  dropped tmux observation is never relabeled as byte-replay evidence.
 - Native Runs do not acquire a tmux dependency.
 
 ## Alternatives
@@ -124,7 +126,8 @@ Evidence pack: [tmux-backend track](../../../.bagakit/researcher/topics/engineer
   be invalid UTF-8, and is interleaved with empty records, notifications,
   command blocks, and numbered results whose ownership must fail closed.
 - `TMUX-02` (`l01`, `l02`): tmux can pause or terminate a slow control client.
-  Recovery must expose a gap and cannot relabel screen state as raw history.
+  Recovery must expose raw-output gap and non-output observation discontinuity
+  separately and cannot relabel screen state as raw history.
 - `TMUX-03` (`l03`) transfers only the upstream queued-output detach/teardown
   failure: ctxmux must close only its incarnation-local adapter resources while
   preserving exact queued replay and leaving any still-live pane tmux-owned.
@@ -159,7 +162,10 @@ the rest of the import tuple therefore participate in the target fence.
   tracking, EOF classification, blank-line output continuity, and pause-storm
   deduplication. The public pause fixture also proves post-pause output,
   caller-cursor reattach, late replay truncation, exact surviving bytes, and
-  pane survival. A deterministic fake Control fixture with an independent pane
+  pane survival. Tiny-channel mixed-event coverage forces output plus every
+  current tmux observation across attachment lag and proves an explicit
+  discontinuity before one terminal boundary. A deterministic fake Control
+  fixture with an independent pane
   process sentinel proves repeated public import and EOF-driven successful
   cleanup: historical status and terminal attachment remain available, the
   sentinel remains alive, and the daemon descriptor census returns exactly to
@@ -190,4 +196,4 @@ server-version evidence.
 - `fixtures/tmux-control-mode.json`: checked-in byte/transcript corpus
 - `fixtures/wrong-cases.json`: active `TMUX-01` through `TMUX-04`
 - `.github/ci-evidence-map.json`: required job and platform reachability
-- `docs/protocol.md`: public generation-6 behavior
+- `docs/protocol.md`: public generation-13 behavior

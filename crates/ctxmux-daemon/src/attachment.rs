@@ -14,8 +14,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 #[cfg(test)]
 use super::AttachmentHookPoint;
 use super::{
-    ConnectionError, ControlResult, Run, RunManager, UpgradeRequestAdmission, UpgradeRequestPermit,
-    control_not_applied, invalid_request, receive, send, upgrade_retry_error,
+    ConnectionError, ControlResult, LiveEventCursor, Run, RunManager, UpgradeRequestAdmission,
+    UpgradeRequestPermit, control_not_applied, invalid_request, receive, send, upgrade_retry_error,
 };
 
 const MAX_PENDING_STOP_RESULTS: usize = 64;
@@ -37,6 +37,10 @@ pub(super) async fn handle(
     handle_pinned(wire, manager, run, after_byte, request_permit, None).await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one select loop keeps command-result, terminal, and live-delivery ordering auditable"
+)]
 pub(super) async fn handle_pinned(
     mut wire: Framed<UnixStream, LinesCodec>,
     manager: Arc<RunManager>,
@@ -45,7 +49,9 @@ pub(super) async fn handle_pinned(
     request_permit: UpgradeRequestPermit,
     initial_response: Option<Response>,
 ) -> Result<(), ConnectionError> {
-    let (_guard, mut events) = run.subscribe();
+    let (_guard, subscription) = run.subscribe();
+    let mut events = subscription.receiver;
+    let mut live_cursor = subscription.cursor;
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSubscribe).await;
@@ -67,18 +73,19 @@ pub(super) async fn handle_pinned(
         hook.pause_once(AttachmentHookPoint::AfterSnapshot).await;
     }
     if !terminal_state.is_running() {
-        send(
+        return finish_terminal_snapshot(
             &mut wire,
-            &ServerFrame::Event {
-                event: terminal_event(terminal_state),
-            },
+            &run,
+            terminal_state,
+            live_cursor,
+            sent_through_byte,
         )
-        .await?;
-        return Ok(());
+        .await;
     }
 
     let mut command_results = PendingResults::new();
     let mut controls = ControlState::default();
+    let mut receiver_lagged = false;
     loop {
         // Result-first bias is bounded by 1,024 input receipts plus the narrow
         // connection-local recoverable Stop result bound;
@@ -111,35 +118,166 @@ pub(super) async fn handle_pinned(
                     return Ok(());
                 }
             }
-            event = events.recv() => {
-                match event {
-                    Ok(RunEvent::Output { chunk }) if chunk.end_byte <= sent_through_byte => {}
-                    Ok(RunEvent::Output { chunk }) => {
-                        sent_through_byte = chunk.end_byte;
-                        send(&mut wire, &ServerFrame::Event {
-                            event: RunEvent::Output { chunk },
-                        }).await?;
-                    }
-                    Ok(event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. })) => {
-                        if controls.pending_stops.is_empty() {
-                            send(&mut wire, &ServerFrame::Event { event }).await?;
-                            return Ok(());
+            received = events.recv(), if controls.held_terminal.is_none() => {
+                match received {
+                    Ok(envelope) => {
+                        if receiver_lagged {
+                            receiver_lagged = false;
+                            match recover_lagged_delivery(
+                                &mut wire,
+                                &run,
+                                live_cursor,
+                                envelope.before,
+                                &mut sent_through_byte,
+                            )
+                            .await?
+                            {
+                                LagRecovery::Continue => {}
+                                LagRecovery::Close => return Ok(()),
+                                LagRecovery::Terminal(terminal) => {
+                                    if controls.pending_stops.is_empty() {
+                                        send(&mut wire, &ServerFrame::Event { event: terminal })
+                                            .await?;
+                                        return Ok(());
+                                    }
+                                    controls.held_terminal = Some(terminal);
+                                    continue;
+                                }
+                            }
                         }
-                        controls.held_terminal = Some(event);
+                        live_cursor = envelope.after;
+                        match envelope.event {
+                            RunEvent::Output { chunk }
+                                if chunk.end_byte <= sent_through_byte => {}
+                            RunEvent::Output { chunk } => {
+                                sent_through_byte = chunk.end_byte;
+                                send(&mut wire, &ServerFrame::Event {
+                                    event: RunEvent::Output { chunk },
+                                }).await?;
+                            }
+                            event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => {
+                                if controls.pending_stops.is_empty() {
+                                    send(&mut wire, &ServerFrame::Event { event }).await?;
+                                    return Ok(());
+                                }
+                                controls.held_terminal = Some(event);
+                            }
+                            event => send(&mut wire, &ServerFrame::Event { event }).await?,
+                        }
                     }
-                    Ok(event) => send(&mut wire, &ServerFrame::Event { event }).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let latest_output_bytes = run.info().latest_output_bytes;
-                        sent_through_byte = latest_output_bytes;
-                        send(&mut wire, &ServerFrame::Event {
-                            event: RunEvent::Gap { latest_output_bytes },
-                        }).await?;
+                        receiver_lagged = true;
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
         }
     }
+}
+
+async fn finish_terminal_snapshot(
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    run: &Run,
+    terminal_state: RunState,
+    live_cursor: LiveEventCursor,
+    sent_through_byte: u64,
+) -> Result<(), ConnectionError> {
+    let cursor_after_snapshot = run.events.cursor();
+    let observation_discontinuous =
+        cursor_after_snapshot.observation_revision > live_cursor.observation_revision;
+    if observation_discontinuous {
+        send(
+            wire,
+            &ServerFrame::Event {
+                event: RunEvent::ObservationDiscontinuity,
+            },
+        )
+        .await?;
+    }
+    if !observation_discontinuous
+        && (cursor_after_snapshot.output_bytes > sent_through_byte
+            || cursor_after_snapshot.output_discontinuity_revision
+                > live_cursor.output_discontinuity_revision)
+    {
+        let latest_output_bytes = cursor_after_snapshot
+            .output_bytes
+            .max(cursor_after_snapshot.latest_output_discontinuity_byte);
+        send(
+            wire,
+            &ServerFrame::Event {
+                event: RunEvent::Gap {
+                    latest_output_bytes,
+                },
+            },
+        )
+        .await?;
+    }
+    send(
+        wire,
+        &ServerFrame::Event {
+            event: terminal_event(terminal_state),
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+enum LagRecovery {
+    Continue,
+    Close,
+    Terminal(RunEvent),
+}
+
+async fn recover_lagged_delivery(
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    run: &Run,
+    delivered: LiveEventCursor,
+    retained_before: LiveEventCursor,
+    sent_through_byte: &mut u64,
+) -> Result<LagRecovery, ConnectionError> {
+    let authoritative = run.info();
+    let lost_observation = retained_before.observation_revision > delivered.observation_revision;
+    let lost_terminal = retained_before.terminal_revision > delivered.terminal_revision;
+    let lost_output_marker =
+        retained_before.output_discontinuity_revision > delivered.output_discontinuity_revision;
+    let lost_output_bytes = retained_before.output_bytes > *sent_through_byte;
+    if lost_observation {
+        send(
+            wire,
+            &ServerFrame::Event {
+                event: RunEvent::ObservationDiscontinuity,
+            },
+        )
+        .await?;
+    }
+    if !lost_observation && (lost_output_marker || lost_output_bytes) {
+        let marker_head = if lost_output_marker {
+            retained_before.latest_output_discontinuity_byte
+        } else {
+            0
+        };
+        let latest_output_bytes = retained_before
+            .output_bytes
+            .max(marker_head)
+            .max(authoritative.latest_output_bytes);
+        *sent_through_byte = (*sent_through_byte).max(latest_output_bytes);
+        send(
+            wire,
+            &ServerFrame::Event {
+                event: RunEvent::Gap {
+                    latest_output_bytes,
+                },
+            },
+        )
+        .await?;
+    }
+    if lost_observation && authoritative.state.is_running() {
+        return Ok(LagRecovery::Close);
+    }
+    if (lost_observation || lost_terminal) && !authoritative.state.is_running() {
+        return Ok(LagRecovery::Terminal(terminal_event(authoritative.state)));
+    }
+    Ok(LagRecovery::Continue)
 }
 
 async fn send_replay(
