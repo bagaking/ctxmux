@@ -224,8 +224,14 @@
       "supersedes": [],
       "introduced_in_revision": 1,
       "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 1,
+          "status": "fail"
+        }
+      ],
       "notes": []
     },
     {
