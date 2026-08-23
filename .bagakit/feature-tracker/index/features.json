@@ -163,7 +163,7 @@
     {
       "feat_id": "f-22gcz4t8v",
       "title": "Make native Stop recoverable across response loss",
-      "status": "in_progress",
+      "status": "archived",
       "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",

@@ -276,10 +276,44 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
-      "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
       "notes": []
     }
-  ]
+  ],
+  "closeout_review": {
+    "schema": "bagakit.feature-closeout-review.v1",
+    "documentation": {
+      "disposition": "verified_current",
+      "rationale": "The protocol, Recoverable Stop ADR, SDK guide, roadmap, and verification evidence already describe the qualified capability, recovery flow, ownership boundary, planned-exec continuity, and residual limits.",
+      "refs": [
+        "docs/protocol.md",
+        "docs/architecture/choices/017-recoverable-stop-operations.md",
+        "packages/sdk/README.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-22gcz4t8v/verification.md"
+      ]
+    },
+    "learning": {
+      "disposition": "candidates_reviewed",
+      "rationale": "The reviewed plan corrections, source-attestation failures, RSS fixture correction, and final evidence were compared with the original scope; durable lessons are already encoded in the focused qualifier, testing strategy, and owning documents.",
+      "refs": [
+        ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
+        ".bagakit/feature-tracker/features/f-22gcz4t8v/verification.md",
+        "docs/testing-strategy.md"
+      ]
+    },
+    "promotion": {
+      "disposition": "not_needed",
+      "rationale": "No separate principle or reusable subsystem needs promotion; the accepted behavior and qualification rules already live in their existing repository SSOT.",
+      "refs": []
+    }
+  }
 }
