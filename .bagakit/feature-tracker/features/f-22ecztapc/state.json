@@ -4,32 +4,32 @@
   "title": "Complete the local Runtime embedding contract",
   "slug": "local-runtime-embedding-contract",
   "goal": "Complete and independently qualify the Provider-neutral local Runtime surface that embedding products need: explicit Integration and Level B ownership, Runtime identity and capabilities, revisioned Run observation, bounded wait helpers, and race-safe TypeScript activation, without moving Provider sessions or orchestration into ctxmux.",
-  "status": "in_progress",
+  "status": "ready",
   "workspace_mode": "current_tree",
   "base_ref": "main",
   "branch": "",
   "worktree_name": "",
   "worktree_path": "",
-  "current_task_id": "T-001",
+  "current_task_id": null,
   "runtime_role": "standalone",
   "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 2,
-    "no_progress_rounds": 2,
-    "round_count": 3
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 4
   },
   "gate": {
-    "last_result": "fail",
+    "last_result": "pass",
     "last_task_id": "T-001",
     "last_check_commands": [
       {
         "command": "scripts/check.sh",
-        "exit_code": 101,
-        "status": "fail"
+        "exit_code": 0,
+        "status": "pass"
       }
     ],
-    "last_log_path": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/gate-T-001-r3-0001.log"
+    "last_log_path": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/gate-T-001-r4-0001.log"
   },
   "history": [
     {
@@ -63,6 +63,14 @@
     {
       "action": "task_gate",
       "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => done"
     }
   ],
   "goal_contract": {

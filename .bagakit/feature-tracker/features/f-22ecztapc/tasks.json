@@ -112,13 +112,13 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
-      "status": "in_progress",
-      "gate_result": "fail",
+      "status": "done",
+      "gate_result": "pass",
       "last_gate_commands": [
         {
           "command": "scripts/check.sh",
-          "exit_code": 101,
-          "status": "fail"
+          "exit_code": 0,
+          "status": "pass"
         }
       ],
       "notes": []
