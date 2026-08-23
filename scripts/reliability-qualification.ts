@@ -1375,7 +1375,7 @@ async function runChaosOwnerMatrix(
         child_pid: run.pid,
         process_tree: processTreeBeforeCleanup,
       });
-      await daemon.client.stop(run.id);
+      await daemon.client.stop(await daemon.client.prepareStop(run.id));
       await waitForRunExit(daemon.client, run.id);
       await waitForNoLiveChildren(daemon.pid, 5_000);
       results.integration_host_exit = {
@@ -1483,7 +1483,7 @@ async function runSecurityMatrix(
         error.code === "invalid_request",
     );
     assert.equal((await daemon.client.list()).length, before.length + 1);
-    await daemon.client.stop(run.id);
+    await daemon.client.stop(await daemon.client.prepareStop(run.id));
     await waitForRunExit(daemon.client, run.id);
 
     const markerPath = join(daemon.directory, "argv-injection-marker");
@@ -1623,7 +1623,7 @@ async function runStressMatrix(
       await attachment.resize({ cols: 80 + (index % 20), rows: 24 });
       await attachment.input(`churn-${index}`);
       await attachment.detach();
-      await daemon.client.stop(run.id);
+      await daemon.client.stop(await daemon.client.prepareStop(run.id));
       await waitForRunExit(daemon.client, run.id);
     }
     await waitForNoLiveChildren(daemon.pid, 10_000);
@@ -1679,7 +1679,7 @@ async function runConcurrentStartPressure(
       );
     }
     await mapLimit(starts.outputs, concurrency, async (run) => {
-      await daemon.client.stop(run.id);
+      await daemon.client.stop(await daemon.client.prepareStop(run.id));
     });
     await mapLimit(starts.outputs, concurrency, async (run) =>
       waitForRunExit(daemon.client, run.id),
@@ -1752,7 +1752,7 @@ async function runSoakScenario(
       `soak retained ${retainedOutputBytes} bytes beyond the declared per-Run bound`,
     );
     await mapLimit(runs, runCount, async (run) => {
-      await daemon.client.stop(run.id);
+      await daemon.client.stop(await daemon.client.prepareStop(run.id));
     });
     await mapLimit(runs, runCount, async (run) =>
       waitForRunExit(daemon.client, run.id),
@@ -1846,7 +1846,7 @@ async function runFanoutScenario(
       slow_gap: slowGap,
     });
     for (const attachment of attachments) attachment.close();
-    await daemon.client.stop(run.id);
+    await daemon.client.stop(await daemon.client.prepareStop(run.id));
     await waitForRunExit(daemon.client, run.id);
     return {
       fanout,
@@ -1964,7 +1964,7 @@ async function measureResources(
     const retainedOutputBytes = await retainedBytes(daemon.client, runs);
 
     await mapLimit(runs, 16, async (run) => {
-      await daemon.client.stop(run.id);
+      await daemon.client.stop(await daemon.client.prepareStop(run.id));
     });
     await mapLimit(runs, 16, async (run) =>
       waitForRunExit(daemon.client, run.id),

@@ -107,7 +107,7 @@
     },
     {
       "id": "PTY-003",
-      "choice": "002-portable-pty-native-backend",
+      "choice": "017-recoverable-stop-operations",
       "source_ids": ["b03"],
       "source_refs": [
         "https://github.com/wezterm/wezterm/blob/portable-pty-0.9.0/pty/src/lib.rs#L316-L374"
@@ -123,7 +123,7 @@
       "test_refs": [
         {
           "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
-          "anchor": "stop_escalates_past_ignored_hup_and_rejects_repeated_stop"
+          "anchor": "recoverable_stop_replays_settled_forced_result"
         }
       ]
     },

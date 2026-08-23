@@ -294,6 +294,10 @@ function assertInstalledPackageIsSelfContained(consumerDirectory, sourceRoot) {
 const CONSUMER_SOURCE = String.raw`
 import assert from "node:assert/strict";
 import { execFile as execFileCallback, spawn } from "node:child_process";
+import { once } from "node:events";
+import { readFile } from "node:fs/promises";
+import { createConnection } from "node:net";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -306,6 +310,7 @@ import {
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   defineRun,
@@ -432,6 +437,47 @@ async function waitForExit(attachment) {
   throw new Error("timed out waiting for artifact Run exit");
 }
 
+async function waitForMarker(path, expected) {
+  const deadline = Date.now() + 5_000;
+  let observed = "";
+  while (Date.now() <= deadline) {
+    try {
+      observed = await readFile(path, "utf8");
+      if (observed === expected) return;
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await delay(20);
+  }
+  throw new Error("timed out waiting for recoverable Stop marker; got " + observed);
+}
+
+async function sendStopWithoutReadingResponse(operation) {
+  const socket = createConnection(socketPath);
+  await once(socket, "connect");
+  const lines = createInterface({ input: socket, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  socket.write(JSON.stringify({ type: "hello", hello: { protocol: PROTOCOL_VERSION } }) + "\n");
+  const hello = await iterator.next();
+  assert.equal(hello.done, false);
+  assert.equal(JSON.parse(hello.value).runtime.daemonInstanceId, operation.daemonInstance);
+  await new Promise((resolve, reject) => {
+    socket.write(JSON.stringify({
+      type: "request",
+      request: {
+        type: "stop",
+        operation: {
+          daemon_instance: operation.daemonInstance,
+          operation_key: operation.operationKey,
+          id: operation.runId,
+        },
+      },
+    }) + "\n", (error) => error == null ? resolve() : reject(error));
+  });
+  lines.close();
+  socket.destroy();
+}
+
 async function nextOutput(attachment) {
   const replay = attachment.snapshot.replay.chunks[0];
   if (replay !== undefined) return { type: "output", chunk: replay };
@@ -523,6 +569,7 @@ try {
     "native.execute_materialized_level_b": 1,
     "native.fork_level_a": 1,
     "native.recoverable_input": 1,
+    "native.recoverable_stop": 1,
     "native.start": 1,
     "tmux.discover": 1,
     "tmux.import": 1,
@@ -627,7 +674,8 @@ try {
   assert.match(replay, /ARTIFACT:after/u);
   const cliStatus = (await execFile(cliBinary, ["--socket", socketPath, "status", run.id])).stdout;
   assert.match(cliStatus, new RegExp("^" + run.id + "\\trunning\\tpid="));
-  assert.deepEqual((await replayAttachment.stop()).receipt, {
+  const replayStop = await client.prepareStop(run.id, "consumer-attachment-stop");
+  assert.deepEqual((await replayAttachment.stop(replayStop)).receipt, {
     type: "stop",
     disposition: "graceful",
   });
@@ -637,6 +685,29 @@ try {
     signal: null,
   });
   assert.equal((await client.status(run.id)).state.type, "exited");
+
+  const stopMarker = socketPath + ".recoverable-stop-marker";
+  const recoverableRun = await client.start(defineRun("/bin/sh", {
+    args: [
+      "-c",
+      "printf 'ready\\n' > \"$1\"; trap 'printf \"stop\\n\" >> \"$1\"; sleep 0.2; exit 0' TERM; while :; do sleep 1; done",
+      "ctxmux-consumer-recoverable-stop",
+      stopMarker,
+    ],
+  }));
+  const retainedStop = await client.prepareStop(
+    recoverableRun.id,
+    "consumer-response-loss-stop",
+  );
+  assert.equal(runtime.capabilities[RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP], 1);
+  await waitForMarker(stopMarker, "ready\n");
+  await sendStopWithoutReadingResponse(retainedStop);
+  await waitForMarker(stopMarker, "ready\nstop\n");
+  const replacementClient = new CtxmuxClient({ socketPath });
+  const recoveredStop = await replacementClient.stop(retainedStop);
+  assert.deepEqual(recoveredStop.receipt, { type: "stop", disposition: "graceful" });
+  assert.deepEqual((await replacementClient.stop(retainedStop)).receipt, recoveredStop.receipt);
+  assert.equal(await readFile(stopMarker, "utf8"), "ready\nstop\n");
 
   const provider = syntheticProviderIntegration();
   const registered = registerIntegration(client, provider);
@@ -749,7 +820,7 @@ try {
   );
 
   unrelatedAttachment.close();
-  await client.stop(unrelated.id);
+  await client.stop(await client.prepareStop(unrelated.id));
   parentAttachment.close();
   const child = await registered.forkLevelB(parent, levelB, { detection });
   assert.deepEqual(child.lineage, { parent: parent.id, fidelity: "level_b" });
@@ -763,8 +834,8 @@ try {
   );
   childAttachment.close();
   assert.equal((await client.status(parent.id)).state.type, "running");
-  await client.stop(parent.id);
-  await client.stop(child.id);
+  await client.stop(await client.prepareStop(parent.id));
+  await client.stop(await client.prepareStop(child.id));
 } finally {
   await stopDaemon();
 }
@@ -783,10 +854,13 @@ import {
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   MAX_RUNTIME_CAPABILITY_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_NATIVE_START,
   registerIntegration,
+  stopOperationKey,
   type Integration,
   type IntegrationSemanticEvent,
+  type RecoverableStopOperation,
   type RunInfo,
   type RunSpec,
   type RuntimeCapabilityRequirements,
@@ -836,9 +910,11 @@ const provider: Integration<
 declare const client: CtxmuxClient;
 declare const parent: RunInfo;
 declare const config: ProviderForkConfig;
+declare const retainedStop: RecoverableStopOperation;
 const runtimeInfo: Promise<RuntimeIdentity> = client.runtimeInfo();
 const capabilities: RuntimeIdentity["capabilities"] = {
   "native.start": 1,
+  [RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP]: 1,
 };
 const requirements: RuntimeCapabilityRequirements = {
   [RUNTIME_CAPABILITY_NATIVE_START]: MAX_RUNTIME_CAPABILITY_VERSION,
@@ -854,6 +930,11 @@ const unsupportedCapability: Error = new CtxmuxUnsupportedCapabilityError(
 );
 const registered = registerIntegration(client, provider);
 const child: Promise<RunInfo> = registered.forkLevelB(parent, config);
+const preparedStop: Promise<RecoverableStopOperation> = client.prepareStop(
+  parent.id,
+  stopOperationKey("consumer-retained-stop"),
+);
+const recoveredStop = client.stop(retainedStop);
 const publicErrors: readonly Error[] = [
   new IntegrationUnavailableError("consumer-provider", {
     status: "unavailable",
@@ -865,6 +946,8 @@ const publicErrors: readonly Error[] = [
   new IntegrationMaterializationError("consumer-provider", "missing_planner"),
 ];
 void child;
+void preparedStop;
+void recoveredStop;
 void publicErrors;
 void runtimeInfo;
 void capabilities;

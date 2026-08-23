@@ -12,8 +12,9 @@ use std::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
 use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{
-    CreateOperationKey, ForkFidelity, ForkPlan, PROTOCOL_VERSION, RunEvent, RunId, RunInfo,
-    RunSpec, RunState, TerminalSize,
+    CreateOperationKey, DaemonInstanceId, ForkFidelity, ForkPlan, PROTOCOL_VERSION,
+    RecoverableStop, RunEvent, RunId, RunInfo, RunSpec, RunState, StopDisposition,
+    StopOperationKey, TerminalSize,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -41,7 +42,7 @@ usage:
   ctxmux [--socket <path>] resize <run-id> <cols> <rows>
   ctxmux [--socket <path>] interrupt <run-id>
   ctxmux [--socket <path>] attach <run-id> [after-byte]
-  ctxmux [--socket <path>] stop <run-id>
+  ctxmux [--socket <path>] stop [--daemon-instance <uuid> --operation-key <key>] <run-id>
 
 CTXMUX_SOCKET may be used instead of --socket. When neither is set, ctxmux uses
 $XDG_RUNTIME_DIR/ctxmux/ctxmux.sock or a process-temp path, and starts ctxmuxd
@@ -138,12 +139,7 @@ async fn run() -> Result<(), String> {
             print_run(&accepted.run);
         }
         "attach" => attach(&client, args).await?,
-        "stop" => {
-            let id = take_run_id(&mut args)?;
-            ensure_empty(&args)?;
-            let accepted = client.stop(id).await.map_err(|error| error.to_string())?;
-            print_run(&accepted.run);
-        }
+        "stop" => stop(&client, args).await?,
         _ => unreachable!("known commands are enumerated before connect-or-spawn"),
     }
     Ok(())
@@ -317,6 +313,67 @@ async fn resize(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         .resize(id, TerminalSize { cols, rows })
         .await
         .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+async fn stop(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let mut daemon_instance = None;
+    let mut operation_key = None;
+    while let Some(flag) = args.first().and_then(|value| value.to_str()) {
+        match flag {
+            "--daemon-instance" => {
+                args.remove(0);
+                if daemon_instance.is_some() {
+                    return Err("--daemon-instance may be supplied only once".to_owned());
+                }
+                daemon_instance = Some(
+                    take_string(&mut args, "daemon instance")?
+                        .parse::<DaemonInstanceId>()
+                        .map_err(|error| format!("invalid daemon instance: {error}"))?,
+                );
+            }
+            "--operation-key" => {
+                args.remove(0);
+                if operation_key.is_some() {
+                    return Err("--operation-key may be supplied only once".to_owned());
+                }
+                operation_key = Some(
+                    take_string(&mut args, "Stop operation key")?
+                        .parse::<StopOperationKey>()
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            _ => break,
+        }
+    }
+    let id = take_run_id(&mut args)?;
+    ensure_empty(&args)?;
+    let operation = match (daemon_instance, operation_key) {
+        (None, None) => client
+            .prepare_stop(id)
+            .await
+            .map_err(|error| error.to_string())?,
+        (Some(daemon_instance), Some(operation_key)) => RecoverableStop {
+            daemon_instance,
+            operation_key,
+            id,
+        },
+        _ => {
+            return Err(
+                "--daemon-instance and --operation-key must be supplied together".to_owned(),
+            );
+        }
+    };
+    let accepted = client
+        .stop(operation)
+        .await
+        .map_err(|error| error.to_string())?;
+    let disposition = match accepted.receipt.disposition {
+        StopDisposition::Graceful => "graceful",
+        StopDisposition::Forced => "forced",
+    };
+    println!("stop={disposition}");
+    print_run(&accepted.run);
     Ok(())
 }
 

@@ -4,9 +4,12 @@ import {
   spawn,
   type ChildProcess,
 } from "node:child_process";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -30,6 +33,7 @@ import {
   type Integration,
   type IntegrationObserver,
   type IntegrationSemanticEvent,
+  type RecoverableStopOperation,
   type RunEvent,
   type RunId,
   type RunInfo,
@@ -39,6 +43,50 @@ import {
 const execFile = promisify(execFileCallback);
 const daemonBinary = requiredEnvironment("CTXMUXD_BIN");
 const cliBinary = requiredEnvironment("CTXMUX_BIN");
+
+test(
+  "Recoverable Stop replays one receipt after response loss and client replacement",
+  { timeout: 15_000 },
+  async (context) => {
+    const { client, directory, socketPath } = await startTestDaemon(context);
+    const markerPath = join(directory, "recoverable-stop-marker");
+    const run = await client.start(
+      defineRun("/bin/sh", {
+        args: [
+          "-c",
+          concatShell(
+            "printf 'ready\\n' > \"$1\";",
+            'trap \'printf "stop\\n" >> "$1"; sleep 0.2; exit 0\' TERM;',
+            "while :; do sleep 1; done",
+          ),
+          "ctxmux-recoverable-stop",
+          markerPath,
+        ],
+      }),
+      createOperationKey("sdk-recoverable-stop-run"),
+    );
+    const operation = await client.prepareStop(
+      run.id,
+      "sdk-response-loss-stop",
+    );
+
+    await waitForMarker(markerPath, "ready\n");
+    await sendStopWithoutReadingResponse(socketPath, operation);
+    await waitForMarker(markerPath, "ready\nstop\n");
+
+    const replacementClient = new CtxmuxClient({ socketPath });
+    const recovered = await replacementClient.stop(operation);
+    assert.deepEqual(recovered.receipt, {
+      type: "stop",
+      disposition: "graceful",
+    });
+    assert.deepEqual(
+      (await replacementClient.stop(operation)).receipt,
+      recovered.receipt,
+    );
+    assert.equal(await readFile(markerPath, "utf8"), "ready\nstop\n");
+  },
+);
 
 test(
   "CLI and TypeScript SDK share one daemon-owned Run across client exits",
@@ -70,6 +118,7 @@ test(
       "native.execute_materialized_level_b": 1,
       "native.fork_level_a": 1,
       "native.recoverable_input": 1,
+      "native.recoverable_stop": 1,
       "native.start": 1,
       "tmux.discover": 1,
       "tmux.import": 1,
@@ -332,13 +381,25 @@ test(
       new RegExp(`^${sdkRun.id}\\trunning\\tpid=`),
     );
     assert.deepEqual(
-      (await step("stop SDK-forked Run", reconnectedClient.stop(sdkChild.id)))
-        .receipt,
+      (
+        await step(
+          "stop SDK-forked Run",
+          reconnectedClient.stop(
+            await reconnectedClient.prepareStop(sdkChild.id),
+          ),
+        )
+      ).receipt,
       { type: "stop", disposition: "graceful" },
     );
     assert.deepEqual(
-      (await step("stop SDK-created Run", reconnectedClient.stop(sdkRun.id)))
-        .receipt,
+      (
+        await step(
+          "stop SDK-created Run",
+          reconnectedClient.stop(
+            await reconnectedClient.prepareStop(sdkRun.id),
+          ),
+        )
+      ).receipt,
       { type: "stop", disposition: "graceful" },
     );
   },
@@ -510,7 +571,7 @@ setInterval(() => {}, 1_000);
 
     parentAttachment.close();
     unrelatedAttachment.close();
-    await client.stop(unrelated.id);
+    await client.stop(await client.prepareStop(unrelated.id));
     const rawParent = await waitForNoAttachments(client, parent.id);
     assert.equal(rawParent.pid, parentPid);
     assert.equal(rawParent.state.type, "running");
@@ -545,8 +606,8 @@ setInterval(() => {}, 1_000);
     );
     childAttachment.close();
     assert.equal((await client.status(parent.id)).state.type, "running");
-    await client.stop(parent.id);
-    await client.stop(child.id);
+    await client.stop(await client.prepareStop(parent.id));
+    await client.stop(await client.prepareStop(child.id));
   },
 );
 
@@ -619,7 +680,7 @@ test(
     for (const operation of [
       () => client.input(run.id, "must-not-reach-tmux"),
       () => client.resize(run.id, { cols: 100, rows: 40 }),
-      () => client.stop(run.id),
+      async () => client.stop(await client.prepareStop(run.id)),
     ]) {
       await assert.rejects(
         operation(),
@@ -755,6 +816,71 @@ async function waitForProcessExit(pid: number): Promise<void> {
     await delay(20);
   }
   throw new Error(`tmux SDK fixture server ${pid} did not exit`);
+}
+
+async function sendStopWithoutReadingResponse(
+  socketPath: string,
+  operation: RecoverableStopOperation,
+): Promise<void> {
+  const socket = createConnection(socketPath);
+  await once(socket, "connect");
+  const lines = createInterface({ input: socket, crlfDelay: Infinity });
+  const iterator = lines[Symbol.asyncIterator]();
+  socket.write(
+    `${JSON.stringify({ type: "hello", hello: { protocol: PROTOCOL_VERSION } })}\n`,
+  );
+  const hello = await iterator.next();
+  assert.equal(hello.done, false);
+  assert.equal(
+    (
+      JSON.parse(hello.value ?? "null") as {
+        readonly runtime?: { readonly daemonInstanceId?: unknown };
+      }
+    ).runtime?.daemonInstanceId,
+    operation.daemonInstance,
+  );
+  await new Promise<void>((resolve, reject) => {
+    socket.write(
+      `${JSON.stringify({
+        type: "request",
+        request: {
+          type: "stop",
+          operation: {
+            daemon_instance: operation.daemonInstance,
+            operation_key: operation.operationKey,
+            id: operation.runId,
+          },
+        },
+      })}\n`,
+      (error) => (error == null ? resolve() : reject(error)),
+    );
+  });
+  lines.close();
+  socket.destroy();
+}
+
+async function waitForMarker(path: string, expected: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  let observed = "";
+  while (Date.now() <= deadline) {
+    try {
+      observed = await readFile(path, "utf8");
+      if (observed === expected) {
+        return;
+      }
+    } catch (error) {
+      if (
+        typeof error !== "object" ||
+        error === null ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      ) {
+        throw error;
+      }
+    }
+    await delay(20);
+  }
+  throw new Error(`timed out waiting for Stop marker; observed ${observed}`);
 }
 
 function processIsRunning(pid: number): boolean {
