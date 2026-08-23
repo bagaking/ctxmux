@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 11
+# 003 — Unix socket and NDJSON protocol generation 12
 
-- Status: accepted for generation 11; pre-stable
+- Status: accepted for generation 12; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -66,9 +66,11 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 11 directly replaces generation 10. It requires one
-caller-retained recoverable native Stop operation and advertises
-`native.recoverable_stop: 1` without a compatibility layer. Generation 10
+Protocol generation 12 directly replaces generation 11. It adds one explicit
+`attach_recoverable_stop` composite so terminal attachment recovery intent is
+present before the ordinary terminal-event/EOF boundary. Generation 11
+requires one caller-retained recoverable native Stop operation and advertises
+`native.recoverable_stop: 1`. Generation 10
 introduced the exact RuntimeIdentity and flat numeric capability record; the
 pre-stable contract directly rejected the obsolete snake_case and
 nested-boolean draft. Generation 9 introduced native Signal plus
@@ -79,7 +81,7 @@ keys and receipts; generation 6 introduced the narrow `run_capacity` error;
 generation 5 introduced correlated attachment controls, typed owner receipts,
 failure dispositions, and applied PTY-size readback; generation 4 introduced
 bounded creation keys. An older peer fails the exact generation handshake
-before request dispatch; ctxmux does not provide a generation-10 fallback,
+before request dispatch; ctxmux does not provide a generation-11 fallback,
 migration, alias, version range, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 

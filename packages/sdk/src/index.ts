@@ -16,6 +16,7 @@ export type {
   CtxmuxClientOptions,
   InputReceipt,
   RecoverableInputOperation,
+  RecoverableStopAttachment,
   ResizeReceipt,
   RuntimeCapabilityRequirements,
   SignalReceipt,
@@ -130,7 +131,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 11. */
+/** Fill the portable defaults required by protocol generation 12. */
 export function defineRun(
   program: string,
   options: {

@@ -1,4 +1,4 @@
-# Local Protocol Generation 11
+# Local Protocol Generation 12
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -13,7 +13,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 11.
+- Raw PTY bytes are represented as integer arrays in generation 12.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -28,7 +28,7 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. A successful generation-11
+The generation fence covers the wire contract only. A successful generation-12
 Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
 ```ts
@@ -130,7 +130,7 @@ them from platform or executable state.
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
 only configured capability requirements; framing, the exact identity shape,
-and protocol generation are still validated. Generation 11 adds no
+and protocol generation are still validated. Generation 12 adds no
 version-range or capability negotiation, endpoint discovery, dynamic registry,
 Provider catalog, plugin discovery, or host/credential identity.
 
@@ -140,7 +140,7 @@ the Rust target vocabulary, or the client-local pre-dispatch boundary requires
 explicit user confirmation and a later reviewed Feature Tracker plan revision
 before implementation.
 
-After the handshake, a connection has one of two shapes:
+After the handshake, a connection has one of three shapes:
 
 1. A short-lived request receives one response or one explicit error.
 2. An `attach` request receives one metadata snapshot header, zero or more
@@ -148,6 +148,11 @@ After the handshake, a connection has one of two shapes:
    Run events until detach, disconnect, Run exit, or daemon exit. Rust and
    TypeScript clients reassemble the replay events before returning their
    public attachment snapshot.
+3. An `attach_recoverable_stop` request first resolves the explicitly carried
+   Stop operation. Rejection returns one ordinary control response and closes.
+   Acceptance receives the metadata header and ordered replay, then the
+   ordinary accepted Stop response, followed by the same live or terminal event
+   stream as `attach`.
 
 Closing a client socket only removes that attachment. It does not stop the Run.
 
@@ -207,14 +212,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 11.
+ownership in generation 12.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 11 retains `run_capacity` for the global retained-Run admission
+Generation 12 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -223,7 +228,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-11 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-12 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -246,7 +251,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-11 decoding and
+The daemon compares canonical typed requests after generation-12 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -348,6 +353,16 @@ in-flight result or replay the settled `stop { disposition }` receipt. This
 works across short connections, attachment connections, response loss, and a
 fresh client. The attachment command ID remains correlation-only; recovery
 comes from resending the complete retained Stop operation.
+
+An ordinary `attach` request remains observation-only. A terminal Run sends
+its retained replay, exactly one terminal event, and EOF without waiting for a
+possible later command. A caller that needs both fresh-client Stop recovery and
+an attachment uses `attach_recoverable_stop`, carrying the complete retained
+operation in the initial request. The daemon resolves that operation through
+the same ledger while pinning its exact Run, then sends the attachment snapshot
+and replay, the ordinary `control_accepted` Stop receipt, and the normal live or
+terminal event stream. This explicit composite avoids both a lost-wakeup window
+and an indefinitely retained terminal attachment.
 
 A different key for a Run that already owns a Stop operation, or reuse of the
 same key for another retained Run, returns `stop_operation_conflict` before
@@ -554,7 +569,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-11 peer that puts `chunks` back into the header is invalid.
+generation-12 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -585,7 +600,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemonInstanceId` in the ordinary generation-11 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-12 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -613,7 +628,7 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 11 gains no upgrade wire
+strictly bounded, unique, and validated; generation 12 gains no upgrade wire
 operation.
 
 Persistent startup requires a real same-owner `0700` directory, regular
@@ -647,6 +662,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-11 frame at runtime, rejects duplicate
+validates the complete nested generation-12 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

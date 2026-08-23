@@ -2068,10 +2068,6 @@ impl RunManager {
         Ok(())
     }
 
-    fn has_recoverable_stop(&self, id: RunId) -> bool {
-        self.registry.has_recoverable_stop(id)
-    }
-
     fn begin_recoverable_stop(
         self: &Arc<Self>,
         operation: RecoverableStop,
@@ -4539,6 +4535,45 @@ fn control_unknown(error: ProtocolError) -> ControlFailure {
     }
 }
 
+async fn handle_recoverable_stop_attachment(
+    mut wire: Framed<UnixStream, LinesCodec>,
+    manager: Arc<RunManager>,
+    operation: RecoverableStop,
+    after_byte: u64,
+    request_permit: UpgradeRequestPermit,
+) -> Result<(), ConnectionError> {
+    let flight = match manager.begin_recoverable_stop(operation) {
+        Ok(flight) => flight,
+        Err(failure) => {
+            send(
+                &mut wire,
+                &ServerFrame::Response {
+                    response: Response::ControlRejected { failure },
+                },
+            )
+            .await?;
+            drop(request_permit);
+            return Ok(());
+        }
+    };
+    let (run, result) = flight.resolve().await;
+    let response = short_control_response(&run, result);
+    if matches!(&response, Response::ControlAccepted { .. }) {
+        return attachment::handle_pinned(
+            wire,
+            manager,
+            run,
+            after_byte,
+            request_permit,
+            Some(response),
+        )
+        .await;
+    }
+    send(&mut wire, &ServerFrame::Response { response }).await?;
+    drop(request_permit);
+    Ok(())
+}
+
 async fn handle_connection(
     stream: UnixStream,
     manager: Arc<RunManager>,
@@ -4599,13 +4634,30 @@ async fn handle_connection(
         }
         UpgradeRequestAdmission::Sealed => return Ok(()),
     };
-    if let Request::Attach { id, after_byte } = request {
-        return attachment::handle(wire, manager, id, after_byte, request_permit).await;
-    }
-    let response = execute_request(&manager, request).await;
-    match response {
-        Ok(response) => send(&mut wire, &ServerFrame::Response { response }).await?,
-        Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
+    match request {
+        Request::Attach { id, after_byte } => {
+            return attachment::handle(wire, manager, id, after_byte, request_permit).await;
+        }
+        Request::AttachRecoverableStop {
+            operation,
+            after_byte,
+        } => {
+            return handle_recoverable_stop_attachment(
+                wire,
+                manager,
+                operation,
+                after_byte,
+                request_permit,
+            )
+            .await;
+        }
+        request => {
+            let response = execute_request(&manager, request).await;
+            match response {
+                Ok(response) => send(&mut wire, &ServerFrame::Response { response }).await?,
+                Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
+            }
+        }
     }
     drop(request_permit);
     Ok(())
@@ -4703,7 +4755,7 @@ async fn execute_request(
             Ok(short_control_response(&run, run.signal(signal).await))
         }
         Request::Stop { operation } => recoverable_stop_response(manager, operation).await,
-        Request::Attach { .. } => Err(ProtocolError::new(
+        Request::Attach { .. } | Request::AttachRecoverableStop { .. } => Err(ProtocolError::new(
             ErrorCode::Internal,
             "attach request reached short-lived request handler",
         )),
@@ -4749,7 +4801,10 @@ async fn recoverable_stop_response(
     };
     let (run, result) = flight.resolve().await;
     Ok(match result {
-        Ok(receipt) => Response::ControlAccepted { run, receipt },
+        Ok(receipt) => Response::ControlAccepted {
+            run: run.info(),
+            receipt,
+        },
         Err(failure) => Response::ControlRejected { failure },
     })
 }

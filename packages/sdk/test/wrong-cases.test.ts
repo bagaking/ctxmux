@@ -1855,6 +1855,132 @@ test("recoverable Stop sends the exact retained operation and exposes conflicts"
   );
 });
 
+test("recoverable Stop composite carries intent before terminal attachment EOF", async (context) => {
+  let connection = 0;
+  const terminal = {
+    type: "exited" as const,
+    code: 0,
+    signal: null,
+  };
+  const terminalRun = {
+    ...runInfo(),
+    state: terminal,
+    latest_output_bytes: 0,
+    first_available_byte: 0,
+  };
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    connection += 1;
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: {
+        type: "attach_recoverable_stop",
+        operation: {
+          daemon_instance: DAEMON_INSTANCE,
+          operation_key: "sdk-wrong-case-stop",
+          id: RUN_ID,
+        },
+        after_byte: 0,
+      },
+    });
+    if (connection === 1) {
+      peer.send({
+        type: "attached",
+        snapshot: {
+          run: terminalRun,
+          replay: {
+            first_available_byte: 0,
+            latest_output_bytes: 0,
+            truncated: false,
+          },
+        },
+      });
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_accepted",
+          run: terminalRun,
+          receipt: { type: "stop", disposition: "graceful" },
+        },
+      });
+      peer.send({
+        type: "event",
+        event: { type: "exited", state: terminal },
+      });
+      socket.end();
+    } else if (connection === 2) {
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_rejected",
+          failure: {
+            error: {
+              code: "daemon_instance_mismatch",
+              message: "operation belongs to another daemon",
+            },
+            disposition: "not_applied",
+          },
+        },
+      });
+    } else {
+      peer.send({
+        type: "attached",
+        snapshot: {
+          run: terminalRun,
+          replay: {
+            first_available_byte: 0,
+            latest_output_bytes: 0,
+            truncated: false,
+          },
+        },
+      });
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_rejected",
+          failure: {
+            error: {
+              code: "invalid_run_state",
+              message: "already terminal",
+            },
+            disposition: "not_applied",
+          },
+        },
+      });
+    }
+  });
+  const client = new CtxmuxClient({ socketPath: daemon.socketPath });
+  const recovered = await client.attachRecoverableStop(stopOperation());
+  assert.deepEqual(recovered.stop, {
+    run: terminalRun,
+    receipt: { type: "stop", disposition: "graceful" },
+  });
+  assert.deepEqual(recovered.attachment.snapshot.run, terminalRun);
+  assert.deepEqual(await recovered.attachment.nextEvent(), {
+    type: "exited",
+    state: terminal,
+  });
+  assert.equal(await recovered.attachment.nextEvent(), undefined);
+
+  await assert.rejects(
+    client.attachRecoverableStop(stopOperation()),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "daemon_instance_mismatch" &&
+      error.disposition === "not_applied",
+  );
+  await assert.rejects(
+    client.attachRecoverableStop(stopOperation()),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "internal" &&
+      error.disposition === "unknown" &&
+      error.message ===
+        "recoverable Stop attachment was rejected after its snapshot",
+  );
+});
+
 test("attachment rejects a malformed Stop key before consuming a command ID", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
