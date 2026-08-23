@@ -1,8 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io,
+    io::{self, BufRead, BufReader},
     path::Path,
     process::{Child, Command, Stdio},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -28,6 +29,9 @@ struct TestDaemon {
     child: Child,
     directory: TempDir,
     client: Client,
+    /// Lines captured from a stderr-piped daemon, shared with a drain thread.
+    /// `None` for the inherit-stderr constructors, which do not scan stderr.
+    stderr_lines: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl TestDaemon {
@@ -107,12 +111,63 @@ impl TestDaemon {
         directory: TempDir,
         socket: impl Into<std::path::PathBuf>,
     ) -> Self {
+        Self::from_spawned_with_stderr(child, directory, socket, None).await
+    }
+
+    /// Start a persistent daemon (`--state-dir`) with stderr piped so the
+    /// incoming handoff image's resume log line can be scanned. A drain thread
+    /// reads the pipe line-by-line into a shared buffer so the tokio runtime is
+    /// never blocked on the synchronous pipe. The thread ends when the daemon
+    /// dies and closes the pipe (see `Drop`).
+    async fn start_persistent() -> Self {
+        let directory = tempfile::tempdir().expect("create daemon temp directory");
+        let socket = directory.path().join("ctxmux.sock");
+        let state_dir = directory.path().join("state");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--state-dir")
+            .arg(&state_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn persistent ctxmuxd");
+
+        let stderr = child.stderr.take().expect("persistent daemon exposes stderr");
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let drain = Arc::clone(&stderr_lines);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        // Mirror the daemon's stderr so `--nocapture` runs stay
+                        // observable while iterating.
+                        eprintln!("[ctxmuxd stderr] {line}");
+                        drain.lock().expect("stderr buffer lock").push(line);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+    }
+
+    async fn from_spawned_with_stderr(
+        child: Child,
+        directory: TempDir,
+        socket: impl Into<std::path::PathBuf>,
+        stderr_lines: Option<Arc<Mutex<Vec<String>>>>,
+    ) -> Self {
         let socket = socket.into();
         let client = Client::new(socket);
         let mut daemon = Self {
             child,
             directory,
             client,
+            stderr_lines,
         };
 
         timeout(Duration::from_secs(5), async {
@@ -129,6 +184,42 @@ impl TestDaemon {
         .await
         .expect("ctxmuxd should accept connections");
         daemon
+    }
+
+    /// Deliver a real `SIGHUP` to the daemon process and assert delivery.
+    fn sighup(&self) {
+        let delivered = Command::new("kill")
+            .arg("-HUP")
+            .arg(self.child.id().to_string())
+            .status()
+            .expect("send SIGHUP to ctxmuxd")
+            .success();
+        assert!(delivered, "SIGHUP should be delivered to ctxmuxd");
+    }
+
+    /// Poll the piped stderr buffer until the incoming handoff image logs its
+    /// resume line, then return that line so the run count can be asserted.
+    async fn wait_resume_signal(&self, timeout_secs: u64) -> String {
+        let lines = self
+            .stderr_lines
+            .as_ref()
+            .expect("wait_resume_signal requires a stderr-piped daemon");
+        timeout(Duration::from_secs(timeout_secs), async {
+            loop {
+                {
+                    let captured = lines.lock().expect("stderr buffer lock");
+                    if let Some(line) = captured
+                        .iter()
+                        .find(|line| line.contains("adopted inherited listener for handoff"))
+                    {
+                        return line.clone();
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("incoming handoff image should log its resume signal")
     }
 }
 
@@ -2358,4 +2449,166 @@ async fn sighup_memory_only_noop() {
         "SIGHUP must not interrupt the live run"
     );
     assert!(process_exists(pid), "child should still be running after SIGHUP");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one continuous test proves same-pid child survival, master/writer re-adoption, and gapless replay across a real execve upgrade"
+)]
+async fn upgrade_preserves_live_run() {
+    // HEADLINE acceptance test for the exec-in-place upgrade: a persistent
+    // daemon that receives SIGHUP drains, re-execs its own binary at the SAME
+    // pid, and re-adopts the live native run. This drives a real
+    // SIGHUP -> execve of CARGO_BIN_EXE_ctxmuxd (no shim, no fake) and proves
+    // the child, its pty master + input writer, and the durable output cursor
+    // all cross the exec with no replay gap.
+
+    // 1. Start a persistent daemon and a live interactive Run. Record P0.
+    let mut daemon = TestDaemon::start_persistent().await;
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start native Run");
+    let p0 = run.pid.expect("shell exposes a process id");
+    assert!(process_exists(p0), "child should be running before the upgrade");
+
+    // 2. Attach, reach READY, and drive I/O to a known cursor C0.
+    let (mut first_attachment, first_snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach to native Run");
+    let mut observed = replay_bytes(&first_snapshot.replay.chunks);
+    let mut last_seq = first_snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut first_attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    first_attachment
+        .input(b"before\n".to_vec())
+        .await
+        .expect("write through attachment before the upgrade");
+    wait_for_output(
+        &mut first_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:before",
+    )
+    .await;
+    let c0 = last_seq;
+    // The attachment is per-connection: the old image's accept loop that serves
+    // it is replaced by execve, so this connection cannot survive the upgrade.
+    // The RUN survives; drop the attachment now and re-attach afterwards.
+    drop(first_attachment);
+
+    // 3. Trigger the real re-exec and await the incoming image's resume signal.
+    daemon.sighup();
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(
+        resume.contains("1 run(s)"),
+        "incoming image should adopt exactly one live run, got: {resume}"
+    );
+    // A real execve replaces the image but keeps the SAME os process, so the
+    // child never exits across the upgrade: try_wait stays None. This is a
+    // strong same-pid proof at the daemon level.
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("poll daemon across the upgrade")
+            .is_none(),
+        "execve must reuse the same os process (no daemon exit)"
+    );
+
+    // 4. Same-child survival: the run reports the same pid and the child is
+    //    still alive. The client reconnects to the unchanged socket inode.
+    let status = timeout(Duration::from_secs(10), async {
+        loop {
+            match daemon.client.status(run.id).await {
+                Ok(status) => return status,
+                // The new accept loop is serving as of the resume log line, but
+                // a status/attach may briefly race the top of serve_with_manager.
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("upgraded daemon should answer status for the surviving run");
+    assert_eq!(
+        status.pid,
+        Some(p0),
+        "the surviving run must keep its original child pid"
+    );
+    assert!(
+        process_exists(p0),
+        "the original child must still be alive after the upgrade"
+    );
+    assert_eq!(status.state, RunState::Running, "the run must stay running");
+
+    // 5. Master + writer re-adopted: attach fresh at C0 and observe an echo.
+    //    Observing OUT:resumed proves both the pty master (read path) and the
+    //    input writer were re-bound by Run::readopt on the incoming image.
+    let (second_attachment, second_snapshot) = timeout(Duration::from_secs(10), async {
+        loop {
+            match daemon.client.attach(run.id, c0).await {
+                Ok(pair) => return pair,
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("re-attach to the surviving run after the upgrade");
+
+    // 6. No replay gap (f04, the core continuity claim): the fresh attach at
+    //    after_byte == C0 must yield contiguous output. The durable cursor
+    //    continued, so replay is not truncated below C0, and the first chunk
+    //    after C0 is contiguous with it. wait_for_output PANICS on a
+    //    RunEvent::Gap, so driving output through it below also proves no gap.
+    assert!(
+        second_snapshot.replay.latest_output_bytes >= c0,
+        "durable output cursor must not regress across the upgrade"
+    );
+    if let Some(first_chunk) = second_snapshot.replay.chunks.first() {
+        assert_eq!(
+            first_chunk.start_byte, c0,
+            "replay after the upgrade must be contiguous from the requested cursor"
+        );
+    }
+
+    let mut observed = replay_bytes(&second_snapshot.replay.chunks);
+    let mut last_seq = second_snapshot.replay.latest_output_bytes;
+    let mut second_attachment = second_attachment;
+    second_attachment
+        .input(b"resumed\n".to_vec())
+        .await
+        .expect("write through the re-adopted input writer");
+    wait_for_output(
+        &mut second_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:resumed",
+    )
+    .await;
+
+    // Let the child exit cleanly through the re-adopted session.
+    second_attachment
+        .input(b"quit\n".to_vec())
+        .await
+        .expect("write quit through the re-adopted input writer");
+    wait_for_output(
+        &mut second_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:quit",
+    )
+    .await;
+    assert_eq!(
+        wait_until_exited(&daemon.client, run.id).await,
+        RunState::Exited {
+            code: 7,
+            signal: None,
+        },
+        "the re-adopted run should exit through its own quit path"
+    );
 }
