@@ -11,7 +11,10 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
+
+/// Current schema of the daemon-wide Runtime capability manifest.
+pub const RUNTIME_CAPABILITY_MANIFEST_VERSION: u16 = 1;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -21,6 +24,9 @@ pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
 
 /// Maximum UTF-8 byte length of one caller-owned native Input operation key.
 pub const MAX_INPUT_OPERATION_KEY_BYTES: usize = 128;
+
+/// Maximum UTF-8 byte length of one daemon-authored build identity.
+pub const MAX_RUNTIME_BUILD_ID_BYTES: usize = 128;
 
 /// Attachment-local correlation identity for one control command.
 ///
@@ -198,6 +204,128 @@ impl std::str::FromStr for DaemonInstanceId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         value.parse().map(Self)
     }
+}
+
+/// Identity of one logical Runtime endpoint.
+///
+/// Persistent mode stores this identity with the state directory so a cold
+/// replacement retains the same Runtime while receiving a new daemon
+/// incarnation. Memory-only mode allocates a fresh Runtime identity at daemon
+/// startup. This identity is not a Run, build, host, Provider, or credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct RuntimeId(Uuid);
+
+impl RuntimeId {
+    /// Allocate a fresh logical Runtime identity.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for RuntimeId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for RuntimeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for RuntimeId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
+/// Opaque identity of the daemon build serving one Runtime connection.
+///
+/// The value is suitable for equality checks across reconnect or planned
+/// exec. It is not a binary signature, source attestation, host identity, or
+/// authorization credential.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, TS)]
+#[serde(transparent)]
+#[ts(type = "string")]
+pub struct RuntimeBuildId(String);
+
+impl RuntimeBuildId {
+    /// Validate one non-empty bounded build identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeBuildIdError`] when the value is empty or exceeds the
+    /// public UTF-8 byte bound.
+    pub fn new(value: impl Into<String>) -> Result<Self, RuntimeBuildIdError> {
+        let identity = Self(value.into());
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Return the exact opaque value.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Validate an identity received through an untrusted protocol decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeBuildIdError`] for an empty or oversized value.
+    pub fn validate(&self) -> Result<(), RuntimeBuildIdError> {
+        let bytes = self.0.len();
+        if bytes == 0 {
+            return Err(RuntimeBuildIdError::Empty);
+        }
+        if bytes > MAX_RUNTIME_BUILD_ID_BYTES {
+            return Err(RuntimeBuildIdError::TooLong {
+                actual: bytes,
+                maximum: MAX_RUNTIME_BUILD_ID_BYTES,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeBuildId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+impl fmt::Display for RuntimeBuildId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::str::FromStr for RuntimeBuildId {
+    type Err = RuntimeBuildIdError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Invalid daemon-authored Runtime build identity.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum RuntimeBuildIdError {
+    /// The identity has no bytes.
+    #[error("Runtime build identity must not be empty")]
+    Empty,
+    /// The identity exceeds the public byte bound.
+    #[error("Runtime build identity is {actual} bytes; maximum is {maximum}")]
+    TooLong { actual: usize, maximum: usize },
 }
 
 /// Caller-owned identity for one recoverable native Input operation.
@@ -621,7 +749,7 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 9.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 10.
     pub data: Vec<u8>,
 }
 
@@ -647,6 +775,73 @@ pub struct OutputReplayHeader {
     pub latest_output_bytes: u64,
     /// Whether output newer than the requested cursor had already been evicted.
     pub truncated: bool,
+}
+
+/// Native operation classes implemented by this Runtime endpoint.
+///
+/// These declarations do not override one Run's current capabilities or
+/// lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRuntimeCapabilities {
+    /// Start a daemon-owned native Run.
+    pub start: bool,
+    /// Apply or recover one caller-keyed native Input operation.
+    pub recoverable_input: bool,
+    /// Execute a portable Level A fork from a compatible retained Run.
+    pub fork_level_a: bool,
+    /// Execute a complete caller-materialized Level B Run specification.
+    pub execute_materialized_level_b: bool,
+}
+
+/// tmux operation classes implemented by this Runtime endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct TmuxRuntimeCapabilities {
+    /// Discover panes through an explicitly selected public tmux endpoint.
+    pub discover: bool,
+    /// Import one pane as a read-only memory-only Run.
+    pub import: bool,
+}
+
+/// Optional local services active on this Runtime endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeServiceCapabilities {
+    /// A persistent state directory is active for this Runtime.
+    pub persistent_state_active: bool,
+    /// Planned exec-in-place ownership continuity is active.
+    pub planned_exec_upgrade_continuity: bool,
+}
+
+/// Versioned daemon-wide capabilities declared independently of Run metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeCapabilityManifest {
+    /// Schema version for these fixed typed capability fields.
+    pub version: u16,
+    /// Native operation classes.
+    pub native: NativeRuntimeCapabilities,
+    /// tmux operation classes.
+    pub tmux: TmuxRuntimeCapabilities,
+    /// Optional active local services.
+    pub services: RuntimeServiceCapabilities,
+}
+
+/// Provider-neutral description of the Runtime serving one connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeDescription {
+    /// Logical Runtime or persistent-store lineage.
+    pub runtime_id: RuntimeId,
+    /// Current live retry and authority fence.
+    pub daemon_instance_id: DaemonInstanceId,
+    /// Opaque serving build identity.
+    pub build_id: RuntimeBuildId,
+    /// Exact public protocol generation used by this connection.
+    pub protocol_generation: u16,
+    /// Independently declared endpoint operation classes and local services.
+    pub capabilities: RuntimeCapabilityManifest,
 }
 
 /// First message sent by every client connection.
@@ -921,10 +1116,7 @@ impl ProtocolError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// Successful protocol handshake.
-    Hello {
-        protocol: u16,
-        daemon_instance: DaemonInstanceId,
-    },
+    Hello { runtime: RuntimeDescription },
     /// Result of one short-lived request.
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
@@ -1072,9 +1264,12 @@ mod tests {
         AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError, RecoverableInput, Request,
-        Response, RunBackend, RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState,
-        ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
+        MAX_INPUT_OPERATION_KEY_BYTES, NativeRuntimeCapabilities, PROTOCOL_VERSION, ProtocolError,
+        RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, Response, RunBackend,
+        RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState, RuntimeBuildId,
+        RuntimeCapabilityManifest, RuntimeDescription, RuntimeId, RuntimeServiceCapabilities,
+        ServerFrame, StopDisposition, TerminalSize, TmuxRuntimeCapabilities, decode_frame,
+        encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -1098,6 +1293,34 @@ mod tests {
             first_available_byte: 0,
             attachments: 1,
             applied_input_bytes: Some(0),
+        }
+    }
+
+    fn sample_runtime_description(daemon_instance_id: DaemonInstanceId) -> RuntimeDescription {
+        RuntimeDescription {
+            runtime_id: "018f47f2-9df7-7f5f-8f2d-d3353f114aea"
+                .parse::<RuntimeId>()
+                .unwrap(),
+            daemon_instance_id,
+            build_id: RuntimeBuildId::new("ctxmuxd/0.1.0").unwrap(),
+            protocol_generation: PROTOCOL_VERSION,
+            capabilities: RuntimeCapabilityManifest {
+                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+                native: NativeRuntimeCapabilities {
+                    start: true,
+                    recoverable_input: true,
+                    fork_level_a: true,
+                    execute_materialized_level_b: true,
+                },
+                tmux: TmuxRuntimeCapabilities {
+                    discover: true,
+                    import: true,
+                },
+                services: RuntimeServiceCapabilities {
+                    persistent_state_active: false,
+                    planned_exec_upgrade_continuity: false,
+                },
+            },
         }
     }
 
@@ -1141,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_input_has_exact_generation_9_wire_shapes() {
+    fn runtime_and_recoverable_input_have_exact_generation_10_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1149,14 +1372,31 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(ServerFrame::Hello {
-                protocol: PROTOCOL_VERSION,
-                daemon_instance,
+                runtime: sample_runtime_description(daemon_instance),
             })
             .unwrap(),
             serde_json::json!({
                 "type": "hello",
-                "protocol": 9,
-                "daemon_instance": daemon_instance.to_string(),
+                "runtime": {
+                    "runtime_id": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
+                    "daemon_instance_id": daemon_instance.to_string(),
+                    "build_id": "ctxmuxd/0.1.0",
+                    "protocol_generation": 10,
+                    "capabilities": {
+                        "version": 1,
+                        "native": {
+                            "start": true,
+                            "recoverable_input": true,
+                            "fork_level_a": true,
+                            "execute_materialized_level_b": true,
+                        },
+                        "tmux": { "discover": true, "import": true },
+                        "services": {
+                            "persistent_state_active": false,
+                            "planned_exec_upgrade_continuity": false,
+                        },
+                    },
+                },
             })
         );
         assert_eq!(

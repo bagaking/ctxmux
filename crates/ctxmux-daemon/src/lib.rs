@@ -40,9 +40,12 @@ pub use persistence::PersistenceError;
 use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
     CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
-    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError, RecoverableInput,
-    Request, Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec,
-    RunState, ServerFrame, TerminalSize, TmuxRunEvent, decode_frame, encode_frame,
+    MAX_FRAME_BYTES, NativeRuntimeCapabilities, OutputChunk, OutputReplay, PROTOCOL_VERSION,
+    ProtocolError, RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, Response,
+    RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
+    RuntimeBuildId, RuntimeCapabilityManifest, RuntimeDescription, RuntimeId,
+    RuntimeServiceCapabilities, ServerFrame, TerminalSize, TmuxRunEvent, TmuxRuntimeCapabilities,
+    decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system};
@@ -92,6 +95,11 @@ const TMUX_IMPORT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUX_IMPORT_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
 const TMUX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const UPGRADE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
+
+fn runtime_build_id() -> RuntimeBuildId {
+    RuntimeBuildId::new(concat!("ctxmuxd/", env!("CARGO_PKG_VERSION")))
+        .expect("ctxmuxd package version forms a valid Runtime build identity")
+}
 
 /// Failure that prevents the daemon server from running.
 #[derive(Debug, Error)]
@@ -701,7 +709,9 @@ impl Drop for SocketGuard {
 }
 
 struct RunManager {
+    runtime_id: RuntimeId,
     daemon_instance: DaemonInstanceId,
+    build_id: RuntimeBuildId,
     registry: RunRegistry,
     creation_flights: CreationFlightOwner,
     unpublished_cleanups: UnpublishedCleanupOwner,
@@ -1187,7 +1197,9 @@ impl RunManager {
         qualification_stats: QualificationStats,
     ) -> Self {
         Self {
+            runtime_id: RuntimeId::new(),
             daemon_instance,
+            build_id: runtime_build_id(),
             registry: RunRegistry::with_stats(qualification_stats.clone()),
             creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
@@ -1206,6 +1218,33 @@ impl RunManager {
             attachment_hook: None,
             #[cfg(test)]
             creation_hook: None,
+        }
+    }
+
+    fn runtime_description(&self) -> RuntimeDescription {
+        let persistent = self.persistence.is_some();
+        RuntimeDescription {
+            runtime_id: self.runtime_id,
+            daemon_instance_id: self.daemon_instance,
+            build_id: self.build_id.clone(),
+            protocol_generation: PROTOCOL_VERSION,
+            capabilities: RuntimeCapabilityManifest {
+                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+                native: NativeRuntimeCapabilities {
+                    start: true,
+                    recoverable_input: true,
+                    fork_level_a: true,
+                    execute_materialized_level_b: true,
+                },
+                tmux: TmuxRuntimeCapabilities {
+                    discover: true,
+                    import: !persistent,
+                },
+                services: RuntimeServiceCapabilities {
+                    persistent_state_active: persistent,
+                    planned_exec_upgrade_continuity: persistent,
+                },
+            },
         }
     }
 
@@ -1247,7 +1286,9 @@ impl RunManager {
             })
             .collect();
         Self {
+            runtime_id: persistence.runtime_id(),
             daemon_instance: persistence.daemon_instance(),
+            build_id: runtime_build_id(),
             registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
             creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
@@ -1332,7 +1373,9 @@ impl RunManager {
             runs.push((operation_key, run, metadata_owner));
         }
         Ok(Self {
+            runtime_id: persistence.runtime_id(),
             daemon_instance: persistence.daemon_instance(),
+            build_id: runtime_build_id(),
             registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
             creation_flights,
             unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
@@ -4321,8 +4364,7 @@ async fn handle_connection(
             send(
                 &mut wire,
                 &ServerFrame::Hello {
-                    protocol: PROTOCOL_VERSION,
-                    daemon_instance: manager.daemon_instance,
+                    runtime: manager.runtime_description(),
                 },
             )
             .await?;

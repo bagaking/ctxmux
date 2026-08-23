@@ -46,7 +46,9 @@ export {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_FRAME_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
+  MAX_RUNTIME_BUILD_ID_BYTES,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
 } from "./generated/constants.js";
 export type { AttachedHeader } from "./generated/AttachedHeader.js";
 export type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
@@ -81,12 +83,19 @@ export type { RunInputReference } from "./generated/RunInputReference.js";
 export type { RunLineage } from "./generated/RunLineage.js";
 export type { RunSpec } from "./generated/RunSpec.js";
 export type { RunState } from "./generated/RunState.js";
+export type { RuntimeBuildId } from "./generated/RuntimeBuildId.js";
+export type { RuntimeCapabilityManifest } from "./generated/RuntimeCapabilityManifest.js";
+export type { RuntimeDescription } from "./generated/RuntimeDescription.js";
+export type { RuntimeId } from "./generated/RuntimeId.js";
+export type { RuntimeServiceCapabilities } from "./generated/RuntimeServiceCapabilities.js";
 export type { RunSignal } from "./generated/RunSignal.js";
 export type { StopDisposition } from "./generated/StopDisposition.js";
 export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { TerminalSize } from "./generated/TerminalSize.js";
 export type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
+export type { TmuxRuntimeCapabilities } from "./generated/TmuxRuntimeCapabilities.js";
 export type { TmuxRunEvent } from "./generated/TmuxRunEvent.js";
+export type { NativeRuntimeCapabilities } from "./generated/NativeRuntimeCapabilities.js";
 
 import { PROTOCOL_VERSION } from "./generated/constants.js";
 import type { RunSpec } from "./generated/RunSpec.js";
@@ -108,7 +117,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 9. */
+/** Fill the portable defaults required by protocol generation 10. */
 export function defineRun(
   program: string,
   options: {

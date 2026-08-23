@@ -10,8 +10,9 @@ use std::{
 
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
-    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, RunEvent, RunId,
-    RunInfo, RunSpec, RunState, TerminalSize,
+    CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, PROTOCOL_VERSION,
+    RUNTIME_CAPABILITY_MANIFEST_VERSION, RunEvent, RunId, RunInfo, RunSpec, RunState,
+    RuntimeDescription, TerminalSize,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -150,6 +151,27 @@ fn shell_spec(script: &str) -> RunSpec {
         size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
+}
+
+fn assert_persistent_runtime_manifest(runtime: &RuntimeDescription) {
+    assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
+    assert_eq!(
+        runtime.capabilities.version,
+        RUNTIME_CAPABILITY_MANIFEST_VERSION
+    );
+    assert!(runtime.capabilities.native.start);
+    assert!(runtime.capabilities.native.recoverable_input);
+    assert!(runtime.capabilities.native.fork_level_a);
+    assert!(runtime.capabilities.native.execute_materialized_level_b);
+    assert!(runtime.capabilities.tmux.discover);
+    assert!(!runtime.capabilities.tmux.import);
+    assert!(runtime.capabilities.services.persistent_state_active);
+    assert!(
+        runtime
+            .capabilities
+            .services
+            .planned_exec_upgrade_continuity
+    );
 }
 
 const ORDINARY_TERMINAL_WAIT: Duration = Duration::from_secs(10);
@@ -310,6 +332,11 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
     let socket = temp.path().join("ctxmux.sock");
     let mut first = Daemon::start(socket.clone(), &state_dir).await;
     let first_client = first.client();
+    let first_runtime = first_client
+        .runtime_info()
+        .await
+        .expect("read first Runtime description");
+    assert_persistent_runtime_manifest(&first_runtime);
     let live = first_client
         .start(shell_spec(
             "trap '' HUP TERM; printf 'stale-pid-sentinel'; exec /bin/sleep 60",
@@ -352,6 +379,16 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
 
     let second = Daemon::start(socket, &state_dir).await;
     let client = second.client();
+    let replacement_runtime = client
+        .runtime_info()
+        .await
+        .expect("read replacement Runtime description");
+    assert_persistent_runtime_manifest(&replacement_runtime);
+    assert_eq!(replacement_runtime.runtime_id, first_runtime.runtime_id);
+    assert_ne!(
+        replacement_runtime.daemon_instance_id,
+        first_runtime.daemon_instance_id
+    );
     let recovered = client
         .status(live.id)
         .await

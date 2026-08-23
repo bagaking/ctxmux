@@ -72,7 +72,7 @@ multiply each existing local bound, while parser containers, transient clones,
 Run metadata, and allocator overhead remain measured RSS rather than being
 misrepresented as replay bytes.
 
-SQLite may accept a schema-3 store containing up to 4,096 structurally
+SQLite may accept a schema-4 store containing up to 4,096 structurally
 valid rows during fail-closed format validation. Bounded, restartable startup
 transactions reconcile prior running rows to interrupted, evict the canonical
 terminal prefix to 128, and finish serving-epoch publication before socket publication.
@@ -377,7 +377,7 @@ WAL-frame fixture before the dependency can change.
 
 This implementation supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
-replacement. Decision 009 remains authoritative for schema-3 validation up to
+replacement. Decision 009 remains authoritative for schema-4 validation up to
 the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
 limits, file ceilings, recovery class, and SQLite durability assumptions.
 
@@ -597,7 +597,7 @@ wall-clock expiration is promised. The 128 ceiling bounds Registry records and
 their 512 MiB replay payload; the shared eight-slot overlap owner produces the
 separate 544 MiB retained-plus-overlap payload bound above. Neither value bounds
 descendant processes from legacy direct-child Stop semantics. Generation 9
-replaces that boundary with complete POSIX-session Stop; a session-escaping
+introduced complete POSIX-session Stop; a session-escaping
 descendant remains deliberately outside the declared owner scope.
 The payload ceiling is not a universal daemon RSS claim: extreme short reads
 can amplify chunk/Vec metadata, and public attachments clone replay without a
@@ -670,7 +670,7 @@ or deterministic-owner fixtures.
   attachment lookup paths
 - `crates/ctxmux-daemon/src/native_control.rs`: native child, reap, PTY, and
   input-drain ownership
-- `crates/ctxmux-daemon/src/persistence.rs`: schema-3 validation, SQLite actor,
+- `crates/ctxmux-daemon/src/persistence.rs`: schema-4 validation, SQLite actor,
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts

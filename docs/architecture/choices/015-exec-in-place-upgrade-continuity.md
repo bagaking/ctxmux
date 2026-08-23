@@ -115,6 +115,13 @@ continues to own the PTY. 009's "fresh UUID per daemon" is refined to "fresh per
 cold start, preserved across intentional exec-in-place", because exec-in-place is
 by definition the same live-control owner.
 
+The logical Runtime ID is also preserved. It is reloaded from schema-4
+`runtime_meta` through the existing SQLite owner; it is not copied into the
+version-2 handoff manifest. The incoming image constructs its own build label
+and capability manifest from that image and the active persistence mode. The
+build label may therefore stay equal or change without affecting Runtime or
+daemon-instance continuity, and it is not handoff authority or attestation.
+
 ### State lock continuity
 
 009 holds an exclusive advisory lock on a companion file for the daemon lifetime
@@ -157,6 +164,9 @@ re-exec changes no frame.
 - A preserved daemon instance requires preservation of the complete settled
   recoverable-Input ledger and cursor. A response-loss retry after upgrade
   returns the original range without another physical write.
+- The public Runtime ID and daemon instance remain equal before and after the
+  exec. Build and manifest facts are reconstructed by the incoming image rather
+  than copied as hidden continuity state.
 
 ## Alternatives
 
@@ -242,7 +252,9 @@ owner preflight must drain them first or abort before extraction.
   a fresh attach from that cursor shows contiguous output with no gap, and the
   per-Run descriptor and thread census is unchanged.
 - Covered: a response-loss recoverable Input crosses a real exec and returns its
-  original range without a duplicate child-visible write.
+  original range without a duplicate child-visible write; public Hello before
+  and after the exec reports the same Runtime ID and daemon instance and the
+  persistent service manifest.
 - Covered: a blocked real PTY Input crosses `SIGHUP`; a same-attachment command
   observes the drain retry result, the Input ACK precedes resume, and the
   incoming cursor advances exactly once.
