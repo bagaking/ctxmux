@@ -13,6 +13,13 @@
   reached the formatting gate and found the new roadmap row non-canonical.
   Commit `584dc8a` contains only that formatter result. The next full clean run
   passed, so no Stop behavior was hidden by the retry.
+- Gate determinism correction: a later canonical run reproduced a pre-existing
+  unit-test race between receipt visibility and the input drain clearing its
+  planned-exec crossing flag. The three affected handoff tests now wait for the
+  owner-defined handoff-ready boundary with a two-second deadline instead of
+  assuming that receipt delivery drains the request gate. The formerly failing
+  completed-ledger case passed ten consecutive exact runs; the unknown-ledger
+  and crossing-operation cases also passed exactly, with daemon clippy clean.
 
 ## Manual Checks
 
