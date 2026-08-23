@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22ecztapc",
   "plan_status": "reviewed",
-  "plan_revision": 2,
-  "supersedes_revision": 1,
-  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md",
+  "plan_revision": 3,
+  "supersedes_revision": 2,
+  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -12,7 +12,7 @@
     "docs/protocol.md",
     "docs/roadmap.md",
     "packages/sdk/README.md",
-    ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
+    ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md"
   ],
   "plan_history": [
     {
@@ -51,6 +51,31 @@
         "docs/roadmap.md",
         "packages/sdk/README.md",
         ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
+      ],
+      "task_ids": [
+        "T-000",
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "packages/sdk/README.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md"
       ],
       "task_ids": [
         "T-000",
@@ -157,16 +182,18 @@
       "acceptance": [
         "The public contract exposes exactly `daemonInstanceId: string`, `runtimeId: string`, `runtimeIdPersistence: \"daemon\" | \"state_dir\"`, `buildId: string`, `protocolGeneration: number`, `platform: string`, `arch: string`, and `capabilities: Record<string, number>`; Rust protocol truth, generated TypeScript declarations, runtime validation, client projections, CLI JSON, and documentation agree on those fields.",
         "`runtimeId` remains distinct from daemon incarnation, Run, Provider, build, host, and credential identity. `runtimeIdPersistence` is `daemon` for a memory-only Runtime ID that lasts one daemon lifetime and `state_dir` for a Runtime ID preserved by the selected state-directory lineage across cold replacement; validated planned exec preserves the Runtime and daemon identities.",
-        "`buildId`, `platform`, and `arch` are daemon-authored serving-build facts with documented canonical values. They are not Git or binary attestation, host fingerprinting, credentials, Provider identity, endpoint discovery, or transport negotiation.",
-        "Capabilities are one flat string-to-number record. Each value is a positive integer naming the highest fully implemented public contract version for that exact key; an absent key is unsupported. Zero, negative, fractional, boolean, string, nested-object, and platform/executable-inferred values fail closed, and a request for an absent key or a version above the advertised value returns an explicit unsupported result without fallback.",
-        "The Rust and TypeScript clients consume the same protocol source of truth, reject incompatible identity/capability contracts before dispatch, and the CLI remains a client of the Rust public boundary. Real memory-only, persistent cold-replacement, and planned-exec fixtures prove the identity and persistence discriminator lifecycle.",
-        "No plugin discovery, marketplace, embedded runtime, capability negotiation, transport negotiation framework, Provider catalog, or host credential surface is introduced. Any change to the confirmed fields, discriminators, flat capability keys or numeric version semantics requires explicit user confirmation and a later reviewed Feature Tracker plan revision before implementation."
+        "`buildId`, `platform`, and `arch` are daemon-authored serving-build facts. `platform` is exactly `std::env::consts::OS` and `arch` is exactly `std::env::consts::ARCH` (for example `macos` and `aarch64` on an Apple Silicon macOS build), not Node/release names. These facts are not Git or binary attestation, host fingerprinting, credentials, Provider identity, endpoint discovery, or transport negotiation.",
+        "The initial flat capability catalog is exactly `native.start`, `native.recoverable_input`, `native.fork_level_a`, `native.execute_materialized_level_b`, `tmux.discover`, `tmux.import`, `services.persistent_state`, and `services.planned_exec_upgrade_continuity`. A Runtime advertises only fully implemented keys; version `1` names the currently implemented public contract for each advertised initial key, and absence means unsupported.",
+        "Each capability value and client requirement is a JavaScript-safe positive integer in `1..=9_007_199_254_740_991` naming the highest fully implemented version for that exact key. Zero, negative, fractional, boolean, string, null, array, nested-object, overflow, and platform/executable-inferred values fail closed in Rust and TypeScript. A request for an absent key or a version above the advertised value returns an explicit `unsupported_capability` result without fallback.",
+        "Capability requirements are client-local compatibility preconditions: the Rust client builder and TypeScript client options accept exact required key/version pairs, compare them after Hello and before sending any business Request or Attach frame, and do not add requirements to the wire. Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI auto-start readiness remain raw identity inspection paths so an incompatible live Runtime can be diagnosed without replacement.",
+        "Rust and TypeScript mock peers prove absent and higher-version requirements close before a business frame; real memory-only public-client fixtures prove no Run is created on rejection. Real memory-only, persistent cold-replacement, and planned-exec fixtures prove the identity and persistence discriminator lifecycle, and the CLI remains a client of the Rust public boundary.",
+        "No plugin discovery, marketplace, embedded runtime, capability negotiation, transport negotiation framework, Provider catalog, operation-to-key inference, key normalization, or host credential surface is introduced. Any change to the confirmed fields, discriminators, initial flat keys, safe-integer version semantics, Rust target vocabulary, or client-local pre-dispatch requirement boundary requires explicit user confirmation and a later reviewed Feature Tracker plan revision before implementation."
       ],
       "verification": [
         {
           "kind": "command",
           "ref": "scripts/check.sh",
-          "proves": "Exact RuntimeIdentity schema, cross-language and CLI parity, identity lifecycles, compatibility failures, numeric capability negatives, public clients, and repository regressions pass."
+          "proves": "Exact RuntimeIdentity schema, cross-language and CLI parity, safe-integer capability negatives, client-local absent/higher rejection before dispatch, identity lifecycles, public clients, and repository regressions pass."
         },
         {
           "kind": "artifact",
@@ -175,8 +202,8 @@
         },
         {
           "kind": "artifact",
-          "ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md",
-          "proves": "The direct user-confirmed minimum contract and change-control requirement are durably bound to plan revision 2."
+          "ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md",
+          "proves": "The direct user-confirmed initial key catalog, numeric domain, Rust target vocabulary, client-local requirement boundary, and change-control rule are durably bound to plan revision 3."
         }
       ],
       "source_refs": [
@@ -184,7 +211,7 @@
         "docs/protocol.md#connection-state",
         "crates/ctxmux-protocol/src/lib.rs",
         "packages/sdk/src/index.ts",
-        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md"
       ],
       "supersedes": [],
       "introduced_in_revision": 1,

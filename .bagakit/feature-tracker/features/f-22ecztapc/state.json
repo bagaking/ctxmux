@@ -87,6 +87,18 @@
     {
       "action": "task_started",
       "detail": "T-002"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
     }
   ],
   "goal_contract": {
