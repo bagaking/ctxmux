@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 9
+# 003 — Unix socket and NDJSON protocol generation 10
 
-- Status: accepted for generation 9; pre-stable
+- Status: accepted for generation 10; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -11,11 +11,20 @@ Rust and TypeScript clients need a simple local boundary that survives client re
 
 Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The daemon operator still supplies the socket path to `ctxmuxd`. The first-party CLI may omit that path: it uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` or a process-temp fallback, and starts a sibling `ctxmuxd` when nothing is listening. Other clients, including the SDK, still select the socket explicitly and do not start the daemon. The daemon creates the socket with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
 
-The first frame is an exact protocol-generation handshake. Short-lived connections carry one request. Attachment connections carry one metadata snapshot header, bounded ordered replay-output frames through that header's replay head, then bidirectional control frames and live events. One encoded frame is limited to 1 MiB; total retained replay is not required to fit in one frame.
+The first frame is an exact protocol-generation handshake. A successful Hello
+returns one typed `RuntimeDescription`: logical Runtime ID, daemon instance,
+opaque serving build ID, exact protocol generation, and a fixed versioned
+capability manifest. Short-lived connections carry one request. Attachment
+connections carry one metadata snapshot header, bounded ordered replay-output
+frames through that header's replay head, then bidirectional control frames and
+live events. One encoded frame is limited to 1 MiB; total retained replay is not
+required to fit in one frame.
 
 ## Quality attributes and invariants
 
 - Version mismatch fails before a request is executed.
+- Unknown Runtime manifest versions and malformed or extra Runtime fields fail
+  before a public client exposes endpoint facts.
 - A decoded invalid request receives a typed protocol error.
 - Startup stale cleanup and shutdown never intentionally replace or remove an
   ordinary file, symlink, or independently substituted listener.
@@ -50,19 +59,17 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 9 directly replaces generation 8. It retains cumulative
-output byte cursors and adds native Signal plus Stop disposition without a
-compatibility layer. Generation 8 had replaced output
-chunk ordinals with cumulative half-open byte ranges across Run metadata,
-Attach, replay, live output, and Gap. It retains daemon-instance identity plus
-recoverable native Input operation keys and receipts from generation 7, and
-the narrow `run_capacity` error for retained-Run admission introduced by
-generation 6, the correlated attachment controls, typed owner receipts,
-failure dispositions, and applied PTY-size readback introduced by generation
-5, plus the bounded creation keys introduced by generation 4. An
-older peer fails the exact generation handshake before request dispatch;
-ctxmux does not provide a generation-7 fallback, migration, alias, or dual
-encoding.
+Protocol generation 10 directly replaces generation 9. It adds the typed
+Runtime description and capability manifest without a compatibility layer.
+Generation 9 introduced native Signal plus complete-session Stop disposition;
+generation 8 introduced cumulative half-open output byte cursors. Generation 7
+introduced daemon-instance identity plus recoverable native Input operation
+keys and receipts; generation 6 introduced the narrow `run_capacity` error;
+generation 5 introduced correlated attachment controls, typed owner receipts,
+failure dispositions, and applied PTY-size readback; generation 4 introduced
+bounded creation keys. An older peer fails the exact generation handshake
+before request dispatch; ctxmux does not provide a generation-9 fallback,
+migration, alias, version range, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
@@ -80,6 +87,9 @@ An owner-only directory and mode `0600` materially reduce the local threat surfa
 - Covered now: generation mismatch before request dispatch, wrong lifecycle
   requests, socket mode, active-listener refusal, non-socket and symlink
   refusal.
+- Covered now: exact Runtime Hello shape, Runtime/daemon/Run identity
+  separation, Rust/TypeScript/CLI parity, unknown manifest rejection, and
+  malformed or forbidden discovery fields failing closed.
 - Covered now: the exact 1 MiB ceiling, one-byte oversize input with and without a delimiter, bounded closure, and no daemon Run mutation across Rust and Node boundaries.
 - Covered now: retained replay larger than one frame is sent as bounded ordered
   output events and reassembled exactly by both public clients.

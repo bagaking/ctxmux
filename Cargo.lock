@@ -111,6 +111,7 @@ dependencies = [
  "ctxmux-daemon",
  "ctxmux-protocol",
  "portable-pty",
+ "serde_json",
  "tempfile",
  "tokio",
  "vt100",

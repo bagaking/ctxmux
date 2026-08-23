@@ -13,9 +13,12 @@ import {
   CtxmuxCommandError,
   CtxmuxInvalidFrameError,
   MAX_FRAME_BYTES,
+  MAX_RUNTIME_BUILD_ID_BYTES,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   inputOperationKey,
   type OutputChunk,
+  type RuntimeDescription,
   type ServerFrame,
 } from "../src/index.ts";
 import { runEventSource } from "../src/attachment.ts";
@@ -24,6 +27,30 @@ import { JsonLinesConnection, WireClosedError } from "../src/wire.ts";
 
 const RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114ae8";
 const DAEMON_INSTANCE = "018f47f2-9df7-7f5f-8f2d-d3353f114ae9";
+const RUNTIME_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114aea";
+
+function runtimeDescription(): RuntimeDescription {
+  return {
+    runtime_id: RUNTIME_ID,
+    daemon_instance_id: DAEMON_INSTANCE,
+    build_id: "ctxmuxd/0.1.0",
+    protocol_generation: PROTOCOL_VERSION,
+    capabilities: {
+      version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+      native: {
+        start: true,
+        recoverable_input: true,
+        fork_level_a: true,
+        execute_materialized_level_b: true,
+      },
+      tmux: { discover: true, import: true },
+      services: {
+        persistent_state_active: false,
+        planned_exec_upgrade_continuity: false,
+      },
+    },
+  };
+}
 const MALFORMED_PROTOCOL_FRAMES = (
   JSON.parse(
     readFileSync(
@@ -98,10 +125,133 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     [
       {
         type: "hello",
-        protocol: PROTOCOL_VERSION,
-        daemon_instance: "not-a-uuid",
+        runtime: { ...runtimeDescription(), runtime_id: "not-a-uuid" },
       },
-      "$frame.daemon_instance",
+      "$frame.runtime.runtime_id",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          daemon_instance_id: "not-a-uuid",
+        },
+      },
+      "$frame.runtime.daemon_instance_id",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: { ...runtimeDescription(), build_id: "" },
+      },
+      "$frame.runtime.build_id",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          build_id: "x".repeat(MAX_RUNTIME_BUILD_ID_BYTES + 1),
+        },
+      },
+      "$frame.runtime.build_id",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            version: RUNTIME_CAPABILITY_MANIFEST_VERSION + 1,
+          },
+        },
+      },
+      "$frame.runtime.capabilities.version",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            native: {
+              ...runtimeDescription().capabilities.native,
+              fork_level_a: "true",
+            },
+          },
+        },
+      },
+      "$frame.runtime.capabilities.native.fork_level_a",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: { ...runtimeDescription(), host: "private" },
+      },
+      "$frame.runtime.host",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            plugins: [],
+          },
+        },
+      },
+      "$frame.runtime.capabilities.plugins",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            native: {
+              ...runtimeDescription().capabilities.native,
+              provider_catalog: [],
+            },
+          },
+        },
+      },
+      "$frame.runtime.capabilities.native.provider_catalog",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            tmux: {
+              ...runtimeDescription().capabilities.tmux,
+              transport_negotiation: true,
+            },
+          },
+        },
+      },
+      "$frame.runtime.capabilities.tmux.transport_negotiation",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          capabilities: {
+            ...runtimeDescription().capabilities,
+            services: {
+              ...runtimeDescription().capabilities.services,
+              credentials: "secret",
+            },
+          },
+        },
+      },
+      "$frame.runtime.capabilities.services.credentials",
     ],
     [
       { type: "response", response: { type: "invented" } },
@@ -325,12 +475,43 @@ test("SC-02 rejects malformed nested runtime frames", () => {
   }
 });
 
+test("SC-02 rejects incompatible Runtime generations before dispatch", async (context) => {
+  for (const protocolGeneration of [
+    PROTOCOL_VERSION - 1,
+    PROTOCOL_VERSION + 1,
+  ]) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      assert.deepEqual(await peer.receive(), {
+        type: "hello",
+        hello: { protocol: PROTOCOL_VERSION },
+      });
+      peer.send({
+        type: "hello",
+        runtime: {
+          ...runtimeDescription(),
+          protocol_generation: protocolGeneration,
+        },
+      });
+      assert.equal(
+        await peer.receiveOptional(),
+        undefined,
+        "an incompatible Hello must close before any request dispatch",
+      );
+    });
+
+    await assert.rejects(
+      new CtxmuxClient({ socketPath: daemon.socketPath }).runtimeInfo(),
+      /expected compatible hello, received hello/u,
+    );
+  }
+});
+
 test("SC-02 accepts TypeScript-authored server variants and rejects mutations", () => {
   const frames: readonly ServerFrame[] = [
     {
       type: "hello",
-      protocol: PROTOCOL_VERSION,
-      daemon_instance: DAEMON_INSTANCE,
+      runtime: runtimeDescription(),
     },
     { type: "response", response: { type: "started", run: runInfo() } },
     {
@@ -1745,8 +1926,7 @@ class MockPeer {
     });
     this.send({
       type: "hello",
-      protocol: PROTOCOL_VERSION,
-      daemon_instance: DAEMON_INSTANCE,
+      runtime: runtimeDescription(),
     });
   }
 

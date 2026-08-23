@@ -305,6 +305,7 @@ import {
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   defineRun,
   registerIntegration,
 } from "@ctxmux/sdk";
@@ -495,6 +496,31 @@ async function stopDaemon() {
 
 try {
   await waitForDaemon();
+  const runtime = await client.runtimeInfo();
+  assert.equal(runtime.daemon_instance_id, (await readiness).daemon_instance);
+  assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
+  assert.equal(runtime.build_id, "ctxmuxd/" + expectedVersion);
+  assert.equal(runtime.protocol_generation, expectedProtocol);
+  assert.deepEqual(runtime.capabilities, {
+    version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+    native: {
+      start: true,
+      recoverable_input: true,
+      fork_level_a: true,
+      execute_materialized_level_b: true,
+    },
+    tmux: { discover: true, import: true },
+    services: {
+      persistent_state_active: false,
+      planned_exec_upgrade_continuity: false,
+    },
+  });
+  assert.deepEqual(
+    JSON.parse(
+      (await execFile(cliBinary, ["--socket", socketPath, "runtime"])).stdout,
+    ),
+    runtime,
+  );
   const run = await client.start(
     defineRun("/bin/sh", {
       args: [
@@ -503,6 +529,8 @@ try {
       ],
     }),
   );
+  assert.notEqual(run.id, runtime.runtime_id);
+  assert.notEqual(run.id, runtime.daemon_instance_id);
   const status = await client.status(run.id);
   assert.equal(status.state.type, "running");
   assert.notEqual(status.pid, null);
@@ -704,11 +732,14 @@ import {
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   registerIntegration,
   type Integration,
   type IntegrationSemanticEvent,
   type RunInfo,
   type RunSpec,
+  type RuntimeCapabilityManifest,
+  type RuntimeDescription,
 } from "@ctxmux/sdk";
 import { shellIntegration } from "@ctxmux/sdk/integrations";
 
@@ -754,6 +785,21 @@ const provider: Integration<
 declare const client: CtxmuxClient;
 declare const parent: RunInfo;
 declare const config: ProviderForkConfig;
+const runtimeInfo: Promise<RuntimeDescription> = client.runtimeInfo();
+const manifest: RuntimeCapabilityManifest = {
+  version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+  native: {
+    start: true,
+    recoverable_input: true,
+    fork_level_a: true,
+    execute_materialized_level_b: true,
+  },
+  tmux: { discover: true, import: true },
+  services: {
+    persistent_state_active: false,
+    planned_exec_upgrade_continuity: false,
+  },
+};
 const registered = registerIntegration(client, provider);
 const child: Promise<RunInfo> = registered.forkLevelB(parent, config);
 const publicErrors: readonly Error[] = [
@@ -768,6 +814,8 @@ const publicErrors: readonly Error[] = [
 ];
 void child;
 void publicErrors;
+void runtimeInfo;
+void manifest;
 void shellIntegration;
 `;
 

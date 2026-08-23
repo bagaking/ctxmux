@@ -1,6 +1,10 @@
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
+import {
+  MAX_RUNTIME_BUILD_ID_BYTES,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
+} from "./generated/constants.js";
 
 const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "version_mismatch",
@@ -26,7 +30,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-9 wire contract. */
+/** A daemon frame failed the runtime half of the generation-10 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -42,8 +46,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   const frame = record(value, "$frame");
   switch (discriminant(frame, "$frame")) {
     case "hello":
-      unsignedInteger(frame.protocol, "$frame.protocol", 0xffff);
-      canonicalUuid(frame.daemon_instance, "$frame.daemon_instance");
+      runtimeDescription(frame.runtime, "$frame.runtime");
       break;
     case "response":
       response(frame.response, "$frame.response");
@@ -69,7 +72,76 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-/** Reject a generation-9 u64 before JavaScript can round a replay cursor. */
+function runtimeDescription(value: unknown, path: string): void {
+  const runtime = record(value, path);
+  exactFields(runtime, path, [
+    "runtime_id",
+    "daemon_instance_id",
+    "build_id",
+    "protocol_generation",
+    "capabilities",
+  ]);
+  canonicalUuid(runtime.runtime_id, `${path}.runtime_id`);
+  canonicalUuid(runtime.daemon_instance_id, `${path}.daemon_instance_id`);
+  const buildId = string(runtime.build_id, `${path}.build_id`);
+  const buildIdBytes = new TextEncoder().encode(buildId).byteLength;
+  if (buildIdBytes === 0 || buildIdBytes > MAX_RUNTIME_BUILD_ID_BYTES) {
+    throw invalid(
+      `${path}.build_id`,
+      `a non-empty UTF-8 string of at most ${String(MAX_RUNTIME_BUILD_ID_BYTES)} bytes`,
+    );
+  }
+  unsignedInteger(
+    runtime.protocol_generation,
+    `${path}.protocol_generation`,
+    0xffff,
+  );
+  runtimeCapabilityManifest(runtime.capabilities, `${path}.capabilities`);
+}
+
+function runtimeCapabilityManifest(value: unknown, path: string): void {
+  const manifest = record(value, path);
+  exactFields(manifest, path, ["version", "native", "tmux", "services"]);
+  if (manifest.version !== RUNTIME_CAPABILITY_MANIFEST_VERSION) {
+    throw invalid(
+      `${path}.version`,
+      `Runtime capability manifest version ${String(RUNTIME_CAPABILITY_MANIFEST_VERSION)}`,
+    );
+  }
+  const native = record(manifest.native, `${path}.native`);
+  exactFields(native, `${path}.native`, [
+    "start",
+    "recoverable_input",
+    "fork_level_a",
+    "execute_materialized_level_b",
+  ]);
+  boolean(native.start, `${path}.native.start`);
+  boolean(native.recoverable_input, `${path}.native.recoverable_input`);
+  boolean(native.fork_level_a, `${path}.native.fork_level_a`);
+  boolean(
+    native.execute_materialized_level_b,
+    `${path}.native.execute_materialized_level_b`,
+  );
+  const tmux = record(manifest.tmux, `${path}.tmux`);
+  exactFields(tmux, `${path}.tmux`, ["discover", "import"]);
+  boolean(tmux.discover, `${path}.tmux.discover`);
+  boolean(tmux.import, `${path}.tmux.import`);
+  const services = record(manifest.services, `${path}.services`);
+  exactFields(services, `${path}.services`, [
+    "persistent_state_active",
+    "planned_exec_upgrade_continuity",
+  ]);
+  boolean(
+    services.persistent_state_active,
+    `${path}.services.persistent_state_active`,
+  );
+  boolean(
+    services.planned_exec_upgrade_continuity,
+    `${path}.services.planned_exec_upgrade_continuity`,
+  );
+}
+
+/** Reject a generation-10 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -506,6 +578,19 @@ function record(value: unknown, path: string): Record<string, unknown> {
     throw invalid(path, "an object");
   }
   return value as Record<string, unknown>;
+}
+
+function exactFields(
+  value: Record<string, unknown>,
+  path: string,
+  expected: readonly string[],
+): void {
+  const allowed = new Set(expected);
+  for (const field of Object.keys(value)) {
+    if (!allowed.has(field)) {
+      throw invalid(`${path}.${field}`, "a declared Runtime field");
+    }
+  }
 }
 
 function array(value: unknown, path: string): readonly unknown[] {

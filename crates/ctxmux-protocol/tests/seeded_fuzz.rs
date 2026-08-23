@@ -4,8 +4,10 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    ClientFrame, ClientHello, DaemonInstanceId, PROTOCOL_VERSION, ServerFrame, decode_frame,
-    encode_frame,
+    ClientFrame, ClientHello, DaemonInstanceId, NativeRuntimeCapabilities, PROTOCOL_VERSION,
+    RUNTIME_CAPABILITY_MANIFEST_VERSION, RuntimeBuildId, RuntimeCapabilityManifest,
+    RuntimeDescription, RuntimeId, RuntimeServiceCapabilities, ServerFrame,
+    TmuxRuntimeCapabilities, decode_frame, encode_frame,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -24,8 +26,29 @@ fn seeded_native_protocol_fuzz_target_is_total_and_round_trips_valid_frames() {
     .expect("encode valid client seed")
     .into_bytes();
     let valid_server = encode_frame(&ServerFrame::Hello {
-        protocol: PROTOCOL_VERSION,
-        daemon_instance: DaemonInstanceId::new(),
+        runtime: RuntimeDescription {
+            runtime_id: RuntimeId::new(),
+            daemon_instance_id: DaemonInstanceId::new(),
+            build_id: RuntimeBuildId::new("ctxmuxd/fuzz").unwrap(),
+            protocol_generation: PROTOCOL_VERSION,
+            capabilities: RuntimeCapabilityManifest {
+                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+                native: NativeRuntimeCapabilities {
+                    start: true,
+                    recoverable_input: true,
+                    fork_level_a: true,
+                    execute_materialized_level_b: true,
+                },
+                tmux: TmuxRuntimeCapabilities {
+                    discover: true,
+                    import: true,
+                },
+                services: RuntimeServiceCapabilities {
+                    persistent_state_active: false,
+                    planned_exec_upgrade_continuity: false,
+                },
+            },
+        },
     })
     .expect("encode valid server seed")
     .into_bytes();

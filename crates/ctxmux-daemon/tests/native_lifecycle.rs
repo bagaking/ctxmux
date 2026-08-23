@@ -12,9 +12,9 @@ use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, RecoverableInput, Request, RunEvent, RunId, RunInputKind, RunInputReference,
-    RunLineage, RunSignal, RunSpec, RunState, ServerFrame, StopDisposition, TerminalSize,
-    decode_frame, encode_frame,
+    PROTOCOL_VERSION, RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, RunEvent,
+    RunId, RunInputKind, RunInputReference, RunLineage, RunSignal, RunSpec, RunState,
+    RuntimeDescription, ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde_json::Value;
@@ -485,10 +485,8 @@ async fn send_request_without_reading_response(client: &Client, request: Request
         .expect("read daemon hello");
     assert!(matches!(
         decode_frame::<ServerFrame>(&hello).expect("decode daemon hello"),
-        ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION,
-            ..
-        }
+        ServerFrame::Hello { runtime }
+            if runtime.protocol_generation == PROTOCOL_VERSION
     ));
     wire.send(encode_frame(&ClientFrame::Request { request }).expect("encode abandoned request"))
         .await
@@ -663,10 +661,8 @@ async fn assert_malformed_request_closes(client: &Client, frame: &[u8]) {
         .expect("read fixture handshake response");
     assert!(matches!(
         decode_frame::<ServerFrame>(&response).expect("decode fixture handshake response"),
-        ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION,
-            ..
-        }
+        ServerFrame::Hello { runtime }
+            if runtime.protocol_generation == PROTOCOL_VERSION
     ));
 
     let mut stream = wire.into_inner();
@@ -731,6 +727,27 @@ fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
         ClientError::ControlRejected { failure } => assert_eq!(failure.error.code, expected),
         other => panic!("expected protocol error {expected:?}, got {other:?}"),
     }
+}
+
+fn assert_persistent_runtime_manifest(runtime: &RuntimeDescription) {
+    assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
+    assert_eq!(
+        runtime.capabilities.version,
+        RUNTIME_CAPABILITY_MANIFEST_VERSION
+    );
+    assert!(runtime.capabilities.native.start);
+    assert!(runtime.capabilities.native.recoverable_input);
+    assert!(runtime.capabilities.native.fork_level_a);
+    assert!(runtime.capabilities.native.execute_materialized_level_b);
+    assert!(runtime.capabilities.tmux.discover);
+    assert!(!runtime.capabilities.tmux.import);
+    assert!(runtime.capabilities.services.persistent_state_active);
+    assert!(
+        runtime
+            .capabilities
+            .services
+            .planned_exec_upgrade_continuity
+    );
 }
 
 fn process_exists(pid: u32) -> bool {
@@ -1246,10 +1263,8 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
     .expect("send current hello");
     assert!(matches!(
         receive_server_frame(&mut wire, "reading attachment hello").await,
-        ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION,
-            ..
-        }
+        ServerFrame::Hello { runtime }
+            if runtime.protocol_generation == PROTOCOL_VERSION
     ));
     wire.send(
         encode_frame(&ClientFrame::Request {
@@ -1533,11 +1548,13 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         .start(raw_capture_shell(2))
         .await
         .expect("start persistent response-loss capture Run");
-    let daemon_instance = daemon
+    let before_runtime = daemon
         .client
-        .daemon_instance()
+        .runtime_info()
         .await
-        .expect("read pre-upgrade daemon incarnation");
+        .expect("read pre-upgrade Runtime description");
+    assert_persistent_runtime_manifest(&before_runtime);
+    let daemon_instance = before_runtime.daemon_instance_id;
     let (mut attachment, snapshot) = daemon
         .client
         .attach(run.id, 0)
@@ -1584,9 +1601,18 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
     daemon.sighup();
     let resume = daemon.wait_resume_signal(10).await;
     assert!(resume.contains(" 1 run(s)"), "unexpected resume: {resume}");
+    let after_runtime = daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("read post-upgrade Runtime description");
+    assert_persistent_runtime_manifest(&after_runtime);
     assert_eq!(
-        daemon.client.daemon_instance().await.unwrap(),
-        daemon_instance,
+        after_runtime.runtime_id, before_runtime.runtime_id,
+        "planned upgrade preserves the logical Runtime"
+    );
+    assert_eq!(
+        after_runtime.daemon_instance_id, daemon_instance,
         "planned upgrade preserves the retry fence"
     );
 
@@ -1863,17 +1889,17 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn daemon_rejects_generation_8_before_request_dispatch() {
+async fn daemon_rejects_generation_9_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 9,
+        PROTOCOL_VERSION, 10,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
         .await
         .expect("connect raw protocol client");
-    let generation_8_hello = encode_frame(&ClientFrame::Hello {
-        hello: ClientHello { protocol: 8 },
+    let generation_9_hello = encode_frame(&ClientFrame::Hello {
+        hello: ClientHello { protocol: 9 },
     })
     .expect("encode previous-generation hello");
     let start = encode_frame(&ClientFrame::Request {
@@ -1891,7 +1917,7 @@ async fn daemon_rejects_generation_8_before_request_dispatch() {
     })
     .expect("encode queued start request");
     stream
-        .write_all(format!("{generation_8_hello}\n{start}\n").as_bytes())
+        .write_all(format!("{generation_9_hello}\n{start}\n").as_bytes())
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
@@ -1949,10 +1975,8 @@ async fn protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation() {
         .expect("read exact-limit handshake response");
     assert!(matches!(
         decode_frame::<ServerFrame>(&line).expect("decode exact-limit response"),
-        ServerFrame::Hello {
-            protocol: PROTOCOL_VERSION,
-            ..
-        }
+        ServerFrame::Hello { runtime }
+            if runtime.protocol_generation == PROTOCOL_VERSION
     ));
     drop(wire);
 

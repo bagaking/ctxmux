@@ -1,4 +1,4 @@
-# Local Protocol Generation 9
+# Local Protocol Generation 10
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -13,7 +13,7 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 9.
+- Raw PTY bytes are represented as integer arrays in generation 10.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -28,18 +28,66 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. Generation 9 does not yet
-negotiate runtime build identity, host identity, or a daemon-wide capability
-manifest; those remain separate open work.
+The generation fence covers the wire contract only. A successful generation-10
+Hello carries one Provider-neutral `RuntimeDescription`:
 
-Generation 9 includes one random daemon-incarnation identity in the successful
-Hello frame. It is a live retry fence, not build, host, platform, or durable
-process identity. A cold start creates a new identity; a persistent-mode
-planned exec-in-place upgrade preserves it together with the complete settled
-recoverable-Input ledger and cursor. Ordinary `input` retains the prior receipt semantics:
-when its result is lost, callers must not retry it. The separate
-`recoverable_input` operation below binds the original daemon incarnation and
-can resolve its own lost response.
+```text
+runtime_id
+daemon_instance_id
+build_id
+protocol_generation
+capabilities { version, native, tmux, services }
+```
+
+`runtime_id` names the logical Runtime or persistent-store lineage. In
+persistent mode it is stored in the existing SQLite owner: a cold replacement
+using that state directory keeps the Runtime ID but receives a new daemon
+instance. A validated planned exec keeps both identities. A memory-only daemon
+allocates both identities at startup, so neither survives cold replacement. A
+different state directory creates a different Runtime. It is not derived from
+the serving epoch and is distinct from a Run ID, daemon incarnation, build,
+host, Provider, or credential identity.
+
+`daemon_instance_id` is the live retry and authority fence. It is not a Run,
+build, host, platform, Provider, credential, socket, PID, or durable process
+identity. A persistent planned exec preserves it together with the complete
+settled recoverable-Input ledger and cursor. Ordinary `input` retains the prior
+receipt semantics: when its result is lost, callers must not retry it. The
+separate `recoverable_input` operation below binds the original daemon instance
+and can resolve its own lost response.
+
+`build_id` is an opaque daemon-authored build label. The current implementation
+derives it from the package version as `ctxmuxd/<CARGO_PKG_VERSION>`; clients
+compare its exact bytes and must not parse that format. It may change when a
+planned exec loads another image and is suitable only for equality and
+diagnostics. It is not a Git
+commit, binary hash, signature, source attestation, host identity, or
+authorization credential.
+
+The fixed capability manifest has schema version 1. Its independently declared
+boolean operation classes are:
+
+```text
+native: start, recoverable_input, fork_level_a, execute_materialized_level_b
+tmux: discover, import
+services: persistent_state_active, planned_exec_upgrade_continuity
+```
+
+All four native classes and tmux discovery are implemented. Tmux import is
+available only in memory-only mode. The two service flags are true only when a
+persistent state directory is active. `true` means this endpoint implements the
+operation class; `false` means the endpoint makes no such claim in the current
+activation. A true operation class does not promise that a particular Run, target, external
+tmux server, or caller-supplied plan is currently usable. `RunInfo.capabilities`
+remains the per-Run Backend truth. Unsupported capability requests fail
+explicitly and never infer support from a platform or executable name. Service
+flags are observed activation facts, not additional request kinds.
+
+Rust and TypeScript clients reject an unknown protocol or manifest version
+before exposing the description. The manifest is declaration, not negotiation.
+Generation 10 adds no version-range or capability negotiation, endpoint discovery, dynamic
+capability registry, Provider catalog, plugin discovery, or host/credential
+identity.
 
 After the handshake, a connection has one of two shapes:
 
@@ -107,14 +155,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 9.
+ownership in generation 10.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 9 retains `run_capacity` for the global retained-Run admission
+Generation 10 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -123,7 +171,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-9 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-10 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -146,7 +194,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-9 decoding and
+The daemon compares canonical typed requests after generation-10 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -411,7 +459,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-9 peer that puts `chunks` back into the header is invalid.
+generation-10 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports where the daemon had advanced when a live receiver
 fell behind. It is not a recovery cursor: the caller must reattach using its own
@@ -442,7 +490,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`daemon_instance` in the ordinary generation-9 public hello from the selected
+`runtime.daemon_instance_id` in the ordinary generation-10 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -457,8 +505,10 @@ process, and `SIGHUP` is a logged no-op. With `--state-dir
 identity, exact `RunSpec`, lineage, terminal state, and the committed bounded
 replay window across cold daemon restart. On intentional `SIGHUP`, the daemon
 instead performs an exec-in-place upgrade: its PID, listener inode, state lock,
-live child and PTY masters, daemon instance, input cursors and settled ledgers
-survive; attachments reconnect from their own output cursors.
+live child and PTY masters, Runtime ID, daemon instance, input cursors and
+settled ledgers survive; attachments reconnect from their own output cursors.
+The incoming image reconstructs its build ID and manifest from the new image
+and active persistence mode; they are not handoff authority.
 
 Before extraction, the daemon's upgrade request gate is reversible. Requests
 already admitted retain their permit through owner completion and response
@@ -467,7 +517,7 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 9 gains no upgrade wire
+strictly bounded, unique, and validated; generation 10 gains no upgrade wire
 operation.
 
 Persistent startup requires a real same-owner `0700` directory, regular
@@ -475,8 +525,8 @@ same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
 state lock. Exact schema version, SQLite integrity, typed JSON, a required
 native `RunSpec` satisfying the live-start semantic rules, lifecycle, lineage,
 cursor, contiguous chunk, byte-accounting, and quota invariants are validated
-against the schema-3 format envelope before the socket is published. A valid
-older store may contain up to 4,096 records; bounded, restartable startup
+against the schema-4 format envelope before the socket is published. Schema 4
+stores the Runtime UUID in `runtime_meta`; bounded, restartable startup
 transactions reconcile prior running rows, evict the canonical terminal prefix
 to the operational 128-record ceiling, and finish serving-epoch publication before
 the socket becomes visible. Unknown versions, corrupt state, or an
@@ -501,6 +551,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-9 frame at runtime, rejects duplicate
+validates the complete nested generation-10 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.
