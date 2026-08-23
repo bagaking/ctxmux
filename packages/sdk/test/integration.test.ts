@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
+  IntegrationMaterializationError,
+  IntegrationProvenanceError,
   IntegrationUnavailableError,
   registerIntegration,
 } from "../src/index.ts";
@@ -195,8 +197,8 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
   await assert.rejects(
     registerIntegration(client, withoutPlanner).forkLevelB(parent, undefined),
     (error: unknown) =>
-      error instanceof IntegrationCapabilityError &&
-      error.capability === "level_b_fork",
+      error instanceof IntegrationMaterializationError &&
+      error.reason === "missing_planner",
   );
   const withoutProvenance = {
     ...withoutPlanner,
@@ -212,8 +214,7 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
       undefined,
     ),
     (error: unknown) =>
-      error instanceof IntegrationCapabilityError &&
-      error.capability === "level_b_fork",
+      error instanceof IntegrationProvenanceError && error.reason === "missing",
   );
 
   const emitted: TestEvent = {
@@ -248,10 +249,33 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
   assert.notEqual(receipt, undefined);
   await assert.rejects(
     registered.forkLevelB(parent, { receipt: receipt! }),
-    /returned a non-Level-B fork plan/,
+    (error: unknown) =>
+      error instanceof IntegrationMaterializationError &&
+      error.reason === "invalid_plan",
+  );
+  const invalidSpec = {
+    ...downgraded,
+    id: "invalid-spec",
+    planLevelBFork() {
+      plans += 1;
+      return { type: "level_b", spec: {} as RunSpec } as const;
+    },
+  };
+  const invalidSpecRegistered = registerIntegration(client, invalidSpec);
+  const invalidSpecReceipt = invalidSpecRegistered
+    .createObserver(parent)
+    .observe({ type: "output", chunk })[0];
+  assert.notEqual(invalidSpecReceipt, undefined);
+  await assert.rejects(
+    invalidSpecRegistered.forkLevelB(parent, {
+      receipt: invalidSpecReceipt!,
+    }),
+    (error: unknown) =>
+      error instanceof IntegrationMaterializationError &&
+      error.reason === "invalid_plan",
   );
   assert.equal(forks, 0);
-  assert.equal(plans, 1);
+  assert.equal(plans, 2);
 });
 
 test("registerIntegration rejects blank identities and unsupported generations", () => {

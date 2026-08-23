@@ -79,10 +79,10 @@ Omission is valid when the declared policy excludes that class, and borrowing is
 - Covered: the public Rust client and daemon prove that Level A reproduces only
   the complete declared `RunSpec`, records parent plus `level_a`, creates a
   distinct child PID, and leaves parent and child independently usable.
-- Required: a synthetic host-owned Provider binds provenance to an exact parent,
+- Covered: a synthetic host-owned Provider binds provenance to an exact parent,
   materializes a complete generic replacement `RunSpec`, and records declared
   references plus `level_b` lineage through the public fork path.
-- Required: copied, unbound, mismatched, and unrelated-Run provenance creates no
+- Covered: copied, unbound, mismatched, and unrelated-Run provenance creates no
   child and never changes the request to Level A.
 - Covered: Shell rejects Level B before any raw fork request or child creation.
 - Covered: every Level B Integration requires a provenance hook; missing-hook

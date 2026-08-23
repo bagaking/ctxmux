@@ -133,6 +133,9 @@ Registration binds one imported module to the existing raw client. It performs
 no package discovery and owns no Run state. The returned Run remains available
 through `client.status`, `client.attach`, and the rest of the raw SDK even if
 the Integration observer or its host disappears.
+The packaged `@ctxmux/sdk/integrations` subpath contains only the Provider-neutral
+shell conformance Integration. Agent- or vendor-specific Integrations belong to
+the embedding product that imports them.
 Registered `start` and `forkLevelB` accept one narrow optional object containing
 `detection` inputs and `operationKey`. They pass the key unchanged to the
 generic Run client; the Integration does not own or reinterpret creation
@@ -144,6 +147,16 @@ native resume construction in their own Provider modules. A Level B-capable
 host binds provenance to the exact parent and supplies a complete generic
 replacement `RunSpec`; ctxmux executes that plan and records lineage. Missing
 provenance fails before mutation and never becomes a Level A request.
+
+`forkLevelB` reports fail-closed host-boundary errors as exported structured
+classes. `IntegrationUnavailableError` carries the unavailable detection,
+`IntegrationCapabilityError` names an undeclared capability,
+`IntegrationProvenanceError.reason` is `missing` or `wrong_source`, and
+`IntegrationMaterializationError.reason` is `missing_planner` or
+`invalid_plan`. None of these paths invokes the raw fork operation: the binding
+checks that the materialized Level B plan carries a complete executable
+`RunSpec` before forwarding it. The public daemon protocol remains the runtime
+authority and also rejects an invalid raw fork without creating a Run.
 
 ## Attach to a Run
 

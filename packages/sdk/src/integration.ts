@@ -5,6 +5,7 @@ import type { ForkPlan } from "./generated/ForkPlan.js";
 import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
+import { validateRunSpec } from "./validation.js";
 
 /** Current public contract generation for host-local Integrations. */
 export const INTEGRATION_API_VERSION = 2 as const;
@@ -52,6 +53,13 @@ export interface UnavailableIntegrationDetection {
 
 export type IntegrationDetection =
   AvailableIntegrationDetection | UnavailableIntegrationDetection;
+
+/** Why host-local Level B provenance could not authorize one parent Run. */
+export type IntegrationProvenanceFailure = "missing" | "wrong_source";
+
+/** Why an available Integration could not materialize an exact Level B plan. */
+export type IntegrationMaterializationFailure =
+  "missing_planner" | "invalid_plan";
 
 /** Normalized meaning derived by a host without replacing the raw Run event. */
 export interface IntegrationSemanticEvent {
@@ -134,18 +142,46 @@ export class IntegrationCapabilityError extends Error {
   }
 }
 
-/** A Level B plan did not carry evidence observed from its declared parent. */
+/** A Level B request did not carry evidence observed from its declared parent. */
 export class IntegrationProvenanceError extends Error {
   public readonly integrationId: string;
   public readonly parentId: RunInfo["id"];
+  public readonly reason: IntegrationProvenanceFailure;
 
-  public constructor(integrationId: string, parentId: RunInfo["id"]) {
+  public constructor(
+    integrationId: string,
+    parentId: RunInfo["id"],
+    reason: IntegrationProvenanceFailure,
+  ) {
     super(
-      `Integration ${integrationId} has no verified Level B provenance for parent Run ${parentId}`,
+      reason === "missing"
+        ? `Integration ${integrationId} has no Level B provenance for parent Run ${parentId}`
+        : `Integration ${integrationId} Level B provenance belongs to another Run, not parent ${parentId}`,
     );
     this.name = "IntegrationProvenanceError";
     this.integrationId = integrationId;
     this.parentId = parentId;
+    this.reason = reason;
+  }
+}
+
+/** An available Integration did not produce one exact, executable Level B plan. */
+export class IntegrationMaterializationError extends Error {
+  public readonly integrationId: string;
+  public readonly reason: IntegrationMaterializationFailure;
+
+  public constructor(
+    integrationId: string,
+    reason: IntegrationMaterializationFailure,
+  ) {
+    super(
+      reason === "missing_planner"
+        ? `Integration ${integrationId} has no Level B plan materializer`
+        : `Integration ${integrationId} returned an invalid Level B plan`,
+    );
+    this.name = "IntegrationMaterializationError";
+    this.integrationId = integrationId;
+    this.reason = reason;
   }
 }
 
@@ -193,20 +229,44 @@ export function registerIntegration<
       if (detection.status === "unavailable") {
         throw new IntegrationUnavailableError(integration.id, detection);
       }
-      if (
-        !detection.capabilities.includes("level_b_fork") ||
-        integration.planLevelBFork === undefined ||
-        integration.levelBForkProvenance === undefined
-      ) {
+      if (!detection.capabilities.includes("level_b_fork")) {
         throw new IntegrationCapabilityError(integration.id, "level_b_fork");
       }
+      if (integration.planLevelBFork === undefined) {
+        throw new IntegrationMaterializationError(
+          integration.id,
+          "missing_planner",
+        );
+      }
+      if (integration.levelBForkProvenance === undefined) {
+        throw new IntegrationProvenanceError(
+          integration.id,
+          parent.id,
+          "missing",
+        );
+      }
       const provenance = integration.levelBForkProvenance(config);
-      if (
-        typeof provenance !== "object" ||
-        provenance === null ||
-        observedProvenance.get(provenance) !== parent.id
-      ) {
-        throw new IntegrationProvenanceError(integration.id, parent.id);
+      if (typeof provenance !== "object" || provenance === null) {
+        throw new IntegrationProvenanceError(
+          integration.id,
+          parent.id,
+          "missing",
+        );
+      }
+      const provenanceSource = observedProvenance.get(provenance);
+      if (provenanceSource === undefined) {
+        throw new IntegrationProvenanceError(
+          integration.id,
+          parent.id,
+          "missing",
+        );
+      }
+      if (provenanceSource !== parent.id) {
+        throw new IntegrationProvenanceError(
+          integration.id,
+          parent.id,
+          "wrong_source",
+        );
       }
       const plan: unknown = integration.planLevelBFork(
         parent,
@@ -217,10 +277,22 @@ export function registerIntegration<
         typeof plan !== "object" ||
         plan === null ||
         !("type" in plan) ||
-        plan.type !== "level_b"
+        plan.type !== "level_b" ||
+        !("spec" in plan) ||
+        typeof plan.spec !== "object" ||
+        plan.spec === null
       ) {
-        throw new TypeError(
-          `Integration ${integration.id} returned a non-Level-B fork plan`,
+        throw new IntegrationMaterializationError(
+          integration.id,
+          "invalid_plan",
+        );
+      }
+      try {
+        validateRunSpec(plan.spec, "$levelBForkPlan.spec");
+      } catch {
+        throw new IntegrationMaterializationError(
+          integration.id,
+          "invalid_plan",
         );
       }
       return client.fork(
@@ -233,8 +305,22 @@ export function registerIntegration<
       const observer = integration.createObserver();
       return {
         observe(event) {
-          if (parent !== undefined && runEventSource(event) !== parent.id) {
-            throw new IntegrationProvenanceError(integration.id, parent.id);
+          if (parent !== undefined) {
+            const source = runEventSource(event);
+            if (source === undefined) {
+              throw new IntegrationProvenanceError(
+                integration.id,
+                parent.id,
+                "missing",
+              );
+            }
+            if (source !== parent.id) {
+              throw new IntegrationProvenanceError(
+                integration.id,
+                parent.id,
+                "wrong_source",
+              );
+            }
           }
           const observed = observer.observe(event);
           if (parent !== undefined) {

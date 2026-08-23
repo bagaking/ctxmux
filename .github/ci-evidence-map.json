@@ -691,20 +691,6 @@
       ]
     },
     {
-      "id": "codex-integration-contracts",
-      "kind": "test",
-      "path": "packages/sdk/test/codex-integration.test.ts",
-      "invariants": [
-        "Codex detection, argv, Level B planning, and observation remain explicit"
-      ],
-      "selection_ref": "packages/sdk/package.json",
-      "selection_anchor": "test/codex-integration.test.ts",
-      "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
-      ]
-    },
-    {
       "id": "sdk-hostile-frame-contracts",
       "kind": "test",
       "path": "packages/sdk/test/wrong-cases.test.ts",
@@ -723,8 +709,7 @@
       "kind": "test",
       "path": "packages/sdk/test/parser-fuzz.test.ts",
       "invariants": [
-        "seeded TypeScript wire and Codex JSONL fuzz targets stay total, bounded, and replayable",
-        "the minimized Codex JSONL regression corpus remains an ordinary required test"
+        "seeded TypeScript wire validation stays total, bounded, and replayable"
       ],
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/parser-fuzz.test.ts",
@@ -738,7 +723,7 @@
       "kind": "test",
       "path": "packages/sdk/test/client-parity.test.ts",
       "invariants": [
-        "CLI and SDK share daemon-owned Run identity and Level B continuation",
+        "CLI and SDK share daemon-owned Run identity, while a host-owned Provider materializes fail-closed public Level B without entering the SDK publication",
         "TypeScript SDK discovers, imports, attaches, and detaches one real read-only tmux pane without taking ownership"
       ],
       "selection_ref": "packages/sdk/package.json",
@@ -767,7 +752,8 @@
       "kind": "public_smoke",
       "path": "scripts/check-local-consumer.mjs",
       "invariants": [
-        "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies"
+        "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies",
+        "the packed SDK declarations and runtime exports support an external TypeScript Provider Integration with fail-closed Level B and no Agent-specific publication dependency"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "npm run test:local-consumer",
@@ -841,10 +827,6 @@
       {
         "id": "seeded-parser-and-model-qualification",
         "reason": "reliability.yml raises deterministic native/TypeScript parser fuzz and public multi-client model case counts, records the exact seed and owner boundaries, and preserves a replay receipt without replacing PR corpus/model coverage."
-      },
-      {
-        "id": "real-codex-semantic-canary",
-        "reason": "Credential-controlled vendor evidence runs from reliability.yml and never substitutes for required hermetic Integration tests."
       },
       {
         "id": "nightly-reliability-qualification",

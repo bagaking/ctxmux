@@ -297,7 +297,17 @@ import { execFile as execFileCallback, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { CtxmuxClient, PROTOCOL_VERSION, defineRun } from "@ctxmux/sdk";
+import {
+  CtxmuxClient,
+  INTEGRATION_API_VERSION,
+  IntegrationCapabilityError,
+  IntegrationMaterializationError,
+  IntegrationProvenanceError,
+  IntegrationUnavailableError,
+  PROTOCOL_VERSION,
+  defineRun,
+  registerIntegration,
+} from "@ctxmux/sdk";
 
 const execFile = promisify(execFileCallback);
 const daemonBinary = process.env.CTXMUXD_BIN;
@@ -416,6 +426,64 @@ async function waitForExit(attachment) {
   throw new Error("timed out waiting for artifact Run exit");
 }
 
+async function nextOutput(attachment) {
+  const replay = attachment.snapshot.replay.chunks[0];
+  if (replay !== undefined) return { type: "output", chunk: replay };
+  const deadline = Date.now() + 5_000;
+  while (Date.now() <= deadline) {
+    const event = await attachment.nextEvent();
+    if (event?.type === "output") return event;
+    if (event === undefined || event.type === "exited" || event.type === "interrupted") break;
+    if (event.type === "gap") throw new Error("unexpected Provider output gap");
+  }
+  throw new Error("Provider Run produced no output");
+}
+
+function syntheticProviderIntegration() {
+  return {
+    id: "synthetic-provider",
+    apiVersion: INTEGRATION_API_VERSION,
+    async detect(options = {}) {
+      if (options.executable === undefined) {
+        return {
+          status: "unavailable",
+          executable: "synthetic-provider",
+          reason: "missing_capability",
+        };
+      }
+      return {
+        status: "available",
+        executable: options.executable,
+        version: "consumer-owned",
+        capabilities: ["semantic_events", "level_b_fork"],
+      };
+    },
+    planLaunch(config) {
+      return config.recipe;
+    },
+    planLevelBFork(_parent, config) {
+      return { type: "level_b", spec: config.recipe };
+    },
+    levelBForkProvenance(config) {
+      return config.provenance;
+    },
+    createObserver() {
+      return {
+        observe(event) {
+          if (event.type !== "output") return [];
+          return [{
+            integrationId: "synthetic-provider",
+            name: "source.observed",
+            data: {
+              range: [event.chunk.start_byte, event.chunk.end_byte],
+            },
+          }];
+        },
+      };
+    },
+  };
+}
+
 async function stopDaemon() {
   if (daemon.exitCode !== null) return;
   daemon.kill("SIGINT");
@@ -492,12 +560,215 @@ try {
     signal: null,
   });
   assert.equal((await client.status(run.id)).state.type, "exited");
+
+  const provider = syntheticProviderIntegration();
+  const registered = registerIntegration(client, provider);
+  const detection = { executable: "/bin/sh" };
+  const parentRecipe = defineRun("/bin/sh", {
+    args: ["-c", "trap 'exit 0' TERM; printf 'PROVIDER_PARENT\\n'; while :; do sleep 1; done"],
+    declaredInputs: [{ kind: "workspace", reference: "consumer-workspace" }],
+  });
+  const parent = await registered.start(
+    { recipe: parentRecipe },
+    { detection },
+  );
+  const parentAttachment = await client.attach(parent.id);
+  const provenance = registered
+    .createObserver(parent)
+    .observe(await nextOutput(parentAttachment))[0];
+  assert.notEqual(provenance, undefined);
+
+  const unrelated = await client.start(
+    defineRun("/bin/sh", {
+      args: ["-c", "trap 'exit 0' TERM; printf 'UNRELATED\\n'; while :; do sleep 1; done"],
+    }),
+  );
+  const unrelatedAttachment = await client.attach(unrelated.id);
+  const unrelatedEvent = await nextOutput(unrelatedAttachment);
+  assert.throws(
+    () => registered.createObserver(parent).observe(unrelatedEvent),
+    (error) =>
+      error instanceof IntegrationProvenanceError &&
+      error.reason === "wrong_source",
+  );
+
+  const childRecipe = defineRun("/bin/sh", {
+    args: ["-c", "trap 'exit 0' TERM; printf 'PROVIDER_CHILD\\n'; while :; do sleep 1; done"],
+    declaredInputs: [
+      { kind: "workspace", reference: "consumer-workspace" },
+      { kind: "artifact", reference: "artifact://consumer-proof" },
+      { kind: "context", reference: "synthetic-context:parent" },
+    ],
+  });
+  const levelB = { provenance, recipe: childRecipe };
+  const beforeRejected = (await client.list()).map(({ id }) => id);
+  await assert.rejects(
+    registered.forkLevelB(parent, {
+      ...levelB,
+      provenance: { ...provenance },
+    }, { detection }),
+    (error) =>
+      error instanceof IntegrationProvenanceError && error.reason === "missing",
+  );
+  await assert.rejects(
+    registered.forkLevelB(unrelated, levelB, { detection }),
+    (error) =>
+      error instanceof IntegrationProvenanceError &&
+      error.reason === "wrong_source",
+  );
+  await assert.rejects(
+    registered.forkLevelB(parent, levelB),
+    (error) =>
+      error instanceof IntegrationUnavailableError &&
+      error.detection.reason === "missing_capability",
+  );
+  const withoutLevelBCapability = {
+    ...provider,
+    id: "synthetic-provider-without-level-b",
+    async detect() {
+      return {
+        status: "available",
+        executable: "/bin/sh",
+        version: "consumer-owned",
+        capabilities: ["semantic_events"],
+      };
+    },
+  };
+  await assert.rejects(
+    registerIntegration(client, withoutLevelBCapability).forkLevelB(
+      parent,
+      levelB,
+      { detection },
+    ),
+    (error) =>
+      error instanceof IntegrationCapabilityError &&
+      error.capability === "level_b_fork",
+  );
+  const { levelBForkProvenance: _provenance, ...withoutProvenance } = provider;
+  await assert.rejects(
+    registerIntegration(client, withoutProvenance).forkLevelB(
+      parent,
+      levelB,
+      { detection },
+    ),
+    (error) =>
+      error instanceof IntegrationProvenanceError && error.reason === "missing",
+  );
+  const { planLevelBFork: _plan, ...withoutMaterializer } = provider;
+  await assert.rejects(
+    registerIntegration(client, withoutMaterializer).forkLevelB(
+      parent,
+      levelB,
+      { detection },
+    ),
+    (error) =>
+      error instanceof IntegrationMaterializationError &&
+      error.reason === "missing_planner",
+  );
+  assert.deepEqual(
+    (await client.list()).map(({ id }) => id),
+    beforeRejected,
+    "fail-closed Level B cases created no child Run or Level A fallback",
+  );
+
+  unrelatedAttachment.close();
+  await client.stop(unrelated.id);
+  parentAttachment.close();
+  const child = await registered.forkLevelB(parent, levelB, { detection });
+  assert.deepEqual(child.lineage, { parent: parent.id, fidelity: "level_b" });
+  assert.deepEqual(child.spec, childRecipe);
+  const childAttachment = await client.attach(child.id);
+  await waitForText(
+    childAttachment,
+    replayBytes(childAttachment.snapshot.replay.chunks),
+    childAttachment.snapshot.replay.latest_output_bytes,
+    "PROVIDER_CHILD",
+  );
+  childAttachment.close();
+  assert.equal((await client.status(parent.id)).state.type, "running");
+  await client.stop(parent.id);
+  await client.stop(child.id);
 } finally {
   await stopDaemon();
 }
 
 if (daemonStderr.length > 0) process.stderr.write(daemonStderr);
 process.stdout.write("isolated artifact consumer passed\n");
+`;
+
+const CONSUMER_TYPESCRIPT_SOURCE = String.raw`
+import {
+  CtxmuxClient,
+  INTEGRATION_API_VERSION,
+  IntegrationCapabilityError,
+  IntegrationMaterializationError,
+  IntegrationProvenanceError,
+  IntegrationUnavailableError,
+  registerIntegration,
+  type Integration,
+  type IntegrationSemanticEvent,
+  type RunInfo,
+  type RunSpec,
+} from "@ctxmux/sdk";
+import { shellIntegration } from "@ctxmux/sdk/integrations";
+
+interface ProviderReceipt extends IntegrationSemanticEvent {
+  readonly integrationId: "consumer-provider";
+  readonly name: "source.observed";
+}
+
+interface ProviderForkConfig {
+  readonly provenance: ProviderReceipt;
+  readonly recipe: RunSpec;
+}
+
+const provider: Integration<
+  { readonly recipe: RunSpec },
+  ProviderForkConfig,
+  ProviderReceipt
+> = {
+  id: "consumer-provider",
+  apiVersion: INTEGRATION_API_VERSION,
+  async detect() {
+    return {
+      status: "available",
+      executable: "/bin/sh",
+      version: "consumer-owned",
+      capabilities: ["semantic_events", "level_b_fork"],
+    };
+  },
+  planLaunch(config) {
+    return config.recipe;
+  },
+  planLevelBFork(_parent, config) {
+    return { type: "level_b", spec: config.recipe };
+  },
+  levelBForkProvenance(config) {
+    return config.provenance;
+  },
+  createObserver() {
+    return { observe: () => [] };
+  },
+};
+
+declare const client: CtxmuxClient;
+declare const parent: RunInfo;
+declare const config: ProviderForkConfig;
+const registered = registerIntegration(client, provider);
+const child: Promise<RunInfo> = registered.forkLevelB(parent, config);
+const publicErrors: readonly Error[] = [
+  new IntegrationUnavailableError("consumer-provider", {
+    status: "unavailable",
+    executable: "/missing",
+    reason: "not_found",
+  }),
+  new IntegrationCapabilityError("consumer-provider", "level_b_fork"),
+  new IntegrationProvenanceError("consumer-provider", parent.id, "wrong_source"),
+  new IntegrationMaterializationError("consumer-provider", "missing_planner"),
+];
+void child;
+void publicErrors;
+void shellIntegration;
 `;
 
 async function runIsolatedConsumer(consumerDirectory, args, environment) {
@@ -617,6 +888,31 @@ async function main() {
       false,
     );
     assertInstalledPackageIsSelfContained(consumerDirectory, root);
+    const consumerTypeScript = path.join(
+      consumerDirectory,
+      "consumer-types.mts",
+    );
+    fs.writeFileSync(consumerTypeScript, CONSUMER_TYPESCRIPT_SOURCE, {
+      mode: 0o644,
+    });
+    run(
+      process.execPath,
+      [
+        path.join(root, "node_modules", "typescript", "bin", "tsc"),
+        "--noEmit",
+        "--target",
+        "ES2024",
+        "--module",
+        "NodeNext",
+        "--moduleResolution",
+        "NodeNext",
+        "--strict",
+        "--noUncheckedIndexedAccess",
+        "--exactOptionalPropertyTypes",
+        consumerTypeScript,
+      ],
+      { cwd: consumerDirectory, environment, timeout: 20_000 },
+    );
     const consumerScript = path.join(consumerDirectory, "consumer.mjs");
     fs.writeFileSync(consumerScript, CONSUMER_SOURCE, { mode: 0o644 });
     const consumerEnvironment = { ...environment };
