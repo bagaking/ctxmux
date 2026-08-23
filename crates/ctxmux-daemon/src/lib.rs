@@ -4,7 +4,7 @@
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
@@ -68,8 +68,9 @@ use crate::native_control::{
 use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
 use crate::native_session::{AdoptedChild, NativeSession};
 use crate::persistence::{
-    CommittedStart, Persistence, PersistentCandidate, PersistentRun, PersistentStartCompletion,
-    PersistentStartFailure, RecoveredRun, StagedPersistentStart, StartDisposition,
+    CommittedStart, HandoffHint, Persistence, PersistentCandidate, PersistentRun,
+    PersistentStartCompletion, PersistentStartFailure, RecoveredRun, StagedPersistentStart,
+    StartDisposition,
 };
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 use crate::tmux::{
@@ -115,6 +116,10 @@ pub enum ServerError {
     /// Optional durable state could not be safely opened or reconciled.
     #[error(transparent)]
     Persistence(#[from] PersistenceError),
+    /// A handed-off Run could not be re-adopted onto live native control after an
+    /// exec-in-place upgrade.
+    #[error("adopt handed-off run: {0}")]
+    Adopt(String),
     /// One or more owned runtime operations or Backend controls failed cleanup.
     #[error("ctxmux daemon shutdown failed: {failures}")]
     Shutdown {
@@ -213,17 +218,53 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
         None => None,
     };
     let state_dir = state_dir.into();
-    let (persistence, recovered) = Persistence::open(state_dir.clone())?;
-    let stats = QualificationStats::from_optional_inherited_fd(
-        qualification_stats_fd,
-        persistence.daemon_instance().to_string(),
-    )
-    .map_err(|source| ServerError::io("qualification stats fd", source))?;
-    let manager = Arc::new(RunManager::persistent_with_stats(
-        persistence,
-        recovered,
-        stats,
-    ));
+    let manager = if let Some(manifest) = &handoff {
+        // Incoming exec-in-place image: reuse the handed-off epoch, exclude
+        // the still-live Run set from reconciliation, and adopt the inherited
+        // state-lock descriptor rather than re-locking. Each raw fd number in
+        // the manifest is wrapped into an `OwnedFd` exactly once here — the
+        // state lock into the hint and each Run's pty master into the adopt
+        // map. The listener fd is intentionally left untouched: it is wrapped
+        // later inside `serve_with_persistence_manager`/`adopt_listener`.
+        let live_set: HashSet<RunId> = manifest.runs.iter().map(|run| run.run_id).collect();
+        let mut adopt: HashMap<RunId, (OwnedFd, u32)> =
+            HashMap::with_capacity(manifest.runs.len());
+        for run in &manifest.runs {
+            let master = ctxmux_inherited_fd::owned_from_raw(run.master_fd)
+                .map_err(|source| ServerError::io("<handoff master fd>", source))?;
+            adopt.insert(run.run_id, (master, run.child_pid));
+        }
+        let hint = HandoffHint {
+            epoch: manifest.epoch.clone(),
+            live_set,
+            state_lock_fd: Some(
+                ctxmux_inherited_fd::owned_from_raw(manifest.state_lock_fd)
+                    .map_err(|source| ServerError::io("<handoff state-lock fd>", source))?,
+            ),
+        };
+        let (persistence, recovered) = Persistence::open_with_handoff(state_dir.clone(), hint)?;
+        let stats = QualificationStats::from_optional_inherited_fd(
+            qualification_stats_fd,
+            persistence.daemon_instance().to_string(),
+        )
+        .map_err(|source| ServerError::io("qualification stats fd", source))?;
+        Arc::new(
+            RunManager::persistent_with_handoff_and_stats(persistence, recovered, stats, adopt)
+                .map_err(|error| ServerError::Adopt(error.message))?,
+        )
+    } else {
+        let (persistence, recovered) = Persistence::open(state_dir.clone())?;
+        let stats = QualificationStats::from_optional_inherited_fd(
+            qualification_stats_fd,
+            persistence.daemon_instance().to_string(),
+        )
+        .map_err(|source| ServerError::io("qualification stats fd", source))?;
+        Arc::new(RunManager::persistent_with_stats(
+            persistence,
+            recovered,
+            stats,
+        ))
+    };
     serve_with_persistence_manager(
         socket_path.into(),
         manager,
@@ -1072,6 +1113,89 @@ impl RunManager {
             #[cfg(test)]
             creation_hook: None,
         }
+    }
+
+    /// Startup sibling of [`persistent_with_stats`](Self::persistent_with_stats)
+    /// used only on the exec-in-place adopt path. Recovered rows whose `run_id`
+    /// appears in `adopt` re-bind live native control via [`Run::readopt`]
+    /// (consuming the handed-off pty master and child pid); every other row takes
+    /// the historical [`Run::recover`] path, byte-identical to the cold-start
+    /// method. Fallible because `readopt` can fail to re-adopt a child or master.
+    ///
+    /// Any `adopt` entry left after the loop (the manifest listed a Run that
+    /// persistence did not recover — not expected, since live rows stay in the
+    /// recovered set) has its `OwnedFd` dropped and closed at function end. That
+    /// is an acceptable fail-safe; no extra validation is added for it.
+    #[allow(clippy::too_many_arguments)]
+    fn persistent_with_handoff_and_stats(
+        persistence: Persistence,
+        recovered: Vec<RecoveredRun>,
+        qualification_stats: QualificationStats,
+        mut adopt: HashMap<RunId, (OwnedFd, u32)>,
+    ) -> Result<Self, ProtocolError> {
+        let terminal_publications = TerminalPublicationOwner::default();
+        let native_runs = NativeRuntimeOwner::default();
+        let native_input_drains = InputDrainGate::with_stats(qualification_stats.clone());
+        let creation_flights = CreationFlightOwner::with_stats(qualification_stats.clone());
+        let incarnation_failure = IncarnationFailure::default();
+        let mut runs = Vec::with_capacity(recovered.len());
+        for recovered in recovered {
+            let operation_key = recovered.operation_key.clone();
+            let metadata_bytes = recovered.metadata_bytes;
+            let durable = persistence.recovered_run(
+                recovered
+                    .info
+                    .durable_output_bytes
+                    .unwrap_or(recovered.info.latest_output_bytes),
+                metadata_bytes,
+            );
+            let metadata_owner = durable.metadata_bytes_owner();
+            let run = match adopt.remove(&recovered.info.id) {
+                Some((master_fd, child_pid)) => Run::readopt(
+                    recovered,
+                    durable,
+                    master_fd,
+                    child_pid,
+                    native_runs.clone(),
+                    LIVE_EVENT_CAPACITY,
+                    terminal_publications.clone(),
+                    qualification_stats.clone(),
+                    native_input_drains.clone(),
+                    NativeWaitFailure {
+                        creation_flights: creation_flights.clone(),
+                        incarnation_failure: incarnation_failure.clone(),
+                    },
+                )?,
+                None => Run::recover(
+                    recovered,
+                    durable,
+                    LIVE_EVENT_CAPACITY,
+                    terminal_publications.clone(),
+                    qualification_stats.clone(),
+                ),
+            };
+            runs.push((operation_key, run, metadata_owner));
+        }
+        Ok(Self {
+            daemon_instance: persistence.daemon_instance(),
+            registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
+            creation_flights,
+            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
+            terminal_publications,
+            native_input_drains,
+            native_runs,
+            qualification_stats,
+            live_event_capacity: LIVE_EVENT_CAPACITY,
+            persistence: Some(persistence),
+            commit_unknown_reservations: Mutex::new(Vec::new()),
+            incarnation_failure,
+            tmux_shutting_down: AtomicBool::new(false),
+            tmux_operation_gate: RwLock::new(()),
+            #[cfg(test)]
+            attachment_hook: None,
+            #[cfg(test)]
+            creation_hook: None,
+        })
     }
 
     async fn create(
