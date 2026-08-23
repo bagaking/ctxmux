@@ -57,7 +57,7 @@ fn resolve_inherited_descriptors(
         readiness: inherited_fd(readiness_fd, "readiness")?,
         handoff: handoff_fd
             .map(|raw| {
-                ctxmux_inherited_fd::owned_from_raw(raw).map_err(|error| {
+                ctxmux_inherited_fd::claim_inherited_process_fd(raw).map_err(|error| {
                     eprintln!("ctxmuxd: invalid handoff fd: {error}");
                     ExitCode::from(2)
                 })

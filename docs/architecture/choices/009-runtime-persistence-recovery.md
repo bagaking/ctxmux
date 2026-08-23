@@ -254,7 +254,7 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - Does a later product milestone justify a stable per-Run owner or another
   platform mechanism for live PTY handoff? Answered: no standing per-Run owner.
   [015](015-exec-in-place-upgrade-continuity.md) keeps live control across a
-  *planned* upgrade by carrying the master fd across an `execve`-in-place — the
+  _planned_ upgrade by carrying the master fd across an `execve`-in-place — the
   same process, so no metadata-named re-adoption and no broker — and
   [016](016-interrupted-run-derivation.md) records the boundary for creating a new Run
   from an explicit derivation plan rather than re-adopting its dead PTY.

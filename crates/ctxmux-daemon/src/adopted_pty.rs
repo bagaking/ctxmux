@@ -37,7 +37,8 @@ impl AdoptedMasterPty {
     /// Adopt an already-owned inherited master descriptor.
     ///
     /// The `OwnedFd` must be obtained through the audited
-    /// `ctxmux_inherited_fd` seam (`duplicate_cloexec` / `owned_from_raw`);
+    /// `ctxmux_inherited_fd` seam (`duplicate_cloexec` /
+    /// `claim_inherited_process_fd`);
     /// this type never converts a raw integer itself.
     pub(crate) fn from_owned_fd(fd: OwnedFd) -> Self {
         Self { fd }

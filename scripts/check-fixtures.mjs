@@ -194,9 +194,9 @@ const sourceRegistry = new Map();
 const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
-  if (corpus.cases.length !== 38) {
+  if (corpus.cases.length !== 40) {
     fail(
-      `corpus must contain all 38 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 40 retained cases, got ${corpus.cases.length}`,
     );
   }
 
@@ -389,9 +389,9 @@ if (actualChoiceFiles.join("\0") !== expectedChoiceFiles.join("\0")) {
     `choice coverage drifted: expected [${expectedChoiceFiles.join(", ")}], got [${actualChoiceFiles.join(", ")}]`,
   );
 }
-if (sourceRegistry.size !== 39) {
+if (sourceRegistry.size !== 40) {
   fail(
-    `source coverage drifted: expected 39 retained source ids, got ${sourceRegistry.size}`,
+    `source coverage drifted: expected 40 retained source ids, got ${sourceRegistry.size}`,
   );
 }
 

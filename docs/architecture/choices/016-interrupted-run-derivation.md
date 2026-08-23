@@ -82,14 +82,14 @@ change fidelity.
 
 ## Ownership
 
-| Concern | Owner |
-| --- | --- |
-| interrupted parent identity, retained `RunSpec`, replay bytes, lifecycle, and lineage | ctxmux |
-| Level A clone, new process creation, retry safety, and generic derivation record | ctxmux |
-| Provider session identity and capability | embedding Provider/Integration |
-| semantic replay parsing and provenance validation | embedding Provider/Integration |
-| provider-native resume arguments and replacement `RunSpec` | embedding Provider/Integration |
-| whether to retry explicitly as Level A after Level B fails | caller or operator |
+| Concern                                                                               | Owner                          |
+| ------------------------------------------------------------------------------------- | ------------------------------ |
+| interrupted parent identity, retained `RunSpec`, replay bytes, lifecycle, and lineage | ctxmux                         |
+| Level A clone, new process creation, retry safety, and generic derivation record      | ctxmux                         |
+| Provider session identity and capability                                              | embedding Provider/Integration |
+| semantic replay parsing and provenance validation                                     | embedding Provider/Integration |
+| provider-native resume arguments and replacement `RunSpec`                            | embedding Provider/Integration |
+| whether to retry explicitly as Level A after Level B fails                            | caller or operator             |
 
 ## Quality attributes and invariants
 

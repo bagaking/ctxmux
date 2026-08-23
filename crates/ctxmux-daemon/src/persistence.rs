@@ -433,7 +433,9 @@ impl Persistence {
         {
             return Err(PersistenceError::ActorStopped);
         }
-        reply_rx.recv().map_err(|_| PersistenceError::ActorStopped)?;
+        reply_rx
+            .recv()
+            .map_err(|_| PersistenceError::ActorStopped)?;
         if let Some(message) = mutex_lock(&self.inner.failure).clone() {
             return Err(PersistenceError::Mutation(message));
         }

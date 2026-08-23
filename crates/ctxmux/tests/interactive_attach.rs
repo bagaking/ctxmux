@@ -262,6 +262,34 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
         .await
         .expect("start CLI screen fixture Run");
 
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            let (readiness, snapshot) = client
+                .attach(run.id, 0)
+                .await
+                .expect("observe CLI screen fixture replay readiness");
+            let replay = snapshot
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>();
+            readiness
+                .detach()
+                .await
+                .expect("detach CLI screen fixture readiness observer");
+            if replay
+                .windows(b"READY".len())
+                .any(|window| window == b"READY")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("CLI screen fixture reaches its stable current screen");
+
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,

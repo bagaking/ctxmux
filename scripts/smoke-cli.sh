@@ -7,9 +7,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 ctxmux_cli_bin=${CTXMUX_BIN:-"$PWD/target/debug/ctxmux"}
 ctxmux_daemon_bin=${CTXMUXD_BIN:-"$PWD/target/debug/ctxmuxd"}
 ctxmux_cli_tmp=$(cd "$(mktemp -d)" && pwd -P)
-ctxmux_cli_socket="$ctxmux_cli_tmp/ctxmux.sock"
+ctxmux_cli_socket="$ctxmux_cli_tmp/ctxmux/ctxmux.sock"
 ctxmux_cli_daemon_log="$ctxmux_cli_tmp/ctxmuxd.log"
 ctxmux_cli_daemon_pid=
+
+mkdir -p "$(dirname "$ctxmux_cli_socket")"
 
 fail() {
   echo "ctxmux CLI smoke: $*" >&2
@@ -117,7 +119,19 @@ ctxmux_cli_fork_retry=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" fork --o
 [[ ${ctxmux_cli_fork_retry%%$'\t'*} == "$ctxmux_cli_child" ]] || fail "Fork retry returned a different Run"
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status "$ctxmux_cli_child" >/dev/null
 
-ctxmux_cli_stop_run=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c "sleep 30")
+ctxmux_cli_stop_run=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c "trap '' INT; printf 'INT-READY\\n'; sleep 30")
+ctxmux_cli_interrupt_ready=false
+for _ in $(seq 1 100)
+do
+  ctxmux_cli_stop_status=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status "$ctxmux_cli_stop_run")
+  if [[ $ctxmux_cli_stop_status =~ head=[1-9][0-9]* ]]
+  then
+    ctxmux_cli_interrupt_ready=true
+    break
+  fi
+  sleep 0.02
+done
+[[ $ctxmux_cli_interrupt_ready == true ]] || fail "interrupt fixture did not become ready"
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" interrupt "$ctxmux_cli_stop_run" >/dev/null
 "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" stop "$ctxmux_cli_stop_run" >/dev/null
 ctxmux_cli_stopped=false
@@ -139,7 +153,8 @@ expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
 expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 9"
 expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 9"
 
-expect_failure "--socket or CTXMUX_SOCKET is required" env -u CTXMUX_SOCKET "$ctxmux_cli_bin" list
+ctxmux_cli_default_list=$(env -u CTXMUX_SOCKET XDG_RUNTIME_DIR="$ctxmux_cli_tmp" "$ctxmux_cli_bin" list)
+expect_contains "$ctxmux_cli_default_list" "$ctxmux_cli_run"
 expect_failure "unknown command" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" unknown
 expect_failure "invalid columns" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --cols invalid -- /bin/sh
 expect_failure "missing program" "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start --

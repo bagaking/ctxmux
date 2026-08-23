@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::Path,
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
@@ -134,7 +135,10 @@ impl TestDaemon {
             .spawn()
             .expect("spawn persistent ctxmuxd");
 
-        let stderr = child.stderr.take().expect("persistent daemon exposes stderr");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("persistent daemon exposes stderr");
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let drain = Arc::clone(&stderr_lines);
         std::thread::spawn(move || {
@@ -200,18 +204,29 @@ impl TestDaemon {
     /// Poll the piped stderr buffer until the incoming handoff image logs its
     /// resume line, then return that line so the run count can be asserted.
     async fn wait_resume_signal(&self, timeout_secs: u64) -> String {
+        self.wait_stderr_line(
+            "adopted inherited listener for handoff",
+            timeout_secs,
+            "incoming handoff image should log its resume signal",
+        )
+        .await
+    }
+
+    async fn wait_stderr_line(
+        &self,
+        needle: &str,
+        timeout_secs: u64,
+        timeout_message: &str,
+    ) -> String {
         let lines = self
             .stderr_lines
             .as_ref()
-            .expect("wait_resume_signal requires a stderr-piped daemon");
+            .expect("stderr matching requires a stderr-piped daemon");
         timeout(Duration::from_secs(timeout_secs), async {
             loop {
                 {
                     let captured = lines.lock().expect("stderr buffer lock");
-                    if let Some(line) = captured
-                        .iter()
-                        .find(|line| line.contains("adopted inherited listener for handoff"))
-                    {
+                    if let Some(line) = captured.iter().find(|line| line.contains(needle)) {
                         return line.clone();
                     }
                 }
@@ -219,7 +234,30 @@ impl TestDaemon {
             }
         })
         .await
-        .expect("incoming handoff image should log its resume signal")
+        .unwrap_or_else(|_| panic!("{timeout_message}"))
+    }
+
+    async fn wait_stderr_occurrences(&self, needle: &str, expected: usize) {
+        let lines = self
+            .stderr_lines
+            .as_ref()
+            .expect("stderr counting requires a stderr-piped daemon");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let count = lines
+                    .lock()
+                    .expect("stderr buffer lock")
+                    .iter()
+                    .filter(|line| line.contains(needle))
+                    .count();
+                if count >= expected {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("expected daemon stderr occurrences arrive");
     }
 }
 
@@ -304,6 +342,42 @@ fn non_reading_shell() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn externally_released_reader_shell(
+    ready: &Path,
+    release: &Path,
+    expected_bytes: usize,
+) -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            format!(
+                concat!(
+                    "stty raw -echo; ",
+                    "printf ready > \"$CTXMUX_READER_READY\"; ",
+                    "while [ ! -e \"$CTXMUX_READER_RELEASE\" ]; do sleep 0.01; done; ",
+                    "dd bs=1 count={} 2>/dev/null | wc -c; ",
+                    "printf 'CAPTURED\\n'; exec /bin/sleep 30"
+                ),
+                expected_bytes
+            ),
+        ],
+        cwd: None,
+        env: BTreeMap::from([
+            (
+                "CTXMUX_READER_READY".to_owned(),
+                ready.to_string_lossy().into_owned(),
+            ),
+            (
+                "CTXMUX_READER_RELEASE".to_owned(),
+                release.to_string_lossy().into_owned(),
+            ),
+        ]),
         size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
@@ -667,6 +741,74 @@ fn process_exists(pid: u32) -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+#[cfg(target_os = "linux")]
+fn process_file_descriptor_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .expect("read daemon file descriptors from procfs")
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn process_file_descriptor_count(pid: u32) -> usize {
+    let output = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-Fn"])
+        .output()
+        .expect("inspect daemon file descriptors with lsof");
+    assert!(output.status.success(), "lsof descriptor census failed");
+    String::from_utf8(output.stdout)
+        .expect("lsof descriptor census is UTF-8")
+        .lines()
+        .filter(|line| line.starts_with('f'))
+        .count()
+}
+
+#[cfg(target_os = "linux")]
+fn process_thread_count(pid: u32) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .expect("read daemon threads from procfs")
+        .count()
+}
+
+#[cfg(target_os = "macos")]
+fn process_thread_count(pid: u32) -> usize {
+    let output = Command::new("ps")
+        .args(["-M", "-p", &pid.to_string()])
+        .output()
+        .expect("inspect daemon threads with ps");
+    assert!(output.status.success(), "ps thread census failed");
+    String::from_utf8(output.stdout)
+        .expect("ps thread census is UTF-8")
+        .lines()
+        .skip(1)
+        .count()
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn stable_process_resources(pid: u32) -> (usize, usize) {
+    timeout(Duration::from_secs(5), async {
+        let mut previous = None;
+        let mut stable_samples = 0;
+        loop {
+            let current = (
+                process_file_descriptor_count(pid),
+                process_thread_count(pid),
+            );
+            if previous == Some(current) {
+                stable_samples += 1;
+            } else {
+                previous = Some(current);
+                stable_samples = 1;
+            }
+            if stable_samples == 5 {
+                return current;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon resource census settles")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1377,6 +1519,124 @@ async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
         .map(|byte| u8::from_str_radix(byte, 16).expect("od emits hexadecimal bytes"))
         .collect::<Vec<_>>();
     assert_eq!(bytes, b"AB", "abandoned retry wrote the first payload once");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one end-to-end fixture keeps response loss, re-exec, retry, and child byte oracle in one causal proof"
+)]
+async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
+    let daemon = TestDaemon::start_persistent().await;
+    let run = daemon
+        .client
+        .start(raw_capture_shell(2))
+        .await
+        .expect("start persistent response-loss capture Run");
+    let daemon_instance = daemon
+        .client
+        .daemon_instance()
+        .await
+        .expect("read pre-upgrade daemon incarnation");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach response-loss oracle");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    let replay_cursor = last_seq;
+
+    let key = InputOperationKey::new("upgrade-lost-response-input").unwrap();
+    send_request_without_reading_response(
+        &daemon.client,
+        Request::RecoverableInput {
+            operation: RecoverableInput {
+                daemon_instance,
+                operation_key: key.clone(),
+                id: run.id,
+                expected_byte: 0,
+                data: b"A".to_vec(),
+            },
+        },
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if daemon
+                .client
+                .status(run.id)
+                .await
+                .is_ok_and(|status| status.applied_input_bytes == Some(1))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("abandoned Input settles before upgrade");
+    drop(attachment);
+
+    daemon.sighup();
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(resume.contains(" 1 run(s)"), "unexpected resume: {resume}");
+    assert_eq!(
+        daemon.client.daemon_instance().await.unwrap(),
+        daemon_instance,
+        "planned upgrade preserves the retry fence"
+    );
+
+    let recovered = daemon
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance,
+            operation_key: key,
+            id: run.id,
+            expected_byte: 0,
+            data: b"A".to_vec(),
+        })
+        .await
+        .expect("post-upgrade retry returns the pre-upgrade applied range");
+    assert_eq!(recovered.receipt.start_byte, 0);
+    assert_eq!(recovered.receipt.end_byte, 1);
+    assert_eq!(recovered.run.applied_input_bytes, Some(1));
+
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, replay_cursor)
+        .await
+        .expect("reconnect output oracle after upgrade");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    daemon
+        .client
+        .recoverable_input(RecoverableInput {
+            daemon_instance,
+            operation_key: InputOperationKey::new("upgrade-following-input").unwrap(),
+            id: run.id,
+            expected_byte: 1,
+            data: b"B".to_vec(),
+        })
+        .await
+        .expect("following operation continues from restored cursor");
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"CAPTURED").await;
+    let captured = observed
+        .windows(b"CAPTURED".len())
+        .position(|window| window == b"CAPTURED")
+        .expect("raw child publishes capture marker");
+    let bytes = std::str::from_utf8(&observed[..captured])
+        .expect("od byte oracle is ASCII")
+        .split_ascii_whitespace()
+        .filter_map(|byte| u8::from_str_radix(byte, 16).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bytes, b"AB",
+        "retry after re-exec must not physically write A twice"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2450,7 +2710,330 @@ async fn sighup_memory_only_noop() {
         RunState::Running,
         "SIGHUP must not interrupt the live run"
     );
-    assert!(process_exists(pid), "child should still be running after SIGHUP");
+    assert!(
+        process_exists(pid),
+        "child should still be running after SIGHUP"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_upgrade_before_extract_restores_complete_service() {
+    let daemon = TestDaemon::start_persistent().await;
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start reversible-upgrade Run");
+    let pid = run.pid.expect("live Run exposes pid");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach before reversible upgrade failure");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let state_dir = daemon.directory.path().join("state");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make handoff-file creation fail before extract");
+    daemon.sighup();
+    let aborted = daemon
+        .wait_stderr_line(
+            "upgrade aborted before extract, continuing to serve",
+            5,
+            "outgoing image should report a reversible pre-extract abort",
+        )
+        .await;
+    assert!(
+        aborted.contains("ctxmux-handoff"),
+        "unexpected abort: {aborted}"
+    );
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore persistent state directory permissions");
+
+    daemon
+        .client
+        .ping()
+        .await
+        .expect("same image resumes ordinary requests");
+    let status = daemon
+        .client
+        .status(run.id)
+        .await
+        .expect("same Run remains published");
+    assert_eq!(status.pid, Some(pid));
+    assert_eq!(status.state, RunState::Running);
+    assert!(process_exists(pid));
+    attachment
+        .input(b"after-abort\n".to_vec())
+        .await
+        .expect("existing attachment remains controllable after abort");
+    wait_for_output(
+        &mut attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:after-abort",
+    )
+    .await;
+
+    let second = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("creation admission is fully restored after abort");
+    daemon
+        .client
+        .stop(second.id)
+        .await
+        .expect("stop second Run");
+    daemon.client.stop(run.id).await.expect("stop original Run");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adopted_child_preserves_public_signal_exit_identity() {
+    let daemon = TestDaemon::start_persistent().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sleep".to_owned(),
+            args: vec!["30".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start signal-exit Run");
+    let pid = run.pid.expect("signal-exit Run exposes pid");
+    daemon.sighup();
+    daemon.wait_resume_signal(10).await;
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .expect("terminate re-adopted child")
+            .success()
+    );
+    let state = wait_until_exited(&daemon.client, run.id).await;
+    let RunState::Exited { code, signal } = state else {
+        panic!("signal-terminated re-adopted child must exit: {state:?}");
+    };
+    assert!(
+        signal.is_some(),
+        "signal termination must not flatten into a normal numeric exit: code={code}"
+    );
+    assert_ne!(code, 143, "SIGTERM must not masquerade as exit code 143");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real PTY fixture keeps drain admission, crossing ACK, exec resume, and exact-once cursor ordering auditable"
+)]
+async fn upgrade_drains_crossing_input_through_its_ack_response() {
+    const INPUT_BYTES: usize = 256 * 1024;
+
+    let daemon = TestDaemon::start_persistent().await;
+    let ready = daemon.directory.path().join("crossing-reader-ready");
+    let release = daemon.directory.path().join("crossing-reader-release");
+    let run = daemon
+        .client
+        .start(externally_released_reader_shell(
+            &ready,
+            &release,
+            INPUT_BYTES,
+        ))
+        .await
+        .expect("start crossing-control reader");
+    timeout(Duration::from_secs(5), async {
+        while !ready.exists() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("child reaches its external read barrier");
+    let (attachment, _) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach crossing-control writer");
+    let attachment = Arc::new(attachment);
+    let input = {
+        let attachment = Arc::clone(&attachment);
+        tokio::spawn(async move { attachment.input(vec![b'A'; INPUT_BYTES]).await })
+    };
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !input.is_finished(),
+        "the real PTY write must be blocked before SIGHUP"
+    );
+
+    daemon.sighup();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match attachment.resize(TerminalSize { rows: 25, cols: 81 }).await {
+                Err(ClientError::ControlRejected { failure })
+                    if failure.error.code == ErrorCode::BackendUnavailable
+                        && failure.disposition == CommandDisposition::NotApplied =>
+                {
+                    break;
+                }
+                Ok(_) | Err(_) => sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("existing connection retry response proves the upgrade gate is draining");
+    assert!(
+        !input.is_finished(),
+        "crossing Input remains owner-pending while the gate drains"
+    );
+
+    std::fs::write(&release, b"release").expect("release the child reader externally");
+    let accepted = timeout(Duration::from_secs(10), input)
+        .await
+        .expect("crossing Input ACK precedes upgrade resume")
+        .expect("join crossing Input task")
+        .expect("crossing Input receives its unique accepted result");
+    assert_eq!(
+        accepted.receipt.written_bytes,
+        u32::try_from(INPUT_BYTES).expect("fixture input length fits u32")
+    );
+
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(resume.contains(" 1 run(s)"), "unexpected resume: {resume}");
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match attachment.next_event().await {
+                Ok(Some(_)) => {}
+                Ok(None) | Err(ClientError::Closed) => break,
+                Err(error) => panic!("old attachment termination was unexpected: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("old attachment closes after its crossing ACK");
+    let rejected = attachment
+        .input(b"late".to_vec())
+        .await
+        .expect_err("old attachment cannot mutate the incoming image");
+    assert_eq!(
+        rejected.control_disposition(),
+        Some(CommandDisposition::NotApplied)
+    );
+
+    let status = daemon
+        .client
+        .status(run.id)
+        .await
+        .expect("incoming image exposes the re-adopted Run");
+    assert_eq!(
+        status.applied_input_bytes,
+        Some(INPUT_BYTES as u64),
+        "crossing Input crosses the PTY boundary exactly once"
+    );
+    let (mut fresh, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("reconnect after crossing ACK");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed
+        .windows(b"CAPTURED".len())
+        .any(|window| window == b"CAPTURED")
+    {
+        wait_for_output(&mut fresh, &mut observed, &mut last_seq, b"CAPTURED").await;
+    }
+    assert!(
+        observed
+            .windows(INPUT_BYTES.to_string().len())
+            .any(|window| window == INPUT_BYTES.to_string().as_bytes()),
+        "child confirms the complete crossing payload"
+    );
+    daemon
+        .client
+        .stop(run.id)
+        .await
+        .expect("stop crossing fixture");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_upgrades_have_zero_settled_fd_and_thread_delta() {
+    let daemon = TestDaemon::start_persistent().await;
+    let daemon_pid = daemon.child.id();
+    let socket_inode = std::fs::metadata(daemon.client.socket_path())
+        .expect("stat published daemon socket")
+        .ino();
+    let run = daemon
+        .client
+        .start(non_reading_shell())
+        .await
+        .expect("start resource-census Run");
+    let child_pid = run.pid.expect("resource-census Run exposes pid");
+    let baseline = stable_process_resources(daemon_pid).await;
+
+    for upgrade in 1..=2 {
+        daemon.sighup();
+        daemon
+            .wait_stderr_occurrences("adopted inherited listener for handoff", upgrade)
+            .await;
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if daemon.client.ping().await.is_ok() {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("incoming image resumes public service");
+
+        assert_eq!(daemon.child.id(), daemon_pid, "exec keeps the daemon PID");
+        let status = daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("read re-adopted Run during census");
+        assert_eq!(status.pid, Some(child_pid));
+        assert!(process_exists(child_pid));
+        assert_eq!(
+            std::fs::metadata(daemon.client.socket_path())
+                .expect("stat inherited listener socket")
+                .ino(),
+            socket_inode,
+            "upgrade must not rebind the listener inode"
+        );
+        assert_eq!(
+            stable_process_resources(daemon_pid).await,
+            baseline,
+            "upgrade {upgrade} must not add a permanent descriptor or owner thread"
+        );
+        let handoff_names = std::fs::read_dir(daemon.directory.path().join("state"))
+            .expect("inspect state directory after upgrade")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ctxmux-handoff-")
+            })
+            .count();
+        assert_eq!(
+            handoff_names, 0,
+            "unlinked handoff files must leave no pathname"
+        );
+    }
+
+    daemon
+        .client
+        .stop(run.id)
+        .await
+        .expect("stop resource-census Run");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2474,7 +3057,10 @@ async fn upgrade_preserves_live_run() {
         .await
         .expect("start native Run");
     let p0 = run.pid.expect("shell exposes a process id");
-    assert!(process_exists(p0), "child should be running before the upgrade");
+    assert!(
+        process_exists(p0),
+        "child should be running before the upgrade"
+    );
 
     // 2. Attach, reach READY, and drive I/O to a known cursor C0.
     let (mut first_attachment, first_snapshot) = daemon
@@ -2485,7 +3071,13 @@ async fn upgrade_preserves_live_run() {
     let mut observed = replay_bytes(&first_snapshot.replay.chunks);
     let mut last_seq = first_snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
-        wait_for_output(&mut first_attachment, &mut observed, &mut last_seq, b"READY").await;
+        wait_for_output(
+            &mut first_attachment,
+            &mut observed,
+            &mut last_seq,
+            b"READY",
+        )
+        .await;
     }
     first_attachment
         .input(b"before\n".to_vec())
@@ -2499,16 +3091,11 @@ async fn upgrade_preserves_live_run() {
     )
     .await;
     let c0 = last_seq;
-    // The attachment is per-connection: the old image's accept loop that serves
-    // it is replaced by execve, so this connection cannot survive the upgrade.
-    // The RUN survives; drop the attachment now and re-attach afterwards.
-    drop(first_attachment);
-
     // 3. Trigger the real re-exec and await the incoming image's resume signal.
     daemon.sighup();
     let resume = daemon.wait_resume_signal(10).await;
     assert!(
-        resume.contains("1 run(s)"),
+        resume.contains(" 1 run(s)"),
         "incoming image should adopt exactly one live run, got: {resume}"
     );
     // A real execve replaces the image but keeps the SAME os process, so the
@@ -2547,6 +3134,40 @@ async fn upgrade_preserves_live_run() {
         "the original child must still be alive after the upgrade"
     );
     assert_eq!(status.state, RunState::Running, "the run must stay running");
+
+    // Connections are deliberately not migrated. Observe the old attachment's
+    // transport terminate, then prove any later command is rejected locally as
+    // not-applied rather than crossing into the incoming image ambiguously.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match first_attachment.next_event().await {
+                Ok(Some(RunEvent::Output { chunk })) => {
+                    assert_eq!(chunk.start_byte, last_seq);
+                    last_seq = chunk.end_byte;
+                }
+                Ok(Some(RunEvent::Gap {
+                    latest_output_bytes,
+                })) => panic!("old attachment observed an output gap at {latest_output_bytes}"),
+                Ok(Some(event)) => {
+                    panic!("old attachment ended with an unexpected event: {event:?}")
+                }
+                Ok(None) | Err(ClientError::Closed) => break,
+                Err(error) => {
+                    panic!("old attachment ended with an unexpected client error: {error}")
+                }
+            }
+        }
+    })
+    .await
+    .expect("old attachment transport terminates across exec");
+    let old_command = first_attachment
+        .input(b"must-not-cross\n".to_vec())
+        .await
+        .expect_err("closed pre-upgrade attachment rejects later commands");
+    assert_eq!(
+        old_command.control_disposition(),
+        Some(CommandDisposition::NotApplied)
+    );
 
     // 5. Master + writer re-adopted: attach fresh at C0 and observe an echo.
     //    Observing OUT:resumed proves both the pty master (read path) and the
@@ -2656,7 +3277,10 @@ async fn upgrade_preserves_output_across_the_reader_window() {
         .await
         .expect("start native Run");
     let p0 = run.pid.expect("shell exposes a process id");
-    assert!(process_exists(p0), "child should be running before the upgrade");
+    assert!(
+        process_exists(p0),
+        "child should be running before the upgrade"
+    );
 
     // 2. Attach, reach READY, drive `before` to a known cursor C0.
     let (mut first_attachment, first_snapshot) = daemon
@@ -2667,7 +3291,13 @@ async fn upgrade_preserves_output_across_the_reader_window() {
     let mut observed = replay_bytes(&first_snapshot.replay.chunks);
     let mut last_seq = first_snapshot.replay.latest_output_bytes;
     if !observed.windows(5).any(|window| window == b"READY") {
-        wait_for_output(&mut first_attachment, &mut observed, &mut last_seq, b"READY").await;
+        wait_for_output(
+            &mut first_attachment,
+            &mut observed,
+            &mut last_seq,
+            b"READY",
+        )
+        .await;
     }
     first_attachment
         .input(b"before\n".to_vec())

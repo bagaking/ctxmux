@@ -56,12 +56,15 @@ a new operation. A partial write, flush failure after an uncertain write, or
 writer panic consumes or fences that operation, returns `unknown`, and poisons
 the input lane; ctxmux does not invent an applied byte range.
 
-The daemon incarnation is random and changes on every daemon start. A request
-bound to an earlier incarnation is rejected before Run lookup or PTY mutation.
-Fresh clients must retain the operation's original incarnation rather than
-silently replacing it with the current handshake value. Ctxmux does not claim
-cross-crash exactly-once Input: a PTY write and a durable result ledger cannot
-be committed atomically without a cooperating target protocol.
+The daemon incarnation is random and changes on every cold start. Decision 015
+preserves it across an intentional exec-in-place upgrade and therefore carries
+the complete settled Run-local ledger, poisoned-lane state, and input cursor in
+the validated handoff manifest. A request bound to an earlier cold incarnation
+is rejected before Run lookup or PTY mutation. Fresh clients must retain the
+operation's original incarnation rather than silently replacing it with the
+current handshake value. Ctxmux does not claim cross-crash exactly-once Input:
+a PTY write and a SQLite result cannot be committed atomically without a
+cooperating target protocol.
 
 ## Success boundary
 
@@ -82,8 +85,9 @@ Message, Delivery, ACK, Reply, Task, dispatch, DAG, or UI-timeline concepts.
 - Treat `accepted=true` or a completed socket write as semantic delivery. A PTY
   has no knowledge of TUI state or message submission.
 - Replay all unknown input. This can duplicate irreversible terminal actions.
-- Persist the ledger across daemon restart. SQLite cannot share an atomic
-  commit boundary with an external PTY write.
+- Persist the ledger across cold daemon restart. SQLite cannot share an atomic
+  commit boundary with an external PTY write. Decision 015's planned exec is
+  not a cold restart: the same live owner carries the in-memory ledger and PTY.
 - Generalize Input, Resize, Stop, and Signal behind one public transaction
   framework. Their targets, idempotence, results, and failure algebra differ.
 - Implement process-group Stop in this Feature. It is valuable but owns a
@@ -91,14 +95,17 @@ Message, Delivery, ACK, Reply, Task, dispatch, DAG, or UI-timeline concepts.
 
 ## Evidence
 
-The representative test uses a real child and public client boundary. It drops
-the first response after one physical write, reconnects with the exact same
+The representative tests use real children and the public client boundary. One
+drops the first response after a physical write, reconnects with the exact same
 operation, observes the original byte range, and proves from child output that
-the payload arrived once. Focused variants prove conflict, daemon replacement,
-and bounded-ledger stale-cursor rejection. Rust and TypeScript clients must
-agree on the generated wire shape and failure vocabulary.
+the payload arrived once. A second performs a real exec-in-place upgrade between
+response loss and retry and proves the same range, cursor, and one physical
+payload survive. Focused variants prove conflict, cold-daemon replacement,
+unknown poisoned-lane handoff, and bounded-ledger stale-cursor rejection. Rust
+and TypeScript clients must agree on the generated wire shape and failure
+vocabulary.
 
-## Wrong-case corpus（错题集）
+## Wrong-case corpus
 
 - `INPUT-01` transfers the response-loss duplicate-write failure. It is active
   under T-004: a real child proves that a dropped first response followed by an

@@ -430,8 +430,8 @@ fn errno_to_io(error: Errno) -> std::io::Error {
     std::io::Error::from_raw_os_error(error.raw_os_error())
 }
 
-/// Encode a `waitid` result as a `portable_pty::ExitStatus`, preferring the
-/// normal exit code and falling back to the conventional `128 + signal`.
+/// Encode a `waitid` result as a `portable_pty::ExitStatus`, preserving whether
+/// the child exited normally or was terminated by a signal.
 ///
 /// The final `1` is a defensive default: reaped with `WEXITED`, a terminal
 /// child is always `CLD_EXITED` or `CLD_KILLED`/`CLD_DUMPED`, so one of the two
@@ -440,7 +440,13 @@ fn exit_status_from_waitid(status: &WaitIdStatus) -> ExitStatus {
     if let Some(code) = status.exit_status() {
         ExitStatus::with_exit_code(code.unsigned_abs())
     } else if let Some(signal) = status.terminating_signal() {
-        ExitStatus::with_exit_code(128 + signal.unsigned_abs())
+        use std::os::unix::process::ExitStatusExt as _;
+
+        // A terminating wait status encodes the signal number in the low bits.
+        // `portable_pty`'s standard conversion then retains the platform signal
+        // name, matching freshly spawned children instead of flattening it to a
+        // synthetic `128 + signal` normal exit code.
+        std::process::ExitStatus::from_raw(signal).into()
     } else {
         ExitStatus::with_exit_code(1)
     }
@@ -564,6 +570,32 @@ mod tests {
                 .expect("cache retains the reaped status")
                 .exit_code(),
             7
+        );
+    }
+
+    #[test]
+    fn adopted_child_preserves_signal_exit_identity() {
+        use portable_pty::Child;
+
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 30"])
+            .spawn()
+            .expect("spawn signal-exit adopted child");
+        let pid = child.id();
+        std::mem::forget(child);
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status()
+                .expect("terminate adopted child")
+                .success()
+        );
+        let status = adopted.wait().expect("reap signal-exit adopted child");
+        assert!(
+            status.signal().is_some(),
+            "signal exit must not be flattened into a normal numeric code: {status:?}"
         );
     }
 

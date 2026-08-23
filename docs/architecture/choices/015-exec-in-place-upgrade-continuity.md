@@ -12,7 +12,7 @@
 ## Context
 
 [009](009-runtime-persistence-recovery.md) makes Runs independent of clients and
-recovers *historical* state across daemon restart, but explicitly leaves live
+recovers _historical_ state across daemon restart, but explicitly leaves live
 PTY control unrecoverable: a prior `running` row becomes
 `interrupted { daemon_restart }`. Its open question asked whether a later
 milestone justifies "a stable per-Run owner or another platform mechanism for
@@ -45,7 +45,7 @@ retains the right to `waitid` them; only pending `SIGCHLD` disposition resets.
 This is why exec-in-place does **not** contradict 009's rule that a replacement
 daemon never "opens, attaches to, or signals a process named only by persisted
 metadata": the child is named by a **live master fd carried across the exec**
-and reap authority is proven by *being the same parent process*, not by a
+and reap authority is proven by _being the same parent process_, not by a
 guessed PID. Identity is possession.
 
 ### What crosses the exec
@@ -165,7 +165,7 @@ re-exec changes no frame.
   live Runs across controlled daemon replacement"), modeled on Herdr's live
   handoff (`tests/live_handoff.rs` spawns a replacement server and waits for the
   new pid while the old one still owns the pty). Rejected in favor of
-  exec-in-place, and this record **supersedes that direction**: Herdr *must* use
+  exec-in-place, and this record **supersedes that direction**: Herdr _must_ use
   two processes because its pty actor holds heavy in-process terminal state
   (`src/pty/actor/unix.rs`: grids, terminal responses, render state) that cannot
   be rebuilt from a store, so its fds must cross a process boundary while both
@@ -176,7 +176,7 @@ re-exec changes no frame.
     commit restores the old owner" — a rollback to a still-live quiesced
     predecessor. Exec-in-place **cannot offer that**, and does not try to: once
     `execve` fires the old image is gone, so there is no predecessor to roll
-    back to. Its failure model is instead a *pre-exec* guarantee plus atomicity:
+    back to. Its failure model is instead a _pre-exec_ guarantee plus atomicity:
     any failure **before** `execve` leaves the current daemon fully owning every
     fd and simply continuing to serve; `execve` itself is atomic; an `execve`
     that returns (only on error) degrades to today's shutdown fail-stop. We
@@ -187,7 +187,7 @@ re-exec changes no frame.
     continuity, explicit disposition for crossing controls) are preserved by
     the implemented request drain and all-owner extraction boundary.
 - **A standing per-Run owner or shim** that always holds the fd so control also
-  survives a *crash*. Rejected: one extra process and supervision boundary per
+  survives a _crash_. Rejected: one extra process and supervision boundary per
   Run, reversing the daemon-wide-owner performance work and breaking the frozen
   per-Run budget slopes, for the crash case operators do not deliberately
   trigger.
