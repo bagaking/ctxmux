@@ -4,4 +4,16 @@ export const MAX_FRAME_BYTES = 1048576 as const;
 export const MAX_CREATE_OPERATION_KEY_BYTES = 128 as const;
 export const MAX_INPUT_OPERATION_KEY_BYTES = 128 as const;
 export const MAX_RUNTIME_BUILD_ID_BYTES = 128 as const;
-export const RUNTIME_CAPABILITY_MANIFEST_VERSION = 1 as const;
+export const RUNTIME_CAPABILITY_NATIVE_START = "native.start" as const;
+export const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT =
+  "native.recoverable_input" as const;
+export const RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A =
+  "native.fork_level_a" as const;
+export const RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B =
+  "native.execute_materialized_level_b" as const;
+export const RUNTIME_CAPABILITY_TMUX_DISCOVER = "tmux.discover" as const;
+export const RUNTIME_CAPABILITY_TMUX_IMPORT = "tmux.import" as const;
+export const RUNTIME_CAPABILITY_PERSISTENT_STATE =
+  "services.persistent_state" as const;
+export const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY =
+  "services.planned_exec_upgrade_continuity" as const;

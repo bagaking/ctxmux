@@ -11,8 +11,11 @@ use std::{
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, PROTOCOL_VERSION,
-    RUNTIME_CAPABILITY_MANIFEST_VERSION, RunEvent, RunId, RunInfo, RunSpec, RunState,
-    RuntimeDescription, TerminalSize,
+    RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_START,
+    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent, RunId, RunInfo, RunSpec, RunState,
+    RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -153,24 +156,31 @@ fn shell_spec(script: &str) -> RunSpec {
     }
 }
 
-fn assert_persistent_runtime_manifest(runtime: &RuntimeDescription) {
+fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
     assert_eq!(
-        runtime.capabilities.version,
-        RUNTIME_CAPABILITY_MANIFEST_VERSION
+        runtime.runtime_id_persistence,
+        RuntimeIdPersistence::StateDir
     );
-    assert!(runtime.capabilities.native.start);
-    assert!(runtime.capabilities.native.recoverable_input);
-    assert!(runtime.capabilities.native.fork_level_a);
-    assert!(runtime.capabilities.native.execute_materialized_level_b);
-    assert!(runtime.capabilities.tmux.discover);
-    assert!(!runtime.capabilities.tmux.import);
-    assert!(runtime.capabilities.services.persistent_state_active);
-    assert!(
-        runtime
-            .capabilities
-            .services
-            .planned_exec_upgrade_continuity
+    assert_eq!(runtime.platform, std::env::consts::OS);
+    assert_eq!(runtime.arch, std::env::consts::ARCH);
+    assert_eq!(
+        runtime.capabilities,
+        BTreeMap::from([
+            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+                1,
+            ),
+            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+            (RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY.to_owned(),
+                1,
+            ),
+        ])
     );
 }
 
@@ -336,7 +346,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
         .runtime_info()
         .await
         .expect("read first Runtime description");
-    assert_persistent_runtime_manifest(&first_runtime);
+    assert_persistent_runtime_identity(&first_runtime);
     let live = first_client
         .start(shell_spec(
             "trap '' HUP TERM; printf 'stale-pid-sentinel'; exec /bin/sleep 60",
@@ -383,7 +393,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
         .runtime_info()
         .await
         .expect("read replacement Runtime description");
-    assert_persistent_runtime_manifest(&replacement_runtime);
+    assert_persistent_runtime_identity(&replacement_runtime);
     assert_eq!(replacement_runtime.runtime_id, first_runtime.runtime_id);
     assert_ne!(
         replacement_runtime.daemon_instance_id,

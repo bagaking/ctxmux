@@ -13,8 +13,31 @@ use uuid::Uuid;
 /// Current protocol generation developed in this repository.
 pub const PROTOCOL_VERSION: u16 = 10;
 
-/// Current schema of the daemon-wide Runtime capability manifest.
-pub const RUNTIME_CAPABILITY_MANIFEST_VERSION: u16 = 1;
+/// Start a daemon-owned native Run.
+pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
+
+/// Apply or recover one caller-keyed native Input operation.
+pub const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT: &str = "native.recoverable_input";
+
+/// Execute a portable Level A fork from a compatible retained Run.
+pub const RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A: &str = "native.fork_level_a";
+
+/// Execute a complete caller-materialized Level B Run specification.
+pub const RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B: &str =
+    "native.execute_materialized_level_b";
+
+/// Discover panes through an explicitly selected public tmux endpoint.
+pub const RUNTIME_CAPABILITY_TMUX_DISCOVER: &str = "tmux.discover";
+
+/// Import one pane as a read-only memory-only Run.
+pub const RUNTIME_CAPABILITY_TMUX_IMPORT: &str = "tmux.import";
+
+/// Retain Runtime identity and historical Run state in one state directory.
+pub const RUNTIME_CAPABILITY_PERSISTENT_STATE: &str = "services.persistent_state";
+
+/// Preserve live ownership across a validated planned exec-in-place upgrade.
+pub const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY: &str =
+    "services.planned_exec_upgrade_continuity";
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -777,71 +800,69 @@ pub struct OutputReplayHeader {
     pub truncated: bool,
 }
 
-/// Native operation classes implemented by this Runtime endpoint.
-///
-/// These declarations do not override one Run's current capabilities or
-/// lifecycle state.
+/// Persistence class of one logical Runtime identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct NativeRuntimeCapabilities {
-    /// Start a daemon-owned native Run.
-    pub start: bool,
-    /// Apply or recover one caller-keyed native Input operation.
-    pub recoverable_input: bool,
-    /// Execute a portable Level A fork from a compatible retained Run.
-    pub fork_level_a: bool,
-    /// Execute a complete caller-materialized Level B Run specification.
-    pub execute_materialized_level_b: bool,
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeIdPersistence {
+    /// The Runtime ID lasts for one memory-only daemon lifetime.
+    Daemon,
+    /// The selected state-directory lineage preserves the Runtime ID.
+    StateDir,
 }
 
-/// tmux operation classes implemented by this Runtime endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct TmuxRuntimeCapabilities {
-    /// Discover panes through an explicitly selected public tmux endpoint.
-    pub discover: bool,
-    /// Import one pane as a read-only memory-only Run.
-    pub import: bool,
-}
-
-/// Optional local services active on this Runtime endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeServiceCapabilities {
-    /// A persistent state directory is active for this Runtime.
-    pub persistent_state_active: bool,
-    /// Planned exec-in-place ownership continuity is active.
-    pub planned_exec_upgrade_continuity: bool,
-}
-
-/// Versioned daemon-wide capabilities declared independently of Run metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeCapabilityManifest {
-    /// Schema version for these fixed typed capability fields.
-    pub version: u16,
-    /// Native operation classes.
-    pub native: NativeRuntimeCapabilities,
-    /// tmux operation classes.
-    pub tmux: TmuxRuntimeCapabilities,
-    /// Optional active local services.
-    pub services: RuntimeServiceCapabilities,
-}
-
-/// Provider-neutral description of the Runtime serving one connection.
+/// Provider-neutral identity of the Runtime serving one connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeDescription {
-    /// Logical Runtime or persistent-store lineage.
-    pub runtime_id: RuntimeId,
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[ts(rename_all = "camelCase")]
+pub struct RuntimeIdentity {
     /// Current live retry and authority fence.
     pub daemon_instance_id: DaemonInstanceId,
+    /// Logical Runtime or persistent-store lineage.
+    pub runtime_id: RuntimeId,
+    /// Whether the Runtime ID belongs to this daemon or a state-directory lineage.
+    pub runtime_id_persistence: RuntimeIdPersistence,
     /// Opaque serving build identity.
     pub build_id: RuntimeBuildId,
     /// Exact public protocol generation used by this connection.
     pub protocol_generation: u16,
-    /// Independently declared endpoint operation classes and local services.
-    pub capabilities: RuntimeCapabilityManifest,
+    /// Canonical Rust build-target operating-system value.
+    #[serde(deserialize_with = "deserialize_non_empty_runtime_string")]
+    pub platform: String,
+    /// Canonical Rust build-target architecture value.
+    #[serde(deserialize_with = "deserialize_non_empty_runtime_string")]
+    pub arch: String,
+    /// Highest implemented public contract version for each exact flat key.
+    #[serde(deserialize_with = "deserialize_runtime_capabilities")]
+    #[ts(type = "Record<string, number>")]
+    pub capabilities: BTreeMap<String, u16>,
+}
+
+fn deserialize_non_empty_runtime_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(D::Error::custom(
+            "Runtime build-target value must not be empty",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_runtime_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, u16>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let capabilities = BTreeMap::<String, u16>::deserialize(deserializer)?;
+    if let Some((key, _)) = capabilities.iter().find(|(_, version)| **version == 0) {
+        return Err(D::Error::custom(format!(
+            "Runtime capability {key:?} must have a positive integer version"
+        )));
+    }
+    Ok(capabilities)
 }
 
 /// First message sent by every client connection.
@@ -1116,7 +1137,7 @@ impl ProtocolError {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// Successful protocol handshake.
-    Hello { runtime: RuntimeDescription },
+    Hello { runtime: RuntimeIdentity },
     /// Result of one short-lived request.
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
@@ -1264,12 +1285,14 @@ mod tests {
         AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_OPERATION_KEY_BYTES, NativeRuntimeCapabilities, PROTOCOL_VERSION, ProtocolError,
-        RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, Response, RunBackend,
-        RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState, RuntimeBuildId,
-        RuntimeCapabilityManifest, RuntimeDescription, RuntimeId, RuntimeServiceCapabilities,
-        ServerFrame, StopDisposition, TerminalSize, TmuxRuntimeCapabilities, decode_frame,
-        encode_frame,
+        MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError,
+        RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+        RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+        RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_TMUX_DISCOVER,
+        RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request, Response, RunBackend,
+        RunCapabilities, RunId, RunInfo, RunSignal, RunSpec, RunState, RuntimeBuildId, RuntimeId,
+        RuntimeIdPersistence, RuntimeIdentity, ServerFrame, StopDisposition, TerminalSize,
+        decode_frame, encode_frame,
     };
 
     fn sample_run_info() -> RunInfo {
@@ -1296,31 +1319,28 @@ mod tests {
         }
     }
 
-    fn sample_runtime_description(daemon_instance_id: DaemonInstanceId) -> RuntimeDescription {
-        RuntimeDescription {
+    fn sample_runtime_identity(daemon_instance_id: DaemonInstanceId) -> RuntimeIdentity {
+        RuntimeIdentity {
+            daemon_instance_id,
             runtime_id: "018f47f2-9df7-7f5f-8f2d-d3353f114aea"
                 .parse::<RuntimeId>()
                 .unwrap(),
-            daemon_instance_id,
+            runtime_id_persistence: RuntimeIdPersistence::Daemon,
             build_id: RuntimeBuildId::new("ctxmuxd/0.1.0").unwrap(),
             protocol_generation: PROTOCOL_VERSION,
-            capabilities: RuntimeCapabilityManifest {
-                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-                native: NativeRuntimeCapabilities {
-                    start: true,
-                    recoverable_input: true,
-                    fork_level_a: true,
-                    execute_materialized_level_b: true,
-                },
-                tmux: TmuxRuntimeCapabilities {
-                    discover: true,
-                    import: true,
-                },
-                services: RuntimeServiceCapabilities {
-                    persistent_state_active: false,
-                    planned_exec_upgrade_continuity: false,
-                },
-            },
+            platform: "linux".to_owned(),
+            arch: "x86_64".to_owned(),
+            capabilities: std::collections::BTreeMap::from([
+                (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+                (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+                (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+                (
+                    RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+                    1,
+                ),
+                (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+                (RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1),
+            ]),
         }
     }
 
@@ -1364,7 +1384,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_and_recoverable_input_have_exact_generation_10_wire_shapes() {
+    fn runtime_identity_and_recoverable_input_have_exact_generation_10_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1372,29 +1392,26 @@ mod tests {
 
         assert_eq!(
             serde_json::to_value(ServerFrame::Hello {
-                runtime: sample_runtime_description(daemon_instance),
+                runtime: sample_runtime_identity(daemon_instance),
             })
             .unwrap(),
             serde_json::json!({
                 "type": "hello",
                 "runtime": {
-                    "runtime_id": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
-                    "daemon_instance_id": daemon_instance.to_string(),
-                    "build_id": "ctxmuxd/0.1.0",
-                    "protocol_generation": 10,
+                    "daemonInstanceId": daemon_instance.to_string(),
+                    "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
+                    "runtimeIdPersistence": "daemon",
+                    "buildId": "ctxmuxd/0.1.0",
+                    "protocolGeneration": 10,
+                    "platform": "linux",
+                    "arch": "x86_64",
                     "capabilities": {
-                        "version": 1,
-                        "native": {
-                            "start": true,
-                            "recoverable_input": true,
-                            "fork_level_a": true,
-                            "execute_materialized_level_b": true,
-                        },
-                        "tmux": { "discover": true, "import": true },
-                        "services": {
-                            "persistent_state_active": false,
-                            "planned_exec_upgrade_continuity": false,
-                        },
+                        "native.start": 1,
+                        "native.recoverable_input": 1,
+                        "native.fork_level_a": 1,
+                        "native.execute_materialized_level_b": 1,
+                        "tmux.discover": 1,
+                        "tmux.import": 1,
                     },
                 },
             })

@@ -3027,14 +3027,14 @@ async function openProtocolSocket(socketPath: string): Promise<Socket> {
   const hello = JSON.parse(line) as {
     readonly type?: string;
     readonly runtime?: {
-      readonly protocol_generation?: number;
-      readonly daemon_instance_id?: string;
+      readonly protocolGeneration?: number;
+      readonly daemonInstanceId?: string;
     };
   };
   assert.equal(hello.type, "hello");
-  assert.equal(hello.runtime?.protocol_generation, PROTOCOL_VERSION);
+  assert.equal(hello.runtime?.protocolGeneration, PROTOCOL_VERSION);
   assert.match(
-    hello.runtime?.daemon_instance_id ?? "",
+    hello.runtime?.daemonInstanceId ?? "",
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
   );
   return socket;
