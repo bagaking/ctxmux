@@ -19,11 +19,11 @@ async function fixtureHelper(body) {
   const executable = join(directory, "sampler");
   await writeFile(
     executable,
-    `#!/bin/sh\nprintf '%s\\n' 'ctxmux-rss-sampler-ready-v1' >&2\nread start_command\n[ "$start_command" = start ] || exit 2\n${body}\n`,
+    `#!/bin/sh\nprintf '%s\\n' "$$" > "$0.pid"\nprintf '%s\\n' 'ctxmux-rss-sampler-ready-v1' >&2\nread start_command\n[ "$start_command" = start ] || exit 2\n${body}\n`,
     "utf8",
   );
   await chmod(executable, 0o755);
-  return { directory, executable };
+  return { directory, executable, pidPath: `${executable}.pid` };
 }
 
 async function startTestSampler(executable, target, intervalMs, maximumGapMs) {
@@ -113,9 +113,7 @@ test("RSS sampling fails closed when the helper cannot start", async () => {
 });
 
 test("RSS sampling bounds a stuck first observation by one sample gap", async () => {
-  const fixture = await fixtureHelper(
-    'printf \'%s\\n\' "$$" > "${0%/*}/pid"\nexec /bin/sleep 10',
-  );
+  const fixture = await fixtureHelper("exec /bin/sleep 10");
   try {
     const prepared = await prepareRssSampler(
       fixture.executable,
@@ -123,10 +121,10 @@ test("RSS sampling bounds a stuck first observation by one sample gap", async ()
       25,
       100,
     );
+    const helperPid = Number(await readFile(fixture.pidPath, "utf8"));
+    assert.ok(Number.isSafeInteger(helperPid) && helperPid > 0);
+    assert.doesNotThrow(() => process.kill(helperPid, 0));
     await assert.rejects(startRssSampler(prepared), /first frame in time/u);
-    const helperPid = Number(
-      await readFile(join(fixture.directory, "pid"), "utf8"),
-    );
     for (let attempt = 0; attempt < 100; attempt += 1) {
       try {
         process.kill(helperPid, 0);

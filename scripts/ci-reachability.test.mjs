@@ -23,6 +23,7 @@ const eventSha = '"${{ github.sha }}"';
 const sourceIdentityCommand =
   environmentNeutralizationCommand +
   ` && test "$(${gitCommand} rev-parse HEAD)" = ${eventSha} && test -z "$(${gitStatusCommand})"`;
+const scriptTestCommand = "node --test --test-concurrency=1 scripts/*.test.mjs";
 
 function gateRun(command) {
   return `${sourceIdentityCommand} && exec /bin/bash --noprofile --norc ${command}`;
@@ -61,7 +62,7 @@ function createFixture(t) {
   );
   fs.writeFileSync(
     path.join(root, "scripts/check.sh"),
-    "cargo test --workspace --all-targets\nnode --test scripts/*.test.mjs\n",
+    `cargo test --workspace --all-targets\n${scriptTestCommand}\n`,
   );
 
   const jobs = [
@@ -89,12 +90,8 @@ function createFixture(t) {
   const reach = jobs.map(({ id: job, platforms }) => ({ job, platforms }));
   const suites = [
     ["rust", "crates/demo/src/lib.rs", "cargo test --workspace --all-targets"],
-    [
-      "typescript",
-      "packages/sdk/test/client.test.ts",
-      "node --test scripts/*.test.mjs",
-    ],
-    ["scripts", "scripts/gate.test.mjs", "node --test scripts/*.test.mjs"],
+    ["typescript", "packages/sdk/test/client.test.ts", scriptTestCommand],
+    ["scripts", "scripts/gate.test.mjs", scriptTestCommand],
   ].map(([id, suitePath, selectionAnchor]) => ({
     id,
     kind: "test",
@@ -188,6 +185,22 @@ test("discovers every checked-in Rust, TypeScript, and script test surface", (t)
 test("accepts complete required-job, platform, invariant, and selection reach", (t) => {
   const fixture = createFixture(t);
   assert.deepEqual(validateCiReachability(fixture), []);
+});
+
+test("requires serial script-file scheduling for qualification fixtures", (t) => {
+  const fixture = createFixture(t);
+  const checkPath = path.join(fixture.root, "scripts/check.sh");
+  fs.writeFileSync(
+    checkPath,
+    fs
+      .readFileSync(checkPath, "utf8")
+      .replace(scriptTestCommand, "node --test scripts/*.test.mjs"),
+  );
+  assert.ok(
+    validateCiReachability(fixture).some((error) =>
+      error.includes("selection anchor is unreachable"),
+    ),
+  );
 });
 
 test("canonical final steps override persisted shell startup paths", (t) => {
