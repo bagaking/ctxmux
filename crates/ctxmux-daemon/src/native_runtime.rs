@@ -778,6 +778,17 @@ fn extract_live_descriptors(entries: &mut [NativeEntry]) -> Vec<LiveDescriptors>
         // the pty master box is never dropped and the master fd stays open.
         std::mem::forget(watching.child);
         std::mem::forget(watching.control);
+        // Stop the owner from reading this master after extract. `entry.output`
+        // holds a CLOEXEC *dup* of the master (created at spawn via
+        // `duplicate_cloexec`), so dropping it closes ONLY the reader-side dup —
+        // the master handed off in the manifest stays open via the forgotten
+        // control Arc above. With the reader gone and lifecycle now `Done`, the
+        // owner-loop retain predicate drops this entry, so no further `Append`
+        // can be enqueued for it. The durable barrier taken after extract then
+        // covers every byte ever read (f04), and unread kernel-buffer bytes
+        // remain for the incoming image to read starting at the persisted
+        // cursor.
+        entry.output = None;
     }
     descriptors
 }

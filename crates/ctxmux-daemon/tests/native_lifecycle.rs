@@ -256,6 +256,8 @@ fn interactive_shell() -> RunSpec {
                 "while IFS= read -r line; do ",
                 "case \"$line\" in ",
                 "size) printf 'SIZE:'; stty size ;; ",
+                "burst=*) n=${line#burst=}; i=0; ",
+                "while [ \"$i\" -lt \"$n\" ]; do printf 'OUT:burst-%06d\\n' \"$i\"; i=$((i+1)); done ;; ",
                 "quit) printf 'OUT:quit\\n'; exit 7 ;; ",
                 "*) printf 'OUT:%s\\n' \"$line\" ;; ",
                 "esac; done"
@@ -2592,6 +2594,240 @@ async fn upgrade_preserves_live_run() {
     .await;
 
     // Let the child exit cleanly through the re-adopted session.
+    second_attachment
+        .input(b"quit\n".to_vec())
+        .await
+        .expect("write quit through the re-adopted input writer");
+    wait_for_output(
+        &mut second_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:quit",
+    )
+    .await;
+    assert_eq!(
+        wait_until_exited(&daemon.client, run.id).await,
+        RunState::Exited {
+            code: 7,
+            signal: None,
+        },
+        "the re-adopted run should exit through its own quit path"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one continuous test drives a burst through the exec-upgrade reader window and proves content-complete, gapless continuity from the settled snapshot"
+)]
+async fn upgrade_preserves_output_across_the_reader_window() {
+    // REGRESSION GUARD for the f04 replay-gap defect: at extract the owner MUST
+    // stop reading each pty master (native_runtime.rs sets `entry.output = None`
+    // so the retain predicate drops the just-extracted entry). If the reader is
+    // NOT stopped, it keeps draining the master in the window between the
+    // durable barrier returning and execve; any byte it consumes there is pulled
+    // out of the pty kernel buffer (unre-readable by the incoming image) and its
+    // Append races — and loses to — execve killing the persistence actor. The
+    // durable head then lags the bytes actually consumed, so after readopt the
+    // adopted master is misaligned: k bytes are silently lost mid-stream.
+    //
+    // This test drives a distinctive multi-line burst through that exact window
+    // (a single small input triggers the child to spew BURST_LINES ordered
+    // lines, so output keeps flowing while the owner is torn down at SIGHUP),
+    // lets it fully settle on the incoming image, then re-attaches at C0 and
+    // proves from the SETTLED snapshot that EVERY burst line survived. Offsets
+    // alone do not catch the defect (the incoming image re-numbers from the
+    // persisted cursor, so start_byte stays contiguous even when a run of bytes
+    // is dropped); the per-line CONTENT assertions in step 8 are what fail if
+    // any byte is lost in the window. Confirmed to FAIL against the pre-fix code
+    // (a run of ~300-860 burst lines vanishes mid-stream) and PASS with the
+    // `entry.output = None` fix.
+
+    // A single small input triggers the child to emit this many ordered lines
+    // (`OUT:burst-000000` ..), so output keeps flowing across the whole
+    // extract -> barrier -> exec window while the owner is being torn down.
+    const BURST_LINES: usize = 4000;
+
+    // 1. Start a persistent daemon and a live interactive Run.
+    let mut daemon = TestDaemon::start_persistent().await;
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start native Run");
+    let p0 = run.pid.expect("shell exposes a process id");
+    assert!(process_exists(p0), "child should be running before the upgrade");
+
+    // 2. Attach, reach READY, drive `before` to a known cursor C0.
+    let (mut first_attachment, first_snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach to native Run");
+    let mut observed = replay_bytes(&first_snapshot.replay.chunks);
+    let mut last_seq = first_snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut first_attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+    first_attachment
+        .input(b"before\n".to_vec())
+        .await
+        .expect("write through attachment before the upgrade");
+    wait_for_output(
+        &mut first_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:before",
+    )
+    .await;
+    let c0 = last_seq;
+
+    // 3. Trigger a long child-driven burst and SIGHUP immediately. A single
+    //    small input line makes the child emit BURST_LINES ordered lines
+    //    (`OUT:burst-000000` ..) with NO further input needed, so output keeps
+    //    flowing across the whole extract -> barrier -> exec window while the
+    //    owner is being torn down — the exact window the defect corrupts. We do
+    //    NOT wait for the echo: awaiting the input receipt only proves the
+    //    `burst=N` line reached the pty; the child then spews on its own. We
+    //    SIGHUP right after so the reader is stopped mid-burst.
+    first_attachment
+        .input(format!("burst={BURST_LINES}\n").into_bytes())
+        .await
+        .expect("flush the burst trigger to the pty writer before the upgrade");
+    // The per-connection attachment cannot survive execve; drop it and re-attach
+    // afterwards. Dropping it does NOT stop the owner's reader (output is
+    // persisted independently of attachments) — only extract must.
+    drop(first_attachment);
+
+    // 4. Trigger the real re-exec and await the incoming image's resume signal.
+    daemon.sighup();
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(
+        resume.contains("1 run(s)"),
+        "incoming image should adopt exactly one live run, got: {resume}"
+    );
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("poll daemon across the upgrade")
+            .is_none(),
+        "execve must reuse the same os process (no daemon exit)"
+    );
+
+    // 5. Wait for the burst to FULLY settle on the incoming image. Output is
+    //    logged + persisted by the owner independently of any attachment, so we
+    //    poll status until `latest_output_bytes` stops growing. Settling first
+    //    is deliberate: it lets us read the whole burst from the attach SNAPSHOT
+    //    (replay, contiguous by construction) instead of the live broadcast
+    //    channel, whose bounded capacity would raise a spurious lag `Gap` on a
+    //    68KB in-flight burst and mask the real defect either way.
+    let settled = timeout(Duration::from_secs(15), async {
+        let mut stable_at = None;
+        let mut stable_polls = 0;
+        loop {
+            if let Ok(info) = daemon.client.status(run.id).await {
+                if Some(info.latest_output_bytes) == stable_at {
+                    stable_polls += 1;
+                    // ~600ms of no growth: the child's burst loop has ended and
+                    // every byte the incoming image will ever read is logged.
+                    if stable_polls >= 6 {
+                        return info.latest_output_bytes;
+                    }
+                } else {
+                    stable_at = Some(info.latest_output_bytes);
+                    stable_polls = 0;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("burst output should settle on the incoming image");
+
+    // 6. Attach fresh at C0 on the incoming image and take the settled snapshot.
+    let (second_attachment, second_snapshot) = timeout(Duration::from_secs(10), async {
+        loop {
+            match daemon.client.attach(run.id, c0).await {
+                Ok(pair) => return pair,
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("re-attach to the surviving run after the upgrade");
+
+    // 7. Offsets: replay must be contiguous from the requested cursor C0 (first
+    //    chunk starts exactly at C0, no truncation below it) and the durable
+    //    cursor never regressed. NOTE: contiguous offsets ALONE do not catch the
+    //    defect — the incoming image re-numbers from the persisted cursor, so a
+    //    lost byte leaves the stream offset-contiguous but content-short. The
+    //    content check in step 8 is the real detector.
+    assert_eq!(
+        second_snapshot.replay.latest_output_bytes, settled,
+        "the settled snapshot must expose the full logged output length"
+    );
+    assert!(
+        second_snapshot.replay.latest_output_bytes >= c0,
+        "durable output cursor must not regress across the upgrade"
+    );
+    let first_chunk = second_snapshot
+        .replay
+        .chunks
+        .first()
+        .expect("a settled snapshot from C0 must replay at least one chunk");
+    assert_eq!(
+        first_chunk.start_byte, c0,
+        "replay after the upgrade must be contiguous from the requested cursor C0"
+    );
+    // Chunks within the snapshot must themselves be gap-free.
+    let mut cursor = first_chunk.start_byte;
+    for chunk in &second_snapshot.replay.chunks {
+        assert_eq!(
+            chunk.start_byte, cursor,
+            "settled replay chunks must be byte-contiguous (no gap) from C0"
+        );
+        cursor = chunk.end_byte;
+    }
+
+    // 8. CONTENT completeness (the real f04 defect detector): every burst line
+    //    must be present in the settled replay. If the pre-fix reader kept
+    //    draining the master in the barrier→exec window, the bytes it consumed
+    //    there are lost (their Append raced and lost to execve, and they are
+    //    gone from the kernel buffer), so a run of lines vanishes mid-stream
+    //    even though the offsets above stayed perfectly contiguous.
+    let observed = replay_bytes(&second_snapshot.replay.chunks);
+    for index in 0..BURST_LINES {
+        let marker = format!("OUT:burst-{index:06}");
+        assert!(
+            observed
+                .windows(marker.len())
+                .any(|window| window == marker.as_bytes()),
+            "burst line {marker} must survive the exec-upgrade reader window \
+             (a missing line means bytes were lost between the barrier and execve)"
+        );
+    }
+
+    // 9. Drive MORE output after resume to confirm the re-adopted writer + master
+    //    keep echoing past the boundary. This is a small live burst, so it does
+    //    not overflow the live channel; `wait_for_output` panics on any Gap and
+    //    asserts chunk.start_byte == last_byte, proving live continuity too.
+    let mut observed = observed;
+    let mut last_seq = second_snapshot.replay.latest_output_bytes;
+    let mut second_attachment = second_attachment;
+    second_attachment
+        .input(b"resumed\n".to_vec())
+        .await
+        .expect("write through the re-adopted input writer");
+    wait_for_output(
+        &mut second_attachment,
+        &mut observed,
+        &mut last_seq,
+        b"OUT:resumed",
+    )
+    .await;
+
+    // 10. Clean exit through the re-adopted session.
     second_attachment
         .input(b"quit\n".to_vec())
         .await

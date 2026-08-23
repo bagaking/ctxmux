@@ -420,6 +420,22 @@ async fn serve_with_manager(
                             "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
                         );
                     }
+                    Err(UpgradeAbort::Quiesce(error)) => {
+                        // `shutdown_owned_controls` failed AFTER it irreversibly
+                        // latched its daemon-global mutations (admission fenced,
+                        // tmux shutting down). No run was extracted, but the
+                        // daemon can no longer create runs or service tmux, so
+                        // "continue serving" would be a lie. Fail-stop. Do NOT
+                        // call `shutdown_owned_controls` again — its globals are
+                        // already latched and a second call would re-run the
+                        // quiesce that just failed.
+                        let message = format!(
+                            "exec-in-place upgrade failed to quiesce owned controls; the daemon has irreversibly closed admission and cannot continue — failing stop: {error}"
+                        );
+                        manager.incarnation_failure.record(message.clone());
+                        manager.qualification_stats.finish();
+                        return Err(ServerError::Shutdown { failures: message });
+                    }
                     Err(UpgradeAbort::AfterExtract(error)) => {
                         // Point of no return passed: native children/controls were
                         // forgotten and their fds marked to survive exec, but exec
@@ -447,11 +463,22 @@ async fn serve_with_manager(
     }
 }
 
-/// Which side of the extract point-of-no-return an aborted exec-in-place upgrade
-/// failed on. Before extract the daemon can keep serving; after extract it must
-/// fail-stop (never resume with forgotten controls).
+/// How an aborted exec-in-place upgrade failed, relative to two irreversible
+/// points. The upgrade proceeds: reversible setup → quiesce owned controls →
+/// extract (point of no return) → exec.
+/// - `BeforeExtract`: a reversible setup step failed (handoff pipe / CLOEXEC)
+///   before anything daemon-global was mutated — the daemon keeps serving.
+/// - `Quiesce`: `shutdown_owned_controls` failed, but it has ALREADY latched
+///   irreversible globals (admission fenced, tmux shutting down) — the daemon
+///   can no longer create runs or service tmux, so it must fail-stop even
+///   though no run was extracted.
+/// - `AfterExtract`: a failure past the point of no return — native
+///   children/controls were forgotten and their fds marked to survive exec, but
+///   exec did not happen — fail-stop so process death reclaims the fds (never
+///   resume serving with forgotten controls).
 enum UpgradeAbort {
     BeforeExtract(ServerError),
+    Quiesce(ServerError),
     AfterExtract(ServerError),
 }
 
@@ -496,19 +523,23 @@ fn perform_exec_upgrade(
     // Quiesce tmux control owners exactly as shutdown does. Native runs are
     // untouched here (they are handed off live below); tmux runs cannot be
     // handed off and are reconciled fresh by the incoming image from state.
+    // This latches irreversible daemon-global mutations (admission fenced, tmux
+    // shutting down) at its very top, so a failure here is NOT reversible: it is
+    // `Quiesce`, which fail-stops rather than resuming a bricked serve loop.
     manager
         .shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)
-        .map_err(UpgradeAbort::BeforeExtract)?;
+        .map_err(UpgradeAbort::Quiesce)?;
 
     // --- POINT OF NO RETURN: extract relinquishes reap/close authority for
     // every live native child; from here, any failure is fail-stop. ---
     let live = manager.native_runs.extract_for_handoff();
 
-    // Durable-commit barrier AFTER extract (corrected order): extract has
-    // stopped the owner's reader, so every byte ever read is now enqueued as an
-    // Append. Draining the FIFO here guarantees the persisted cursor covers all
-    // of them before we exec. A barrier *before* extract would race the still-
-    // running reader and could leave a replay gap.
+    // Durable-commit barrier AFTER extract (corrected order): extract closes
+    // each run's pty reader (via `entry.output = None`) and relinquishes its
+    // child/control, so after extract the owner enqueues no further Appends.
+    // Draining the FIFO barrier here fences every byte ever read before we exec,
+    // guaranteeing the persisted cursor covers all of them. A barrier *before*
+    // extract would race the still-running reader and could leave a replay gap.
     manager
         .persistence_barrier()
         .map_err(UpgradeAbort::AfterExtract)?;
