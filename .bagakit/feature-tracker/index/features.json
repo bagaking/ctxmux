@@ -141,7 +141,7 @@
     {
       "feat_id": "f-22ecztapc",
       "title": "Complete the local Runtime embedding contract",
-      "status": "in_progress",
+      "status": "ready",
       "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",

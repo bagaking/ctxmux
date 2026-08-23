@@ -1,10 +1,9 @@
 {
-  "version": 2,
-  "feat_id": "f-22ecztapc",
-  "plan_status": "reviewed",
-  "plan_revision": 2,
-  "supersedes_revision": 1,
-  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md",
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
+  },
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -14,57 +13,10 @@
     "packages/sdk/README.md",
     ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
   ],
-  "plan_history": [
-    {
-      "revision": 1,
-      "supersedes_revision": null,
-      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "packages/sdk/README.md"
-      ],
-      "task_ids": [
-        "T-000",
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004",
-        "T-005",
-        "T-006"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 2,
-      "supersedes_revision": 1,
-      "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "packages/sdk/README.md",
-        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
-      ],
-      "task_ids": [
-        "T-000",
-        "T-001",
-        "T-002",
-        "T-003",
-        "T-004",
-        "T-005",
-        "T-006"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    }
-  ],
+  "supersedes": {
+    "revision": 1,
+    "reason": "Replace the weaker inferred nested-boolean Runtime manifest with the direct user-confirmed RuntimeIdentity minimum contract before continuing T-002."
+  },
   "tasks": [
     {
       "id": "T-000",
@@ -93,18 +45,7 @@
         "docs/protocol.md#persistence-and-restart-recovery",
         "crates/ctxmux-daemon/tests/native_lifecycle.rs"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "done",
-      "gate_result": "pass",
-      "last_gate_commands": [
-        {
-          "command": "scripts/check.sh",
-          "exit_code": 0,
-          "status": "pass"
-        }
-      ],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-001",
@@ -136,18 +77,7 @@
         "docs/architecture/choices/011-context-artifact-lineage-fork.md",
         "packages/sdk/README.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "done",
-      "gate_result": "pass",
-      "last_gate_commands": [
-        {
-          "command": "scripts/check.sh",
-          "exit_code": 0,
-          "status": "pass"
-        }
-      ],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-002",
@@ -186,12 +116,7 @@
         "packages/sdk/src/index.ts",
         ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-2-plan-review.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-003",
@@ -222,12 +147,7 @@
         "crates/ctxmux-protocol/src/lib.rs",
         "crates/ctxmux-daemon/src/persistence.rs"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-004",
@@ -253,12 +173,7 @@
         "crates/ctxmux/src/main.rs",
         "packages/sdk/src/index.ts"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-005",
@@ -289,12 +204,7 @@
         "packages/sdk/README.md",
         "packages/sdk/src/index.ts"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-006",
@@ -330,12 +240,8 @@
         "docs/roadmap.md",
         "packages/sdk/README.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     }
   ]
 }
+
