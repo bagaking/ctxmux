@@ -112,13 +112,14 @@ CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run"
     assert.notEqual(runtime.runtimeId, runId);
     assert.notEqual(runtime.daemonInstanceId, runId);
     assert.match(runtime.buildId, /^ctxmuxd\/[^/]+$/u);
-    assert.equal(runtime.protocolGeneration, 10);
+    assert.equal(runtime.protocolGeneration, 11);
     assert.notEqual(runtime.platform, "");
     assert.notEqual(runtime.arch, "");
     assert.deepEqual(runtime.capabilities, {
       "native.execute_materialized_level_b": 1,
       "native.fork_level_a": 1,
       "native.recoverable_input": 1,
+      "native.recoverable_stop": 1,
       "native.start": 1,
       "tmux.discover": 1,
       "tmux.import": 1,
@@ -190,8 +191,8 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 10"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 10"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 11"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 11"
 
 ctxmux_cli_default_list=$(env -u CTXMUX_SOCKET XDG_RUNTIME_DIR="$ctxmux_cli_tmp" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_default_list" "$ctxmux_cli_run"
