@@ -32,6 +32,7 @@ independently closable; one result must not keep an unrelated owner open.
 | Composition and release (`f-225cz7943`) | Prove public composition, activation, installation, packaging, independent release review, supported platforms, and local release gates.                                                        | composition example; package/release preparation; daemon activation; release qualification                                                     |
 | Peer performance (`f-22aczwza9`)        | Run one pre-registered, budget-bounded measure/optimize/remeasure cycle and record honest wins, ties, and losses.                                                                               | comparable harness; measured raw-byte ROI decision; bounded-cycle result                                                                       |
 | Recoverable native Input                | Make one native short-lived Input retry-safe after response loss within the same daemon incarnation and report the exact applied PTY byte range.                                                | Rust public vertical; TypeScript parity; bounded review and focused Gate                                                                       |
+| Recoverable native Stop (`f-22gcz4t8v`) | Recover one complete-session Stop result after response loss without entering the existing Stop owner twice, and keep the operation record bounded by retained Run lifetime.                    | frozen Stop/SSOT baseline; Rust owner vertical; attachment/TS/CLI/exec/GC parity; exact-commit qualification                                    |
 | Public Local consumer (`f-22dczvf38`)   | Close only the exact-commit local embedding gaps without absorbing consumer semantics or Remote transport.                                                                                      | cumulative output byte cursors; public interrupt and complete process-tree Stop; exact-commit artifacts and required CI qualification          |
 
 The earlier reliability-and-performance umbrella `f-226cz5zdq` is superseded
@@ -101,6 +102,36 @@ transport, release work, or Agent message semantics. The later public-local-
 consumer Feature owns foreground-group Interrupt and complete POSIX-session
 Stop because their target, grace, force, and quiescence rules are not Input's
 mutation algebra.
+
+### M1 operation hardening — recoverable native Stop
+
+Feature `f-22gcz4t8v` closes only the remaining response-loss ambiguity around
+the already implemented complete-session Stop owner. It does not redesign Stop
+admission, foreground mutation fencing, graceful/forced cleanup, direct-child
+reaping, POSIX-session quiescence, or the documented `setsid()` and PID-reuse
+limits.
+
+The public operation binds one caller-retained key to the original daemon
+instance and exact Run. One admitted key owns the Run's single Stop attempt;
+an exact duplicate joins or replays its terminal result, while another key for
+that Run or reuse against another Run conflicts before mutation. Short requests
+and attachment controls converge on one ledger. The ledger retains at most one
+entry per retained Run, leaves with Run collection, and crosses a validated
+planned exec only with the preserved daemon instance. Cold replacement does
+not promise Stop-result recovery.
+
+Delivery order is vertical: first freeze the current Stop and SSOT baseline,
+then prove the Rust response-loss path, extend that same owner to attachment,
+TypeScript, CLI, planned exec and collection, and finally qualify one exact
+commit through an isolated consumer. Do not preserve the pre-stable Stop shape,
+add a general mutation framework, or absorb Agent, Provider, Permission,
+message, Desktop Workbench close, Remote Runtime, crash-adoption, or release
+semantics.
+
+The AgentMux entropy-reduction work is a separate downstream Feature in its own
+repository. It may delete unknown-Stop handling only after consuming the exact
+qualified ctxmux commit and `native.recoverable_stop: 1`; its View-close
+transaction and AgentSession behavior remain AgentMux/Desktop ownership.
 
 ## Architecture evidence and failure corpus
 
