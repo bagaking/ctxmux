@@ -38,9 +38,7 @@ Agent-neutral Run Runtime boundary.
   - Remote tunnel loss remains `unverifiable`; only the remote owner can change
     RunState or settle Stop.
 - Evidence refs:
-  - `.bagakit/researcher/topics/engineering/ctxmux-peer-mechanism-distillation/summaries/synthesis.md`
-  - `.bagakit/researcher/topics/engineering/ctxmux-peer-mechanism-distillation/claims.md#c012`
-  - `.bagakit/researcher/topics/engineering/ctxmux-peer-mechanism-distillation/claims.md#c016`
+  - `.bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md`
   - `docs/roadmap.md#standalone-runtime-convergence--phase-1`
   - `.bagakit/feature-tracker/features/f-22ecztapc/tasks.json`
   - `.bagakit/feature-tracker/features/f-22hjbhvt8/tasks.json`
