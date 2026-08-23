@@ -24,6 +24,118 @@
   ],
   "suites": [
     {
+      "id": "cli-daemon-activation-owner",
+      "kind": "test",
+      "path": "crates/ctxmux/src/daemon.rs",
+      "invariants": [
+        "CLI daemon activation parses readiness, rejects incompatible identity, and cleans up only its own failed launch"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "cli-screen-projection",
+      "kind": "test",
+      "path": "crates/ctxmux/src/screen.rs",
+      "invariants": [
+        "interactive attach paints retained terminal state and applies ordered output without replaying stale control history"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "cli-auto-start-lifecycle",
+      "kind": "test",
+      "path": "crates/ctxmux/tests/auto_start.rs",
+      "invariants": [
+        "the public CLI auto-starts one daemon and a later client reconnects to the same daemon-owned Run"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-adopted-pty",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/adopted_pty.rs",
+      "invariants": [
+        "an inherited PTY master re-establishes safe reader, writer, resize, and terminal-size control after exec"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "daemon-handoff-manifest",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/handoff.rs",
+      "invariants": [
+        "exec handoff schema, descriptors, compact Input ledger, cursor truth, and size bounds fail closed before adoption"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "daemon-native-runtime-owner",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/native_runtime.rs",
+      "invariants": [
+        "the daemon-wide native owner preserves ordered output and direct-child authority while all-owner handoff preflight is atomic"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-spawn-environment",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/native_spawn_env.rs",
+      "invariants": [
+        "native PTY launch publishes deterministic terminal identity without leaking launcher-only environment state"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
+      "id": "native-terminal-identity",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/native_terminal_identity.rs",
+      "invariants": [
+        "real native children receive a controlling terminal, session identity, and foreground process-group behavior"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "fixture-validator-contracts",
       "kind": "test",
       "path": "scripts/check-fixtures.test.mjs",

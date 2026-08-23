@@ -904,6 +904,55 @@
       "reason": "The exact Registry fence and SQLite replacement transaction are accepted design but not implemented yet."
     },
     {
+      "id": "UPGRADE-01",
+      "choice": "015-exec-in-place-upgrade-continuity",
+      "source_ids": ["m02", "m01"],
+      "source_refs": [
+        "https://pubs.opengroup.org/onlinepubs/9799919799/functions/exec.html",
+        "https://pubs.opengroup.org/onlinepubs/9799919799/functions/write.html"
+      ],
+      "failure_mechanism": "A planned exec extracts live PTY ownership while an admitted Input result or retained retry ledger is still crossing, losing acknowledgement or applying the same bytes twice after reconnect.",
+      "invariant": "A planned exec preserves exactly one complete Run owner, ordered output, the complete bounded recoverable-Input cursor and ledger, lifecycle identity, and explicit crossing-control disposition.",
+      "preconditions": "A persistent daemon owns a real PTY child and can pause one admitted Input at the owner boundary before receiving SIGHUP.",
+      "action": "Cross SIGHUP with the held Input, retry a response-lost operation after exec, and repeat settled upgrades while observing process, listener, descriptor, thread, and handoff-path identity.",
+      "oracle": "The crossing acknowledgement precedes reconnect, draining rejects later mutation as not-applied, exact retry writes no second bytes, daemon and child identity remain, ordered output continues, and repeated upgrades add no settled resource or pathname residue.",
+      "platform": ["unix"],
+      "tags": ["upgrade", "exec", "pty", "input", "ownership", "census"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "upgrade_preserves_response_loss_input_ledger_and_cursor"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "upgrade_drains_crossing_input_through_its_ack_response"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "repeated_upgrades_have_zero_settled_fd_and_thread_delta"
+        }
+      ]
+    },
+    {
+      "id": "DERIVATION-01",
+      "choice": "016-interrupted-run-derivation",
+      "source_ids": ["k02"],
+      "source_refs": [
+        "https://github.com/git/git/blob/010afd3166ddc64c9863b1506f12cbcdda0d4ea1/Documentation/git-clone.adoc"
+      ],
+      "failure_mechanism": "A caller requests Provider-native Level B continuation from an interrupted parent, but the Runtime guesses session provenance or silently starts a weaker Level A child.",
+      "invariant": "Interrupted-Run derivation creates a distinct child only from the explicitly requested portable or caller-materialized plan; missing Level B provenance fails before launch and never changes fidelity.",
+      "preconditions": "A retained interrupted parent exists and a future public derivation surface distinguishes Level A from Level B.",
+      "action": "Request Level B without complete caller-owned provenance and a replacement RunSpec, then inspect planner, child, raw-fork, and lineage side effects.",
+      "oracle": "The request returns a structured failure with zero planner, child, and raw-fork effects; Level A occurs only after a separate explicit request.",
+      "platform": ["portable"],
+      "tags": ["derivation", "fork", "provenance", "fidelity", "fail-closed"],
+      "disposition": "future",
+      "activation_task": "future:interrupted-run-derivation",
+      "reason": "ADR 016 defines the Provider-neutral boundary, but no public interrupted-parent derivation verb exists yet."
+    },
+    {
       "id": "INPUT-01",
       "choice": "014-recoverable-input-operations",
       "source_ids": ["m01"],

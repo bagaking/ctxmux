@@ -14,8 +14,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 #[cfg(test)]
 use super::AttachmentHookPoint;
 use super::{
-    ConnectionError, ControlResult, Run, RunManager, STOP_ACK_TIMEOUT, invalid_request, receive,
-    send,
+    ConnectionError, ControlResult, Run, RunManager, STOP_ACK_TIMEOUT, UpgradeRequestAdmission,
+    UpgradeRequestPermit, control_not_applied, invalid_request, receive, send, upgrade_retry_error,
 };
 
 pub(super) async fn handle(
@@ -23,6 +23,7 @@ pub(super) async fn handle(
     manager: Arc<RunManager>,
     id: RunId,
     after_byte: u64,
+    request_permit: UpgradeRequestPermit,
 ) -> Result<(), ConnectionError> {
     let run = match manager.pin(id) {
         Ok(run) => run,
@@ -41,6 +42,10 @@ pub(super) async fn handle(
     let mut sent_through_byte = header.replay.latest_output_bytes;
     send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;
     send_replay(&mut wire, replay_chunks).await?;
+    // Attach setup is one admitted request, but a long-lived attachment is only
+    // a view. Release its request permit after the replay snapshot; each later
+    // mutating command acquires its own permit through `handle_frame`.
+    drop(request_permit);
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSnapshot).await;
@@ -63,8 +68,9 @@ pub(super) async fn handle(
         // the explicit stop barrier, not select readiness, orders terminal exit.
         tokio::select! {
             biased;
-            Some((command_id, outcome)) = command_results.next(), if !command_results.is_empty() => {
+            Some((command_id, outcome, permit)) = command_results.next(), if !command_results.is_empty() => {
                 send_command_result(&mut wire, command_id, outcome).await?;
+                drop(permit);
                 if controls.pending_stop == Some(command_id) {
                     controls.pending_stop = None;
                     if let Some(event) = controls.held_terminal.take() {
@@ -143,7 +149,9 @@ struct ControlState {
     held_terminal: Option<RunEvent>,
 }
 
-type PendingResults = FuturesUnordered<BoxFuture<'static, (AttachmentCommandId, ControlOutcome)>>;
+type PendingResults = FuturesUnordered<
+    BoxFuture<'static, (AttachmentCommandId, ControlOutcome, UpgradeRequestPermit)>,
+>;
 
 enum ControlCommand {
     Input(Vec<u8>),
@@ -188,37 +196,67 @@ async fn handle_frame(
         send(wire, &ServerFrame::Error { error }).await?;
         return Ok(true);
     }
+    let permit = match manager.upgrade_requests.admit() {
+        UpgradeRequestAdmission::Execute(permit) => permit,
+        UpgradeRequestAdmission::Retry(permit) => {
+            send_command_result(
+                wire,
+                command_id,
+                ControlOutcome::Rejected {
+                    failure: control_not_applied(upgrade_retry_error()),
+                },
+            )
+            .await?;
+            drop(permit);
+            return Ok(false);
+        }
+        UpgradeRequestAdmission::Sealed => return Ok(true),
+    };
 
     match command {
         ControlCommand::Input(data) => match run.begin_input(data) {
             Ok(pending) => {
-                results.push(async move { (command_id, outcome(pending.resolve().await)) }.boxed());
+                results.push(
+                    async move { (command_id, outcome(pending.resolve().await), permit) }.boxed(),
+                );
             }
             Err(failure) => {
                 send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+                drop(permit);
             }
         },
         ControlCommand::Resize(size) => {
             send_command_result(wire, command_id, outcome(run.resize(size))).await?;
+            drop(permit);
         }
         ControlCommand::Signal(signal) => match run.begin_signal(signal) {
             Ok(pending) => {
-                results.push(async move { (command_id, outcome(pending.resolve().await)) }.boxed());
+                results.push(
+                    async move { (command_id, outcome(pending.resolve().await), permit) }.boxed(),
+                );
             }
             Err(failure) => {
                 send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+                drop(permit);
             }
         },
         ControlCommand::Stop => match run.begin_stop() {
             Ok(pending) => {
                 controls.pending_stop = Some(command_id);
                 results.push(
-                    async move { (command_id, outcome(pending.resolve(STOP_ACK_TIMEOUT).await)) }
-                        .boxed(),
+                    async move {
+                        (
+                            command_id,
+                            outcome(pending.resolve(STOP_ACK_TIMEOUT).await),
+                            permit,
+                        )
+                    }
+                    .boxed(),
                 );
             }
             Err(failure) => {
                 send_command_result(wire, command_id, ControlOutcome::Rejected { failure }).await?;
+                drop(permit);
             }
         },
     }

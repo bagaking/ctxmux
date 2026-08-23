@@ -34,7 +34,9 @@ manifest; those remain separate open work.
 
 Generation 9 includes one random daemon-incarnation identity in the successful
 Hello frame. It is a live retry fence, not build, host, platform, or durable
-process identity. Ordinary `input` retains the prior receipt semantics:
+process identity. A cold start creates a new identity; a persistent-mode
+planned exec-in-place upgrade preserves it together with the complete settled
+recoverable-Input ledger and cursor. Ordinary `input` retains the prior receipt semantics:
 when its result is lost, callers must not retry it. The separate
 `recoverable_input` operation below binds the original daemon incarnation and
 can resolve its own lost response.
@@ -210,15 +212,17 @@ Input may have advanced it after this operation completed.
 While an operation is pending or retained, an exact retry joins or returns the
 same result; another payload or expected cursor with that key returns
 `input_operation_conflict`. The Run-local ledger retains at most 256 entries and
-1 MiB of request bytes. It evicts only completed results. Clients use a fresh
-key for every new logical operation; an exact retry after eviction still has an
-old expected cursor and returns `input_cursor_mismatch` without mutation.
+1 MiB of request bytes. It is incarnation-local, not connection-local. A
+planned exec-in-place upgrade carries its complete completed/unknown entries,
+poisoned-lane state, and applied cursor in the validated handoff manifest; a
+cold replacement does not. It evicts only completed results. Clients use a
+fresh key for every new logical operation; an exact retry after eviction still
+has an old expected cursor and returns `input_cursor_mismatch` without mutation.
 
 Partial write, flush failure, or writer panic returns an `unknown` failure,
 retains that keyed unknown result, and poisons the Input lane. No applied range
-or cursor advance is invented. The ledger is memory-only. A replacement daemon
-returns `daemon_instance_mismatch`; ctxmux never claims cross-crash exactly-once
-Input.
+or cursor advance is invented. A cold replacement daemon returns
+`daemon_instance_mismatch`; ctxmux never claims cross-crash exactly-once Input.
 
 ### Control correlation and owner receipts
 
@@ -448,9 +452,23 @@ not Run state, discovery, persistence, cross-user authentication, or a new wire
 generation. Without the flag daemon startup is unchanged.
 
 Without `--state-dir`, Runs outlive CLI and SDK connections but not the daemon
-process. With `--state-dir <dedicated-directory>`, one owner-only SQLite store
-recovers historical Run identity, exact `RunSpec`, lineage, terminal state, and
-the committed bounded replay window across daemon restart.
+process, and `SIGHUP` is a logged no-op. With `--state-dir
+<dedicated-directory>`, one owner-only SQLite store recovers historical Run
+identity, exact `RunSpec`, lineage, terminal state, and the committed bounded
+replay window across cold daemon restart. On intentional `SIGHUP`, the daemon
+instead performs an exec-in-place upgrade: its PID, listener inode, state lock,
+live child and PTY masters, daemon instance, input cursors and settled ledgers
+survive; attachments reconnect from their own output cursors.
+
+Before extraction, the daemon's upgrade request gate is reversible. Requests
+already admitted retain their permit through owner completion and response
+write, while later attachment commands receive an explicit retryable
+`backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
+setup failure, or all-owner preflight failure restores normal admission. After
+extraction, ownership has been relinquished to the pending exec and any error is
+fail-stop. The version-2 handoff manifest and every carried descriptor are
+strictly bounded, unique, and validated; generation 9 gains no upgrade wire
+operation.
 
 Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
@@ -465,10 +483,12 @@ the socket becomes visible. Unknown versions, corrupt state, or an
 individually unprovable normalization unit fail startup; there is no migration,
 reset, salvage, or partial exposure.
 
-A prior-epoch running record becomes `interrupted { reason: daemon_restart }`
-with `pid: null`. Live PTY ownership and child control are not recovered. An old
-HUP-ignoring process may remain an orphan, but the replacement daemon never
-opens or signals it from persisted metadata.
+A prior-epoch running record not accompanied by the validated live handoff set
+becomes `interrupted { reason: daemon_restart }` with `pid: null`. A cold
+replacement never recovers live PTY ownership or child control and never opens
+or signals an old HUP-ignoring process from persisted metadata. The planned
+exec path is different: the same parent process carries actual master
+descriptors and wait authority; it does not adopt a PID guessed from SQLite.
 
 ## Authoritative schema
 

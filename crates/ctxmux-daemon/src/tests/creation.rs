@@ -1277,7 +1277,9 @@ async fn barrier_flushes_prior_appends_before_returning() {
     // the durable cursor already covers every byte recorded up to this mark.
     run.record_output(b"barrier-covers-these-bytes".to_vec());
     let mark = run.info().latest_output_bytes;
-    persistence.barrier().expect("clean-slot barrier commits and returns Ok");
+    persistence
+        .barrier()
+        .expect("clean-slot barrier commits and returns Ok");
     assert!(
         run.info().durable_output_bytes.unwrap_or(0) >= mark,
         "barrier must not return until every prior append is durable (mark {mark})"

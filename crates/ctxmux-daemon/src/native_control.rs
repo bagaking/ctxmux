@@ -1,7 +1,7 @@
 //! Current-incarnation ownership of one native Run's PTY controls.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -15,6 +15,7 @@ use ctxmux_protocol::{
     InputOperationKey, ProtocolError, RunId, RunSignal, StopDisposition, TerminalSize,
 };
 use portable_pty::{Child, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, watch};
 
 use crate::adopted_pty::AdoptedMasterPty;
@@ -28,6 +29,7 @@ const INPUT_BURST_MAX_COMMANDS: usize = 64;
 const INPUT_BURST_MAX_BYTES: usize = 256 * 1024;
 const INPUT_RESULT_MAX_ENTRIES: usize = 256;
 const INPUT_RESULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1024;
 const STOP_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub(crate) type ControlResult = Result<ControlReceipt, ControlFailure>;
@@ -343,6 +345,174 @@ enum InputOperationEntry {
     },
 }
 
+/// Recoverable native Input truth that must cross an exec-in-place upgrade
+/// because that upgrade deliberately preserves the daemon incarnation fence.
+/// Only settled entries can be handed off: the upgrade request gate waits for
+/// every admitted mutation and its response write before extraction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandoffInputState {
+    pub(crate) applied_input_bytes: u64,
+    pub(crate) input_failure: Option<ProtocolError>,
+    pub(crate) operations: Vec<HandoffInputOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum HandoffInputOperation {
+    Completed {
+        key: InputOperationKey,
+        expected_byte: u64,
+        #[serde(with = "handoff_bytes")]
+        data: Vec<u8>,
+        range: AppliedInputRange,
+    },
+    Unknown {
+        key: InputOperationKey,
+        expected_byte: u64,
+        #[serde(with = "handoff_bytes")]
+        data: Vec<u8>,
+        failure: ControlFailure,
+    },
+}
+
+impl HandoffInputState {
+    pub(crate) fn empty() -> Self {
+        Self {
+            applied_input_bytes: 0,
+            input_failure: None,
+            operations: Vec::new(),
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.operations.len() > INPUT_RESULT_MAX_ENTRIES {
+            return Err(format!(
+                "handoff native Input ledger has {} entries; maximum is {INPUT_RESULT_MAX_ENTRIES}",
+                self.operations.len()
+            ));
+        }
+        let mut retained_bytes = 0_usize;
+        let mut keys = HashSet::<InputOperationKey>::new();
+        let mut completed_end = 0_u64;
+        let mut unknown_count = 0_usize;
+        let mut diagnostic_bytes = self
+            .input_failure
+            .as_ref()
+            .map_or(0, |failure| failure.message.len());
+        for operation in &self.operations {
+            let (key, expected_byte, data) = match operation {
+                HandoffInputOperation::Completed {
+                    key,
+                    expected_byte,
+                    data,
+                    range,
+                } => {
+                    let expected_end = expected_byte
+                        .checked_add(
+                            u64::try_from(data.len())
+                                .map_err(|_| "handoff native Input length does not fit u64")?,
+                        )
+                        .ok_or("handoff native Input range overflows")?;
+                    if range.start_byte != *expected_byte
+                        || range.end_byte != expected_end
+                        || range.end_byte > self.applied_input_bytes
+                        || range.start_byte < completed_end
+                    {
+                        return Err(
+                            "handoff completed native Input range is inconsistent".to_owned()
+                        );
+                    }
+                    completed_end = range.end_byte;
+                    (key, expected_byte, data)
+                }
+                HandoffInputOperation::Unknown {
+                    key,
+                    expected_byte,
+                    data,
+                    failure,
+                } => {
+                    unknown_count += 1;
+                    diagnostic_bytes = diagnostic_bytes
+                        .checked_add(failure.error.message.len())
+                        .ok_or("handoff native Input diagnostic size overflows")?;
+                    if failure.disposition != CommandDisposition::Unknown {
+                        return Err(
+                            "handoff unknown native Input has a non-unknown disposition".to_owned()
+                        );
+                    }
+                    if *expected_byte != self.applied_input_bytes {
+                        return Err(
+                            "handoff unknown native Input does not fence the current cursor"
+                                .to_owned(),
+                        );
+                    }
+                    if self.input_failure.as_ref().map(|error| error.code)
+                        != Some(failure.error.code)
+                    {
+                        return Err(
+                            "handoff unknown native Input has a different poisoned-lane failure code"
+                                .to_owned(),
+                        );
+                    }
+                    (key, expected_byte, data)
+                }
+            };
+            key.validate()
+                .map_err(|error| format!("invalid handoff native Input key: {error}"))?;
+            if data.is_empty() {
+                return Err("handoff recoverable native Input payload is empty".to_owned());
+            }
+            if !keys.insert(key.clone()) {
+                return Err("handoff native Input ledger contains a duplicate key".to_owned());
+            }
+            let _ = expected_byte;
+            retained_bytes = retained_bytes
+                .checked_add(data.len())
+                .ok_or("handoff native Input retained-byte count overflows")?;
+        }
+        if retained_bytes > INPUT_RESULT_MAX_REQUEST_BYTES {
+            return Err(format!(
+                "handoff native Input ledger retains {retained_bytes} request bytes; maximum is {INPUT_RESULT_MAX_REQUEST_BYTES}"
+            ));
+        }
+        if unknown_count > 1 {
+            return Err(
+                "handoff native Input ledger contains multiple unknown operations".to_owned(),
+            );
+        }
+        validate_handoff_diagnostic_bytes(diagnostic_bytes)
+    }
+}
+
+fn validate_handoff_diagnostic_bytes(diagnostic_bytes: usize) -> Result<(), String> {
+    if diagnostic_bytes > HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES {
+        return Err(format!(
+            "handoff native Input diagnostics retain {diagnostic_bytes} bytes; maximum is {HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+mod handoff_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    pub(super) fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(D::Error::custom)
+    }
+}
+
 impl InputOperationEntry {
     fn request(&self) -> &InputOperationRequest {
         match self {
@@ -472,13 +642,17 @@ impl NativeControlOwner {
         writer: Box<dyn Write + Send>,
         input_drains: InputDrainGate,
         owner_wake: OwnerWake,
+        input_state: HandoffInputState,
     ) -> Self {
-        Self::new_with_pty(
+        Self::new_with_pty_and_input_state(
             run_id,
             Box::new(adopted),
             writer,
             input_drains,
             owner_wake,
+            INPUT_RESULT_MAX_ENTRIES,
+            INPUT_RESULT_MAX_REQUEST_BYTES,
+            input_state,
         )
     }
 
@@ -561,8 +735,83 @@ impl NativeControlOwner {
         input_result_max_entries: usize,
         input_result_max_request_bytes: usize,
     ) -> Self {
+        Self::new_with_pty_and_input_state(
+            run_id,
+            pty,
+            writer,
+            input_drains,
+            owner_wake,
+            input_result_max_entries,
+            input_result_max_request_bytes,
+            HandoffInputState::empty(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_pty_and_input_state(
+        run_id: RunId,
+        pty: Box<dyn PtyControl>,
+        writer: Box<dyn Write + Send>,
+        input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
+        input_result_max_entries: usize,
+        input_result_max_request_bytes: usize,
+        input_state: HandoffInputState,
+    ) -> Self {
         debug_assert!(input_result_max_entries > 0);
         debug_assert!(input_result_max_request_bytes > 0);
+        input_state
+            .validate()
+            .expect("re-adopted native Input state is validated before construction");
+        let retained_input_request_bytes = input_state
+            .operations
+            .iter()
+            .map(|operation| match operation {
+                HandoffInputOperation::Completed { data, .. }
+                | HandoffInputOperation::Unknown { data, .. } => data.len(),
+            })
+            .sum();
+        let mut input_operations = HashMap::with_capacity(input_state.operations.len());
+        let mut completed_input_operations = VecDeque::new();
+        for operation in input_state.operations {
+            match operation {
+                HandoffInputOperation::Completed {
+                    key,
+                    expected_byte,
+                    data,
+                    range,
+                } => {
+                    input_operations.insert(
+                        key.clone(),
+                        InputOperationEntry::Completed {
+                            request: InputOperationRequest {
+                                expected_byte,
+                                data: Arc::from(data),
+                            },
+                            range,
+                        },
+                    );
+                    completed_input_operations.push_back(key);
+                }
+                HandoffInputOperation::Unknown {
+                    key,
+                    expected_byte,
+                    data,
+                    failure,
+                } => {
+                    input_operations.insert(
+                        key,
+                        InputOperationEntry::Unknown {
+                            request: InputOperationRequest {
+                                expected_byte,
+                                data: Arc::from(data),
+                            },
+                            failure,
+                        },
+                    );
+                }
+            }
+        }
         Self {
             inner: Arc::new(NativeControlInner {
                 run_id,
@@ -570,15 +819,15 @@ impl NativeControlOwner {
                 writer: Mutex::new(Some(writer)),
                 state: Mutex::new(NativeControlState {
                     phase: ControlPhase::Open,
-                    input_failure: None,
+                    input_failure: input_state.input_failure,
                     input_queue: VecDeque::new(),
                     input_commands: 0,
                     input_bytes: 0,
                     input_scheduled: false,
-                    applied_input_bytes: 0,
-                    input_operations: HashMap::new(),
-                    completed_input_operations: VecDeque::new(),
-                    retained_input_request_bytes: 0,
+                    applied_input_bytes: input_state.applied_input_bytes,
+                    input_operations,
+                    completed_input_operations,
+                    retained_input_request_bytes,
                     input_result_max_entries,
                     input_result_max_request_bytes,
                     child_open: true,
@@ -736,6 +985,95 @@ impl NativeControlOwner {
 
     pub(crate) fn applied_input_bytes(&self) -> u64 {
         mutex_lock(&self.inner.state).applied_input_bytes
+    }
+
+    /// Snapshot the complete bounded recoverable-Input contract after the
+    /// daemon request gate has drained. This is a precondition check as well as
+    /// serialization: a pending input/child command makes extraction fail
+    /// before any ownership is relinquished.
+    pub(crate) fn handoff_input_state(&self) -> Result<HandoffInputState, String> {
+        let state = mutex_lock(&self.inner.state);
+        if state.phase != ControlPhase::Open
+            || !state.child_open
+            || state.stop_pending
+            || !state.child_commands.is_empty()
+            || state.input_scheduled
+            || state.input_commands != 0
+            || state.input_bytes != 0
+            || !state.input_queue.is_empty()
+        {
+            return Err(format!(
+                "Run {} still has a crossing native control at handoff",
+                self.inner.run_id
+            ));
+        }
+
+        let mut operations = Vec::with_capacity(state.input_operations.len());
+        for key in &state.completed_input_operations {
+            let Some(InputOperationEntry::Completed { request, range }) =
+                state.input_operations.get(key)
+            else {
+                return Err(format!(
+                    "Run {} completed native Input order is inconsistent",
+                    self.inner.run_id
+                ));
+            };
+            operations.push(HandoffInputOperation::Completed {
+                key: key.clone(),
+                expected_byte: request.expected_byte,
+                data: request.data.to_vec(),
+                range: *range,
+            });
+        }
+        let mut unknown = state
+            .input_operations
+            .iter()
+            .filter_map(|(key, entry)| match entry {
+                InputOperationEntry::Unknown { request, failure } => Some((
+                    key.clone(),
+                    request.expected_byte,
+                    request.data.to_vec(),
+                    failure.clone(),
+                )),
+                InputOperationEntry::Pending { .. } | InputOperationEntry::Completed { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        if state
+            .input_operations
+            .values()
+            .any(|entry| matches!(entry, InputOperationEntry::Pending { .. }))
+        {
+            return Err(format!(
+                "Run {} has a pending recoverable Input at handoff",
+                self.inner.run_id
+            ));
+        }
+        unknown.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+        operations.extend(
+            unknown
+                .into_iter()
+                .map(
+                    |(key, expected_byte, data, failure)| HandoffInputOperation::Unknown {
+                        key,
+                        expected_byte,
+                        data,
+                        failure,
+                    },
+                ),
+        );
+        if operations.len() != state.input_operations.len() {
+            return Err(format!(
+                "Run {} native Input handoff ledger is incomplete",
+                self.inner.run_id
+            ));
+        }
+        let snapshot = HandoffInputState {
+            applied_input_bytes: state.applied_input_bytes,
+            input_failure: state.input_failure.clone(),
+            operations,
+        };
+        snapshot.validate()?;
+        Ok(snapshot)
     }
 
     pub(crate) fn begin_stop(&self) -> Result<PendingStop, ControlFailure> {
@@ -1702,8 +2040,8 @@ mod tests {
     use portable_pty::PtySize;
 
     use super::{
-        ChildCommand, InputDrainGate, NativeControlOwner, PortablePtyControl, PtyControl,
-        StopOwnerResult, mutex_lock,
+        ChildCommand, HandoffInputOperation, InputDrainGate, NativeControlOwner,
+        PortablePtyControl, PtyControl, StopOwnerResult, mutex_lock,
     };
     use crate::native_runtime::NativeRunOwner;
 
@@ -2355,6 +2693,154 @@ mod tests {
         assert_eq!(stale.error.code, ErrorCode::InputCursorMismatch);
         assert_eq!(stale.disposition, CommandDisposition::NotApplied);
         assert_eq!(*mutex_lock(&written), b"ABC");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completed_recoverable_input_ledger_round_trips_without_a_second_write() {
+        let original_written = Arc::new(Mutex::new(Vec::new()));
+        let (original, _child) = owner(
+            Box::new(RecordingWriter(Arc::clone(&original_written))),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let key = InputOperationKey::new("handoff-completed").unwrap();
+        let range = original
+            .begin_recoverable_input(key.clone(), 0, b"A".to_vec())
+            .expect("admit original operation")
+            .resolve()
+            .await
+            .expect("apply original operation");
+        let snapshot = original
+            .handoff_input_state()
+            .expect("settled ledger is handoff-ready");
+        assert_eq!(snapshot.applied_input_bytes, 1);
+        assert!(matches!(
+            snapshot.operations.as_slice(),
+            [HandoffInputOperation::Completed { range: retained, .. }] if *retained == range
+        ));
+
+        let adopted_written = Arc::new(Mutex::new(Vec::new()));
+        let runtime = NativeRunOwner::default();
+        let adopted = NativeControlOwner::new_with_pty_and_input_state(
+            original.run_id(),
+            Box::new(FakePty::new(0)),
+            Box::new(RecordingWriter(Arc::clone(&adopted_written))),
+            InputDrainGate::default(),
+            runtime.owner_wake(),
+            super::INPUT_RESULT_MAX_ENTRIES,
+            super::INPUT_RESULT_MAX_REQUEST_BYTES,
+            snapshot,
+        );
+        assert_eq!(
+            adopted
+                .begin_recoverable_input(key, 0, b"A".to_vec())
+                .expect("adopted owner finds retained operation")
+                .resolve()
+                .await
+                .expect("retained operation stays successful"),
+            range
+        );
+        assert!(
+            mutex_lock(&adopted_written).is_empty(),
+            "retained retry must not cross the PTY write boundary again"
+        );
+        adopted
+            .begin_recoverable_input(
+                InputOperationKey::new("handoff-following").unwrap(),
+                1,
+                b"B".to_vec(),
+            )
+            .expect("cursor continues after handoff")
+            .resolve()
+            .await
+            .expect("following operation applies");
+        assert_eq!(*mutex_lock(&adopted_written), b"B");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_recoverable_input_and_poisoned_lane_round_trip() {
+        let original_written = Arc::new(Mutex::new(Vec::new()));
+        let (original, _child) = owner(
+            Box::new(PrefixThenFailWriter {
+                wrote_prefix: false,
+                written: Arc::clone(&original_written),
+            }),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let key = InputOperationKey::new("handoff-unknown").unwrap();
+        let failure = original
+            .begin_recoverable_input(key.clone(), 0, b"AB".to_vec())
+            .expect("admit ambiguous operation")
+            .resolve()
+            .await
+            .expect_err("partial write is unknown");
+        let snapshot = original
+            .handoff_input_state()
+            .expect("settled unknown ledger is handoff-ready");
+        assert_eq!(snapshot.applied_input_bytes, 0);
+        assert!(snapshot.input_failure.is_some());
+
+        let adopted_written = Arc::new(Mutex::new(Vec::new()));
+        let runtime = NativeRunOwner::default();
+        let adopted = NativeControlOwner::new_with_pty_and_input_state(
+            original.run_id(),
+            Box::new(FakePty::new(0)),
+            Box::new(RecordingWriter(Arc::clone(&adopted_written))),
+            InputDrainGate::default(),
+            runtime.owner_wake(),
+            super::INPUT_RESULT_MAX_ENTRIES,
+            super::INPUT_RESULT_MAX_REQUEST_BYTES,
+            snapshot,
+        );
+        assert_eq!(
+            adopted
+                .begin_recoverable_input(key, 0, b"AB".to_vec())
+                .expect("retained unknown remains addressable")
+                .resolve()
+                .await
+                .expect_err("retained unknown stays unknown"),
+            failure
+        );
+        let rejected = adopted
+            .begin_input(b"C".to_vec())
+            .expect_err("poisoned lane rejects new input after handoff");
+        assert_eq!(rejected.disposition, CommandDisposition::NotApplied);
+        assert!(mutex_lock(&adopted_written).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_input_rejects_handoff_until_the_owner_settles() {
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (owner, _child) = owner(
+            Box::new(BlockingWriter {
+                started: Some(started_tx),
+                release: Arc::clone(&release),
+                written: Arc::new(Mutex::new(0)),
+            }),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let pending = owner
+            .begin_recoverable_input(
+                InputOperationKey::new("handoff-pending").unwrap(),
+                0,
+                b"A".to_vec(),
+            )
+            .expect("admit crossing operation");
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("operation reaches blocking writer");
+        assert!(
+            owner.handoff_input_state().is_err(),
+            "crossing operation must reject extraction"
+        );
+        release_writer(&release);
+        pending.resolve().await.expect("crossing operation settles");
+        owner
+            .handoff_input_state()
+            .expect("settled operation becomes handoff-ready");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

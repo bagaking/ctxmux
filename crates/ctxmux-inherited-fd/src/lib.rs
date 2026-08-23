@@ -56,20 +56,23 @@ pub fn duplicate_nonblocking_cloexec(raw_fd: RawFd) -> std::io::Result<OwnedFd> 
     Ok(owned)
 }
 
-/// Take ownership of an already-open inherited descriptor as an `OwnedFd`.
+/// Claim one already-open descriptor delivered by the process inheritance
+/// contract as an `OwnedFd`.
 ///
 /// The returned `OwnedFd` closes the descriptor on drop. Unlike
 /// `duplicate_cloexec`, this claims the caller's own descriptor number rather
-/// than duplicating it, so exactly one owner exists afterward. Intended for
-/// single-use descriptors the parent set up for this process (e.g. an
-/// exec-handoff pipe read end).
+/// than duplicating it. This API does not pretend Rust can prove ownership
+/// across `spawn` or `execve`: before entry, the launcher/outgoing image must
+/// have transferred the descriptor without retaining another Rust owner. The
+/// receiving process validates descriptor lists for uniqueness before making
+/// one claim per descriptor.
 ///
 /// # Errors
 ///
 /// Rejects standard descriptors and returns an operating-system error when the
 /// descriptor is not open.
 #[allow(unsafe_code)]
-pub fn owned_from_raw(raw_fd: RawFd) -> std::io::Result<OwnedFd> {
+pub fn claim_inherited_process_fd(raw_fd: RawFd) -> std::io::Result<OwnedFd> {
     if raw_fd < 3 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -81,9 +84,10 @@ pub fn owned_from_raw(raw_fd: RawFd) -> std::io::Result<OwnedFd> {
     if unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // SAFETY: the caller guarantees it holds sole ownership of this open,
-    // inherited descriptor and transfers that ownership here; the probe above
-    // confirmed it is open, so exactly one owner (the returned OwnedFd) exists.
+    // SAFETY: the process inheritance contract guarantees that no Rust owner
+    // exists in this image for this transferred descriptor. The probe above
+    // confirms it is open; the receiving startup path validates uniqueness and
+    // calls this function exactly once for each inherited number.
     Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
 
@@ -123,7 +127,7 @@ mod tests {
         pipe::pipe,
     };
 
-    use super::{duplicate_cloexec, duplicate_nonblocking_cloexec, owned_from_raw};
+    use super::{claim_inherited_process_fd, duplicate_cloexec, duplicate_nonblocking_cloexec};
 
     #[test]
     fn blocking_duplicate_preserves_shared_status_flags() {
@@ -193,10 +197,10 @@ mod tests {
     }
 
     #[test]
-    fn owned_from_raw_claims_the_descriptor_without_duplicating() {
+    fn inherited_process_claim_uses_the_transferred_descriptor_without_duplicating() {
         let (reader, writer) = pipe().unwrap();
         let raw = writer.as_raw_fd();
-        let owned = owned_from_raw(raw).unwrap();
+        let owned = claim_inherited_process_fd(raw).unwrap();
         // No dup: the returned owner claims the caller's own descriptor number.
         assert_eq!(owned.as_raw_fd(), raw);
         // Ownership moved to `owned`; forget the original so only one owner drops.
@@ -209,13 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn owned_from_raw_rejects_standard_and_closed_descriptors() {
+    fn inherited_process_claim_rejects_standard_and_closed_descriptors() {
         assert_eq!(
-            owned_from_raw(2).unwrap_err().kind(),
+            claim_inherited_process_fd(2).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            owned_from_raw(1_000_000).unwrap_err().raw_os_error(),
+            claim_inherited_process_fd(1_000_000)
+                .unwrap_err()
+                .raw_os_error(),
             Some(libc::EBADF)
         );
     }

@@ -14,7 +14,7 @@ use std::{
     },
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock, RwLock,
+        Arc, Condvar, Mutex, OnceLock, RwLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
@@ -62,8 +62,8 @@ use crate::creation::{
     UnpublishedCleanupReservation,
 };
 use crate::native_control::{
-    ControlResult, DetachedNativeDescriptors, InputDrainGate, NativeControlOwner, PendingInput,
-    PendingSignal, PendingStop,
+    ControlResult, DetachedNativeDescriptors, HandoffInputState, InputDrainGate,
+    NativeControlOwner, PendingInput, PendingSignal, PendingStop,
 };
 use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
 use crate::native_session::{AdoptedChild, NativeSession};
@@ -91,6 +91,7 @@ const TMUX_IMPORT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 const TMUX_IMPORT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUX_IMPORT_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
 const TMUX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
+const UPGRADE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Failure that prevents the daemon server from running.
 #[derive(Debug, Error)]
@@ -227,18 +228,18 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
         // map. The listener fd is intentionally left untouched: it is wrapped
         // later inside `serve_with_persistence_manager`/`adopt_listener`.
         let live_set: HashSet<RunId> = manifest.runs.iter().map(|run| run.run_id).collect();
-        let mut adopt: HashMap<RunId, (OwnedFd, u32)> =
+        let mut adopt: HashMap<RunId, (OwnedFd, u32, HandoffInputState)> =
             HashMap::with_capacity(manifest.runs.len());
         for run in &manifest.runs {
-            let master = ctxmux_inherited_fd::owned_from_raw(run.master_fd)
+            let master = ctxmux_inherited_fd::claim_inherited_process_fd(run.master_fd)
                 .map_err(|source| ServerError::io("<handoff master fd>", source))?;
-            adopt.insert(run.run_id, (master, run.child_pid));
+            adopt.insert(run.run_id, (master, run.child_pid, run.input_state.clone()));
         }
         let hint = HandoffHint {
             epoch: manifest.epoch.clone(),
             live_set,
             state_lock_fd: Some(
-                ctxmux_inherited_fd::owned_from_raw(manifest.state_lock_fd)
+                ctxmux_inherited_fd::claim_inherited_process_fd(manifest.state_lock_fd)
                     .map_err(|source| ServerError::io("<handoff state-lock fd>", source))?,
             ),
         };
@@ -325,7 +326,15 @@ async fn serve_with_persistence_manager(
             .map_err(|source| ServerError::io(&socket_path, source))?;
         listener
     };
-    serve_with_manager(socket_path, listener, manager, readiness_fd, handoff, state_dir).await
+    serve_with_manager(
+        socket_path,
+        listener,
+        manager,
+        readiness_fd,
+        handoff,
+        state_dir,
+    )
+    .await
 }
 
 /// Reconstruct the local listener from an inherited socket fd without binding.
@@ -334,7 +343,7 @@ async fn serve_with_persistence_manager(
 /// outgoing image left (its CLOEXEC bit cleared just before exec) and wraps it
 /// through the safe `From<OwnedFd>` impl, so the socket inode is unchanged.
 fn adopt_listener(listener_fd: RawFd) -> Result<UnixListener, ServerError> {
-    let owned = ctxmux_inherited_fd::owned_from_raw(listener_fd)
+    let owned = ctxmux_inherited_fd::claim_inherited_process_fd(listener_fd)
         .map_err(|source| ServerError::io("<handoff listener fd>", source))?;
     let std_listener = std::os::unix::net::UnixListener::from(owned); // safe From<OwnedFd>
     std_listener
@@ -420,22 +429,6 @@ async fn serve_with_manager(
                             "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
                         );
                     }
-                    Err(UpgradeAbort::Quiesce(error)) => {
-                        // `shutdown_owned_controls` failed AFTER it irreversibly
-                        // latched its daemon-global mutations (admission fenced,
-                        // tmux shutting down). No run was extracted, but the
-                        // daemon can no longer create runs or service tmux, so
-                        // "continue serving" would be a lie. Fail-stop. Do NOT
-                        // call `shutdown_owned_controls` again — its globals are
-                        // already latched and a second call would re-run the
-                        // quiesce that just failed.
-                        let message = format!(
-                            "exec-in-place upgrade failed to quiesce owned controls; the daemon has irreversibly closed admission and cannot continue — failing stop: {error}"
-                        );
-                        manager.incarnation_failure.record(message.clone());
-                        manager.qualification_stats.finish();
-                        return Err(ServerError::Shutdown { failures: message });
-                    }
                     Err(UpgradeAbort::AfterExtract(error)) => {
                         // Point of no return passed: native children/controls were
                         // forgotten and their fds marked to survive exec, but exec
@@ -464,21 +457,16 @@ async fn serve_with_manager(
 }
 
 /// How an aborted exec-in-place upgrade failed, relative to two irreversible
-/// points. The upgrade proceeds: reversible setup → quiesce owned controls →
+/// points. The upgrade proceeds: reversible setup → drain admitted requests →
 /// extract (point of no return) → exec.
-/// - `BeforeExtract`: a reversible setup step failed (handoff pipe / CLOEXEC)
+/// - `BeforeExtract`: a reversible setup step failed (handoff file / request drain)
 ///   before anything daemon-global was mutated — the daemon keeps serving.
-/// - `Quiesce`: `shutdown_owned_controls` failed, but it has ALREADY latched
-///   irreversible globals (admission fenced, tmux shutting down) — the daemon
-///   can no longer create runs or service tmux, so it must fail-stop even
-///   though no run was extracted.
 /// - `AfterExtract`: a failure past the point of no return — native
 ///   children/controls were forgotten and their fds marked to survive exec, but
 ///   exec did not happen — fail-stop so process death reclaims the fds (never
 ///   resume serving with forgotten controls).
 enum UpgradeAbort {
     BeforeExtract(ServerError),
-    Quiesce(ServerError),
     AfterExtract(ServerError),
 }
 
@@ -492,47 +480,54 @@ fn perform_exec_upgrade(
     listener: &UnixListener,
     manager: &RunManager,
 ) -> Result<(), UpgradeAbort> {
-    use std::io::Write as _;
+    use std::io::{Seek as _, Write as _};
     use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     use std::os::unix::process::CommandExt as _;
 
     // --- Reversible phase (before the point of no return) ---
 
-    // Create the handoff pipe. `rustix::pipe::pipe_with(PipeFlags::CLOEXEC)` is
-    // gated out on Apple, so create a plain pipe and set close-on-exec on both
-    // ends explicitly (a safe rustix flag mutation). Both ends start CLOEXEC so
-    // they never leak into a concurrent spawn on another runtime worker; the
-    // read end's CLOEXEC is cleared just before execve so it survives as
-    // --handoff-fd, and the write end stays CLOEXEC and is closed by us before
-    // exec so the reader gets EOF.
-    let (read_end, write_end) = rustix::pipe::pipe().map_err(|errno| {
+    // A regular, immediately unlinked state-dir file avoids the pipe-capacity
+    // deadlock that a complete bounded Input ledger could trigger before exec:
+    // no incoming reader exists until the image has already been replaced.
+    let handoff_path = state_dir.join(format!(".ctxmux-handoff-{}", uuid::Uuid::new_v4()));
+    let mut handoff_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&handoff_path)
+        .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io(&handoff_path, source)))?;
+    std::fs::remove_file(&handoff_path)
+        .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io(&handoff_path, source)))?;
+    rustix::io::fcntl_setfd(&handoff_file, rustix::io::FdFlags::CLOEXEC).map_err(|errno| {
         UpgradeAbort::BeforeExtract(ServerError::io(
-            "<handoff pipe>",
+            "<handoff file cloexec>",
             std::io::Error::from(errno),
         ))
     })?;
-    for end in [&read_end, &write_end] {
-        rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).map_err(|errno| {
-            UpgradeAbort::BeforeExtract(ServerError::io(
-                "<handoff pipe cloexec>",
-                std::io::Error::from(errno),
-            ))
-        })?;
-    }
+    let exe = std::env::current_exe()
+        .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io("<current_exe>", source)))?;
 
-    // Quiesce tmux control owners exactly as shutdown does. Native runs are
-    // untouched here (they are handed off live below); tmux runs cannot be
-    // handed off and are reconciled fresh by the incoming image from state.
-    // This latches irreversible daemon-global mutations (admission fenced, tmux
-    // shutting down) at its very top, so a failure here is NOT reversible: it is
-    // `Quiesce`, which fail-stops rather than resuming a bricked serve loop.
-    manager
-        .shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)
-        .map_err(UpgradeAbort::Quiesce)?;
+    // Fence new request mutations and wait until every already-admitted request
+    // has written its response. The fence is RAII-reversible until extraction,
+    // so timeout or owner preflight failure restores complete service.
+    let mut request_fence = manager
+        .upgrade_requests
+        .begin_drain(UPGRADE_QUIESCE_TIMEOUT)
+        .map_err(|failure| {
+            UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures: failure })
+        })?;
 
     // --- POINT OF NO RETURN: extract relinquishes reap/close authority for
     // every live native child; from here, any failure is fail-stop. ---
-    let live = manager.native_runs.extract_for_handoff();
+    let live = manager
+        .native_runs
+        .extract_for_handoff()
+        .map_err(|failure| {
+            UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures: failure })
+        })?;
+    request_fence.commit();
 
     // Durable-commit barrier AFTER extract (corrected order): extract closes
     // each run's pty reader (via `entry.output = None`) and relinquishes its
@@ -552,6 +547,7 @@ fn perform_exec_upgrade(
             run_id: d.run_id,
             child_pid: d.child_pid,
             master_fd: d.master_fd,
+            input_state: d.input_state,
         })
         .collect();
     let epoch = manager.daemon_instance.to_string();
@@ -563,29 +559,27 @@ fn perform_exec_upgrade(
         .state_lock_fd();
     let manifest = crate::handoff::HandoffManifest::new(epoch, listener_fd, state_lock_fd, runs);
 
-    // Serialize + write one NDJSON line, then close the write end so the incoming
-    // image's read_to_end sees EOF after the buffered bytes.
-    let mut bytes = serde_json::to_vec(&manifest).map_err(|source| {
+    // Serialize directly into the unlinked file, append one NDJSON newline, and
+    // rewind it for the incoming image. This keeps transient memory bounded by
+    // serde's per-value work instead of cloning every retained Input payload.
+    serde_json::to_writer(&mut handoff_file, &manifest).map_err(|source| {
         UpgradeAbort::AfterExtract(ServerError::io(
             "<handoff manifest>",
             std::io::Error::other(source),
         ))
     })?;
-    bytes.push(b'\n');
-    let read_fd = read_end.as_raw_fd();
-    {
-        let mut writer = std::fs::File::from(write_end);
-        writer
-            .write_all(&bytes)
-            .and_then(|()| writer.flush())
-            .map_err(|source| {
-                UpgradeAbort::AfterExtract(ServerError::io("<handoff manifest>", source))
-            })?;
-    } // writer (write_end) dropped here → pipe write end closed → reader gets EOF
+    handoff_file
+        .write_all(b"\n")
+        .and_then(|()| handoff_file.flush())
+        .and_then(|()| handoff_file.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|source| {
+            UpgradeAbort::AfterExtract(ServerError::io("<handoff manifest>", source))
+        })?;
+    let read_fd = handoff_file.as_raw_fd();
 
     // Clear CLOEXEC LAST, immediately before execve, on exactly the fds that
     // must survive: the manifest's fds ([listener, state_lock, ...masters]) plus
-    // the handoff pipe read end. Nothing else.
+    // the handoff manifest file. Nothing else.
     for fd in manifest.all_fds() {
         ctxmux_inherited_fd::clear_cloexec(fd).map_err(|source| {
             UpgradeAbort::AfterExtract(ServerError::io("<handoff fd cloexec>", source))
@@ -597,9 +591,6 @@ fn perform_exec_upgrade(
 
     // Re-exec this same binary with the inherited descriptors. exec() returns
     // ONLY on failure; on success the image is replaced here.
-    let exe = std::env::current_exe().map_err(|source| {
-        UpgradeAbort::AfterExtract(ServerError::io("<current_exe>", source))
-    })?;
     let mut command = std::process::Command::new(exe);
     command
         .arg("--socket")
@@ -609,8 +600,8 @@ fn perform_exec_upgrade(
         .arg("--handoff-fd")
         .arg(read_fd.to_string());
     let exec_error = command.exec(); // only returns on failure
-    // Keep read_end alive until here so the fd is not closed before exec.
-    drop(read_end);
+    // Keep the manifest file alive until here so the fd is not closed before exec.
+    drop(handoff_file);
     Err(UpgradeAbort::AfterExtract(ServerError::io(
         "<exec-in-place>",
         exec_error,
@@ -722,12 +713,142 @@ struct RunManager {
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
     incarnation_failure: IncarnationFailure,
+    upgrade_requests: UpgradeRequestGate,
     tmux_shutting_down: AtomicBool,
     tmux_operation_gate: RwLock<()>,
     #[cfg(test)]
     attachment_hook: Option<Arc<AttachmentTestHook>>,
     #[cfg(test)]
     creation_hook: Option<Arc<CreationTestHook>>,
+}
+
+#[derive(Clone, Default)]
+struct UpgradeRequestGate {
+    inner: Arc<UpgradeRequestGateInner>,
+}
+
+#[derive(Default)]
+struct UpgradeRequestGateInner {
+    state: Mutex<UpgradeRequestGateState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct UpgradeRequestGateState {
+    phase: UpgradeRequestPhase,
+    active: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum UpgradeRequestPhase {
+    #[default]
+    Open,
+    Draining,
+    Sealed,
+}
+
+enum UpgradeRequestAdmission {
+    Execute(UpgradeRequestPermit),
+    Retry(UpgradeRequestPermit),
+    Sealed,
+}
+
+struct UpgradeRequestPermit {
+    inner: Arc<UpgradeRequestGateInner>,
+}
+
+struct UpgradeRequestFence {
+    gate: UpgradeRequestGate,
+    committed: bool,
+}
+
+impl UpgradeRequestGate {
+    fn admit(&self) -> UpgradeRequestAdmission {
+        let mut state = mutex_lock(&self.inner.state);
+        match state.phase {
+            UpgradeRequestPhase::Open | UpgradeRequestPhase::Draining => {
+                state.active += 1;
+                let permit = UpgradeRequestPermit {
+                    inner: Arc::clone(&self.inner),
+                };
+                if state.phase == UpgradeRequestPhase::Open {
+                    UpgradeRequestAdmission::Execute(permit)
+                } else {
+                    UpgradeRequestAdmission::Retry(permit)
+                }
+            }
+            UpgradeRequestPhase::Sealed => UpgradeRequestAdmission::Sealed,
+        }
+    }
+
+    fn begin_drain(&self, timeout: Duration) -> Result<UpgradeRequestFence, String> {
+        let deadline = Instant::now() + timeout;
+        let mut state = mutex_lock(&self.inner.state);
+        if state.phase != UpgradeRequestPhase::Open {
+            return Err("another exec-in-place upgrade is already draining requests".to_owned());
+        }
+        state.phase = UpgradeRequestPhase::Draining;
+        while state.active != 0 {
+            let now = Instant::now();
+            if now >= deadline {
+                state.phase = UpgradeRequestPhase::Open;
+                self.inner.changed.notify_all();
+                return Err(format!(
+                    "timed out waiting for {} admitted request(s) to finish",
+                    state.active
+                ));
+            }
+            let (next, _) = self
+                .inner
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next;
+        }
+        state.phase = UpgradeRequestPhase::Sealed;
+        Ok(UpgradeRequestFence {
+            gate: self.clone(),
+            committed: false,
+        })
+    }
+}
+
+impl Drop for UpgradeRequestPermit {
+    fn drop(&mut self) {
+        let mut state = mutex_lock(&self.inner.state);
+        state.active = state
+            .active
+            .checked_sub(1)
+            .expect("upgrade request permits remain balanced");
+        if state.active == 0 {
+            self.inner.changed.notify_all();
+        }
+    }
+}
+
+impl UpgradeRequestFence {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for UpgradeRequestFence {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut state = mutex_lock(&self.gate.inner.state);
+        debug_assert_eq!(state.phase, UpgradeRequestPhase::Sealed);
+        state.phase = UpgradeRequestPhase::Open;
+        self.gate.inner.changed.notify_all();
+    }
+}
+
+fn upgrade_retry_error() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::BackendUnavailable,
+        "ctxmux daemon is draining for an exec-in-place upgrade; reconnect and retry",
+    )
 }
 
 #[derive(Clone, Default)]
@@ -1078,6 +1199,7 @@ impl RunManager {
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
+            upgrade_requests: UpgradeRequestGate::default(),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -1137,6 +1259,7 @@ impl RunManager {
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
+            upgrade_requests: UpgradeRequestGate::default(),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -1162,7 +1285,7 @@ impl RunManager {
         persistence: Persistence,
         recovered: Vec<RecoveredRun>,
         qualification_stats: QualificationStats,
-        mut adopt: HashMap<RunId, (OwnedFd, u32)>,
+        mut adopt: HashMap<RunId, (OwnedFd, u32, HandoffInputState)>,
     ) -> Result<Self, ProtocolError> {
         let terminal_publications = TerminalPublicationOwner::default();
         let native_runs = NativeRuntimeOwner::default();
@@ -1182,11 +1305,12 @@ impl RunManager {
             );
             let metadata_owner = durable.metadata_bytes_owner();
             let run = match adopt.remove(&recovered.info.id) {
-                Some((master_fd, child_pid)) => Run::readopt(
+                Some((master_fd, child_pid, input_state)) => Run::readopt(
                     recovered,
                     durable,
                     master_fd,
                     child_pid,
+                    input_state,
                     native_runs.clone(),
                     LIVE_EVENT_CAPACITY,
                     terminal_publications.clone(),
@@ -1220,6 +1344,7 @@ impl RunManager {
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure,
+            upgrade_requests: UpgradeRequestGate::default(),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -2923,6 +3048,7 @@ impl Run {
         persistence: PersistentRun,
         master_fd: OwnedFd,
         child_pid: u32,
+        input_state: HandoffInputState,
         native_runs: NativeRuntimeOwner,
         live_event_capacity: usize,
         terminal_publications: TerminalPublicationOwner,
@@ -2967,6 +3093,7 @@ impl Run {
             writer,
             input_drains,
             owner_wake,
+            input_state,
         );
         // Mirror the spawn seam: bind the reap control so that if registration
         // fails, `PendingChild::drop` records the kill/reap outcome against the
@@ -4230,14 +4357,30 @@ async fn handle_connection(
         return Ok(());
     };
 
+    let request_permit = match manager.upgrade_requests.admit() {
+        UpgradeRequestAdmission::Execute(permit) => permit,
+        UpgradeRequestAdmission::Retry(permit) => {
+            send(
+                &mut wire,
+                &ServerFrame::Error {
+                    error: upgrade_retry_error(),
+                },
+            )
+            .await?;
+            drop(permit);
+            return Ok(());
+        }
+        UpgradeRequestAdmission::Sealed => return Ok(()),
+    };
     if let Request::Attach { id, after_byte } = request {
-        return attachment::handle(wire, manager, id, after_byte).await;
+        return attachment::handle(wire, manager, id, after_byte, request_permit).await;
     }
     let response = execute_request(&manager, request).await;
     match response {
         Ok(response) => send(&mut wire, &ServerFrame::Response { response }).await?,
         Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
     }
+    drop(request_permit);
     Ok(())
 }
 
@@ -4487,16 +4630,16 @@ mod tests {
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, LIVE_EVENT_CAPACITY, LaunchSetupStep, NativeRuntimeOwner,
-        NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
-        Persistence, PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager,
-        ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
+        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep,
+        NativeRuntimeOwner, NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
+        PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode, RecoveredRun,
+        Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
         TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
         TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
         TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
-        TmuxRunControl, TmuxTermination, TmuxWaitCause, mutex_lock, prepare_socket_path,
-        prepare_socket_path_with_hook, resolve_tmux_termination, serve_with_manager,
-        serve_with_persistence_manager, spawn_error,
+        TmuxRunControl, TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission,
+        UpgradeRequestGate, mutex_lock, prepare_socket_path, prepare_socket_path_with_hook,
+        resolve_tmux_termination, serve_with_manager, serve_with_persistence_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
     use crate::native_control::NativeControlOwner;
@@ -4512,6 +4655,69 @@ mod tests {
         );
         assert!(TMUX_IMPORT_TOTAL_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
         assert!(TMUX_DISCOVERY_TIMEOUT < TMUX_SHUTDOWN_TIMEOUT);
+    }
+
+    #[test]
+    fn upgrade_request_gate_drains_the_complete_response_window_and_reopens_on_abort() {
+        let gate = UpgradeRequestGate::default();
+        let UpgradeRequestAdmission::Execute(in_flight) = gate.admit() else {
+            panic!("open upgrade gate admits the existing request");
+        };
+
+        let draining_gate = gate.clone();
+        let drain = std::thread::spawn(move || draining_gate.begin_drain(Duration::from_secs(2)));
+        let retry = loop {
+            match gate.admit() {
+                UpgradeRequestAdmission::Execute(permit) => {
+                    drop(permit);
+                    std::thread::yield_now();
+                }
+                UpgradeRequestAdmission::Retry(permit) => break permit,
+                UpgradeRequestAdmission::Sealed => {
+                    panic!("drain cannot seal while the original request is active")
+                }
+            }
+        };
+
+        // The first permit represents owner completion through response write;
+        // the retry permit represents the explicit retry response itself. Both
+        // are part of the crossing-control window and must drain before seal.
+        drop(in_flight);
+        assert!(
+            !drain.is_finished(),
+            "retry response permit still keeps upgrade extraction fenced"
+        );
+        drop(retry);
+        let fence = drain
+            .join()
+            .expect("join upgrade drain")
+            .expect("all admitted response windows drain");
+        assert!(matches!(gate.admit(), UpgradeRequestAdmission::Sealed));
+
+        // A pre-extract abort drops the uncommitted fence and restores full
+        // admission; the current image remains a complete owner.
+        drop(fence);
+        let UpgradeRequestAdmission::Execute(reopened) = gate.admit() else {
+            panic!("uncommitted upgrade fence must reopen admission");
+        };
+        drop(reopened);
+    }
+
+    #[test]
+    fn upgrade_request_gate_timeout_restores_full_admission() {
+        let gate = UpgradeRequestGate::default();
+        let UpgradeRequestAdmission::Execute(in_flight) = gate.admit() else {
+            panic!("open upgrade gate admits the existing request");
+        };
+        let Err(failure) = gate.begin_drain(Duration::from_millis(10)) else {
+            panic!("an unfinished response window must time out the drain");
+        };
+        assert!(failure.contains("1 admitted request"));
+        let UpgradeRequestAdmission::Execute(after_timeout) = gate.admit() else {
+            panic!("timed-out pre-extract drain must restore full admission");
+        };
+        drop(after_timeout);
+        drop(in_flight);
     }
 
     #[derive(Debug, Default)]
@@ -4724,14 +4930,16 @@ mod tests {
         // `pair.master`, the same move the SIGHUP handoff makes over the
         // inherited descriptor.
         let master_fd = ctxmux_inherited_fd::duplicate_cloexec(
-            pair.master.as_raw_fd().expect("pty master exposes a raw fd"),
+            pair.master
+                .as_raw_fd()
+                .expect("pty master exposes a raw fd"),
         )
         .expect("dup inherited master fd");
 
         // A persistence recovered at the non-zero durable head above.
         let directory = tempfile::tempdir().expect("create readopt persistence directory");
-        let (persistence, _recovered) = Persistence::open(directory.path().join("state"))
-            .expect("open readopt persistence");
+        let (persistence, _recovered) =
+            Persistence::open(directory.path().join("state")).expect("open readopt persistence");
         let persistence_run = persistence.recovered_run(DURABLE_HEAD, 0);
 
         let run_id = RunId::new();
@@ -4806,6 +5014,7 @@ mod tests {
             persistence_run,
             master_fd,
             child_pid,
+            HandoffInputState::empty(),
             native_runs.clone(),
             LIVE_EVENT_CAPACITY,
             TerminalPublicationOwner::default(),
@@ -4828,8 +5037,11 @@ mod tests {
 
         // The master fd is live: a resize round-trips through the adopted
         // adapter (a non-tty fd would return ENOTTY here).
-        run.resize(TerminalSize { rows: 40, cols: 132 })
-            .expect("resize the re-adopted live master");
+        run.resize(TerminalSize {
+            rows: 40,
+            cols: 132,
+        })
+        .expect("resize the re-adopted live master");
 
         // The input path is live end to end: bytes reach the real pty master
         // and the applied cursor advances by exactly the bytes written.
@@ -4858,8 +5070,7 @@ mod tests {
                         .expect("probe frame parses")
                 })
                 .filter_map(|frame| {
-                    frame["high_water"]
-                        [crate::qualification_stats::Gauge::InputDrains as usize]
+                    frame["high_water"][crate::qualification_stats::Gauge::InputDrains as usize]
                         .as_u64()
                 })
                 .max()
@@ -6689,7 +6900,7 @@ mod tests {
         let bound = UnixListener::bind(&socket).expect("bind the pre-exec listener");
         let before = fs::symlink_metadata(&socket).expect("stat the bound socket");
 
-        // Dup first so `owned_from_raw` inside `adopt_listener` can claim exactly
+        // Dup first so the inherited-process claim inside `adopt_listener` owns exactly
         // one owner; keep `bound` alive so the inode is never unlinked.
         let dup =
             ctxmux_inherited_fd::duplicate_cloexec(bound.as_raw_fd()).expect("dup the listener fd");
@@ -6698,7 +6909,11 @@ mod tests {
 
         let after = fs::symlink_metadata(&socket).expect("stat the socket after adoption");
         assert_eq!(before.ino(), after.ino(), "adoption must not replace inode");
-        assert_eq!(before.dev(), after.dev(), "adoption must not replace device");
+        assert_eq!(
+            before.dev(),
+            after.dev(),
+            "adoption must not replace device"
+        );
 
         // Prove it is the live socket, not a dead fd: a client connect is
         // accepted on the adopted listener.
