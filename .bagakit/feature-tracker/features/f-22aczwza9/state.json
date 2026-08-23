@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "feat_id": "f-22aczwza9",
+  "title": "Run one bounded ctxmux peer-performance cycle",
+  "slug": "bounded-peer-performance-cycle",
+  "goal": "Execute one pre-registered and budget-bounded performance cycle over genuinely comparable ctxmux, tmux, and Zellij workloads; preserve correctness and raw evidence, accept wins, ties, and losses honestly, and stop after the fixed cycle with the best valid result and an explicit next-cycle decision.",
+  "status": "blocked",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "internal_blocker",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 0
+  },
+  "gate": {
+    "last_result": null,
+    "last_task_id": null,
+    "last_check_commands": [],
+    "last_log_path": null
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> bf21a5f3af082ffa29d189c8b3e8ab0da03b4d49dc4b087cddc9a92375fa3084"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=1; supersedes_revision=none"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> current_tree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-004 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-004 => internal_blocker"
+    }
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features/f-22aczwza9/goal.md",
+    "revision": "bf21a5f3af082ffa29d189c8b3e8ab0da03b4d49dc4b087cddc9a92375fa3084"
+  },
+  "blocked_reason": "Commit c2f8d4a is only a substrate checkpoint; T-004 still lacks the frozen 1/32/128 resource census, a clean reliability gate, independent owner-boundary review, and the AgentMux consumer repin. The task may be restarted when those acceptance conditions are owned together.",
+  "blocked_task_id": "T-004"
+}

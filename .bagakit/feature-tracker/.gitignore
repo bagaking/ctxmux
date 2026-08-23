@@ -1,0 +1,4 @@
+artifacts/*.log
+**/artifacts/*.log
+**/*.lock
+local/

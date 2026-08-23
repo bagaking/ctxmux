@@ -1,0 +1,111 @@
+{
+  "version": 2,
+  "feat_id": "f-22fczqx4j",
+  "plan_status": "reviewed",
+  "plan_revision": 1,
+  "supersedes_revision": null,
+  "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/architecture/choices/016-interrupted-run-derivation.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/architecture/choices/016-interrupted-run-derivation.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Define and prove Remote Runtime execution",
+      "objective": "Add a real remote Backend only after Phase 1 fixes Runtime identity, capabilities, observation, waits, activation, and Integration ownership.",
+      "outcome": "Clients can select a declared remote Runtime and preserve the same Run lifecycle contract without placing transport credentials or distributed orchestration in the core model.",
+      "acceptance": [
+        "A reviewed architecture decision defines remote Runtime identity, transport, authentication owner, capability discovery, failure and reconnect semantics, process ownership, replay, retention, security, and supported platforms before implementation.",
+        "Remote execution remains a Backend axis; Integrations still describe what runs, while scheduling, fleet policy, credentials, collaboration, and evaluation stay above ctxmux.",
+        "Unsupported input, resize, signal, stop, replay, fork, persistence, or upgrade requests fail explicitly with no local fallback or fidelity downgrade.",
+        "Real remote-process lifecycle evidence proves client exit survival, reconnect, ordered output, terminal observation, bounded failure, and cleanup through the public protocol."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "Remote protocol, security, lifecycle, reconnect, capability negatives, resources, and supported-platform gates pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture.md",
+          "proves": "Remote Backend ownership, trust boundary, guarantees, and non-goals are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#architecture-direction",
+        "docs/architecture.md#stable-boundary",
+        "docs/vision.md#non-goals",
+        "docs/protocol.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Add Provider-neutral interrupted Run derivation metadata",
+      "objective": "Expose the smallest generic derivation inputs and lineage needed for a caller to materialize a new Run from an interrupted one without claiming Provider-native resume.",
+      "outcome": "An embedding client can inspect generic interruption and declared derivation references, choose policy externally, and submit an explicit new Run plan with honest lineage.",
+      "acceptance": [
+        "The model records only Provider-neutral source Run identity, interruption reason, portable Run specification, declared references, capability requirements, and actual derivation fidelity.",
+        "Provider session IDs, semantic replay, prompt reconstruction, permissions, workspace state, message history, and native resume commands remain Integration or embedding-product data.",
+        "A request for richer derivation fails closed when the Integration cannot materialize it and never silently becomes Level A or an ordinary restart.",
+        "Cold restart, planned exec continuity, Remote Runtime reconnection, fork, and interrupted derivation remain separately named and tested lifecycle classes."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Derivation schema, lineage, failure fidelity, persistence, cross-language parity, and negative space pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/016-interrupted-run-derivation.md",
+          "proves": "Provider-neutral derivation and Provider-owned resume remain separate contracts."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/016-interrupted-run-derivation.md",
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/protocol.md#persistence-and-restart-recovery",
+        "docs/architecture/choices/011-context-artifact-lineage-fork.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    }
+  ]
+}

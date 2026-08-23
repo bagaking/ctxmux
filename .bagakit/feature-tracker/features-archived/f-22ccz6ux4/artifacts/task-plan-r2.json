@@ -1,0 +1,91 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/grill/runs/local-operation-kernel-boundary/grill-brief.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/testing-strategy.md",
+    "docs/architecture/choices/014-recoverable-input-operations.md",
+    ".bagakit/grill/runs/local-operation-kernel-boundary/grill-brief.md",
+    ".bagakit/researcher/topics/engineering/recoverable-run-operations/summaries/synthesis.md"
+  ],
+  "supersedes": {
+    "revision": 2,
+    "reason": "Clarify that per-Run Input key conflict lasts only while an operation is pending or retained; bounded eviction still prevents exact replay through the stale expected cursor without permanent tombstones."
+  },
+  "tasks": [
+    {
+      "id": "T-004",
+      "title": "Deliver the recoverable native Input public vertical",
+      "objective": "Implement the smallest next-generation native Input contract that recovers a lost response within one daemon incarnation without a second PTY write across the Rust and TypeScript public boundary.",
+      "outcome": "A caller-retained operation binds one daemon incarnation, Run, per-Run key, non-empty payload, and expected applied-input cursor, then returns one exact applied range or a typed fail-closed result.",
+      "acceptance": [
+        "The Rust protocol SSOT adds only a random daemon-incarnation identity, bounded Input operation key, public applied-input cursor, recoverable short-lived native Input request, exact half-open byte-range receipt, and typed conflict, stale-cursor, and instance-mismatch vocabulary; the generation bumps once and attachment command IDs keep their correlation-only meaning.",
+        "One native Input owner serializes legacy and recoverable successful writes under one monotonically increasing checked cursor; while an `(incarnation, RunId, key)` operation is pending or retained, a matching request joins or returns its result and a different payload or expected cursor conflicts before mutation.",
+        "The per-Run result ledger is bounded by entry count and retained request bytes; clients use fresh keys for new logical operations, retained conflict is not misrepresented as permanent key uniqueness, eviction cannot authorize an exact replay because the original expected cursor is stale, and empty recoverable Input is rejected.",
+        "Partial or ambiguous write, flush failure, or writer panic produces no applied range, consumes or fences the operation, and leaves the Input lane fail-closed; no operation ledger or exactly-once claim crosses daemon restart.",
+        "Generated TypeScript declarations, runtime validation, Rust client, and SDK expose the same operation and retain its original daemon instance across reconnect; documentation distinguishes bytes_applied from semantic acknowledgement.",
+        "Focused owner tests plus one deterministic real-child PTY E2E prove response loss, fresh-client exact-result recovery, no second physical write, same-key conflict, stale-cursor eviction, and live replacement-daemon rejection. No general mutation framework, persistence schema, Build/Host manifest, Stop Tree, Resize recovery, Signal, SSH, release, soak, metrics sink, or Agent semantics are added."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Protocol generation, daemon owner, Rust and TypeScript clients, real-PTY response-loss recovery, typed negatives, documentation, and ordinary repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "docs/protocol.md",
+        "crates/ctxmux-protocol/src/lib.rs",
+        "crates/ctxmux-daemon/src/native_control.rs",
+        "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+        "crates/ctxmux-client/src/lib.rs",
+        "packages/sdk/src/client.ts",
+        "packages/sdk/src/validation.ts",
+        "packages/sdk/test/client-parity.test.ts"
+      ],
+      "supersedes": [
+        "T-001",
+        "T-002"
+      ]
+    },
+    {
+      "id": "T-005",
+      "title": "Boundedly review and close the Input vertical",
+      "objective": "Independently review only the changed recoverable Input owner, public APIs, and named E2E oracle, then close the Feature with proportionate evidence.",
+      "outcome": "The finite recoverable Input claim has no open acceptance-falsifying P0 or P1 defect and does not remain open for adjacent control, release, or qualification work.",
+      "acceptance": [
+        "Independent read-only review covers correctness, owner and lock boundaries, partial-write disposition, bounded resources, protocol and SDK parity, naming, complexity, public evidence, and product drift only for the changed Input vertical.",
+        "Any P0, P1, or other defect that falsifies the approved acceptance receives a deterministic regression and re-review; unrelated P2 and adjacent findings are routed without widening this Feature.",
+        "Authoritative docs match shipped behavior, residual cross-daemon and semantic-acknowledgement limits remain explicit, and one clean ordinary repository Gate passes; no soak, platform matrix, coverage campaign, performance program, or general qualification framework is required."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The reviewed public vertical and ordinary repository regressions pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22ccz6ux4/verification.md",
+          "proves": "The bounded independent review, dispositions, exact source revision, and residual limits are auditable."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [
+        "T-003"
+      ]
+    }
+  ]
+}

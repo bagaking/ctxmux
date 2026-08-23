@@ -1,0 +1,258 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/roadmap.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Establish the repository foundation",
+      "objective": "Create the smallest Rust and TypeScript workspace, shared quality commands, CI, and package boundaries needed for the first executable vertical slice.",
+      "outcome": "A clean checkout has one documented command that formats, analyzes, builds, and tests every initialized workspace without carrying unused framework code.",
+      "acceptance": [
+        "Rust and TypeScript workspace boundaries follow docs/architecture.md and contain no placeholder plugin system.",
+        "A clean checkout can run the documented format, static analysis, build, and test commands.",
+        "CI executes the same repository-owned checks used locally."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The repository-owned quality boundary succeeds from a clean checkout."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/roadmap.md#m0--repository-foundation"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Deliver a durable native Run",
+      "objective": "Implement one daemon-owned local Run through a versioned public boundary with start, attach, detach, reconnect, input, output, resize, exit, and stop behavior.",
+      "outcome": "A real child process survives client exit and can be reattached and controlled without relying on private implementation access.",
+      "acceptance": [
+        "The daemon is the sole owner of the PTY, child process, Run identity, ordered output, and lifecycle state.",
+        "A real child process survives attach-client termination and remains usable after reconnect.",
+        "Invalid lifecycle transitions and unsupported behavior return explicit errors."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The native Run lifecycle integration tests pass through the public boundary."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#system-boundary",
+        "docs/roadmap.md#m1--durable-native-run"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Prove CLI and TypeScript client parity",
+      "objective": "Expose the durable Run lifecycle through a real CLI client and the first TypeScript SDK without letting either client own runtime state.",
+      "outcome": "CLI and TypeScript consumers can manage the same Run through the same versioned daemon boundary and observe consistent state and events.",
+      "acceptance": [
+        "The CLI and TypeScript SDK exercise the same public protocol rather than separate runtime paths.",
+        "Closing either client leaves a durable Run alive unless stop was explicitly requested.",
+        "The SDK has no Electron, React, or editor dependency."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Cross-client lifecycle and state parity tests pass."
+        }
+      ],
+      "source_refs": [
+        "docs/vision.md#local-first-and-embeddable",
+        "docs/architecture.md#stable-boundary",
+        "docs/roadmap.md#m1--durable-native-run"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-008",
+      "title": "Map architecture and critical technical choices",
+      "objective": "Turn the implemented system and target boundaries into one current-versus-target architecture map, core scenario model, and linked decision inventory.",
+      "outcome": "A new contributor can follow every important lifecycle path and open one dedicated document for each critical implemented, provisional, or open technical choice.",
+      "acceptance": [
+        "docs/architecture.md distinguishes current guarantees from target design and maps system context, components, Run ownership, core scenarios, ordering, failure semantics, and maturity gaps.",
+        "Every critical technical choice has one linked document with status, context, decision, alternatives, constraints, local repository evidence, wrong-case section, fixture mapping, and open questions.",
+        "Architecture and decision documents do not claim unimplemented Integration, fork, persistence, or tmux behavior as current capability."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture.md",
+          "proves": "The architecture entrypoint exposes current and target boundaries, key flows, and the decision index."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md#architecture-evidence-and-failure-corpus"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-009",
+      "title": "Research the technical-choice wrong-case corpus",
+      "objective": "Conduct bounded multi-track web research for every critical choice and preserve real failures, incidents, anti-patterns, edge cases, and counterevidence as durable source-backed records.",
+      "outcome": "Each decision document has an evidence-backed wrong-case section and every retained case is indexed with its failure mechanism and ctxmux invariant.",
+      "acceptance": [
+        "The researcher workspace contains a charter, survey or bounded pass, per-choice tracks, primary-source cards, source-bound summaries, claims, counterevidence, and quality and drift evidence.",
+        "Every critical choice document cites retained cases and separates observed source claims from ctxmux-facing inferences and transfer limits.",
+        "docs/architecture/casebook.md maps each case to its choice, source, failure mechanism, protected invariant, and fixture disposition."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/casebook.md",
+          "proves": "The source-backed wrong-case corpus is normalized and traceable to technical decisions."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/roadmap.md#architecture-evidence-and-failure-corpus"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-010",
+      "title": "Materialize wrong cases as continuous fixtures",
+      "objective": "Convert the retained casebook into a validated fixture corpus and executable regressions for capabilities that ctxmux currently implements.",
+      "outcome": "Known failures become a maintained ratchet: current-scope cases run continuously, and future-scope cases carry explicit activation conditions instead of silent gaps.",
+      "acceptance": [
+        "Every retained case has a machine-readable fixture record linking choice, source, failure mechanism, preconditions, action, oracle, platform, tags, and fixture files or explicit activation blocker.",
+        "Applicable P0 lifecycle, protocol, replay, PTY, TypeScript, codegen, and CLI cases have executable tests that validate ctxmux invariants rather than dependency-specific incidental output.",
+        "scripts/check.sh and CI validate fixture schema and run all active fixtures; decision documents and casebook link to the resulting test evidence.",
+        "Cases for unimplemented Integration, fork, persistence, or tmux behavior remain explicitly inactive until the owning feature task implements that capability."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The repository gate validates the case corpus and executes every active wrong-case fixture."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/casebook.md",
+        "docs/roadmap.md#architecture-evidence-and-failure-corpus"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-004",
+      "title": "Add explicit Integrations and the first coding Agent",
+      "objective": "Introduce host-registered TypeScript Integrations only after the generic lifecycle works, then prove the contract with a shell and one mainstream coding Agent.",
+      "outcome": "A client can explicitly register an Integration for detection, launch planning, capabilities, and semantic events while the daemon remains Agent-neutral.",
+      "acceptance": [
+        "Integrations are ordinary explicitly imported TypeScript packages with no discovery service or plugin marketplace.",
+        "Agent-specific data does not enter the daemon's foundational Run types.",
+        "The raw Run remains operable when no semantic Integration observer is attached."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Generic Run and first-Agent Integration tests pass without separate client behavior."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#integration-owns",
+        "docs/architecture.md#two-extension-axes",
+        "docs/roadmap.md#m2--integration-contract-and-first-agent"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-005",
+      "title": "Implement explicit context fidelity and fork",
+      "objective": "Deliver portable Level A fork and prove Integration-provided Level B context fidelity with artifacts and lineage.",
+      "outcome": "Clients can request and inspect a precise fork level, trace lineage, and receive an explicit unsupported result rather than a silent fidelity downgrade.",
+      "acceptance": [
+        "Level A copies only the documented portable Run specification and declared input references.",
+        "Forks record parentage and declared workspace, artifact, and context references.",
+        "One Integration demonstrates a genuine Level B resume or fork.",
+        "A Level B request against a Level A-only Integration fails closed."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Fork fidelity, lineage, and fail-closed capability tests pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#fork-contract",
+        "docs/roadmap.md#m3--context-artifacts-lineage-and-fork"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-006",
+      "title": "Integrate existing tmux sessions",
+      "objective": "Add a tmux Backend through public tmux integration surfaces without coupling native Runs to tmux internals.",
+      "outcome": "ctxmux clients can discover and attach to a selected existing tmux session while tmux remains the owner of that session.",
+      "acceptance": [
+        "The adapter uses the tmux executable or Control Mode rather than the private tmux socket protocol.",
+        "Disconnecting a ctxmux client does not terminate the tmux session.",
+        "Behavioral differences between native and tmux Backends are documented and capability-visible."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "tmux adapter lifecycle and ownership tests pass against a real tmux session."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#tmux-relationship",
+        "docs/roadmap.md#m4--tmux-adapter"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-007",
+      "title": "Prove composition and prepare the first release",
+      "objective": "Use only public APIs to demonstrate a bounded fork-and-combine workflow, then make binaries and packages installable with accurate compatibility documentation.",
+      "outcome": "ctxmux is publishable as infrastructure that enables Crucible- or MapReduce-like clients without absorbing their orchestration and evaluation policy.",
+      "acceptance": [
+        "A small reference example composes multiple Runs and combines results using only public APIs.",
+        "Scheduling, evaluation, and stopping policy remain in the example client rather than the runtime core.",
+        "Binaries and packages have reproducible installation, compatibility, and release checks.",
+        "README claims match behavior proven by the release gates."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The composition example, packaging checks, and full release suite pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "README.md",
+          "proves": "Public positioning and installation guidance describe only shipped capabilities."
+        }
+      ],
+      "source_refs": [
+        "docs/vision.md#composition-stays-above-the-mux",
+        "docs/roadmap.md#m5--composition-proof-and-release"
+      ],
+      "supersedes": []
+    }
+  ]
+}
+

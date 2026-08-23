@@ -1,0 +1,136 @@
+{
+  "version": 1,
+  "feat_id": "f-22dczvf38",
+  "title": "Qualify the public local consumer contract",
+  "slug": "public-local-consumer-contract",
+  "goal": "Close only the public Run contract gaps required by an exact-commit local embedding consumer: cumulative output byte cursors, interrupt plus complete process-tree stop, and reproducible SDK/binary consumption with required CI evidence.",
+  "status": "done",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 8
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-005",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22dczvf38/artifacts/gate-T-005-r8-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=1; supersedes_revision=none"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> current_tree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-002 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-002 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-002 => internal_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => pass"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-004 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-003 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-003 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-003 => external_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-005 => done"
+    }
+  ]
+}

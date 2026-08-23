@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "generated_by": "bagakit-feature-tracker",
+  "feature_id_issuance": {
+    "scheme": "feature-tracker-id-v1-c3n2g4",
+    "next_cursor": 14
+  },
+  "features": [
+    {
+      "feat_id": "f-222cz7by9",
+      "title": "Build ctxmux foundation",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-223czq75x",
+      "title": "Persist and recover ctxmux Runs",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-224czneed",
+      "title": "Integrate tmux sessions",
+      "status": "ready",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-225cz7943",
+      "title": "Prove composition and prepare release",
+      "status": "ready",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-226cz5zdq",
+      "title": "Qualify ctxmux reliability and performance",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-227czdavj",
+      "title": "Harden persistence admission and recovered-state validation",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-228cz55vj",
+      "title": "Preserve live Runs across controlled daemon replacement",
+      "status": "discarded",
+      "workspace_mode": "proposal_only",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-229cz9szm",
+      "title": "Stage client-authorized artifacts into local Runs",
+      "status": "proposal",
+      "workspace_mode": "proposal_only",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22aczwza9",
+      "title": "Run one bounded ctxmux peer-performance cycle",
+      "status": "blocked",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "internal_blocker",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22bczhydf",
+      "title": "Close ctxmux Run-Kernel correctness",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22ccz6ux4",
+      "title": "Make native Input retry-safe across response loss",
+      "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22dczvf38",
+      "title": "Qualify the public local consumer contract",
+      "status": "done",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22ecztapc",
+      "title": "Complete the local Runtime embedding contract",
+      "status": "in_progress",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22fczqx4j",
+      "title": "Extend Runtime reach and interrupted derivation",
+      "status": "proposal",
+      "workspace_mode": "proposal_only",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "blocked_reason_class": "none",
+      "runtime_relations": []
+    }
+  ]
+}

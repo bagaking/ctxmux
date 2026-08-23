@@ -1,0 +1,214 @@
+{
+  "version": 2,
+  "feat_id": "f-22aczwza9",
+  "plan_status": "reviewed",
+  "plan_revision": 2,
+  "supersedes_revision": 1,
+  "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/testing-strategy.md",
+    "docs/architecture/choices/001-rust-tokio-daemon.md",
+    "docs/architecture/choices/013-retained-run-resource-governance.md",
+    "docs/roadmap.md#program-ownership-and-convergence"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/testing-strategy.md",
+        "docs/roadmap.md#program-ownership-and-convergence"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/testing-strategy.md",
+        "docs/architecture/choices/001-rust-tokio-daemon.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/roadmap.md#program-ownership-and-convergence"
+      ],
+      "task_ids": [
+        "T-004",
+        "T-001",
+        "T-002",
+        "T-003"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-004",
+      "title": "Eliminate permanent per-Run native workers",
+      "objective": "Remove the fresh-daemon and live-native-Run owner costs exposed by the frozen AgentMux consumer comparison without changing ctxmux protocol, event fan-out, or lifecycle truth.",
+      "outcome": "A small fixed daemon runtime and daemon-wide native output/reap owners preserve exact Run semantics while an ordinary live native Run adds no permanent OS thread and its measured owner RSS slope is competitive with the frozen tmux resource checkpoint.",
+      "acceptance": [
+        "The daemon Tokio runtime uses an explicit fixed two-worker pool instead of sizing itself from host CPU count; activation, shutdown, sockets, persistence, and public latency remain correct.",
+        "Native output readiness and direct-child wait/reap work use daemon-wide bounded owners; an ordinary idle or active native Run adds zero permanent reader or waiter OS threads, while blocking Stop or cleanup work remains explicitly bounded and observable.",
+        "Natural exit, ordered byte output, output-before-terminal publication, exact child reap, process-tree Stop, signal, unpublished rollback, wait-authority loss, persistence activation, Registry collection, and shutdown retain their current fail-closed semantics under concurrency and injected failures.",
+        "The existing 1/32/128 native resource census proves zero threads per Run and a 32-live-Run RSS slope below 32 KiB per Run without changing the frozen census workload, sampling, budgets, or subtracting post-hoc owners; a fresh daemon also records the fixed worker census for the external consumer recheck.",
+        "Per-Run broadcast capacity, output encoding, replay, attachment lag, tmux control, Backend or Integration boundaries, compatibility aliases, fallback paths, and new dependencies are unchanged.",
+        "A clean candidate passes the complete repository and reliability gates, receives an independent owner-boundary review, and is committed before the AgentMux consumer repins it; publishing packages or releases remains out of scope."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Native lifecycle, protocol, SDK, failure, shutdown, and repository regressions pass on the shared-owner implementation."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "The frozen 1/32/128 owner and resource census preserves correctness and demonstrates the new thread/RSS slope without budget relaxation."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/001-rust-tokio-daemon.md",
+          "proves": "The daemon-wide native owner boundary, blocking disposition, residual limits, and non-goals replace the obsolete two-thread-per-Run architecture truth."
+        }
+      ],
+      "source_refs": [
+        "docs/roadmap.md#program-ownership-and-convergence",
+        "docs/architecture/choices/001-rust-tokio-daemon.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/testing-strategy.md",
+        "crates/ctxmux-daemon/src/main.rs",
+        "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/native_control.rs"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 2,
+      "status": "blocked",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": [],
+      "last_blocker": {
+        "class": "internal_blocker",
+        "reason": "Commit c2f8d4a is only a substrate checkpoint; T-004 still lacks the frozen 1/32/128 resource census, a clean reliability gate, independent owner-boundary review, and the AgentMux consumer repin. The task may be restarted when those acceptance conditions are owned together."
+      }
+    },
+    {
+      "id": "T-001",
+      "title": "Freeze the comparable peer harness",
+      "objective": "Pre-register one reproducible harness for overlapping ctxmux, tmux, and Zellij semantics before performance results guide implementation.",
+      "outcome": "Every measured workload, environment, metric, statistical rule, practical margin, and comparability boundary is immutable for the cycle.",
+      "acceptance": [
+        "Pinned peer versions, hardware and toolchain identity, child workload, warm-up, sampling, failure handling, and raw-result schema are explicit.",
+        "Comparable start, first output, attach, input-to-output, replay, throughput, fan-out, shutdown, CPU, RSS, descriptor, and thread metrics are frozen before candidate results.",
+        "Each metric declares direction, practical margin, statistical rule, noise budget, and semantic exclusions; incomparable behavior is reviewed before measurement.",
+        "Harness self-tests prove workload parity, unit normalization, completeness, failed-process handling, and report reproducibility."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/run.sh",
+          "proves": "The pinned peer harness executes every frozen workload and emits complete machine-readable results."
+        },
+        {
+          "kind": "artifact",
+          "ref": "benchmarks/README.md",
+          "proves": "Comparability, environments, statistics, and immutable cycle rules are reviewable."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Measure and decide raw-byte ROI",
+      "objective": "Profile the clean incremental consumer path and change its byte representation only when one frozen material-benefit rule exceeds protocol and maintenance cost.",
+      "outcome": "The cycle either earns a simpler faster exact-byte path or records a valid no-change decision without speculative protocol churn.",
+      "acceptance": [
+        "Profiles cover the current integer-array wire path and the smallest viable alternatives under frozen chunk, replay, fan-out, rate, latency, CPU, RSS, wire-byte, and event-loop metrics.",
+        "A representation changes only when it meets the predeclared material-benefit and no-regression rules; otherwise the current representation is retained.",
+        "Any selected path preserves arbitrary fragmented bytes, sequence, replay/live join, truncation, Gap, frame limits, validation, backpressure, security, and cross-language behavior.",
+        "No negotiation fallback, dual encoding, compatibility alias, renderer snapshot, or benchmark-only shortcut is added."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/run.sh",
+          "proves": "The frozen streaming workload supports the predeclared change-or-retain decision."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The selected or retained path preserves ordinary correctness and reliability gates."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#output-and-reconnect",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Record the bounded-cycle result",
+      "objective": "Remeasure once, independently reproduce the complete comparison, and close the fixed cycle with honest outcomes and an explicit next-cycle decision.",
+      "outcome": "Repo-local raw data and a reproducible report show wins, ties, losses, variance, and scope without keeping Kernel or release work open.",
+      "acceptance": [
+        "One bounded optimize-and-remeasure pass stays inside the pre-registered time and complexity budget.",
+        "Every result remains traceable to exact source, peer versions, hardware, toolchains, commands, raw samples, and comparability decisions.",
+        "Independent reproduction rebuilds the report from clean raw evidence and confirms correctness gates remain green.",
+        "Wins, ties, and losses are all reported; no workload, peer, percentile, or resource metric is removed after results.",
+        "The task records repo-local evidence only; publishing results, pushing refs, or mutating a hosted system still requires explicit authorization.",
+        "The report records an explicit stop or separately reviewed next-cycle proposal; it does not silently extend this Feature."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/compare.sh",
+          "proves": "The complete frozen comparison and independent reproduction are machine-checkable."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22aczwza9/verification.md",
+          "proves": "Raw evidence, outcomes, variance, limits, and next-cycle disposition are auditable."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    }
+  ]
+}

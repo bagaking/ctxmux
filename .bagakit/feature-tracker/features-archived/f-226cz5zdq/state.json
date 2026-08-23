@@ -1,0 +1,566 @@
+{
+  "version": 1,
+  "feat_id": "f-226cz5zdq",
+  "title": "Qualify ctxmux reliability and performance",
+  "slug": "reliability-performance-qualification",
+  "goal": "Turn every shipped ctxmux capability into high-confidence evidence across correctness, chaos, stress, concurrency, security, resources, platforms, and performance, then close only after independent functional review and reproducible peer benchmark wins.",
+  "status": "archived",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 43
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-033",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/gate-T-033-r43-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=1; supersedes_revision=none"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> current_tree; root_branch=main"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> a23b6bcce586a5ff541a2122f1658358a47066882a44d3f7b92a3cef90309186"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "a23b6bcce586a5ff541a2122f1658358a47066882a44d3f7b92a3cef90309186 -> beb0ae99067301b5017865555e9ff27b65bd2f88e167ccb1e96d1f8760c1386c"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=4; supersedes_revision=3"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-002 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-002 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=5; supersedes_revision=4"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-009"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-009 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-009 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-003 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-003 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-004 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=6; supersedes_revision=5"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-016"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-016 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-016 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-017"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-017 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-017 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-018"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-018 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-018 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-010"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-010 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-010 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=7; supersedes_revision=6"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-019"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-019"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=8; supersedes_revision=7"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-019"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-019 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-019 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=9; supersedes_revision=8"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-022"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-022 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-022 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-022 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-020"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-020 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-020 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=10; supersedes_revision=9"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-023"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-023 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-023 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=11; supersedes_revision=10"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-025"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-025 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-025 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-024"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-024 => pass"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-024 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-024 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=12; supersedes_revision=11"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-021"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-021 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-021 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-021 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-021 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-012"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-012 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-012 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-012 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-012 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-012 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-013"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-013 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-013 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-013 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=13; supersedes_revision=12"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-026"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-026 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-026 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-026 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-027"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-027 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-027 => internal_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=14; supersedes_revision=13"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "beb0ae99067301b5017865555e9ff27b65bd2f88e167ccb1e96d1f8760c1386c -> 3263cb2b5903b5053a41f81b5194d41df4b906f619d2bdee26649e8c754a52a3"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-031"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-031 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-031 => fail"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-031 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-031 => internal_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=15; supersedes_revision=14"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-032"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-032"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=16; supersedes_revision=15"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-032"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-032 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-032 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-032 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-028"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-028 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-028 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-028 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-028 => pass"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-028 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-028 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-029"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-029 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-029 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-029 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-030"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-030"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=17; supersedes_revision=16"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "3263cb2b5903b5053a41f81b5194d41df4b906f619d2bdee26649e8c754a52a3 -> 6912e899d793175c43c50bf4f752a6b087f7e40baa35541c11819515cbc000b9"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-033"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-033 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-033 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-033 => done"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "tracker metadata closed; Git workspace unchanged"
+    }
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features-archived/f-226cz5zdq/goal.md",
+    "revision": "6912e899d793175c43c50bf4f752a6b087f7e40baa35541c11819515cbc000b9"
+  },
+  "closed_from_status": "done"
+}

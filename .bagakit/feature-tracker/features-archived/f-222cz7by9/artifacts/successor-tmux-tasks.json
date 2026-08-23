@@ -1,0 +1,41 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/roadmap.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/architecture/choices/012-tmux-control-mode-backend.md",
+    "docs/roadmap.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Integrate existing tmux sessions",
+      "objective": "Add a tmux Backend through public tmux integration surfaces without coupling native Runs to tmux internals.",
+      "outcome": "Ctxmux clients can discover and attach to a selected existing tmux session while tmux remains its owner.",
+      "acceptance": [
+        "The adapter uses the tmux executable or Control Mode rather than the private tmux socket protocol.",
+        "Disconnecting or terminating a ctxmux client does not terminate the tmux session.",
+        "Control Mode framing, escaped bytes, lag, teardown, and version differences fail explicitly and have transcript or real-session evidence.",
+        "Behavioral differences from native Runs are documented and capability-visible without forcing an abstract Backend framework first."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The adapter lifecycle, ownership, transcript, and real tmux session tests pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md#m4--tmux-adapter"
+      ],
+      "supersedes": []
+    }
+  ]
+}

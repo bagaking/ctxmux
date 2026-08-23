@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "feat_id": "f-225cz7943",
+  "title": "Prove composition and prepare release",
+  "slug": "composition-release",
+  "goal": "Prove public-API composition without absorbing orchestration, then make ctxmux reproducibly release-ready without publishing externally.",
+  "status": "ready",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 0
+  },
+  "gate": {
+    "last_result": null,
+    "last_task_id": null,
+    "last_check_commands": [],
+    "last_log_path": null
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=current_tree; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> f49c83f8c0bf0e6df614d77930f1a57f194849a856453d1d7f0cd89499ef582a"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed,f-226cz5zdq"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed,f-226cz5zdq,f-227czdavj"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "f49c83f8c0bf0e6df614d77930f1a57f194849a856453d1d7f0cd89499ef582a -> 370ecd54fbfc771a613bdcb89d046c392f0689158618be19c40f343b89ae5f9d"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed,f-22bczhydf,f-227czdavj"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-223czq75x,f-224czneed,f-22bczhydf,f-227czdavj,f-22ecztapc"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    }
+  ],
+  "depends_on": [
+    "f-223czq75x",
+    "f-224czneed",
+    "f-22bczhydf",
+    "f-227czdavj",
+    "f-22ecztapc"
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features/f-225cz7943/goal.md",
+    "revision": "370ecd54fbfc771a613bdcb89d046c392f0689158618be19c40f343b89ae5f9d"
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/architecture/choices/009-runtime-persistence-recovery.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/testing-strategy.md",
+    "docs/architecture/choices/009-runtime-persistence-recovery.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Separate recoverable persistence admission from fatal store failure",
+      "objective": "Keep expected capacity or metadata admission rejection local to one unpublished Run while preserving the fatal latch for failures that make durable state untrustworthy.",
+      "outcome": "A rejected durable start creates no child publication or partial row and does not prevent existing Runs from appending or finalizing or a later admissible Run from starting.",
+      "acceptance": [
+        "Persistence errors distinguish recoverable admission rejection from database, I/O, commit, integrity, actor, and invariant failures that make the store untrustworthy.",
+        "The actor latches only fatal store failures; a running-record or metadata-capacity rejection returns the existing public persistence error for that start without freezing unrelated append, finalize, or later start commands.",
+        "An owner-local small-capacity seam proves one rejected start leaves no durable row, then a terminal record or newly available capacity permits a later start and terminal commit through the same actor.",
+        "A deterministic fatal store failure still freezes the durable cursor and rejects later mutations while already-owned live Run control remains available as ADR 009 declares.",
+        "The correction adds no schema migration, recovery class, retry loop, public fault API, or generic storage framework."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Persistence admission, fatal-latch, native lifecycle, and full repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/009-runtime-persistence-recovery.md",
+          "proves": "Recoverable admission and fatal durable-state failure semantics remain explicit at the persistence owner boundary."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/testing-strategy.md#layer-2--deterministic-owner-seams",
+        "docs/testing-strategy.md#stress-and-soak-testing"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Validate recovered native Run specifications through one semantic owner",
+      "objective": "Make live launch and startup recovery share one daemon-owned RunSpec semantic validator so parseable but invalid durable rows fail before socket publication.",
+      "outcome": "Every recovered native Run has a non-null launch specification satisfying the same program, terminal-size, and declared-reference invariants as a newly started Run.",
+      "acceptance": [
+        "RunSpec semantic admission has one daemon-owned Rust validator reused by start, fork materialization, persistent insert, and recovered-state validation; TypeScript continues to validate the public wire shape without becoming daemon admission truth.",
+        "The native persistence format rejects null RunSpec, empty program, zero rows or columns, and empty declared-input references as corrupt state before the daemon publishes its socket.",
+        "Persistent insert fails closed if a caller attempts to store non-native backend identity, non-native capabilities, a missing spec, or an invalid spec; no partial row or Run publication occurs.",
+        "Real restart corruption fixtures prove no Rust, TypeScript, CLI, or attachment client can observe a rejected Run or a partially exposed valid sibling.",
+        "The correction adds no tmux persistence, PID adoption, schema migration, salvage path, or Backend abstraction."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Shared RunSpec validation, real restart corruption, cross-client validation, and full repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/009-runtime-persistence-recovery.md",
+          "proves": "The recovered native Run domain and pre-publication corruption boundary are documented."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#run-domain-model",
+        "docs/architecture.md#start-a-native-run",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/protocol.md#lifetime-and-persistent-mode",
+        "docs/testing-strategy.md#p2--qualify-capability-specific-risk"
+      ],
+      "supersedes": []
+    }
+  ]
+}

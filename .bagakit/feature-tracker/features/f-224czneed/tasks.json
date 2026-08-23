@@ -1,0 +1,153 @@
+{
+  "version": 2,
+  "feat_id": "f-224czneed",
+  "plan_status": "reviewed",
+  "plan_revision": 3,
+  "supersedes_revision": 2,
+  "review_ref": ".bagakit/feature-tracker/features/f-224czneed/artifacts/revision-3-plan-review.md",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/architecture/choices/012-tmux-control-mode-backend.md",
+    "docs/roadmap.md",
+    ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-13-plan-review.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/roadmap.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md"
+      ],
+      "task_ids": [
+        "T-001"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": "docs/roadmap.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md"
+      ],
+      "task_ids": [
+        "T-001"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": ".bagakit/feature-tracker/features/f-224czneed/artifacts/revision-3-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-13-plan-review.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Import existing tmux panes",
+      "objective": "Discover live panes from one explicit tmux server and import one unambiguous pane as a read-only Run through the tmux executable and public Control Mode.",
+      "outcome": "Ctxmux clients can discover live pane associations on a selected tmux server and attach to one unambiguous imported pane while tmux remains the owner of its server, session, window, pane, PTY, and process.",
+      "acceptance": [
+        "The adapter uses the tmux executable and public Control Mode rather than the private tmux socket protocol.",
+        "Import binds the complete server/session/window/pane/pane-PID identity and fails closed when a pane ID has multiple linked associations or later changes identity.",
+        "Disconnecting a ctxmux client or shutting down ctxmux does not terminate the tmux pane, session, or server.",
+        "Control Mode framing, escaped bytes, lag, teardown, and client/server version differences fail explicitly and have transcript or real-session evidence.",
+        "Behavioral differences from native Runs are documented and capability-visible without forcing an abstract Backend framework first."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The adapter lifecycle, ownership, transcript, public-client, and real tmux session tests pass; remote minimum/current version qualification remains separate CI evidence."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md#m4--tmux-adapter"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "blocked",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "external_blocker",
+        "reason": "Exact b4dcbb355a5940eea839d70dd6736a8d472b4737 is not published; required Ubuntu tmux 3.4 and macOS-current CI receipts cannot run without user-authorized GitHub publication and authenticated CI access."
+      }
+    },
+    {
+      "id": "T-002",
+      "title": "Preserve tmux observation truth across attachment lag",
+      "objective": "Make attachment fan-out distinguish replayable raw-output loss from non-replayable tmux observation loss instead of representing both with one output byte cursor.",
+      "outcome": "A lagged tmux attachment either reconstructs the exact observation state promised by the Backend or fails closed with an explicit discontinuity; Gap with head_seq remains honest byte-replay evidence only.",
+      "acceptance": [
+        "Gap with head_seq represents output-stream delivery loss and directs reattachment from the caller-owned cursor; replay then returns an exact retained continuation or explicit truncation without claiming every missing byte remains recoverable, and it never claims recovery for a dropped Backend observation.",
+        "If session_renamed, paused, continued, terminal, or a future non-output tmux observation can be lost, the protocol exposes an explicit non-output discontinuity or a reconnect snapshot sufficient to restore the declared observation state.",
+        "Deterministic tiny-channel fixtures mix retained output with every current tmux observation, force lag, and prove exact raw replay, no silent semantic loss, one terminal boundary, and survival of the tmux-owned pane.",
+        "Rust client, TypeScript SDK, CLI, protocol documentation, generated declarations, and runtime validation agree on the corrected boundary; any incompatible wire change advances the protocol generation without a fallback encoding.",
+        "T-002 local completion neither satisfies nor erases T-001's required Ubuntu tmux 3.4 and macOS-current receipts; T-001 is re-gated from the corrected commit before the Feature can archive.",
+        "The correction remains in generic attachment delivery plus tmux observation semantics and adds no durable event bus, public Backend trait, Agent state, tmux private-protocol support, or speculative event-sourcing framework."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Mixed output and tmux-observation lag, reconnect, fail-closed discontinuity, cross-client parity, generated protocol drift, and full repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Replayable byte gaps and non-output observation discontinuity have distinct public semantics."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/protocol.md#output-and-reconnect",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 3,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    }
+  ]
+}

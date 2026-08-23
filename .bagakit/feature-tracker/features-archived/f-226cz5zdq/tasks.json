@@ -1,0 +1,2084 @@
+{
+  "version": 2,
+  "feat_id": "f-226cz5zdq",
+  "plan_status": "reviewed",
+  "plan_revision": 17,
+  "supersedes_revision": 16,
+  "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    ".bagakit/feature-tracker/features/f-226cz5zdq/goal.md",
+    ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md",
+    "crates/ctxmux-daemon/src/tests/creation.rs"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-009",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-010",
+        "T-011",
+        "T-005",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-009",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-010",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-015",
+        "T-005",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 4,
+      "supersedes_revision": 3,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-009",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-010",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 5,
+      "supersedes_revision": 4,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-009",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-010",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 6,
+      "supersedes_revision": 5,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md"
+      ],
+      "task_ids": [
+        "T-003",
+        "T-004",
+        "T-016",
+        "T-017",
+        "T-018",
+        "T-010",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [
+        "T-001",
+        "T-002",
+        "T-009"
+      ],
+      "supersedes_by_task": {
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-018": [
+          "T-001"
+        ]
+      }
+    },
+    {
+      "revision": 7,
+      "supersedes_revision": 6,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-020",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [
+        "T-004",
+        "T-010",
+        "T-018"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-020": [
+          "T-018"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 8,
+      "supersedes_revision": 7,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-020",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-020": [
+          "T-018"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 9,
+      "supersedes_revision": 8,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-020",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-020": [
+          "T-018"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 10,
+      "supersedes_revision": 9,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [
+        "T-020"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 11,
+      "supersedes_revision": 10,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json",
+        ".github/workflows/ci.yml",
+        ".github/ci-evidence-map.json",
+        "scripts/ci-reachability.mjs",
+        "scripts/ci-reachability.test.mjs"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 12,
+      "supersedes_revision": 11,
+      "review_ref": "docs/testing-strategy.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json",
+        ".github/workflows/ci.yml",
+        ".github/ci-evidence-map.json",
+        "scripts/ci-reachability.mjs",
+        "scripts/ci-reachability.test.mjs",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/herdr-transfer-review.md"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-012",
+        "T-013",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ]
+      }
+    },
+    {
+      "revision": 13,
+      "supersedes_revision": 12,
+      "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-13-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        ".bagakit/feature-tracker/features-archived/f-227czdavj/tasks.json",
+        ".github/workflows/ci.yml",
+        ".github/ci-evidence-map.json",
+        "scripts/ci-reachability.mjs",
+        "scripts/ci-reachability.test.mjs",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/herdr-transfer-review.md",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-011",
+        "T-013",
+        "T-026",
+        "T-027",
+        "T-014",
+        "T-005",
+        "T-015",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [
+        "T-012"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-026": [
+          "T-012"
+        ]
+      }
+    },
+    {
+      "revision": 14,
+      "supersedes_revision": 13,
+      "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-14-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/goal.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-14-plan-review.md",
+        ".bagakit/feature-tracker/features/f-224czneed/tasks.json",
+        ".bagakit/feature-tracker/features/f-225cz7943/tasks.json",
+        ".bagakit/feature-tracker/features/f-22aczwza9/state.json"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-013",
+        "T-026",
+        "T-031",
+        "T-028",
+        "T-029",
+        "T-030",
+        "T-006",
+        "T-007"
+      ],
+      "superseded_task_ids": [
+        "T-005",
+        "T-008",
+        "T-011",
+        "T-014",
+        "T-015",
+        "T-027"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-026": [
+          "T-012"
+        ],
+        "T-031": [
+          "T-005",
+          "T-008",
+          "T-011",
+          "T-014",
+          "T-015"
+        ],
+        "T-028": [
+          "T-027"
+        ],
+        "T-029": [
+          "T-027"
+        ],
+        "T-030": [
+          "T-027"
+        ]
+      }
+    },
+    {
+      "revision": 15,
+      "supersedes_revision": 14,
+      "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-15-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/goal.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-14-plan-review.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-15-plan-review.md",
+        "crates/ctxmux-daemon/tests/persistence_recovery.rs"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-013",
+        "T-026",
+        "T-032",
+        "T-028",
+        "T-029",
+        "T-030",
+        "T-006",
+        "T-007"
+      ],
+      "superseded_task_ids": [
+        "T-031"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-026": [
+          "T-012"
+        ],
+        "T-032": [
+          "T-031"
+        ],
+        "T-028": [
+          "T-027"
+        ],
+        "T-029": [
+          "T-027"
+        ],
+        "T-030": [
+          "T-027"
+        ]
+      }
+    },
+    {
+      "revision": 16,
+      "supersedes_revision": 15,
+      "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-16-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/testing-strategy.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/goal.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-14-plan-review.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-15-plan-review.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-16-plan-review.md",
+        "crates/ctxmux-daemon/tests/persistence_recovery.rs"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-013",
+        "T-026",
+        "T-032",
+        "T-028",
+        "T-029",
+        "T-030",
+        "T-006",
+        "T-007"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-026": [
+          "T-012"
+        ],
+        "T-032": [
+          "T-031"
+        ],
+        "T-028": [
+          "T-027"
+        ],
+        "T-029": [
+          "T-027"
+        ],
+        "T-030": [
+          "T-027"
+        ]
+      }
+    },
+    {
+      "revision": 17,
+      "supersedes_revision": 16,
+      "review_ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/goal.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md",
+        "crates/ctxmux-daemon/src/tests/creation.rs"
+      ],
+      "task_ids": [
+        "T-019",
+        "T-022",
+        "T-023",
+        "T-025",
+        "T-024",
+        "T-021",
+        "T-003",
+        "T-016",
+        "T-017",
+        "T-013",
+        "T-026",
+        "T-032",
+        "T-028",
+        "T-029",
+        "T-033"
+      ],
+      "superseded_task_ids": [
+        "T-006",
+        "T-007",
+        "T-030"
+      ],
+      "supersedes_by_task": {
+        "T-022": [
+          "T-010"
+        ],
+        "T-023": [
+          "T-020"
+        ],
+        "T-021": [
+          "T-004"
+        ],
+        "T-016": [
+          "T-002"
+        ],
+        "T-017": [
+          "T-009"
+        ],
+        "T-026": [
+          "T-012"
+        ],
+        "T-032": [
+          "T-031"
+        ],
+        "T-028": [
+          "T-027"
+        ],
+        "T-029": [
+          "T-027"
+        ],
+        "T-033": [
+          "T-006",
+          "T-007",
+          "T-030"
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-019",
+      "title": "Advance the breaking Run wire contract to protocol generation 3",
+      "objective": "Make incompatible Backend, replay-streaming, interruption, persistence, and tmux wire shapes fail at the first handshake instead of after a request can mutate daemon state.",
+      "outcome": "All current Rust, CLI, and TypeScript peers speak protocol generation 3, while a generation-2 peer receives version_mismatch before any Run request is executed.",
+      "acceptance": [
+        "The Rust protocol constant is the only generation SSOT and generated TypeScript constants, clients, fixtures, documentation, and version output agree on generation 3.",
+        "A raw generation-2 hello to a generation-3 daemon receives version_mismatch, the connection closes before request execution, and the daemon Run list remains unchanged.",
+        "Generation-3 Rust, CLI, and TypeScript request plus streamed-attach parity pass through the public socket, including the current Backend, capabilities, interruption, and replay-header shapes.",
+        "Current protocol, architecture, ADR 003, persistence, tmux, SDK, and testing documents identify generation 3 where they describe the wire contract; the separate Integration API generation remains independently versioned.",
+        "The change deletes the obsolete generation claim and adds no v2 fallback, migration, negotiation alias, dual encoding, or unrelated new wire capability."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Generation mismatch negative-space, generated schema drift, cross-language parity, streamed replay, and the full repository gate pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The complete current generation-3 public boundary and pre-stable compatibility policy are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#delivery-rules",
+        "docs/architecture.md#stable-boundary",
+        "docs/architecture/choices/003-unix-socket-json-lines-protocol.md",
+        "docs/protocol.md#connection-state",
+        "docs/testing-strategy.md#layer-4--parser-and-compatibility-corpora"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 7,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-022",
+      "title": "Close post-archive persistence correctness findings",
+      "objective": "Coordinate the independently owned persistence hardening Feature through completion and bind its corrected admission and recovered-state guarantees back into reliability qualification.",
+      "outcome": "Persistence recovery has a new auditable correction boundary after its historical archive, without mutating archived truth or moving storage implementation into the qualification Feature.",
+      "acceptance": [
+        "Feature f-227czdavj owns and completes recoverable admission versus fatal-store classification plus shared recovered RunSpec validation; this task does not duplicate that implementation.",
+        "The hardening Feature passes deterministic actor admission, fatal-latch, invalid-spec, real restart, no-partial-publication, and full repository gates and is formally archived.",
+        "Qualification binds the exact hardening commit or tree, archived summary, gate evidence, and shipped boundary while preserving the historical f-223czq75x archive unchanged.",
+        "The corrected public boundary still rejects recovered input, resize, stop, and Level B fork and adds no live PTY handoff, PID adoption, schema migration, salvage, or tmux persistence.",
+        "No current persistence claim is counted complete from the superseded T-010 evidence alone."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The corrected persistence actor, recovery corruption, cross-client, and repository gates pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features-archived/f-227czdavj/summary.md",
+          "proves": "The post-archive persistence hardening owner is formally closed with exact gate evidence."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery",
+        "docs/testing-strategy.md#capability-feature-closure-before-final-qualification",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "supersedes": [
+        "T-010"
+      ],
+      "introduced_in_revision": 7,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-023",
+      "title": "Separate CI N/A from retained changed-line evidence",
+      "objective": "Remove the incentive to add unrelated executable code when a product change has no changed executable denominator, while preserving explicit retained-evidence and owner-floor guarantees.",
+      "outcome": "CI reports zero-denominator product changes honestly as N/A instead of manufacturing a coverage proof or forcing an unrelated executable edit, while retained changed-line evidence remains non-empty and fail-closed.",
+      "acceptance": [
+        "Changed-line auto mode reports N/A when the current product change has no executable added or modified line; N/A is visibly distinct from a passing changed-line percentage and is never recorded as changed-line coverage evidence.",
+        "Filesystem source inventory, all seven owner groups, fixed 90/85/95 floors, missing-report checks, and the ordinary repository Gate still execute for documentation, comment-only, deletion-only, rename, and untracked product changes.",
+        "Explicit true retained-evidence mode still requires an explicit valid base, direct or merge-base semantics, a nonzero executable denominator, and at least 90 percent coverage; it never degrades to N/A.",
+        "When auto mode has a nonzero executable denominator it still enforces the 90 percent floor, including mixed executable and non-executable changes without counting deleted or comment-only lines as executable evidence.",
+        "Policy tests cover documentation-only, comment-only, deletion-only, rename, untracked, mixed executable/non-executable, passing and failing executable percentages, and explicit retained-evidence behavior.",
+        "Testing strategy, contributor guidance, CI evidence-map language, and Tracker verification distinguish owner qualification, auto N/A, and retained changed-line proof without weakening T-020's seven-owner result."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-coverage.sh",
+          "proves": "All owner floors pass and the corrected auto versus explicit changed-line semantics execute on instrumented reports."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/testing-strategy.md",
+          "proves": "CI N/A and retained-evidence meanings are public, distinct, and do not invite a fake executable denominator."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#code-coverage-ratchet",
+        "coverage-policy.json",
+        "scripts/coverage-policy.mjs",
+        "scripts/coverage-policy.test.mjs",
+        ".github/ci-evidence-map.json"
+      ],
+      "supersedes": [
+        "T-020"
+      ],
+      "introduced_in_revision": 10,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-025",
+      "title": "Bind required CI Gates to one neutralized execution boundary",
+      "objective": "Prevent an earlier workflow step from using persisted shell startup state to mutate the checkout or weaken required Gate environment after source identity was verified.",
+      "outcome": "Each required critical and coverage Gate starts with inert shell startup files, verifies the exact clean checkout, and immediately executes the canonical Gate inside one final step that has no post-fence runner boundary.",
+      "acceptance": [
+        "The independent source-fence step is removed. Critical and coverage each have exactly one unconditional final Gate step whose exact inline command neutralizes inherited shell and Git redirection state, verifies the checked-out HEAD and complete worktree against the event source identity, and immediately execs the canonical Gate with no intervening runner step or repository helper.",
+        "The final step explicitly binds BASH_ENV and ENV to /dev/null before Bash startup, unsets those variables before the nested Gate Bash, invokes a platform-owned Bash without profile or rc files, and retains the exact required CTXMUX, tmux, fuzz, model, and coverage environment. Ubuntu 24.04 and macOS 15 remain the only claimed lanes.",
+        "The identity check cannot be redirected by PATH or the common GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR, GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, or GIT_ALTERNATE_OBJECT_DIRECTORIES environment channels; it uses the platform Git binary and the workflow event SHA rather than a mutable prior-step value.",
+        "Deterministic validator and shell-process oracles reproduce first-shell-noop/second-shell BASH_ENV mutation, show that same-step composition without startup neutralization is still unsafe, and reject missing or changed startup bindings, split fence/Gate steps, weakened identity checks, altered Gate invocations, and helper-only self-verification for both required jobs.",
+        "Canonical checkout, job matrix, triggers, required platforms, no-skip/no-retry rules, exact source inventory, seven coverage owners, 90/85/95 floors, changed-line base semantics, and full test selection remain unchanged and continue to pass the ordinary repository Gate.",
+        "The correction stays inside GitHub required-step and CI-reachability ownership. It adds no reusable workflow-security framework and makes no claim against hostile runners, arbitrary actions or background processes, dynamic-loader injection, complete toolchain or PATH attestation, Git object-store tampering, Windows, or self-hosted runners.",
+        "T-020 and T-023 remain immutable historical evidence; this task records the later CI execution-boundary correction, independent adversarial review, exact commit/message audit, and formal Gate under its own receipt."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The startup-hook negative oracles, canonical required workflow, CI reachability, ordinary tests, and public Gates pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/ci.yml",
+          "proves": "Critical and coverage use the same reviewed startup-neutralized final-step execution contract."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#gate-topology",
+        ".github/workflows/ci.yml",
+        ".github/ci-evidence-map.json",
+        "scripts/ci-reachability.mjs",
+        "scripts/ci-reachability.test.mjs"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 11,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-024",
+      "title": "Reconcile the shipped restart-recovery guarantee",
+      "objective": "Remove the contradictory architecture-table claim that restart recovery is wholly open while preserving the distinction between shipped historical recovery and unsupported live PTY continuity.",
+      "outcome": "The architecture source of truth states one coherent durability boundary: client churn and optional historical recovery are shipped, while live process adoption, PTY handoff, reboot continuity, migration, and upgrade continuity remain open.",
+      "acceptance": [
+        "The current-guarantees table no longer labels all restart recovery open and distinguishes daemon-lifetime native control from optional state-dir historical recovery.",
+        "Architecture, protocol, roadmap, and persistence decision 009 agree that a prior running row becomes interrupted and no stored PID or PTY becomes live authority.",
+        "The correction adds no new persistence, migration, process adoption, live handoff, compatibility, or platform guarantee.",
+        "Documentation formatting, consistency checks, and the ordinary repository Gate pass on the corrected source tree."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture.md",
+          "proves": "The current guarantee and target columns describe shipped historical recovery and still-open live continuity without contradiction."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The corrected authoritative documentation remains consistent with the executable persistence boundary and repository Gate."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#current-guarantees-and-target-boundaries",
+        "docs/protocol.md#run-operations",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 10,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-021",
+      "title": "Bind resource baselines to reproducible runtime identity",
+      "objective": "Replace mutable current-tree observation claims with clean-source receipts that bind the exact source commit, harness, daemon binary, locked build path, and raw resource measurements.",
+      "outcome": "Every frozen CPU, RSS, thread, descriptor, and retention budget can be traced to one clean, addressable runtime and qualification harness rather than an unrecorded dirty binary.",
+      "acceptance": [
+        "The qualification receipt records a clean source commit, dirty or diff state, daemon SHA-256, harness SHA-256, lockfile identity, locked build command, toolchain, and environment before any stage executes.",
+        "Policy rejects missing, dirty, unreachable, mixed-source, mixed-harness, mixed-binary, or hash-drifted baseline rounds and verifies the harness bytes against the recorded source commit.",
+        "The provenance-capable harness lands first; three observe rounds then run from that clean commit with the same source, harness, daemon binary, workload, seed policy, and measurement contract before budgets are re-frozen.",
+        "Checked-in receipt hashes and recomputed maxima bind all six idle and active 1/32/128 cells; remote nightly, release, and platform runs remain pending until their own artifacts exist.",
+        "Commit messages, Tracker evidence, and documentation distinguish harness reachability, clean local observations, and unexecuted remote qualification without claiming a mutable current tree or checked-in JSON hash proves the binary source."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "The source-bound harness and all frozen observation budgets pass the reliability policy and public resource workloads."
+        },
+        {
+          "kind": "artifact",
+          "ref": "fixtures/reliability/observe-darwin-arm64-r1.json",
+          "proves": "One of three durable raw rounds records the exact clean source, harness, binary, workload, environment, and measurements."
+        },
+        {
+          "kind": "artifact",
+          "ref": "reliability-budgets.json",
+          "proves": "All source-bound receipt hashes and maxima are recomputed before the budget file is accepted."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#stress-and-soak-testing",
+        "docs/testing-strategy.md#benchmarks-and-performance-regression",
+        "scripts/reliability-qualification.ts",
+        "scripts/reliability-policy.mjs",
+        "reliability-budgets.json"
+      ],
+      "supersedes": [
+        "T-004"
+      ],
+      "introduced_in_revision": 7,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Force concurrency and hostile input",
+      "objective": "Systematically explore the interleavings and hostile byte streams that ordinary real-time E2E tests cannot force reliably.",
+      "outcome": "Core owner races and parser boundaries fail reproducibly with retained seeds rather than intermittently in production.",
+      "acceptance": [
+        "Barriers force subscribe versus snapshot, stop versus wait, detach versus output, final-output versus exit, and declared multi-client mutation interleavings.",
+        "A small model or property test compares generated public operations only with semantics the protocol actually promises; undefined arbitration is not fabricated as a test oracle.",
+        "Native protocol, TypeScript wire validation, Agent JSONL observation, and future active protocol parsers have fuzz targets plus ordinary regression corpora for minimized failures.",
+        "Scheduled sanitizer, race, or model-check lanes state exactly which native and dependency boundaries they cover and retain replay information on failure."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Deterministic interleaving, property, corpus, and minimized fuzz regressions pass on every change."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/ci.yml",
+          "proves": "Required and scheduled concurrency and hostile-input lanes are reachable."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#layer-2--deterministic-owner-seams",
+        "docs/testing-strategy.md#layer-4--parser-and-compatibility-corpora",
+        "docs/testing-strategy.md#concurrency-and-race-testing"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 5,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-016",
+      "title": "Fence daemon shutdown socket cleanup by bound identity",
+      "objective": "Make socket cleanup symmetric across startup and shutdown so an exiting daemon cannot unlink a different listener that replaced its published pathname.",
+      "outcome": "The daemon removes only the Unix socket identity it successfully bound, while independently substituted live listeners remain reachable after the old daemon exits.",
+      "acceptance": [
+        "The shutdown guard retains the bound socket device and inode after successful bind and unlinks the pathname only while it still names that identity.",
+        "A real replacement listener can take over the pathname before the old daemon exits; old-daemon shutdown preserves the replacement path and new connections still reach it.",
+        "Missing, non-socket, symlink, or different-socket replacements are never removed, and documentation keeps pathname recheck versus unlink non-atomicity in a hostile writable parent as a residual boundary."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The real replacement-listener shutdown regression and the complete native lifecycle gate pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/architecture/choices/003-unix-socket-json-lines-protocol.md",
+        "docs/testing-strategy.md#security-testing"
+      ],
+      "supersedes": [
+        "T-002"
+      ],
+      "introduced_in_revision": 6,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-017",
+      "title": "Bind Level B provenance to the actual source Run",
+      "objective": "Replace object-local Level B receipts with fail-closed source ownership so a continuation can only use semantic evidence emitted by its declared parent Run.",
+      "outcome": "Every Level B fork is backed by verifiable parent/source identity; missing provenance support and misrouted unrelated Run output create no raw fork request or child Run.",
+      "acceptance": [
+        "Every Integration that advertises Level B must provide a provenance receipt path; a missing provenance hook fails before planning or raw fork instead of bypassing verification.",
+        "The observer and receipt boundary binds semantic evidence to the actual source Run identity, so routing another Run output event through a parent observer cannot authenticate the declared parent.",
+        "Hermetic unit and public-daemon regressions prove missing-hook and unrelated-source rejection with raw fork count zero and no child Run, while the valid Codex continuation path and Level B lineage still pass."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Source-bound provenance negatives, no-child public behavior, and the valid Codex Level B continuation gate pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/architecture/choices/010-explicit-typescript-integrations.md",
+        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
+        "packages/sdk/README.md"
+      ],
+      "supersedes": [
+        "T-009"
+      ],
+      "introduced_in_revision": 6,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-013",
+      "title": "Correlate attachment controls and expose applied terminal size",
+      "objective": "Give low-latency persistent attachments deterministic per-command outcomes and real PTY size observability without inventing a general transaction system.",
+      "outcome": "Consumers can pipeline input, resize, and stop, match every acceptance or error to its command, repair size drift, and distinguish accepted stop from final exit.",
+      "acceptance": [
+        "Every attachment input, resize, and stop command carries a bounded opaque command id, and every accepted or error result echoes it without confusing command results with output or lifecycle events.",
+        "The contract states the exact owner boundary reached by acceptance: input is accepted only after the daemon's PTY write boundary succeeds, resize reports the size read back from the owning PTY, and stop acceptance remains separate from terminal Exited.",
+        "Command ids provide correlation, not permission to replay uncertain input; duplicate, reconnect, and unknown-disposition behavior is explicit and fails closed unless a separately proven deduplication contract applies.",
+        "A real PTY fixture pipelines at least 1000 ordered input chunks plus concurrent resize and stop, proves exact result matching, bytes and applied size, and covers rejection, disconnect, late result, backpressure, and final-output ordering.",
+        "Short-lived request methods and persistent Attachment methods present compatible semantics through the public SDK without a second command bus or Agent-specific acknowledgement layer.",
+        "The current daemon incarnation has one explicit PTY control-owner boundary for input, resize, stop, and future quiesce; durable Run facts are not mislabeled as live authority, and the change adds no public actor, Backend hierarchy, or duplicate runtime graph solely for implementation shape.",
+        "Bounded input backpressure cannot starve resize or stop, and the real PTY fixture preserves fragmented opaque terminal input including SGR mouse and bracketed-paste sequences without interpreting them as UI or Agent semantics."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Protocol, SDK, real PTY, pipelined control, control-under-input-saturation, opaque mouse/paste bytes, applied-size, disconnect, and lifecycle ordering regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "packages/sdk/README.md",
+          "proves": "Attachment command resolution, correlation, retry limits, applied size, and stop-versus-exit semantics are documented for clean consumers."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        "docs/protocol.md#output-and-reconnect",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure",
+        "packages/sdk/README.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/herdr-transfer-review.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 3,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-026",
+      "title": "Close unpublished-child rollback before creation-key reuse",
+      "objective": "Make the shared Start/Fork publication boundary retain direct-child and exact-key ownership across a pre-COMMIT persistence rejection until the child-handle owner proves terminal-and-reaped, so a same-key retry cannot create a second process.",
+      "outcome": "Every rejected persistent creation either proves its ctxmux-owned direct child reaped before the key becomes reusable or transfers child ownership and an exact-key fence into bounded private cleanup accounting without indefinitely consuming an unrelated key stripe or global launch permit.",
+      "acceptance": [
+        "Deterministic owner-controlled Start and Fork fixtures launch a real direct child, force persistence rejection before COMMIT, and prove kill plus reap, no published Run/key mapping, and an unrelated-process sentinel untouched.",
+        "Terminal-and-reaped proof comes from the waiter that owns the child handle; public RunState, a cached PID, elapsed time, or a log line is never treated as cleanup proof, and stop, kill, wait, or waiter-channel failure cannot be ignored.",
+        "Until reap is proven, the existing creation owner retains the child and exact key or safely transfers both to one globally bounded daemon-private cleanup owner; a transfer may release the shared stripe and global launch permit only after the exact-key fence is independently installed.",
+        "An unresolved cleanup is reported explicitly, remains visible to bounded accounting and daemon shutdown, and cannot be multiplied without bound by changing operation keys; it publishes no fake Run and creates no PID-based signalling fallback.",
+        "Concurrent same-key retry during cleanup converges on the existing owner or an explicit fenced failure without a second launch; after proven cleanup exactly one new leader may reuse the key, while unrelated keys retain launch progress.",
+        "Normal persistence capacity rejection remains recoverable and does not poison unrelated append or finalize operations; fatal storage failure classification remains unchanged.",
+        "The correction requalifies T-012 public Start/Fork duplicate concurrency, response loss, conflicting reuse, post-COMMIT publication, restart recovery, Rust client, CLI, and TypeScript SDK behavior.",
+        "Protocol and architecture truth distinguish proven rollback key reuse from an unresolved exact-key fence, while daemon crash still promises no persistent pending tombstone, process adoption, or descendant cleanup.",
+        "The correction stays inside creation, native child ownership, and persistence admission; it adds no Session identity, process-tree policy, persistent pending tombstone, public transaction API, Backend framework, or general fault-injection system."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Real-child persistence rejection, kill/reap, same-key concurrency, unrelated identity, persistence actor, and full repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#start-a-native-run",
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md#t-013--correlated-attachment-controls-and-applied-pty-size"
+      ],
+      "supersedes": [
+        "T-012"
+      ],
+      "introduced_in_revision": 13,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-032",
+      "title": "Make persistence recovery E2E concurrency-stable",
+      "objective": "Replace two stale wall-clock and initial-cursor assumptions with protocol-authoritative persistence oracles while preserving the full default-concurrency workload and all runtime behavior.",
+      "outcome": "The persistence recovery binary deterministically proves dynamic Start snapshots and over-4-MiB replay pruning under ordinary parallel execution without retries, sleeps, payload reduction, or suite serialization.",
+      "acceptance": [
+        "The initial persistent Start response accepts any durable cursor permitted by its dynamic RunInfo snapshot and proves the invariant durable_head_seq <= head_seq instead of requiring an impossible scheduling order.",
+        "The retained-replay fixture still emits more than 4 MiB, proves truncation, exact Z-byte tail, durable cursor equality at terminal state, restart recovery, and identical replay, but uses an explicit heavy-workload terminal budget distinct from the ordinary small-Run hang budget.",
+        "No runtime, protocol, persistence, descriptor, terminal-publication, or owner behavior changes unless a separate public-boundary violation is demonstrated.",
+        "The complete persistence_recovery binary passes under its default parallel test execution without test retries, sleeps, serial execution, or reducing the retention-pressure payload.",
+        "The complete scripts/check.sh Gate passes once; the failed T-031 Gate records and corrected diagnosis remain preserved."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The corrected persistence E2E oracles and every ordinary repository regression pass together without retry."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-16-plan-review.md",
+          "proves": "The original failures, protocol-authoritative diagnosis, prohibited non-solutions, and bounded correction are explicit."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md",
+        "crates/ctxmux-daemon/tests/persistence_recovery.rs",
+        "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/persistence.rs",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/gate-T-031-r31-0001.log",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/gate-T-031-r32-0001.log"
+      ],
+      "supersedes": [
+        "T-031"
+      ],
+      "introduced_in_revision": 15,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-028",
+      "title": "Ship memory-only retained Run admission and GC",
+      "objective": "Implement the accepted 128-record memory-only Registry ceiling through one reservation, pin, collection-fence, and exact replacement owner before any physical Backend mutation.",
+      "outcome": "A memory-only daemon can churn indefinitely without exceeding 128 retained or projected Runs, losing protected owners, or retaining stale creation-key mappings.",
+      "acceptance": [
+        "Start, Fork, and tmux import reserve one projected Registry slot before physical launch or Control startup and return run_capacity without mutation when no eligible terminal candidate exists.",
+        "Retained, Collecting, and Removed linearize under the Registry owner; copy-only List and Status do not pin, while Attach, control, and fresh Fork acquire an atomic lookup-to-pin owner or fail explicitly.",
+        "One deterministic eligible terminal candidate is fenced and its Run plus exact operation-key mapping are removed together; live, attached, pinned, reader, waiter, input-drain, tmux-control, persistence-transition, and T-026 cleanup owners are never collected.",
+        "Post-collection List, Status, Attach, fresh Fork, and old-key reuse match the documented generation-6 error matrix without silent replay continuity or duplicate physical launch.",
+        "The implementation adds no background GC actor, TTL, public delete API, Session identity, Backend framework, or second reservation truth."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Memory-only admission, owner races, exact removal, key reuse, public errors, tmux import, and repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        "docs/protocol.md",
+        "crates/ctxmux-daemon/src/creation.rs",
+        "crates/ctxmux-daemon/src/lib.rs"
+      ],
+      "supersedes": [
+        "T-027"
+      ],
+      "introduced_in_revision": 14,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-029",
+      "title": "Close persistent retained Run replacement",
+      "objective": "Implement the smallest persistence-owned exact replacement transaction whose WAL and page-cost admission is proven before launch and whose COMMIT disposition cannot reopen a key or duplicate a Run.",
+      "outcome": "Persistent mode supports bounded retained-Run churn across restart while old candidates and the new Run are always recovered as one pre- or post-COMMIT state.",
+      "acceptance": [
+        "A reviewed persistence-owned WAL and page-cost admission rule bounds the exact candidate set before physical launch; an unprovable or over-budget request returns run_capacity before mutation rather than relying on a post-launch SQLite failure.",
+        "The persistence actor distinguishes NotCommitted, Committed, and fail-stop CommitUnknown; only NotCommitted restores candidates, while Committed always drives one infallible exact Registry replacement.",
+        "Candidate rows, replay, metadata accounting, and byte-exact creation keys change in one SQLite transaction, and crash fixtures around COMMIT recover either all old candidates or only the new Run.",
+        "Startup normalization and ordinary creation remain inside the frozen record, metadata, replay, database, WAL, and SHM ceilings without weakening schema validation or adopting live processes.",
+        "The implementation introduces no general transaction API, migration compatibility layer, durable collecting ticket, pending tombstone, or PID-based recovery."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Persistent admission, WAL boundary, exact replacement, COMMIT ambiguity, restart recovery, key convergence, and repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/protocol.md",
+        "crates/ctxmux-daemon/src/persistence.rs",
+        "crates/ctxmux-daemon/src/creation.rs"
+      ],
+      "supersedes": [
+        "T-027"
+      ],
+      "introduced_in_revision": 14,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-033",
+      "title": "Close retained-state convergence with one representative TDD",
+      "objective": "Prove the shipped memory-only and persistent retention owners converge across repeated replacement, same-key retry, and restart without building a new qualification platform.",
+      "outcome": "One cheap deterministic ordinary oracle and one focused review close the Run-Kernel reliability Feature.",
+      "acceptance": [
+        "A failing-first deterministic test uses a reduced private record ceiling and drives at least three complete turnover windows through both memory-only and persistent creation owners.",
+        "Every boundary retains exactly the configured Run count and exact operation-key mapping; retrying a retained key returns the same RunId and does not start another physical child.",
+        "Persistent restart recovers the exact final retained Run/key/replay tuple set, clears stale PID authority, and a post-restart same-key retry still resolves without a physical launch.",
+        "The implementation reuses the existing Registry, persistence actor, public creation path, and test helpers; it adds no metrics sink, public admin API, background GC actor, second budget model, or qualification framework.",
+        "One independent reviewer finds no open P0/P1 in the changed retention boundary, and scripts/check.sh passes once from the exact clean revision. P2 and adjacent release, platform, soak, pressure, tmux, packaging, and performance work do not block closure."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The representative retention oracle and all ordinary repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md",
+          "proves": "The exact revision, focused review disposition, Gate receipt, and bounded residual risks are retained."
+        }
+      ],
+      "source_refs": [
+        "crates/ctxmux-daemon/src/tests/creation.rs",
+        "crates/ctxmux-daemon/src/creation.rs",
+        "crates/ctxmux-daemon/src/persistence.rs",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md"
+      ],
+      "supersedes": [
+        "T-006",
+        "T-007",
+        "T-030"
+      ],
+      "introduced_in_revision": 17,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-001",
+      "title": "Make coverage and CI reachability explicit",
+      "objective": "Add measurable Rust and TypeScript coverage plus a job-to-invariant CI map without treating percentages as lifecycle proof.",
+      "outcome": "Every checked-in critical test has visible platform and gate reach, and unexercised hand-written logic is constrained by a reviewed coverage ratchet.",
+      "acceptance": [
+        "Coverage reports separate generated code, platform-impossible branches, hand-written runtime code, and pure protocol or validator code.",
+        "After an observation baseline, required gates enforce at least 90 percent changed-line coverage, 85 percent hand-written runtime, client, and SDK line coverage, and 95 percent pure protocol codec and runtime-validator line coverage.",
+        "Ubuntu and macOS continuously run the critical real daemon, process, PTY, protocol, CLI, and SDK contract subset appropriate to each platform.",
+        "The job-to-invariant map exposes skipped, ignored, conditionally unreachable, or schedule-only evidence instead of counting it as a passing gate."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The required local quality and critical behavior gate remains green with coverage selection enabled."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/ci.yml",
+          "proves": "Required platform jobs and test-to-job reachability are durable repository configuration."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#what-coverage-means",
+        "docs/testing-strategy.md#gate-topology",
+        "docs/testing-strategy.md#code-coverage-ratchet"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-018"
+      ]
+    },
+    {
+      "id": "T-002",
+      "title": "Close current owner-boundary P0 gaps",
+      "objective": "Replace implementation-order, unit-only, and manual evidence for shipped high-risk lifecycle behavior with deterministic public-boundary tests.",
+      "outcome": "Lag recovery, stop identity, interactive CLI PTY restoration, and socket startup safety have executable real-owner oracles.",
+      "acceptance": [
+        "A real attachment observes Gap and reattaches from its caller-owned cursor with exact retained continuation or explicit truncation and no duplicate live join.",
+        "HUP-ignoring child and stop-after-wait barriers prove the accepted direct-child or process-tree policy without signalling stale or unrelated identity.",
+        "A checked-in controlling-PTY fixture proves raw input, resize, detach, stable terminal restoration, and surviving Run identity on each supported Unix platform.",
+        "A deterministic stale-socket replacement race fails closed without removing or binding over an unrelated target.",
+        "The corrections remain owner-local and do not introduce a general fault framework, Backend abstraction, or unsupported capability claim."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The public lag, stop, CLI PTY, socket race, and full repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#core-scenarios-and-end-to-end-paths",
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        "docs/testing-strategy.md#p0--close-false-confidence-gaps"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 4,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-016"
+      ]
+    },
+    {
+      "id": "T-004",
+      "title": "Establish chaos, stress, security, and resource qualification",
+      "objective": "Create reproducible heavy reliability lanes with explicit failure traces, workload bounds, security negatives, CPU and memory budgets, and resource cleanup oracles.",
+      "outcome": "Ctxmux demonstrates bounded CPU, memory, and cleanup behavior through failures, output pressure, fan-out, high concurrent Run counts, lifecycle churn, adversarial local input, and long-running operation.",
+      "acceptance": [
+        "Named chaos scenarios kill or stall each current owner at reviewed transitions and record the seed, action trace, process tree, daemon log, and cleanup result.",
+        "Stress and soak workloads cover replay limits, fast and slow fan-out, 1/32/128 idle and active Runs, lifecycle churn, resize and input under load, final-output drain, and every declared quota.",
+        "Security cases cover socket trust and races, malformed and long-lived frames, argv and environment boundaries, descriptor and PID identity, secrets, and denial-of-service limits with no mutation on rejection.",
+        "After a clean observation baseline and before optimization results guide changes, freeze machine-normalized budgets for core-normalized daemon CPU, peak and steady-state RSS, retained-output bytes, and per-Run RSS, thread, and descriptor slopes at 1/32/128 idle and active Runs; repeated cleanup-owned lifecycle churn returns within the documented baseline envelope, while intentional retained state and absent GC or quotas remain explicit.",
+        "PR smoke, nightly reliability, and release soak lanes have explicit time budgets and preserve every reproducible failure as an ordinary regression."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "The reproducible chaos, stress, security, leak, and soak qualification commands pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/reliability.yml",
+          "proves": "Heavy reliability evidence is continuously reachable outside the ordinary PR critical path."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#chaos-and-fault-testing",
+        "docs/testing-strategy.md#stress-and-soak-testing",
+        "docs/testing-strategy.md#security-testing",
+        "docs/testing-strategy.md#resource-leak-testing"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 5,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-021"
+      ]
+    },
+    {
+      "id": "T-009",
+      "title": "Close Level B provenance and real Codex regressions",
+      "objective": "Bind Level B continuation to the declared parent Run, prove semantic continuation with real Codex, and make availability probing robust without weakening fail-closed behavior.",
+      "outcome": "Level B claims are backed by parent-owned session provenance, hermetic adapter regressions, and a credential-controlled real Codex semantic canary instead of argv agreement alone.",
+      "acceptance": [
+        "The Integration verifies that continuation identity belongs to the declared parent Run; an unrelated or unverifiable session fails before a raw fork request and creates no child Run.",
+        "A hermetic recording executable continues to prove exact argv, protocol framing, lineage, distinct child identity, explicit unsupported capability, and deterministic failure behavior.",
+        "A credential-controlled real Codex canary creates the parent through the supported Integration, establishes a unique semantic fact there, and proves that fact remains observable only through the Level B continuation while recording tool version and redacting credentials.",
+        "The default availability probe tolerates the measured supported Codex cold-start envelope; an explicit timeout still returns a deterministic fail-closed result without an unbounded wait.",
+        "Every provenance, probe, or semantic-canary failure is retained as an ordinary reproducible regression or a visible external-canary failure; retries, fake semantic assertions, and fallback to Level A cannot make Level B green."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Parent/session provenance, hermetic argv/protocol behavior, timeout handling, and the full repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/reliability.yml",
+          "proves": "The credential-controlled real Codex semantic canary is continuously reachable and remains separate from hermetic required tests."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/roadmap.md#m3--context-artifacts-lineage-and-fork",
+        "docs/testing-strategy.md#current-ctxmux-audit",
+        "docs/testing-strategy.md#gate-topology",
+        "docs/testing-strategy.md#p2--qualify-capability-specific-risk"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 5,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-017"
+      ]
+    },
+    {
+      "id": "T-010",
+      "title": "Complete, qualify, and archive persistence recovery",
+      "objective": "Drive f-223czq75x through its own accepted recovery tasks and gates, formally archive it, and qualify exactly the recovery class it ships.",
+      "outcome": "Persistence and restart recovery have one implementation truth, a closed Feature lifecycle, and complete real-restart qualification evidence with unsupported continuity claims excluded.",
+      "acceptance": [
+        "Feature f-223czq75x completes its own T-001 recovery decision and T-002 implementation plan; this task coordinates closure and qualification without duplicating or replacing that Feature's implementation truth.",
+        "The accepted contract names durable metadata, replay, live-control, daemon-epoch, atomicity, corruption, retention, cleanup, orphan, and unsupported-state behavior before implementation is claimed complete.",
+        "Real restart and wrong-case fixtures prove every supported recovery guarantee, corrupt or torn generations, stale or recycled process identity, and bounded retained state without adopting or signalling an unrelated process.",
+        "The owning Feature records a passing gate and is formally archived with its canonical summary; the qualification report binds the archived Feature, shipped boundary, exact revision, commands, and evidence.",
+        "Chaos, security, resource, independent review, and final qualification lanes include the shipped recovery class, while unsupported live PTY or process continuity remains explicit and cannot be inferred from persisted metadata."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/009-runtime-persistence-recovery.md",
+          "proves": "The accepted recovery class and fail-closed durability semantics are explicit."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The owning restart, corruption, stale-identity, retention, wrong-case, and repository gates pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-223czq75x/summary.md",
+          "proves": "The persistence Feature is formally archived with its completed task and gate evidence."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery",
+        "docs/testing-strategy.md#p2--qualify-capability-specific-risk",
+        "docs/testing-strategy.md#capability-feature-closure-before-final-qualification"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 2,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-022"
+      ]
+    },
+    {
+      "id": "T-012",
+      "title": "Make Run creation retry-safe without adding Session identity",
+      "objective": "Make start and fork converge after a lost response through one bounded caller operation key while preserving RunId as the sole physical Run incarnation.",
+      "outcome": "A consumer can retry an uncertain creation request without spawning a duplicate Run, and ctxmux gains no mutable tag store, second Session identity, or silent attach-or-create behavior.",
+      "acceptance": [
+        "Start and fork accept one bounded opaque creation operation key; the same key and canonical request return the original RunInfo, while the same key with different semantics returns a typed conflict and creates no Run.",
+        "RunId remains the only physical incarnation fence, and the protocol adds no mutable metadata CRUD, Agent-specific owner field, reusable public SessionId, or implicit attach-or-create fallback.",
+        "Operation-key retention and collection share the Run ownership and quota model; if a recovery class preserves a Run across daemon restart, its create mapping is committed and recovered atomically with that class rather than silently permitting a duplicate.",
+        "Deterministic barriers cover concurrent duplicate requests, spawn success followed by response loss, conflicting reuse, failed spawn, collection, corruption, and every supported restart boundary with exact one-process and no-unrelated-Run oracles.",
+        "CLI and TypeScript SDK expose the same public behavior, and callers are not promised global exactly-once execution beyond the declared key scope and lifetime."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Public CLI, SDK, protocol, concurrent retry, response-loss, conflict, and applicable restart regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The operation-key scope, canonical-request equality, lifetime, conflict, collection, and non-guarantees are public and reviewable."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#system-and-ownership-model",
+        "docs/protocol.md#native-run-operations",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 3,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-026"
+      ]
+    },
+    {
+      "id": "T-018",
+      "title": "Correct coverage gate evidence and changed-line base proof",
+      "objective": "Replace the ordinary-gate-only T-001 receipt with explicit coverage-lane evidence whose changed-line claim is bound to a meaningful comparison base.",
+      "outcome": "Coverage qualification records the actual instrumented command and non-empty changed executable line result, while a clean HEAD comparison cannot be cited as proof of the changed-line ratchet.",
+      "acceptance": [
+        "A fresh explicit scripts/check.sh --coverage execution passes on the corrected tree and verification records the command, group percentages, comparison base, and a nonzero changed executable line denominator.",
+        "Coverage policy has an evidence mode that fails when changed-line proof is required but the selected base yields no changed executable product lines; ordinary no-change runs remain distinguishable rather than being promoted into proof.",
+        "CI keeps an explicit pull-request or push comparison base, and policy tests cover missing, clean-HEAD, and non-empty changed-line evidence behavior."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-coverage.sh",
+          "proves": "The instrumented Rust and TypeScript coverage policy executes with an explicit meaningful base."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md",
+          "proves": "The exact coverage command, base, non-empty denominator, thresholds, and result are recorded as correction evidence."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#code-coverage-ratchet",
+        "scripts/check.sh",
+        "scripts/check-coverage.sh",
+        "scripts/coverage-policy.mjs",
+        ".github/workflows/ci.yml"
+      ],
+      "supersedes": [
+        "T-001"
+      ],
+      "introduced_in_revision": 6,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-020"
+      ]
+    },
+    {
+      "id": "T-020",
+      "title": "Restore complete coverage and changed-line qualification",
+      "objective": "Make every instrumented hand-written source file belong to one honest owner group, preserve the pure-validator floor through executable negatives, and require meaningful changed-line evidence whenever product source changes.",
+      "outcome": "Coverage cannot turn green by omitting persistence or tmux, diluting mature runtime coverage, lowering the validator contract, or treating an empty product denominator as proof.",
+      "acceptance": [
+        "Persistence and tmux each have an explicit coverage owner group and baseline so neither is omitted or hidden inside a lowered aggregate; any owner-boundary exception is named and cannot be reported as satisfying the ordinary 85 percent runtime floor.",
+        "TypeScript protocol validators retain the 95 percent floor through high-value tests for tmux events and IDs, interrupted state and reason, safe unsigned integers, terminal wire errors, and current race-sensitive branches rather than a threshold reduction.",
+        "Changed-line mode supports ordinary reporting, explicit evidence, and CI auto-detection: owned product changes require a non-empty executable denominator, pure documentation changes may report none, and product-only comments cannot silently become evidence.",
+        "The required coverage workflow supplies the pull-request or push base and enables CI auto-detection; retained local evidence uses an explicit base plus non-empty denominator and records every group result.",
+        "Policy self-tests cover unassigned files, missing reports, product versus documentation diffs, empty executable product diffs, non-empty passing evidence, and failing changed-line percentages."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-coverage.sh",
+          "proves": "All explicit coverage groups, the 95 percent validator floor, and a meaningful changed-line comparison pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/ci.yml",
+          "proves": "Required CI supplies the comparison base and fail-closed product-change evidence mode."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#code-coverage-ratchet",
+        "coverage-policy.json",
+        "scripts/coverage-policy.mjs",
+        "scripts/coverage-policy.test.mjs",
+        ".github/workflows/ci.yml"
+      ],
+      "supersedes": [
+        "T-018"
+      ],
+      "introduced_in_revision": 7,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "superseded_by": [
+        "T-023"
+      ]
+    },
+    {
+      "id": "T-027",
+      "title": "Bound retained Runs and creation keys with ownership-safe GC",
+      "objective": "Give a long-lived daemon an explicit global retained-state budget and exited-Run collection policy whose memory, CPU, thread, descriptor, replay, and key semantics remain measurable under sustained churn.",
+      "outcome": "Exited Run records and creation keys no longer grow without bound; protected live or pinned owners are never collected, and retained replay is discarded only with one eligible terminal Run under a documented fail-closed contract.",
+      "acceptance": [
+        "One reviewed retention contract fixes one exact global Run-record ceiling, deterministic candidate order and tie-breaks, trigger points, temporary-owner treatment, running Runs, lookup-to-pin ownership, exited replay, creation flights and keys, persistent rows, collection eligibility, and observable post-collection errors before implementation; the total replay bound is derived from that ceiling and the existing per-Run retention contract rather than a second hot-path byte quota.",
+        "Start, Fork, and tmux import collect eligible terminal Runs before exceeding the global Run-record ceiling; when running, attached, pinned, or other protected owners exhaust capacity, admission returns a typed capacity error before native physical launch or Backend publication instead of crossing the bound.",
+        "Eligibility requires quiescent native reader, waiter and control ownership, tmux control, attachment lookup-to-pin, fresh Fork lookup, same-key retry lookup, input drain, terminal publication, reader completion, and persistence transition; lookup-to-pin admission is atomic against collection, and deterministic barriers cover each lookup or completion racing collection.",
+        "An unpublished-child cleanup or exact-key fence retained by T-026 is a protected owner: collection cannot release its key, hide it from bounded accounting, or make it eligible for a second physical launch.",
+        "One exact candidate fence prevents new pins, then one Registry transition removes an eligible retained Run and all of its operation-key mappings together without a stale lookup or duplicate physical-process window.",
+        "Persistent collection first fences the exact candidate, deletes its row, owned replay, key and accounting in one SQLite transaction, restores eligibility on pre-COMMIT failure, and after COMMIT performs an exact non-failing Registry removal; injected failures and restart around COMMIT recover only fully present or fully absent state.",
+        "Collection preserves immutable descendant lineage even when its parent RunId becomes a dangling historical reference; a retained child's same-key Fork retry still resolves before parent lookup, while a fresh-key Fork against a collected parent returns run_not_found.",
+        "After collection, List omits the Run, Status and Attach report run_not_found, and a fresh-key Fork naming it reports run_not_found; the old operation key may create a new physical Run only after its prior Run is absent from every retained owner, and clients receive no silent replay or continuity claim.",
+        "Deterministic memory-only and persistent churn workloads cross the production budget for at least three collection windows and prove pre-registered non-growth for core-normalized CPU, collection work and latency, peak and steady RSS, retained bytes, Run/key count, threads, descriptors, child, attachment, reader, waiter, and input-drain ownership; restart recovers the same retained set and key mappings.",
+        "Historical observe receipts, hashes, runtime identities, and every numeric frozen ceiling remain unchanged; current qualification declares the new GC/admission contract separately, and no shortened soak, rebaseline, or post-result margin change replaces canonical nightly evidence.",
+        "The policy adds no Agent/session metadata, scheduler, distributed lease, public Backend hierarchy, arbitrary TTL compatibility layer, or budget relaxation; SSH, Signal/process-tree, and Runtime identity negotiation remain separate capabilities."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Registry, persistence, replay, key reuse, and public collection regressions pass."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "A clean canonical nightly qualification records at least three collection windows, CPU and memory plateaus, the frozen 1/32/128 resource matrix, source identity, receipt hashes, and unchanged budget hashes."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md",
+          "proves": "The exact clean commit, canonical nightly receipt and hash, raw plateau series, and unchanged frozen-budget hash are bound to T-027 completion."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/protocol.md#retry-safe-run-creation",
+        "docs/testing-strategy.md#resource-leak-testing",
+        "crates/ctxmux-daemon/src/creation.rs",
+        "crates/ctxmux-daemon/src/persistence.rs",
+        "scripts/reliability-qualification.ts",
+        "scripts/reliability-baseline-policy.mjs",
+        "scripts/reliability-policy.mjs",
+        "reliability-budgets.json"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 13,
+      "status": "blocked",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": [],
+      "last_blocker": {
+        "class": "internal_blocker",
+        "reason": "T-027 combines independently closable memory-only Registry GC, persistent exact replacement, and sustained qualification, while the accepted architecture still requires a reviewed SQLite WAL/page-cost admission strategy before persistent replacement can be implemented safely; supersede this program-sized task with bounded vertical tasks before further execution."
+      },
+      "superseded_by": [
+        "T-028",
+        "T-029",
+        "T-030"
+      ]
+    },
+    {
+      "id": "T-031",
+      "title": "Route adjacent outcomes to independently closable Features",
+      "objective": "Remove duplicated tmux, activation, packaging, and open-ended peer-performance work from this reliability closure while preserving each outcome under one explicit neighboring Feature owner.",
+      "outcome": "This Feature contains only finite Run-Kernel reliability closure; tmux completion is owned by f-224czneed, activation and release packaging by f-225cz7943, and one budget-bounded performance cycle by f-22aczwza9.",
+      "acceptance": [
+        "The current reviewed plan no longer duplicates tmux completion, local activation, benchmark harness, raw-byte optimization, or comprehensive peer-win implementation tasks.",
+        "Feature f-224czneed remains the sole implementation owner for tmux version qualification and observation truth across attachment lag.",
+        "Feature f-225cz7943 remains the sole implementation owner for clean-consumer composition, installation, activation, packaging, and release gates.",
+        "Proposal f-22aczwza9 owns one pre-registered budget-bounded performance cycle that stops with honest wins, ties, and losses instead of blocking reliability closure on universal peer wins.",
+        "No neighboring Feature is activated by this routing task; each must acquire its own reviewed task plan, Goal when needed, workspace, and evidence before execution."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-14-plan-review.md",
+          "proves": "The finite closure and every routed outcome have one explicit owner."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Convergence-only tracker changes do not regress repository behavior."
+        }
+      ],
+      "source_refs": [
+        ".bagakit/feature-tracker/features/f-224czneed/tasks.json",
+        ".bagakit/feature-tracker/features/f-225cz7943/tasks.json",
+        ".bagakit/feature-tracker/features/f-22aczwza9/state.json",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [
+        "T-005",
+        "T-008",
+        "T-011",
+        "T-014",
+        "T-015"
+      ],
+      "introduced_in_revision": 14,
+      "status": "blocked",
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 101,
+          "status": "fail"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "internal_blocker",
+        "reason": "The required repository gate failed twice and the full default-concurrency persistence_recovery binary reproducibly fails exited_run_recovers_metadata_replay_terminal_controls_and_level_a_fork (exit code 1 instead of 0) plus persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_tail (terminal-state timeout). The convergence routing is recorded, but current HEAD must regain persistence lifecycle correctness before this transition can close."
+      },
+      "superseded_by": [
+        "T-032"
+      ]
+    }
+  ],
+  "closeout_review": {
+    "schema": "bagakit.feature-closeout-review.v1",
+    "documentation": {
+      "disposition": "updated",
+      "rationale": "Owning architecture and testing SSOT now describe T-033 as the finite representative closure and preserve T-030 only as superseded history.",
+      "refs": [
+        "docs/architecture.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/testing-strategy.md"
+      ]
+    },
+    "learning": {
+      "disposition": "candidates_reviewed",
+      "rationale": "Revision history and final evidence were reviewed; the durable lesson is already embodied in the finite Goal and supersession plan, so no additional knowledge surface is needed.",
+      "refs": [
+        ".bagakit/feature-tracker/features/f-226cz5zdq/artifacts/revision-17-plan-review.md",
+        ".bagakit/feature-tracker/features/f-226cz5zdq/verification.md"
+      ]
+    },
+    "promotion": {
+      "disposition": "not_needed",
+      "rationale": "The convergence correction is task-local and already captured by repository delivery rules and the reviewed Feature plan; creating another promoted artifact would add entropy.",
+      "refs": []
+    }
+  }
+}

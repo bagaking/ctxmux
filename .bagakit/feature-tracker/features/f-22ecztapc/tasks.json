@@ -1,0 +1,301 @@
+{
+  "version": 2,
+  "feat_id": "f-22ecztapc",
+  "plan_status": "reviewed",
+  "plan_revision": 1,
+  "supersedes_revision": null,
+  "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "packages/sdk/README.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "packages/sdk/README.md"
+      ],
+      "task_ids": [
+        "T-000",
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-000",
+      "title": "Bind the delivered exec-upgrade baseline",
+      "objective": "Record the already delivered persistent-daemon exec-in-place continuity as the clean baseline for the remaining local Runtime embedding work.",
+      "outcome": "The next tasks build on one committed, gated baseline that preserves live Run ownership, replay, and recoverable-Input retry truth across an intentional upgrade.",
+      "acceptance": [
+        "Commit e88bdc5 is reachable from the current tree and contains the bounded handoff manifest, request drain, owner transfer, re-adoption, retry-ledger continuity, and public lifecycle evidence.",
+        "The complete repository gate passes from a clean e88bdc5 tree without weakening the checked-in reliability, coverage, fixture, or CI reachability policy.",
+        "Cold restart, intentional exec upgrade, Provider-specific resume, and future remote execution remain distinct ownership classes in architecture and protocol truth."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The delivered exec-upgrade baseline and complete repository contract pass from a clean commit."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
+          "proves": "The exact upgrade ownership, rollback, fail-stop, and non-goal boundary is durable."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
+        "docs/protocol.md#persistence-and-restart-recovery",
+        "crates/ctxmux-daemon/tests/native_lifecycle.rs"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-001",
+      "title": "Make Integration and Level B ownership explicit",
+      "objective": "Finish the public Provider-neutral Integration contract and Level B materialization boundary without moving Provider session or orchestration policy into ctxmux.",
+      "outcome": "Embedding clients can detect and register explicit Integrations, materialize an exact Level B Run plan, and receive fail-closed capability results through public SDK surfaces.",
+      "acceptance": [
+        "Integration remains an explicitly imported and registered host-process extension axis, separate from Backend execution location and daemon foundational types.",
+        "Level B requires Integration-provided workspace, artifact, lineage, and native-session fidelity and fails explicitly when materialization or provenance is unavailable; no Level A fallback occurs.",
+        "Provider-specific session discovery, semantic resume, permissions, prompt parsing, orchestration, and evaluation remain embedding-client responsibilities.",
+        "A clean TypeScript consumer proves a valid Level B path and missing-capability, wrong-source, and unavailable-Integration negative space through public APIs."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Integration registration, public Level B behavior, negative space, generated declarations, and repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/010-explicit-typescript-integrations.md",
+          "proves": "Integration, Backend, Runtime, and embedding-client ownership are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/architecture/choices/010-explicit-typescript-integrations.md",
+        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
+        "packages/sdk/README.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "in_progress",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Expose Runtime identity and capability manifest",
+      "objective": "Give clients one Provider-neutral description of the compatible Runtime endpoint and the capabilities it can honestly activate or execute.",
+      "outcome": "A client can distinguish Runtime identity, protocol compatibility, Backend capabilities, and optional local services without probing private implementation details.",
+      "acceptance": [
+        "Runtime identity is distinct from daemon incarnation, Run identity, Provider identity, build identity, host identity, and remote credentials.",
+        "The manifest reports versioned public protocol compatibility and independently declared capabilities; unsupported requests fail explicitly and do not infer behavior from platform or executable names.",
+        "The Rust and TypeScript clients consume the same protocol source of truth and the CLI remains a client of that public boundary.",
+        "No plugin discovery, marketplace, embedded runtime, transport negotiation framework, or Provider catalog is introduced."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Manifest schema, cross-language parity, compatibility failures, capability negatives, and public clients pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Runtime identity and capability semantics have one public protocol owner."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#stable-boundary",
+        "docs/protocol.md#connection-state",
+        "crates/ctxmux-protocol/src/lib.rs",
+        "packages/sdk/src/index.ts"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Add revisioned Run observation metadata",
+      "objective": "Make Run snapshots and observations orderable without asking clients to infer freshness from receipt arrival or wall-clock polling.",
+      "outcome": "Public Run metadata carries one owner-issued revision and well-defined lifecycle timestamps that Rust and TypeScript observers can compare safely.",
+      "acceptance": [
+        "Run revision is monotonic for one Run and changes exactly with publicly observable metadata; clients do not use local receipt order as a substitute.",
+        "Creation, start, terminal, interruption, and latest observation timestamps use documented clocks and nullability, survive persistence where claimed, and do not pretend to provide distributed causal time.",
+        "Snapshot, attach, event, list, status, fork, cold recovery, and exec-upgrade paths agree on revision and timestamp truth.",
+        "Protocol generation, generated TypeScript declarations, SDK validation, persistence schema, CLI presentation, and wrong-case fixtures move together with no compatibility fallback."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Revision monotonicity, timestamp lifecycle, persistence, upgrade, Rust/TypeScript parity, and full regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Revision and timestamp meaning, ordering, persistence, and limitations are public."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#run-operations",
+        "docs/architecture.md#run-domain-model",
+        "crates/ctxmux-protocol/src/lib.rs",
+        "crates/ctxmux-daemon/src/persistence.rs"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-004",
+      "title": "Provide bounded Rust and TypeScript wait helpers",
+      "objective": "Provide one public, deadline-bounded way to wait for Run predicates and terminal state without open-coded polling races across clients.",
+      "outcome": "Rust, TypeScript, and CLI consumers share explicit wait semantics over revisioned observations, reconnect, gaps, and terminal outcomes.",
+      "acceptance": [
+        "Rust and TypeScript helpers accept explicit predicates or terminal waits, absolute or duration deadlines, cancellation, and typed timeout, disappearance, transport, and protocol outcomes.",
+        "Wait uses public status, attach, event, gap, and reconnect behavior without busy loops, hidden daemon state, unbounded retries, or semantic Agent-status inference.",
+        "The CLI wait command reuses the Rust client helper instead of maintaining a second lifecycle algorithm.",
+        "Real process tests cover already-satisfied, later-satisfied, exit, interruption, reconnect, gap, cancellation, timeout, daemon replacement, and concurrent waiters."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Rust, TypeScript, CLI, lifecycle, deadline, reconnect, and clean-consumer wait behavior pass."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#output-and-reconnect",
+        "crates/ctxmux-client/src/lib.rs",
+        "crates/ctxmux/src/main.rs",
+        "packages/sdk/src/index.ts"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-005",
+      "title": "Provide race-safe TypeScript Runtime activation",
+      "objective": "Expose a framework-neutral TypeScript helper that connects to or activates one compatible local ctxmux Runtime while the daemon remains the Run owner.",
+      "outcome": "An embedding product can activate, prove readiness, exit, and later reconnect without private spawning logic or coupling daemon life to Node.",
+      "acceptance": [
+        "Concurrent activators converge on one compatible Runtime or return a typed conflict using public identity and readiness, not fixed sleeps.",
+        "Live, stale, ordinary-file, symlink, permission, timeout, crashed-launcher, and incompatible-Runtime cases never kill or replace an unrelated target.",
+        "The helper exposes explicit executable, socket, state, environment, deadline, and child-disposition inputs and performs no download, global mutation, credential handling, Electron coupling, or SSH fallback.",
+        "The activating Node process may exit while daemon-owned Runs survive and a fresh clean consumer reconnects to the same Run and replay."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Activation races, socket safety, readiness, compatibility, caller-exit survival, and SDK regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "packages/sdk/README.md",
+          "proves": "Activation inputs, lifecycle, errors, security boundary, and non-goals are consumer-visible."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#stable-boundary",
+        "docs/protocol.md#transport-and-framing",
+        "packages/sdk/README.md",
+        "packages/sdk/src/index.ts"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-006",
+      "title": "Qualify the standalone Runtime embedding surface",
+      "objective": "Prove the complete Phase 1 embedding contract from clean external consumers and supported local environments before downstream products consume it.",
+      "outcome": "Integration, Level B, Runtime identity, observation metadata, wait, and activation ship as one independently installable public surface with an owner receipt.",
+      "acceptance": [
+        "Fresh Rust and TypeScript consumers install only declared public artifacts and exercise identity, capability, start, observe, wait, activation, Level B, attach, reconnect, stop, and unsupported behavior without repository-private imports.",
+        "Clean-environment gates bind exact source, package and binary contents, supported platforms, process survival, filesystem permissions, compatibility, and no hidden ambient daemon or global configuration.",
+        "Independent review covers Runtime versus Integration versus Backend versus embedding-product ownership and closes every P0/P1 finding with executable evidence.",
+        "The complete repository, coverage, reliability, package, and standalone-consumer gates pass from one clean committed candidate; no package publish, Git push, or hosted release occurs."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The complete repository surface passes on the clean Phase 1 candidate."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "Standalone consumer, platform, package, security, lifecycle, and release qualification pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/qualification-report.md",
+          "proves": "Public claims, evidence, review findings, supported environments, and residual limits are auditable."
+        }
+      ],
+      "source_refs": [
+        "CONTRIBUTING.md",
+        "docs/testing-strategy.md",
+        "docs/roadmap.md",
+        "packages/sdk/README.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    }
+  ]
+}

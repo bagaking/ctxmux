@@ -1,0 +1,67 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/roadmap.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "README.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/roadmap.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Prove public-API fork composition",
+      "objective": "Build one deliberately small fork-and-combine example using only public APIs without moving scheduling or evaluation into ctxmux.",
+      "outcome": "A client can express a bounded Crucible- or MapReduce-like workflow while the runtime remains a mux rather than a Harness.",
+      "acceptance": [
+        "The example creates, forks, observes, stops, and combines Runs using only public client and Integration APIs.",
+        "Scheduling, evaluation, reduction, winner selection, and stopping policy remain inside the example client.",
+        "The example is deterministic enough for the repository gate and does not create a reusable orchestration framework."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The public composition example and full repository checks pass."
+        }
+      ],
+      "source_refs": [
+        "docs/vision.md#composition-stays-above-the-mux",
+        "docs/roadmap.md#m5--composition-proof-and-release"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Prepare reproducible installation and release gates",
+      "objective": "Make binaries and packages installable and release-checkable with public claims bounded to proven behavior, without publishing externally.",
+      "outcome": "Ctxmux is release-ready through reproducible local checks and accurate installation and compatibility documentation.",
+      "acceptance": [
+        "Rust binaries and the TypeScript package have reproducible build, install, package-content, and compatibility checks.",
+        "README and package metadata distinguish current native, fork, persistence, and tmux guarantees accurately.",
+        "Release preparation performs no registry publish, Git push, hosted release, or other external mutation without explicit authorization."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Packaging, installation, compatibility, composition, and full repository checks pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "README.md",
+          "proves": "Public positioning and installation guidance describe only shipped capabilities."
+        }
+      ],
+      "source_refs": [
+        "README.md",
+        "docs/roadmap.md#m5--composition-proof-and-release"
+      ],
+      "supersedes": []
+    }
+  ]
+}

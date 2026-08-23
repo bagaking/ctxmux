@@ -1,0 +1,134 @@
+{
+  "version": 1,
+  "feat_id": "f-22ccz6ux4",
+  "title": "Make native Input retry-safe across response loss",
+  "slug": "recoverable-input-operations",
+  "goal": "Recover a native Input result after response loss within one daemon incarnation without duplicating PTY bytes, and report the exact applied byte range.",
+  "status": "archived",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 7
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-005",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22ccz6ux4/artifacts/gate-T-005-r7-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=1; supersedes_revision=none"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> b260140b4422b16385f2e5586efc7d8102ef8829706fed360f810943129a1b18"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> current_tree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "b260140b4422b16385f2e5586efc7d8102ef8829706fed360f810943129a1b18 -> c14ca3358d9143a0459d9029466c4dc94742431aaa52381b511042fcc690f01f"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-004 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-005 => done"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "tracker metadata closed; Git workspace unchanged"
+    }
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features-archived/f-22ccz6ux4/goal.md",
+    "revision": "c14ca3358d9143a0459d9029466c4dc94742431aaa52381b511042fcc690f01f"
+  },
+  "closed_from_status": "done"
+}

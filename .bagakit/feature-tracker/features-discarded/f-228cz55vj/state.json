@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "feat_id": "f-228cz55vj",
+  "title": "Preserve live Runs across controlled daemon replacement",
+  "slug": "controlled-live-run-handoff",
+  "goal": "After the current release, determine and prove whether compatible local ctxmux daemon incarnations can transactionally transfer live PTY and child-process authority with exactly one owner, rollback before commit, ordered output continuity, explicit interrupted transient work, and no claim of crash, reboot, or arbitrary-process recovery.",
+  "status": "discarded",
+  "workspace_mode": "proposal_only",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 0
+  },
+  "gate": {
+    "last_result": null,
+    "last_task_id": null,
+    "last_check_commands": [],
+    "last_log_path": null
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=f-225cz7943"
+    },
+    {
+      "action": "feat_discarded",
+      "detail": "reason=superseded; replacement=f-22ecztapc"
+    }
+  ],
+  "depends_on": [
+    "f-225cz7943"
+  ],
+  "closed_from_status": "proposal",
+  "discard_reason": "superseded",
+  "replacement_feat_id": "f-22ecztapc"
+}

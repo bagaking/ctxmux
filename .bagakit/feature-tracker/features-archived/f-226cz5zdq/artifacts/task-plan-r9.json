@@ -1,0 +1,581 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/testing-strategy.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/testing-strategy.md",
+    "packages/sdk/README.md",
+    "docs/architecture/choices/009-runtime-persistence-recovery.md",
+    "docs/architecture/choices/012-tmux-control-mode-backend.md",
+    ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+  ],
+  "tasks": [
+    {
+      "id": "T-019",
+      "title": "Advance the breaking Run wire contract to protocol generation 3",
+      "objective": "Make incompatible Backend, replay-streaming, interruption, persistence, and tmux wire shapes fail at the first handshake instead of after a request can mutate daemon state.",
+      "outcome": "All current Rust, CLI, and TypeScript peers speak protocol generation 3, while a generation-2 peer receives version_mismatch before any Run request is executed.",
+      "acceptance": [
+        "The Rust protocol constant is the only generation SSOT and generated TypeScript constants, clients, fixtures, documentation, and version output agree on generation 3.",
+        "A raw generation-2 hello to a generation-3 daemon receives version_mismatch, the connection closes before request execution, and the daemon Run list remains unchanged.",
+        "Generation-3 Rust, CLI, and TypeScript request plus streamed-attach parity pass through the public socket, including the current Backend, capabilities, interruption, and replay-header shapes.",
+        "Current protocol, architecture, ADR 003, persistence, tmux, SDK, and testing documents identify generation 3 where they describe the wire contract; the separate Integration API generation remains independently versioned.",
+        "The change deletes the obsolete generation claim and adds no v2 fallback, migration, negotiation alias, dual encoding, or unrelated new wire capability."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Generation mismatch negative-space, generated schema drift, cross-language parity, streamed replay, and the full repository gate pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The complete current generation-3 public boundary and pre-stable compatibility policy are explicit."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#delivery-rules",
+        "docs/architecture.md#stable-boundary",
+        "docs/architecture/choices/003-unix-socket-json-lines-protocol.md",
+        "docs/protocol.md#connection-state",
+        "docs/testing-strategy.md#layer-4--parser-and-compatibility-corpora"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-022",
+      "title": "Close post-archive persistence correctness findings",
+      "objective": "Coordinate the independently owned persistence hardening Feature through completion and bind its corrected admission and recovered-state guarantees back into reliability qualification.",
+      "outcome": "Persistence recovery has a new auditable correction boundary after its historical archive, without mutating archived truth or moving storage implementation into the qualification Feature.",
+      "acceptance": [
+        "Feature f-227czdavj owns and completes recoverable admission versus fatal-store classification plus shared recovered RunSpec validation; this task does not duplicate that implementation.",
+        "The hardening Feature passes deterministic actor admission, fatal-latch, invalid-spec, real restart, no-partial-publication, and full repository gates and is formally archived.",
+        "Qualification binds the exact hardening commit or tree, archived summary, gate evidence, and shipped boundary while preserving the historical f-223czq75x archive unchanged.",
+        "The corrected public boundary still rejects recovered input, resize, stop, and Level B fork and adds no live PTY handoff, PID adoption, schema migration, salvage, or tmux persistence.",
+        "No current persistence claim is counted complete from the superseded T-010 evidence alone."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The corrected persistence actor, recovery corruption, cross-client, and repository gates pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features-archived/f-227czdavj/summary.md",
+          "proves": "The post-archive persistence hardening owner is formally closed with exact gate evidence."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery",
+        "docs/testing-strategy.md#capability-feature-closure-before-final-qualification",
+        ".bagakit/feature-tracker/features/f-227czdavj/tasks.json"
+      ],
+      "supersedes": [
+        "T-010"
+      ]
+    },
+    {
+      "id": "T-023",
+      "title": "Separate CI N/A from retained changed-line evidence",
+      "objective": "Remove the incentive to add unrelated executable code when a product change has no changed executable denominator, while preserving explicit retained-evidence and owner-floor guarantees.",
+      "outcome": "CI reports zero-denominator product changes honestly as N/A instead of manufacturing a coverage proof or forcing an unrelated executable edit, while retained changed-line evidence remains non-empty and fail-closed.",
+      "acceptance": [
+        "Changed-line auto mode reports N/A when the current product change has no executable added or modified line; N/A is visibly distinct from a passing changed-line percentage and is never recorded as changed-line coverage evidence.",
+        "Filesystem source inventory, all seven owner groups, fixed 90/85/95 floors, missing-report checks, and the ordinary repository Gate still execute for documentation, comment-only, deletion-only, rename, and untracked product changes.",
+        "Explicit true retained-evidence mode still requires an explicit valid base, direct or merge-base semantics, a nonzero executable denominator, and at least 90 percent coverage; it never degrades to N/A.",
+        "When auto mode has a nonzero executable denominator it still enforces the 90 percent floor, including mixed executable and non-executable changes without counting deleted or comment-only lines as executable evidence.",
+        "Policy tests cover documentation-only, comment-only, deletion-only, rename, untracked, mixed executable/non-executable, passing and failing executable percentages, and explicit retained-evidence behavior.",
+        "Testing strategy, contributor guidance, CI evidence-map language, and Tracker verification distinguish owner qualification, auto N/A, and retained changed-line proof without weakening T-020's seven-owner result."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-coverage.sh",
+          "proves": "All owner floors pass and the corrected auto versus explicit changed-line semantics execute on instrumented reports."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/testing-strategy.md",
+          "proves": "CI N/A and retained-evidence meanings are public, distinct, and do not invite a fake executable denominator."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#code-coverage-ratchet",
+        "coverage-policy.json",
+        "scripts/coverage-policy.mjs",
+        "scripts/coverage-policy.test.mjs",
+        ".github/ci-evidence-map.json"
+      ],
+      "supersedes": [
+        "T-020"
+      ]
+    },
+    {
+      "id": "T-024",
+      "title": "Reconcile the shipped restart-recovery guarantee",
+      "objective": "Remove the contradictory architecture-table claim that restart recovery is wholly open while preserving the distinction between shipped historical recovery and unsupported live PTY continuity.",
+      "outcome": "The architecture source of truth states one coherent durability boundary: client churn and optional historical recovery are shipped, while live process adoption, PTY handoff, reboot continuity, migration, and upgrade continuity remain open.",
+      "acceptance": [
+        "The current-guarantees table no longer labels all restart recovery open and distinguishes daemon-lifetime native control from optional state-dir historical recovery.",
+        "Architecture, protocol, roadmap, and persistence decision 009 agree that a prior running row becomes interrupted and no stored PID or PTY becomes live authority.",
+        "The correction adds no new persistence, migration, process adoption, live handoff, compatibility, or platform guarantee.",
+        "Documentation formatting, consistency checks, and the ordinary repository Gate pass on the corrected source tree."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture.md",
+          "proves": "The current guarantee and target columns describe shipped historical recovery and still-open live continuity without contradiction."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The corrected authoritative documentation remains consistent with the executable persistence boundary and repository Gate."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#current-guarantees-and-target-boundaries",
+        "docs/protocol.md#run-operations",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery",
+        "docs/architecture/choices/009-runtime-persistence-recovery.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-021",
+      "title": "Bind resource baselines to reproducible runtime identity",
+      "objective": "Replace mutable current-tree observation claims with clean-source receipts that bind the exact source commit, harness, daemon binary, locked build path, and raw resource measurements.",
+      "outcome": "Every frozen CPU, RSS, thread, descriptor, and retention budget can be traced to one clean, addressable runtime and qualification harness rather than an unrecorded dirty binary.",
+      "acceptance": [
+        "The qualification receipt records a clean source commit, dirty or diff state, daemon SHA-256, harness SHA-256, lockfile identity, locked build command, toolchain, and environment before any stage executes.",
+        "Policy rejects missing, dirty, unreachable, mixed-source, mixed-harness, mixed-binary, or hash-drifted baseline rounds and verifies the harness bytes against the recorded source commit.",
+        "The provenance-capable harness lands first; three observe rounds then run from that clean commit with the same source, harness, daemon binary, workload, seed policy, and measurement contract before budgets are re-frozen.",
+        "Checked-in receipt hashes and recomputed maxima bind all six idle and active 1/32/128 cells; remote nightly, release, and platform runs remain pending until their own artifacts exist.",
+        "Commit messages, Tracker evidence, and documentation distinguish harness reachability, clean local observations, and unexecuted remote qualification without claiming a mutable current tree or checked-in JSON hash proves the binary source."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "The source-bound harness and all frozen observation budgets pass the reliability policy and public resource workloads."
+        },
+        {
+          "kind": "artifact",
+          "ref": "fixtures/reliability/observe-darwin-arm64-r1.json",
+          "proves": "One of three durable raw rounds records the exact clean source, harness, binary, workload, environment, and measurements."
+        },
+        {
+          "kind": "artifact",
+          "ref": "reliability-budgets.json",
+          "proves": "All source-bound receipt hashes and maxima are recomputed before the budget file is accepted."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#stress-and-soak-testing",
+        "docs/testing-strategy.md#benchmarks-and-performance-regression",
+        "scripts/reliability-qualification.ts",
+        "scripts/reliability-policy.mjs",
+        "reliability-budgets.json"
+      ],
+      "supersedes": [
+        "T-004"
+      ]
+    },
+    {
+      "id": "T-003",
+      "title": "Force concurrency and hostile input",
+      "objective": "Systematically explore the interleavings and hostile byte streams that ordinary real-time E2E tests cannot force reliably.",
+      "outcome": "Core owner races and parser boundaries fail reproducibly with retained seeds rather than intermittently in production.",
+      "acceptance": [
+        "Barriers force subscribe versus snapshot, stop versus wait, detach versus output, final-output versus exit, and declared multi-client mutation interleavings.",
+        "A small model or property test compares generated public operations only with semantics the protocol actually promises; undefined arbitration is not fabricated as a test oracle.",
+        "Native protocol, TypeScript wire validation, Agent JSONL observation, and future active protocol parsers have fuzz targets plus ordinary regression corpora for minimized failures.",
+        "Scheduled sanitizer, race, or model-check lanes state exactly which native and dependency boundaries they cover and retain replay information on failure."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Deterministic interleaving, property, corpus, and minimized fuzz regressions pass on every change."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".github/workflows/ci.yml",
+          "proves": "Required and scheduled concurrency and hostile-input lanes are reachable."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#layer-2--deterministic-owner-seams",
+        "docs/testing-strategy.md#layer-4--parser-and-compatibility-corpora",
+        "docs/testing-strategy.md#concurrency-and-race-testing"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-016",
+      "title": "Fence daemon shutdown socket cleanup by bound identity",
+      "objective": "Make socket cleanup symmetric across startup and shutdown so an exiting daemon cannot unlink a different listener that replaced its published pathname.",
+      "outcome": "The daemon removes only the Unix socket identity it successfully bound, while independently substituted live listeners remain reachable after the old daemon exits.",
+      "acceptance": [
+        "The shutdown guard retains the bound socket device and inode after successful bind and unlinks the pathname only while it still names that identity.",
+        "A real replacement listener can take over the pathname before the old daemon exits; old-daemon shutdown preserves the replacement path and new connections still reach it.",
+        "Missing, non-socket, symlink, or different-socket replacements are never removed, and documentation keeps pathname recheck versus unlink non-atomicity in a hostile writable parent as a residual boundary."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The real replacement-listener shutdown regression and the complete native lifecycle gate pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/architecture/choices/003-unix-socket-json-lines-protocol.md",
+        "docs/testing-strategy.md#security-testing"
+      ],
+      "supersedes": [
+        "T-002"
+      ]
+    },
+    {
+      "id": "T-017",
+      "title": "Bind Level B provenance to the actual source Run",
+      "objective": "Replace object-local Level B receipts with fail-closed source ownership so a continuation can only use semantic evidence emitted by its declared parent Run.",
+      "outcome": "Every Level B fork is backed by verifiable parent/source identity; missing provenance support and misrouted unrelated Run output create no raw fork request or child Run.",
+      "acceptance": [
+        "Every Integration that advertises Level B must provide a provenance receipt path; a missing provenance hook fails before planning or raw fork instead of bypassing verification.",
+        "The observer and receipt boundary binds semantic evidence to the actual source Run identity, so routing another Run output event through a parent observer cannot authenticate the declared parent.",
+        "Hermetic unit and public-daemon regressions prove missing-hook and unrelated-source rejection with raw fork count zero and no child Run, while the valid Codex continuation path and Level B lineage still pass."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Source-bound provenance negatives, no-child public behavior, and the valid Codex Level B continuation gate pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#context-fork-and-tmux-targets",
+        "docs/architecture/choices/010-explicit-typescript-integrations.md",
+        "docs/architecture/choices/011-context-artifact-lineage-fork.md",
+        "packages/sdk/README.md"
+      ],
+      "supersedes": [
+        "T-009"
+      ]
+    },
+    {
+      "id": "T-011",
+      "title": "Complete, qualify, and archive the tmux adapter",
+      "objective": "Drive f-224czneed through its own public-Control-Mode adapter task and gates, formally archive it, and include its exact supported semantics in qualification.",
+      "outcome": "The tmux adapter has one implementation truth, preserves tmux ownership, closes its Feature lifecycle, and carries supported-version and failure evidence into final qualification and applicable peer comparisons.",
+      "acceptance": [
+        "Feature f-224czneed completes its own T-001 adapter plan; this task coordinates closure and qualification without moving tmux implementation truth into f-226cz5zdq.",
+        "The adapter uses only the tmux executable and public Control Mode, keeps tmux as session, pane, PTY, and process owner, and exposes differences from native Runs through documented capabilities.",
+        "Every short-lived tmux version, discovery, or identity subprocess runs outside Tokio workers under a hard deadline; timeout kills and reaps the child, bounds captured output, returns a backend-local error, and leaves unrelated daemon requests responsive.",
+        "The bounded Control Mode reader distinguishes an empty command-block output line from true EOF, and transcript plus runtime regressions prove that neither empty output nor fragmented reads spuriously interrupt the imported Run.",
+        "Transcript and real-session fixtures cover the supported minimum and current tmux versions, escaped and non-UTF-8 bytes, notifications and bounded serial command/result correlation, post-import replay/live joining, slow-consumer lag, detach under load, server loss, target changes, and pane PID survival.",
+        "The owning Feature records a passing gate and is formally archived with its canonical summary; the qualification report binds the archived Feature, supported tmux versions, exact revision, commands, and evidence.",
+        "Chaos, resource, independent review, final qualification, and applicable pre-registered benchmark lanes include the shipped adapter without weakening native Run semantics or claiming private tmux wire compatibility."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/012-tmux-control-mode-backend.md",
+          "proves": "The public-surface ownership and capability boundary remains explicit."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The adapter lifecycle, Control Mode, lag, ownership, supported-version, real-session, and repository gates pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-224czneed/summary.md",
+          "proves": "The tmux adapter Feature is formally archived with its completed task and gate evidence."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture/choices/012-tmux-control-mode-backend.md",
+        "docs/roadmap.md#m4--tmux-adapter",
+        "docs/testing-strategy.md#p2--qualify-capability-specific-risk",
+        "docs/testing-strategy.md#capability-feature-closure-before-final-qualification"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-012",
+      "title": "Make Run creation retry-safe without adding Session identity",
+      "objective": "Make start and fork converge after a lost response through one bounded caller operation key while preserving RunId as the sole physical Run incarnation.",
+      "outcome": "A consumer can retry an uncertain creation request without spawning a duplicate Run, and ctxmux gains no mutable tag store, second Session identity, or silent attach-or-create behavior.",
+      "acceptance": [
+        "Start and fork accept one bounded opaque creation operation key; the same key and canonical request return the original RunInfo, while the same key with different semantics returns a typed conflict and creates no Run.",
+        "RunId remains the only physical incarnation fence, and the protocol adds no mutable metadata CRUD, Agent-specific owner field, reusable public SessionId, or implicit attach-or-create fallback.",
+        "Operation-key retention and collection share the Run ownership and quota model; if a recovery class preserves a Run across daemon restart, its create mapping is committed and recovered atomically with that class rather than silently permitting a duplicate.",
+        "Deterministic barriers cover concurrent duplicate requests, spawn success followed by response loss, conflicting reuse, failed spawn, collection, corruption, and every supported restart boundary with exact one-process and no-unrelated-Run oracles.",
+        "CLI and TypeScript SDK expose the same public behavior, and callers are not promised global exactly-once execution beyond the declared key scope and lifetime."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Public CLI, SDK, protocol, concurrent retry, response-loss, conflict, and applicable restart regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The operation-key scope, canonical-request equality, lifetime, conflict, collection, and non-guarantees are public and reviewable."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#system-and-ownership-model",
+        "docs/protocol.md#native-run-operations",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-013",
+      "title": "Correlate attachment controls and expose applied terminal size",
+      "objective": "Give low-latency persistent attachments deterministic per-command outcomes and real PTY size observability without inventing a general transaction system.",
+      "outcome": "Consumers can pipeline input, resize, and stop, match every acceptance or error to its command, repair size drift, and distinguish accepted stop from final exit.",
+      "acceptance": [
+        "Every attachment input, resize, and stop command carries a bounded opaque command id, and every accepted or error result echoes it without confusing command results with output or lifecycle events.",
+        "The contract states the exact owner boundary reached by acceptance: input is accepted only after the daemon's PTY write boundary succeeds, resize reports the size read back from the owning PTY, and stop acceptance remains separate from terminal Exited.",
+        "Command ids provide correlation, not permission to replay uncertain input; duplicate, reconnect, and unknown-disposition behavior is explicit and fails closed unless a separately proven deduplication contract applies.",
+        "A real PTY fixture pipelines at least 1000 ordered input chunks plus concurrent resize and stop, proves exact result matching, bytes and applied size, and covers rejection, disconnect, late result, backpressure, and final-output ordering.",
+        "Short-lived request methods and persistent Attachment methods present compatible semantics through the public SDK without a second command bus or Agent-specific acknowledgement layer."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Protocol, SDK, real PTY, pipelined control, applied-size, disconnect, and lifecycle ordering regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "packages/sdk/README.md",
+          "proves": "Attachment command resolution, correlation, retry limits, applied size, and stop-versus-exit semantics are documented for clean consumers."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        "docs/protocol.md#output-and-reconnect",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure",
+        "packages/sdk/README.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-014",
+      "title": "Provide race-safe local daemon activation for embedders",
+      "objective": "Define and prove the smallest framework-neutral connect-or-activate path for one compatible local ctxmux daemon without coupling Run lifetime to the activating client.",
+      "outcome": "A clean consumer can install, activate, discover readiness, exit, and reconnect to one daemon-owned Run through an explicit local lifecycle with deterministic race and version behavior.",
+      "acceptance": [
+        "One reviewed activation contract selects an explicit socket and compatible binary, uses protocol readiness rather than sleeps, and makes daemon ownership, logs, lifetime, and cleanup visible to the operator.",
+        "Concurrent activators converge on one compatible daemon or return a typed conflict; live, stale, ordinary-file, symlink, permission, readiness-timeout, crashed-launcher, and version-mismatch cases never kill or replace an unrelated daemon or target.",
+        "The activating SDK or CLI process may exit without terminating daemon-owned Runs, and a fresh process reconnects to the same Run identity and replay; any explicitly ephemeral test mode is separate and cannot become the production default.",
+        "Activation performs no silent network download, registry publish, global configuration mutation, credential handling, Electron coupling, SSH deployment, or fallback runtime selection.",
+        "A clean package-consumer fixture proves install, connect-or-activate, concurrent launch, client restart, incompatible version, daemon failure trace, and orderly operator-requested shutdown through public surfaces."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Local activation, concurrency, socket safety, version, client-exit survival, clean-consumer, and repository regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "README.md",
+          "proves": "Installation, activation, ownership, compatibility, logging, shutdown, and unsupported remote behavior are accurately documented."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#architecture-direction",
+        "docs/architecture.md#current-guarantees-and-target-boundaries",
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/roadmap.md#m5--composition-proof-and-release",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-005",
+      "title": "Build the fair peer benchmark harness",
+      "objective": "Pre-register and implement one reproducible benchmark harness for overlapping ctxmux, tmux, and Zellij mux semantics before performance results guide optimization.",
+      "outcome": "Performance work uses fixed workloads, environments, statistics, and win rules that cannot be changed after results are known.",
+      "acceptance": [
+        "The harness pins competitor versions, records hardware and toolchain metadata, uses identical child workloads, warm-up and sampling policy, and emits inspectable raw results.",
+        "Pre-registered workloads cover cold session or Run start, first output, attach or reconnect, input-to-output latency, retained replay, sustained throughput, one-to-many fan-out, shutdown, and CPU, RSS, descriptor, and thread cost where semantics overlap.",
+        "Each metric declares direction, practical margin, statistical win rule, noise budget, and comparability boundary before candidate measurements.",
+        "Incomparable product behavior is excluded by independent review before measurement, not reclassified after a losing result.",
+        "The harness has self-tests for workload parity, result completeness, unit normalization, failed process handling, and regression-report generation."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/run.sh",
+          "proves": "The pinned peer harness executes every pre-registered workload and produces complete machine-readable results."
+        },
+        {
+          "kind": "artifact",
+          "ref": "benchmarks/README.md",
+          "proves": "Workloads, comparability, environment, statistics, and immutable win rules are reviewable before final qualification."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#benchmarks-and-performance-regression",
+        "docs/testing-strategy.md#competitive-evidence"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-015",
+      "title": "Earn a faster incremental raw-byte path",
+      "objective": "Profile the real clean-consumer hot path and adopt the simplest faster versioned byte representation only when measured end-to-end benefit exceeds protocol and implementation complexity.",
+      "outcome": "Incremental terminal consumers receive high-throughput, low-latency exact bytes with bounded cost, while ctxmux avoids an unearned encoding rewrite or renderer-specific API.",
+      "acceptance": [
+        "Before candidate results, the harness freezes chunk distributions, replay sizes, 1/8/32 attachment fan-out, input and output rates, warm-up, samples, platforms, CPU, RSS, bytes on wire, event-loop lag, first-output and p95/p99 latency, practical margins, and no-regression rules.",
+        "Profiles account for the current generation-3 integer-array representation and the simplest viable alternatives; a representation changes only when it wins the frozen material-benefit rule, otherwise the measured no-change decision closes the task without speculative protocol churn.",
+        "Any selected representation preserves arbitrary and fragmented raw bytes, monotonic sequence, replay and live joining, Truncated and Gap behavior, frame limits, validation before mutation, bounded backpressure, security, resource, and cross-language behavior.",
+        "Because the public contract is not stable, a selected new generation deletes the obsolete path rather than shipping negotiation fallback, dual encoding, compatibility aliases, or renderer-specific snapshots.",
+        "A clean incremental consumer writes replay once and subsequent chunks only, and the final qualification demonstrates the improvement without weakening correctness or cherry-picking chunk sizes, peers, samples, percentiles, or resource metrics."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/run.sh",
+          "proves": "The frozen clean-consumer streaming workload emits complete raw results and satisfies the predeclared change-or-retain decision rule."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "The selected or retained byte path preserves every correctness, security, resource, platform, and reliability gate."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/qualification-report.md",
+          "proves": "Profiles, ROI decision, raw evidence, exact versions, scope, and no-regression results are independently reviewable."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#delivery-rules",
+        "docs/architecture.md#security-durability-and-resource-boundaries",
+        "docs/protocol.md#output-and-reconnect",
+        "docs/testing-strategy.md#benchmarks-and-performance-regression",
+        "docs/testing-strategy.md#embeddable-run-kernel-adoption-closure"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-006",
+      "title": "Complete independent multi-Agent functional review",
+      "objective": "Have multiple independent Agents review every shipped functional domain and public claim, then close every material finding with re-review evidence.",
+      "outcome": "No functional domain, boundary, or public capability is accepted solely by its implementation author or left without an evidence-backed disposition.",
+      "acceptance": [
+        "A review map assigns at least three independent Agents across daemon, PTY and lifecycle; protocol, replay and clients; SDK, Integrations, fork and context; persistence and tmux when shipped; CLI, packaging and security; and tests, CI and benchmarks.",
+        "Every relevant public claim, implementation path, platform branch, error path, and owner handoff has an explicit reviewer and evidence reference.",
+        "Reviewers record concrete P0, P1, P2, accepted-risk, and no-finding outcomes without subjective aggregate scores; no domain is inferred complete from another domain's review.",
+        "All P0 and P1 findings are fixed, gain executable regression evidence, and are re-reviewed by an Agent other than the correction author.",
+        "The qualification report retains review scope, findings, dispositions, evidence, and any bounded P2 or non-goal that remains."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/qualification-report.md",
+          "proves": "Independent functional-domain review coverage and every material finding disposition are durable and auditable."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "All review corrections and their ordinary regressions pass the required repository gate."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#protected-invariants",
+        "docs/architecture.md#components-and-stable-boundaries",
+        "docs/testing-strategy.md#what-coverage-means"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-007",
+      "title": "Complete the full reliability qualification",
+      "objective": "Execute the complete test-evidence matrix for every shipped capability and supported platform after functional review findings are closed.",
+      "outcome": "The release candidate has complete contract, owner-boundary, hostile-input, interleaving, failure, load, resource, platform, security, and coverage evidence with no silent gaps.",
+      "acceptance": [
+        "Every shipped guarantee and supported platform maps to a passing gate-reachable oracle; unsupported and unimplemented behavior remains explicitly excluded rather than represented by an ignored test.",
+        "PR critical, platform, nightly fuzz and sanitizer, chaos, stress and soak, security, resource census, external compatibility, and release qualification lanes pass from clean reproducible environments.",
+        "Coverage floors pass and no required test is skipped, quarantined, retried into green, or reachable only through an undocumented manual command.",
+        "There are no open P0 or P1 testing, security, concurrency, durability, resource, or cross-platform findings in the strategy, functional review, CI artifacts, or wrong-case corpus.",
+        "Every failure seed and regression found during qualification is retained with a deterministic ordinary oracle before the task closes."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "All required PR, scheduled, platform, security, stress, chaos, leak, and release test lanes pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/qualification-report.md",
+          "proves": "The invariant-to-gate matrix has no unexplained missing, skipped, or failed evidence."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#target-test-architecture",
+        "docs/testing-strategy.md#top-level-reliability-lanes",
+        "docs/testing-strategy.md#gate-topology"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-008",
+      "title": "Win the comprehensive peer benchmark qualification",
+      "objective": "Optimize and remeasure ctxmux until it beats every pre-registered applicable tmux and Zellij benchmark without weakening correctness or changing the comparison after results are visible.",
+      "outcome": "Ctxmux has a reproducible, independently reviewed performance advantage across the complete overlapping mux workload rather than one selected headline metric.",
+      "acceptance": [
+        "Every workload and metric pre-registered in T-005 satisfies its declared statistical win rule and practical margin against every applicable pinned peer; ties and losses keep the task open.",
+        "No workload, peer, sample, percentile, resource metric, or supported-platform result is removed or reclassified after measurements without a pre-result independent comparability decision recorded in the harness history.",
+        "Latency, throughput, fan-out, replay, shutdown, CPU, memory, descriptor, and thread results remain traceable to raw data, exact commits, versions, hardware, toolchains, and commands.",
+        "All correctness, reliability, security, resource, and public API gates still pass with the optimized implementation; benchmark-only shortcuts or semantic weakening are rejected.",
+        "An independent Agent reproduces the final comparison from a clean environment and the qualification report presents wins, variance, scope limits, and raw-result references without cherry-picking."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "benchmarks/compare.sh",
+          "proves": "Every pre-registered applicable peer comparison satisfies its immutable win rule."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "Performance optimizations preserve the complete correctness and reliability qualification."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/qualification-report.md",
+          "proves": "Independent reproduction, complete raw evidence, wins, and comparison boundaries are reviewable."
+        }
+      ],
+      "source_refs": [
+        "docs/testing-strategy.md#benchmarks-and-performance-regression",
+        "docs/testing-strategy.md#gate-topology",
+        "docs/testing-strategy.md#adoption-sequence"
+      ],
+      "supersedes": []
+    }
+  ]
+}

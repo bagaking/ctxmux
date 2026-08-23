@@ -1,0 +1,223 @@
+{
+  "version": 2,
+  "feat_id": "f-225cz7943",
+  "plan_status": "reviewed",
+  "plan_revision": 3,
+  "supersedes_revision": 2,
+  "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+  "source_refs": [
+    "AGENTS.md",
+    "README.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/roadmap.md",
+    "docs/testing-strategy.md",
+    ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/roadmap.md",
+      "source_refs": [
+        "AGENTS.md",
+        "README.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/roadmap.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002"
+      ],
+      "superseded_task_ids": []
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "README.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "docs/roadmap.md#program-ownership-and-convergence"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": "docs/roadmap.md#program-ownership-and-convergence",
+      "source_refs": [
+        "AGENTS.md",
+        "README.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Prove public-API fork composition",
+      "objective": "Build one deliberately small fork-and-combine example using only public APIs without moving scheduling or evaluation into ctxmux.",
+      "outcome": "A client can express a bounded Crucible- or MapReduce-like workflow while the runtime remains a mux rather than a Harness.",
+      "acceptance": [
+        "The example creates, forks, observes, stops, and combines Runs using only public client and Integration APIs.",
+        "Scheduling, evaluation, reduction, winner selection, and stopping policy remain inside the example client.",
+        "The example is deterministic enough for the repository gate and does not create a reusable orchestration framework."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The public composition example and full repository checks pass."
+        }
+      ],
+      "source_refs": [
+        "docs/vision.md#composition-stays-above-the-mux",
+        "docs/roadmap.md#m5--composition-proof-and-release"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Prepare reproducible installation and release gates",
+      "objective": "Make binaries and packages installable and release-checkable with public claims bounded to proven behavior, without publishing externally.",
+      "outcome": "Ctxmux is release-ready through reproducible local checks and accurate installation and compatibility documentation.",
+      "acceptance": [
+        "Rust binaries and the TypeScript package have reproducible build, install, package-content, and compatibility checks.",
+        "README and package metadata distinguish current native, fork, persistence, and tmux guarantees accurately.",
+        "Release preparation performs no registry publish, Git push, hosted release, or other external mutation without explicit authorization."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Packaging, installation, compatibility, composition, and full repository checks pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "README.md",
+          "proves": "Public positioning and installation guidance describe only shipped capabilities."
+        }
+      ],
+      "source_refs": [
+        "README.md",
+        "docs/roadmap.md#m5--composition-proof-and-release"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Qualify Phase 1 local Runtime activation",
+      "objective": "Consume and independently qualify the TypeScript activation helper owned by Feature f-22ecztapc instead of implementing another activation path in release work.",
+      "outcome": "AgentMux and clean consumers demonstrate that the Phase 1 public helper can install, activate, observe readiness, exit, and reconnect to the same daemon-owned Run through an explicit local lifecycle.",
+      "acceptance": [
+        "Feature f-22ecztapc delivers the framework-neutral TypeScript activation helper and its standalone clean-environment gate before this task begins; this task makes no second helper, alias, or private launcher.",
+        "The AgentMux repository, as the external embedding owner, pins the qualified ctxmux candidate and supplies an external receipt proving concurrent activation, compatible Runtime selection, launcher exit, Run survival, and reconnect through public SDK APIs.",
+        "Live, stale, ordinary-file, symlink, permission, timeout, crashed-launcher, and version-mismatch cases are consumed from the Phase 1 contract and independently exercised where the AgentMux packaging boundary can change their outcome.",
+        "Activation performs no silent download, global configuration mutation, credential handling, Electron-owned process lifetime, SSH deployment, runtime fallback, or private ctxmux-daemon access.",
+        "The ctxmux owner receipt and the AgentMux external receipt are both required; repository-local mocks or a ctxmux-only clean consumer cannot substitute for the embedding-owner result."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The release tree consumes the qualified activation surface without duplicating its implementation and keeps repository gates green."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22ecztapc/owner-receipt.json",
+          "proves": "The ctxmux Phase 1 owner has delivered and qualified the activation helper before downstream release consumption."
+        },
+        {
+          "kind": "owner_receipt",
+          "ref": "AgentMux local Runtime activation receipt",
+          "proves": "The separately owned AgentMux repository pins and exercises the public helper at its real embedding and packaging boundary."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#stable-boundary",
+        "docs/roadmap.md#m5--composition-proof-and-release",
+        "docs/testing-strategy.md",
+        "packages/sdk/README.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 2,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-004",
+      "title": "Complete independent release qualification",
+      "objective": "Independently review release-facing claims and execute clean-consumer, supported-platform, security, package, and release gates without absorbing open Kernel or performance work.",
+      "outcome": "The release candidate has an auditable public-claim map and reproducible platform evidence with no open release-blocking P0/P1 finding.",
+      "acceptance": [
+        "Independent reviewers cover CLI, SDK, composition, activation, installation, packaging, documentation, security, supported platforms, and release automation.",
+        "Every release-facing P0/P1 finding is fixed with an executable regression and independent re-review; bounded P2 risk is recorded honestly.",
+        "Required clean-consumer, platform, package-content, compatibility, security, and release lanes pass without hidden skips or retries.",
+        "The final report distinguishes Kernel, tmux, and performance owners and does not make their unfinished outcomes release evidence.",
+        "Before package metadata claims a license or publishability, the user explicitly selects an appropriate project license; the chosen LICENSE, Rust and SDK metadata, package contents, and install checks agree.",
+        "No external publish or hosted release occurs without explicit authorization."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-qualification.sh",
+          "proves": "Required clean-consumer, platform, security, package, and release lanes pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-225cz7943/verification.md",
+          "proves": "Release review coverage, findings, platform evidence, and residual limits are auditable."
+        }
+      ],
+      "source_refs": [
+        "README.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 2,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    }
+  ]
+}

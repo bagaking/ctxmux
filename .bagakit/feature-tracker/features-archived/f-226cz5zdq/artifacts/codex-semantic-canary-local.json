@@ -1,0 +1,46 @@
+{
+  "schema": "ctxmux.codex-semantic-canary.v1",
+  "status": "pass",
+  "recorded_at": "2026-08-09T20:08:36.995Z",
+  "codex_version": "0.147.0",
+  "credential_mode": "codex_login",
+  "probe_elapsed_ms": 247,
+  "parent_run_id": "f50c6e6b-af22-4d22-9e95-3851c07b6353",
+  "child_run_id": "82f3ade3-f71a-496d-a41d-55060cb67306",
+  "session_id_sha256": "a8346348b87699ca33cd2f8ffde746d8d3d1a920bcd9cae24a2fbe9bd16bef2b",
+  "semantic_fact_sha256": "95975fb429237c6eb8b7908a12c5c2ede942dce762ae4798ed6c3d22d1435b99",
+  "child_prompt_contains_fact": false,
+  "continuation_exact": true,
+  "fatal_diagnostics_zero": true,
+  "lineage_fidelity": "level_b",
+  "parent_event_names": [
+    "integration.parse_error",
+    "thread.started",
+    "turn.started",
+    "item.completed",
+    "turn.completed"
+  ],
+  "child_event_names": [
+    "integration.parse_error",
+    "thread.started",
+    "turn.started",
+    "item.completed",
+    "turn.completed"
+  ],
+  "parent_diagnostic_counts": {
+    "invalid_json": 32
+  },
+  "child_diagnostic_counts": {
+    "invalid_json": 32
+  },
+  "parent_output_line_classes": {
+    "other_non_json": 32,
+    "json": 5,
+    "blank": 1
+  },
+  "child_output_line_classes": {
+    "other_non_json": 32,
+    "json": 4,
+    "blank": 1
+  }
+}

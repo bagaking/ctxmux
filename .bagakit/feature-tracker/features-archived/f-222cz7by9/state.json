@@ -1,0 +1,208 @@
+{
+  "version": 1,
+  "feat_id": "f-222cz7by9",
+  "title": "Build ctxmux foundation",
+  "slug": "ctxmux-foundation",
+  "goal": "Deliver a publishable context-aware Run multiplexer whose durable local Runs can be embedded by CLIs, editors, and automations without becoming an Agent Harness.",
+  "status": "archived",
+  "workspace_mode": "current_tree",
+  "base_ref": "HEAD",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 11
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-012",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-222cz7by9/artifacts/gate-T-012-r11-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=current_tree; base_ref=HEAD; root_branch=detached"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> 2b45105d1dc06d48892182c44dca8d0ddc0d40f2e20ccb8c0b4a8afb94ec17ab"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-002 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-002 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-003 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-003 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "2b45105d1dc06d48892182c44dca8d0ddc0d40f2e20ccb8c0b4a8afb94ec17ab -> 029ffff7bb88584d50293bc30c50ce980d080420484bd73677b1f7ba68593a1e"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-008"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-008 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-008 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-009"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-009 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-009 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-010"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-010 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-010 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-011"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-011 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-011 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-004"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-004 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-004 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-005 => done"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=4; supersedes_revision=3"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-012"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "029ffff7bb88584d50293bc30c50ce980d080420484bd73677b1f7ba68593a1e -> ebaf1c9401d4e36a366700471fbf5bf376a48c27351f33b59d648167da0fe0c0"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-012 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-012 => done"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "moved + cleaned"
+    }
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features-archived/f-222cz7by9/goal.md",
+    "revision": "ebaf1c9401d4e36a366700471fbf5bf376a48c27351f33b59d648167da0fe0c0"
+  },
+  "closed_from_status": "done",
+  "archived_cleanup": {
+    "workspace_mode": "current_tree",
+    "base_ref": "HEAD",
+    "branch_merged": false,
+    "worktree_removed": false,
+    "worktree_pruned": false,
+    "branch_deleted": false,
+    "note": "worktree mode removes/prunes worktree and deletes merged branch; current_tree/proposal_only only archive feat metadata",
+    "preserved_root_entries": []
+  }
+}

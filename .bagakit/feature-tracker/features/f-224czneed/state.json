@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "feat_id": "f-224czneed",
+  "title": "Integrate tmux sessions",
+  "slug": "tmux-adapter",
+  "goal": "Expose existing tmux-owned sessions through ctxmux public Run surfaces while preserving tmux ownership and public protocol boundaries.",
+  "status": "ready",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 4
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-001",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-224czneed/artifacts/gate-T-001-r4-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=current_tree; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "feature_goal_set",
+      "detail": "none -> b5cf742bef4db75d9e52f255669aec802eca9a406b1d826ee3e732e21a74cec4"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-001 => external_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    }
+  ],
+  "goal_contract": {
+    "schema": "bagakit.feature-goal.v1",
+    "ref": ".bagakit/feature-tracker/features/f-224czneed/goal.md",
+    "revision": "b5cf742bef4db75d9e52f255669aec802eca9a406b1d826ee3e732e21a74cec4"
+  }
+}

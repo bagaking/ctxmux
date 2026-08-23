@@ -14,5 +14,6 @@ coverage
 .claude
 
 .worktrees
-.bagakit
+.bagakit/*
+!.bagakit/feature-tracker/
 .playwright-cli

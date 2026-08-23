@@ -1,0 +1,65 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/roadmap.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/architecture/choices/009-runtime-persistence-recovery.md",
+    "docs/roadmap.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Accept the restart recovery contract",
+      "objective": "Decide which metadata, replay, and live-control classes can honestly survive daemon restart before selecting a store or changing the runtime.",
+      "outcome": "The persistence decision has an accepted, testable recovery boundary with explicit identity, corruption, cleanup, orphan, and unsupported-state semantics.",
+      "acceptance": [
+        "The decision separates durable metadata and replay from live PTY ownership and names every unsupported recovery claim.",
+        "Process identity never relies on PID alone and ambiguous adoption fails closed.",
+        "Atomicity, corruption, retention, cleanup, daemon epoch, and orphan policy are explicit before implementation.",
+        "The selected design uses existing platform or maintained library behavior unless repository evidence proves it insufficient."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/009-runtime-persistence-recovery.md",
+          "proves": "The accepted decision defines the supported recovery class and its failure semantics."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Implement and prove the accepted recovery class",
+      "objective": "Persist and reconcile only the state accepted by T-001, with real restart evidence and fail-closed stale or corrupt state handling.",
+      "outcome": "Daemon restart preserves exactly the declared state without adopting an unrelated process or claiming unsupported live PTY control.",
+      "acceptance": [
+        "A real daemon restart proves every supported metadata, replay, lineage, and control guarantee.",
+        "Interrupted or corrupt stored generations select one valid generation or return a typed failure.",
+        "Stale or recycled process identity never signals, attaches to, or adopts an unrelated process.",
+        "Applicable persistence wrong cases become executable fixtures and global retention remains bounded."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Restart, corruption, stale-identity, retention, and full repository checks pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/casebook.md",
+        "docs/roadmap.md#m35--persistence-and-restart-recovery"
+      ],
+      "supersedes": []
+    }
+  ]
+}

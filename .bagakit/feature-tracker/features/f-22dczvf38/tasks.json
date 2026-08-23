@@ -1,0 +1,318 @@
+{
+  "version": 2,
+  "feat_id": "f-22dczvf38",
+  "plan_status": "reviewed",
+  "plan_revision": 3,
+  "supersedes_revision": 2,
+  "review_ref": "docs/plans/public-local-consumer-contract-review.md",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/plans/public-local-consumer-contract-review.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/plans/public-local-consumer-contract-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": "docs/plans/public-local-consumer-contract-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-004",
+        "T-003"
+      ],
+      "superseded_task_ids": [
+        "T-002"
+      ],
+      "supersedes_by_task": {
+        "T-004": [
+          "T-002"
+        ]
+      }
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": "docs/plans/public-local-consumer-contract-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-004",
+        "T-003",
+        "T-005"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-004": [
+          "T-002"
+        ]
+      }
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Make public output cursors cumulative bytes",
+      "objective": "Replace chunk-ordinal output positions with one cumulative byte space across the native daemon, versioned protocol, CLI and TypeScript SDK without compatibility fields.",
+      "outcome": "A client can attach after an absolute byte position, join replay and live output without rebuilding offsets, and interpret truncation or Gap in the same byte space after reconnect.",
+      "acceptance": [
+        "Every output record carries exact startByte/endByte boundaries, and Run head/oldest/attach/gap fields use cumulative bytes with explicit names; UTF-8 character count, PTY read count and protocol sequence never masquerade as byte position.",
+        "Replay eviction retains absolute byte identity; attaching before retained history returns honest truncation/Gap boundaries, while replay-to-live transition is ordered and duplicate-free.",
+        "The public CLI and TypeScript SDK expose only byte cursor names and behavior; old seq/chunk cursor fields, aliases, converters and migration paths are deleted.",
+        "Real daemon tests cover multi-byte output, multiple PTY reads, eviction, replay/live continuity, reconnect and slow-consumer Gap from public client boundaries."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Rust, protocol generation, CLI and TypeScript SDK agree on cumulative output bytes."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The public byte cursor, replay and Gap contract is authoritative."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md",
+        "docs/decisions/protocol-and-transport.md",
+        "docs/testing/strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-004",
+      "title": "Own practical POSIX interrupt and complete-session stop",
+      "objective": "Expose kernel-directed PTY Interrupt on macOS and make Stop terminate the complete visible native Run session under an explicit practical POSIX identity boundary.",
+      "outcome": "Embedding clients can interrupt an interactive Run without translating interrupt into Stop, and successful Stop leaves no visible Run-session descendants while the unavoidable numeric identity reuse race remains explicit.",
+      "acceptance": [
+        "The public protocol, CLI and TypeScript SDK distinguish interrupt/signal from Stop and return typed unsupported or invalid-target results where a signal is unavailable.",
+        "On macOS, Interrupt uses `TIOCSIG` on the retained PTY master so the kernel targets the current foreground process group without a userspace PGID validation-to-signal gap; no private API, entitlement or synthetic audit token is introduced.",
+        "Stop owns the local, same-user, non-elevated processes still visible in the `portable-pty`-created POSIX session, keeps the leader waitable as the SID incarnation anchor, immediately revalidates each ordinary member before numeric signalling, and performs no waits, locks or unrelated I/O between that revalidation and signal delivery.",
+        "Stop uses bounded graceful and forced phases and succeeds only after the direct child is reaped and the visible session is empty; observation, permission or retained-descendant uncertainty fails explicitly, and killing only the shell or direct child is insufficient.",
+        "Protocol, architecture, testing and threat-boundary documentation state that POSIX PID/PGID reuse between identity check and signal is an unavoidable residual TOCTOU rather than a zero-risk guarantee; a descendant that creates another session is out of scope.",
+        "Real fixtures cover PTY-directed foreground Interrupt, shell grandchildren, stubborn descendants, already-exited races, concurrent Interrupt/Stop, client disconnect, immediate revalidation failure, and unrelated-process sentinels without claiming to eliminate numeric identity reuse."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "All public surfaces and native lifecycle tests pass with one daemon process owner."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Signal and complete Stop semantics, errors and platform boundaries are explicit."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/decisions/pty-process-and-signals.md",
+        "docs/testing/strategy.md"
+      ],
+      "supersedes": [
+        "T-002"
+      ],
+      "introduced_in_revision": 2,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Qualify exact-commit consumer artifacts and CI",
+      "objective": "Produce and verify a reproducible public TypeScript SDK plus ctxmux/ctxmuxd binary artifact from one exact clean commit, and fix any source-owned required-CI failure without publishing externally.",
+      "outcome": "An unrelated clean consumer can verify Git identity, build or unpack immutable artifacts, start the matching daemon and use only the public SDK without an adjacent checkout, global install or registry publication.",
+      "acceptance": [
+        "One repository command creates a bounded manifest binding exact Git commit, protocol/build identity, supported platform, SDK package and ctxmux/ctxmuxd binary hashes; a dirty tree fails closed.",
+        "A clean consumer fixture installs or unpacks only produced artifacts in an isolated directory and proves start/status/input/attach/replay/interrupt/stop without reading the ctxmux source tree or using file/path dependencies.",
+        "Artifact production is deterministic where declared and every unavoidable platform-specific field is explicit; no npm, crate, GitHub Release or global installation is performed or claimed.",
+        "`scripts/check.sh` and required hosted CI pass on the exact final commit. Current required-CI failures are classified; source-owned failures are fixed in this Feature, while external infrastructure failures retain precise evidence instead of being hidden."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The final exact commit passes repository and public-consumer gates."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/release.md",
+          "proves": "Exact-commit artifact creation, verification, consumption and non-publication boundaries are documented."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/testing/strategy.md",
+          "proves": "Required CI classification and clean-consumer evidence are durable."
+        }
+      ],
+      "source_refs": [
+        "docs/roadmap.md",
+        "docs/release.md",
+        "docs/testing/strategy.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "blocked",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "external_blocker",
+        "reason": "Exact-final hosted macOS, Ubuntu, and coverage evidence cannot exist without pushing commit 185ba19 and starting or rerunning hosted CI; current authority explicitly forbids push, publication, and hosted reruns. Local exact-commit artifact and isolated-consumer qualification passed and remain available for downstream consumption."
+      }
+    },
+    {
+      "id": "T-005",
+      "title": "Prove the exact daemon bootstrap child",
+      "objective": "Add one optional inherited readiness descriptor to ctxmuxd so an embedding parent can bind the responding public daemon instance to the exact child it spawned without trusting a socket race, PID guess, sleep or filesystem-only receipt.",
+      "outcome": "After the Unix listener is bound and permissioned, the spawned ctxmuxd publishes its public daemon instance through the caller-owned descriptor; an embedding client accepts the socket only when that receipt and the public hello instance agree, while normal daemon startup remains unchanged when no descriptor is requested.",
+      "acceptance": [
+        "ctxmuxd accepts one bounded inherited readiness descriptor, rejects standard, duplicate, missing or invalid descriptor arguments, duplicates it CLOEXEC, and does not expose a compatibility alias or environment fallback.",
+        "The daemon writes exactly one bounded readiness record only after the Unix listener is bound and mode 0600 is applied; a requested receipt write failure fails startup and the socket guard removes the endpoint.",
+        "The readiness record contains the same daemon instance returned by the versioned public handshake; an unrelated or racing peer cannot produce a valid receipt over the spawned child inherited descriptor.",
+        "A real process test starts ctxmuxd with an inherited descriptor, proves receipt-to-handshake equality, covers invalid/closed descriptors, and proves ordinary startup without the flag remains unchanged.",
+        "docs/protocol.md and daemon usage describe readiness as bootstrap provenance only; it does not add Agent semantics, Run state, discovery, persistence, migration, fallback or a new protocol generation."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Rust tests, CLI smoke, SDK parity, exact local consumer and reliability smoke pass with the inherited bootstrap receipt."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The readiness timing, payload and non-goals are authoritative."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/release.md",
+        "docs/plans/public-local-consumer-contract-review.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 3,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Own interrupt and complete process-tree stop",
+      "objective": "Expose public interrupt/signal and make Stop terminate the complete native Run process tree through the daemon owner with bounded graceful and forced dispositions.",
+      "outcome": "Embedding clients can interrupt an interactive Run without translating interrupt into Stop, and final Stop leaves no Run-owned descendants or ambiguous live ownership.",
+      "acceptance": [
+        "The public protocol, CLI and TypeScript SDK distinguish interrupt/signal from Stop and return typed unsupported or invalid-target results where a signal is unavailable.",
+        "POSIX native Runs are placed in an owner-controlled process group/session; interrupt targets the intended Run scope, while Stop uses a bounded graceful phase then forcefully terminates remaining descendants.",
+        "Stop completion means the complete owned process tree is quiescent and reaped or an explicit failure/disposition is returned; killing only the shell or direct child is insufficient.",
+        "Real fixtures cover shell grandchildren, stubborn descendants, already-exited races, concurrent interrupt/stop, client disconnect and no effect on unrelated processes."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "All public surfaces and native lifecycle tests pass with one daemon process owner."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "Signal and complete Stop semantics, errors and platform boundaries are explicit."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/decisions/pty-process-and-signals.md",
+        "docs/testing/strategy.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "blocked",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "internal_blocker",
+        "reason": "The original zero-risk complete-session Stop acceptance cannot be proven with supported macOS/POSIX numeric PID and PGID signalling; Owner approved a practical same-user local non-elevated contract with the residual reuse TOCTOU documented and superseded through a new plan revision."
+      },
+      "superseded_by": [
+        "T-004"
+      ]
+    }
+  ]
+}

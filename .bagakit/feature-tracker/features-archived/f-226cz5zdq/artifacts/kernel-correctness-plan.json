@@ -1,0 +1,172 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": "docs/roadmap.md#program-ownership-and-convergence"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/testing-strategy.md",
+    "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+    "docs/architecture/choices/009-runtime-persistence-recovery.md",
+    "docs/architecture/choices/013-retained-run-resource-governance.md",
+    "docs/roadmap.md#program-ownership-and-convergence"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Ship memory-only retained Run admission and GC",
+      "objective": "Implement the accepted 128-record memory-only Registry ceiling through one reservation, pin, collection-fence, and exact replacement owner before physical Backend mutation.",
+      "outcome": "A memory-only daemon can churn indefinitely without exceeding 128 retained or projected Runs, losing protected owners, or retaining stale creation-key mappings.",
+      "acceptance": [
+        "Start, Fork, and tmux import reserve projected Registry capacity before physical launch or Control startup and return run_capacity without mutation when no eligible terminal candidate exists.",
+        "Retained and Collecting linearize under one Registry truth; List and Status copy, while Attach, control, and fresh Fork pin atomically or fail explicitly.",
+        "One deterministic terminal candidate and its exact operation-key mapping are fenced and removed together; live, pinned, reader, waiter, input-drain, tmux-control, persistence-transition, and UnpublishedCleanupOwner entries are never collected.",
+        "Post-collection public errors, lineage, replay loss, retry convergence, key reuse, cap-one Fork, reverse publication, shutdown, and 127-to-129 races match the generation-6 contract.",
+        "Persistent managers keep their legacy retained publication path and emit no collection capacity result until T-003 closes exact durable replacement.",
+        "No background actor, TTL, public delete API, Session identity, Backend framework, or second reservation truth is added."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Memory admission, owner races, exact removal, key reuse, public errors, tmux import, and repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "docs/protocol.md",
+        "crates/ctxmux-daemon/src/creation.rs",
+        "crates/ctxmux-daemon/src/lib.rs"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Bound unclassified native waiter failure",
+      "objective": "Give an unclassified direct-child try_wait error one bounded fail-closed owner disposition instead of polling every 20 ms forever or fabricating process exit.",
+      "outcome": "A lost native child-wait authority stops consuming CPU, never signals a cached PID, remains explicit to clients, and has defined key and collection semantics.",
+      "acceptance": [
+        "Before implementation, one reviewed owner-local contract fixes the unique internal and public disposition of an unclassified try_wait error without assuming the underlying io::Error is transient or permanent.",
+        "The bounded disposition ends the 20-ms busy loop, closes live control, retains the child handle or transfers it to an explicit fail-stop owner until its safety contract is satisfied, and never fabricates reap or falls back to cached-PID signalling.",
+        "Reader drain, terminal publication, attachment delivery, persistence, restart, shutdown, and later collection remain fail-closed under the chosen disposition.",
+        "A deterministic fake-Child seam proves bounded poll count, no busy loop, no discarded live handle, no duplicate terminal publication, no extra signal, and the single selected disposition.",
+        "The change remains inside native waiter/control ownership and adds no process-tree policy, supervisor actor, or process adoption."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Unclassified waiter failure, native lifecycle, control fencing, persistence, shutdown, and repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/004-run-lifecycle-concurrency.md",
+        "docs/protocol.md",
+        "crates/ctxmux-daemon/src/lib.rs",
+        "crates/ctxmux-daemon/src/native_control.rs"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Close persistent retained Run replacement",
+      "objective": "Implement the smallest persistence-owned exact replacement whose WAL and page-cost admission is proven before launch and whose COMMIT disposition cannot reopen a key or duplicate a Run.",
+      "outcome": "Persistent mode supports bounded churn across restart while old candidates and the new Run recover as one pre- or post-COMMIT state.",
+      "acceptance": [
+        "A reviewed persistence-owned WAL and page-cost rule bounds the exact candidate set before physical launch; unprovable or over-budget requests return run_capacity before mutation.",
+        "The actor distinguishes NotCommitted, Committed, and fail-stop CommitUnknown; only NotCommitted restores candidates and Committed drives one infallible Registry replacement.",
+        "Candidate rows, replay, metadata accounting, and byte-exact creation keys change in one SQLite transaction; crash fixtures recover all old candidates or only the new Run.",
+        "Startup normalization and ordinary creation stay inside frozen record, metadata, replay, database, WAL, and SHM ceilings.",
+        "No general transaction API, migration layer, durable collection ticket, pending tombstone, or PID adoption is added."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Persistent admission, exact replacement, COMMIT ambiguity, restart, key convergence, and repository regressions pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md",
+        "docs/architecture/choices/013-retained-run-resource-governance.md",
+        "crates/ctxmux-daemon/src/persistence.rs",
+        "crates/ctxmux-daemon/src/creation.rs"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-004",
+      "title": "Complete bounded Run-Kernel correctness review",
+      "objective": "Independently review the shipped Run owner boundaries and close only P0/P1 defects required by the finite Kernel oracle.",
+      "outcome": "Kernel completion does not depend on implementation-author judgment or expand with adjacent P2, release, tmux-product, or performance work.",
+      "acceptance": [
+        "Independent reviewers cover native lifecycle, Registry and keys, replay and attachment, protocol and clients, fork provenance, persistence, security, and resource ownership.",
+        "Every P0/P1 finding in a shipped Kernel claim gains an executable regression and independent re-review; P2 findings are recorded or routed unless they block a required Gate.",
+        "The review explicitly checks product drift, owner count, lock order, failure disposition, public errors, SSOT, complexity, naming, and deterministic evidence.",
+        "Fork review covers Kernel capability, caller-materialized plans, lineage, and fail-closed enforcement only; Integration-owned semantic provenance remains in the SDK host and is not reimplemented here.",
+        "Tmux version qualification, activation, packaging, platforms, release, and peer performance remain with their neighboring Features."
+      ],
+      "verification": [
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22bczhydf/verification.md",
+          "proves": "The bounded Kernel review map, findings, dispositions, and exact evidence are auditable."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "All required Kernel corrections and ordinary regressions pass."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture.md",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-005",
+      "title": "Qualify retained-state plateau",
+      "objective": "Only after memory-only admission, bounded waiter failure, persistent replacement, and Kernel review close, prove bounded records, replay, resources, owner counts, and retry identity across sustained churn and restart.",
+      "outcome": "Source-bound evidence demonstrates a stable retained-state plateau without budget relaxation, hidden duplicate starts, or shortened soak.",
+      "acceptance": [
+        "The harness consumes reliability-gc-contract.json as the sole workload, seed, helper, owner, sampling, resource, and time-budget truth.",
+        "T-001 through T-004 are done before canonical qualification begins; a partial memory-only implementation is never presented as the two-mode result.",
+        "Both modes fill 128 records and complete at least three full 128-Run turnover windows with exact retries, cumulative physical-start counts, bounded candidate work, and zero quiescent transient owners.",
+        "Persistent restart preserves the exact retained Run/key/replay tuple set and resumes churn without duplicate launch or mixed COMMIT state.",
+        "Maximum replay pressure and the ordinary nightly soak satisfy frozen CPU, RSS, descriptor, thread, child, attachment, reader, waiter, and input-drain rules.",
+        "Historical receipts, hashes, workloads, numeric margins, and frozen budgets remain unchanged; no shorter soak or post-result rebaseline replaces them.",
+        "A clean exact revision passes scripts/check.sh and the canonical nightly reliability profile with receipts and unchanged budget hashes retained."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Retained-state correctness and repository regressions pass."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/check-reliability.sh",
+          "proves": "Canonical churn, pressure, restart, plateau, and unchanged-budget evidence pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22bczhydf/verification.md",
+          "proves": "The exact source, raw series, receipt hashes, and residual Kernel limits are bound to closure."
+        }
+      ],
+      "source_refs": [
+        "reliability-gc-contract.json",
+        "reliability-budgets.json",
+        "scripts/reliability-qualification.ts",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": []
+    }
+  ]
+}

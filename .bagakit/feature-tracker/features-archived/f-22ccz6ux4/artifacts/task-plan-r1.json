@@ -1,0 +1,112 @@
+{
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/grill/runs/local-operation-kernel-boundary/grill-brief.md"
+  },
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/roadmap.md",
+    "docs/testing-strategy.md",
+    "docs/architecture/choices/014-recoverable-input-operations.md",
+    ".bagakit/grill/runs/local-operation-kernel-boundary/grill-brief.md",
+    ".bagakit/researcher/topics/engineering/recoverable-run-operations/summaries/synthesis.md"
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Ship the recoverable native Input vertical",
+      "objective": "Implement one public short-lived native Input operation whose exact result can be recovered after response loss within the same daemon incarnation without another PTY write.",
+      "outcome": "Rust clients can retain one instance-bound Input operation, reconnect, recover its exact applied byte range, and fail closed on conflict, stale cursor, ambiguous write, or daemon replacement.",
+      "acceptance": [
+        "The next protocol generation advertises one random daemon-incarnation identity and defines a bounded opaque Input operation key, exact Run and non-empty bytes, expected input byte cursor, exact applied half-open byte range, and typed instance, conflict, and cursor failures.",
+        "The existing native Input owner is the only physical writer and orders instance fence, exact retained-key recovery or conflict, missing-key cursor validation, and physical write; matching retry returns the original range without mutation.",
+        "The per-Run completed-result ledger is bounded by entry count and retained request bytes; eviction cannot turn a stale operation into a new write because its expected cursor fails closed.",
+        "Every successful legacy or recoverable native Input advances the same applied-input cursor; partial or ambiguous write produces no applied range, consumes or fences the operation, and preserves the existing poisoned-lane safety boundary.",
+        "One real-PTY public test combines response loss, fresh-client reconnect, exact-result recovery, and child-side proof that bytes were written once; focused owner tests cover conflict, eviction, empty input, and ambiguous write, while a live second-daemon test proves instance rejection before mutation.",
+        "AttachmentCommandId remains connection-local correlation. No durable Resize, Stop Tree, Signal, SSH, release, general operation framework, Agent, Message, Delivery, ACK, Reply, Task, DAG, or UI-timeline semantics are added."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "cargo test -p ctxmux-daemon recoverable_input",
+          "proves": "The native owner algebra and real-PTY response-loss vertical pass."
+        },
+        {
+          "kind": "command",
+          "ref": "cargo test -p ctxmux-client recoverable_input",
+          "proves": "The Rust public client retains instance-bound operation identity and validates exact results."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "docs/protocol.md",
+        "crates/ctxmux-protocol/src/lib.rs",
+        "crates/ctxmux-daemon/src/native_control.rs",
+        "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+        "crates/ctxmux-client/src/lib.rs"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-002",
+      "title": "Expose TypeScript recoverable Input parity",
+      "objective": "Expose the same instance-bound recoverable Input operation through the generated TypeScript wire contract and dependency-free SDK without creating a second semantic implementation.",
+      "outcome": "A fresh SDK client can retry a caller-retained operation after response loss and receive the original applied byte range while runtime validation rejects malformed or mismatched results.",
+      "acceptance": [
+        "Rust protocol types remain the wire-shape SSOT; generated TypeScript declarations, runtime validation, exports, and SDK client API carry the original daemon instance, operation key, Run, expected cursor, exact bytes, and applied range.",
+        "The SDK never replaces an operation's retained daemon instance with a new handshake value and never represents bytes_applied as target acknowledgement or reply.",
+        "One focused wrong-case group covers new frame validation and typed failures, and one real-daemon SDK test proves fresh-client result recovery; Rust tests remain the non-duplication, conflict, eviction, and instance-fence authority.",
+        "Existing attachment Input behavior and public unknown disposition remain unchanged."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "npm test --workspace @ctxmux/sdk",
+          "proves": "SDK runtime validation, client behavior, and focused real-daemon parity pass."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "packages/sdk/src/client.ts",
+        "packages/sdk/src/validation.ts",
+        "packages/sdk/test/wrong-cases.test.ts",
+        "packages/sdk/test/client-parity.test.ts"
+      ],
+      "supersedes": []
+    },
+    {
+      "id": "T-003",
+      "title": "Review and close the bounded Input contract",
+      "objective": "Independently review the shipped Input owner boundary and close the Feature with proportionate public evidence and current documentation.",
+      "outcome": "The recoverable Input claim is source-bound, has no open P0 or P1 defect in its finite scope, and does not keep adjacent control or release work open.",
+      "acceptance": [
+        "Independent read-only review covers correctness, owner and lock boundaries, partial-write disposition, bounded resources, protocol and SDK parity, naming, complexity, and product drift for this Input vertical only.",
+        "Any P0 or P1 within the shipped claim receives a deterministic regression and re-review; adjacent Stop, Resize, Signal, SSH, release, coverage, tmux, and performance findings are routed without expanding this Feature.",
+        "Protocol, architecture, SDK, and test documentation state that bytes_applied proves only the daemon-owned PTY boundary and that cross-daemon exactly-once and semantic acknowledgement are unsupported.",
+        "A clean exact revision passes the ordinary repository Gate once; no soak, platform matrix, metrics sink, coverage campaign, or general qualification framework is required for closure."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Formatting, static analysis, Rust and TypeScript contracts, public E2E behavior, and repository regressions pass together."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22ccz6ux4/verification.md",
+          "proves": "The bounded independent review, finding dispositions, exact revision, and residual limits are auditable."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md",
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "docs/testing-strategy.md"
+      ],
+      "supersedes": []
+    }
+  ]
+}
