@@ -31,6 +31,7 @@ import {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
 } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
@@ -48,6 +49,11 @@ import {
   validateServerFrame,
 } from "./validation.js";
 import { encodeJsonLine, JsonLinesConnection } from "./wire.js";
+import {
+  encodeRecoverableStop,
+  type RecoverableStopOperation,
+  stopOperationKey,
+} from "./stop-operation.js";
 
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
@@ -333,11 +339,51 @@ export class CtxmuxClient {
     );
   }
 
-  public async stop(id: RunId): Promise<ControlAccepted<StopReceipt>> {
-    return decodeShortControl(
-      await this.#controlRequest({ type: "stop", id }),
+  /** Prepare one caller-retained Stop operation without applying it. */
+  public async prepareStop(
+    id: RunId,
+    operationKey = stopOperationKey(),
+  ): Promise<RecoverableStopOperation> {
+    const runtime = await this.runtimeInfo();
+    const advertisedVersion = Object.hasOwn(
+      runtime.capabilities,
+      RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+    )
+      ? runtime.capabilities[RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP]
+      : undefined;
+    if (advertisedVersion === undefined || advertisedVersion < 1) {
+      throw new CtxmuxUnsupportedCapabilityError(
+        RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+        1,
+        advertisedVersion,
+      );
+    }
+    return {
+      daemonInstance: runtime.daemonInstanceId,
+      operationKey: stopOperationKey(operationKey),
+      runId: id,
+    };
+  }
+
+  /** Apply or recover one caller-retained complete-session Stop. */
+  public async stop(
+    operation: RecoverableStopOperation,
+  ): Promise<ControlAccepted<StopReceipt>> {
+    const response = decodeShortControl(
+      await this.#controlRequest({
+        type: "stop",
+        operation: encodeRecoverableStop(operation),
+      }),
       decodeStopReceipt,
     );
+    if (response.run.id !== operation.runId) {
+      throw new CtxmuxCommandError(
+        "internal",
+        "recoverable Stop response names another Run",
+        "unknown",
+      );
+    }
+    return response;
   }
 
   public async interrupt(id: RunId): Promise<ControlAccepted<SignalReceipt>> {

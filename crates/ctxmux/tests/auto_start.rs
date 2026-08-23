@@ -1,11 +1,12 @@
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
 };
 
 use ctxmux_client::Client;
-use ctxmux_protocol::DaemonInstanceId;
+use ctxmux_protocol::{DaemonInstanceId, RunSpec, TerminalSize};
 
 const DEADLINE: Duration = Duration::from_secs(15);
 
@@ -113,6 +114,95 @@ async fn ping_reuses_an_already_listening_daemon() {
     assert_eq!(
         instance, after,
         "CLI ping must reuse the listening daemon instead of replacing it"
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_replays_a_caller_retained_operation_and_prints_its_disposition() {
+    let directory = tempfile::tempdir().expect("create recoverable Stop CLI fixture");
+    let socket = directory.path().join("ctxmux.sock");
+    let marker = directory.path().join("stop-marker");
+    let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
+    let client = Client::new(&socket);
+    let daemon_instance = tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let Ok(instance) = client.daemon_instance().await {
+                return instance;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("in-process daemon accepts recoverable Stop connections");
+    let run = client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "printf 'ready\\n' > \"$1\"; ",
+                    "trap 'printf \"stop\\n\" >> \"$1\"; sleep 0.2; exit 0' TERM; ",
+                    "while :; do sleep 1; done"
+                )
+                .to_owned(),
+                "ctxmux-cli-recoverable-stop".to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            cwd: Some(directory.path().to_string_lossy().into_owned()),
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start CLI recoverable Stop fixture");
+    tokio::time::timeout(DEADLINE, async {
+        loop {
+            if std::fs::read_to_string(&marker).is_ok_and(|value| value == "ready\n") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("fixture installs its TERM trap");
+
+    let incomplete = Command::new(ctxmux_bin())
+        .arg("--socket")
+        .arg(&socket)
+        .args(["stop", "--operation-key", "cli-retained-stop"])
+        .arg(run.id.to_string())
+        .output()
+        .expect("run incomplete recoverable Stop CLI command");
+    assert!(!incomplete.status.success());
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("must be supplied together"));
+
+    for attempt in 1..=2 {
+        let output = Command::new(ctxmux_bin())
+            .arg("--socket")
+            .arg(&socket)
+            .args(["stop", "--daemon-instance"])
+            .arg(daemon_instance.to_string())
+            .args(["--operation-key", "cli-retained-stop"])
+            .arg(run.id.to_string())
+            .output()
+            .expect("run retained recoverable Stop CLI command");
+        assert!(
+            output.status.success(),
+            "recoverable Stop attempt {attempt} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("stop=graceful"),
+            "recoverable Stop attempt {attempt} omitted disposition: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("read CLI Stop marker"),
+        "ready\nstop\n"
     );
 
     server.abort();

@@ -19,6 +19,7 @@ import {
   PROTOCOL_VERSION,
   inputOperationKey,
   type OutputChunk,
+  type RecoverableStopOperation,
   type RuntimeIdentity,
   type ServerFrame,
 } from "../src/index.ts";
@@ -33,6 +34,30 @@ import {
 const RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114ae8";
 const DAEMON_INSTANCE = "018f47f2-9df7-7f5f-8f2d-d3353f114ae9";
 const RUNTIME_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114aea";
+const OTHER_RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114aeb";
+
+function stopOperation(
+  runId = RUN_ID,
+  operationKey = "sdk-wrong-case-stop",
+): RecoverableStopOperation {
+  return {
+    daemonInstance: DAEMON_INSTANCE,
+    operationKey,
+    runId,
+  };
+}
+
+function stopFrame(commandId: number) {
+  return {
+    type: "stop",
+    command_id: commandId,
+    operation: {
+      daemon_instance: DAEMON_INSTANCE,
+      operation_key: "sdk-wrong-case-stop",
+      id: RUN_ID,
+    },
+  } as const;
+}
 
 function runtimeIdentity(): RuntimeIdentity {
   return {
@@ -1340,7 +1365,7 @@ test("T-013 correlates out-of-order attachment controls with typed receipts", as
       command_id: 2,
       size: { cols: 100, rows: 30 },
     });
-    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 3 });
+    assert.deepEqual(await peer.receive(), stopFrame(3));
     peer.send({
       type: "command_result",
       command_id: 2,
@@ -1378,7 +1403,7 @@ test("T-013 correlates out-of-order attachment controls with typed receipts", as
   }).attach(RUN_ID);
   const input = attachment.input("hi");
   const resize = attachment.resize({ cols: 100, rows: 30 });
-  const stop = attachment.stop();
+  const stop = attachment.stop(stopOperation());
   assert.deepEqual(await resize, {
     commandId: 2,
     receipt: {
@@ -1460,7 +1485,7 @@ test("T-013 reserves attachment capacity for resize and stop after 32 pending in
       command_id: 33,
       size: { cols: 90, rows: 25 },
     });
-    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 34 });
+    assert.deepEqual(await peer.receive(), stopFrame(34));
     for (let commandId = 1; commandId <= 32; commandId += 1) {
       peer.send({
         type: "command_result",
@@ -1505,7 +1530,7 @@ test("T-013 reserves attachment capacity for resize and stop after 32 pending in
       error.commandId === undefined,
   );
   const resize = attachment.resize({ cols: 90, rows: 25 });
-  const stop = attachment.stop();
+  const stop = attachment.stop(stopOperation());
   await Promise.all(inputs);
   assert.equal((await resize).commandId, 33);
   assert.equal((await stop).commandId, 34);
@@ -1528,7 +1553,7 @@ test("T-013 bounds pending input bytes without consuming the rejected command ID
         inputBytes,
       );
     }
-    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 3 });
+    assert.deepEqual(await peer.receive(), stopFrame(3));
     for (let commandId = 1; commandId <= 2; commandId += 1) {
       peer.send({
         type: "command_result",
@@ -1563,7 +1588,7 @@ test("T-013 bounds pending input bytes without consuming the rejected command ID
       error.disposition === "not_applied" &&
       error.commandId === undefined,
   );
-  const stop = attachment.stop();
+  const stop = attachment.stop(stopOperation());
   await Promise.all([first, second]);
   assert.equal((await stop).commandId, 3);
   attachment.close();
@@ -1613,7 +1638,7 @@ test("T-013 rejects an oversize attachment frame before consuming its command ID
     await peer.handshake();
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
-    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 1 });
+    assert.deepEqual(await peer.receive(), stopFrame(1));
     peer.send({
       type: "command_result",
       command_id: 1,
@@ -1643,7 +1668,7 @@ test("T-013 rejects an oversize attachment frame before consuming its command ID
       error.disposition === "not_applied" &&
       error.commandId === undefined,
   );
-  assert.equal((await attachment.stop()).commandId, 1);
+  assert.equal((await attachment.stop(stopOperation())).commandId, 1);
   attachment.close();
 });
 
@@ -1677,7 +1702,7 @@ test("T-013 fences detach until pending controls have unique results", async (co
   }).attach(RUN_ID);
   const input = attachment.input("x");
   const detaching = attachment.detach();
-  await assert.rejects(attachment.stop(), /detaching/);
+  await assert.rejects(attachment.stop(stopOperation()), /detaching/);
   resultRelease.resolve();
   await input;
   await detaching;
@@ -1724,7 +1749,7 @@ test("T-013 preserves short-control receipts, rejections, and lost-response disp
     receipt: { type: "input", written_bytes: 2 },
   });
   await assert.rejects(
-    client.stop(RUN_ID),
+    client.stop(stopOperation()),
     (error: unknown) =>
       error instanceof CtxmuxCommandError &&
       error.code === "invalid_run_state" &&
@@ -1738,6 +1763,129 @@ test("T-013 preserves short-control receipts, rejections, and lost-response disp
       error.code === "io" &&
       error.disposition === "unknown",
   );
+});
+
+test("recoverable Stop preparation fails closed when capability v1 is absent", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+  });
+  await assert.rejects(
+    new CtxmuxClient({ socketPath: daemon.socketPath }).prepareStop(
+      RUN_ID,
+      "retained-stop-key",
+    ),
+    (error: unknown) =>
+      error instanceof CtxmuxUnsupportedCapabilityError &&
+      error.capability === "native.recoverable_stop" &&
+      error.requiredVersion === 1 &&
+      error.advertisedVersion === undefined,
+  );
+});
+
+test("recoverable Stop sends the exact retained operation and exposes conflicts", async (context) => {
+  let connection = 0;
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    connection += 1;
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: {
+        type: "stop",
+        operation: {
+          daemon_instance: DAEMON_INSTANCE,
+          operation_key: "sdk-wrong-case-stop",
+          id: RUN_ID,
+        },
+      },
+    });
+    if (connection === 1) {
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_accepted",
+          run: runInfo(),
+          receipt: { type: "stop", disposition: "graceful" },
+        },
+      });
+    } else if (connection === 2) {
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_rejected",
+          failure: {
+            error: {
+              code: "stop_operation_conflict",
+              message: "key retained for another Run",
+            },
+            disposition: "not_applied",
+          },
+        },
+      });
+    } else {
+      peer.send({
+        type: "response",
+        response: {
+          type: "control_accepted",
+          run: { ...runInfo(), id: OTHER_RUN_ID },
+          receipt: { type: "stop", disposition: "graceful" },
+        },
+      });
+    }
+  });
+  const client = new CtxmuxClient({ socketPath: daemon.socketPath });
+  assert.deepEqual(await client.stop(stopOperation()), {
+    run: runInfo(),
+    receipt: { type: "stop", disposition: "graceful" },
+  });
+  await assert.rejects(
+    client.stop(stopOperation()),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "stop_operation_conflict" &&
+      error.disposition === "not_applied",
+  );
+  await assert.rejects(
+    client.stop(stopOperation()),
+    (error: unknown) =>
+      error instanceof CtxmuxCommandError &&
+      error.code === "internal" &&
+      error.disposition === "unknown",
+  );
+});
+
+test("attachment rejects a malformed Stop key before consuming a command ID", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), stopFrame(1));
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "stop", disposition: "graceful" },
+      },
+    });
+  });
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  for (const operationKey of ["", "x".repeat(129)]) {
+    await assert.rejects(
+      attachment.stop(stopOperation(RUN_ID, operationKey)),
+      (error: unknown) =>
+        error instanceof CtxmuxCommandError &&
+        error.code === "invalid_request" &&
+        error.disposition === "not_applied" &&
+        error.commandId === undefined,
+    );
+  }
+  assert.equal((await attachment.stop(stopOperation())).commandId, 1);
+  attachment.close();
 });
 
 test(
@@ -1862,10 +2010,7 @@ test(
           },
         });
       }
-      assert.deepEqual(await peer.receive(), {
-        type: "stop",
-        command_id: 1,
-      });
+      assert.deepEqual(await peer.receive(), stopFrame(1));
       peer.send({
         type: "command_result",
         command_id: 1,
@@ -1879,7 +2024,7 @@ test(
     const attachment = await new CtxmuxClient({
       socketPath: daemon.socketPath,
     }).attach(RUN_ID);
-    assert.deepEqual(await attachment.stop(), {
+    assert.deepEqual(await attachment.stop(stopOperation()), {
       commandId: 1,
       receipt: { type: "stop", disposition: "graceful" },
     });
@@ -1918,7 +2063,7 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
         },
       });
     }
-    assert.deepEqual(await peer.receive(), { type: "stop", command_id: 1 });
+    assert.deepEqual(await peer.receive(), stopFrame(1));
     peer.send({
       type: "event",
       event: { type: "tmux", event: { type: "paused" } },
@@ -1953,7 +2098,7 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
   await delay(50);
   assert.equal((await attachment.nextEvent())?.type, "output");
   assert.equal((await attachment.nextEvent())?.type, "output");
-  await attachment.stop();
+  await attachment.stop(stopOperation());
   for (let expected = 2; expected < 256; expected += 1) {
     assert.deepEqual(await attachment.nextEvent(), {
       type: "output",
@@ -2068,7 +2213,7 @@ test(
       socketPath: daemon.socketPath,
     }).attach(RUN_ID);
     await assert.rejects(
-      settleWithin(attachment.stop(), 2_000),
+      settleWithin(attachment.stop(stopOperation()), 2_000),
       (error: unknown) =>
         error instanceof CtxmuxCommandError && error.disposition === "unknown",
     );
@@ -2154,14 +2299,16 @@ class MockPeer {
     socket.on("error", () => undefined);
   }
 
-  public async handshake(): Promise<void> {
+  public async handshake(
+    runtime: RuntimeIdentity = runtimeIdentity(),
+  ): Promise<void> {
     assert.deepEqual(await this.receive(), {
       type: "hello",
       hello: { protocol: PROTOCOL_VERSION },
     });
     this.send({
       type: "hello",
-      runtime: runtimeIdentity(),
+      runtime,
     });
   }
 

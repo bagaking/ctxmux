@@ -193,8 +193,12 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
     assert_eq!(status.state, RunState::Running);
     assert_eq!(status.attachments, 0);
 
+    let stop_operation = client
+        .prepare_stop(run.id)
+        .await
+        .expect("prepare CLI PTY Stop");
     client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop surviving CLI PTY Run");
     tokio::time::timeout(DEADLINE, async {
@@ -351,8 +355,12 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
     let cli_status = wait_for_child(&mut *cli, DEADLINE);
     assert!(cli_status.success(), "ctxmux attach failed: {cli_status:?}");
 
+    let stop_operation = client
+        .prepare_stop(run.id)
+        .await
+        .expect("prepare CLI screen Stop");
     client
-        .stop(run.id)
+        .stop(stop_operation)
         .await
         .expect("stop CLI screen fixture Run");
     drop(writer);

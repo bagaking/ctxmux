@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 10
+# 003 — Unix socket and NDJSON protocol generation 11
 
-- Status: accepted for generation 10; pre-stable
+- Status: accepted for generation 11; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -66,18 +66,20 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 10 directly replaces generation 9. It adds the exact
-RuntimeIdentity and flat numeric capability record without a compatibility
-layer. The pre-stable contract directly rejects the obsolete snake_case and
-nested-boolean draft; it has no alias or dual encoding.
-Generation 9 introduced native Signal plus complete-session Stop disposition;
+Protocol generation 11 directly replaces generation 10. It requires one
+caller-retained recoverable native Stop operation and advertises
+`native.recoverable_stop: 1` without a compatibility layer. Generation 10
+introduced the exact RuntimeIdentity and flat numeric capability record; the
+pre-stable contract directly rejected the obsolete snake_case and
+nested-boolean draft. Generation 9 introduced native Signal plus
+complete-session Stop disposition;
 generation 8 introduced cumulative half-open output byte cursors. Generation 7
 introduced daemon-instance identity plus recoverable native Input operation
 keys and receipts; generation 6 introduced the narrow `run_capacity` error;
 generation 5 introduced correlated attachment controls, typed owner receipts,
 failure dispositions, and applied PTY-size readback; generation 4 introduced
 bounded creation keys. An older peer fails the exact generation handshake
-before request dispatch; ctxmux does not provide a generation-9 fallback,
+before request dispatch; ctxmux does not provide a generation-10 fallback,
 migration, alias, version range, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 

@@ -33,6 +33,20 @@ target/debug/ctxmux status "$run_id"
 target/debug/ctxmux stop "$run_id"
 ```
 
+The short form generates a fresh one-shot Stop identity. When a script must
+recover after losing the CLI response, retain the daemon instance from
+`ctxmux runtime` and supply one operation key; retry the exact same command:
+
+```bash
+target/debug/ctxmux stop \
+  --daemon-instance <daemon-instance-uuid> \
+  --operation-key deployment-stop-42 \
+  "$run_id"
+```
+
+Both recovery flags are required together. A successful invocation prints
+`stop=graceful` or `stop=forced` from the daemon-owned complete-session receipt.
+
 To keep historical Run metadata across daemon restart, start the daemon
 yourself with `--state-dir`:
 

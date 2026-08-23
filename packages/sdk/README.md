@@ -8,12 +8,15 @@ on Electron, React, an editor, or the Rust implementation.
 ```ts
 import {
   CtxmuxClient,
+  CtxmuxCommandError,
   CtxmuxUnsupportedCapabilityError,
+  RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   createOperationKey,
   defineRun,
   inputOperationKey,
+  stopOperationKey,
 } from "@ctxmux/sdk";
 
 const client = new CtxmuxClient({
@@ -144,6 +147,57 @@ for each new logical Input. `receipt` proves the exact half-open byte range
 applied at the daemon-owned PTY write boundary; it does not prove that the
 target process read, understood, acknowledged, or replied to those bytes.
 
+## Recover a native Stop result
+
+Prepare and retain the complete operation before sending Stop. `prepareStop`
+checks `native.recoverable_stop: 1`, captures the exact daemon incarnation, and
+does not mutate the Run:
+
+```ts
+const stopOperation = await client.prepareStop(run.id, stopOperationKey());
+
+try {
+  const { receipt } = await client.stop(stopOperation);
+  console.log(receipt.disposition); // "graceful" or "forced"
+} catch (error) {
+  if (
+    !(error instanceof CtxmuxCommandError) ||
+    error.disposition !== "unknown"
+  ) {
+    throw error;
+  }
+  // Transport loss made the first response unknown; keep the operation.
+  const replacement = new CtxmuxClient({
+    socketPath: "target/ctxmux.sock",
+    requiredCapabilities: {
+      [RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP]: 1,
+    },
+  });
+  const { receipt } = await replacement.stop(stopOperation);
+  console.log(receipt.disposition);
+}
+```
+
+The same key and Run join an in-flight Stop or replay its retained receipt. A
+different key for that Run, or the same key for another retained Run, throws
+`CtxmuxCommandError` with `stop_operation_conflict` before mutation. The record
+lasts until the exact Run is collected and survives a validated planned exec;
+it does not survive a cold daemon replacement. A new daemon therefore rejects
+the old operation with `daemon_instance_mismatch` instead of guessing whether
+an old process was stopped.
+
+An attachment uses the same retained operation:
+
+```ts
+const attachment = await client.attach(run.id);
+const stopOperation = await client.prepareStop(run.id);
+const { receipt, commandId } = await attachment.stop(stopOperation);
+```
+
+`commandId` correlates the result on that attachment only. If the connection
+loses the result, retry `client.stop(stopOperation)` with a fresh client; never
+turn the attachment command ID into a retry key.
+
 ## Discover and observe a tmux-owned pane
 
 Tmux discovery and import use the same public daemon protocol as native Runs:
@@ -172,7 +226,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 10 imports by socket path plus pane ID, an ambiguous linked
+because generation 11 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -252,9 +306,10 @@ An `Attachment` owns one persistent client connection, not the Run. Use
 `detach()` for a clean protocol detach or `close()` to simulate an abrupt client
 disconnect. `detach()` resolves after the daemon acknowledges `Detached`;
 `close()` returns immediately without sending that frame. Both leave a live Run
-running. `stop()` explicitly terminates it.
+running. `stop(operation)` explicitly terminates it.
 
-On a live attachment, `input()`, `resize()`, `interrupt()`, and `stop()` allocate a
+On a live attachment, `input()`, `resize()`, `interrupt()`, and
+`stop(operation)` allocate a
 connection-local command ID and resolve only after the daemon returns the
 matching owner receipt. One background receive pump demultiplexes command
 results from Run events, so a slow event consumer cannot steal an acknowledgement
@@ -270,17 +325,20 @@ the Run's current foreground process group. A stop receipt reports `graceful`
 or `forced` only after the direct child is reaped and the complete owned POSIX
 session is empty; the final `exited` event remains a later publication fact.
 
-`CtxmuxClient.input()`, `resize()`, `interrupt()`, and `stop()` expose the same typed receipts
+`CtxmuxClient.input()`, `resize()`, `interrupt()`, and `stop(operation)` expose
+the same typed receipts
 as `{ run, receipt }` over short-lived connections. A rejected control throws
 `CtxmuxCommandError` with `not_applied` or `unknown`. If a sent command loses its
 unique result, the SDK reports `unknown`, closes that attachment when required,
-and never reconnects, replays, or guesses. Callers must not automatically retry
-uncertain input. `detach()` first fences new commands, waits for every pending
+and never reconnects or guesses from a command ID. Callers must not
+automatically retry uncertain ordinary input, resize, or interrupt. Recoverable
+Stop is retried only by resending its complete retained operation. `detach()`
+first fences new commands, waits for every pending
 result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterByte)` resumes ordered output after the last observed cumulative byte cursor.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 10 represents cursors as
+4 MiB replay contains the complete history. Generation 11 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

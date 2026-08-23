@@ -2,6 +2,7 @@
 import type { CreateOperationKey } from "./CreateOperationKey.js";
 import type { ForkPlan } from "./ForkPlan.js";
 import type { RecoverableInput } from "./RecoverableInput.js";
+import type { RecoverableStop } from "./RecoverableStop.js";
 import type { RunId } from "./RunId.js";
 import type { RunSignal } from "./RunSignal.js";
 import type { RunSpec } from "./RunSpec.js";
@@ -26,7 +27,7 @@ export type Request =
   | { type: "recoverable_input"; operation: RecoverableInput }
   | { type: "resize"; id: RunId; size: TerminalSize }
   | { type: "signal"; id: RunId; signal: RunSignal }
-  | { type: "stop"; id: RunId }
+  | { type: "stop"; operation: RecoverableStop }
   | {
       type: "attach";
       id: RunId;

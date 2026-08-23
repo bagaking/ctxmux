@@ -4,10 +4,12 @@ import test from "node:test";
 import {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
+  MAX_STOP_OPERATION_KEY_BYTES,
   PROTOCOL_VERSION,
   createOperationKey,
   defineRun,
   inputOperationKey,
+  stopOperationKey,
   versionInfo,
 } from "../src/index.ts";
 
@@ -77,5 +79,24 @@ test("inputOperationKey enforces the exact UTF-8 byte ceiling", () => {
   assert.throws(
     () => inputOperationKey(42 as unknown as string),
     /well-formed UTF-16/,
+  );
+});
+
+test("stopOperationKey enforces the exact UTF-8 byte ceiling", () => {
+  assert.equal(
+    stopOperationKey("x".repeat(MAX_STOP_OPERATION_KEY_BYTES)).length,
+    128,
+  );
+  assert.throws(() => stopOperationKey(""), /must not be empty/);
+  assert.throws(
+    () => stopOperationKey("x".repeat(MAX_STOP_OPERATION_KEY_BYTES + 1)),
+    /maximum is 128/,
+  );
+  assert.doesNotThrow(() => stopOperationKey("界".repeat(42)));
+  assert.throws(() => stopOperationKey("界".repeat(43)), /129 bytes/);
+  assert.throws(() => stopOperationKey("\ud800"), /well-formed UTF-16/);
+  assert.throws(
+    () => stopOperationKey(42 as unknown as string),
+    /must be a string/,
   );
 });
