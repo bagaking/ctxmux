@@ -5,8 +5,8 @@
 - Closed From Status: proposal
 - Workspace Mode: proposal_only
 - Base Ref: main
-- Branch: 
-- Worktree: 
+- Branch:
+- Worktree:
 - Discard Reason: superseded
 - Replacement Feat: f-22hjbhvt8
 
@@ -18,7 +18,7 @@
 
 ## Closure
 - Git Workspace: unchanged; use ordinary Git commands for worktree or branch cleanup
-- Preserved Root Entries: 
+- Preserved Root Entries:
 
 ## Task Stats
 - todo: 2
@@ -35,7 +35,7 @@
   - Refs: .bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md, .bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md
 - Promotion: not_needed
   - Rationale: The durable ownership decision is already recorded in the roadmap and replacement Feature; no separate Chronicle, principle, or knowledge promotion is needed.
-  - Refs: 
+  - Refs:
 
 ## Counters
 - gate_fail_streak: 0
