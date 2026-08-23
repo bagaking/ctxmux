@@ -913,7 +913,7 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 10.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 11.
     pub data: Vec<u8>,
 }
 
