@@ -2,6 +2,15 @@
 
 Status: approved through explicit user delegation on 2026-08-24.
 
+Revision 3 scope correction: the user confirmed that this Feature owns only
+delivery and qualification of `native.recoverable_stop: 1` in ctxmux. Its
+terminal output is one exact ctxmux commit proven through Rust, TypeScript,
+CLI, attachment, and a real packed consumer. That public commit and capability
+make external integration possible, but no external consumer Feature, handoff,
+task plan, code change, or adoption schedule belongs to this Feature. The
+correction removes the earlier AgentMux handoff and downstream acceptance
+wording without changing valid Recoverable Stop implementation work.
+
 Revision 2 correction: an independent plan review found that Rust name filters
 can exit successfully with zero selected tests and that the package-local SDK
 E2E command does not build or inject the required ctxmux binaries. The reviewed
@@ -22,9 +31,9 @@ result after reconnect instead of executing Stop again.
 The current Stop implementation already owns admission, process-session
 cleanup, reap proof, graceful/forced disposition, and mutation fencing. Its
 remaining public gap is response-loss ambiguity: a client can lose the receipt
-and cannot distinguish a completed Stop from a failed delivery. AgentMux and
-other clients should consume Runtime truth instead of maintaining a second
-guessing layer for this ambiguity.
+and cannot distinguish a completed Stop from a failed delivery. A public
+recoverable operation lets any compatible client consume Runtime truth without
+moving client-specific semantics into ctxmux.
 
 ## Intended generalization
 
@@ -59,8 +68,9 @@ must converge through the same daemon-owned operation record.
 - Attachment command IDs remain connection-local correlation and never become
   idempotency keys.
 - No recoverable Resize, Interrupt, arbitrary Signal, semantic Agent stop,
-  Workbench close transaction, Remote Runtime, crash-time child adoption, host
-  reboot continuity, or cold-restart exactly-once promise is added.
+  AgentSession or Provider behavior, Workbench close transaction, Remote
+  Runtime, crash-time child adoption, host reboot continuity, or cold-restart
+  exactly-once promise is added.
 - The SQLite state schema is not widened merely to persist Stop receipts across
   cold replacement. Planned-exec handoff state owns the accepted continuity.
 
@@ -86,14 +96,13 @@ must converge through the same daemon-owned operation record.
 - A process that escaped the owned POSIX session with `setsid()` remains outside
   the Stop ownership claim; recoverability must not widen process scope.
 
-## Downstream split
+## External consumer boundary
 
-AgentMux entropy reduction is a separate downstream Feature in the AgentMux
-repository. It may freeze and consume the exact ctxmux commit only after this
-Feature qualifies. It owns adapter thinning, AgentSession association, and the
-Desktop Workbench close transaction; ctxmux does not absorb those semantics.
-The downstream proposal must retain AgentMux activation and wait/revision code
-until their separate ctxmux capabilities actually ship.
+This Feature stops after ctxmux publishes the qualified exact commit and
+`native.recoverable_stop: 1` capability. External consumers independently
+decide whether, when, and how to integrate it. This Feature does not create,
+plan, modify, or schedule AgentMux work. AgentSession association, Provider
+semantics, and the Desktop Workbench close transaction remain outside ctxmux.
 
 ## Evidence refs
 

@@ -31,10 +31,10 @@
     {
       "feat_id": "f-224czneed",
       "title": "Integrate tmux sessions",
-      "status": "ready",
-      "workspace_mode": "current_tree",
-      "branch": "",
-      "worktree_name": "",
+      "status": "in_progress",
+      "workspace_mode": "worktree",
+      "branch": "featuref-224czneed",
+      "worktree_name": "wt-f-224czneed",
       "runtime_role": "standalone",
       "blocked_reason_class": "none",
       "runtime_relations": []
@@ -141,10 +141,10 @@
     {
       "feat_id": "f-22ecztapc",
       "title": "Complete the local Runtime embedding contract",
-      "status": "ready",
-      "workspace_mode": "current_tree",
-      "branch": "",
-      "worktree_name": "",
+      "status": "in_progress",
+      "workspace_mode": "worktree",
+      "branch": "featuref-22ecztapc",
+      "worktree_name": "wt-f-22ecztapc",
       "runtime_role": "standalone",
       "blocked_reason_class": "none",
       "runtime_relations": []

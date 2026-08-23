@@ -4,13 +4,13 @@
   "title": "Integrate tmux sessions",
   "slug": "tmux-adapter",
   "goal": "Expose existing tmux-owned sessions through ctxmux public Run surfaces while preserving tmux ownership and public protocol boundaries.",
-  "status": "ready",
-  "workspace_mode": "current_tree",
+  "status": "in_progress",
+  "workspace_mode": "worktree",
   "base_ref": "main",
-  "branch": "",
-  "worktree_name": "",
-  "worktree_path": "",
-  "current_task_id": null,
+  "branch": "featuref-224czneed",
+  "worktree_name": "wt-f-224czneed",
+  "worktree_path": ".worktrees/wt-f-224czneed",
+  "current_task_id": "T-002",
   "runtime_role": "standalone",
   "blocked_reason_class": "none",
   "runtime_relations": [],
@@ -83,6 +83,14 @@
     {
       "action": "task_plan_set",
       "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "current_tree -> worktree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
     }
   ],
   "goal_contract": {

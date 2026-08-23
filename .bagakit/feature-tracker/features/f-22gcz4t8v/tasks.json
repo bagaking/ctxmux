@@ -2,8 +2,8 @@
   "version": 2,
   "feat_id": "f-22gcz4t8v",
   "plan_status": "reviewed",
-  "plan_revision": 2,
-  "supersedes_revision": 1,
+  "plan_revision": 3,
+  "supersedes_revision": 2,
   "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
   "source_refs": [
     "AGENTS.md",
@@ -44,6 +44,30 @@
     {
       "revision": 2,
       "supersedes_revision": 1,
+      "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "docs/testing-strategy.md",
+        "docs/architecture/choices/014-recoverable-input-operations.md",
+        "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
+        ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
+      ],
+      "task_ids": [
+        "T-000",
+        "T-001",
+        "T-002",
+        "T-003"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
       "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
       "source_refs": [
         "AGENTS.md",
@@ -144,8 +168,14 @@
       "supersedes": [],
       "introduced_in_revision": 1,
       "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 1,
+          "status": "fail"
+        }
+      ],
       "notes": []
     },
     {
@@ -201,14 +231,14 @@
     {
       "id": "T-003",
       "title": "Qualify the recoverable Stop contract",
-      "objective": "Independently review and qualify the finite recoverable Stop claim on one clean committed candidate before any downstream AgentMux deletion depends on it.",
-      "outcome": "The exact ctxmux commit is a trustworthy upstream boundary for native Stop recovery, with no open P0/P1 defect and explicit residual limits.",
+      "objective": "Independently review and qualify the finite recoverable Stop claim on one clean committed ctxmux candidate before advertising it as a public capability.",
+      "outcome": "The exact ctxmux commit is a trustworthy public boundary for native Stop recovery, with no open P0/P1 defect and explicit residual limits.",
       "acceptance": [
         "One independent read-only review covers operation identity, join/replay algebra, conflict-before-mutation, Stop owner entry count, response-loss and client-crash behavior, attachment convergence, bounded retention, collection, planned exec, daemon replacement, protocol/SDK parity, and process ownership limits.",
-        "Every P0/P1 within the accepted claim receives a deterministic regression and re-review. Recoverable Resize/Interrupt, Remote Runtime, crash/host-reboot adoption, Agent semantics, Workbench close transaction, package publication, and downstream deletion remain outside this Feature.",
+        "Every P0/P1 within the accepted claim receives a deterministic regression and re-review. Recoverable Resize/Interrupt, Remote Runtime, crash/host-reboot adoption, AgentSession and Provider semantics, Workbench close transaction, package publication, and external consumer adoption remain outside this Feature.",
         "A clean packed consumer proves Runtime capability discovery, caller-retained Stop preparation, response loss, a fresh client recovering the original graceful/forced receipt, and no second physical Stop effect without repository-private imports.",
         "The complete repository, CI evidence-map, generated-type, documentation-consistency, reliability, and package-consumer gates pass on one exact committed source candidate; verification records that commit and tree.",
-        "The Feature closes without compatibility shims, migration code, a generic operation framework, a second Stop owner, or unfinished scaffolding. The downstream AgentMux Feature receives only the exact commit/capability receipt and keeps its own UI/Agent semantics."
+        "The Feature closes when that exact qualified ctxmux commit advertises `native.recoverable_stop: 1`, without compatibility shims, migration code, a generic operation framework, a second Stop owner, unfinished scaffolding, or any external consumer plan or code change."
       ],
       "verification": [
         {
@@ -224,7 +254,7 @@
         {
           "kind": "artifact",
           "ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/verification.md",
-          "proves": "The independent review, exact candidate, finding dispositions, downstream handoff, and residual limits are auditable."
+          "proves": "The independent review, exact candidate, capability declaration, finding dispositions, and residual limits are auditable."
         }
       ],
       "source_refs": [

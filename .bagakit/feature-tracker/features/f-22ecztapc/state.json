@@ -4,13 +4,13 @@
   "title": "Complete the local Runtime embedding contract",
   "slug": "local-runtime-embedding-contract",
   "goal": "Complete and independently qualify the Provider-neutral local Runtime surface that embedding products need: explicit Integration and Level B ownership, Runtime identity and capabilities, revisioned Run observation, bounded wait helpers, and race-safe TypeScript activation, without moving Provider sessions or orchestration into ctxmux.",
-  "status": "ready",
-  "workspace_mode": "current_tree",
+  "status": "in_progress",
+  "workspace_mode": "worktree",
   "base_ref": "main",
-  "branch": "",
-  "worktree_name": "",
-  "worktree_path": "",
-  "current_task_id": null,
+  "branch": "featuref-22ecztapc",
+  "worktree_name": "wt-f-22ecztapc",
+  "worktree_path": ".worktrees/wt-f-22ecztapc",
+  "current_task_id": "T-003",
   "runtime_role": "standalone",
   "blocked_reason_class": "none",
   "runtime_relations": [],
@@ -107,6 +107,14 @@
     {
       "action": "task_finished",
       "detail": "T-002 => done"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "current_tree -> worktree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
     }
   ],
   "goal_contract": {
