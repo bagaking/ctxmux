@@ -9,7 +9,7 @@ import type { RunSpec } from "./RunSpec.js";
 import type { TerminalSize } from "./TerminalSize.js";
 
 /**
- * Command sent on a short-lived request connection.
+ * Initial request sent after one successful connection handshake.
  */
 export type Request =
   | { type: "start"; operation_key: CreateOperationKey; spec: RunSpec }
@@ -28,6 +28,14 @@ export type Request =
   | { type: "resize"; id: RunId; size: TerminalSize }
   | { type: "signal"; id: RunId; signal: RunSignal }
   | { type: "stop"; operation: RecoverableStop }
+  | {
+      type: "attach_recoverable_stop";
+      operation: RecoverableStop;
+      /**
+       * Cumulative number of output bytes already observed by the client.
+       */
+      after_byte: number;
+    }
   | {
       type: "attach";
       id: RunId;

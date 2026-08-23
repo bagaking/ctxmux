@@ -1068,9 +1068,9 @@ pub(crate) struct RecoverableStopFlight {
 }
 
 impl RecoverableStopFlight {
-    pub(crate) async fn resolve(self) -> (RunInfo, ControlResult) {
+    pub(crate) async fn resolve(self) -> (Arc<Run>, ControlResult) {
         let result = self.cell.wait().await;
-        (self.run.info(), result)
+        (self.run, result)
     }
 }
 
@@ -1866,13 +1866,6 @@ impl RunRegistry {
                 _run: run,
                 pending: Some(pending),
             },
-        })
-    }
-
-    pub(crate) fn has_recoverable_stop(&self, id: RunId) -> bool {
-        let state = read_lock(&self.state);
-        state.runs.get(&id).is_some_and(|entry| {
-            entry.residency == RegistryResidency::Retained && entry.stop_operation.is_some()
         })
     }
 

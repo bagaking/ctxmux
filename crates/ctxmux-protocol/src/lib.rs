@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -913,7 +913,7 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 11.
+    /// Raw PTY bytes. JSON represents these as an integer array in generation 12.
     pub data: Vec<u8>,
 }
 
@@ -1111,7 +1111,7 @@ pub struct ClientHello {
     pub protocol: u16,
 }
 
-/// Command sent on a short-lived request connection.
+/// Initial request sent after one successful connection handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
@@ -1147,6 +1147,13 @@ pub enum Request {
     Signal { id: RunId, signal: RunSignal },
     /// Apply or recover one complete-session native Stop operation.
     Stop { operation: RecoverableStop },
+    /// Apply or recover one native Stop operation and attach to its exact Run.
+    AttachRecoverableStop {
+        operation: RecoverableStop,
+        /// Cumulative number of output bytes already observed by the client.
+        #[serde(default)]
+        after_byte: u64,
+    },
     /// Attach to retained output and future lifecycle events.
     Attach {
         id: RunId,
@@ -1162,7 +1169,7 @@ pub enum Request {
 pub enum ClientFrame {
     /// Initial version handshake.
     Hello { hello: ClientHello },
-    /// One short-lived request.
+    /// One initial request.
     Request { request: Request },
     /// Write bytes through a live attachment.
     Input {
@@ -1232,7 +1239,7 @@ pub enum ControlOutcome {
     Rejected { failure: ControlFailure },
 }
 
-/// Response to a short-lived request.
+/// Result of one request or the control phase of one composite attachment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
@@ -1251,12 +1258,12 @@ pub enum Response {
     Runs { runs: Vec<RunInfo> },
     /// Current metadata for one Run.
     Status { run: RunInfo },
-    /// A short-lived control request reached its documented owner boundary.
+    /// A control request reached its documented owner boundary.
     ControlAccepted {
         run: RunInfo,
         receipt: ControlReceipt,
     },
-    /// A short-lived control request failed with an explicit disposition.
+    /// A control request failed with an explicit disposition.
     ControlRejected { failure: ControlFailure },
     /// One recoverable native Input reached the PTY write boundary.
     InputApplied {
@@ -1382,7 +1389,7 @@ impl ProtocolError {
 pub enum ServerFrame {
     /// Successful protocol handshake.
     Hello { runtime: RuntimeIdentity },
-    /// Result of one short-lived request.
+    /// Result of one request or composite attachment control phase.
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
     Attached { snapshot: AttachedHeader },
@@ -1630,7 +1637,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_11_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_12_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1648,7 +1655,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 11,
+                    "protocolGeneration": 12,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -1721,17 +1728,18 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_stop_request_has_exact_generation_11_wire_shape() {
+    fn recoverable_stop_requests_have_exact_generation_12_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
+        let operation = RecoverableStop {
+            daemon_instance,
+            operation_key: StopOperationKey::new("stop-8").unwrap(),
+            id: run_id,
+        };
         assert_eq!(
             serde_json::to_value(Request::Stop {
-                operation: RecoverableStop {
-                    daemon_instance,
-                    operation_key: StopOperationKey::new("stop-8").unwrap(),
-                    id: run_id,
-                },
+                operation: operation.clone(),
             })
             .unwrap(),
             serde_json::json!({
@@ -1741,6 +1749,22 @@ mod tests {
                     "operation_key": "stop-8",
                     "id": run_id.to_string(),
                 },
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(Request::AttachRecoverableStop {
+                operation,
+                after_byte: 17,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "attach_recoverable_stop",
+                "operation": {
+                    "daemon_instance": daemon_instance.to_string(),
+                    "operation_key": "stop-8",
+                    "id": run_id.to_string(),
+                },
+                "after_byte": 17,
             })
         );
     }
