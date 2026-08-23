@@ -8,7 +8,8 @@ use std::{
 
 use ctxmux_protocol::{
     AttachedSnapshot, ClientFrame, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-    MAX_INPUT_OPERATION_KEY_BYTES, PROTOCOL_VERSION, RunSignal, ServerFrame, StopDisposition,
+    MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_BUILD_ID_BYTES, PROTOCOL_VERSION,
+    RUNTIME_CAPABILITY_MANIFEST_VERSION, RunSignal, ServerFrame, StopDisposition,
 };
 use ts_rs::{Config, TS};
 
@@ -43,12 +44,16 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
                 "export const PROTOCOL_VERSION = {} as const;\n",
                 "export const MAX_FRAME_BYTES = {} as const;\n",
                 "export const MAX_CREATE_OPERATION_KEY_BYTES = {} as const;\n",
-                "export const MAX_INPUT_OPERATION_KEY_BYTES = {} as const;\n"
+                "export const MAX_INPUT_OPERATION_KEY_BYTES = {} as const;\n",
+                "export const MAX_RUNTIME_BUILD_ID_BYTES = {} as const;\n",
+                "export const RUNTIME_CAPABILITY_MANIFEST_VERSION = {} as const;\n"
             ),
             PROTOCOL_VERSION,
             MAX_FRAME_BYTES,
             MAX_CREATE_OPERATION_KEY_BYTES,
             MAX_INPUT_OPERATION_KEY_BYTES,
+            MAX_RUNTIME_BUILD_ID_BYTES,
+            RUNTIME_CAPABILITY_MANIFEST_VERSION,
         ),
     )?;
     Ok(())

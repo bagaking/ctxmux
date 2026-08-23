@@ -19,6 +19,8 @@ import {
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
+  PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   createOperationKey,
   defineRun,
   inputOperationKey,
@@ -41,6 +43,35 @@ test(
   { timeout: 15_000 },
   async (context) => {
     const { client, socketPath } = await startTestDaemon(context);
+    const runtime = await client.runtimeInfo();
+    const cliRuntime = JSON.parse(
+      (await execFile(cliBinary, ["--socket", socketPath, "runtime"])).stdout,
+    ) as unknown;
+    assert.deepEqual(cliRuntime, runtime);
+    assert.deepEqual(Object.keys(runtime).sort(), [
+      "build_id",
+      "capabilities",
+      "daemon_instance_id",
+      "protocol_generation",
+      "runtime_id",
+    ]);
+    assert.equal(runtime.protocol_generation, PROTOCOL_VERSION);
+    assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
+    assert.match(runtime.build_id, /^ctxmuxd\/[^/]+$/u);
+    assert.deepEqual(runtime.capabilities, {
+      version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
+      native: {
+        start: true,
+        recoverable_input: true,
+        fork_level_a: true,
+        execute_materialized_level_b: true,
+      },
+      tmux: { discover: true, import: true },
+      services: {
+        persistent_state_active: false,
+        planned_exec_upgrade_continuity: false,
+      },
+    });
 
     const shell = concatShell(
       "printf 'READY\\n';",
@@ -62,6 +93,8 @@ test(
     ]);
     const runId = startedByCli.stdout.trim() as RunId;
     assert.notEqual(runId, "");
+    assert.notEqual(runId, runtime.runtime_id);
+    assert.notEqual(runId, runtime.daemon_instance_id);
 
     const firstClient = new CtxmuxClient({ socketPath });
     const initialStatus = await firstClient.status(runId);

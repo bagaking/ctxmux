@@ -2,16 +2,16 @@
 import type { AttachedHeader } from "./AttachedHeader.js";
 import type { AttachmentCommandId } from "./AttachmentCommandId.js";
 import type { ControlOutcome } from "./ControlOutcome.js";
-import type { DaemonInstanceId } from "./DaemonInstanceId.js";
 import type { ProtocolError } from "./ProtocolError.js";
 import type { Response } from "./Response.js";
 import type { RunEvent } from "./RunEvent.js";
+import type { RuntimeDescription } from "./RuntimeDescription.js";
 
 /**
  * Frames sent by the daemon.
  */
 export type ServerFrame =
-  | { type: "hello"; protocol: number; daemon_instance: DaemonInstanceId }
+  | { type: "hello"; runtime: RuntimeDescription }
   | { type: "response"; response: Response }
   | { type: "attached"; snapshot: AttachedHeader }
   | { type: "event"; event: RunEvent }

@@ -29,6 +29,7 @@ fn usage() -> &'static str {
 usage:
   ctxmux --version
   ctxmux [--socket <path>] ping
+  ctxmux [--socket <path>] runtime
   ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux [--socket <path>] tmux-list <tmux-socket>
   ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
@@ -74,6 +75,7 @@ async fn run() -> Result<(), String> {
     if !matches!(
         command.as_str(),
         "ping"
+            | "runtime"
             | "start"
             | "tmux-list"
             | "tmux-import"
@@ -95,6 +97,18 @@ async fn run() -> Result<(), String> {
             ensure_empty(&args)?;
             client.ping().await.map_err(|error| error.to_string())?;
             println!("ok");
+        }
+        "runtime" => {
+            ensure_empty(&args)?;
+            let runtime = client
+                .runtime_info()
+                .await
+                .map_err(|error| error.to_string())?;
+            println!(
+                "{}",
+                serde_json::to_string(&runtime)
+                    .map_err(|error| format!("failed to encode Runtime description: {error}"))?
+            );
         }
         "start" => start(&client, args).await?,
         "tmux-list" => tmux_list(&client, args).await?,

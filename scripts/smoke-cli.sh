@@ -79,11 +79,44 @@ do
 done
 [[ $ctxmux_cli_ready == true ]] || fail "daemon did not become ready"
 
+ctxmux_cli_runtime=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" runtime)
+ctxmux_cli_runtime_again=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" runtime)
+[[ "$ctxmux_cli_runtime_again" == "$ctxmux_cli_runtime" ]] ||
+  fail "Runtime description changed within one daemon lifetime"
+
 ctxmux_cli_run=$(
   "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c \
     "read line; printf 'OUT:%s\\n' \"\$line\""
 )
 [[ "$ctxmux_cli_run" =~ ^[0-9a-f-]{36}$ ]] || fail "start returned an invalid Run id: $ctxmux_cli_run"
+CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run" \
+  node --input-type=module -e '
+    import assert from "node:assert/strict";
+    const runtime = JSON.parse(process.env.CTXMUX_SMOKE_RUNTIME);
+    const runId = process.env.CTXMUX_SMOKE_RUN_ID;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+    assert.match(runtime.runtime_id, uuid);
+    assert.match(runtime.daemon_instance_id, uuid);
+    assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
+    assert.notEqual(runtime.runtime_id, runId);
+    assert.notEqual(runtime.daemon_instance_id, runId);
+    assert.match(runtime.build_id, /^ctxmuxd\/[^/]+$/u);
+    assert.equal(runtime.protocol_generation, 10);
+    assert.deepEqual(runtime.capabilities, {
+      version: 1,
+      native: {
+        start: true,
+        recoverable_input: true,
+        fork_level_a: true,
+        execute_materialized_level_b: true,
+      },
+      tmux: { discover: true, import: true },
+      services: {
+        persistent_state_active: false,
+        planned_exec_upgrade_continuity: false,
+      },
+    });
+  '
 
 ctxmux_cli_status=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" status "$ctxmux_cli_run")
 expect_contains "$ctxmux_cli_status" $'\trunning\t'
@@ -150,8 +183,8 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 9"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 9"
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 10"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 10"
 
 ctxmux_cli_default_list=$(env -u CTXMUX_SOCKET XDG_RUNTIME_DIR="$ctxmux_cli_tmp" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_default_list" "$ctxmux_cli_run"

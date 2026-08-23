@@ -62,8 +62,13 @@ creation keys, an exact BINARY unique-key index, and typed JSON, a required
 native `RunSpec` accepted by the same semantic validator as live
 start and fork, allowed lifecycle values, non-self lineage, byte totals,
 strictly contiguous retained byte ranges, matching durable first/latest
-cursors, and quota accounting. Schema-3 validation accepts its 4,096-record
-4,096-record format envelope, then startup normalization uses bounded,
+cursors, and quota accounting. Schema 4 additionally stores one valid
+`runtime_meta.runtime_id` UUID beside the serving epoch. It is created once for
+the state-directory lineage and survives cold replacement while the serving
+epoch changes; a planned exec reloads both preserved identities from this
+existing owner. It is not derived from the state path, socket, PID, host, or
+serving epoch. Schema-4 validation accepts its 4,096-record format envelope,
+then startup normalization uses bounded,
 spill-disabled transactions to reconcile prior running rows and evict the
 canonical terminal prefix to the operational 128-record ceiling. Each batch
 starts from a zero WAL, proves its cache-resident page charge before COMMIT,
@@ -72,8 +77,8 @@ bootstrap epoch immediately so an interrupted first open remains structurally
 reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
-application and operational invariants are revalidated. Protocol generation 9
-and persistence schema 3 are pre-stable, so the current schema has no
+application and operational invariants are revalidated. Protocol generation 10
+and persistence schema 4 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed
 startup failure. Ctxmux performs no repair, reset, migration, or partial
@@ -114,8 +119,8 @@ child behind a false success.
 
 Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
 replay tail remains. Persistent replay has a 256 MiB global logical byte budget
-and serialized metadata has a separate 64 MiB logical byte budget. Schema 2 can
-validate an older store containing up to 4,096 records, but a serving daemon
+and serialized metadata has a separate 64 MiB logical byte budget. Schema 4 can
+validate a store containing up to 4,096 records, but a serving daemon
 normalizes it to the same 128 retained or projected records used by the
 Registry before socket publication. The oldest chunks are pruned across Runs
 while keeping each retained replay window contiguous and its truncation cursors
@@ -234,6 +239,9 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
   PIDs, listener inode, live PTY control, ordered output, and the complete
   recoverable-Input cursor/ledger across a real exec, while existing
   attachments reconnect.
+- Active: public Hello observations prove that a cold replacement on the same
+  state directory keeps the Runtime ID and changes the daemon instance; both
+  endpoints report the persistent capability manifest.
 - Active / `PERSIST-01`: a stored running row naming an unrelated live PID is
   reconciled to interrupted; the unrelated process and old orphan are neither
   opened nor signalled.
@@ -267,7 +275,7 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 
 ## Repository evidence
 
-- `crates/ctxmux-protocol/src/lib.rs`: `RunId`
+- `crates/ctxmux-protocol/src/lib.rs`: `RunId` and `RuntimeId`
 - `crates/ctxmux-daemon/src/persistence.rs`: state-directory owner, single
   SQLite actor, recovery validation, reconciliation, and retention
 - `crates/ctxmux-daemon/tests/persistence_recovery.rs`: real restart,

@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
-    RunBackend, RunCapabilities, RunId, RunInfo, RunLineage, RunSpec, RunState,
+    RunBackend, RunCapabilities, RunId, RunInfo, RunLineage, RunSpec, RunState, RuntimeId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, params_from_iter};
 use thiserror::Error;
@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::{creation::MAX_RETAINED_RUNS, run_spec::validate_run_spec};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
 const PAGE_SIZE_BYTES: u64 = 4 * 1024;
@@ -143,6 +143,7 @@ struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
     failure: Arc<Mutex<Option<String>>>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
+    runtime_id: RuntimeId,
     epoch: String,
     /// Raw fd of the advisory state lock held by the persistence actor thread.
     /// Surfaced so an exec-in-place upgrade can record it in the handoff manifest
@@ -403,6 +404,10 @@ impl PersistentRun {
 }
 
 impl Persistence {
+    pub(crate) fn runtime_id(&self) -> RuntimeId {
+        self.inner.runtime_id
+    }
+
     pub(crate) fn daemon_instance(&self) -> DaemonInstanceId {
         self.inner
             .epoch
@@ -504,7 +509,7 @@ impl Persistence {
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
-        let (epoch, state_lock_fd, recovered) = match init_rx.recv() {
+        let (runtime_id, epoch, state_lock_fd, recovered) = match init_rx.recv() {
             Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -520,6 +525,7 @@ impl Persistence {
                 sender: command_tx,
                 failure,
                 join: Mutex::new(Some(join)),
+                runtime_id,
                 epoch,
                 state_lock_fd,
                 #[cfg(test)]
@@ -907,7 +913,7 @@ enum StageCompletion {
 /// The persistence actor's startup handshake payload: the serving epoch, the
 /// raw fd its state lock is held on (surfaced for exec-in-place handoff), and
 /// the reconciled recovered Runs.
-type ActorInit = Result<(String, RawFd, Vec<RecoveredRun>), PersistenceError>;
+type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
 
 fn actor_main(
     state_dir: &Path,
@@ -933,7 +939,12 @@ fn actor_main(
             return;
         }
     };
-    let init_payload = Ok((store.epoch.clone(), store.state_lock_raw_fd(), recovered));
+    let init_payload = Ok((
+        store.runtime_id,
+        store.epoch.clone(),
+        store.state_lock_raw_fd(),
+        recovered,
+    ));
     if init.send(init_payload).is_err() {
         return;
     }
@@ -1219,6 +1230,7 @@ struct StateStore {
     wal_path: PathBuf,
     shm_path: PathBuf,
     connection: Connection,
+    runtime_id: RuntimeId,
     epoch: String,
     /// Runs handed off live across an exec-in-place upgrade: excluded from
     /// reconciliation so they stay `running`, and their count is the relaxed
@@ -1343,11 +1355,11 @@ impl StateStore {
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;")
             .map_err(PersistenceError::database)?;
-        if database_existed {
-            validate_existing_schema(&connection)?;
+        let runtime_id = if database_existed {
+            validate_existing_schema(&connection)?
         } else {
-            create_schema(&connection, &epoch)?;
-        }
+            create_schema(&connection, &epoch)?
+        };
         connection
             .pragma_update(
                 None,
@@ -1377,6 +1389,7 @@ impl StateStore {
             wal_path,
             shm_path,
             connection,
+            runtime_id,
             epoch,
             live_set,
             admission_limits,
@@ -1806,17 +1819,18 @@ impl StateStore {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(PersistenceError::database)?;
-        let current_epoch: String = self
+        let (runtime_id, current_epoch): (String, String) = self
             .connection
             .query_row(
-                "SELECT current_epoch FROM runtime_meta WHERE singleton = 1",
+                "SELECT runtime_id, current_epoch FROM runtime_meta WHERE singleton = 1",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(PersistenceError::database)?;
         if nonnegative_u64(records, "record count")? > self.admission_limits.run_records
             || nonnegative_u64(metadata, "metadata total")? > self.admission_limits.metadata_bytes
             || running != live_count(&self.live_set)
+            || runtime_id != self.runtime_id.to_string()
             || current_epoch != self.epoch
         {
             return Err(PersistenceError::Corrupt(
@@ -2892,7 +2906,11 @@ fn validate_state_file(path: &Path) -> Result<(), PersistenceError> {
     Ok(())
 }
 
-fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), PersistenceError> {
+fn create_schema(
+    connection: &Connection,
+    initial_epoch: &str,
+) -> Result<RuntimeId, PersistenceError> {
+    let runtime_id = RuntimeId::new();
     connection
         .execute_batch(&format!(
             "PRAGMA page_size={PAGE_SIZE_BYTES};
@@ -2901,6 +2919,7 @@ fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), Per
              CREATE TABLE runtime_meta (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 schema_version INTEGER NOT NULL,
+                runtime_id TEXT NOT NULL,
                 current_epoch TEXT NOT NULL
              );
              CREATE TABLE runs (
@@ -2935,15 +2954,15 @@ fn create_schema(connection: &Connection, initial_epoch: &str) -> Result<(), Per
         .map_err(PersistenceError::database)?;
     connection
         .execute(
-            "INSERT INTO runtime_meta(singleton, schema_version, current_epoch)
-             VALUES (1, ?1, ?2)",
-            params![SCHEMA_VERSION, initial_epoch],
+            "INSERT INTO runtime_meta(singleton, schema_version, runtime_id, current_epoch)
+             VALUES (1, ?1, ?2, ?3)",
+            params![SCHEMA_VERSION, runtime_id.to_string(), initial_epoch],
         )
         .map_err(PersistenceError::database)?;
-    Ok(())
+    Ok(runtime_id)
 }
 
-fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceError> {
+fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, PersistenceError> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(PersistenceError::database)?;
@@ -2953,11 +2972,11 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
             expected: SCHEMA_VERSION,
         });
     }
-    let (meta_rows, meta_version, current_epoch): (i64, i64, String) = connection
+    let (meta_rows, meta_version, runtime_id, current_epoch): (i64, i64, String, String) = connection
         .query_row(
-            "SELECT count(*), min(schema_version), min(current_epoch) FROM runtime_meta",
+            "SELECT count(*), min(schema_version), min(runtime_id), min(current_epoch) FROM runtime_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(PersistenceError::database)?;
     if meta_rows != 1 || meta_version != SCHEMA_VERSION {
@@ -2968,6 +2987,9 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
     }
     Uuid::parse_str(&current_epoch).map_err(|_| {
         PersistenceError::Corrupt("runtime metadata has an invalid daemon epoch".to_owned())
+    })?;
+    let runtime_id = runtime_id.parse().map_err(|_| {
+        PersistenceError::Corrupt("runtime metadata has an invalid Runtime identity".to_owned())
     })?;
     let mut statement = connection
         .prepare(
@@ -3000,7 +3022,7 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
     validate_table_columns(
         connection,
         "runtime_meta",
-        &["singleton", "schema_version", "current_epoch"],
+        &["singleton", "schema_version", "runtime_id", "current_epoch"],
     )?;
     validate_table_columns(
         connection,
@@ -3030,7 +3052,8 @@ fn validate_existing_schema(connection: &Connection) -> Result<(), PersistenceEr
         &["ordinal", "run_id", "start_byte", "end_byte", "data"],
     )?;
     validate_creation_key_index(connection)?;
-    validate_database_format_pragmas(connection)
+    validate_database_format_pragmas(connection)?;
+    Ok(runtime_id)
 }
 
 fn validate_database_format_pragmas(connection: &Connection) -> Result<(), PersistenceError> {
@@ -4362,7 +4385,7 @@ mod tests {
     #[test]
     fn creation_key_index_is_unique_binary_and_exactly_validated() {
         let connection = test_connection();
-        validate_existing_schema(&connection).expect("accept canonical schema 2 index");
+        validate_existing_schema(&connection).expect("accept canonical schema 4 index");
 
         connection
             .execute_batch(
@@ -5081,6 +5104,24 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read published handoff epoch")
+    }
+
+    #[test]
+    fn runtime_identity_survives_cold_replacement_but_daemon_instance_changes() {
+        let fixture = TempDir::new().expect("create Runtime identity fixture");
+        let state_dir = fixture.path().join("state");
+        let (first, recovered) = Persistence::open(&state_dir).expect("open first Runtime image");
+        assert!(recovered.is_empty());
+        let runtime_id = first.runtime_id();
+        let first_instance = first.daemon_instance();
+        first.assert_exclusive_owner();
+        drop(first);
+
+        let (replacement, recovered) =
+            Persistence::open(&state_dir).expect("open cold replacement image");
+        assert!(recovered.is_empty());
+        assert_eq!(replacement.runtime_id(), runtime_id);
+        assert_ne!(replacement.daemon_instance(), first_instance);
     }
 
     #[test]
