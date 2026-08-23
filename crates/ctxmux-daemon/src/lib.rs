@@ -764,7 +764,9 @@ struct RunManager {
 /// terminal result instead of leaving every retry blocked on an empty cell.
 struct RecoverableStopSettlementOwner {
     manager: Arc<RunManager>,
+    run_id: RunId,
     settlement: Option<RecoverableStopSettlement>,
+    upgrade_permit: Option<UpgradeRequestPermit>,
 }
 
 impl RecoverableStopSettlementOwner {
@@ -776,6 +778,9 @@ impl RecoverableStopSettlementOwner {
             .wait()
             .await;
         self.finish(result);
+        if self.upgrade_permit.is_some() {
+            self.wait_for_handoff_ready().await;
+        }
     }
 
     fn finish(&mut self, result: ControlResult) {
@@ -786,6 +791,33 @@ impl RecoverableStopSettlementOwner {
         self.manager
             .registry
             .settle_recoverable_stop(settlement, result);
+    }
+
+    async fn wait_for_handoff_ready(&self) {
+        let deadline = Instant::now() + STOP_ACK_TIMEOUT;
+        loop {
+            match self.manager.native_runs.handoff_ready(self.run_id) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!(
+                        "ctxmuxd recoverable Stop handoff readiness probe failed for Run {}: {error}",
+                        self.run_id
+                    );
+                    return;
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                eprintln!(
+                    "ctxmuxd timed out waiting for Run {} Stop cleanup to reach a handoff boundary",
+                    self.run_id
+                );
+                return;
+            }
+            tokio::time::sleep(CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(now)))
+                .await;
+        }
     }
 }
 
@@ -2036,11 +2068,25 @@ impl RunManager {
         Ok(())
     }
 
+    fn has_recoverable_stop(&self, id: RunId) -> bool {
+        self.registry.has_recoverable_stop(id)
+    }
+
     fn begin_recoverable_stop(
         self: &Arc<Self>,
         operation: RecoverableStop,
     ) -> Result<RecoverableStopFlight, ControlFailure> {
+        let mut upgrade_permit = None;
+        self.begin_recoverable_stop_with_owner_permit(operation, &mut upgrade_permit)
+    }
+
+    fn begin_recoverable_stop_with_owner_permit(
+        self: &Arc<Self>,
+        operation: RecoverableStop,
+        upgrade_permit: &mut Option<UpgradeRequestPermit>,
+    ) -> Result<RecoverableStopFlight, ControlFailure> {
         self.validate_recoverable_stop(&operation, None)?;
+        let run_id = operation.id;
         match self
             .registry
             .begin_recoverable_stop(operation.id, operation.operation_key)?
@@ -2049,7 +2095,9 @@ impl RunManager {
             RecoverableStopAdmission::Owner { flight, settlement } => {
                 let owner = RecoverableStopSettlementOwner {
                     manager: Arc::clone(self),
+                    run_id,
                     settlement: Some(settlement),
+                    upgrade_permit: upgrade_permit.take(),
                 };
                 tokio::spawn(owner.run());
                 Ok(flight)
@@ -6247,7 +6295,9 @@ mod tests {
 
         drop(super::RecoverableStopSettlementOwner {
             manager: Arc::clone(&server.manager),
+            run_id: run.id,
             settlement: Some(settlement),
+            upgrade_permit: None,
         });
 
         let (_, result) = flight.resolve().await;
