@@ -15,15 +15,21 @@
   "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 0,
-    "no_progress_rounds": 0,
-    "round_count": 0
+    "gate_fail_streak": 1,
+    "no_progress_rounds": 1,
+    "round_count": 1
   },
   "gate": {
-    "last_result": null,
-    "last_task_id": null,
-    "last_check_commands": [],
-    "last_log_path": null
+    "last_result": "fail",
+    "last_task_id": "T-000",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 101,
+        "status": "fail"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/gate-T-000-r1-0001.log"
   },
   "history": [
     {
@@ -57,6 +63,10 @@
     {
       "action": "task_started",
       "detail": "T-000"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-000 => fail"
     }
   ],
   "goal_contract": {
