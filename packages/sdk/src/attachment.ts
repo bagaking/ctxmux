@@ -22,11 +22,7 @@ import type { RunId } from "./generated/RunId.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
 import { CtxmuxInvalidFrameError, validateServerFrame } from "./validation.js";
-import {
-  encodeJsonLine,
-  JsonLinesConnection,
-  WireClosedError,
-} from "./wire.js";
+import { encodeJsonLine, WireClosedError } from "./wire.js";
 
 const MAX_ATTACHMENT_COMMAND_ID = 0xffff_ffff;
 const MAX_PENDING_COMMANDS = 64;
@@ -34,6 +30,13 @@ const MAX_PENDING_INPUT_COMMANDS = 32;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
 const MAX_QUEUED_EVENTS = 256;
 const MAX_QUEUED_EVENT_BYTES = 1024 * 1024;
+
+interface AttachmentWire {
+  send(value: unknown): Promise<void>;
+  sendEncoded(payload: string): Promise<void>;
+  receive(): Promise<unknown>;
+  close(): void;
+}
 
 const runEventSources = new WeakMap<object, RunId>();
 
@@ -55,7 +58,7 @@ export function runEventSource(event: RunEvent): RunId | undefined {
 
 /** Live TypeScript attachment to one daemon-owned Run. */
 export class Attachment {
-  readonly #wire: JsonLinesConnection;
+  readonly #wire: AttachmentWire;
   readonly #pending = new Map<AttachmentCommandId, PendingCommand>();
   readonly #events: QueuedEvent[] = [];
   #state: AttachmentState = "open";
@@ -75,7 +78,7 @@ export class Attachment {
   #detachPromise: Promise<void> | undefined;
   public readonly snapshot: AttachedSnapshot;
 
-  public constructor(wire: JsonLinesConnection, snapshot: AttachedSnapshot) {
+  public constructor(wire: AttachmentWire, snapshot: AttachedSnapshot) {
     this.#wire = wire;
     this.snapshot = snapshot;
     for (const chunk of snapshot.replay.chunks) {

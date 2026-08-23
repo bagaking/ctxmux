@@ -609,7 +609,7 @@
       ],
       "failure_mechanism": "Integration fields interpolated into shell text execute metacharacters or change argv boundaries.",
       "invariant": "Structured executable and argv values are exact; shell use is explicit and bounded.",
-      "preconditions": "The Codex Integration launch-plan builder starts a recording child through the public SDK.",
+      "preconditions": "A synthetic host-owned Provider supplies a complete generic RunSpec through the public Integration binding.",
       "action": "Build plans from metacharacter, whitespace, quote, and newline corpus values and launch a recording child.",
       "oracle": "The child observes the exact declared argv with no implicit shell evaluation.",
       "platform": ["node"],
@@ -618,7 +618,7 @@
       "test_refs": [
         {
           "path": "packages/sdk/test/client-parity.test.ts",
-          "anchor": "Codex Integration resumes declared context through a public Level B fork"
+          "anchor": "a host-owned Provider materializes public Level B without a fallback"
         }
       ]
     },
@@ -630,22 +630,14 @@
         "https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle"
       ],
       "failure_mechanism": "Executable presence is treated as proof of compatible semantic capability.",
-      "invariant": "Capabilities are declared only after bounded, compatible version and help probes succeed.",
-      "preconditions": "The Codex Integration provides bounded version and capability probes.",
-      "action": "Probe missing, incompatible, malformed, and silent tool implementations.",
-      "oracle": "Only a valid compatible probe declares capabilities; every missing, malformed, incompatible, hanging, or failed probe returns unavailable and starts no Run.",
+      "invariant": "The generic binding accepts only an Integration-owned available result; every unavailable result fails before Run mutation.",
+      "preconditions": "An explicitly imported host Integration returns a structured unavailable detection.",
+      "action": "Request start and Level B through the registered public binding after unavailable detection.",
+      "oracle": "The SDK returns IntegrationUnavailableError and invokes neither raw start nor raw fork; provider-specific compatibility probing remains embedding-client-owned.",
       "platform": ["node"],
       "tags": ["integration", "capability", "probe", "fail-closed"],
-      "disposition": "active",
+      "disposition": "covered",
       "test_refs": [
-        {
-          "path": "packages/sdk/test/codex-integration.test.ts",
-          "anchor": "Codex detection fails closed across missing, malformed, incompatible, and hanging probes"
-        },
-        {
-          "path": "packages/sdk/test/codex-integration.test.ts",
-          "anchor": "Codex default probing tolerates the supported cold-start envelope"
-        },
         {
           "path": "packages/sdk/test/integration.test.ts",
           "anchor": "registerIntegration fails closed before start when detection is unavailable"

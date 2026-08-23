@@ -21,6 +21,7 @@ export type {
 export {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
+  IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   registerIntegration,
@@ -31,8 +32,10 @@ export type {
   IntegrationCapability,
   IntegrationDetection,
   IntegrationDetectionOptions,
+  IntegrationMaterializationFailure,
   IntegrationObserver,
   IntegrationOperationOptions,
+  IntegrationProvenanceFailure,
   IntegrationSemanticEvent,
   IntegrationUnavailableReason,
   LevelBForkPlan,

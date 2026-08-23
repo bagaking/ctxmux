@@ -14,21 +14,23 @@ import {
   Attachment,
   CtxmuxClient,
   CtxmuxProtocolError,
+  INTEGRATION_API_VERSION,
+  IntegrationCapabilityError,
+  IntegrationMaterializationError,
   IntegrationProvenanceError,
+  IntegrationUnavailableError,
   createOperationKey,
   defineRun,
   inputOperationKey,
   registerIntegration,
+  type Integration,
   type IntegrationObserver,
+  type IntegrationSemanticEvent,
   type RunEvent,
   type RunId,
+  type RunInfo,
+  type RunSpec,
 } from "../src/index.ts";
-import {
-  codexIntegration,
-  isCodexSessionProvenance,
-  type CodexSessionProvenance,
-  type CodexSemanticEvent,
-} from "../src/integrations/index.ts";
 
 const execFile = promisify(execFileCallback);
 const daemonBinary = requiredEnvironment("CTXMUXD_BIN");
@@ -271,199 +273,207 @@ test(
 );
 
 test(
-  "Codex Integration resumes declared context through a public Level B fork",
+  "a host-owned Provider materializes public Level B without a fallback",
   { timeout: 15_000 },
   async (context) => {
     const { client, directory } = await startTestDaemon(context);
-    const executable = join(directory, "codex.mjs");
+    const executable = join(directory, "synthetic-provider.mjs");
     await writeFile(
       executable,
       `#!/usr/bin/env node
 const args = process.argv.slice(2);
-if (args[0] === "--version") {
-  console.log("codex-cli 0.144.4");
-} else if (args[0] === "exec" && args[1] === "--help") {
-  console.log("      --json  Print JSONL");
-} else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--help") {
-  console.log("      --json  Resume as JSONL");
-} else if (args[0] === "exec" && args[1] === "--json" && args[2] === "--") {
-  console.log(JSON.stringify({ type: "thread.started", thread_id: "session-123", argv: args }));
-  setInterval(() => {}, 1_000);
-} else if (args[0] === "exec" && args[1] === "resume" && args[2] === "--json" && args[3] === "--") {
-  console.log(JSON.stringify({ type: "turn.started", argv: args }));
-  setInterval(() => {}, 1_000);
-} else {
-  process.exitCode = 64;
-}
+console.log(JSON.stringify({ type: args[0], argv: args }));
+setInterval(() => {}, 1_000);
 `,
     );
     await chmod(executable, 0o755);
+    const provider = syntheticProviderIntegration();
+    const registered = registerIntegration(client, provider);
     const prompt = "review 'quoted'; $(touch never)\nthen explain";
-
-    const registered = registerIntegration(client, codexIntegration);
-    const integrationStartKey = createOperationKey("codex-integration-start");
-    const run = await registered.start(
-      { prompt, cwd: directory },
-      {
-        detection: { executable },
-        operationKey: integrationStartKey,
-      },
-    );
-    const retriedRun = await registered.start(
-      { prompt, cwd: directory },
-      {
-        detection: { executable },
-        operationKey: integrationStartKey,
-      },
-    );
-    assert.equal(retriedRun.id, run.id);
-    assert.ok(run.spec);
-    assert.deepEqual(run.spec.args, ["exec", "--json", "--", prompt]);
-    assert.deepEqual(run.spec.declared_inputs, [
-      { kind: "workspace", reference: directory },
-    ]);
-    const pid = run.pid;
-    assert.notEqual(pid, null);
-
-    const attachment = await client.attach(run.id);
-    const expectedRecord = JSON.stringify({
-      type: "thread.started",
-      thread_id: "session-123",
-      argv: ["exec", "--json", "--", prompt],
+    const parentRecipe = defineRun(executable, {
+      args: ["source", prompt],
+      cwd: directory,
+      declaredInputs: [{ kind: "workspace", reference: directory }],
     });
-    const parentOutput = await waitForOutput(
-      attachment,
-      replayBytes(attachment.snapshot.replay.chunks),
-      attachment.snapshot.replay.latest_output_bytes,
-      expectedRecord,
+    const startOptions = {
+      detection: { executable },
+      operationKey: createOperationKey("synthetic-provider-start"),
+    } as const;
+    const parent = await registered.start(
+      { recipe: parentRecipe },
+      startOptions,
     );
-    assert.match(
-      new TextDecoder().decode(parentOutput.observed),
-      /session-123/,
+    assert.equal(
+      (await registered.start({ recipe: parentRecipe }, startOptions)).id,
+      parent.id,
     );
-    attachment.close();
+    assert.deepEqual(parent.spec, parentRecipe);
+    const parentPid = parent.pid;
+    assert.notEqual(parentPid, null);
 
-    const provenanceAttachment = await client.attach(run.id);
-    const parentObserver = registered.createObserver(run);
-    const session = await waitForCodexSession(
-      provenanceAttachment,
-      parentObserver,
+    const exactArgvAttachment = await client.attach(parent.id);
+    await waitForOutput(
+      exactArgvAttachment,
+      replayBytes(exactArgvAttachment.snapshot.replay.chunks),
+      exactArgvAttachment.snapshot.replay.latest_output_bytes,
+      JSON.stringify({ type: "source", argv: ["source", prompt] }),
     );
-    const sessionId = session.sessionId;
-    const unrelatedRecord = JSON.stringify({
-      type: "thread.started",
-      thread_id: "from-unrelated-run",
-    });
+    exactArgvAttachment.close();
+    const parentAttachment = await client.attach(parent.id);
+    const parentObserver = registered.createObserver(parent);
+    const provenance = parentObserver.observe(
+      await nextOutputEvent(parentAttachment),
+    )[0];
+    assert.notEqual(provenance, undefined);
+
     const unrelated = await client.start(
-      defineRun("/bin/sh", {
-        args: ["-c", `printf '%s\\n' '${unrelatedRecord}'; sleep 30`],
-      }),
+      defineRun("/bin/sh", { args: ["-c", "printf 'unrelated\\n'; sleep 30"] }),
     );
     const unrelatedAttachment = await client.attach(unrelated.id);
     const unrelatedOutput = await nextOutputEvent(unrelatedAttachment);
     assert.throws(
       () => parentObserver.observe(unrelatedOutput),
-      (error: unknown) => error instanceof IntegrationProvenanceError,
-      "another Run's real attachment event must not authenticate the parent",
+      (error: unknown) =>
+        error instanceof IntegrationProvenanceError &&
+        error.reason === "wrong_source",
+      "another Run's public event must not authenticate the parent",
     );
-    const beforeRejectedForks = (await client.list()).map(({ id }) => id);
-    const rejectedConfig = {
-      session,
-      prompt: "must not create a child",
+
+    const continuation = "compare the two candidates";
+    const contextReference = "synthetic-context:parent";
+    const artifactReference = "artifact://review-plan.json";
+    const childRecipe = defineRun(executable, {
+      args: ["continue", continuation],
       cwd: directory,
+      declaredInputs: [
+        { kind: "workspace", reference: directory },
+        { kind: "artifact", reference: artifactReference },
+        { kind: "context", reference: contextReference },
+      ],
+    });
+    const validConfig = {
+      provenance: provenance!,
+      recipe: childRecipe,
     };
+    const levelBOptions = {
+      detection: { executable },
+      operationKey: createOperationKey("synthetic-provider-level-b"),
+    } as const;
+    const beforeRejectedForks = (await client.list()).map(({ id }) => id);
+
     await assert.rejects(
-      registered.forkLevelB(unrelated, rejectedConfig, {
+      registered.forkLevelB(unrelated, validConfig, {
         detection: { executable },
       }),
-      (error: unknown) => error instanceof IntegrationProvenanceError,
+      (error: unknown) =>
+        error instanceof IntegrationProvenanceError &&
+        error.reason === "wrong_source",
     );
     await assert.rejects(
       registered.forkLevelB(
-        run,
-        { ...rejectedConfig, session: { ...session } },
+        parent,
+        { ...validConfig, provenance: { ...provenance! } },
         { detection: { executable } },
       ),
-      (error: unknown) => error instanceof IntegrationProvenanceError,
+      (error: unknown) =>
+        error instanceof IntegrationProvenanceError &&
+        error.reason === "missing",
+    );
+    await assert.rejects(
+      registered.forkLevelB(parent, validConfig),
+      (error: unknown) =>
+        error instanceof IntegrationUnavailableError &&
+        error.detection.reason === "missing_capability",
+    );
+    const withoutLevelBCapability = {
+      ...provider,
+      id: "synthetic-provider-without-level-b",
+      async detect() {
+        return {
+          status: "available" as const,
+          executable,
+          version: "test-owned",
+          capabilities: ["semantic_events" as const],
+        };
+      },
+    };
+    await assert.rejects(
+      registerIntegration(client, withoutLevelBCapability).forkLevelB(
+        parent,
+        validConfig,
+        { detection: { executable } },
+      ),
+      (error: unknown) =>
+        error instanceof IntegrationCapabilityError &&
+        error.capability === "level_b_fork",
+    );
+    const { levelBForkProvenance: _provenance, ...withoutProvenance } =
+      provider;
+    await assert.rejects(
+      registerIntegration(client, withoutProvenance).forkLevelB(
+        parent,
+        validConfig,
+        { detection: { executable } },
+      ),
+      (error: unknown) =>
+        error instanceof IntegrationProvenanceError &&
+        error.reason === "missing",
+    );
+    const { planLevelBFork: _plan, ...withoutMaterializer } = provider;
+    await assert.rejects(
+      registerIntegration(client, withoutMaterializer).forkLevelB(
+        parent,
+        validConfig,
+        { detection: { executable } },
+      ),
+      (error: unknown) =>
+        error instanceof IntegrationMaterializationError &&
+        error.reason === "missing_planner",
     );
     assert.deepEqual(
       (await client.list()).map(({ id }) => id),
       beforeRejectedForks,
-      "rejected provenance must not create a daemon Run",
+      "every rejected Level B request must create no Run, including Level A",
     );
+
+    parentAttachment.close();
     unrelatedAttachment.close();
     await client.stop(unrelated.id);
+    const rawParent = await waitForNoAttachments(client, parent.id);
+    assert.equal(rawParent.pid, parentPid);
+    assert.equal(rawParent.state.type, "running");
 
-    provenanceAttachment.close();
-    const rawStatus = await waitForNoAttachments(client, run.id);
-    assert.equal(rawStatus.pid, pid);
-    assert.equal(rawStatus.state.type, "running");
-    const continuation = "compare the two candidates";
-    const artifactReference = "artifact://review-plan.json";
-    const levelBKey = createOperationKey("codex-integration-level-b-fork");
     const child = await registered.forkLevelB(
-      run,
-      {
-        session,
-        prompt: continuation,
-        cwd: directory,
-        artifactReferences: [artifactReference],
-      },
-      {
-        detection: { executable },
-        operationKey: levelBKey,
-      },
+      parent,
+      validConfig,
+      levelBOptions,
     );
     const retriedChild = await registered.forkLevelB(
-      run,
-      {
-        session,
-        prompt: continuation,
-        cwd: directory,
-        artifactReferences: [artifactReference],
-      },
-      {
-        detection: { executable },
-        operationKey: levelBKey,
-      },
+      parent,
+      validConfig,
+      levelBOptions,
     );
     assert.equal(retriedChild.id, child.id);
-    assert.notEqual(child.id, run.id);
-    assert.notEqual(child.pid, pid);
+    assert.notEqual(child.id, parent.id);
+    assert.notEqual(child.pid, parentPid);
     assert.deepEqual(child.lineage, {
-      parent: run.id,
+      parent: parent.id,
       fidelity: "level_b",
     });
-    assert.ok(child.spec);
-    assert.deepEqual(child.spec.args, [
-      "exec",
-      "resume",
-      "--json",
-      "--",
-      sessionId,
-      continuation,
-    ]);
-    assert.deepEqual(child.spec.declared_inputs, [
-      { kind: "workspace", reference: directory },
-      { kind: "artifact", reference: artifactReference },
-      { kind: "context", reference: sessionId },
-    ]);
-
+    assert.deepEqual(child.spec, childRecipe);
     const childAttachment = await client.attach(child.id);
-    const resumedRecord = JSON.stringify({
-      type: "turn.started",
-      argv: ["exec", "resume", "--json", "--", sessionId, continuation],
-    });
     await waitForOutput(
       childAttachment,
       replayBytes(childAttachment.snapshot.replay.chunks),
       childAttachment.snapshot.replay.latest_output_bytes,
-      resumedRecord,
+      JSON.stringify({
+        type: "continue",
+        argv: ["continue", continuation],
+      }),
     );
     childAttachment.close();
-    assert.equal((await client.status(run.id)).state.type, "running");
-    assert.equal((await client.status(child.id)).state.type, "running");
-    await client.stop(run.id);
+    assert.equal((await client.status(parent.id)).state.type, "running");
+    await client.stop(parent.id);
     await client.stop(child.id);
   },
 );
@@ -768,33 +778,67 @@ async function waitForExit(
   throw new Error("timed out waiting for Run exit");
 }
 
-async function waitForCodexSession(
-  attachment: Attachment,
-  observer: IntegrationObserver<CodexSemanticEvent>,
-): Promise<CodexSessionProvenance> {
-  for (const chunk of attachment.snapshot.replay.chunks) {
-    const session = observer
-      .observe({ type: "output", chunk })
-      .find(isCodexSessionProvenance);
-    if (session !== undefined) {
-      return session;
-    }
-  }
-  const deadline = Date.now() + 5_000;
-  while (Date.now() <= deadline) {
-    const event = await attachment.nextEvent();
-    if (event === undefined || event.type === "exited") {
-      break;
-    }
-    if (event.type === "gap") {
-      throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
-    }
-    const session = observer.observe(event).find(isCodexSessionProvenance);
-    if (session !== undefined) {
-      return session;
-    }
-  }
-  throw new Error("parent attachment did not emit Codex session provenance");
+interface SyntheticProviderReceipt extends IntegrationSemanticEvent {
+  readonly integrationId: "synthetic-provider";
+  readonly name: "source.observed";
+  readonly sourceToken: string;
+}
+
+interface SyntheticProviderForkConfig {
+  readonly provenance: SyntheticProviderReceipt;
+  readonly recipe: RunSpec;
+}
+
+function syntheticProviderIntegration(): Integration<
+  { readonly recipe: RunSpec },
+  SyntheticProviderForkConfig,
+  SyntheticProviderReceipt
+> {
+  return {
+    id: "synthetic-provider",
+    apiVersion: INTEGRATION_API_VERSION,
+    async detect(options) {
+      if (options?.executable === undefined) {
+        return {
+          status: "unavailable",
+          executable: "synthetic-provider",
+          reason: "missing_capability",
+        };
+      }
+      return {
+        status: "available",
+        executable: options.executable,
+        version: "test-owned",
+        capabilities: ["semantic_events", "level_b_fork"],
+      };
+    },
+    planLaunch(config) {
+      return config.recipe;
+    },
+    planLevelBFork(_parent, config) {
+      return { type: "level_b", spec: config.recipe };
+    },
+    levelBForkProvenance(config) {
+      return config.provenance;
+    },
+    createObserver(): IntegrationObserver<SyntheticProviderReceipt> {
+      return {
+        observe(event) {
+          if (event.type !== "output") {
+            return [];
+          }
+          return [
+            {
+              integrationId: "synthetic-provider",
+              name: "source.observed",
+              sourceToken: `${String(event.chunk.start_byte)}:${String(event.chunk.end_byte)}`,
+              data: {},
+            },
+          ];
+        },
+      };
+    },
+  };
 }
 
 async function nextOutputEvent(
