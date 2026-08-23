@@ -143,9 +143,9 @@ async fn stop_replays_a_caller_retained_operation_and_prints_its_disposition() {
             args: vec![
                 "-c".to_owned(),
                 concat!(
+                    "trap 'printf \"stop\\n\" >> \"$1\"; exit 0' TERM; ",
                     "printf 'ready\\n' > \"$1\"; ",
-                    "trap 'printf \"stop\\n\" >> \"$1\"; sleep 0.2; exit 0' TERM; ",
-                    "while :; do sleep 1; done"
+                    "while IFS= read -r _line; do :; done"
                 )
                 .to_owned(),
                 "ctxmux-cli-recoverable-stop".to_owned(),

@@ -55,9 +55,9 @@ test(
         args: [
           "-c",
           concatShell(
+            'trap \'printf "stop\\n" >> "$1"; exit 0\' TERM;',
             "printf 'ready\\n' > \"$1\";",
-            'trap \'printf "stop\\n" >> "$1"; sleep 0.2; exit 0\' TERM;',
-            "while :; do sleep 1; done",
+            "while IFS= read -r _line; do :; done",
           ),
           "ctxmux-recoverable-stop",
           markerPath,
