@@ -903,6 +903,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "packages/sdk/src/client.ts",
           "packages/sdk/src/attachment.ts",
           "packages/sdk/src/control.ts",
+          "packages/sdk/src/stop-operation.ts",
           "packages/sdk/src/index.ts",
           "packages/sdk/src/integration.ts",
           "packages/sdk/src/integrations/index.ts",
