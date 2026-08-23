@@ -12,6 +12,7 @@ import {
   CtxmuxClient,
   CtxmuxCommandError,
   CtxmuxInvalidFrameError,
+  CtxmuxRuntimeIdentityMismatchError,
   CtxmuxUnsupportedCapabilityError,
   MAX_FRAME_BYTES,
   MAX_RUNTIME_BUILD_ID_BYTES,
@@ -704,6 +705,52 @@ test("SC-02 validates and snapshots client capability requirements", async (cont
   assert.deepEqual(await client.list(), []);
 });
 
+test("SC-02 fences every business dispatch to the caller-retained Runtime identity", async (context) => {
+  const expected = runtimeIdentity();
+  const replacement = {
+    ...expected,
+    daemonInstanceId: "018f47f2-9df7-7f5f-8f2d-d3353f114aec",
+  };
+  const cases = [
+    {
+      name: "request",
+      invoke: (client: CtxmuxClient) => client.list(),
+    },
+    {
+      name: "attach",
+      invoke: (client: CtxmuxClient) => client.attach(RUN_ID),
+    },
+    {
+      name: "control",
+      invoke: (client: CtxmuxClient) => client.input(RUN_ID, "x"),
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake(replacement);
+      assert.equal(
+        await peer.receiveOptional(),
+        undefined,
+        `${entry.name} must close after Hello without a business frame`,
+      );
+    });
+    const client = new CtxmuxClient({
+      socketPath: daemon.socketPath,
+      expectedRuntimeIdentity: expected,
+    });
+    await assert.rejects(
+      entry.invoke(client),
+      (error: unknown) =>
+        error instanceof CtxmuxRuntimeIdentityMismatchError &&
+        error.expected.daemonInstanceId === expected.daemonInstanceId &&
+        error.actual.daemonInstanceId === replacement.daemonInstanceId,
+      entry.name,
+    );
+  }
+});
+
 test("SC-02 keeps runtimeInfo raw when requirements are unsupported", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
@@ -714,6 +761,20 @@ test("SC-02 keeps runtimeInfo raw when requirements are unsupported", async (con
     requiredCapabilities: { "services.persistent_state": 1 },
   });
   assert.deepEqual(await client.runtimeInfo(), runtimeIdentity());
+
+  const replacement = {
+    ...runtimeIdentity(),
+    daemonInstanceId: "018f47f2-9df7-7f5f-8f2d-d3353f114aec",
+  };
+  const identityDaemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake(replacement);
+  });
+  const identityClient = new CtxmuxClient({
+    socketPath: identityDaemon.socketPath,
+    expectedRuntimeIdentity: runtimeIdentity(),
+  });
+  assert.deepEqual(await identityClient.runtimeInfo(), replacement);
 });
 
 test("SC-02 rejects unsupported requirements before every business-frame path", async (context) => {

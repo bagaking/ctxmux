@@ -4,6 +4,7 @@ export {
   CtxmuxCommandError,
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
+  CtxmuxRuntimeIdentityMismatchError,
   CtxmuxUnsupportedCapabilityError,
   createOperationKey,
   inputOperationKey,

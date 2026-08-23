@@ -112,13 +112,21 @@ target, external tmux server, or caller-supplied plan is currently usable.
 `RunInfo.capabilities` remains the per-Run Backend truth, and Integration
 capabilities remain host-process truth. No layer is inferred from another.
 
-Rust and TypeScript clients may carry a local exact-key requirement record.
-Requirements do not cross the wire and do not add a negotiation frame:
+Rust and TypeScript clients may carry one caller-retained exact
+`RuntimeIdentity` expectation plus a local exact-key capability requirement
+record. Neither precondition crosses the wire or adds a negotiation frame:
 
 ```text
 connect -> send ClientHello(protocol only) -> validate RuntimeIdentity
-        -> compare configured requirements -> send Request or Attach
+        -> compare expected identity -> compare capability requirements
+        -> send Request or Attach
 ```
+
+The identity comparison uses Hello on the same connection that would carry the
+business frame. Any field or capability-record mismatch returns a typed local
+identity-mismatch error and closes before dispatch, so a separate
+`runtime_info`/`runtimeInfo()` preflight is not required and cannot create an
+endpoint-replacement race.
 
 An advertised version satisfies a requirement only when it is greater than or
 equal to the required version. A missing key or lower version produces the
@@ -129,7 +137,7 @@ them from platform or executable state.
 
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
-only configured capability requirements; framing, the exact identity shape,
+configured identity and capability requirements; framing, the exact identity shape,
 and protocol generation are still validated. Generation 13 adds no
 version-range or capability negotiation, endpoint discovery, dynamic registry,
 Provider catalog, plugin discovery, or host/credential identity.

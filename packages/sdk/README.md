@@ -71,17 +71,23 @@ safe-integer domain are owned by [the protocol contract](../../docs/protocol.md#
 An absent key is unsupported; an advertised version satisfies a requirement
 only when it is greater than or equal to the requested version.
 
-Requirements are local to one client and are checked after Hello but before a
-business Request or Attach frame. `runtimeInfo()` remains raw identity
-inspection, so an incompatible live Runtime can still be diagnosed:
+Identity and capability requirements are local to one client and are checked
+against Hello on the same connection before a business Request or Attach
+frame. Retain the exact `RuntimeIdentity` returned by a trusted connection and
+pass it as `expectedRuntimeIdentity` to fence later dispatch without a
+`runtimeInfo()` preflight race. `runtimeInfo()` itself remains raw inspection,
+so a different live Runtime can still be diagnosed:
 
 ```ts
+const inspector = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const observed = await inspector.runtimeInfo();
 const persistentClient = new CtxmuxClient({
   socketPath: "target/ctxmux.sock",
+  expectedRuntimeIdentity: observed,
   requiredCapabilities: { [RUNTIME_CAPABILITY_PERSISTENT_STATE]: 1 },
 });
 
-const observed = await persistentClient.runtimeInfo(); // ignores local requirements
+const current = await persistentClient.runtimeInfo(); // ignores local requirements
 try {
   await persistentClient.list(); // requirements apply before dispatch
 } catch (error) {
