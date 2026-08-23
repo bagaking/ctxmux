@@ -780,6 +780,50 @@ mod tests {
         assert!(first_ordinal.get() < second_ordinal.get());
     }
 
+    /// The terminal-ordinal single-set contract, asserted directly.
+    ///
+    /// A live re-adopted run (`Run::readopt`) defers its ordinal to `publish()`,
+    /// run when the child later exits — it must NOT call `recover()`. A past bug
+    /// had `readopt` calling `recover()` first; then the child's exit-time
+    /// `publish()` would `set()` the same `OnceLock` a second time and panic the
+    /// finalize worker — a panic otherwise swallowed by `let _ = worker.join()`.
+    /// This contract is the last line of defense, so assert the double-`set()`
+    /// panics explicitly here rather than relying on that swallowed worker.
+    #[test]
+    fn recover_then_publish_on_the_same_cell_panics_the_single_set_contract() {
+        let owner = TerminalPublicationOwner::default();
+        let cell = OnceLock::new();
+
+        // The historical-restore path sets the ordinal now.
+        owner.recover(&cell);
+        assert!(
+            cell.get().is_some(),
+            "recover publishes the historical terminal ordinal"
+        );
+
+        // A subsequent publish() on the SAME cell is exactly what a live
+        // re-adopted run would do at child-exit time; the second set() must
+        // panic the single-set contract rather than silently overwrite. Suppress
+        // the default hook so the deliberate panic does not spam test stderr.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.publish(&cell, || {});
+        }));
+        std::panic::set_hook(previous_hook);
+
+        let payload = result.expect_err("a second set() on one cell must panic");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(
+            message.contains("publishes terminal state once"),
+            "the panic must be the single-set contract failure, got: {message:?}"
+        );
+    }
+
     #[test]
     fn cleanup_reservations_enforce_and_reclaim_the_shared_owner_bound() {
         let owner = UnpublishedCleanupOwner::default();

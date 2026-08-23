@@ -2703,7 +2703,7 @@ async fn upgrade_preserves_output_across_the_reader_window() {
     daemon.sighup();
     let resume = daemon.wait_resume_signal(10).await;
     assert!(
-        resume.contains("1 run(s)"),
+        resume.contains(" 1 run(s)"),
         "incoming image should adopt exactly one live run, got: {resume}"
     );
     assert!(

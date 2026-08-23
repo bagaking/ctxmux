@@ -2978,6 +2978,16 @@ impl Run {
         let reader_guard = qualification_stats.guard(QualificationGauge::Readers);
         let waiter_guard = qualification_stats.guard(QualificationGauge::Waiters);
 
+        // A live re-adopted run defers its terminal ordinal to `publish()` (run
+        // when the child later exits), mirroring the live `new_native` spawn
+        // path — deliberately NOT `terminal_publications.recover(...)`. Unlike
+        // `Run::recover` (which restores historical dead runs and so DOES call
+        // `recover` here), calling `recover` on this cell would `set()` it now,
+        // and the child's exit-time `publish()` would double-`set()` the same
+        // `OnceLock` and panic the finalize worker. This single-set contract is
+        // unit-tested by
+        // `recover_then_publish_on_the_same_cell_panics_the_single_set_contract`
+        // in creation.rs.
         let terminal_ordinal = OnceLock::new();
         let run = Arc::new(Self {
             id,
@@ -4878,6 +4888,12 @@ mod tests {
             "a successful re-adoption must not record an incarnation failure"
         );
 
+        // Scope note: this test covers Bug 1 (pid derivation / caller-threaded
+        // values) only. The terminal-ordinal single-set contract (Bug 2 — a
+        // live re-adopted run must defer to `publish()` and never `recover()`)
+        // is covered by the focused
+        // `recover_then_publish_on_the_same_cell_panics_the_single_set_contract`
+        // in creation.rs.
         // Teardown: Stop drives TERM + reap through the owner (the sole reaper,
         // via waitid), so no zombie survives. Our own `child` handle never
         // waits — `std::process::Child::drop` does not reap — so there is no
