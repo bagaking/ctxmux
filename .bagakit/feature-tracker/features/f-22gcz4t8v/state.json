@@ -10,26 +10,26 @@
   "branch": "",
   "worktree_name": "",
   "worktree_path": "",
-  "current_task_id": "T-000",
+  "current_task_id": "T-001",
   "runtime_role": "standalone",
   "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 1,
-    "no_progress_rounds": 1,
-    "round_count": 1
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 2
   },
   "gate": {
-    "last_result": "fail",
+    "last_result": "pass",
     "last_task_id": "T-000",
     "last_check_commands": [
       {
         "command": "scripts/check.sh",
-        "exit_code": 101,
-        "status": "fail"
+        "exit_code": 0,
+        "status": "pass"
       }
     ],
-    "last_log_path": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/gate-T-000-r1-0001.log"
+    "last_log_path": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/gate-T-000-r2-0001.log"
   },
   "history": [
     {
@@ -67,6 +67,18 @@
     {
       "action": "task_gate",
       "detail": "T-000 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-000 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-000 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
     }
   ],
   "goal_contract": {
