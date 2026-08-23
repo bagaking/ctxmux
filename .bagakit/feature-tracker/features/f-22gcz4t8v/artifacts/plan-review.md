@@ -2,6 +2,14 @@
 
 Status: approved through explicit user delegation on 2026-08-24.
 
+Revision 2 correction: an independent plan review found that Rust name filters
+can exit successfully with zero selected tests and that the package-local SDK
+E2E command does not build or inject the required ctxmux binaries. The reviewed
+plan therefore requires one repository qualification script that asserts each
+Recoverable Stop test selection is non-empty before running it, and uses the
+root `npm run test:e2e` entrypoint for real SDK parity. This tightens evidence
+only; it does not change the accepted behavior or scope below.
+
 ## What
 
 Add `native.recoverable_stop: 1` without replacing the existing complete-session

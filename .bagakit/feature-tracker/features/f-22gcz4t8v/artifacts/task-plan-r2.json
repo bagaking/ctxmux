@@ -1,10 +1,9 @@
 {
-  "version": 2,
-  "feat_id": "f-22gcz4t8v",
-  "plan_status": "reviewed",
-  "plan_revision": 2,
-  "supersedes_revision": 1,
-  "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
+  "schema": "bagakit.feature-task-plan.v1",
+  "review": {
+    "status": "approved",
+    "evidence_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
+  },
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -16,56 +15,10 @@
     "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
     ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
   ],
-  "plan_history": [
-    {
-      "revision": 1,
-      "supersedes_revision": null,
-      "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "docs/testing-strategy.md",
-        "docs/architecture/choices/014-recoverable-input-operations.md",
-        "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
-        ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
-      ],
-      "task_ids": [
-        "T-000",
-        "T-001",
-        "T-002",
-        "T-003"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    },
-    {
-      "revision": 2,
-      "supersedes_revision": 1,
-      "review_ref": ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md",
-      "source_refs": [
-        "AGENTS.md",
-        "docs/vision.md",
-        "docs/architecture.md",
-        "docs/protocol.md",
-        "docs/roadmap.md",
-        "docs/testing-strategy.md",
-        "docs/architecture/choices/014-recoverable-input-operations.md",
-        "docs/architecture/choices/015-exec-in-place-upgrade-continuity.md",
-        ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
-      ],
-      "task_ids": [
-        "T-000",
-        "T-001",
-        "T-002",
-        "T-003"
-      ],
-      "superseded_task_ids": [],
-      "supersedes_by_task": {}
-    }
-  ],
+  "supersedes": {
+    "revision": 1,
+    "reason": "Replace Rust filters that can silently select zero tests and the package-local SDK E2E command with discriminating repository-owned qualification entrypoints before execution begins."
+  },
   "tasks": [
     {
       "id": "T-000",
@@ -99,12 +52,7 @@
         "crates/ctxmux-daemon/tests/native_lifecycle.rs",
         ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-001",
@@ -135,12 +83,7 @@
         "crates/ctxmux-daemon/src/lib.rs",
         "crates/ctxmux-daemon/tests/native_lifecycle.rs"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-002",
@@ -185,12 +128,7 @@
         "packages/sdk/test/client-parity.test.ts",
         "crates/ctxmux-daemon/tests/native_lifecycle.rs"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     },
     {
       "id": "T-003",
@@ -232,12 +170,7 @@
         "scripts/check-local-consumer.mjs",
         ".bagakit/feature-tracker/features/f-22gcz4t8v/artifacts/plan-review.md"
       ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "supersedes": []
     }
   ]
 }
