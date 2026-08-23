@@ -1243,6 +1243,96 @@ async fn committed_creation_survives_a_post_commit_failure_and_restart() {
     assert_eq!(wait_for_marker_pids(&marker, 1).await, vec![original_pid]);
 }
 
+// The exec-in-place upgrade drains, extracts, then calls `Persistence::barrier`
+// before `execve` so the incoming image resumes on a persisted cursor that
+// covers every byte read before extract (invariant f04, no replay gap). The two
+// tests below pin the barrier primitive directly — its Ok path (a clean slot
+// flushes prior appends durable) and, critically, its Err path (a poisoned slot
+// is surfaced so `perform_exec_upgrade` fail-stops instead of exec-ing into a
+// replay gap). The end-to-end re-exec proof (A13) exercises only the happy path,
+// so without these the f04 error-surfacing branch would ship untested.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_flushes_prior_appends_before_returning() {
+    let temp = tempfile::tempdir().expect("create barrier ok-path fixture");
+    let state_dir = temp.path().join("state");
+    let marker = temp.path().join("starts.log");
+    let (persistence, recovered) =
+        Persistence::open(&state_dir).expect("open barrier ok-path persistence");
+    assert!(recovered.is_empty());
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let created = manager
+        .create(
+            CreateOperationKey::new("barrier-ok-path").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, true),
+            },
+        )
+        .await
+        .expect("start a running persistent Run");
+    let run = manager.get(created.id).expect("resolve the running Run");
+
+    // Record output on the reader's behalf, then barrier. FIFO ordering means
+    // the Append is enqueued before `Command::Barrier`, so when barrier returns
+    // the durable cursor already covers every byte recorded up to this mark.
+    run.record_output(b"barrier-covers-these-bytes".to_vec());
+    let mark = run.info().latest_output_bytes;
+    persistence.barrier().expect("clean-slot barrier commits and returns Ok");
+    assert!(
+        run.info().durable_output_bytes.unwrap_or(0) >= mark,
+        "barrier must not return until every prior append is durable (mark {mark})"
+    );
+    assert!(!persistence.is_failed());
+
+    run.stop().await.expect("stop barrier ok-path Run");
+    wait_for_run_terminal_async(&manager.get(created.id).unwrap()).await;
+    drop(run);
+    wait_for_run_workers(&manager).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn barrier_surfaces_a_poisoned_slot_so_the_upgrade_fail_stops() {
+    let temp = tempfile::tempdir().expect("create barrier err-path fixture");
+    let state_dir = temp.path().join("state");
+    let marker = temp.path().join("starts.log");
+    let (persistence, recovered) =
+        Persistence::open(&state_dir).expect("open barrier err-path persistence");
+    assert!(recovered.is_empty());
+    // Arm a post-commit failure so the Run publishes but the shared failure slot
+    // is poisoned — exactly the state the barrier must refuse to clear.
+    persistence.fail_next_insert_after_commit();
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let error = manager
+        .create(
+            CreateOperationKey::new("barrier-err-path").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, true),
+            },
+        )
+        .await
+        .expect_err("post-commit failure is visible to the creating caller");
+    assert_eq!(error.code, ErrorCode::Persistence);
+    assert!(persistence.is_failed());
+    let original = manager.list().into_iter().next().expect("Run published");
+
+    // The f04 guard: a barrier over a poisoned slot returns Err, which is what
+    // makes `perform_exec_upgrade` fail-stop rather than exec into a replay gap.
+    let barrier = persistence.barrier();
+    assert!(
+        matches!(barrier, Err(crate::PersistenceError::Mutation(_))),
+        "barrier over a poisoned slot must surface the failure, got {barrier:?}"
+    );
+
+    manager
+        .get(original.id)
+        .expect("resolve poisoned-slot Run")
+        .stop()
+        .await
+        .expect("stop poisoned-slot Run");
+    wait_for_run_terminal_async(&manager.get(original.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistent_replacement_removes_exact_run_and_key_in_the_same_epoch() {
     let temp = tempfile::tempdir().expect("create collection fixture");
