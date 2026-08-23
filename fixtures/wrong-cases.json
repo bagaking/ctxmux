@@ -107,7 +107,7 @@
     },
     {
       "id": "PTY-003",
-      "choice": "017-recoverable-stop-operations",
+      "choice": "002-portable-pty-native-backend",
       "source_ids": ["b03"],
       "source_refs": [
         "https://github.com/wezterm/wezterm/blob/portable-pty-0.9.0/pty/src/lib.rs#L316-L374"
@@ -116,7 +116,7 @@
       "invariant": "The public meaning of stop and the eventual child state agree.",
       "preconditions": "A Run child deliberately ignores SIGHUP.",
       "action": "Request stop and observe acknowledgement, Run state, and child liveness.",
-      "oracle": "Stop is accepted through the owned child handle and the HUP-ignoring direct child reaches terminal state; repeated stop is rejected.",
+      "oracle": "The admitted Stop reaches terminal state through the owned child handle; retrying its exact retained operation replays the original receipt, while a new or conflicting operation and any other Stop attempt without that admission are rejected.",
       "platform": ["unix"],
       "tags": ["pty", "signals", "stop", "contract"],
       "disposition": "active",
@@ -971,6 +971,32 @@
         {
           "path": "crates/ctxmux-daemon/src/native_control.rs",
           "anchor": "recoverable_partial_write_retains_unknown_without_an_applied_range"
+        }
+      ]
+    },
+    {
+      "id": "STOP-01",
+      "choice": "017-recoverable-stop-operations",
+      "source_ids": ["n01"],
+      "source_refs": [
+        "https://aws.amazon.com/builders-library/making-retries-safe-with-idempotent-APIs/"
+      ],
+      "failure_mechanism": "A client loses the response after complete-session Stop has run, reconnects, and enters another logical Stop without the original operation identity.",
+      "invariant": "Within one daemon incarnation, retrying the exact retained Stop operation joins or replays its original complete-session receipt without another physical Stop effect; different operations fail before mutation.",
+      "preconditions": "A real native Run can complete one admitted Stop while the client discards its first response and reconnects with the original operation identity.",
+      "action": "Drop the first response after the child records the Stop effect, retry the exact operation from a fresh client, then try conflicting, replacement-incarnation, planned-exec, and collection variants.",
+      "oracle": "The exact retry returns the original graceful or forced receipt and the child records one physical Stop effect; conflicting or replacement-incarnation operations mutate nothing, while planned exec and collection honor the declared ledger boundary.",
+      "platform": ["unix", "node"],
+      "tags": ["stop", "idempotency", "response-loss", "lifecycle", "process"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "recoverable_stop_response_loss_recovers_from_a_fresh_client"
+        },
+        {
+          "path": "packages/sdk/test/client-parity.test.ts",
+          "anchor": "Recoverable Stop replays one receipt after response loss and client replacement"
         }
       ]
     }
