@@ -42,6 +42,7 @@ import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
 import type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
 import {
+  copyRequiredRuntimeCapabilities,
   CtxmuxInvalidFrameError,
   validateCursor,
   validateServerFrame,
@@ -50,6 +51,33 @@ import { encodeJsonLine, JsonLinesConnection } from "./wire.js";
 
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
+  /** Exact Runtime capability versions required before business dispatch. */
+  readonly requiredCapabilities?: RuntimeCapabilityRequirements;
+}
+
+/** Exact Runtime capability versions required before business dispatch. */
+export type RuntimeCapabilityRequirements = Readonly<Record<string, number>>;
+
+/** A client-local Runtime capability precondition is not satisfied. */
+export class CtxmuxUnsupportedCapabilityError extends CtxmuxProtocolError {
+  public readonly capability: string;
+  public readonly requiredVersion: number;
+  public readonly advertisedVersion: number | undefined;
+
+  public constructor(
+    capability: string,
+    requiredVersion: number,
+    advertisedVersion: number | undefined,
+  ) {
+    super(
+      "unsupported_capability",
+      `unsupported Runtime capability ${JSON.stringify(capability)}: required ${String(requiredVersion)}, advertised ${advertisedVersion === undefined ? "absent" : String(advertisedVersion)}`,
+    );
+    this.name = "CtxmuxUnsupportedCapabilityError";
+    this.capability = capability;
+    this.requiredVersion = requiredVersion;
+    this.advertisedVersion = advertisedVersion;
+  }
 }
 
 export interface RecoverableInputOperation {
@@ -124,12 +152,16 @@ function isWellFormedUtf16(value: string): boolean {
 /** Stateless connector to one local ctxmux daemon. */
 export class CtxmuxClient {
   readonly #socketPath: string;
+  readonly #requiredCapabilities: ReadonlyMap<string, number>;
 
   public constructor(options: CtxmuxClientOptions) {
     if (options.socketPath.length === 0) {
       throw new TypeError("socketPath must not be empty");
     }
     this.#socketPath = options.socketPath;
+    this.#requiredCapabilities = copyRequiredRuntimeCapabilities(
+      options.requiredCapabilities,
+    );
   }
 
   public async ping(): Promise<void> {
@@ -321,7 +353,7 @@ export class CtxmuxClient {
 
   public async attach(id: RunId, afterByte = 0): Promise<Attachment> {
     validateCursor(afterByte, "afterByte");
-    const { wire } = await this.#connect();
+    const { wire } = await this.#connectForDispatch();
     try {
       await wire.send({
         type: "request",
@@ -343,7 +375,7 @@ export class CtxmuxClient {
   }
 
   async #request(request: Request): Promise<Response> {
-    const { wire } = await this.#connect();
+    const { wire } = await this.#connectForDispatch();
     try {
       await wire.send({ type: "request", request } satisfies ClientFrame);
       const frame = serverFrame(await wire.receive());
@@ -362,8 +394,11 @@ export class CtxmuxClient {
   async #controlRequest(request: Request): Promise<Response> {
     let wire: JsonLinesConnection;
     try {
-      ({ wire } = await this.#connect());
+      ({ wire } = await this.#connectForDispatch());
     } catch (error) {
+      if (error instanceof CtxmuxUnsupportedCapabilityError) {
+        throw error;
+      }
       throw new CtxmuxCommandError(
         error instanceof CtxmuxProtocolError ? error.code : "io",
         asError(error).message,
@@ -441,6 +476,37 @@ export class CtxmuxClient {
       return { wire, runtime: frame.runtime };
     } catch (error) {
       wire.close();
+      throw error;
+    }
+  }
+
+  async #connectForDispatch(): Promise<{
+    readonly wire: JsonLinesConnection;
+    readonly runtime: RuntimeIdentity;
+  }> {
+    const connection = await this.#connect();
+    try {
+      for (const [capability, requiredVersion] of this.#requiredCapabilities) {
+        const advertisedVersion = Object.hasOwn(
+          connection.runtime.capabilities,
+          capability,
+        )
+          ? connection.runtime.capabilities[capability]
+          : undefined;
+        if (
+          advertisedVersion === undefined ||
+          advertisedVersion < requiredVersion
+        ) {
+          throw new CtxmuxUnsupportedCapabilityError(
+            capability,
+            requiredVersion,
+            advertisedVersion,
+          );
+        }
+      }
+      return connection;
+    } catch (error) {
+      connection.wire.close();
       throw error;
     }
   }

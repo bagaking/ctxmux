@@ -264,10 +264,12 @@ another execution location or Provider-adjacent metadata:
    from the publication. Level B remains explicit and fail-closed.
 3. **T-002 / T1 — Runtime identity and capabilities.** Publish a persistent
    `runtimeId`, a `daemonInstanceId` that changes on cold replacement but not a
-   same-process planned exec, a build identity that may change on exec, and a
-   versioned capability manifest. `runtimeId` must not reuse the serving epoch:
-   persistent mode binds it to the state-directory lineage, while memory-only
-   mode promises stability only for one daemon lifetime.
+   same-process planned exec, an explicit identity-persistence discriminator,
+   serving-build target facts, and a flat numeric capability record. Clients
+   may enforce exact local requirements after Hello and before business
+   dispatch. `runtimeId` must not reuse the serving epoch: persistent mode
+   binds it to the state-directory lineage, while memory-only mode promises
+   stability only for one daemon lifetime.
 4. **T-003 / T2 — authoritative Run observations.** Add Run state revision,
    owner-recorded UTC timestamps, and a typed observation envelope. State
    revision, output byte cursor, and delivery-gap position remain separate

@@ -4,6 +4,7 @@ export const MAX_FRAME_BYTES = 1048576 as const;
 export const MAX_CREATE_OPERATION_KEY_BYTES = 128 as const;
 export const MAX_INPUT_OPERATION_KEY_BYTES = 128 as const;
 export const MAX_RUNTIME_BUILD_ID_BYTES = 128 as const;
+export const MAX_RUNTIME_CAPABILITY_VERSION = 9007199254740991 as const;
 export const RUNTIME_CAPABILITY_NATIVE_START = "native.start" as const;
 export const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT =
   "native.recoverable_input" as const;

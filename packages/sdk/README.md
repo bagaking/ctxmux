@@ -8,12 +8,18 @@ on Electron, React, an editor, or the Rust implementation.
 ```ts
 import {
   CtxmuxClient,
+  CtxmuxUnsupportedCapabilityError,
+  RUNTIME_CAPABILITY_NATIVE_START,
+  RUNTIME_CAPABILITY_PERSISTENT_STATE,
   createOperationKey,
   defineRun,
   inputOperationKey,
 } from "@ctxmux/sdk";
 
-const client = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const client = new CtxmuxClient({
+  socketPath: "target/ctxmux.sock",
+  requiredCapabilities: { [RUNTIME_CAPABILITY_NATIVE_START]: 1 },
+});
 const operationKey = createOperationKey(); // retain until disposition is known
 const run = await client.start(
   defineRun("/bin/sh", {
@@ -33,27 +39,67 @@ Closing the SDK process does not stop a daemon-owned Run.
 ```ts
 const runtime = await client.runtimeInfo();
 console.log(
-  runtime.runtime_id,
-  runtime.daemon_instance_id,
-  runtime.build_id,
-  runtime.protocol_generation,
+  runtime.daemonInstanceId,
+  runtime.runtimeId,
+  runtime.runtimeIdPersistence,
+  runtime.buildId,
+  runtime.protocolGeneration,
+  runtime.platform,
+  runtime.arch,
   runtime.capabilities,
 );
 ```
 
-`runtime_id` names the logical Runtime. Persistent cold replacement keeps it
-while changing `daemon_instance_id`; memory-only cold replacement changes both;
-a validated planned exec keeps both. `build_id` is an opaque daemon-authored
-label that may change on exec. Compare it exactly; do not parse it or treat it
-as a commit, binary hash, signature, or attestation.
+`runtimeId` names the logical Runtime. `runtimeIdPersistence` is `daemon` when
+that identity lasts one memory-only daemon lifetime and `state_dir` when the
+selected state directory preserves it. Persistent cold replacement keeps the
+Runtime ID while changing `daemonInstanceId`; memory-only cold replacement
+changes both; a validated planned exec keeps both.
 
-The Runtime manifest declares daemon-wide operation classes and active local
-services. A true class does not guarantee that a particular Run, target,
-external tmux server, or caller plan is usable. `run.capabilities` remains the
-per-Run Backend truth, and Integration detection/materialization capabilities
-remain host-local Integration truth. These three layers are not inferred from
-one another. A false or unsupported operation never authorizes fallback or
-platform/executable-name inference.
+`buildId` is an opaque daemon-authored label that may change on exec. Compare
+it exactly; do not parse it or treat it as a commit, binary hash, signature, or
+attestation. `platform` and `arch` use Rust serving-build vocabulary from
+`std::env::consts`: an Apple Silicon macOS build reports `macos` and `aarch64`,
+not Node's `darwin` and `arm64`. These are build facts, not host probes.
+
+The flat capability record declares the highest fully implemented version for
+each exact endpoint key. The complete initial catalog, mode availability, and
+safe-integer domain are owned by [the protocol contract](../../docs/protocol.md#connection-state).
+An absent key is unsupported; an advertised version satisfies a requirement
+only when it is greater than or equal to the requested version.
+
+Requirements are local to one client and are checked after Hello but before a
+business Request or Attach frame. `runtimeInfo()` remains raw identity
+inspection, so an incompatible live Runtime can still be diagnosed:
+
+```ts
+const persistentClient = new CtxmuxClient({
+  socketPath: "target/ctxmux.sock",
+  requiredCapabilities: { [RUNTIME_CAPABILITY_PERSISTENT_STATE]: 1 },
+});
+
+const observed = await persistentClient.runtimeInfo(); // ignores local requirements
+try {
+  await persistentClient.list(); // requirements apply before dispatch
+} catch (error) {
+  if (error instanceof CtxmuxUnsupportedCapabilityError) {
+    console.error(
+      error.code, // "unsupported_capability"
+      error.capability,
+      error.requiredVersion,
+      error.advertisedVersion, // undefined when absent
+    );
+  }
+}
+```
+
+Keys are compared exactly; the SDK does not whitelist, normalize, infer them
+from an operation, or send them on the wire. A mismatch closes before business
+dispatch and never authorizes fallback. Raw inspection still validates the
+wire shape and protocol generation. Endpoint capabilities do not guarantee
+that a particular Run, target, external tmux server, or caller plan is usable.
+`run.capabilities` remains the per-Run Backend truth, while Integration
+detection and materialization capabilities remain host-local Integration truth.
 
 `start` and `fork` accept an optional caller-retained creation operation key.
 When a connection closes before its response is known, retry the exact request

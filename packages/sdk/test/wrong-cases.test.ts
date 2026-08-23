@@ -12,8 +12,10 @@ import {
   CtxmuxClient,
   CtxmuxCommandError,
   CtxmuxInvalidFrameError,
+  CtxmuxUnsupportedCapabilityError,
   MAX_FRAME_BYTES,
   MAX_RUNTIME_BUILD_ID_BYTES,
+  MAX_RUNTIME_CAPABILITY_VERSION,
   PROTOCOL_VERSION,
   inputOperationKey,
   type OutputChunk,
@@ -22,7 +24,11 @@ import {
 } from "../src/index.ts";
 import { runEventSource } from "../src/attachment.ts";
 import { validateServerFrame } from "../src/validation.ts";
-import { JsonLinesConnection, WireClosedError } from "../src/wire.ts";
+import {
+  JsonLinesConnection,
+  WireClosedError,
+  parseJsonFrame,
+} from "../src/wire.ts";
 
 const RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114ae8";
 const DAEMON_INSTANCE = "018f47f2-9df7-7f5f-8f2d-d3353f114ae9";
@@ -108,6 +114,62 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
     (error: unknown) =>
       error instanceof CtxmuxInvalidFrameError && error.path === "afterByte",
   );
+});
+
+test("SC-01 validates capability versions from exact JSON number tokens", () => {
+  for (const [spelling, expectedVersion] of [
+    ["1", 1],
+    ["1.0", 1],
+    ["1e0", 1],
+    ["10e-1", 1],
+    ["9007199254740991", MAX_RUNTIME_CAPABILITY_VERSION],
+    ["9007199254740991.0", MAX_RUNTIME_CAPABILITY_VERSION],
+    ["90071992547409910e-1", MAX_RUNTIME_CAPABILITY_VERSION],
+  ] as const) {
+    const frame = validateServerFrame(
+      parseJsonFrame(
+        JSON.stringify({ type: "hello", runtime: runtimeIdentity() }).replace(
+          '"native.start":1',
+          `"native.start":${spelling}`,
+        ),
+      ),
+    );
+    assert.equal(
+      frame.type === "hello"
+        ? frame.runtime.capabilities["native.start"]
+        : undefined,
+      expectedVersion,
+    );
+  }
+
+  for (const spelling of [
+    "-0",
+    "0",
+    "1.0000000000000001",
+    "0.99999999999999999",
+    "9007199254740990.5",
+    "9007199254740989.5",
+    "9007199254740991.1",
+    "9007199254740992",
+    "9007199254740992.0",
+    "9007199254740992e0",
+    "1e400",
+    "1e-400",
+  ]) {
+    const parsed = parseJsonFrame(
+      JSON.stringify({ type: "hello", runtime: runtimeIdentity() }).replace(
+        '"native.start":1',
+        `"native.start":${spelling}`,
+      ),
+    );
+    assert.throws(
+      () => validateServerFrame(parsed),
+      (error: unknown) =>
+        error instanceof CtxmuxInvalidFrameError &&
+        error.path === "$frame.runtime.capabilities.native.start",
+      `fractional source token must not round into the accepted domain: ${spelling}`,
+    );
+  }
 });
 
 test("SC-02 rejects malformed nested runtime frames", () => {
@@ -219,6 +281,30 @@ test("SC-02 rejects malformed nested runtime frames", () => {
     [
       {
         type: "hello",
+        runtime: { ...runtimeIdentity(), capabilities: { candidate: null } },
+      },
+      "$frame.runtime.capabilities.candidate",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: { ...runtimeIdentity(), capabilities: { candidate: [] } },
+      },
+      "$frame.runtime.capabilities.candidate",
+    ],
+    [
+      {
+        type: "hello",
+        runtime: {
+          ...runtimeIdentity(),
+          capabilities: { candidate: MAX_RUNTIME_CAPABILITY_VERSION + 1 },
+        },
+      },
+      "$frame.runtime.capabilities.candidate",
+    ],
+    [
+      {
+        type: "hello",
         runtime: { ...runtimeIdentity(), capabilities: null },
       },
       "$frame.runtime.capabilities",
@@ -253,7 +339,7 @@ test("SC-02 rejects malformed nested runtime frames", () => {
           },
         },
       },
-      "$frame.runtime.daemonInstanceId",
+      "$frame.runtime.runtime_id",
     ],
     [
       { type: "response", response: { type: "invented" } },
@@ -475,6 +561,33 @@ test("SC-02 rejects malformed nested runtime frames", () => {
       JSON.stringify(mutation),
     );
   }
+  assert.equal(
+    validateServerFrame({
+      type: "hello",
+      runtime: {
+        ...runtimeIdentity(),
+        capabilities: { candidate: MAX_RUNTIME_CAPABILITY_VERSION },
+      },
+    }).type,
+    "hello",
+  );
+  const integerFrame = JSON.stringify({
+    type: "hello",
+    runtime: {
+      ...runtimeIdentity(),
+      capabilities: { candidate: 1 },
+    },
+  });
+  for (const spelling of ["1.0", "1e0"]) {
+    const parsed: unknown = JSON.parse(
+      integerFrame.replace('"candidate":1', `"candidate":${spelling}`),
+    );
+    assert.equal(
+      validateServerFrame(parsed).type,
+      "hello",
+      `${spelling} is the same safe-integer numeric value`,
+    );
+  }
 });
 
 test("SC-02 rejects incompatible Runtime generations before dispatch", async (context) => {
@@ -505,6 +618,126 @@ test("SC-02 rejects incompatible Runtime generations before dispatch", async (co
     await assert.rejects(
       new CtxmuxClient({ socketPath: daemon.socketPath }).runtimeInfo(),
       /expected compatible hello, received hello/u,
+    );
+  }
+});
+
+test("SC-02 validates and snapshots client capability requirements", async (context) => {
+  for (const value of [
+    0,
+    -1,
+    1.5,
+    true,
+    "1",
+    null,
+    [],
+    {},
+    MAX_RUNTIME_CAPABILITY_VERSION + 1,
+  ]) {
+    assert.throws(
+      () =>
+        new CtxmuxClient({
+          socketPath: "unused.sock",
+          requiredCapabilities: {
+            candidate: value,
+          } as unknown as Record<string, number>,
+        }),
+      TypeError,
+    );
+  }
+  for (const value of [null, []]) {
+    assert.throws(
+      () =>
+        new CtxmuxClient({
+          socketPath: "unused.sock",
+          requiredCapabilities: value as unknown as Record<string, number>,
+        }),
+      TypeError,
+    );
+  }
+  new CtxmuxClient({
+    socketPath: "unused.sock",
+    requiredCapabilities: { candidate: MAX_RUNTIME_CAPABILITY_VERSION },
+  });
+
+  const mutableRequirements: Record<string, number> = { "native.start": 1 };
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    assert.deepEqual(await peer.receive(), {
+      type: "request",
+      request: { type: "list" },
+    });
+    peer.send({ type: "response", response: { type: "runs", runs: [] } });
+  });
+  const client = new CtxmuxClient({
+    socketPath: daemon.socketPath,
+    requiredCapabilities: mutableRequirements,
+  });
+  mutableRequirements["native.start"] = 2;
+  mutableRequirements["new.missing"] = 1;
+  assert.deepEqual(await client.list(), []);
+});
+
+test("SC-02 keeps runtimeInfo raw when requirements are unsupported", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+  });
+  const client = new CtxmuxClient({
+    socketPath: daemon.socketPath,
+    requiredCapabilities: { "services.persistent_state": 1 },
+  });
+  assert.deepEqual(await client.runtimeInfo(), runtimeIdentity());
+});
+
+test("SC-02 rejects unsupported requirements before every business-frame path", async (context) => {
+  const cases = [
+    {
+      name: "request absent exact key",
+      requirements: { toString: 1 },
+      invoke: (client: CtxmuxClient) => client.list(),
+      capability: "toString",
+      requiredVersion: 1,
+      advertisedVersion: undefined,
+    },
+    {
+      name: "attach higher version",
+      requirements: { "native.start": 2 },
+      invoke: (client: CtxmuxClient) => client.attach(RUN_ID),
+      capability: "native.start",
+      requiredVersion: 2,
+      advertisedVersion: 1,
+    },
+    {
+      name: "control higher version",
+      requirements: { "native.start": 2 },
+      invoke: (client: CtxmuxClient) => client.input(RUN_ID, "x"),
+      capability: "native.start",
+      requiredVersion: 2,
+      advertisedVersion: 1,
+    },
+  ] as const;
+
+  for (const entry of cases) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      assert.equal(await peer.receiveOptional(), undefined, entry.name);
+    });
+    const client = new CtxmuxClient({
+      socketPath: daemon.socketPath,
+      requiredCapabilities: entry.requirements,
+    });
+    await assert.rejects(
+      entry.invoke(client),
+      (error: unknown) =>
+        error instanceof CtxmuxUnsupportedCapabilityError &&
+        error.code === "unsupported_capability" &&
+        error.capability === entry.capability &&
+        error.requiredVersion === entry.requiredVersion &&
+        error.advertisedVersion === entry.advertisedVersion,
+      entry.name,
     );
   }
 });

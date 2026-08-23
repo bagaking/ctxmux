@@ -14,12 +14,15 @@ import {
   Attachment,
   CtxmuxClient,
   CtxmuxProtocolError,
+  CtxmuxUnsupportedCapabilityError,
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
+  RUNTIME_CAPABILITY_NATIVE_START,
+  RUNTIME_CAPABILITY_PERSISTENT_STATE,
   createOperationKey,
   defineRun,
   inputOperationKey,
@@ -71,6 +74,43 @@ test(
       "tmux.discover": 1,
       "tmux.import": 1,
     });
+
+    const runsBeforeCapabilityRejection = await client.list();
+    for (const [requirements, expectedCapability, expectedAdvertised] of [
+      [
+        { [RUNTIME_CAPABILITY_PERSISTENT_STATE]: 1 },
+        RUNTIME_CAPABILITY_PERSISTENT_STATE,
+        undefined,
+      ],
+      [
+        { [RUNTIME_CAPABILITY_NATIVE_START]: 2 },
+        RUNTIME_CAPABILITY_NATIVE_START,
+        1,
+      ],
+    ] as const) {
+      const guardedClient = new CtxmuxClient({
+        socketPath,
+        requiredCapabilities: requirements,
+      });
+      assert.deepEqual(
+        await guardedClient.runtimeInfo(),
+        runtime,
+        "configured runtimeInfo remains raw identity inspection",
+      );
+      await assert.rejects(
+        guardedClient.start(defineRun("/bin/true")),
+        (error: unknown) =>
+          error instanceof CtxmuxUnsupportedCapabilityError &&
+          error.code === "unsupported_capability" &&
+          error.capability === expectedCapability &&
+          error.advertisedVersion === expectedAdvertised,
+      );
+      assert.deepEqual(
+        await client.list(),
+        runsBeforeCapabilityRejection,
+        "a client-local capability rejection must not create a real Run",
+      );
+    }
 
     const shell = concatShell(
       "printf 'READY\\n';",
