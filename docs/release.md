@@ -85,10 +85,10 @@ cross-compiled bundle, installer, compatibility layer, or remote backend.
 
 ## Required hosted CI evidence
 
-The latest published required run available during the 2026-08-14 audit is
+The latest published required run available during the audit is
 [CI run 31722805068](https://github.com/bagaking/ctxmux/actions/runs/31722805068)
-for commit `0f7f598ff706736a57d319de27f739fe222002c2`, started
-2026-08-13 16:51 UTC. GitHub's public jobs and check annotations establish:
+for commit `0f7f598ff706736a57d319de27f739fe222002c2`. GitHub's public jobs and check
+annotations establish:
 
 - macOS 15 installed tmux successfully, then `Check workspace` failed with exit
   1;
