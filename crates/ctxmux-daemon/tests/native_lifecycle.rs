@@ -1895,6 +1895,207 @@ async fn recoverable_stop_attachment_to_short_survives_attachment_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recoverable_stop_fresh_terminal_attachment_replays_settled_receipt() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon.directory.path().join("terminal-attachment-stop.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start terminal attachment Stop fixture");
+    let (mut readiness, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach terminal Stop readiness observer");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut readiness, &mut observed, &mut last_seq, b"READY").await;
+    }
+    readiness
+        .detach()
+        .await
+        .expect("detach terminal Stop readiness observer");
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    let settled = daemon
+        .client
+        .stop(operation.clone())
+        .await
+        .expect("settle Stop before the fresh attachment");
+    assert_eq!(settled.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+    let terminal = wait_until_exited(&daemon.client, run.id).await;
+
+    let (attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach after recoverable Stop settlement");
+    assert_eq!(snapshot.run.state, terminal);
+    let replayed = timeout(Duration::from_secs(2), attachment.stop(operation))
+        .await
+        .expect("terminal attachment keeps the recovery lane available")
+        .expect("terminal attachment replays the retained Stop receipt");
+    assert_eq!(replayed.receipt, settled.receipt);
+    assert_eq!(
+        attachment.next_event().await.expect("read terminal event"),
+        Some(RunEvent::Exited { state: terminal })
+    );
+    assert_eq!(
+        attachment
+            .next_event()
+            .await
+            .expect("read terminal attachment EOF after replay"),
+        None
+    );
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recoverable_stop_same_attachment_duplicates_join_and_conflicts_fail_closed() {
+    let daemon = TestDaemon::start().await;
+    let marker = daemon
+        .directory
+        .path()
+        .join("attachment-duplicate-stop.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start attachment duplicate Stop fixture");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach duplicate Stop client");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let attachment = Arc::new(attachment);
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    let first = {
+        let attachment = Arc::clone(&attachment);
+        let operation = operation.clone();
+        tokio::spawn(async move { attachment.stop(operation).await })
+    };
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+    assert!(!first.is_finished(), "forced Stop remains in flight");
+
+    let duplicate = {
+        let attachment = Arc::clone(&attachment);
+        let operation = operation.clone();
+        tokio::spawn(async move { attachment.stop(operation).await })
+    };
+    tokio::task::yield_now().await;
+    let mut conflicting = operation.clone();
+    conflicting.operation_key = StopOperationKey::new("attachment-conflicting-stop").unwrap();
+    assert_control_failure(
+        attachment
+            .stop(conflicting)
+            .await
+            .expect_err("another Stop operation conflicts before mutation"),
+        ErrorCode::StopOperationConflict,
+        CommandDisposition::NotApplied,
+    );
+
+    let first = timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first attachment Stop settles")
+        .expect("join first attachment Stop task")
+        .expect("first attachment Stop is accepted");
+    let duplicate = timeout(Duration::from_secs(5), duplicate)
+        .await
+        .expect("duplicate attachment Stop settles")
+        .expect("join duplicate attachment Stop task")
+        .expect("duplicate attachment Stop joins the retained operation");
+    assert_eq!(first.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(duplicate.receipt, first.receipt);
+    assert_ne!(duplicate.command_id, first.command_id);
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recoverable_stop_attachment_disconnect_keeps_upgrade_drain_on_settlement_owner() {
+    let daemon = TestDaemon::start_persistent().await;
+    let marker = daemon.directory.path().join("attachment-upgrade-stop.log");
+    let run = daemon
+        .client
+        .start(recoverable_stop_marker_shell(&marker, false))
+        .await
+        .expect("start attachment upgrade Stop fixture");
+    let before = daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("read Runtime identity before attachment Stop");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach upgrade Stop client");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    if !observed.windows(5).any(|window| window == b"READY") {
+        wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+    }
+
+    let attachment = Arc::new(attachment);
+    let operation = fresh_stop(&daemon.client, run.id).await;
+    let abandoned = {
+        let attachment = Arc::clone(&attachment);
+        let operation = operation.clone();
+        tokio::spawn(async move { attachment.stop(operation).await })
+    };
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+    assert!(!abandoned.is_finished(), "forced Stop remains in flight");
+
+    daemon.sighup();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match attachment.resize(TerminalSize { rows: 25, cols: 81 }).await {
+                Err(ClientError::ControlRejected { failure })
+                    if failure.error.code == ErrorCode::BackendUnavailable
+                        && failure.disposition == CommandDisposition::NotApplied =>
+                {
+                    break;
+                }
+                Ok(_) | Err(_) => sleep(Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("attachment observes the planned-exec request drain");
+    assert!(
+        !abandoned.is_finished(),
+        "fixture disconnects while daemon-owned Stop settlement is pending"
+    );
+    abandoned.abort();
+    let _ = abandoned.await;
+    drop(attachment);
+
+    let resume = daemon.wait_resume_signal(10).await;
+    assert!(resume.contains(" 0 run(s)"), "unexpected resume: {resume}");
+    let after = daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("read Runtime identity after attachment Stop handoff");
+    assert_eq!(after.runtime_id, before.runtime_id);
+    assert_eq!(after.daemon_instance_id, before.daemon_instance_id);
+    let replayed = daemon
+        .client
+        .stop(operation)
+        .await
+        .expect("incoming image replays attachment-owned Stop settlement");
+    assert_eq!(replayed.receipt.disposition, StopDisposition::Forced);
+    assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recoverable_stop_planned_exec_replays_the_settled_same_incarnation_result() {
     let daemon = TestDaemon::start_persistent().await;
     let marker = daemon

@@ -1061,6 +1061,7 @@ impl HandoffStopOutcome {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RecoverableStopFlight {
     run: Arc<Run>,
     cell: Arc<StopOperationCell>,
@@ -1865,6 +1866,13 @@ impl RunRegistry {
                 _run: run,
                 pending: Some(pending),
             },
+        })
+    }
+
+    pub(crate) fn has_recoverable_stop(&self, id: RunId) -> bool {
+        let state = read_lock(&self.state);
+        state.runs.get(&id).is_some_and(|entry| {
+            entry.residency == RegistryResidency::Retained && entry.stop_operation.is_some()
         })
     }
 

@@ -1,6 +1,6 @@
 //! Replay join and correlated control delivery for one attachment connection.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use ctxmux_protocol::{
     AttachedHeader, AttachedSnapshot, AttachmentCommandId, ClientFrame, ControlOutcome, ErrorCode,
@@ -17,6 +17,8 @@ use super::{
     ConnectionError, ControlResult, Run, RunManager, UpgradeRequestAdmission, UpgradeRequestPermit,
     control_not_applied, invalid_request, receive, send, upgrade_retry_error,
 };
+
+const MAX_PENDING_STOP_RESULTS: usize = 64;
 
 pub(super) async fn handle(
     mut wire: Framed<UnixStream, LinesCodec>,
@@ -50,7 +52,9 @@ pub(super) async fn handle(
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSnapshot).await;
     }
-    if !terminal_state.is_running() {
+    let running = terminal_state.is_running();
+    let terminal_recovery = !running && manager.has_recoverable_stop(run.id);
+    if !running {
         send(
             &mut wire,
             &ServerFrame::Event {
@@ -58,23 +62,28 @@ pub(super) async fn handle(
             },
         )
         .await?;
-        return Ok(());
+        if !terminal_recovery {
+            return Ok(());
+        }
     }
 
     let mut command_results = PendingResults::new();
     let mut controls = ControlState::default();
     loop {
-        // Result-first bias is bounded by 1,024 input receipts plus one stop;
+        // Result-first bias is bounded by 1,024 input receipts plus the narrow
+        // connection-local recoverable Stop result bound;
         // the explicit stop barrier, not select readiness, orders terminal exit.
         tokio::select! {
             biased;
             Some((command_id, outcome, permit)) = command_results.next(), if !command_results.is_empty() => {
                 send_command_result(&mut wire, command_id, outcome).await?;
                 drop(permit);
-                if controls.pending_stop == Some(command_id) {
-                    controls.pending_stop = None;
+                if controls.pending_stops.remove(&command_id) && controls.pending_stops.is_empty() {
                     if let Some(event) = controls.held_terminal.take() {
                         send(&mut wire, &ServerFrame::Event { event }).await?;
+                        return Ok(());
+                    }
+                    if terminal_recovery {
                         return Ok(());
                     }
                 }
@@ -94,7 +103,7 @@ pub(super) async fn handle(
                     return Ok(());
                 }
             }
-            event = events.recv() => {
+            event = events.recv(), if running => {
                 match event {
                     Ok(RunEvent::Output { chunk }) if chunk.end_byte <= sent_through_byte => {}
                     Ok(RunEvent::Output { chunk }) => {
@@ -104,12 +113,11 @@ pub(super) async fn handle(
                         }).await?;
                     }
                     Ok(event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. })) => {
-                        if controls.pending_stop.is_some() {
-                            controls.held_terminal = Some(event);
-                        } else {
+                        if controls.pending_stops.is_empty() {
                             send(&mut wire, &ServerFrame::Event { event }).await?;
                             return Ok(());
                         }
+                        controls.held_terminal = Some(event);
                     }
                     Ok(event) => send(&mut wire, &ServerFrame::Event { event }).await?,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -145,12 +153,19 @@ async fn send_replay(
 #[derive(Default)]
 struct ControlState {
     last_command_id: Option<AttachmentCommandId>,
-    pending_stop: Option<AttachmentCommandId>,
+    pending_stops: HashSet<AttachmentCommandId>,
     held_terminal: Option<RunEvent>,
 }
 
 type PendingResults = FuturesUnordered<
-    BoxFuture<'static, (AttachmentCommandId, ControlOutcome, UpgradeRequestPermit)>,
+    BoxFuture<
+        'static,
+        (
+            AttachmentCommandId,
+            ControlOutcome,
+            Option<UpgradeRequestPermit>,
+        ),
+    >,
 >;
 
 enum ControlCommand {
@@ -176,14 +191,14 @@ impl ControlState {
             drop(permit);
             return Ok(());
         }
-        if self.pending_stop.is_some() {
+        if self.pending_stops.len() == MAX_PENDING_STOP_RESULTS {
             send_command_result(
                 wire,
                 command_id,
                 ControlOutcome::Rejected {
                     failure: control_not_applied(ProtocolError::new(
                         ErrorCode::ControlBackpressure,
-                        "attachment already has one pending Stop result",
+                        "attachment has 64 pending recoverable Stop results",
                     )),
                 },
             )
@@ -192,9 +207,11 @@ impl ControlState {
             return Ok(());
         }
 
-        match manager.begin_recoverable_stop(operation) {
+        let mut permit = Some(permit);
+        match manager.begin_recoverable_stop_with_owner_permit(operation, &mut permit) {
             Ok(pending) => {
-                self.pending_stop = Some(command_id);
+                let inserted = self.pending_stops.insert(command_id);
+                debug_assert!(inserted, "attachment command IDs are unique");
                 results.push(
                     async move {
                         let (_, result) = pending.resolve().await;
@@ -272,7 +289,8 @@ async fn handle_frame(
         ControlCommand::Input(data) => match run.begin_input(data) {
             Ok(pending) => {
                 results.push(
-                    async move { (command_id, outcome(pending.resolve().await), permit) }.boxed(),
+                    async move { (command_id, outcome(pending.resolve().await), Some(permit)) }
+                        .boxed(),
                 );
             }
             Err(failure) => {
@@ -287,7 +305,8 @@ async fn handle_frame(
         ControlCommand::Signal(signal) => match run.begin_signal(signal) {
             Ok(pending) => {
                 results.push(
-                    async move { (command_id, outcome(pending.resolve().await), permit) }.boxed(),
+                    async move { (command_id, outcome(pending.resolve().await), Some(permit)) }
+                        .boxed(),
                 );
             }
             Err(failure) => {
