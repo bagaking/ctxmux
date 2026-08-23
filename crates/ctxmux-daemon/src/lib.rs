@@ -4,7 +4,7 @@
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     io::{self, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
@@ -40,12 +40,14 @@ pub use persistence::PersistenceError;
 use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
     CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
-    MAX_FRAME_BYTES, NativeRuntimeCapabilities, OutputChunk, OutputReplay, PROTOCOL_VERSION,
-    ProtocolError, RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, Response,
-    RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
-    RuntimeBuildId, RuntimeCapabilityManifest, RuntimeDescription, RuntimeId,
-    RuntimeServiceCapabilities, ServerFrame, TerminalSize, TmuxRunEvent, TmuxRuntimeCapabilities,
-    decode_frame, encode_frame,
+    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError,
+    RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_START,
+    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, Request,
+    Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
+    RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalSize,
+    TmuxRunEvent, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system};
@@ -1221,30 +1223,40 @@ impl RunManager {
         }
     }
 
-    fn runtime_description(&self) -> RuntimeDescription {
+    fn runtime_identity(&self) -> RuntimeIdentity {
         let persistent = self.persistence.is_some();
-        RuntimeDescription {
-            runtime_id: self.runtime_id,
+        let mut capabilities = BTreeMap::from([
+            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+                1,
+            ),
+            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+        ]);
+        if persistent {
+            capabilities.insert(RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1);
+            capabilities.insert(
+                RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY.to_owned(),
+                1,
+            );
+        } else {
+            capabilities.insert(RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1);
+        }
+        RuntimeIdentity {
             daemon_instance_id: self.daemon_instance,
+            runtime_id: self.runtime_id,
+            runtime_id_persistence: if persistent {
+                RuntimeIdPersistence::StateDir
+            } else {
+                RuntimeIdPersistence::Daemon
+            },
             build_id: self.build_id.clone(),
             protocol_generation: PROTOCOL_VERSION,
-            capabilities: RuntimeCapabilityManifest {
-                version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-                native: NativeRuntimeCapabilities {
-                    start: true,
-                    recoverable_input: true,
-                    fork_level_a: true,
-                    execute_materialized_level_b: true,
-                },
-                tmux: TmuxRuntimeCapabilities {
-                    discover: true,
-                    import: !persistent,
-                },
-                services: RuntimeServiceCapabilities {
-                    persistent_state_active: persistent,
-                    planned_exec_upgrade_continuity: persistent,
-                },
-            },
+            platform: std::env::consts::OS.to_owned(),
+            arch: std::env::consts::ARCH.to_owned(),
+            capabilities,
         }
     }
 
@@ -4364,7 +4376,7 @@ async fn handle_connection(
             send(
                 &mut wire,
                 &ServerFrame::Hello {
-                    runtime: manager.runtime_description(),
+                    runtime: manager.runtime_identity(),
                 },
             )
             .await?;

@@ -12,9 +12,13 @@ use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition, ControlOutcome,
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InputOperationKey, MAX_FRAME_BYTES,
-    PROTOCOL_VERSION, RUNTIME_CAPABILITY_MANIFEST_VERSION, RecoverableInput, Request, RunEvent,
-    RunId, RunInputKind, RunInputReference, RunLineage, RunSignal, RunSpec, RunState,
-    RuntimeDescription, ServerFrame, StopDisposition, TerminalSize, decode_frame, encode_frame,
+    PROTOCOL_VERSION, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+    RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+    RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
+    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER,
+    RecoverableInput, Request, RunEvent, RunId, RunInputKind, RunInputReference, RunLineage,
+    RunSignal, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, ServerFrame,
+    StopDisposition, TerminalSize, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde_json::Value;
@@ -729,24 +733,31 @@ fn assert_protocol_error(error: ClientError, expected: ErrorCode) {
     }
 }
 
-fn assert_persistent_runtime_manifest(runtime: &RuntimeDescription) {
+fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.protocol_generation, PROTOCOL_VERSION);
     assert_eq!(
-        runtime.capabilities.version,
-        RUNTIME_CAPABILITY_MANIFEST_VERSION
+        runtime.runtime_id_persistence,
+        RuntimeIdPersistence::StateDir
     );
-    assert!(runtime.capabilities.native.start);
-    assert!(runtime.capabilities.native.recoverable_input);
-    assert!(runtime.capabilities.native.fork_level_a);
-    assert!(runtime.capabilities.native.execute_materialized_level_b);
-    assert!(runtime.capabilities.tmux.discover);
-    assert!(!runtime.capabilities.tmux.import);
-    assert!(runtime.capabilities.services.persistent_state_active);
-    assert!(
-        runtime
-            .capabilities
-            .services
-            .planned_exec_upgrade_continuity
+    assert_eq!(runtime.platform, std::env::consts::OS);
+    assert_eq!(runtime.arch, std::env::consts::ARCH);
+    assert_eq!(
+        runtime.capabilities,
+        BTreeMap::from([
+            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+                1,
+            ),
+            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+            (RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1),
+            (
+                RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY.to_owned(),
+                1,
+            ),
+        ])
     );
 }
 
@@ -1553,7 +1564,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         .runtime_info()
         .await
         .expect("read pre-upgrade Runtime description");
-    assert_persistent_runtime_manifest(&before_runtime);
+    assert_persistent_runtime_identity(&before_runtime);
     let daemon_instance = before_runtime.daemon_instance_id;
     let (mut attachment, snapshot) = daemon
         .client
@@ -1606,7 +1617,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         .runtime_info()
         .await
         .expect("read post-upgrade Runtime description");
-    assert_persistent_runtime_manifest(&after_runtime);
+    assert_persistent_runtime_identity(&after_runtime);
     assert_eq!(
         after_runtime.runtime_id, before_runtime.runtime_id,
         "planned upgrade preserves the logical Runtime"

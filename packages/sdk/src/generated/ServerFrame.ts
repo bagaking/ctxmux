@@ -5,13 +5,13 @@ import type { ControlOutcome } from "./ControlOutcome.js";
 import type { ProtocolError } from "./ProtocolError.js";
 import type { Response } from "./Response.js";
 import type { RunEvent } from "./RunEvent.js";
-import type { RuntimeDescription } from "./RuntimeDescription.js";
+import type { RuntimeIdentity } from "./RuntimeIdentity.js";
 
 /**
  * Frames sent by the daemon.
  */
 export type ServerFrame =
-  | { type: "hello"; runtime: RuntimeDescription }
+  | { type: "hello"; runtime: RuntimeIdentity }
   | { type: "response"; response: Response }
   | { type: "attached"; snapshot: AttachedHeader }
   | { type: "event"; event: RunEvent }

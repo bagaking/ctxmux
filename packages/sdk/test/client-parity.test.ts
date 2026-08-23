@@ -20,7 +20,6 @@ import {
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
-  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   createOperationKey,
   defineRun,
   inputOperationKey,
@@ -49,28 +48,28 @@ test(
     ) as unknown;
     assert.deepEqual(cliRuntime, runtime);
     assert.deepEqual(Object.keys(runtime).sort(), [
-      "build_id",
+      "arch",
+      "buildId",
       "capabilities",
-      "daemon_instance_id",
-      "protocol_generation",
-      "runtime_id",
+      "daemonInstanceId",
+      "platform",
+      "protocolGeneration",
+      "runtimeId",
+      "runtimeIdPersistence",
     ]);
-    assert.equal(runtime.protocol_generation, PROTOCOL_VERSION);
-    assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
-    assert.match(runtime.build_id, /^ctxmuxd\/[^/]+$/u);
+    assert.equal(runtime.protocolGeneration, PROTOCOL_VERSION);
+    assert.equal(runtime.runtimeIdPersistence, "daemon");
+    assert.notEqual(runtime.runtimeId, runtime.daemonInstanceId);
+    assert.match(runtime.buildId, /^ctxmuxd\/[^/]+$/u);
+    assert.notEqual(runtime.platform, "");
+    assert.notEqual(runtime.arch, "");
     assert.deepEqual(runtime.capabilities, {
-      version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-      native: {
-        start: true,
-        recoverable_input: true,
-        fork_level_a: true,
-        execute_materialized_level_b: true,
-      },
-      tmux: { discover: true, import: true },
-      services: {
-        persistent_state_active: false,
-        planned_exec_upgrade_continuity: false,
-      },
+      "native.execute_materialized_level_b": 1,
+      "native.fork_level_a": 1,
+      "native.recoverable_input": 1,
+      "native.start": 1,
+      "tmux.discover": 1,
+      "tmux.import": 1,
     });
 
     const shell = concatShell(
@@ -93,8 +92,8 @@ test(
     ]);
     const runId = startedByCli.stdout.trim() as RunId;
     assert.notEqual(runId, "");
-    assert.notEqual(runId, runtime.runtime_id);
-    assert.notEqual(runId, runtime.daemon_instance_id);
+    assert.notEqual(runId, runtime.runtimeId);
+    assert.notEqual(runId, runtime.daemonInstanceId);
 
     const firstClient = new CtxmuxClient({ socketPath });
     const initialStatus = await firstClient.status(runId);

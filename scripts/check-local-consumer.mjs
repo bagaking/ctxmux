@@ -305,7 +305,6 @@ import {
   IntegrationProvenanceError,
   IntegrationUnavailableError,
   PROTOCOL_VERSION,
-  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   defineRun,
   registerIntegration,
 } from "@ctxmux/sdk";
@@ -497,23 +496,30 @@ async function stopDaemon() {
 try {
   await waitForDaemon();
   const runtime = await client.runtimeInfo();
-  assert.equal(runtime.daemon_instance_id, (await readiness).daemon_instance);
-  assert.notEqual(runtime.runtime_id, runtime.daemon_instance_id);
-  assert.equal(runtime.build_id, "ctxmuxd/" + expectedVersion);
-  assert.equal(runtime.protocol_generation, expectedProtocol);
+  assert.deepEqual(Object.keys(runtime).sort(), [
+    "arch",
+    "buildId",
+    "capabilities",
+    "daemonInstanceId",
+    "platform",
+    "protocolGeneration",
+    "runtimeId",
+    "runtimeIdPersistence",
+  ]);
+  assert.equal(runtime.daemonInstanceId, (await readiness).daemon_instance);
+  assert.notEqual(runtime.runtimeId, runtime.daemonInstanceId);
+  assert.equal(runtime.runtimeIdPersistence, "daemon");
+  assert.equal(runtime.buildId, "ctxmuxd/" + expectedVersion);
+  assert.equal(runtime.protocolGeneration, expectedProtocol);
+  assert.notEqual(runtime.platform, "");
+  assert.notEqual(runtime.arch, "");
   assert.deepEqual(runtime.capabilities, {
-    version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-    native: {
-      start: true,
-      recoverable_input: true,
-      fork_level_a: true,
-      execute_materialized_level_b: true,
-    },
-    tmux: { discover: true, import: true },
-    services: {
-      persistent_state_active: false,
-      planned_exec_upgrade_continuity: false,
-    },
+    "native.execute_materialized_level_b": 1,
+    "native.fork_level_a": 1,
+    "native.recoverable_input": 1,
+    "native.start": 1,
+    "tmux.discover": 1,
+    "tmux.import": 1,
   });
   assert.deepEqual(
     JSON.parse(
@@ -529,8 +535,8 @@ try {
       ],
     }),
   );
-  assert.notEqual(run.id, runtime.runtime_id);
-  assert.notEqual(run.id, runtime.daemon_instance_id);
+  assert.notEqual(run.id, runtime.runtimeId);
+  assert.notEqual(run.id, runtime.daemonInstanceId);
   const status = await client.status(run.id);
   assert.equal(status.state.type, "running");
   assert.notEqual(status.pid, null);
@@ -732,14 +738,12 @@ import {
   IntegrationMaterializationError,
   IntegrationProvenanceError,
   IntegrationUnavailableError,
-  RUNTIME_CAPABILITY_MANIFEST_VERSION,
   registerIntegration,
   type Integration,
   type IntegrationSemanticEvent,
   type RunInfo,
   type RunSpec,
-  type RuntimeCapabilityManifest,
-  type RuntimeDescription,
+  type RuntimeIdentity,
 } from "@ctxmux/sdk";
 import { shellIntegration } from "@ctxmux/sdk/integrations";
 
@@ -785,20 +789,9 @@ const provider: Integration<
 declare const client: CtxmuxClient;
 declare const parent: RunInfo;
 declare const config: ProviderForkConfig;
-const runtimeInfo: Promise<RuntimeDescription> = client.runtimeInfo();
-const manifest: RuntimeCapabilityManifest = {
-  version: RUNTIME_CAPABILITY_MANIFEST_VERSION,
-  native: {
-    start: true,
-    recoverable_input: true,
-    fork_level_a: true,
-    execute_materialized_level_b: true,
-  },
-  tmux: { discover: true, import: true },
-  services: {
-    persistent_state_active: false,
-    planned_exec_upgrade_continuity: false,
-  },
+const runtimeInfo: Promise<RuntimeIdentity> = client.runtimeInfo();
+const capabilities: RuntimeIdentity["capabilities"] = {
+  "native.start": 1,
 };
 const registered = registerIntegration(client, provider);
 const child: Promise<RunInfo> = registered.forkLevelB(parent, config);
@@ -815,7 +808,7 @@ const publicErrors: readonly Error[] = [
 void child;
 void publicErrors;
 void runtimeInfo;
-void manifest;
+void capabilities;
 void shellIntegration;
 `;
 

@@ -1,10 +1,7 @@
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
-import {
-  MAX_RUNTIME_BUILD_ID_BYTES,
-  RUNTIME_CAPABILITY_MANIFEST_VERSION,
-} from "./generated/constants.js";
+import { MAX_RUNTIME_BUILD_ID_BYTES } from "./generated/constants.js";
 
 const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "version_mismatch",
@@ -46,7 +43,7 @@ export function validateServerFrame(value: unknown): ServerFrame {
   const frame = record(value, "$frame");
   switch (discriminant(frame, "$frame")) {
     case "hello":
-      runtimeDescription(frame.runtime, "$frame.runtime");
+      runtimeIdentity(frame.runtime, "$frame.runtime");
       break;
     case "response":
       response(frame.response, "$frame.response");
@@ -72,73 +69,66 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
-function runtimeDescription(value: unknown, path: string): void {
+function runtimeIdentity(value: unknown, path: string): void {
   const runtime = record(value, path);
   exactFields(runtime, path, [
-    "runtime_id",
-    "daemon_instance_id",
-    "build_id",
-    "protocol_generation",
+    "daemonInstanceId",
+    "runtimeId",
+    "runtimeIdPersistence",
+    "buildId",
+    "protocolGeneration",
+    "platform",
+    "arch",
     "capabilities",
   ]);
-  canonicalUuid(runtime.runtime_id, `${path}.runtime_id`);
-  canonicalUuid(runtime.daemon_instance_id, `${path}.daemon_instance_id`);
-  const buildId = string(runtime.build_id, `${path}.build_id`);
+  canonicalUuid(runtime.daemonInstanceId, `${path}.daemonInstanceId`);
+  canonicalUuid(runtime.runtimeId, `${path}.runtimeId`);
+  if (
+    runtime.runtimeIdPersistence !== "daemon" &&
+    runtime.runtimeIdPersistence !== "state_dir"
+  ) {
+    throw invalid(
+      `${path}.runtimeIdPersistence`,
+      '"daemon" or "state_dir"',
+    );
+  }
+  const buildId = string(runtime.buildId, `${path}.buildId`);
   const buildIdBytes = new TextEncoder().encode(buildId).byteLength;
   if (buildIdBytes === 0 || buildIdBytes > MAX_RUNTIME_BUILD_ID_BYTES) {
     throw invalid(
-      `${path}.build_id`,
+      `${path}.buildId`,
       `a non-empty UTF-8 string of at most ${String(MAX_RUNTIME_BUILD_ID_BYTES)} bytes`,
     );
   }
   unsignedInteger(
-    runtime.protocol_generation,
-    `${path}.protocol_generation`,
+    runtime.protocolGeneration,
+    `${path}.protocolGeneration`,
     0xffff,
   );
-  runtimeCapabilityManifest(runtime.capabilities, `${path}.capabilities`);
+  nonEmptyString(runtime.platform, `${path}.platform`);
+  nonEmptyString(runtime.arch, `${path}.arch`);
+  runtimeCapabilities(runtime.capabilities, `${path}.capabilities`);
 }
 
-function runtimeCapabilityManifest(value: unknown, path: string): void {
-  const manifest = record(value, path);
-  exactFields(manifest, path, ["version", "native", "tmux", "services"]);
-  if (manifest.version !== RUNTIME_CAPABILITY_MANIFEST_VERSION) {
-    throw invalid(
-      `${path}.version`,
-      `Runtime capability manifest version ${String(RUNTIME_CAPABILITY_MANIFEST_VERSION)}`,
-    );
+function runtimeCapabilities(value: unknown, path: string): void {
+  const capabilities = record(value, path);
+  for (const [key, version] of Object.entries(capabilities)) {
+    if (
+      typeof version !== "number" ||
+      !Number.isSafeInteger(version) ||
+      version <= 0
+    ) {
+      throw invalid(`${path}.${key}`, "a positive safe integer version");
+    }
   }
-  const native = record(manifest.native, `${path}.native`);
-  exactFields(native, `${path}.native`, [
-    "start",
-    "recoverable_input",
-    "fork_level_a",
-    "execute_materialized_level_b",
-  ]);
-  boolean(native.start, `${path}.native.start`);
-  boolean(native.recoverable_input, `${path}.native.recoverable_input`);
-  boolean(native.fork_level_a, `${path}.native.fork_level_a`);
-  boolean(
-    native.execute_materialized_level_b,
-    `${path}.native.execute_materialized_level_b`,
-  );
-  const tmux = record(manifest.tmux, `${path}.tmux`);
-  exactFields(tmux, `${path}.tmux`, ["discover", "import"]);
-  boolean(tmux.discover, `${path}.tmux.discover`);
-  boolean(tmux.import, `${path}.tmux.import`);
-  const services = record(manifest.services, `${path}.services`);
-  exactFields(services, `${path}.services`, [
-    "persistent_state_active",
-    "planned_exec_upgrade_continuity",
-  ]);
-  boolean(
-    services.persistent_state_active,
-    `${path}.services.persistent_state_active`,
-  );
-  boolean(
-    services.planned_exec_upgrade_continuity,
-    `${path}.services.planned_exec_upgrade_continuity`,
-  );
+}
+
+function nonEmptyString(value: unknown, path: string): string {
+  const result = string(value, path);
+  if (result.length === 0) {
+    throw invalid(path, "a non-empty string");
+  }
+  return result;
 }
 
 /** Reject a generation-10 u64 before JavaScript can round a replay cursor. */
