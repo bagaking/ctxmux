@@ -14,12 +14,16 @@ The category is a **context-aware Run multiplexer**. It occupies the local
 infrastructure layer that tmux occupies for terminal sessions, but its public
 model is a Run rather than a terminal layout.
 
+ctxmux is independently useful at this layer. The daemon and CLI provide the
+standalone Run lifecycle; SDK consumers, editors, and Agent products are
+optional clients of the same public boundary.
+
 ## Who it is for
 
 ctxmux primarily serves:
 
-- client and editor authors who need to embed local process and Agent runtime
-  behavior without rebuilding it;
+- client and editor authors who need to embed local process runtime foundations
+  without rebuilding PTY and process ownership;
 - terminal-first developers who want reliable local Runs that survive client
   churn;
 - tool authors composing higher-level workflows such as Crucible, forked
@@ -46,13 +50,17 @@ kind of persistence, resume, or fork they are requesting.
 ### Runs are universal
 
 Shells, coding agents, servers, tests, benchmarks, and scripts share the same
-runtime lifecycle. Agent metadata belongs in an Integration, not in the Run
+runtime lifecycle. Provider sessions, permissions, messages, and Agent status
+belong to an embedding client's Provider or Integration layer, not in the Run
 foundation.
 
 ### Context fidelity is pluggable
 
 Every Run has a portable baseline. Richer capture, resume, and fork behavior is
-provided by an Integration and exposed as explicit capabilities.
+supplied as an explicit, fully materialized plan by a host-side Integration or
+Provider and exposed as an explicit capability. ctxmux executes and records the
+declared Run operation; it does not infer provider semantics from terminal
+output.
 
 ### Clients are disposable
 
@@ -75,7 +83,7 @@ silently replace a high-fidelity operation with a weaker one.
 ctxmux should make parallel search, Context fork, Crucible, and MapReduce easy
 to compose. It does not own their scheduling, evaluation, or stopping policy.
 Message delivery, semantic acknowledgement, reply correlation, and task state
-likewise remain Integration or harness responsibilities rather than daemon Run
+likewise remain embedding-client responsibilities rather than daemon Run
 semantics.
 
 ### Local-first and embeddable
@@ -84,12 +92,30 @@ The runtime works headlessly and does not require an editor, Electron, React,
 or a hosted control plane. A CLI and first-party clients use the same public
 surface as external clients.
 
+### Standalone is a product invariant
+
+ctxmux is a complete local Runtime product, not a helper library whose basic
+lifecycle depends on a higher-level Agent client. A clean installation must be
+able to activate its daemon, start an arbitrary command as a Run, detach and
+reattach, send input and resize, replay ordered output, wait for terminal state,
+stop the owned process scope, and inspect runtime and Run identity through
+ctxmux's own CLI or SDK.
+
+Provider-neutral launch recipes, the shell Integration, portable Level A fork,
+and execution of a caller-materialized Level B `RunSpec` remain ctxmux
+capabilities. Provider session extraction, provider-native resume, semantic
+replay interpretation, working-state and permission policy, Agent-to-Agent
+messaging, scheduling, and evaluation belong to higher clients. Missing Level B
+provenance is an explicit unsupported result; it never silently becomes Level A.
+
 ## Success
 
-ctxmux succeeds when a new client can install an SDK, connect to the local
-runtime, select or register an Integration, and manage local Runs without
-reimplementing PTY transport, lifecycle, reconnect, output, and Integration
-differences.
+ctxmux succeeds first when its published daemon and CLI pass the complete
+standalone lifecycle in a clean environment with no higher-level client or
+provider CLI installed. It additionally succeeds as an embedding surface when
+a new client can install an SDK, connect to the local runtime, and manage local
+Runs without reimplementing activation, PTY transport, lifecycle, reconnect,
+output, identity, or capability negotiation.
 
 The strongest proof is behavioral: real Runs survive client exit, can be
 reattached, and preserve only the context fidelity their capabilities promise.
@@ -97,8 +123,12 @@ reattached, and preserve only the context fidelity their capabilities promise.
 ## Non-goals
 
 - a general Agent planner, scheduler, evaluator, or team runtime;
+- ownership of provider sessions, provider-native resume, semantic transcript
+  reconstruction, working-state or permission policy, or Agent-to-Agent
+  messaging;
 - copying arbitrary live process memory or undeclared hidden state;
-- a distributed or hosted execution platform;
+- a hosted control plane, Relay, account/environment federation, or remote
+  scheduling platform; a future owner-host Runtime transport is not excluded;
 - a plugin marketplace or untrusted plugin sandbox;
 - wire compatibility with tmux's private client-server protocol;
 - a complete editor inside the core runtime repository.

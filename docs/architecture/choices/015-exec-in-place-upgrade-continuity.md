@@ -1,6 +1,6 @@
 # 015 — Exec-in-place upgrade continuity
 
-- Status: accepted, implementation pending
+- Status: accepted and implemented for persistent mode
 - Scope: keeping live PTY control across an intentional daemon upgrade or
   restart, in persistent mode
 - Supersedes: the two-process transactional direction of Feature **f-228**
@@ -52,41 +52,60 @@ guessed PID. Identity is possession.
 
 Because `execve` preserves the fd table for descriptors whose close-on-exec flag
 is cleared, and runs no destructors, the following survive: the child process,
-the PTY master fd, the input-writer fd, the listener socket fd, and the SQLite
-state-lock fd. The socket inode is never unlinked (`SocketGuard::drop` does not
-run) and the children are never fail-stopped (the owner drop does not run).
+one PTY master fd per live Run, the listener socket fd, the SQLite state-lock fd,
+and one manifest fd. The incoming image duplicates the bidirectional master for
+its reader/writer views. The socket inode is never unlinked
+(`SocketGuard::drop` does not run) and the children are never fail-stopped (the
+owner drop does not run).
 
 Everything else is rebuilt in the new image from persisted state plus the
 inherited fds: the tokio runtime, the single daemon-wide native owner thread,
 each Run's metadata / lineage / capabilities / durable replay cursor, each live
-Run's control owner (wrapping the inherited master fd), output reader, and
+Run's control owner (wrapping the inherited master fd), output reader, complete
+settled recoverable-Input ledger/cursor/poisoned-lane state, and
 `NativeSession` SID anchor. The `portable_pty::Child` handle has no PID→Child
 constructor, so it is replaced by an **adopted-child handle** that wraps the
 bare persisted PID and reaps through `waitid`, preserving the existing
 non-reaping-probe-then-reap ordering and the reaped-leader latch that guards
 against PID reuse.
 
-Per-connection tokio protocol state, attachment cursors, and pending commands
-are **not** migrated. Clients briefly disconnect and reconnect from their last
-observed byte cursor — an existing, tested capability. The daemon instance
-identity is preserved across the exec so reconnecting clients are not fenced.
+Per-connection tokio protocol state and attachment cursors are **not** migrated.
+Before extraction, a daemon-wide request gate drains every admitted mutation
+through owner completion and response write. Commands arriving on an existing
+attachment during that drain receive an explicit retryable `not_applied`
+result. Clients then disconnect and reconnect from their last observed byte
+cursor. The daemon instance identity is preserved across the exec, so retained
+recoverable-Input operations remain addressable after reconnect.
 
 ### Handoff and reconciliation
 
-The upgrade carries, across the exec, a manifest of `{ RunId → fd numbers }` for
-every live Run plus the epoch string to reuse. Close-on-exec is cleared on
-exactly the manifest's fds, the listener fd, the state-lock fd, and the manifest
-channel itself; every other descriptor stays close-on-exec so nothing leaks into
-the new image.
+The upgrade carries a version-2 manifest containing the epoch and, for every
+live Run, `{ RunId, child PID, master fd, complete settled input state }`. It is
+written to an owner-only regular file created inside the state directory and
+immediately unlinked, avoiding pipe-capacity deadlock for bounded ledgers while
+leaving no pathname. Close-on-exec is cleared on exactly the listener, state
+lock, live masters, and manifest file; every other descriptor remains
+close-on-exec.
+
+Before changing admission, all fallible file/executable setup is completed.
+The request gate then transitions `Open -> Draining`, waits for its permit count
+to reach zero, and seals. The native owner preflights every entry before
+relinquishing the first: lifecycle must be `Watching`, the master and PID must
+exist, and no input, signal, Stop, child command, or pending recoverable
+operation may cross the snapshot. Timeout or preflight failure drops the fence
+and restores full service. Extraction is the point of no return; later barrier,
+serialization, CLOEXEC, or `execve` failure is fail-stop.
 
 Startup reconciliation, which today turns every `running` row into
 `interrupted { daemon_restart }`, gains one exclusion: rows whose `RunId` is in
 the inherited live set stay `running` and are re-adopted from their inherited
 fds; all other `running` rows (a real crash remnant) still become `interrupted`
-as before. The discriminator is un-forgeable because it is "a usable fd for this
-RunId actually arrived on this exec", not a stored flag; a RunId in the set
-without a usable fd falls back to normal reconciliation. With no manifest — the
-crash path — the live set is empty and behavior is identical to 009.
+as before. The discriminator is possession of a validated, unique live
+descriptor set, not a stored flag. A malformed schema, duplicate descriptor or
+Run, unusable fd, invalid child PID, or inconsistent input ledger fails startup
+closed; it does not partially adopt or silently downgrade one Run to historical
+reconciliation. With no manifest — the cold/crash path — the live set is empty
+and behavior is identical to 009.
 
 The UUID epoch is **preserved** across an exec-in-place, not minted fresh. The
 epoch is the persistent-mode daemon-instance identity used to fence client
@@ -132,6 +151,12 @@ re-exec changes no frame.
   published endpoint is byte-identical before and after.
 - Memory-only mode makes no upgrade-continuity claim and treats `SIGHUP` as a
   no-op.
+- Every pre-extract failure is reversible: the current image keeps all Run,
+  child, PTY, creation, and tmux ownership and returns to full service. Every
+  post-extract failure is fail-stop; no partial owner resumes.
+- A preserved daemon instance requires preservation of the complete settled
+  recoverable-Input ledger and cursor. A response-loss retry after upgrade
+  returns the original range without another physical write.
 
 ## Alternatives
 
@@ -159,8 +184,8 @@ re-exec changes no frame.
     process, no `SCM_RIGHTS`, and no dual-owner window — the properties that made
     the two-process transaction expensive. f-228's other invariants
     (exactly-one-owner, unchanged Run/PID/PTY identity, ordered output
-    continuity, explicit disposition for crossing controls) are preserved and
-    are implemented as A11 requirements, not weakened.
+    continuity, explicit disposition for crossing controls) are preserved by
+    the implemented request drain and all-owner extraction boundary.
 - **A standing per-Run owner or shim** that always holds the fd so control also
   survives a *crash*. Rejected: one extra process and supervision boundary per
   Run, reversing the daemon-wide-owner performance work and breaking the frozen
@@ -175,8 +200,9 @@ re-exec changes no frame.
 
 Exec-in-place covers planned upgrade and restart only. It cannot recover live
 control after a crash, because a dead process holds no fd to carry, and it never
-adopts a process by PID. Host-reboot and crash cases are served semantically by
-[016](016-semantic-resume.md), not by this record.
+adopts a process by PID. Host-reboot and provider-semantic continuation belong
+to a higher client; [016](016-interrupted-run-derivation.md) records how ctxmux
+executes an explicit generic derivation plan without owning Provider policy.
 
 The re-adopted child is observed through `waitid` on its bare PID; the reaped
 latch must start unset in the reconstructed session so PID reuse cannot
@@ -185,39 +211,49 @@ raw fd, so the master fd is wrapped in a local adapter that implements resize,
 size query, and raw-fd access; the writer is either recovered as its own fd or
 written through a fresh handle over the bidirectional master fd.
 
-Recoverable-Input operation history is **connection-local**, and per-connection
-tokio state does not cross the exec (see above), so the in-memory ledger is lost
-when the connection drops. This is in genuine tension with the preserved epoch:
-because exec-in-place keeps the daemon-instance identity, a reconnecting client
-believes it is still the same incarnation and may **retry** an input operation
-whose accepted/applied receipt it never received. The same-incarnation contract
-would normally let the retained ledger answer that retry idempotently; across
-the exec the ledger is gone. The incoming image must therefore not silently
-double-apply: an operation key it cannot find in a rebuilt ledger is treated as
-first-seen, and A9/A11 own the reconnect handling that keeps "unknown input is
-never replayed" true (f-228 Transfer Check). Durable replay and the byte cursor
-are unaffected — only the connection-local operation-key memory is rebuilt.
+Recoverable-Input operation history is Run-local and bounded, not
+connection-local. The complete settled ledger and applied cursor cross in the
+manifest because the preserved daemon instance keeps same-incarnation retry
+valid. Pending operations cannot be serialized: the request gate and native
+owner preflight must drain them first or abort before extraction.
 
 ## Wrong-case corpus
 
-To be populated during implementation. Anticipated cases: a cleared-CLOEXEC fd
-that fails to survive the exec (silent terminal orphan); a manifest RunId whose
-fd is stale or missing (must fall back to reconciliation, not adopt a dead fd);
-a concurrent opener during a mishandled lock release (epoch theft reconciling
-live Runs); an `execve` failure that must fall back to fail-stop rather than
-leak un-waited children; the second fd-hygiene boundary — a non-CLOEXEC ambient
-descriptor must not survive into the re-exec'd image.
+- An incomplete manifest, duplicate fd/Run/input key, zero child PID, stale
+  schema, or inconsistent input range must fail the incoming image before any
+  partial exposure.
+- A blocked crossing mutation must keep extraction fenced until its unique
+  response is written; a later old-attachment command is explicitly
+  `not_applied` or the connection is closed.
+- A failure before extraction must reopen full service with the original child
+  and PTY; a failure after extraction must fail-stop.
+- Reader activity in the barrier-to-exec window can consume output that neither
+  image publishes; extraction must stop the old reader before the durable
+  barrier.
+- Signal termination after re-adoption must remain a public signal identity,
+  not synthetic exit code `128 + signal`.
+- Repeated upgrades must not accumulate an fd, thread, second native owner, or
+  handoff pathname.
 
 ## Fixture mapping
 
-- Future: a real re-exec of `CARGO_BIN_EXE_ctxmuxd` proves the same child PID
+- Covered: a real re-exec of `CARGO_BIN_EXE_ctxmuxd` proves the same child PID
   survives as a live-controllable Run, input echoes past the pre-upgrade cursor,
   a fresh attach from that cursor shows contiguous output with no gap, and the
   per-Run descriptor and thread census is unchanged.
-- Future: a `SIGHUP` in memory-only mode is a logged no-op.
+- Covered: a response-loss recoverable Input crosses a real exec and returns its
+  original range without a duplicate child-visible write.
+- Covered: a blocked real PTY Input crosses `SIGHUP`; a same-attachment command
+  observes the drain retry result, the Input ACK precedes resume, and the
+  incoming cursor advances exactly once.
+- Covered: handoff setup failure before extraction restores status, existing
+  attachment control, creation, and Stop on the original child.
+- Covered: repeated real upgrades preserve daemon/child PID and listener inode,
+  keep settled fd/thread counts equal, and leave no handoff pathname.
+- Covered: a `SIGHUP` in memory-only mode is a logged no-op.
 - Future: a `running` row not in the live set still reconciles to `interrupted`
   during an upgrade (mixed handed-off and orphaned rows).
-- Future: the second fd-hygiene boundary — an ambient non-CLOEXEC descriptor is
+- Covered: the second fd-hygiene boundary — an ambient non-CLOEXEC descriptor is
   absent in the re-exec'd image.
 
 ## Open questions
@@ -245,4 +281,3 @@ descriptor must not survive into the re-exec'd image.
   reconciliation query, epoch allocation, and the live-set exclusion.
 - `crates/ctxmux-daemon/src/main.rs`: inherited-fd parsing, extended with the
   handoff manifest and reused epoch.
-- `docs/plans/2026-08-22-daemon-upgrade-continuity-design.md`: full design.

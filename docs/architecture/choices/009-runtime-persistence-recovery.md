@@ -36,9 +36,12 @@ The accepted recovery class is historical Run recovery:
   startup normalization before socket publication.
   Its public PID is cleared. It supports the same historical read/replay and
   Level A behavior as an exited Run, but never claims an exit code.
-- Live PTY ownership, child-handle transfer, PID re-adoption, and transparent
-  input/resize/stop continuity are unsupported. A replacement daemon never
-  opens, attaches to, or signals a process named only by persisted metadata.
+- After a cold restart, live PTY ownership, child-handle transfer, PID
+  re-adoption, and transparent input/resize/stop continuity are unsupported. A
+  replacement daemon never opens, attaches to, or signals a process named only
+  by persisted metadata. Decision 015 is the narrow planned-upgrade exception:
+  the same daemon process carries actual master descriptors and wait authority
+  across `execve`; it does not infer ownership from SQLite.
 
 Before opening SQLite or publishing its socket, a persistent daemon validates
 that the state directory is not a symlink, is owned by the effective user, and
@@ -50,7 +53,9 @@ explicitly unlocks it after closing SQLite, so a Run child caught between
 description. A second opener fails with typed `state_in_use`; it cannot allocate
 an epoch or reconcile Runs still owned by the first daemon.
 
-While that lock is held, each daemon allocates a fresh UUID epoch. Startup lets
+While that lock is held, each cold daemon start allocates a fresh UUID epoch.
+An intentional exec-in-place upgrade inherits the same locked file description
+and epoch because it remains the same live-control owner. Startup lets
 SQLite perform its documented journal recovery, then validates exact schema
 version, `PRAGMA quick_check`, and application invariants: typed IDs, bounded
 creation keys, an exact BINARY unique-key index, and typed JSON, a required
@@ -225,6 +230,10 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - Active: daemon kill while a Run is live restores only the committed
   replay window, exposes durable oldest/head/truncation cursors, marks the Run
   interrupted, and never claims live PTY control.
+- Active: an intentional persistent-mode `SIGHUP` preserves daemon and child
+  PIDs, listener inode, live PTY control, ordered output, and the complete
+  recoverable-Input cursor/ledger across a real exec, while existing
+  attachments reconnect.
 - Active / `PERSIST-01`: a stored running row naming an unrelated live PID is
   reconciled to interrupted; the unrelated process and old orphan are neither
   opened nor signalled.
@@ -247,9 +256,10 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
   [015](015-exec-in-place-upgrade-continuity.md) keeps live control across a
   *planned* upgrade by carrying the master fd across an `execve`-in-place — the
   same process, so no metadata-named re-adoption and no broker — and
-  [016](016-semantic-resume.md) reconstructs a crashed Run *semantically* rather
-  than re-adopting its dead PTY. Crash-time live handoff and PID adoption remain
-  unsupported.
+  [016](016-interrupted-run-derivation.md) records the boundary for creating a new Run
+  from an explicit derivation plan rather than re-adopting its dead PTY.
+  Crash-time live handoff
+  and PID adoption remain unsupported.
 - Which user-facing inspection or deletion command should manage durable history
   once a real client requires it?
 - A future schema revision must decide migration and rollback before changing
