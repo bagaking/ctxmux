@@ -4,7 +4,7 @@
   "title": "Qualify the public local consumer contract",
   "slug": "public-local-consumer-contract",
   "goal": "Close only the public Run contract gaps required by an exact-commit local embedding consumer: cumulative output byte cursors, interrupt plus complete process-tree stop, and reproducible SDK/binary consumption with required CI evidence.",
-  "status": "done",
+  "status": "archived",
   "workspace_mode": "current_tree",
   "base_ref": "main",
   "branch": "",
@@ -131,6 +131,11 @@
     {
       "action": "task_finished",
       "detail": "T-005 => done"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "tracker metadata closed; Git workspace unchanged"
     }
-  ]
+  ],
+  "closed_from_status": "done"
 }
