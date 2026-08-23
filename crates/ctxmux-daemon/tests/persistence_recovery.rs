@@ -221,6 +221,9 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
                     latest_output_bytes,
                 } => panic!("unexpected recovered gap at {latest_output_bytes}"),
                 RunEvent::Tmux { event } => panic!("unexpected recovered tmux event: {event:?}"),
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("unexpected recovered observation discontinuity")
+                }
             }
         }
     })

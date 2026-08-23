@@ -7,15 +7,15 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::AtomicU8;
 
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
@@ -47,6 +47,7 @@ const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
 const STARTUP_BATCH_MAX_ROWS: usize = 128;
+const DISK_FULL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy)]
 struct AdmissionLimits {
@@ -83,8 +84,11 @@ pub enum PersistenceError {
         #[source]
         source: io::Error,
     },
-    #[error("ctxmux durable state database failed: {0}")]
-    Database(String),
+    #[error("ctxmux durable state database failed: {message}")]
+    Database {
+        message: String,
+        code: Option<rusqlite::ErrorCode>,
+    },
     #[error("ctxmux persistence actor stopped")]
     ActorStopped,
     #[error("failed to start ctxmux persistence actor: {0}")]
@@ -101,8 +105,40 @@ impl PersistenceError {
         }
     }
 
-    fn database(error: impl std::fmt::Display) -> Self {
-        Self::Database(error.to_string())
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the owned signature is used directly by Result::map_err while preserving SQLite's typed code"
+    )]
+    fn database(error: rusqlite::Error) -> Self {
+        Self::Database {
+            code: error.sqlite_error_code(),
+            message: error.to_string(),
+        }
+    }
+
+    fn database_message(error: impl std::fmt::Display) -> Self {
+        Self::Database {
+            message: error.to_string(),
+            code: None,
+        }
+    }
+
+    fn is_disk_full(&self) -> bool {
+        matches!(
+            self,
+            Self::Database {
+                code: Some(rusqlite::ErrorCode::DiskFull),
+                ..
+            }
+        )
+    }
+
+    #[cfg(test)]
+    fn injected_disk_full() -> Self {
+        Self::Database {
+            message: "injected database or disk is full".to_owned(),
+            code: Some(rusqlite::ErrorCode::DiskFull),
+        }
     }
 
     fn serialization(error: impl std::fmt::Display) -> Self {
@@ -142,6 +178,7 @@ pub(crate) struct Persistence {
 struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
     failure: Arc<Mutex<Option<String>>>,
+    shutdown: Arc<AtomicBool>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
     runtime_id: RuntimeId,
     epoch: String,
@@ -166,6 +203,8 @@ struct PersistenceTestHooks {
     force_startup_over_budget_once: AtomicBool,
     start_commit_crash_phase: AtomicU8,
     fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
+    fail_next_append_as_disk_full: AtomicBool,
+    fail_next_finalize_as_disk_full: AtomicBool,
 }
 
 #[cfg(test)]
@@ -324,6 +363,7 @@ struct FinalizeTestBarrier {
 
 impl Drop for PersistenceInner {
     fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
         let _ = self.sender.send(Command::Shutdown);
         if let Some(join) = mutex_lock(&self.join).take() {
             let _ = join.join();
@@ -492,6 +532,8 @@ impl Persistence {
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let actor_shutdown = Arc::clone(&shutdown);
         #[cfg(test)]
         let actor_test_hooks = Arc::clone(&test_hooks);
         let join = thread::Builder::new()
@@ -504,6 +546,7 @@ impl Persistence {
                     &command_rx,
                     &init_tx,
                     &actor_failure,
+                    &actor_shutdown,
                     #[cfg(test)]
                     &actor_test_hooks,
                 );
@@ -524,6 +567,7 @@ impl Persistence {
             inner: Arc::new(PersistenceInner {
                 sender: command_tx,
                 failure,
+                shutdown,
                 join: Mutex::new(Some(join)),
                 runtime_id,
                 epoch,
@@ -707,6 +751,30 @@ impl Persistence {
             });
         assert!(previous.is_none(), "only one finalize barrier may be armed");
         (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    fn fail_next_append_as_disk_full(&self) {
+        assert!(
+            !self
+                .inner
+                .test_hooks
+                .fail_next_append_as_disk_full
+                .swap(true, Ordering::AcqRel),
+            "only one append DiskFull fixture may be armed"
+        );
+    }
+
+    #[cfg(test)]
+    fn fail_next_finalize_as_disk_full(&self) {
+        assert!(
+            !self
+                .inner
+                .test_hooks
+                .fail_next_finalize_as_disk_full
+                .swap(true, Ordering::AcqRel),
+            "only one finalize DiskFull fixture may be armed"
+        );
     }
 
     #[cfg(test)]
@@ -916,8 +984,9 @@ enum StageCompletion {
 type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
-    reason = "one FIFO actor loop keeps batching, failure latching, barriers, and shutdown ordering explicit"
+    reason = "one FIFO actor entry keeps handoff, retry, failure, barrier, and shutdown owners explicit"
 )]
 fn actor_main(
     state_dir: &Path,
@@ -926,6 +995,7 @@ fn actor_main(
     receiver: &mpsc::Receiver<Command>,
     init: &mpsc::SyncSender<ActorInit>,
     failure: &Mutex<Option<String>>,
+    shutdown: &AtomicBool,
     #[cfg(test)] test_hooks: &Arc<PersistenceTestHooks>,
 ) {
     #[cfg(test)]
@@ -992,10 +1062,22 @@ fn actor_main(
                         Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
-                if mutex_lock(failure).is_none()
-                    && let Err(error) = store.append_batch(&batch)
-                {
-                    remember_failure(failure, &error);
+                if mutex_lock(failure).is_none() {
+                    let result = retry_disk_full(shutdown, || {
+                        #[cfg(test)]
+                        if test_hooks
+                            .fail_next_append_as_disk_full
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Err(PersistenceError::injected_disk_full());
+                        }
+                        store.append_batch(&batch)
+                    });
+                    match result {
+                        Some(Err(error)) => remember_failure(failure, &error),
+                        Some(Ok(())) => {}
+                        None => return,
+                    }
                 }
             }
             Command::Finalize {
@@ -1010,16 +1092,28 @@ fn actor_main(
                 #[cfg(test)]
                 pause_before_finalize(test_hooks);
                 let result = if let Some(message) = mutex_lock(failure).clone() {
-                    Err(PersistenceError::Mutation(message))
+                    Some(Err(PersistenceError::Mutation(message)))
                 } else {
-                    store.finalize(
-                        id,
-                        actual_pid,
-                        &replay,
-                        &state,
-                        &durable_head,
-                        &metadata_bytes,
-                    )
+                    retry_disk_full(shutdown, || {
+                        #[cfg(test)]
+                        if test_hooks
+                            .fail_next_finalize_as_disk_full
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Err(PersistenceError::injected_disk_full());
+                        }
+                        store.finalize(
+                            id,
+                            actual_pid,
+                            &replay,
+                            &state,
+                            &durable_head,
+                            &metadata_bytes,
+                        )
+                    })
+                };
+                let Some(result) = result else {
+                    return;
                 };
                 if let Err(error) = &result {
                     remember_failure(failure, error);
@@ -1036,6 +1130,39 @@ fn actor_main(
             Command::Shutdown => return,
         }
     }
+}
+
+fn retry_disk_full(
+    shutdown: &AtomicBool,
+    mut mutation: impl FnMut() -> Result<(), PersistenceError>,
+) -> Option<Result<(), PersistenceError>> {
+    loop {
+        if shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        match mutation() {
+            Err(error) if error.is_disk_full() => {
+                if wait_for_shutdown(shutdown, DISK_FULL_RETRY_INTERVAL) {
+                    return None;
+                }
+            }
+            result => return Some(result),
+        }
+    }
+}
+
+fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+    let mut remaining = duration;
+    while !remaining.is_zero() {
+        if shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let interval = remaining.min(POLL_INTERVAL);
+        thread::sleep(interval);
+        remaining = remaining.saturating_sub(interval);
+    }
+    shutdown.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -3397,12 +3524,12 @@ fn decode_recovered_row(
         .map_err(PersistenceError::database)?
         .map(|value| serde_json::from_str(&value))
         .transpose()
-        .map_err(PersistenceError::database)?;
+        .map_err(PersistenceError::database_message)?;
     let state = serde_json::from_str(
         &row.get::<_, String>(4)
             .map_err(PersistenceError::database)?,
     )
-    .map_err(PersistenceError::database)?;
+    .map_err(PersistenceError::database_message)?;
     let pid = row
         .get::<_, Option<i64>>(5)
         .map_err(PersistenceError::database)?
@@ -3899,7 +4026,10 @@ mod tests {
         process::{
             Child as ProcessChild, Command as ProcessCommand, Output as ProcessOutput, Stdio,
         },
-        sync::{Arc, atomic::Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -3918,8 +4048,8 @@ mod tests {
         PersistentCandidate, PersistentStartCompletion, RUN_RECORDS, SHM_MAX_BYTES,
         STATE_FILES_MAX_BYTES, StartCommitCrashPhase, StartDisposition, StartReceipt,
         StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay,
-        create_schema, metadata_size, mutex_lock, prune_global_replay_to, validate_existing_schema,
-        wal_charge_for_cache,
+        create_schema, metadata_size, mutex_lock, prune_global_replay_to, retry_disk_full,
+        validate_existing_schema, wal_charge_for_cache,
     };
     use crate::creation::MAX_RETAINED_RUNS;
 
@@ -4541,6 +4671,105 @@ mod tests {
                 .expect("read append-batch durable tuple");
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn transient_disk_full_retries_append_before_later_mutations() {
+        let temp = TempDir::new().expect("create append DiskFull fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(first.id), &first)
+            .expect("insert append DiskFull fixture");
+        let first_replay = replay(vec![chunk(0, b"survives DiskFull")]);
+        persistence.fail_next_append_as_disk_full();
+        durable.append(first.id, first_replay.clone());
+        durable.finalize(first.id, 42, first_replay.clone(), exited_state());
+
+        assert!(!persistence.is_failed());
+        assert_eq!(
+            durable.durable_head(),
+            first_replay.latest_output_bytes,
+            "the queued finalize must run after the retried append"
+        );
+        let later = running_info(RunId::new());
+        let later_durable = persistence
+            .insert_start(&test_operation_key(later.id), &later)
+            .expect("later start remains writable after recovered DiskFull");
+        later_durable.finalize(later.id, 43, replay(Vec::new()), exited_state());
+
+        drop(later_durable);
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen recovered state");
+        let recovered_first = recovered
+            .iter()
+            .find(|run| run.info.id == first.id)
+            .expect("first Run remains durable");
+        assert_eq!(recovered_first.info.state, exited_state());
+        assert_eq!(recovered_first.replay, first_replay);
+        assert!(recovered.iter().any(|run| run.info.id == later.id));
+        drop(reopened);
+    }
+
+    #[test]
+    fn transient_disk_full_retries_finalize_without_poisoning_actor() {
+        let temp = TempDir::new().expect("create finalize DiskFull fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert finalize DiskFull fixture");
+        let output = replay(vec![chunk(0, b"terminal output")]);
+        persistence.fail_next_finalize_as_disk_full();
+        durable.finalize(info.id, 44, output.clone(), exited_state());
+
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), output.latest_output_bytes);
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen finalized state");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].info.state, exited_state());
+        assert_eq!(recovered[0].info.pid, Some(44));
+        assert_eq!(recovered[0].replay, output);
+        drop(reopened);
+    }
+
+    #[test]
+    fn disk_full_retry_observes_shutdown() {
+        let shutdown = AtomicBool::new(false);
+        let mut attempts = 0_u8;
+        let result = retry_disk_full(&shutdown, || {
+            attempts = attempts.saturating_add(1);
+            shutdown.store(true, Ordering::Release);
+            Err(PersistenceError::injected_disk_full())
+        });
+        assert!(result.is_none());
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn sqlite_disk_full_code_survives_error_translation() {
+        let disk_full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            Some("database or disk is full".to_owned()),
+        );
+        assert!(PersistenceError::database(disk_full).is_disk_full());
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is busy".to_owned()),
+        );
+        assert!(!PersistenceError::database(busy).is_disk_full());
     }
 
     #[test]

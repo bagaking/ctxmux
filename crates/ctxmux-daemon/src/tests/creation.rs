@@ -969,15 +969,17 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     assert_finalize_reads_responsive(&server, run.id, initial_head).await;
     record_late_output_after_finalize(&recorded, &finalize_release).await;
 
-    let terminal = tokio::time::timeout(Duration::from_secs(5), events.recv())
+    let terminal = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
         .await
         .expect("terminal event arrives after finalize")
-        .expect("read terminal event");
+        .expect("read terminal event")
+        .event;
     assert!(matches!(terminal, RunEvent::Exited { .. }));
-    let late = tokio::time::timeout(Duration::from_secs(5), events.recv())
+    let late = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
         .await
         .expect("late output remains broadcast")
-        .expect("read late output event");
+        .expect("read late output event")
+        .event;
     assert!(matches!(
         late,
         RunEvent::Output { chunk } if chunk.data == b"late-after-terminal"

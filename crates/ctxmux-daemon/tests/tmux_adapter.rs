@@ -1115,6 +1115,9 @@ async fn wait_for_output(
             {
                 RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
                 RunEvent::Tmux { .. } => {}
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("unexpected tmux observation discontinuity")
+                }
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
@@ -1141,6 +1144,9 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                 RunEvent::Tmux { event } if event == expected => return,
                 RunEvent::Tmux { event } => {
                     panic!("unexpected tmux event while waiting for {expected:?}: {event:?}")
+                }
+                RunEvent::ObservationDiscontinuity => {
+                    panic!("observation continuity was lost while waiting for {expected:?}")
                 }
                 RunEvent::Output { .. } => {}
                 RunEvent::Gap {
@@ -1443,7 +1449,7 @@ async fn collect_exact_output_with_gap_replay(
                             return observed;
                         }
                     }
-                    RunEvent::Gap { .. } => {
+                    RunEvent::Gap { .. } | RunEvent::ObservationDiscontinuity => {
                         drop(attachment);
                         break;
                     }

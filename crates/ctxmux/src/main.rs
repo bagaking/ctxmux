@@ -524,6 +524,10 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
         }
         RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
         RunEvent::Tmux { .. } => Ok(true),
+        RunEvent::ObservationDiscontinuity => Err(
+            "attachment lost one or more non-output observations; output replay cannot reconstruct their semantics"
+                .to_owned(),
+        ),
         RunEvent::Gap {
             latest_output_bytes,
         } => Err(format!(
@@ -716,9 +720,9 @@ fn print_run(run: &RunInfo) {
 
 #[cfg(test)]
 mod tests {
-    use ctxmux_protocol::TerminalSize;
+    use ctxmux_protocol::{RunEvent, TerminalSize};
 
-    use super::{PrefixRouter, normalize_terminal_size};
+    use super::{PrefixRouter, normalize_terminal_size, write_event};
 
     fn route_with_partitions(input: &[u8], boundary_mask: usize) -> (Vec<u8>, bool) {
         let mut router = PrefixRouter::default();
@@ -805,5 +809,13 @@ mod tests {
                 rows: 40,
             }
         );
+    }
+
+    #[test]
+    fn cli_fails_closed_on_non_output_observation_discontinuity() {
+        let error = write_event(RunEvent::ObservationDiscontinuity, &mut Vec::new())
+            .expect_err("CLI cannot repair non-output semantics with byte replay");
+        assert!(error.contains("non-output observations"));
+        assert!(error.contains("cannot reconstruct"));
     }
 }

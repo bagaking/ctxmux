@@ -95,6 +95,57 @@ async fn control_requirement_is_typed_not_applied_before_dispatch() {
 }
 
 #[tokio::test]
+async fn expected_runtime_identity_fences_every_business_dispatch_path() {
+    let expected = runtime_identity();
+    let mut replacement = expected.clone();
+    replacement.daemon_instance_id = DaemonInstanceId::new();
+
+    let (directory, socket, peer) = mock_runtime(replacement.clone());
+    let error = Client::new(&socket)
+        .with_expected_runtime_identity(expected.clone())
+        .list()
+        .await
+        .expect_err("a replacement Runtime must reject Request dispatch");
+    assert_identity_mismatch(
+        error,
+        &expected,
+        &replacement,
+        Some(CommandDisposition::NotApplied),
+    );
+    assert_no_business_frame(directory, peer).await;
+
+    let (directory, socket, peer) = mock_runtime(replacement.clone());
+    let Err(error) = Client::new(&socket)
+        .with_expected_runtime_identity(expected.clone())
+        .attach(ctxmux_protocol::RunId::new(), 0)
+        .await
+    else {
+        panic!("a replacement Runtime must reject Attach dispatch");
+    };
+    assert_identity_mismatch(
+        error,
+        &expected,
+        &replacement,
+        Some(CommandDisposition::NotApplied),
+    );
+    assert_no_business_frame(directory, peer).await;
+
+    let (directory, socket, peer) = mock_runtime(replacement.clone());
+    let error = Client::new(&socket)
+        .with_expected_runtime_identity(expected.clone())
+        .input(ctxmux_protocol::RunId::new(), vec![1])
+        .await
+        .expect_err("a replacement Runtime must reject control dispatch");
+    assert_identity_mismatch(
+        error,
+        &expected,
+        &replacement,
+        Some(CommandDisposition::NotApplied),
+    );
+    assert_no_business_frame(directory, peer).await;
+}
+
+#[tokio::test]
 async fn configured_ping_and_runtime_info_remain_raw_identity_inspection() {
     let runtime = runtime_identity();
 
@@ -112,6 +163,18 @@ async fn configured_ping_and_runtime_info_remain_raw_identity_inspection() {
         .expect("runtime_info remains raw identity inspection");
     assert_eq!(observed, runtime);
     assert_no_business_frame(info_directory, info_peer).await;
+
+    let expected = runtime_identity();
+    let mut replacement = expected.clone();
+    replacement.daemon_instance_id = DaemonInstanceId::new();
+    let (identity_directory, identity_socket, identity_peer) = mock_runtime(replacement.clone());
+    let observed = Client::new(identity_socket)
+        .with_expected_runtime_identity(expected)
+        .runtime_info()
+        .await
+        .expect("runtime_info remains raw when the identity expectation differs");
+    assert_eq!(observed, replacement);
+    assert_no_business_frame(identity_directory, identity_peer).await;
 }
 
 fn required_client(socket: &PathBuf, capability: &str, version: u64) -> Client {
@@ -200,5 +263,21 @@ fn assert_unsupported(
         } if capability == expected_capability
             && required_version == expected_required
             && advertised_version == expected_advertised
+    ));
+}
+
+fn assert_identity_mismatch(
+    error: ClientError,
+    expected: &RuntimeIdentity,
+    actual: &RuntimeIdentity,
+    expected_disposition: Option<CommandDisposition>,
+) {
+    assert_eq!(error.control_disposition(), expected_disposition);
+    assert!(matches!(
+        error,
+        ClientError::RuntimeIdentityMismatch {
+            expected: rejected_expected,
+            actual: rejected_actual,
+        } if rejected_expected.as_ref() == expected && rejected_actual.as_ref() == actual
     ));
 }

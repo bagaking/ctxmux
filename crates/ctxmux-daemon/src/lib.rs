@@ -2442,15 +2442,96 @@ struct Run {
 
 struct LiveEventOwner {
     capacity: usize,
-    sender: Mutex<Option<broadcast::Sender<RunEvent>>>,
+    state: Mutex<LiveEventState>,
+}
+
+struct LiveEventState {
+    sender: Option<broadcast::Sender<LiveRunEvent>>,
+    cursor: LiveEventCursor,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LiveEventCursor {
+    output_bytes: u64,
+    output_discontinuity_revision: u64,
+    latest_output_discontinuity_byte: u64,
+    observation_revision: u64,
+    terminal_revision: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LiveRunEvent {
+    event: RunEvent,
+    before: LiveEventCursor,
+    after: LiveEventCursor,
+}
+
+struct LiveEventSubscription {
+    receiver: broadcast::Receiver<LiveRunEvent>,
+    cursor: LiveEventCursor,
 }
 
 impl LiveEventOwner {
     const fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            sender: Mutex::new(None),
+            state: Mutex::new(LiveEventState {
+                sender: None,
+                cursor: LiveEventCursor {
+                    output_bytes: 0,
+                    output_discontinuity_revision: 0,
+                    latest_output_discontinuity_byte: 0,
+                    observation_revision: 0,
+                    terminal_revision: 0,
+                },
+            }),
         }
+    }
+
+    fn publish(&self, event: RunEvent) {
+        let mut state = mutex_lock(&self.state);
+        let before = state.cursor;
+        match &event {
+            RunEvent::Output { chunk } => {
+                state.cursor.output_bytes = state.cursor.output_bytes.max(chunk.end_byte);
+            }
+            RunEvent::Gap {
+                latest_output_bytes,
+            } => {
+                state.cursor.output_discontinuity_revision = state
+                    .cursor
+                    .output_discontinuity_revision
+                    .checked_add(1)
+                    .expect("live output-discontinuity revision remains representable");
+                state.cursor.latest_output_discontinuity_byte = *latest_output_bytes;
+            }
+            RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => {
+                state.cursor.terminal_revision = state
+                    .cursor
+                    .terminal_revision
+                    .checked_add(1)
+                    .expect("live terminal revision remains representable");
+            }
+            RunEvent::Tmux { .. } | RunEvent::ObservationDiscontinuity => {
+                state.cursor.observation_revision = state
+                    .cursor
+                    .observation_revision
+                    .checked_add(1)
+                    .expect("live observation revision remains representable");
+            }
+        }
+        let envelope = LiveRunEvent {
+            event,
+            before,
+            after: state.cursor,
+        };
+        if let Some(sender) = state.sender.as_ref() {
+            let _ = sender.send(envelope);
+        }
+    }
+
+    fn cursor(&self) -> LiveEventCursor {
+        mutex_lock(&self.state).cursor
     }
 }
 
@@ -3513,15 +3594,24 @@ impl Run {
         mutex_lock(&self.output).mark_source_gap()
     }
 
-    fn subscribe(self: &Arc<Self>) -> (AttachmentGuard, broadcast::Receiver<RunEvent>) {
-        let mut sender = mutex_lock(&self.events.sender);
+    fn subscribe(self: &Arc<Self>) -> (AttachmentGuard, LiveEventSubscription) {
+        // Publish checks the attachment count before taking this same lock.
+        // Taking the lock first closes the count-to-subscription race: once
+        // publishers can observe the new attachment, its receiver exists.
+        let mut event_state = mutex_lock(&self.events.state);
         self.attachments.fetch_add(1, Ordering::AcqRel);
-        let receiver = sender
+        let receiver = event_state
+            .sender
             .get_or_insert_with(|| {
                 let (sender, _) = broadcast::channel(self.events.capacity);
                 sender
             })
             .subscribe();
+        let subscription = LiveEventSubscription {
+            receiver,
+            cursor: event_state.cursor,
+        };
+        drop(event_state);
         let qualification_guard = self
             .qualification_stats
             .guard(QualificationGauge::Attachments);
@@ -3529,7 +3619,7 @@ impl Run {
             run: Arc::clone(self),
             _qualification_guard: qualification_guard,
         };
-        (guard, receiver)
+        (guard, subscription)
     }
 
     fn attachment_snapshot(&self, after_byte: u64) -> AttachedSnapshot {
@@ -3544,9 +3634,7 @@ impl Run {
         if self.attachments.load(Ordering::Acquire) == 0 {
             return;
         }
-        if let Some(sender) = mutex_lock(&self.events.sender).as_ref() {
-            let _ = sender.send(event);
-        }
+        self.events.publish(event);
     }
 
     fn native_control(&self) -> Result<&NativeControlOwner, ProtocolError> {
@@ -4355,9 +4443,9 @@ impl Drop for AttachmentGuard {
         if previous != 1 {
             return;
         }
-        let mut sender = mutex_lock(&self.run.events.sender);
+        let mut state = mutex_lock(&self.run.events.state);
         if self.run.attachments.load(Ordering::Acquire) == 0 {
-            sender.take();
+            state.sender.take();
         }
     }
 }
@@ -4906,18 +4994,18 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use ctxmux_client::{Client, ClientError, replay_bytes};
+    use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
         CommandDisposition, ControlReceipt, CreateOperationKey, ErrorCode, ForkPlan,
         InterruptionReason, ProtocolError, RecoverableStop, RunBackend, RunCapabilities, RunEvent,
-        RunId, RunInfo, RunSpec, RunState, StopDisposition, TerminalSize,
+        RunId, RunInfo, RunSpec, RunState, StopDisposition, TerminalSize, TmuxRunEvent,
     };
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep,
+        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep, LiveRunEvent,
         NativeRuntimeOwner, NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
         PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode, RecoveredRun,
         Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
@@ -4935,6 +5023,13 @@ mod tests {
             .prepare_stop(id)
             .await
             .expect("prepare recoverable Stop operation")
+    }
+
+    async fn next_event_before_timeout(attachment: &Attachment) -> Option<RunEvent> {
+        tokio::time::timeout(Duration::from_secs(5), attachment.next_event())
+            .await
+            .expect("receive attachment event before timeout")
+            .expect("read attachment event")
     }
     use crate::native_control::NativeControlOwner;
 
@@ -6887,28 +6982,410 @@ mod tests {
         let control = NativeControlOwner::new_for_wait_test(id, native_runs.owner_wake());
         let run =
             Run::new_native_for_owner_test(id, control, native_runs, NativeWaitFailure::default());
-        assert!(mutex_lock(&run.events.sender).is_none());
+        assert!(mutex_lock(&run.events.state).sender.is_none());
 
         let (first, mut first_events) = run.subscribe();
         let (second, _second_events) = run.subscribe();
         assert_eq!(run.attachments.load(Ordering::Acquire), 2);
-        assert!(mutex_lock(&run.events.sender).is_some());
+        assert!(mutex_lock(&run.events.state).sender.is_some());
 
         run.publish_event(RunEvent::Gap {
             latest_output_bytes: 7,
         });
         assert!(matches!(
-            first_events.try_recv(),
-            Ok(RunEvent::Gap {
-                latest_output_bytes: 7
+            first_events.receiver.try_recv(),
+            Ok(LiveRunEvent {
+                event: RunEvent::Gap {
+                    latest_output_bytes: 7
+                },
+                ..
             })
         ));
 
         drop(first);
-        assert!(mutex_lock(&run.events.sender).is_some());
+        assert!(mutex_lock(&run.events.state).sender.is_some());
         drop(second);
         assert_eq!(run.attachments.load(Ordering::Acquire), 0);
-        assert!(mutex_lock(&run.events.sender).is_none());
+        assert!(mutex_lock(&run.events.state).sender.is_none());
+    }
+
+    fn tmux_delivery_test_run(pane_pid: u32, live_event_capacity: usize) -> Arc<Run> {
+        let (commands, _command_rx) = std::sync::mpsc::channel();
+        let (_completion_tx, completion) = std::sync::mpsc::channel::<Result<(), String>>();
+        Arc::new(Run {
+            id: RunId::new(),
+            spec: None,
+            lineage: None,
+            backend: RunBackend::Tmux {
+                socket_path: "/tmp/ctxmux-observation-lag.sock".to_owned(),
+                server_pid: pane_pid,
+                server_started_at: 1,
+                session_id: "$1".to_owned(),
+                window_id: "@1".to_owned(),
+                pane_id: "%1".to_owned(),
+                tmux_version: "3.4".to_owned(),
+            },
+            capabilities: RunCapabilities::TMUX_READ_ONLY,
+            pid: Some(pane_pid),
+            state: Mutex::new(RunState::Running),
+            output: Mutex::new(OutputLog::with_initial_truncation()),
+            incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
+                writer: Mutex::new(None),
+                commands,
+                completion: Mutex::new(TmuxCompletion::Pending(completion)),
+            })),
+            native_runs: None,
+            persistence_mode: PersistenceMode::MemoryOnly,
+            persistence_transition: Mutex::new(()),
+            persistence: Mutex::new(PersistenceBinding::Disabled),
+            attachments: AtomicUsize::new(0),
+            qualification_stats: crate::qualification_stats::QualificationStats::default(),
+            terminal_publications: TerminalPublicationOwner::default(),
+            terminal_ordinal: std::sync::OnceLock::new(),
+            events: super::LiveEventOwner::new(live_event_capacity),
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mixed_tmux_lag_separates_output_gap_from_observation_discontinuity() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSnapshot);
+        let mut pane = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn tmux-owned pane sentinel");
+        let pane_pid = pane.id();
+        let run = tmux_delivery_test_run(pane_pid, 2);
+        server
+            .manager
+            .registry
+            .publish_unkeyed_for_test(Arc::clone(&run));
+
+        let (attachment, initial) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("attach before mixed lag");
+        assert!(initial.replay.chunks.is_empty());
+        assert!(initial.replay.truncated);
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .expect("attachment reaches snapshot barrier")
+            .expect("attachment barrier remains connected");
+
+        run.record_output(b"a".to_vec());
+        run.publish_event(RunEvent::Tmux {
+            event: TmuxRunEvent::SessionRenamed {
+                name: b"renamed".to_vec(),
+            },
+        });
+        run.record_output(b"b".to_vec());
+        run.publish_event(RunEvent::Tmux {
+            event: TmuxRunEvent::Paused,
+        });
+        let gap_head = run.mark_output_source_gap();
+        run.publish_event(RunEvent::Gap {
+            latest_output_bytes: gap_head,
+        });
+        run.publish_event(RunEvent::Tmux {
+            event: TmuxRunEvent::Continued,
+        });
+        run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
+        run.record_output(b"c".to_vec());
+        run.record_output(b"d".to_vec());
+        hook.release.notify_one();
+
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::ObservationDiscontinuity)
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&attachment).await, None);
+
+        let (late, replay) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("reattach after source discontinuity");
+        assert!(replay.replay.truncated);
+        assert_eq!(replay_bytes(&replay.replay.chunks), b"abcd");
+        assert_eq!(
+            next_event_before_timeout(&late).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&late).await, None);
+        assert!(
+            process_exists(pane_pid),
+            "ctxmux observation failure must not terminate the tmux-owned pane"
+        );
+
+        pane.kill().expect("terminate pane sentinel after proof");
+        pane.wait().expect("reap pane sentinel after proof");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn output_only_lag_preserves_retained_tmux_observation_before_terminal() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSnapshot);
+        let mut pane = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn retained-observation pane sentinel");
+        let pane_pid = pane.id();
+        let run = tmux_delivery_test_run(pane_pid, 3);
+        server
+            .manager
+            .registry
+            .publish_unkeyed_for_test(Arc::clone(&run));
+        let (attachment, _) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("attach before output-only lag");
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .expect("attachment reaches retained-observation barrier")
+            .expect("retained-observation barrier remains connected");
+
+        for byte in b"abcd" {
+            run.record_output(vec![*byte]);
+        }
+        run.publish_event(RunEvent::Tmux {
+            event: TmuxRunEvent::SessionRenamed {
+                name: b"retained".to_vec(),
+            },
+        });
+        run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
+        hook.release.notify_one();
+
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Gap {
+                latest_output_bytes: 4,
+            })
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Tmux {
+                event: TmuxRunEvent::SessionRenamed {
+                    name: b"retained".to_vec(),
+                },
+            })
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&attachment).await, None);
+        assert!(process_exists(pane_pid));
+        pane.kill()
+            .expect("terminate retained-observation sentinel");
+        pane.wait().expect("reap retained-observation sentinel");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_terminal_is_resnapshotted_once_after_late_output() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSnapshot);
+        let mut pane = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn terminal-resnapshot pane sentinel");
+        let pane_pid = pane.id();
+        let run = tmux_delivery_test_run(pane_pid, 1);
+        server
+            .manager
+            .registry
+            .publish_unkeyed_for_test(Arc::clone(&run));
+        let (attachment, _) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("attach before terminal overwrite");
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .expect("attachment reaches terminal-overwrite barrier")
+            .expect("terminal-overwrite barrier remains connected");
+
+        run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
+        run.record_output(b"a".to_vec());
+        run.record_output(b"b".to_vec());
+        hook.release.notify_one();
+
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Gap {
+                latest_output_bytes: 2,
+            })
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&attachment).await, None);
+
+        let (late, replay) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("reattach after terminal resnapshot");
+        assert_eq!(replay_bytes(&replay.replay.chunks), b"ab");
+        assert_eq!(
+            next_event_before_timeout(&late).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&late).await, None);
+        assert!(process_exists(pane_pid));
+        pane.kill().expect("terminate terminal-resnapshot sentinel");
+        pane.wait().expect("reap terminal-resnapshot sentinel");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_snapshot_marks_tmux_observation_from_the_join_window() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSubscribe);
+        let mut pane = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn join-window pane sentinel");
+        let pane_pid = pane.id();
+        let run = tmux_delivery_test_run(pane_pid, 2);
+        server
+            .manager
+            .registry
+            .publish_unkeyed_for_test(Arc::clone(&run));
+        let client = server.client.clone();
+        let run_id = run.id;
+        let attaching = tokio::spawn(async move { client.attach(run_id, 0).await });
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .expect("attachment reaches subscribe/snapshot join barrier")
+            .expect("join barrier remains connected");
+
+        run.publish_event(RunEvent::Tmux {
+            event: TmuxRunEvent::SessionRenamed {
+                name: b"between".to_vec(),
+            },
+        });
+        run.record_output(b"x".to_vec());
+        let source_gap_head = run.mark_output_source_gap();
+        run.publish_event(RunEvent::Gap {
+            latest_output_bytes: source_gap_head,
+        });
+        run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
+        hook.release.notify_one();
+
+        let (attachment, snapshot) = attaching
+            .await
+            .expect("join-window attachment task completes")
+            .expect("join-window attachment succeeds");
+        assert!(!snapshot.run.state.is_running());
+        assert!(snapshot.replay.truncated);
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"x");
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::ObservationDiscontinuity)
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&attachment).await, None);
+        assert!(process_exists(pane_pid));
+        pane.kill().expect("terminate join-window sentinel");
+        pane.wait().expect("reap join-window sentinel");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_snapshot_marks_output_and_source_gap_after_replay() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSnapshot);
+        let mut pane = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn terminal-join output sentinel");
+        let pane_pid = pane.id();
+        let run = tmux_delivery_test_run(pane_pid, 2);
+        run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
+        server
+            .manager
+            .registry
+            .publish_unkeyed_for_test(Arc::clone(&run));
+
+        let (attachment, snapshot) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("attach to terminal snapshot before late output");
+        assert!(snapshot.replay.chunks.is_empty());
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .expect("attachment reaches post-replay terminal barrier")
+            .expect("post-replay terminal barrier remains connected");
+        run.record_output(b"x".to_vec());
+        let source_gap_head = run.mark_output_source_gap();
+        run.publish_event(RunEvent::Gap {
+            latest_output_bytes: source_gap_head,
+        });
+        hook.release.notify_one();
+
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Gap {
+                latest_output_bytes: 1,
+            })
+        );
+        assert_eq!(
+            next_event_before_timeout(&attachment).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&attachment).await, None);
+
+        let (late, replay) = server
+            .client
+            .attach(run.id, 0)
+            .await
+            .expect("reattach after post-snapshot output Gap");
+        assert!(replay.replay.truncated);
+        assert_eq!(replay_bytes(&replay.replay.chunks), b"x");
+        assert_eq!(
+            next_event_before_timeout(&late).await,
+            Some(RunEvent::Interrupted {
+                reason: InterruptionReason::TmuxServerUnavailable,
+            })
+        );
+        assert_eq!(next_event_before_timeout(&late).await, None);
+        assert!(process_exists(pane_pid));
+        pane.kill()
+            .expect("terminate terminal-join output sentinel");
+        pane.wait().expect("reap terminal-join output sentinel");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

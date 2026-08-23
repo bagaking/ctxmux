@@ -71,17 +71,23 @@ safe-integer domain are owned by [the protocol contract](../../docs/protocol.md#
 An absent key is unsupported; an advertised version satisfies a requirement
 only when it is greater than or equal to the requested version.
 
-Requirements are local to one client and are checked after Hello but before a
-business Request or Attach frame. `runtimeInfo()` remains raw identity
-inspection, so an incompatible live Runtime can still be diagnosed:
+Identity and capability requirements are local to one client and are checked
+against Hello on the same connection before a business Request or Attach
+frame. Retain the exact `RuntimeIdentity` returned by a trusted connection and
+pass it as `expectedRuntimeIdentity` to fence later dispatch without a
+`runtimeInfo()` preflight race. `runtimeInfo()` itself remains raw inspection,
+so a different live Runtime can still be diagnosed:
 
 ```ts
+const inspector = new CtxmuxClient({ socketPath: "target/ctxmux.sock" });
+const observed = await inspector.runtimeInfo();
 const persistentClient = new CtxmuxClient({
   socketPath: "target/ctxmux.sock",
+  expectedRuntimeIdentity: observed,
   requiredCapabilities: { [RUNTIME_CAPABILITY_PERSISTENT_STATE]: 1 },
 });
 
-const observed = await persistentClient.runtimeInfo(); // ignores local requirements
+const current = await persistentClient.runtimeInfo(); // ignores local requirements
 try {
   await persistentClient.list(); // requirements apply before dispatch
 } catch (error) {
@@ -242,13 +248,16 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 12 imports by socket path plus pane ID, an ambiguous linked
+because generation 13 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
 resize, stop, and both fork levels are unsupported. Replay is
 `raw_since_import`, its initial snapshot is truncated, and a later tmux source
-pause remains visible as a gap/truncated replay. ctxmux does not call
+pause remains visible as raw-output gap/truncated replay. A live attachment
+that actually loses a tmux observation receives cursor-free
+`observation_discontinuity` and ends; a later attachment starts a new
+observation boundary and does not claim to restore the missing semantics. ctxmux does not call
 `capture-pane` to synthesize the missing prefix. Detaching the SDK or stopping
 the ctxmux daemon closes only ctxmux's Control Mode client, not the tmux-owned
 pane, session, or server.
@@ -354,7 +363,7 @@ result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterByte)` resumes ordered output after the last observed cumulative byte cursor.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 12 represents cursors as
+4 MiB replay contains the complete history. Generation 13 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 
@@ -370,10 +379,11 @@ first-frame payload.
 Every daemon frame is runtime-validated before generated TypeScript types are
 exposed. Malformed JSON, invalid UTF-8, duplicate object members, invalid nested
 variants, and unsafe cursor integers fail closed with a boundary error.
-Live events are queued under fixed count and byte budgets. Only dropped output
-may be coalesced into an explicit `gap`; tmux and other non-output events are
-never disguised as output loss, and terminal lifecycle gets an independent
-reserved slot.
+Live events are queued under fixed count and byte budgets. Raw-output delivery
+loss may be coalesced into an explicit `gap`. A cursor-free
+`observation_discontinuity` instead reports missing non-output semantics; tmux
+and other non-output events are never disguised as replayable byte loss, and
+terminal lifecycle gets an independent reserved slot.
 
 ## Protocol source of truth
 
