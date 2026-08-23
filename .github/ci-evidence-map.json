@@ -599,6 +599,7 @@
       "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
       "invariants": [
         "real daemon, process, PTY, replay, stop, and fork behavior cross the public boundary, including exact Interrupt, Stop, and natural-exit races with no process survivor or post-Stop signal effect",
+        "memory-only and persistent RuntimeIdentity lifecycles expose exact persistence, target, and capability facts, while unsupported client requirements create no Run",
         "abandoned Start and Fork responses converge on exact Run and PID sets while atomic process markers prove one execution per retained key"
       ],
       "selection_ref": "scripts/check.sh",
@@ -623,11 +624,27 @@
       ]
     },
     {
+      "id": "rust-client-runtime-capability-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-client/tests/runtime_capability_requirements.rs",
+      "invariants": [
+        "Rust client Runtime capability requirements use the exact safe positive-integer domain and reject absent or higher versions after Hello but before every Request, Attach, or attachment-control business frame",
+        "raw ping and runtime_info remain diagnostic inspection paths, and local capability rejection is explicitly not_applied"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
+        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+      ]
+    },
+    {
       "id": "rust-protocol-contracts",
       "kind": "test",
       "path": "crates/ctxmux-protocol/src/lib.rs",
       "invariants": [
-        "generation-10 frames and Runtime description, cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact"
+        "generation-10 frames and the exact RuntimeIdentity shape, cumulative output byte ranges, creation and Input operation keys, daemon-incarnation identity, correlated controls, capacity errors, limits, identifiers, and duplicate rejection are exact",
+        "Runtime capability versions preserve exact JSON numeric meaning across integer, decimal, and exponent spellings and reject fractional, zero, negative, overflow, and unsafe values"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -695,7 +712,8 @@
       "kind": "test",
       "path": "packages/sdk/test/wrong-cases.test.ts",
       "invariants": [
-        "generation-10 replay and Runtime validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races"
+        "generation-10 replay and exact RuntimeIdentity validation reject byte-range overshoot, non-progress, premature EOF, malformed framing, backpressure loss, and close races",
+        "TypeScript Runtime capability versions preserve exact JSON numeric meaning, and unsupported client requirements reject before every business frame while runtimeInfo remains raw"
       ],
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/wrong-cases.test.ts",
@@ -723,7 +741,7 @@
       "kind": "test",
       "path": "packages/sdk/test/client-parity.test.ts",
       "invariants": [
-        "CLI and SDK share daemon-owned Run identity, while a host-owned Provider materializes fail-closed public Level B without entering the SDK publication",
+        "CLI and SDK share one exact daemon-authored RuntimeIdentity and daemon-owned Run identity, while a host-owned Provider materializes fail-closed public Level B without entering the SDK publication",
         "TypeScript SDK discovers, imports, attaches, and detaches one real read-only tmux pane without taking ownership"
       ],
       "selection_ref": "packages/sdk/package.json",
@@ -752,8 +770,8 @@
       "kind": "public_smoke",
       "path": "scripts/check-local-consumer.mjs",
       "invariants": [
-        "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies",
-        "the packed SDK declarations and runtime exports support an external TypeScript Provider Integration with fail-closed Level B and no Agent-specific publication dependency"
+        "one exact clean commit produces bounded content-addressed SDK and binary artifacts whose isolated offline consumer proves public RuntimeIdentity inspection, start, status, input, attach, replay, interrupt, and stop without source-tree access or path dependencies",
+        "the packed SDK declarations and runtime exports preserve exact RuntimeIdentity and capability-requirement types, reject unsupported requirements before dispatch, and support an external TypeScript Provider Integration with fail-closed Level B and no Agent-specific publication dependency"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "npm run test:local-consumer",
