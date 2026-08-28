@@ -11,9 +11,15 @@ use std::{
 
 use ctxmux_client::Client;
 use ctxmux_protocol::{RunSpec, RunState, TerminalSize};
+use ctxmux_test_support::scaled;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-const DEADLINE: Duration = Duration::from_secs(5);
+/// Budget for one expected interactive observation to arrive. Scaled by
+/// `CTXMUX_TEST_TIME_SCALE` so host contention does not fail a wait that a
+/// correct CLI meets on an idle machine.
+fn deadline() -> Duration {
+    scaled(Duration::from_secs(5))
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(
@@ -28,7 +34,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
     let socket = directory.path().join("ctxmux.sock");
     let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
     let client = Client::new(&socket);
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             if client.ping().await.is_ok() {
                 break;
@@ -112,8 +118,8 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
         .spawn_command(command)
         .expect("spawn ctxmux attach in controlling PTY");
 
-    wait_for_bytes(&observed, b"READY", DEADLINE);
-    let raw_deadline = Instant::now() + DEADLINE;
+    wait_for_bytes(&observed, b"READY", deadline());
+    let raw_deadline = Instant::now() + deadline();
     let raw_termios = loop {
         let current = pair
             .master
@@ -133,7 +139,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
 
     writer.write_all(b"raw\n").expect("send raw terminal input");
     writer.flush().expect("flush raw terminal input");
-    wait_for_bytes(&observed, b"INPUT:raw", DEADLINE);
+    wait_for_bytes(&observed, b"INPUT:raw", deadline());
 
     pair.master
         .resize(PtySize {
@@ -143,7 +149,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
             pixel_height: 0,
         })
         .expect("resize controlling PTY and deliver SIGWINCH");
-    let resize_deadline = Instant::now() + DEADLINE;
+    let resize_deadline = Instant::now() + deadline();
     loop {
         if contains_bytes(&observed, b"SIZE:40 120") {
             break;
@@ -175,7 +181,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
         .write_all(&[0x02, b'd'])
         .expect("send Ctrl-b d detach sequence");
     writer.flush().expect("flush detach sequence");
-    let cli_status = wait_for_child(&mut *cli, DEADLINE);
+    let cli_status = wait_for_child(&mut *cli, deadline());
     assert!(cli_status.success(), "ctxmux attach failed: {cli_status:?}");
     assert_eq!(
         pair.master
@@ -201,7 +207,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
         .stop(stop_operation)
         .await
         .expect("stop surviving CLI PTY Run");
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         while client
             .status(run.id)
             .await
@@ -233,7 +239,7 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
     let socket = directory.path().join("ctxmux.sock");
     let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
     let client = Client::new(&socket);
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             if client.ping().await.is_ok() {
                 break;
@@ -266,7 +272,7 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
         .await
         .expect("start CLI screen fixture Run");
 
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             let (readiness, snapshot) = client
                 .attach(run.id, 0)
@@ -341,7 +347,7 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
         .spawn_command(command)
         .expect("spawn ctxmux attach in controlling PTY");
 
-    wait_for_bytes(&observed, b"READY", DEADLINE);
+    wait_for_bytes(&observed, b"READY", deadline());
     assert!(
         !contains_bytes(&observed, b"STALE"),
         "interactive attach replayed erased CSI history; output={}",
@@ -352,7 +358,7 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
         .write_all(&[0x02, b'd'])
         .expect("send Ctrl-b d detach sequence");
     writer.flush().expect("flush detach sequence");
-    let cli_status = wait_for_child(&mut *cli, DEADLINE);
+    let cli_status = wait_for_child(&mut *cli, deadline());
     assert!(cli_status.success(), "ctxmux attach failed: {cli_status:?}");
 
     let stop_operation = client
@@ -384,7 +390,7 @@ async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_inp
     let socket = directory.path().join("ctxmux.sock");
     let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
     let client = Client::new(&socket);
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             if client.ping().await.is_ok() {
                 break;
@@ -457,7 +463,7 @@ async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_inp
         .spawn_command(command)
         .expect("spawn ctxmux tmux attach in controlling PTY");
 
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             let status = client
                 .status(run.id)
@@ -471,7 +477,7 @@ async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_inp
     })
     .await
     .expect("CLI attaches to imported tmux Run");
-    let raw_deadline = Instant::now() + DEADLINE;
+    let raw_deadline = Instant::now() + deadline();
     loop {
         if pair
             .master
@@ -505,7 +511,7 @@ async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_inp
         "public-tmux-output",
         "Enter",
     ]);
-    wait_for_bytes(&observed, b"TMUX:1:public-tmux-output", DEADLINE);
+    wait_for_bytes(&observed, b"TMUX:1:public-tmux-output", deadline());
     assert!(
         !contains_bytes(&observed, b"must-not-reach-tmux"),
         "read-only CLI input reached the tmux pane"
@@ -515,7 +521,7 @@ async fn controlling_pty_detaches_from_read_only_tmux_run_without_forwarding_inp
         .write_all(&[0x02, b'd'])
         .expect("send tmux Run Ctrl-b d detach sequence");
     writer.flush().expect("flush tmux Run detach sequence");
-    let cli_status = wait_for_child(&mut *cli, DEADLINE);
+    let cli_status = wait_for_child(&mut *cli, deadline());
     assert!(
         cli_status.success(),
         "ctxmux tmux attach failed: {cli_status:?}"

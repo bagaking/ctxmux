@@ -19,6 +19,7 @@ use ctxmux_protocol::{
     AttachedSnapshot, ErrorCode, ForkPlan, InterruptionReason, RecoverableStop, ReplayCapability,
     RunBackend, RunCapabilities, RunEvent, RunId, RunSpec, RunState, TerminalSize, TmuxRunEvent,
 };
+use ctxmux_test_support::{daemon_spawn_permit, scaled};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
@@ -85,6 +86,7 @@ impl TestDaemon {
         worker_threads: Option<&str>,
     ) -> Self {
         let socket = directory.path().join("ctxmux.sock");
+        let _permit = daemon_spawn_permit().await;
         let mut command = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"));
         command.arg("--socket").arg(&socket);
         if let Some(state_dir) = state_dir {
@@ -109,7 +111,7 @@ impl TestDaemon {
             client,
         };
 
-        timeout(Duration::from_secs(5), async {
+        timeout(scaled(Duration::from_secs(5)), async {
             loop {
                 if let Some(status) = daemon.child.try_wait().expect("poll ctxmuxd") {
                     panic!("ctxmuxd exited before accepting connections: {status}");
@@ -992,7 +994,7 @@ fn process_file_descriptor_count(pid: u32) -> usize {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn stable_daemon_file_descriptor_count(daemon: &TestDaemon) -> usize {
-    timeout(Duration::from_secs(3), async {
+    timeout(scaled(Duration::from_secs(3)), async {
         let mut previous = None;
         let mut stable_samples = 0;
         loop {
@@ -1067,22 +1069,25 @@ async fn attach_with_timeout(
     id: RunId,
     after_byte: u64,
 ) -> (Attachment, AttachedSnapshot) {
-    timeout(PUBLIC_ATTACHMENT_TIMEOUT, client.attach(id, after_byte))
-        .await
-        .expect("public attachment handshake exceeded its deadline")
-        .expect("attach to Run")
+    timeout(
+        scaled(PUBLIC_ATTACHMENT_TIMEOUT),
+        client.attach(id, after_byte),
+    )
+    .await
+    .expect("public attachment handshake exceeded its deadline")
+    .expect("attach to Run")
 }
 
 async fn next_event_with_timeout(
     attachment: &mut Attachment,
 ) -> Result<Option<RunEvent>, ClientError> {
-    timeout(PUBLIC_ATTACHMENT_TIMEOUT, attachment.next_event())
+    timeout(scaled(PUBLIC_ATTACHMENT_TIMEOUT), attachment.next_event())
         .await
         .expect("public attachment event exceeded its deadline")
 }
 
 async fn detach_with_timeout(attachment: Attachment) {
-    timeout(PUBLIC_ATTACHMENT_TIMEOUT, attachment.detach())
+    timeout(scaled(PUBLIC_ATTACHMENT_TIMEOUT), attachment.detach())
         .await
         .expect("public detach exceeded its deadline")
         .expect("detach from Run");
@@ -1103,7 +1108,7 @@ async fn wait_for_output(
     mut observed: Vec<u8>,
     expected: &[u8],
 ) -> Vec<u8> {
-    timeout(Duration::from_secs(10), async {
+    timeout(scaled(Duration::from_secs(10)), async {
         while !observed
             .windows(expected.len())
             .any(|window| window == expected)
@@ -1134,7 +1139,7 @@ async fn wait_for_output(
 }
 
 async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent) {
-    timeout(Duration::from_secs(10), async {
+    timeout(scaled(Duration::from_secs(10)), async {
         loop {
             match next_event_with_timeout(attachment)
                 .await
@@ -1164,7 +1169,7 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
 }
 
 async fn wait_for_interruption(client: &Client, id: RunId, expected: InterruptionReason) {
-    timeout(Duration::from_secs(10), async {
+    timeout(scaled(Duration::from_secs(10)), async {
         loop {
             match client
                 .status(id)
@@ -1265,11 +1270,18 @@ async fn hanging_discoveries_yield_single_worker_to_unrelated_native_requests() 
     }
     let helper_pids = fake.short_command_pids(HANGING_REQUESTS);
 
-    let native = timeout(Duration::from_secs(1), client.start(portable_spec()))
-        .await
-        .expect("native start must not wait for hanging tmux discovery")
-        .expect("start unrelated native Run");
-    let listed = timeout(Duration::from_secs(1), client.list())
+    // These two budgets prove ISOLATION, not speed: an unrelated request must
+    // return promptly instead of queueing behind the hanging discoveries, whose
+    // own public deadline below is 6s. Scaling keeps that separation intact
+    // while stopping host scheduling noise from reading as a blocked request.
+    let native = timeout(
+        scaled(Duration::from_secs(1)),
+        client.start(portable_spec()),
+    )
+    .await
+    .expect("native start must not wait for hanging tmux discovery")
+    .expect("start unrelated native Run");
+    let listed = timeout(scaled(Duration::from_secs(1)), client.list())
         .await
         .expect("list must not wait for hanging tmux discovery")
         .expect("list Runs during hanging tmux discovery");
@@ -1277,7 +1289,7 @@ async fn hanging_discoveries_yield_single_worker_to_unrelated_native_requests() 
     assert_eq!(listed[0].id, native.id);
 
     for request in hanging {
-        let error = timeout(Duration::from_secs(6), request)
+        let error = timeout(scaled(Duration::from_secs(6)), request)
             .await
             .expect("tmux discovery must honor its public deadline")
             .expect("join hanging discovery task")
@@ -1302,7 +1314,7 @@ async fn hanging_version_probe_is_bounded_reaped_and_request_local() {
     let request = tokio::spawn(async move { request_client.discover_tmux(socket_path).await });
     let helper_pid = fake.short_command_pids(1)[0];
 
-    let error = timeout(Duration::from_secs(6), request)
+    let error = timeout(scaled(Duration::from_secs(6)), request)
         .await
         .expect("tmux version probe must honor its command deadline")
         .expect("join hanging version probe")
@@ -1331,11 +1343,14 @@ async fn import_readiness_timeout_yields_and_rolls_back_before_publication() {
     let import = tokio::spawn(async move { import_client.import_tmux(socket_path, "%0").await });
     let control_pid = fake.control_pid();
 
-    let native = timeout(Duration::from_secs(1), client.start(portable_spec()))
-        .await
-        .expect("native start must not wait for tmux Control Mode readiness")
-        .expect("start unrelated native Run");
-    let error = timeout(Duration::from_secs(9), import)
+    let native = timeout(
+        scaled(Duration::from_secs(1)),
+        client.start(portable_spec()),
+    )
+    .await
+    .expect("native start must not wait for tmux Control Mode readiness")
+    .expect("start unrelated native Run");
+    let error = timeout(scaled(Duration::from_secs(9)), import)
         .await
         .expect("tmux import must honor its total deadline")
         .expect("join tmux import task")
@@ -1415,7 +1430,7 @@ async fn collect_exact_output_with_gap_replay(
     after_byte: u64,
     expected_end: &[u8],
 ) -> Vec<u8> {
-    timeout(Duration::from_secs(10), async {
+    timeout(scaled(Duration::from_secs(10)), async {
         let mut cursor = after_byte;
         let mut observed = Vec::new();
         loop {
@@ -2037,7 +2052,7 @@ async fn pause_storm_writes_one_bounded_continue_command() {
     fake.trigger_control("pause-storm");
     let expected = b"AFTER-CONTINUE\r\nSTORM-DRAINED\r\n";
 
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         while client.status(run.id).await.unwrap().latest_output_bytes
             < u64::try_from(expected.len()).expect("fixture output length fits u64")
         {
@@ -2321,7 +2336,7 @@ async fn detach_during_queued_output_preserves_replay_and_tmux_session() {
     let (attachment, _) = attach_with_timeout(&client, run.id, 0).await;
 
     server.send_line(&target_pane_id, "burst");
-    timeout(Duration::from_secs(5), attachment.detach())
+    timeout(scaled(Duration::from_secs(5)), attachment.detach())
         .await
         .expect("detach should not hang behind queued output")
         .expect("detach during queued output");

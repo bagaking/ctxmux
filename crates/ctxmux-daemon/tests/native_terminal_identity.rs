@@ -6,6 +6,7 @@ use std::{
 
 use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{RunId, RunSpec, TerminalSize};
+use ctxmux_test_support::{daemon_spawn_permit, scaled};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
 
@@ -17,6 +18,7 @@ struct TestDaemon {
 
 impl TestDaemon {
     async fn start_with_host_term(term: &str) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let directory = tempfile::tempdir().expect("create daemon temp directory");
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
@@ -35,7 +37,7 @@ impl TestDaemon {
             _directory: directory,
             client,
         };
-        timeout(Duration::from_secs(5), async {
+        timeout(scaled(Duration::from_secs(5)), async {
             loop {
                 if let Some(status) = daemon.child.try_wait().expect("poll ctxmuxd") {
                     panic!("ctxmuxd exited before accepting connections: {status}");
@@ -76,7 +78,7 @@ fn env_probe_spec(env: BTreeMap<String, String>) -> RunSpec {
 }
 
 async fn wait_until_exited(client: &Client, id: RunId) {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             if !client
                 .status(id)

@@ -40,5 +40,6 @@ workspace = true
 
 [dev-dependencies]
 ctxmux-client = { path = "../ctxmux-client" }
+ctxmux-test-support = { path = "../ctxmux-test-support" }
 serde_json.workspace = true
 tempfile.workspace = true

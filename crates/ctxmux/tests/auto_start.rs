@@ -7,8 +7,14 @@ use std::{
 
 use ctxmux_client::Client;
 use ctxmux_protocol::{DaemonInstanceId, RunSpec, TerminalSize};
+use ctxmux_test_support::scaled;
 
-const DEADLINE: Duration = Duration::from_secs(15);
+/// Budget for one daemon activation or Run observation to arrive. Scaled by
+/// `CTXMUX_TEST_TIME_SCALE` so a contended machine does not fail readiness that
+/// a correct daemon would meet when the host is idle.
+fn deadline() -> Duration {
+    scaled(Duration::from_secs(15))
+}
 
 struct SpawnedSocket {
     socket: PathBuf,
@@ -89,7 +95,7 @@ async fn ping_reuses_an_already_listening_daemon() {
     let socket = directory.path().join("ctxmux.sock");
     let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
     let client = Client::new(&socket);
-    let instance = tokio::time::timeout(DEADLINE, async {
+    let instance = tokio::time::timeout(deadline(), async {
         loop {
             if let Ok(instance) = client.daemon_instance().await {
                 return instance;
@@ -127,7 +133,7 @@ async fn stop_replays_a_caller_retained_operation_and_prints_its_disposition() {
     let marker = directory.path().join("stop-marker");
     let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
     let client = Client::new(&socket);
-    let daemon_instance = tokio::time::timeout(DEADLINE, async {
+    let daemon_instance = tokio::time::timeout(deadline(), async {
         loop {
             if let Ok(instance) = client.daemon_instance().await {
                 return instance;
@@ -158,7 +164,7 @@ async fn stop_replays_a_caller_retained_operation_and_prints_its_disposition() {
         })
         .await
         .expect("start CLI recoverable Stop fixture");
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout(deadline(), async {
         loop {
             if std::fs::read_to_string(&marker).is_ok_and(|value| value == "ready\n") {
                 break;
