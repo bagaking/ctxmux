@@ -4,7 +4,7 @@
   "title": "Carry Runs through an owner-host Remote Runtime",
   "slug": "remote-runtime-transport",
   "goal": "After the local Runtime contract is qualified, carry the existing public ctxmux protocol through a system OpenSSH StreamLocal tunnel to an owner-host ctxmuxd while preserving remote lifecycle truth, exact Runtime and Run identity, reconnect and replay, owner-issued Stop receipts, and fail-closed mixed capabilities without adding Relay, accounts, a control plane, orchestration, or derivation metadata.",
-  "status": "ready",
+  "status": "in_progress",
   "workspace_mode": "worktree",
   "base_ref": "main",
   "branch": "feat/f-22hjbhvt8",
@@ -101,6 +101,22 @@
     {
       "action": "task_finished",
       "detail": "T-005 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-002"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=4; supersedes_revision=3"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-006"
     }
   ],
   "depends_on": []

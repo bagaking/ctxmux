@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22hjbhvt8",
   "plan_status": "reviewed",
-  "plan_revision": 3,
-  "supersedes_revision": 2,
-  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
+  "plan_revision": 4,
+  "supersedes_revision": 3,
+  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -14,7 +14,8 @@
     ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
-    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md"
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md"
   ],
   "plan_history": [
     {
@@ -89,43 +90,43 @@
           "T-001"
         ]
       }
+    },
+    {
+      "revision": 4,
+      "supersedes_revision": 3,
+      "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md"
+      ],
+      "task_ids": [
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006"
+      ],
+      "superseded_task_ids": [
+        "T-002"
+      ],
+      "supersedes_by_task": {
+        "T-005": [
+          "T-001"
+        ],
+        "T-006": [
+          "T-002"
+        ]
+      }
     }
   ],
   "tasks": [
-    {
-      "id": "T-002",
-      "depends_on": [
-        "T-005"
-      ],
-      "title": "Publish probeable remote capability constants and the public endpoint surface",
-      "objective": "Make the remote endpoint capability discoverable through the existing flat numeric capability record and expose the endpoint in the public Rust and TypeScript surfaces so a consumer can fail closed instead of guessing.",
-      "outcome": "A client can require an exact remote capability version before dispatch, receives a typed unsupported result when the owner-host daemon does not advertise it, and reaches the remote endpoint through documented public API rather than private wiring.",
-      "acceptance": [
-        "The owner-host daemon advertises one exact `remote.*` capability key only when the complete implemented contract behind it is active, using the existing flat numeric capability record and its JavaScript-safe positive-integer version domain. No nested shape, boolean, alias, or negotiation frame is introduced.",
-        "The capability is enforced through the existing client-local, byte-exact, pre-dispatch requirement path in both the Rust client and the TypeScript SDK. An absent key or a lower advertised version produces the existing typed unsupported-capability error, closes before any business frame, and never falls back.",
-        "The public Rust and TypeScript surfaces expose the remote endpoint and its new capability constant as first-class, documented API, re-exported the same way existing capability constants are, so an external consumer needs no private module and no hand-written wire declaration.",
-        "The capability names an endpoint contract and nothing more: it does not promise that a specific host is reachable, that a remote Run is currently controllable, or that any `RunInfo.capabilities` value changed. Backend and per-Run capability truth remain unchanged and uninferred from it.",
-        "Unit and cross-language tests cover advertisement presence and absence, exact-version satisfaction, lower-version and missing-key rejection, and proof that rejection happens before dispatch."
-      ],
-      "verification": [
-        {
-          "kind": "command",
-          "ref": "scripts/check-remote-runtime.sh --stage capability",
-          "proves": "Remote capability advertisement, byte-exact pre-dispatch client enforcement, typed unsupported failure without fallback, and public Rust and TypeScript surface parity all hold."
-        }
-      ],
-      "source_refs": [
-        "docs/protocol.md#connection-state",
-        "docs/architecture.md#components-and-stable-boundaries",
-        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
-      ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
-    },
     {
       "id": "T-003",
       "depends_on": [
@@ -167,8 +168,8 @@
     {
       "id": "T-004",
       "depends_on": [
-        "T-002",
-        "T-003"
+        "T-003",
+        "T-006"
       ],
       "title": "Bind the Remote Runtime contract to documentation SSOT and one exact commit",
       "objective": "Publish the qualified remote endpoint contract through the owning documents and close the Feature on one exact commit whose evidence a downstream consumer can cite.",
@@ -256,6 +257,44 @@
           "status": "pass"
         }
       ],
+      "notes": []
+    },
+    {
+      "id": "T-006",
+      "depends_on": [
+        "T-005"
+      ],
+      "title": "Publish the probeable remote endpoint contract in the public surfaces",
+      "objective": "Make the owner-host endpoint contract discoverable from the public Rust and TypeScript surfaces so a consumer can fail closed instead of guessing, without asking any party to declare a fact it cannot observe.",
+      "outcome": "A consumer can probe which endpoint contract the linked client implements, keeps using the existing fail-closed capability path for what the owner-host daemon can do, and reaches the endpoint through documented public API rather than private wiring.",
+      "acceptance": [
+        "The public Rust and TypeScript surfaces export the owner-host endpoint contract version as a first-class documented constant, exported the same way the existing capability constants are, so an external consumer needs no private module and no hand-written declaration.",
+        "The daemon capability record is unchanged: no `remote.*` key is added to it, no nested shape, boolean, alias, or negotiation frame is introduced, and no party advertises a fact about the caller's network position. A daemon reached through a forwarded socket observes an ordinary local connection and must not claim otherwise.",
+        "A consumer probes two separately owned facts: the exported constant for what the linked client can establish, and the existing byte-exact, pre-dispatch, fail-closed capability requirements for what the owner-host daemon can do. An absent key or lower advertised version still produces the existing typed unsupported-capability error, closes before any business frame, and never falls back.",
+        "The constant names the endpoint contract and nothing more: it does not promise that a host is reachable, that credentials work, that a daemon is listening, or that any Run is controllable. Those stay typed runtime failures rather than capability answers, and `RunInfo.capabilities` and Backend truth remain unchanged and uninferred from it.",
+        "The TypeScript SDK reaches an owner-host Runtime through a forwarded socket with no SDK change, proven by a checked-in cross-language fixture rather than derived from the socket-path argument alone.",
+        "Tests cover the exported constant's presence and value in both languages, the daemon record's continued absence of any remote key, and that a missing or lower daemon capability is rejected before dispatch when reached through a tunnel."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-remote-runtime.sh --stage capability",
+          "proves": "The endpoint contract constant is exported and consistent across the Rust and TypeScript surfaces, the daemon record carries no remote key, a TypeScript client reaches an owner-host Runtime through a forwarded socket, and capability rejection still happens before dispatch."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#connection-state",
+        "docs/architecture.md#components-and-stable-boundaries",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md"
+      ],
+      "supersedes": [
+        "T-002"
+      ],
+      "introduced_in_revision": 4,
+      "status": "in_progress",
+      "gate_result": null,
+      "last_gate_commands": [],
       "notes": []
     },
     {

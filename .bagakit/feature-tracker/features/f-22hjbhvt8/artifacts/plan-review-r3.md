@@ -63,6 +63,13 @@ T-003's setup problem, and this Feature still uploads, installs, and spawns
 nothing on its own: the operator provisions the owner host, and a missing
 listener remains an explicit error.
 
+The Owner set one constraint on that provisioning: place only a compiled
+`ctxmuxd` binary on the owner host — do not clone the repository or build there.
+A cross-compiled Linux `x86_64` binary plus a socket path is the entire remote
+footprint. This keeps the owner host free of a toolchain and source tree, and it
+matches the decision boundary: ctxmux never places or starts that binary itself,
+so the operator's copy is the only provisioning step.
+
 ## What does not change
 
 The architecture decision in revision 2 stands unchanged: `RunBackend` remains
