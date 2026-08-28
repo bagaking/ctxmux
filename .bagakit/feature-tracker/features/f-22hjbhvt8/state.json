@@ -4,7 +4,7 @@
   "title": "Carry Runs through an owner-host Remote Runtime",
   "slug": "remote-runtime-transport",
   "goal": "After the local Runtime contract is qualified, carry the existing public ctxmux protocol through a system OpenSSH StreamLocal tunnel to an owner-host ctxmuxd while preserving remote lifecycle truth, exact Runtime and Run identity, reconnect and replay, owner-issued Stop receipts, and fail-closed mixed capabilities without adding Relay, accounts, a control plane, orchestration, or derivation metadata.",
-  "status": "blocked",
+  "status": "ready",
   "workspace_mode": "worktree",
   "base_ref": "main",
   "branch": "feat/f-22hjbhvt8",
@@ -13,21 +13,21 @@
   "runtime_role": "standalone",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 2,
+    "gate_fail_streak": 0,
     "no_progress_rounds": 0,
-    "round_count": 2
+    "round_count": 6
   },
   "gate": {
-    "last_result": "fail",
-    "last_task_id": "T-001",
+    "last_result": "pass",
+    "last_task_id": "T-005",
     "last_check_commands": [
       {
-        "command": "scripts/check-remote-runtime.sh --stage vertical",
-        "exit_code": 1,
-        "status": "fail"
+        "command": "scripts/check-remote-runtime.sh --stage supervision",
+        "exit_code": 0,
+        "status": "pass"
       }
     ],
-    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-001-r2-0001.log"
+    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-005-r6-0001.log"
   },
   "history": [
     {
@@ -73,6 +73,34 @@
     {
       "action": "task_blocker_set",
       "detail": "T-001 => external_blocker"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-005 => done"
     }
   ],
   "depends_on": []

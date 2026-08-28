@@ -2,24 +2,18 @@
   "schema": "bagakit.execution-owner-receipt.v2",
   "owner_kind": "feature_tracker",
   "owner_id": "f-22hjbhvt8",
-  "semantic_revision": "f6b10207ea80cc642597a55f21f11e6ad1eb6f0e6eb8aab9b09266253647f02a",
-  "lifecycle_status": "blocked",
-  "continuation": "blocked",
+  "semantic_revision": "362c4a4c2b90acc5f73dac0fc09d411e249673f7cd16c52373d2062725c53736",
+  "lifecycle_status": "ready",
+  "continuation": "continue",
   "active_item_ids": [],
-  "blockers": [
-    {
-      "item_id": "T-001",
-      "class": "external_blocker",
-      "reason": "The vertical is implemented and its supervision lane, argument-shape lane, and the complete repository gate all pass. The real-OpenSSH lane its acceptance requires cannot run here: this machine has no SSH boundary to an owner host (ssh localhost is refused). That lane fails rather than skips by design, so remote cannot be reported as qualified by a run that never spoke SSH. Unblock by enabling a loopback or remote owner host and rerunning scripts/check-remote-runtime.sh --stage vertical; see verification.md."
-    }
-  ],
+  "blockers": [],
   "replacement_ref": null,
   "evidence_refs": [
     ".bagakit/feature-tracker/features/f-22hjbhvt8/state.json",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/tasks.json"
   ],
   "evidence_hashes": {
-    ".bagakit/feature-tracker/features/f-22hjbhvt8/state.json": "9587587907d755472f106ca5ba1a5f5a827c83faee2a6acff40c599c24f59f83",
-    ".bagakit/feature-tracker/features/f-22hjbhvt8/tasks.json": "64594df018fa4f41e15d53f7f07057cd9336b69e7f91bb1ac1daee62c8f11ea1"
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/state.json": "4b334a0f7b3c81a95b3df5ae612be654d0d1d93aa24a3aa9d9bc3e64cdd6b14c",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/tasks.json": "19189fd1d389e873a1fd6d2de719cc4e9c4fbd880c07f3a6d5fe0cd74a0495f2"
   }
 }

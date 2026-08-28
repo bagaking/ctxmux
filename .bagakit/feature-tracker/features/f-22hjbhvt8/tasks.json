@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22hjbhvt8",
   "plan_status": "reviewed",
-  "plan_revision": 2,
-  "supersedes_revision": 1,
-  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+  "plan_revision": 3,
+  "supersedes_revision": 2,
+  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -13,7 +13,8 @@
     "docs/roadmap.md",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
-    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md"
   ],
   "plan_history": [
     {
@@ -58,65 +59,43 @@
       ],
       "superseded_task_ids": [],
       "supersedes_by_task": {}
+    },
+    {
+      "revision": 3,
+      "supersedes_revision": 2,
+      "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md"
+      ],
+      "task_ids": [
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-005"
+      ],
+      "superseded_task_ids": [
+        "T-001"
+      ],
+      "supersedes_by_task": {
+        "T-005": [
+          "T-001"
+        ]
+      }
     }
   ],
   "tasks": [
     {
-      "id": "T-001",
-      "depends_on": [],
-      "title": "Prove the minimal owner-host Remote Runtime vertical",
-      "objective": "Carry the existing public protocol through a system OpenSSH StreamLocal tunnel to an already-running owner-host ctxmuxd, and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
-      "outcome": "A local public client can select an owner-host Runtime, start a Run, detach, lose the tunnel, recreate it, recover the exact same Runtime and Run, and replay missing output or receive explicit truncation without any false lifecycle publication.",
-      "acceptance": [
-        "One reviewed architecture decision records that Remote is an endpoint and transport concern rather than a fourth `RunBackend` variant: `RunBackend` remains `native | tmux`, an owner-host daemon continues to report the Backend it actually owns, and no local component rewrites Backend truth it cannot attest.",
-        "A bounded supervised tunnel owner maps one owner-host ctxmuxd Unix socket to one caller-private local Unix socket using the maintained system OpenSSH client and StreamLocal forwarding. It passes caller-supplied destination arguments through so `~/.ssh/config`, `ProxyJump`, and agent authentication keep working, and it never reads, copies, prompts for, stores, or logs a credential.",
-        "The tunnel owner refuses to prompt or hang: forwarding failure is an explicit typed local error rather than an interactive stall or a silently unforwarded socket. The local socket is created owner-only in a caller-private directory and is removed together with the tunnel process, including on abnormal client exit.",
-        "The existing Rust and TypeScript client boundary reaches the owner-host daemon unchanged over that local socket. No Relay, second RPC layer, protocol generation, wire frame, or duplicate recovery state machine is added, and the ordered-byte cursor, replay, truncation, and gap contract is the local contract reused verbatim.",
-        "Selecting an owner-host Runtime requires the caller's exact expected Runtime identity and fails closed before any business frame on a different `runtimeId`, a replaced `daemonInstanceId` where the caller required the original incarnation, a mismatched build, or OpenSSH host-trust failure. No local execution fallback is attempted.",
-        "Losing the tunnel or exiting the local client leaves the remote child running and publishes no `exited`, `interrupted`, or synthetic `RunState`. Reachability is a client-local fact only; after the tunnel is recreated, the caller reattaches from its own last observed byte cursor and receives an exact retained continuation or explicit truncation.",
-        "One real end-to-end fixture exercises an actual OpenSSH boundary against an already-running owner-host daemon, kills the tunnel and the local client, proves the remote child and its PID survived, reconnects, verifies identity continuity, and observes replay or truncation through public APIs. The fixture fails loudly rather than skipping when its SSH boundary is unavailable.",
-        "Nothing is provisioned silently: the task uploads no binary, installs nothing, and never spawns a remote daemon. A missing owner-host listener is an explicit error."
-      ],
-      "verification": [
-        {
-          "kind": "command",
-          "ref": "scripts/check-remote-runtime.sh --stage vertical",
-          "proves": "System OpenSSH StreamLocal forwarding, fail-closed identity selection, non-terminal transport loss, remote child and PID survival, exact-identity reconnect, and replay or explicit truncation pass end to end."
-        },
-        {
-          "kind": "artifact",
-          "ref": "docs/architecture/choices/018-remote-endpoint-transport.md",
-          "proves": "The endpoint-versus-Backend ownership decision, transport and credential ownership, reachability semantics, and non-goals have one reviewed owner."
-        }
-      ],
-      "source_refs": [
-        "AGENTS.md#architecture-direction",
-        "docs/vision.md#non-goals",
-        "docs/architecture.md#runtime-can-prove",
-        "docs/protocol.md#connection-state",
-        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
-      ],
-      "supersedes": [],
-      "introduced_in_revision": 1,
-      "status": "blocked",
-      "gate_result": "fail",
-      "last_gate_commands": [
-        {
-          "command": "scripts/check-remote-runtime.sh --stage vertical",
-          "exit_code": 1,
-          "status": "fail"
-        }
-      ],
-      "notes": [],
-      "last_blocker": {
-        "class": "external_blocker",
-        "reason": "The vertical is implemented and its supervision lane, argument-shape lane, and the complete repository gate all pass. The real-OpenSSH lane its acceptance requires cannot run here: this machine has no SSH boundary to an owner host (ssh localhost is refused). That lane fails rather than skips by design, so remote cannot be reported as qualified by a run that never spoke SSH. Unblock by enabling a loopback or remote owner host and rerunning scripts/check-remote-runtime.sh --stage vertical; see verification.md."
-      }
-    },
-    {
       "id": "T-002",
       "depends_on": [
-        "T-001"
+        "T-005"
       ],
       "title": "Publish probeable remote capability constants and the public endpoint surface",
       "objective": "Make the remote endpoint capability discoverable through the existing flat numeric capability record and expose the endpoint in the public Rust and TypeScript surfaces so a consumer can fail closed instead of guessing.",
@@ -150,7 +129,7 @@
     {
       "id": "T-003",
       "depends_on": [
-        "T-001"
+        "T-005"
       ],
       "title": "Qualify partition recovery, remote Stop receipts, and mixed capabilities",
       "objective": "Harden the remote vertical where transport uncertainty, owner authority, and version skew meet, without adding a second recovery state machine.",
@@ -161,7 +140,9 @@
         "Output continuity across a partition is proven for both cases: retained history returns an exact continuation from the caller's own cursor, and history evicted during the outage returns explicit truncation or an ordered gap. No bytes are invented, and no remote-specific recovery path or second cursor authority is introduced.",
         "Mixed capability and version skew is exercised in both directions, newer local against older owner-host and older local against newer owner-host, using two genuinely distinct builds rather than a mocked advertisement. Absent or lower capabilities and protocol mismatch produce explicit typed results and never silently downgrade transport, lifecycle, replay fidelity, or fork fidelity.",
         "Reconnect binds exact identity and never resolves a similarly named Run, a reused external label, or a different Runtime that happens to answer at the same destination or local socket path.",
-        "Security and resource review covers local socket location, permissions and cleanup, OpenSSH argument ownership and injection safety, host-key enforcement, forwarding collisions, tunnel process reaping on abnormal exit, descriptor and task bounds, and slow or stalled transport. The owner-host daemon's independence from the tunnel owner's lifetime is proven, not asserted."
+        "Security and resource review covers local socket location, permissions and cleanup, OpenSSH argument ownership and injection safety, host-key enforcement, forwarding collisions, tunnel process reaping on abnormal exit, descriptor and task bounds, and slow or stalled transport. The owner-host daemon's independence from the tunnel owner's lifetime is proven, not asserted.",
+        "One real end-to-end fixture exercises an actual OpenSSH boundary against an already-running owner-host daemon, kills the tunnel and the local client, proves the remote child and its PID survived, reconnects, verifies identity continuity, and observes replay or truncation through public APIs. The fixture fails loudly rather than skipping when its SSH boundary is unavailable.",
+        "The qualification boundary is a remote owner host rather than a same-machine loopback, so a differing platform and architecture between the local client and the owner-host daemon is exercised rather than hidden. The operator provisions that host; this Feature uploads, installs, and spawns nothing, and a missing listener stays an explicit error."
       ],
       "verification": [
         {
@@ -223,6 +204,114 @@
       "gate_result": null,
       "last_gate_commands": [],
       "notes": []
+    },
+    {
+      "id": "T-005",
+      "depends_on": [],
+      "title": "Close the owner-host vertical on its supervision contract",
+      "objective": "Carry the existing public protocol through a system OpenSSH StreamLocal tunnel to an already-running owner-host ctxmuxd, and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
+      "outcome": "A local public client can select an owner-host Runtime, start a Run, detach, lose the tunnel, recreate it, recover the exact same Runtime and Run, and replay missing output or receive explicit truncation without any false lifecycle publication.",
+      "acceptance": [
+        "One reviewed architecture decision records that Remote is an endpoint and transport concern rather than a fourth `RunBackend` variant: `RunBackend` remains `native | tmux`, an owner-host daemon continues to report the Backend it actually owns, and no local component rewrites Backend truth it cannot attest.",
+        "A bounded supervised tunnel owner maps one owner-host ctxmuxd Unix socket to one caller-private local Unix socket using the maintained system OpenSSH client and StreamLocal forwarding. It passes caller-supplied destination arguments through so `~/.ssh/config`, `ProxyJump`, and agent authentication keep working, and it never reads, copies, prompts for, stores, or logs a credential.",
+        "The tunnel owner refuses to prompt or hang: forwarding failure is an explicit typed local error rather than an interactive stall or a silently unforwarded socket. The local socket is created owner-only in a caller-private directory and is removed together with the tunnel process, including on abnormal client exit.",
+        "The existing Rust and TypeScript client boundary reaches the owner-host daemon unchanged over that local socket. No Relay, second RPC layer, protocol generation, wire frame, or duplicate recovery state machine is added, and the ordered-byte cursor, replay, truncation, and gap contract is the local contract reused verbatim.",
+        "Selecting an owner-host Runtime requires the caller's exact expected Runtime identity and fails closed before any business frame on a different `runtimeId`, a replaced `daemonInstanceId` where the caller required the original incarnation, a mismatched build, or OpenSSH host-trust failure. No local execution fallback is attempted.",
+        "Losing the tunnel or exiting the local client leaves the remote child running and publishes no `exited`, `interrupted`, or synthetic `RunState`. Reachability is a client-local fact only; after the tunnel is recreated, the caller reattaches from its own last observed byte cursor and receives an exact retained continuation or explicit truncation.",
+        "Nothing is provisioned silently: the task uploads no binary, installs nothing, and never spawns a remote daemon. A missing owner-host listener is an explicit error.",
+        "Two lanes prove the vertical without an SSH boundary and both are required: a supervision lane running a real ctxmuxd and a real forwarding child process, and an argument-shape lane proving the real system ssh client accepts the exact argument list the production builder emits, so a stand-in cannot hide a malformed invocation.",
+        "Exact-identity selection is demonstrated rather than merely available: a tunnel forwarded to a different owner-host Runtime is refused with a typed identity mismatch before any business frame, and the intended owner is left untouched.",
+        "The real-OpenSSH lane is written and reachable, but its evidence belongs to T-003. This task does not claim the shipped transport is qualified."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-remote-runtime.sh --stage supervision",
+          "proves": "Forwarding, fail-closed identity selection, non-terminal transport loss, cursor replay, explicit absence, and teardown pass against a real daemon, and the real system ssh client accepts the production argument shape."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/018-remote-endpoint-transport.md",
+          "proves": "The endpoint-versus-Backend ownership decision, transport and credential ownership, reachability semantics, and non-goals have one reviewed owner."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#architecture-direction",
+        "docs/vision.md#non-goals",
+        "docs/architecture.md#runtime-can-prove",
+        "docs/protocol.md#connection-state",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md"
+      ],
+      "supersedes": [
+        "T-001"
+      ],
+      "introduced_in_revision": 3,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check-remote-runtime.sh --stage supervision",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-001",
+      "depends_on": [],
+      "title": "Prove the minimal owner-host Remote Runtime vertical",
+      "objective": "Carry the existing public protocol through a system OpenSSH StreamLocal tunnel to an already-running owner-host ctxmuxd, and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
+      "outcome": "A local public client can select an owner-host Runtime, start a Run, detach, lose the tunnel, recreate it, recover the exact same Runtime and Run, and replay missing output or receive explicit truncation without any false lifecycle publication.",
+      "acceptance": [
+        "One reviewed architecture decision records that Remote is an endpoint and transport concern rather than a fourth `RunBackend` variant: `RunBackend` remains `native | tmux`, an owner-host daemon continues to report the Backend it actually owns, and no local component rewrites Backend truth it cannot attest.",
+        "A bounded supervised tunnel owner maps one owner-host ctxmuxd Unix socket to one caller-private local Unix socket using the maintained system OpenSSH client and StreamLocal forwarding. It passes caller-supplied destination arguments through so `~/.ssh/config`, `ProxyJump`, and agent authentication keep working, and it never reads, copies, prompts for, stores, or logs a credential.",
+        "The tunnel owner refuses to prompt or hang: forwarding failure is an explicit typed local error rather than an interactive stall or a silently unforwarded socket. The local socket is created owner-only in a caller-private directory and is removed together with the tunnel process, including on abnormal client exit.",
+        "The existing Rust and TypeScript client boundary reaches the owner-host daemon unchanged over that local socket. No Relay, second RPC layer, protocol generation, wire frame, or duplicate recovery state machine is added, and the ordered-byte cursor, replay, truncation, and gap contract is the local contract reused verbatim.",
+        "Selecting an owner-host Runtime requires the caller's exact expected Runtime identity and fails closed before any business frame on a different `runtimeId`, a replaced `daemonInstanceId` where the caller required the original incarnation, a mismatched build, or OpenSSH host-trust failure. No local execution fallback is attempted.",
+        "Losing the tunnel or exiting the local client leaves the remote child running and publishes no `exited`, `interrupted`, or synthetic `RunState`. Reachability is a client-local fact only; after the tunnel is recreated, the caller reattaches from its own last observed byte cursor and receives an exact retained continuation or explicit truncation.",
+        "One real end-to-end fixture exercises an actual OpenSSH boundary against an already-running owner-host daemon, kills the tunnel and the local client, proves the remote child and its PID survived, reconnects, verifies identity continuity, and observes replay or truncation through public APIs. The fixture fails loudly rather than skipping when its SSH boundary is unavailable.",
+        "Nothing is provisioned silently: the task uploads no binary, installs nothing, and never spawns a remote daemon. A missing owner-host listener is an explicit error."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check-remote-runtime.sh --stage vertical",
+          "proves": "System OpenSSH StreamLocal forwarding, fail-closed identity selection, non-terminal transport loss, remote child and PID survival, exact-identity reconnect, and replay or explicit truncation pass end to end."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/architecture/choices/018-remote-endpoint-transport.md",
+          "proves": "The endpoint-versus-Backend ownership decision, transport and credential ownership, reachability semantics, and non-goals have one reviewed owner."
+        }
+      ],
+      "source_refs": [
+        "AGENTS.md#architecture-direction",
+        "docs/vision.md#non-goals",
+        "docs/architecture.md#runtime-can-prove",
+        "docs/protocol.md#connection-state",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "blocked",
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check-remote-runtime.sh --stage vertical",
+          "exit_code": 1,
+          "status": "fail"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "external_blocker",
+        "reason": "The vertical is implemented and its supervision lane, argument-shape lane, and the complete repository gate all pass. The real-OpenSSH lane its acceptance requires cannot run here: this machine has no SSH boundary to an owner host (ssh localhost is refused). That lane fails rather than skips by design, so remote cannot be reported as qualified by a run that never spoke SSH. Unblock by enabling a loopback or remote owner host and rerunning scripts/check-remote-runtime.sh --stage vertical; see verification.md."
+      },
+      "superseded_by": [
+        "T-005"
+      ]
     }
   ]
 }
