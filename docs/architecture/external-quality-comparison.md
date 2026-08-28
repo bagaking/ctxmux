@@ -72,10 +72,18 @@ waits. Bounding how many startups race is a stronger fix than raising the
 budget, because it changes contention rather than tolerance — so a genuinely
 slow startup still fails.
 
-This was measured here, not assumed. On a 14-core host under load average 138,
+This was observed here, not assumed. On a 14-core host under load average 138,
 allowing four concurrent daemon startups left five of 46 tests failing on
 readiness; allowing two returned 46 of 46. Raising the time multiplier to four
-only reduced failures from five to three. See
+only reduced failures from five to three, which is why the gate rather than the
+multiplier is the primary lever.
+
+That comparison was opportunistic rather than controlled, and the limit of that
+evidence is worth stating: at load average 40 or below every limit passes, so an
+ordinary machine reproduces neither the failure nor the fix. This is itself the
+argument for the deterministic-counter approach above — a countable invariant
+would have been checkable on any machine, while a contention-dependent failure
+is only observable on a machine that happens to be busy. See
 `crates/ctxmux-test-support/src/lib.rs`.
 
 ### Poll for a condition, never sleep for one
