@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22hjbhvt8",
   "plan_status": "reviewed",
-  "plan_revision": 1,
-  "supersedes_revision": null,
-  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+  "plan_revision": 2,
+  "supersedes_revision": 1,
+  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -12,7 +12,8 @@
     "docs/protocol.md",
     "docs/roadmap.md",
     ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
-    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md"
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+    ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
   ],
   "plan_history": [
     {
@@ -34,32 +35,58 @@
       ],
       "superseded_task_ids": [],
       "supersedes_by_task": {}
+    },
+    {
+      "revision": 2,
+      "supersedes_revision": 1,
+      "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
+      ],
+      "task_ids": [
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
     }
   ],
   "tasks": [
     {
       "id": "T-001",
+      "depends_on": [],
       "title": "Prove the minimal owner-host Remote Runtime vertical",
-      "objective": "Carry the existing public protocol through system OpenSSH StreamLocal forwarding and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
-      "outcome": "A local public client can start or attach to an owner-host Run, lose transport, recreate the tunnel, recover the same Runtime, Run, and PID, and replay missing output or receive explicit truncation without publishing a false exit.",
+      "objective": "Carry the existing public protocol through a system OpenSSH StreamLocal tunnel to an already-running owner-host ctxmuxd, and prove that a remote daemon-owned Run survives local client and tunnel loss and can be reattached by exact identity.",
+      "outcome": "A local public client can select an owner-host Runtime, start a Run, detach, lose the tunnel, recreate it, recover the exact same Runtime and Run, and replay missing output or receive explicit truncation without any false lifecycle publication.",
       "acceptance": [
-        "A reviewed architecture decision keeps Integrations as what-runs semantics and adds only a transport or Backend path to an owner-host ctxmuxd; the remote daemon remains the sole PTY, child, lifecycle, output, replay, and process-control owner.",
-        "The first implementation uses the maintained system OpenSSH client and StreamLocal forwarding to map the remote daemon Unix socket to a bounded local Unix socket, then reuses the existing protocol and Rust or TypeScript client boundary without Relay or a second product RPC layer.",
-        "The local client and tunnel can terminate while the remote child continues; transport loss changes endpoint reachability to `unverifiable` and does not publish `exited`, `interrupted`, or any synthetic RunState transition.",
-        "A recreated tunnel attaches only to the exact expected `runtimeId + runId`; the same remote PID remains owner evidence, and output generated while disconnected is replayed from the caller cursor or reports explicit truncation.",
-        "OpenSSH owns host-key trust, credentials, and connection policy. Wrong SSH host trust, another Runtime, another Run, or mismatched expected identity fails closed before attach, resume, or process mutation.",
-        "Real end-to-end fixtures use an actual remote owner boundary or isolated SSH host, kill the local tunnel and client, prove remote child survival, reconnect, verify identity and PID continuity, and observe replay or truncation through public APIs."
+        "One reviewed architecture decision records that Remote is an endpoint and transport concern rather than a fourth `RunBackend` variant: `RunBackend` remains `native | tmux`, an owner-host daemon continues to report the Backend it actually owns, and no local component rewrites Backend truth it cannot attest.",
+        "A bounded supervised tunnel owner maps one owner-host ctxmuxd Unix socket to one caller-private local Unix socket using the maintained system OpenSSH client and StreamLocal forwarding. It passes caller-supplied destination arguments through so `~/.ssh/config`, `ProxyJump`, and agent authentication keep working, and it never reads, copies, prompts for, stores, or logs a credential.",
+        "The tunnel owner refuses to prompt or hang: forwarding failure is an explicit typed local error rather than an interactive stall or a silently unforwarded socket. The local socket is created owner-only in a caller-private directory and is removed together with the tunnel process, including on abnormal client exit.",
+        "The existing Rust and TypeScript client boundary reaches the owner-host daemon unchanged over that local socket. No Relay, second RPC layer, protocol generation, wire frame, or duplicate recovery state machine is added, and the ordered-byte cursor, replay, truncation, and gap contract is the local contract reused verbatim.",
+        "Selecting an owner-host Runtime requires the caller's exact expected Runtime identity and fails closed before any business frame on a different `runtimeId`, a replaced `daemonInstanceId` where the caller required the original incarnation, a mismatched build, or OpenSSH host-trust failure. No local execution fallback is attempted.",
+        "Losing the tunnel or exiting the local client leaves the remote child running and publishes no `exited`, `interrupted`, or synthetic `RunState`. Reachability is a client-local fact only; after the tunnel is recreated, the caller reattaches from its own last observed byte cursor and receives an exact retained continuation or explicit truncation.",
+        "One real end-to-end fixture exercises an actual OpenSSH boundary against an already-running owner-host daemon, kills the tunnel and the local client, proves the remote child and its PID survived, reconnects, verifies identity continuity, and observes replay or truncation through public APIs. The fixture fails loudly rather than skipping when its SSH boundary is unavailable.",
+        "Nothing is provisioned silently: the task uploads no binary, installs nothing, and never spawns a remote daemon. A missing owner-host listener is an explicit error."
       ],
       "verification": [
         {
           "kind": "command",
           "ref": "scripts/check-remote-runtime.sh --stage vertical",
-          "proves": "System OpenSSH forwarding, transport-loss non-terminal truth, exact identity reconnect, PID continuity, and replay or truncation pass end to end."
+          "proves": "System OpenSSH StreamLocal forwarding, fail-closed identity selection, non-terminal transport loss, remote child and PID survival, exact-identity reconnect, and replay or explicit truncation pass end to end."
         },
         {
           "kind": "artifact",
-          "ref": "docs/architecture.md",
-          "proves": "Owner-host lifecycle truth, reachability, identity, transport ownership, and non-goals are explicit."
+          "ref": "docs/architecture/choices/018-remote-endpoint-transport.md",
+          "proves": "The endpoint-versus-Backend ownership decision, transport and credential ownership, reachability semantics, and non-goals have one reviewed owner."
         }
       ],
       "source_refs": [
@@ -67,7 +94,7 @@
         "docs/vision.md#non-goals",
         "docs/architecture.md#runtime-can-prove",
         "docs/protocol.md#connection-state",
-        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md"
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
@@ -78,43 +105,110 @@
     },
     {
       "id": "T-002",
-      "title": "Qualify remote identity, Stop receipts, and mixed capabilities",
-      "objective": "Harden the minimal Remote Runtime vertical with fail-closed identity, remote owner receipts, bidirectional mixed-capability evidence, security, resources, and supported-platform qualification.",
-      "outcome": "Remote Runtime has an auditable owner-host contract: transport uncertainty never becomes lifecycle truth, the wrong owner cannot be controlled, Stop has a remote daemon receipt, and mixed versions fail explicitly without fallback.",
+      "depends_on": [
+        "T-001"
+      ],
+      "title": "Publish probeable remote capability constants and the public endpoint surface",
+      "objective": "Make the remote endpoint capability discoverable through the existing flat numeric capability record and expose the endpoint in the public Rust and TypeScript surfaces so a consumer can fail closed instead of guessing.",
+      "outcome": "A client can require an exact remote capability version before dispatch, receives a typed unsupported result when the owner-host daemon does not advertise it, and reaches the remote endpoint through documented public API rather than private wiring.",
       "acceptance": [
-        "Expected Runtime identity and OpenSSH host trust are both required. Wrong Runtime, Run, endpoint, or host trust fails before attach, replay, input, resize, signal, stop, fork, or resume; no local Runtime fallback is attempted.",
-        "Stop completion is accepted only from the remote daemon owner and names its actual disposition. Tunnel loss or local process exit cannot synthesize a Stop receipt or terminal state, and a reconnect observes the remote owner's final truth.",
-        "Mixed capability tests cover a newer local client against an older remote daemon and an older local client against a newer remote daemon; absent or lower capabilities produce explicit unsupported results and never silently downgrade transport, lifecycle, or fork fidelity.",
-        "Disconnect output is replayed from an exact caller cursor when retained and otherwise reports truncation or gap without inventing bytes; reconnect does not reuse a similarly named Run or external label.",
-        "Security and resource review covers temporary socket location and cleanup, OpenSSH argument ownership, host-key enforcement, forwarding collisions, tunnel process cleanup, descriptor and task bounds, slow or lost transport, and daemon independence from the tunnel owner.",
-        "The complete repository and Remote qualification gates pass on supported platforms with no Relay, account, environment, control-plane, deployment, remote scheduling, orchestration, provider, or derivation subsystem."
+        "The owner-host daemon advertises one exact `remote.*` capability key only when the complete implemented contract behind it is active, using the existing flat numeric capability record and its JavaScript-safe positive-integer version domain. No nested shape, boolean, alias, or negotiation frame is introduced.",
+        "The capability is enforced through the existing client-local, byte-exact, pre-dispatch requirement path in both the Rust client and the TypeScript SDK. An absent key or a lower advertised version produces the existing typed unsupported-capability error, closes before any business frame, and never falls back.",
+        "The public Rust and TypeScript surfaces expose the remote endpoint and its new capability constant as first-class, documented API, re-exported the same way existing capability constants are, so an external consumer needs no private module and no hand-written wire declaration.",
+        "The capability names an endpoint contract and nothing more: it does not promise that a specific host is reachable, that a remote Run is currently controllable, or that any `RunInfo.capabilities` value changed. Backend and per-Run capability truth remain unchanged and uninferred from it.",
+        "Unit and cross-language tests cover advertisement presence and absence, exact-version satisfaction, lower-version and missing-key rejection, and proof that rejection happens before dispatch."
       ],
       "verification": [
         {
           "kind": "command",
-          "ref": "scripts/check-remote-runtime.sh --stage qualification",
-          "proves": "Wrong identity, remote Stop receipt, replay limits, bidirectional mixed capabilities, transport failure, security, and resource boundaries pass together."
-        },
+          "ref": "scripts/check-remote-runtime.sh --stage capability",
+          "proves": "Remote capability advertisement, byte-exact pre-dispatch client enforcement, typed unsupported failure without fallback, and public Rust and TypeScript surface parity all hold."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#connection-state",
+        "docs/architecture.md#components-and-stable-boundaries",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-003",
+      "depends_on": [
+        "T-001"
+      ],
+      "title": "Qualify partition recovery, remote Stop receipts, and mixed capabilities",
+      "objective": "Harden the remote vertical where transport uncertainty, owner authority, and version skew meet, without adding a second recovery state machine.",
+      "outcome": "Remote has auditable partition behavior: uncertainty never becomes lifecycle truth, only the remote owner settles a Stop, and version or capability skew fails explicitly in both directions.",
+      "acceptance": [
+        "Stop completion is accepted only from the remote daemon owner and reports its actual disposition. Tunnel loss, local client exit, or a killed tunnel process can never synthesize a Stop receipt or a terminal state, and a later reconnect observes the remote owner's final truth.",
+        "Partition recovery reuses the existing recoverable-operation fences unchanged across a real tunnel break: the retained operation binds the original `daemonInstanceId`, an exact retry joins or replays its settled result, and a replaced incarnation fails at the instance fence rather than mutating anything.",
+        "Output continuity across a partition is proven for both cases: retained history returns an exact continuation from the caller's own cursor, and history evicted during the outage returns explicit truncation or an ordered gap. No bytes are invented, and no remote-specific recovery path or second cursor authority is introduced.",
+        "Mixed capability and version skew is exercised in both directions, newer local against older owner-host and older local against newer owner-host, using two genuinely distinct builds rather than a mocked advertisement. Absent or lower capabilities and protocol mismatch produce explicit typed results and never silently downgrade transport, lifecycle, replay fidelity, or fork fidelity.",
+        "Reconnect binds exact identity and never resolves a similarly named Run, a reused external label, or a different Runtime that happens to answer at the same destination or local socket path.",
+        "Security and resource review covers local socket location, permissions and cleanup, OpenSSH argument ownership and injection safety, host-key enforcement, forwarding collisions, tunnel process reaping on abnormal exit, descriptor and task bounds, and slow or stalled transport. The owner-host daemon's independence from the tunnel owner's lifetime is proven, not asserted."
+      ],
+      "verification": [
         {
           "kind": "command",
-          "ref": "scripts/check-qualification.sh",
-          "proves": "Remote Runtime and the complete supported public contract pass without fallback or hidden skips."
+          "ref": "scripts/check-remote-runtime.sh --stage partition",
+          "proves": "Remote-owner Stop settlement, instance-fenced recovery across a real partition, exact continuation versus explicit truncation, bidirectional skew rejection, and the security and resource boundary all hold."
+        }
+      ],
+      "source_refs": [
+        "docs/protocol.md#recoverable-native-stop",
+        "docs/protocol.md#output-and-reconnect",
+        "docs/architecture.md#concurrency-ordering-and-failure-semantics",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 2,
+      "status": "todo",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-004",
+      "depends_on": [
+        "T-002",
+        "T-003"
+      ],
+      "title": "Bind the Remote Runtime contract to documentation SSOT and one exact commit",
+      "objective": "Publish the qualified remote endpoint contract through the owning documents and close the Feature on one exact commit whose evidence a downstream consumer can cite.",
+      "outcome": "Remote ships as a documented public capability with accurate current-guarantee claims, a complete repository gate on supported platforms, and no second planning or contract truth.",
+      "acceptance": [
+        "The owning documents are updated in the same change and state only what the code proves: the current-guarantees table, the transport and capability contract, the endpoint-versus-Backend ownership boundary, reachability semantics, and the explicit non-goals. No claim is promoted beyond its evidence and no second contract copy is created.",
+        "The remote capability, its version, and its mode availability are recorded in the one public capability catalog that already owns that vocabulary, and the roadmap's Remote phase reflects delivered rather than proposed status.",
+        "The complete repository gate plus the remote qualification stages pass on supported platforms, and the remote fixtures are reachable from the repository check rather than existing only as manual steps.",
+        "The Feature closes with a verification record and owner receipt bound to one exact commit. A downstream consumer can cite that evidence without a ctxmux checkout, and ctxmux creates, plans, or modifies no external consumer code.",
+        "Nothing published claims Relay deployment, account or environment federation, a hosted control plane, remote scheduling, orchestration, Provider sessions, remote binary provisioning, or derivation metadata."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The complete repository gate, including the wired remote qualification, passes at the exact closing commit."
         },
         {
           "kind": "artifact",
           "ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/verification.md",
-          "proves": "The exact candidate, owner-boundary review, mixed-version matrix, supported platforms, and residual limits are auditable."
+          "proves": "The delivered remote contract, its evidence, its supported platforms, and its residual limits are recorded for downstream citation."
         }
       ],
       "source_refs": [
-        "docs/architecture.md#runtime-can-prove",
-        "docs/architecture.md#security-durability-and-resource-boundaries",
-        "docs/protocol.md#control-correlation-and-owner-receipts",
-        "docs/testing-strategy.md",
-        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md"
+        "docs/architecture.md#current-guarantees-and-target-boundaries",
+        "docs/protocol.md#connection-state",
+        "docs/roadmap.md#remote-runtime-transport--phase-2",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md"
       ],
       "supersedes": [],
-      "introduced_in_revision": 1,
+      "introduced_in_revision": 2,
       "status": "todo",
       "gate_result": null,
       "last_gate_commands": [],

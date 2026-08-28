@@ -159,10 +159,10 @@
     {
       "feat_id": "f-22hjbhvt8",
       "title": "Carry Runs through an owner-host Remote Runtime",
-      "status": "proposal",
-      "workspace_mode": "proposal_only",
-      "branch": "",
-      "worktree_name": "",
+      "status": "ready",
+      "workspace_mode": "worktree",
+      "branch": "feat/f-22hjbhvt8",
+      "worktree_name": "wt-f-22hjbhvt8",
       "runtime_role": "standalone",
       "runtime_relations": []
     },

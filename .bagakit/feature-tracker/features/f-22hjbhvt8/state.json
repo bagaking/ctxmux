@@ -4,12 +4,12 @@
   "title": "Carry Runs through an owner-host Remote Runtime",
   "slug": "remote-runtime-transport",
   "goal": "After the local Runtime contract is qualified, carry the existing public ctxmux protocol through a system OpenSSH StreamLocal tunnel to an owner-host ctxmuxd while preserving remote lifecycle truth, exact Runtime and Run identity, reconnect and replay, owner-issued Stop receipts, and fail-closed mixed capabilities without adding Relay, accounts, a control plane, orchestration, or derivation metadata.",
-  "status": "proposal",
-  "workspace_mode": "proposal_only",
+  "status": "ready",
+  "workspace_mode": "worktree",
   "base_ref": "main",
-  "branch": "",
-  "worktree_name": "",
-  "worktree_path": "",
+  "branch": "feat/f-22hjbhvt8",
+  "worktree_name": "wt-f-22hjbhvt8",
+  "worktree_path": ".worktrees/wt-f-22hjbhvt8",
   "runtime_role": "standalone",
   "runtime_relations": [],
   "counters": {
@@ -35,9 +35,19 @@
     {
       "action": "dag_dependencies_updated",
       "detail": "depends_on=f-22ecztapc"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=2; supersedes_revision=1"
+    },
+    {
+      "action": "dag_dependencies_updated",
+      "detail": "depends_on=none"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> worktree; root_branch=fix/test-load-resilience-and-doc-drift"
     }
   ],
-  "depends_on": [
-    "f-22ecztapc"
-  ]
+  "depends_on": []
 }
