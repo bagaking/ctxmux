@@ -10,6 +10,7 @@ members = [
   "crates/ctxmux-rss-sampler",
   "crates/ctxmux-protocol",
   "crates/ctxmux-sqlite-status",
+  "crates/ctxmux-test-support",
 ]
 
 [workspace.package]

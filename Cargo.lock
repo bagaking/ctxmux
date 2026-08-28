@@ -110,6 +110,7 @@ dependencies = [
  "ctxmux-client",
  "ctxmux-daemon",
  "ctxmux-protocol",
+ "ctxmux-test-support",
  "portable-pty",
  "serde_json",
  "tempfile",
@@ -140,6 +141,7 @@ dependencies = [
  "ctxmux-protocol",
  "ctxmux-pty-signal",
  "ctxmux-sqlite-status",
+ "ctxmux-test-support",
  "futures-util",
  "portable-pty",
  "rusqlite",
@@ -203,6 +205,13 @@ version = "0.1.0"
 dependencies = [
  "rusqlite",
  "tempfile",
+]
+
+[[package]]
+name = "ctxmux-test-support"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

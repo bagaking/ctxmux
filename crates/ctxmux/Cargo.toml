@@ -21,5 +21,6 @@ workspace = true
 
 [dev-dependencies]
 ctxmux-daemon = { path = "../ctxmux-daemon" }
+ctxmux-test-support = { path = "../ctxmux-test-support" }
 portable-pty.workspace = true
 tempfile.workspace = true
