@@ -48,8 +48,6 @@ non-interactive attach and the public protocol still return raw replay.
 
 ## Wrong-case corpus
 
-Evidence pack: [output-replay track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/output-replay.md), claim `C005`.
-
 - `OR-001` (`e02`): a PTY read can split or coalesce UTF-8, ANSI, NUL, and arbitrary binary data. Only ordered byte concatenation is invariant.
 - `OR-002` (`e01`): live broadcast lag becomes silent loss if a client resumes from daemon head instead of its own last confirmed cursor.
 - `OR-003` (`e03`): a descendant may retain the PTY slave and write after the direct child exits and the one-second drain expires. The fixture must characterize the chosen direct-child versus PTY-EOF contract.

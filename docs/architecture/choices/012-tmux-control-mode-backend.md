@@ -35,7 +35,7 @@ target. Until a separately reviewed follow-target contract exists, a change to
 any member of the imported tuple interrupts the Run explicitly.
 
 Tmux links can expose one pane ID through multiple session/window associations.
-Discovery reports those rows, but the generation-6 import request names only
+Discovery reports those rows, but the generation-13 import request names only
 socket path plus pane ID. Import therefore fails closed unless that pair
 resolves to exactly one tuple; it never chooses an association by output order.
 
@@ -119,8 +119,6 @@ daemon.
   it necessary adds speculative policy to the runtime core.
 
 ## Wrong-case corpus
-
-Evidence pack: [tmux-backend track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/tmux-backend.md), claim `C012`.
 
 - `TMUX-01` (`l01`, `l02`): Control Mode payload is octal-escaped bytes, can
   be invalid UTF-8, and is interleaved with empty records, notifications,

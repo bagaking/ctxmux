@@ -54,8 +54,6 @@ guard still owns ordinary terminal restoration on that error path.
 
 ## Wrong-case corpus
 
-Evidence pack: [interactive-cli track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/interactive-cli.md), claim `C008`.
-
 - `CLI-01` (`h01`, `h02`): raw mode is process-external state. A real macOS PTY fixture attempt restored stable settings but changed transient `PENDIN`; the case remains inactive until the project chooses a direct termios owner or a reviewed normalization policy. `SIGKILL` and abort still cannot be promised away by a drop guard.
 - `CLI-02` (`h02`): cleanup must restore the user's meaningful prior termios state, not guessed defaults such as `stty sane`. “Byte-identical” is not yet a valid oracle on macOS because the driver can change transient `PENDIN` during raw-to-canonical restoration.
 - `CLI-03` (`h03`): prefix meaning must be independent of read partitioning and EOF must not strand a trailing prefix. Full tmux key-table semantics remain outside the current promise.

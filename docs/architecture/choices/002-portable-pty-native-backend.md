@@ -68,8 +68,6 @@ This is a bounded drain, not an unbounded final-output guarantee.
 
 ## Wrong-case corpus
 
-Evidence pack: [native-pty track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/native-pty.md), claim `C002`.
-
 - `PTY-001` (`b01`): an inherited blocked signal mask once made a launched shell ignore terminal interrupts. The case remains inactive until a safe checked-in launcher seam can test the `portable-pty` boundary without adding test-only unsafe/native code.
 - `PTY-002` (`b02`): ambient non-CLOEXEC descriptors leaked authority and garbage into a PTY child. A sentinel descriptor must be absent unless an inheritance API explicitly declares it.
 - `PTY-003` (`b03`): retaining the cloned Unix killer sent only `SIGHUP`, so a HUP-ignoring child remained running after `stop` was accepted. The waiter now invokes kill on the owned child handle, whose Unix implementation escalates when HUP is ignored.

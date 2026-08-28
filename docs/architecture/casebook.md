@@ -1,6 +1,6 @@
 # Architecture wrong-case casebook
 
-This casebook turns external failures into ctxmux-specific test obligations. The evidence source of truth is the [research topic](../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/index.md); the architecture records keep only the decision-facing synthesis.
+This casebook turns external failures into ctxmux-specific test obligations. The tracked sources of truth are [`fixtures/wrong-cases.json`](../../fixtures/wrong-cases.json), which carries the machine-readable trace and external `source_refs`, and the per-decision `Wrong-case corpus` sections; the architecture records keep only the decision-facing synthesis.
 
 ## Dispositions
 

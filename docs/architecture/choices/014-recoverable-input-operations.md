@@ -5,7 +5,7 @@
 
 ## Context
 
-Generation 6 correlates attachment controls and returns precise owner receipts,
+Generation 5 correlates attachment controls and returns precise owner receipts,
 but its command IDs end with the connection. If a response disappears after a
 PTY write, a caller cannot tell whether retrying would inject the same bytes a
 second time. This is visible in terminal supervisors such as Orca: accepting

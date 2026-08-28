@@ -66,8 +66,6 @@ live-native-Run shutdown policy.
 
 ## Wrong-case corpus
 
-Evidence pack: [daemon-runtime track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/daemon-runtime.md), claim `C001`.
-
 - `DR-001` (`a01`, `a03`): a post-spawn setup failure can return before the child is terminated or reaped. A rejected start must leave no live child, zombie, or published Run id.
 - `DR-002` (`a02`, `a03`): blocking PTY work inside an async connection task can make unrelated requests or shutdown unbounded. A deterministic blocked-operation fixture must prove isolation before this becomes a guarantee.
 - `DR-003` (`a01`): attachment lifetime must not become child lifetime. The existing same-id and same-PID reconnect test is the permanent regression.
