@@ -20,7 +20,9 @@ trap 'rm -rf "$ctxmux_coverage_codegen_dir"; rm -f "$ctxmux_coverage_codegen_blo
 mkdir -p coverage/rust coverage/typescript
 
 cargo llvm-cov clean --workspace
-cargo llvm-cov test --workspace --all-targets --all-features --no-report
+# --no-fail-fast for the same reason as scripts/check.sh: one failing binary
+# must not hide the rest, and a partial run would also undercount coverage.
+cargo llvm-cov test --workspace --all-targets --all-features --no-report --no-fail-fast
 cargo llvm-cov run --no-clean --package ctxmux --bin ctxmux -- --version >/dev/null
 cargo llvm-cov run --no-clean --package ctxmux-protocol --bin export-types -- \
   "$ctxmux_coverage_codegen_dir"
