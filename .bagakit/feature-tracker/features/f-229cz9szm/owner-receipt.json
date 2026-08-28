@@ -1,22 +1,25 @@
 {
-  "schema": "bagakit.execution-owner-receipt.v1",
+  "schema": "bagakit.execution-owner-receipt.v2",
   "owner_kind": "feature_tracker",
   "owner_id": "f-229cz9szm",
-  "semantic_revision": "30c78bf03cfa44c19f841e4114514f7563720a27d04fbf057cfcb1ded1899dce",
+  "semantic_revision": "e80c168d4bf9067872bb66195de5462d057605cdb1e151d216fe216b811d183d",
   "lifecycle_status": "proposal",
   "continuation": "blocked",
-  "current_item_id": null,
-  "blocker": {
-    "class": "workspace_unassigned",
-    "reason": "Feature has no assigned execution workspace."
-  },
+  "active_item_ids": [],
+  "blockers": [
+    {
+      "item_id": null,
+      "class": "workspace_unassigned",
+      "reason": "Feature has no assigned execution workspace."
+    }
+  ],
   "replacement_ref": null,
   "evidence_refs": [
     ".bagakit/feature-tracker/features/f-229cz9szm/state.json",
     ".bagakit/feature-tracker/features/f-229cz9szm/tasks.json"
   ],
   "evidence_hashes": {
-    ".bagakit/feature-tracker/features/f-229cz9szm/state.json": "3a580d2fa0195b9030716e89963d8b19b51b62176330d56244196a550b573453",
+    ".bagakit/feature-tracker/features/f-229cz9szm/state.json": "1b57067c641d401005f9598b2f3fea544627b340817a987eb80f0b082914b9d3",
     ".bagakit/feature-tracker/features/f-229cz9szm/tasks.json": "4cf7e8ba3f1c7cf38a240a5b8d318f6f2688a863792e69ea16f0f3794a9c3315"
   }
 }

@@ -1,12 +1,12 @@
 {
-  "schema": "bagakit.execution-owner-receipt.v1",
+  "schema": "bagakit.execution-owner-receipt.v2",
   "owner_kind": "feature_tracker",
   "owner_id": "f-223czq75x",
-  "semantic_revision": "7f29e9ccebe0a5c66ac6dcdb0047afec3dffa14cb4cf8f8f1726053ec52c594e",
+  "semantic_revision": "b2ea964f709b0dc08f7e19259cbf97eba34935a403a2e7fddd37b2b55fef6f9c",
   "lifecycle_status": "archived",
   "continuation": "complete",
-  "current_item_id": null,
-  "blocker": null,
+  "active_item_ids": [],
+  "blockers": [],
   "replacement_ref": null,
   "evidence_refs": [
     ".bagakit/feature-tracker/features-archived/f-223czq75x/state.json",
@@ -15,7 +15,7 @@
   ],
   "evidence_hashes": {
     ".bagakit/feature-tracker/features-archived/f-223czq75x/state.json": "af0d1066222fd2a5ef12201fb63a0224779c98523bb528c4a0a93f273ff40192",
-    ".bagakit/feature-tracker/features-archived/f-223czq75x/tasks.json": "ad6db914c31a25476f9eb3fe5e252ca97810e50b32dbde2fcbc393327d8b7ead",
+    ".bagakit/feature-tracker/features-archived/f-223czq75x/tasks.json": "aad8582ef76b731f125f13b44f9d8617c6bf110136e0474c93eabfdd425ea12c",
     ".bagakit/feature-tracker/features-archived/f-223czq75x/goal.md": "983278c336ba241bdc89ca6669ccb1f3f0658606250e4f5ed6ebb1851db63ae0"
   }
 }

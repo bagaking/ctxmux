@@ -10,9 +10,7 @@
   "branch": "featuref-224czneed",
   "worktree_name": "wt-f-224czneed",
   "worktree_path": ".worktrees/wt-f-224czneed",
-  "current_task_id": "T-002",
   "runtime_role": "standalone",
-  "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
     "gate_fail_streak": 0,

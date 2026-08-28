@@ -10,9 +10,7 @@
   "branch": "",
   "worktree_name": "",
   "worktree_path": "",
-  "current_task_id": null,
   "runtime_role": "standalone",
-  "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
     "gate_fail_streak": 0,

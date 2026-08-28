@@ -14,7 +14,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -25,7 +24,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -36,7 +34,6 @@
       "branch": "featuref-224czneed",
       "worktree_name": "wt-f-224czneed",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -47,7 +44,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -58,7 +54,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -69,7 +64,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -80,7 +74,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -91,7 +84,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -102,7 +94,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -113,7 +104,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -124,7 +114,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -135,7 +124,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -146,7 +134,6 @@
       "branch": "featuref-22ecztapc",
       "worktree_name": "wt-f-22ecztapc",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -157,7 +144,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -168,7 +154,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -179,7 +164,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     },
     {
@@ -190,7 +174,6 @@
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",
-      "blocked_reason_class": "none",
       "runtime_relations": []
     }
   ]

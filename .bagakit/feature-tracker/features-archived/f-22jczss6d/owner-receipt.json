@@ -1,12 +1,12 @@
 {
-  "schema": "bagakit.execution-owner-receipt.v1",
+  "schema": "bagakit.execution-owner-receipt.v2",
   "owner_kind": "feature_tracker",
   "owner_id": "f-22jczss6d",
-  "semantic_revision": "cdd8aa396071886984233fcf74591937f9579570a15e1ccc17b5f1fd1b05eaaa",
+  "semantic_revision": "a223338ab5ad7c9cd56663db1e76939448dbd4e931b7f3baaa5c8d88bd7dbbfc",
   "lifecycle_status": "archived",
   "continuation": "complete",
-  "current_item_id": null,
-  "blocker": null,
+  "active_item_ids": [],
+  "blockers": [],
   "replacement_ref": null,
   "evidence_refs": [
     ".bagakit/feature-tracker/features-archived/f-22jczss6d/state.json",

@@ -10,9 +10,7 @@
   "branch": "featuref-22ecztapc",
   "worktree_name": "wt-f-22ecztapc",
   "worktree_path": ".worktrees/wt-f-22ecztapc",
-  "current_task_id": "T-003",
   "runtime_role": "standalone",
-  "blocked_reason_class": "none",
   "runtime_relations": [],
   "counters": {
     "gate_fail_streak": 0,

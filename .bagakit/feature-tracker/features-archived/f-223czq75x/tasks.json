@@ -103,5 +103,25 @@
       ],
       "notes": []
     }
-  ]
+  ],
+  "closeout_review": {
+    "schema": "bagakit.feature-closeout-review.v1",
+    "documentation": {
+      "disposition": "verified_current",
+      "rationale": "Persistence and recovery work; its decision record is the owning SSOT.",
+      "refs": [
+        "docs/architecture/choices/009-runtime-persistence-recovery.md"
+      ]
+    },
+    "learning": {
+      "disposition": "no_reusable_learning",
+      "rationale": "Archived before the closeout review contract existed; no review was recorded at the time and none is reconstructed now.",
+      "refs": []
+    },
+    "promotion": {
+      "disposition": "not_needed",
+      "rationale": "No learning was captured for this historical Feature, so there is nothing to route or promote.",
+      "refs": []
+    }
+  }
 }
