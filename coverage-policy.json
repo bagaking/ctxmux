@@ -34,6 +34,14 @@
         "evidence": ".github/ci-evidence-map.json#creation-owner-contracts"
       },
       {
+        "id": "rust-test-support-load-model",
+        "category": "test_only",
+        "language": "rust",
+        "glob": "crates/ctxmux-test-support/src/**",
+        "reason": "The load model is a dev-dependency consumed only by integration-test binaries; it ships in no product artifact and its own bound is proven by a deterministic peak-concurrency assertion rather than product coverage.",
+        "evidence": ".github/ci-evidence-map.json#test-support-load-model"
+      },
+      {
         "id": "macos-process-statistics-leaf",
         "category": "platform_impossible",
         "language": "rust",

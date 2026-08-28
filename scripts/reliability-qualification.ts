@@ -1328,6 +1328,53 @@ function range(first: number, end: number): number[] {
   return Array.from({ length: end - first }, (_, offset) => first + offset);
 }
 
+/** One observed latency series, reported as the distribution rather than a mean. */
+interface LatencySummary {
+  readonly samples: number;
+  readonly p50_ms: number;
+  readonly p95_ms: number;
+  readonly p99_ms: number;
+  readonly max_ms: number;
+}
+
+/**
+ * Nearest-rank percentile over a copy of `values`.
+ *
+ * Nearest-rank is chosen over interpolation because these series are short:
+ * every reported figure is then an actually observed sample rather than a
+ * synthesised value between two of them.
+ */
+function percentile(values: readonly number[], fraction: number): number {
+  assert.ok(values.length > 0, "percentile needs at least one sample");
+  const sorted = [...values].sort((left, right) => left - right);
+  const rank = Math.ceil(fraction * sorted.length);
+  const index = Math.min(Math.max(rank, 1), sorted.length) - 1;
+  return sorted[index] as number;
+}
+
+/**
+ * Summarise one latency series in milliseconds.
+ *
+ * Deliberately descriptive only. `docs/testing-strategy.md` requires trending
+ * variance across enough runs before any per-platform budget exists, and
+ * `reliability-budgets.json` forbids hand-set margins, so these figures are
+ * recorded as observations and are not asserted against a ceiling.
+ */
+function summariseLatency(values: readonly number[]): LatencySummary {
+  return {
+    samples: values.length,
+    p50_ms: round(percentile(values, 0.5), 3),
+    p95_ms: round(percentile(values, 0.95), 3),
+    p99_ms: round(percentile(values, 0.99), 3),
+    max_ms: round(Math.max(...values), 3),
+  };
+}
+
+/** Elapsed milliseconds since a `performance.now()` reading. */
+function elapsedMs(startedAt: number): number {
+  return round(performance.now() - startedAt, 3);
+}
+
 async function runChaosOwnerMatrix(
   options: QualificationOptions,
   receipt: QualificationReceipt,
@@ -1824,14 +1871,35 @@ async function runFanoutScenario(
     );
     const writer = fast[0] ?? slow!;
     const chunk = Buffer.alloc(4096, payloadByte);
+    // Throughput window: from the first byte written until every fast consumer
+    // has observed the complete payload. Writing and consuming overlap, so this
+    // measures the delivered rate through the daemon rather than either side in
+    // isolation.
+    const transferStartedAt = performance.now();
     for (let sent = 0; sent < payloadBytes; sent += chunk.length) {
       await writer.input(chunk);
     }
+    const writeCompleteMs = elapsedMs(transferStartedAt);
     const fastReceipts = await withDeadline(
       Promise.all(consumers),
       30_000,
       `fast fanout ${fanout}`,
     );
+    const deliveredMs = elapsedMs(transferStartedAt);
+    // Tail latency here is the slowest consumer's completion, which is the
+    // figure a fan-out caller actually waits on.
+    const throughput = {
+      payload_bytes: payloadBytes,
+      consumers: consumers.length,
+      write_complete_ms: writeCompleteMs,
+      all_consumers_complete_ms: deliveredMs,
+      bytes_per_second:
+        deliveredMs > 0 ? Math.round((payloadBytes * 1000) / deliveredMs) : 0,
+      aggregate_bytes_per_second:
+        deliveredMs > 0
+          ? Math.round((payloadBytes * consumers.length * 1000) / deliveredMs)
+          : 0,
+    };
 
     let slowGap = false;
     if (slow !== undefined) {
@@ -1844,6 +1912,7 @@ async function runFanoutScenario(
       payload_byte: payloadByte,
       fast_receipts: fastReceipts,
       slow_gap: slowGap,
+      throughput,
     });
     for (const attachment of attachments) attachment.close();
     await daemon.client.stop(await daemon.client.prepareStop(run.id));
@@ -1904,11 +1973,18 @@ async function measureResources(
       await prepareRssSampler(rssSamplerBinary, daemon.child, 25, 75),
     );
     const baseline = sampleProcess(daemon.pid);
+    const startLatenciesMs: number[] = [];
     const startResult = await mapLimitUntilFailure(
       Array.from({ length: count }, (_, index) => index),
       options.resourceStartConcurrency,
-      async () =>
-        daemon.client.start(mode === "active" ? activeSpec() : idleSpec()),
+      async () => {
+        const startedAt = performance.now();
+        const run = await daemon.client.start(
+          mode === "active" ? activeSpec() : idleSpec(),
+        );
+        startLatenciesMs.push(elapsedMs(startedAt));
+        return run;
+      },
     );
     const runs = startResult.outputs;
     if (startResult.failure !== undefined) {
@@ -1930,11 +2006,27 @@ async function measureResources(
         { cause: startResult.failure.error },
       );
     }
+    const loopbackLatenciesMs: number[] = [];
     if (mode === "active") {
       await mapLimit(runs, 16, async (run) => {
         await waitForReplay(daemon.client, run.id, (bytes) =>
           bytes.includes(Buffer.from("READY")),
         );
+      });
+      // The active Run is `exec /bin/cat` behind `stty raw -echo`, so a unique
+      // marker written in comes back out unchanged. Timing that round trip is
+      // the byte-to-byte PTY loopback: bytes crossing the write boundary and
+      // the same bytes observed again through public replay. Measured serially
+      // per Run so a concurrent batch cannot make one Run's queueing delay look
+      // like another's service time.
+      await mapLimit(runs, 16, async (run, index) => {
+        const marker = Buffer.from(`lat-${index}-`);
+        const startedAt = performance.now();
+        await daemon.client.input(run.id, marker);
+        await waitForReplay(daemon.client, run.id, (bytes) =>
+          bytes.includes(marker),
+        );
+        loopbackLatenciesMs.push(elapsedMs(startedAt));
       });
       await mapLimit(runs, 16, async (run, index) => {
         await daemon.client.resize(run.id, {
@@ -1980,6 +2072,25 @@ async function measureResources(
     const cleanupRetainedRuns = (await daemon.client.list()).length;
     await peakSampler.stop();
     const divide = (value: number): number => round(value / count, 3);
+    // Latency rides in its own trace event rather than the resource cell.
+    // The cell's field set is validated exactly by
+    // scripts/reliability-baseline-policy.mjs, and these observations carry no
+    // budget, so widening a gated structure to hold ungated numbers would
+    // couple them for no benefit.
+    trace("observation.latency", {
+      mode,
+      runs: count,
+      daemon_cold_start_ms: daemon.coldStartMs,
+      ...(startLatenciesMs.length > 0
+        ? { run_start_to_accepted_ms: summariseLatency(startLatenciesMs) }
+        : {}),
+      ...(loopbackLatenciesMs.length > 0
+        ? { input_to_output_loopback_ms: summariseLatency(loopbackLatenciesMs) }
+        : {}),
+      budgeted: false,
+      reason:
+        "descriptive observation; a per-platform ceiling requires a variance trend and machine-derived budgets",
+    });
     return {
       mode,
       runs: count,
@@ -2020,6 +2131,13 @@ class DaemonFixture {
   #logClosed = false;
   #statsClosed = false;
   #statsPersisted = false;
+  /** Spawn to first accepted connection, in milliseconds. */
+  #coldStartMs = 0;
+
+  /** Observed cold start for this daemon: spawn until it answered a ping. */
+  public get coldStartMs(): number {
+    return this.#coldStartMs;
+  }
 
   private constructor(
     public readonly label: string,
@@ -2072,6 +2190,7 @@ class DaemonFixture {
       args.push("--state-dir", join(directory, "state"));
     }
     args.push("--qualification-stats-fd", String(statsFd));
+    const spawnedAt = performance.now();
     const child = spawn(daemonBinary, args, {
       cwd: root,
       stdio: ["ignore", "pipe", "pipe", "pipe"],
@@ -2124,6 +2243,7 @@ class DaemonFixture {
         5_000,
         `daemon readiness ${label}`,
       );
+      fixture.#coldStartMs = elapsedMs(spawnedAt);
       return fixture;
     } catch (error) {
       await fixture.kill("SIGKILL");
