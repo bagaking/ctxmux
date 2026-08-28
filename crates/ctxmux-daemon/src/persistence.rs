@@ -47,7 +47,14 @@ const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
 const STARTUP_BATCH_MAX_ROWS: usize = 128;
-const DISK_FULL_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const STORAGE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+// SQLite's WAL checkpoint pragma reports a transient reader conflict in its
+// result row instead of returning an error. Keep this retry budget local to
+// the checkpoint owner: a short-lived external reader must not poison the
+// persistence actor, while a reader that never leaves still fails closed.
+const WAL_CHECKPOINT_MAX_RETRIES: usize = 8;
+const WAL_CHECKPOINT_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const WAL_CHECKPOINT_MAX_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy)]
 struct AdmissionLimits {
@@ -91,6 +98,10 @@ pub enum PersistenceError {
     },
     #[error("ctxmux persistence actor stopped")]
     ActorStopped,
+    #[error(
+        "WAL truncate checkpoint could not reach zero bytes after {attempts} attempts ({detail})"
+    )]
+    WalCheckpointBusy { attempts: usize, detail: String },
     #[error("failed to start ctxmux persistence actor: {0}")]
     ActorStart(String),
     #[error("ctxmux durable state rejected a mutation: {0}")]
@@ -131,6 +142,20 @@ impl PersistenceError {
                 ..
             }
         )
+    }
+
+    fn is_database_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Database {
+                code: Some(rusqlite::ErrorCode::DatabaseBusy),
+                ..
+            }
+        )
+    }
+
+    fn is_transient_storage(&self) -> bool {
+        self.is_disk_full() || matches!(self, Self::WalCheckpointBusy { .. })
     }
 
     #[cfg(test)]
@@ -205,6 +230,7 @@ struct PersistenceTestHooks {
     fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
     fail_next_append_as_disk_full: AtomicBool,
     fail_next_finalize_as_disk_full: AtomicBool,
+    checkpoint_attempts: AtomicU64,
 }
 
 #[cfg(test)]
@@ -788,6 +814,14 @@ impl Persistence {
     }
 
     #[cfg(test)]
+    pub(crate) fn checkpoint_attempts(&self) -> u64 {
+        self.inner
+            .test_hooks
+            .checkpoint_attempts
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
     pub(crate) fn assert_exclusive_owner(&self) {
         assert_eq!(
             Arc::strong_count(&self.inner),
@@ -1034,7 +1068,33 @@ fn actor_main(
         };
         match command {
             Command::StageStart(request) => {
-                handle_staged_start(&mut store, &request, failure);
+                // Fail closed before touching the store: a latched fatal
+                // failure must reject the mutation without driving any
+                // database work, otherwise the rejected start could still
+                // commit durably.
+                if let Some(message) = mutex_lock(failure).clone() {
+                    let _ = request.receipt.decide(StartDisposition::NotCommitted);
+                    let _ = request.ready.send(Err(StageFailure {
+                        error: PersistenceError::Mutation(message),
+                        fatal: true,
+                        capacity: false,
+                    }));
+                    continue;
+                }
+                let result = store.drive_staged_start_with_shutdown(
+                    &request.prepared,
+                    &request.candidates,
+                    &request.receipt,
+                    &request.ready,
+                    &request.decision,
+                    Some(shutdown),
+                );
+                let Ok(result) = result else {
+                    // A shutdown while waiting for a transient checkpoint
+                    // conflict must not be latched as durable corruption.
+                    return;
+                };
+                handle_staged_start_result(&request, result, failure);
             }
             Command::Append {
                 id,
@@ -1063,7 +1123,7 @@ fn actor_main(
                     }
                 }
                 if mutex_lock(failure).is_none() {
-                    let result = retry_disk_full(shutdown, || {
+                    let result = retry_transient_storage(shutdown, || {
                         #[cfg(test)]
                         if test_hooks
                             .fail_next_append_as_disk_full
@@ -1071,9 +1131,14 @@ fn actor_main(
                         {
                             return Err(PersistenceError::injected_disk_full());
                         }
-                        store.append_batch(&batch)
+                        store.append_batch_with_shutdown(&batch, Some(shutdown))
                     });
                     match result {
+                        Some(Err(PersistenceError::ActorStopped))
+                            if shutdown.load(Ordering::Acquire) =>
+                        {
+                            return;
+                        }
                         Some(Err(error)) => remember_failure(failure, &error),
                         Some(Ok(())) => {}
                         None => return,
@@ -1094,7 +1159,7 @@ fn actor_main(
                 let result = if let Some(message) = mutex_lock(failure).clone() {
                     Some(Err(PersistenceError::Mutation(message)))
                 } else {
-                    retry_disk_full(shutdown, || {
+                    retry_transient_storage(shutdown, || {
                         #[cfg(test)]
                         if test_hooks
                             .fail_next_finalize_as_disk_full
@@ -1102,19 +1167,27 @@ fn actor_main(
                         {
                             return Err(PersistenceError::injected_disk_full());
                         }
-                        store.finalize(
+                        store.finalize_with_shutdown(
                             id,
                             actual_pid,
                             &replay,
                             &state,
                             &durable_head,
                             &metadata_bytes,
+                            Some(shutdown),
                         )
                     })
                 };
                 let Some(result) = result else {
                     return;
                 };
+                if matches!(
+                    &result,
+                    Err(PersistenceError::ActorStopped)
+                        if shutdown.load(Ordering::Acquire)
+                ) {
+                    return;
+                }
                 if let Err(error) = &result {
                     remember_failure(failure, error);
                 }
@@ -1132,7 +1205,7 @@ fn actor_main(
     }
 }
 
-fn retry_disk_full(
+fn retry_transient_storage(
     shutdown: &AtomicBool,
     mut mutation: impl FnMut() -> Result<(), PersistenceError>,
 ) -> Option<Result<(), PersistenceError>> {
@@ -1141,13 +1214,92 @@ fn retry_disk_full(
             return None;
         }
         match mutation() {
-            Err(error) if error.is_disk_full() => {
-                if wait_for_shutdown(shutdown, DISK_FULL_RETRY_INTERVAL) {
+            Err(error) if error.is_transient_storage() => {
+                if wait_for_shutdown(shutdown, STORAGE_RETRY_INTERVAL) {
                     return None;
                 }
             }
             result => return Some(result),
         }
+    }
+}
+
+/// Retry the one `SQLite` operation whose normal result explicitly reports a
+/// reader conflict: `wal_checkpoint(TRUNCATE)`. `SQLite` returns `(busy, log,
+/// checkpointed)` for this case rather than a typed error, so treating a
+/// non-zero `busy` value as a permanent mutation failure turns ordinary client
+/// observation into a latched daemon outage. The retry is deliberately local,
+/// bounded, and cancellation-aware; all other database errors remain
+/// fail-closed at the caller.
+fn retry_wal_checkpoint(
+    shutdown: Option<&AtomicBool>,
+    mut checkpoint: impl FnMut() -> Result<(i64, i64, i64), PersistenceError>,
+    mut wal_len: impl FnMut() -> Result<u64, PersistenceError>,
+) -> Result<(), PersistenceError> {
+    let mut backoff = WAL_CHECKPOINT_INITIAL_BACKOFF;
+    for attempt in 0..=WAL_CHECKPOINT_MAX_RETRIES {
+        if shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(PersistenceError::ActorStopped);
+        }
+
+        let (busy, log_frames, checkpointed_frames) = match checkpoint() {
+            Ok(result) => result,
+            Err(error) if error.is_database_busy() => {
+                if attempt == WAL_CHECKPOINT_MAX_RETRIES {
+                    return Err(wal_checkpoint_retry_exhausted(
+                        attempt + 1,
+                        Some(error.to_string()),
+                    ));
+                }
+                if wait_for_optional_shutdown(shutdown, backoff) {
+                    return Err(PersistenceError::ActorStopped);
+                }
+                backoff = next_wal_checkpoint_backoff(backoff);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let bytes = wal_len()?;
+        if busy == 0 && bytes == 0 {
+            return Ok(());
+        }
+        if attempt == WAL_CHECKPOINT_MAX_RETRIES {
+            return Err(wal_checkpoint_retry_exhausted(
+                attempt + 1,
+                Some(format!(
+                    "busy={busy}, log_frames={log_frames}, \
+                     checkpointed_frames={checkpointed_frames}, wal_bytes={bytes}"
+                )),
+            ));
+        }
+        if wait_for_optional_shutdown(shutdown, backoff) {
+            return Err(PersistenceError::ActorStopped);
+        }
+        backoff = next_wal_checkpoint_backoff(backoff);
+    }
+    unreachable!("the bounded WAL checkpoint retry loop always returns")
+}
+
+fn wal_checkpoint_retry_exhausted(attempts: usize, detail: Option<String>) -> PersistenceError {
+    PersistenceError::WalCheckpointBusy {
+        attempts,
+        detail: detail.unwrap_or_else(|| "checkpoint remained busy".to_owned()),
+    }
+}
+
+fn next_wal_checkpoint_backoff(current: Duration) -> Duration {
+    current
+        .checked_mul(2)
+        .unwrap_or(WAL_CHECKPOINT_MAX_BACKOFF)
+        .min(WAL_CHECKPOINT_MAX_BACKOFF)
+}
+
+fn wait_for_optional_shutdown(shutdown: Option<&AtomicBool>, duration: Duration) -> bool {
+    if let Some(flag) = shutdown {
+        wait_for_shutdown(flag, duration)
+    } else {
+        thread::sleep(duration);
+        false
     }
 }
 
@@ -1174,27 +1326,12 @@ fn pause_before_finalize(test_hooks: &PersistenceTestHooks) {
     }
 }
 
-fn handle_staged_start(
-    store: &mut StateStore,
+fn handle_staged_start_result(
     request: &StageRequest,
+    result: StageDriveResult,
     failure: &Mutex<Option<String>>,
 ) {
-    if let Some(message) = mutex_lock(failure).clone() {
-        let _ = request.receipt.decide(StartDisposition::NotCommitted);
-        let _ = request.ready.send(Err(StageFailure {
-            error: PersistenceError::Mutation(message),
-            fatal: true,
-            capacity: false,
-        }));
-        return;
-    }
-    match store.drive_staged_start(
-        &request.prepared,
-        &request.candidates,
-        &request.receipt,
-        &request.ready,
-        &request.decision,
-    ) {
+    match result {
         StageDriveResult::ReadyFailed(stage_failure) => {
             if stage_failure.fatal {
                 remember_failure(failure, &stage_failure.error);
@@ -1971,55 +2108,59 @@ impl StateStore {
         Ok(())
     }
 
-    fn drive_staged_start(
+    fn drive_staged_start_with_shutdown(
         &mut self,
         prepared: &PreparedPersistentStart,
         candidates: &[PersistentCandidate],
         receipt: &StartReceipt,
         ready: &mpsc::SyncSender<Result<(), StageFailure>>,
         decision: &mpsc::Receiver<StageDecision>,
-    ) -> StageDriveResult {
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<StageDriveResult, PersistenceError> {
         if let Err(error) = self.validate_prepared_start(prepared) {
             let _ = receipt.decide(StartDisposition::NotCommitted);
-            return StageDriveResult::ReadyFailed(StageFailure {
+            return Ok(StageDriveResult::ReadyFailed(StageFailure {
                 error,
                 fatal: true,
                 capacity: false,
-            });
+            }));
         }
         if prepared.metadata_bytes > self.admission_limits.metadata_bytes {
             let _ = receipt.decide(StartDisposition::NotCommitted);
-            return StageDriveResult::ReadyFailed(admission_failure(format!(
+            return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
                 "one Run metadata record exceeds the {} byte budget",
                 self.admission_limits.metadata_bytes
-            )));
+            ))));
         }
 
-        if let Err(error) = self.truncate_wal_to_zero() {
+        if let Err(error) = self.truncate_wal_to_zero_with_shutdown(shutdown) {
+            if shutdown.is_some() && matches!(&error, PersistenceError::ActorStopped) {
+                return Err(error);
+            }
             let _ = receipt.decide(StartDisposition::NotCommitted);
-            return StageDriveResult::ReadyFailed(admission_failure(format!(
+            return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
                 "persistent WAL admission could not reach a zero baseline: {error}"
-            )));
+            ))));
         }
         if let Err(error) = self.connection.release_memory() {
             let _ = receipt.decide(StartDisposition::NotCommitted);
-            return StageDriveResult::ReadyFailed(admission_failure(format!(
+            return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
                 "persistent WAL admission could not release the connection cache: {error}"
-            )));
+            ))));
         }
 
         let previous_cache_spill = match self.disable_cache_spill() {
             Ok(value) => value,
             Err(stage_failure) => {
                 let _ = receipt.decide(StartDisposition::NotCommitted);
-                return StageDriveResult::ReadyFailed(stage_failure);
+                return Ok(StageDriveResult::ReadyFailed(stage_failure));
             }
         };
         let result = self
             .drive_staged_start_with_spill_disabled(prepared, candidates, receipt, ready, decision);
         match self.restore_cache_spill(previous_cache_spill) {
-            Ok(()) => result,
-            Err(error) => result.with_restore_failure(error),
+            Ok(()) => Ok(result),
+            Err(error) => Ok(result.with_restore_failure(error)),
         }
     }
 
@@ -2216,18 +2357,28 @@ impl StateStore {
     }
 
     fn truncate_wal_to_zero(&self) -> Result<(), PersistenceError> {
-        let (busy, _, _): (i64, i64, i64) = self
-            .connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .map_err(PersistenceError::database)?;
-        if busy != 0 || file_len(&self.wal_path)? != 0 {
-            return Err(PersistenceError::Mutation(
-                "WAL truncate checkpoint could not reach zero bytes".to_owned(),
-            ));
-        }
-        Ok(())
+        self.truncate_wal_to_zero_with_shutdown(None)
+    }
+
+    fn truncate_wal_to_zero_with_shutdown(
+        &self,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<(), PersistenceError> {
+        retry_wal_checkpoint(
+            shutdown,
+            || {
+                #[cfg(test)]
+                self.test_hooks
+                    .checkpoint_attempts
+                    .fetch_add(1, Ordering::AcqRel);
+                self.connection
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .map_err(PersistenceError::database)
+            },
+            || file_len(&self.wal_path),
+        )
     }
 
     fn stage_exact_replacement(
@@ -2681,9 +2832,18 @@ impl StateStore {
         }
     }
 
+    #[cfg(test)]
     fn append_batch(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
+    ) -> Result<(), PersistenceError> {
+        self.append_batch_with_shutdown(batch, None)
+    }
+
+    fn append_batch_with_shutdown(
+        &mut self,
+        batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
+        shutdown: Option<&AtomicBool>,
     ) -> Result<(), PersistenceError> {
         let mut transaction_batch = Vec::new();
         let mut transaction_payload = 0_usize;
@@ -2692,12 +2852,16 @@ impl StateStore {
             let groups = split_chunks(&replay.chunks)?;
             if groups.is_empty() {
                 if !transaction_batch.is_empty() {
-                    self.append_transaction(&transaction_batch, None)?;
+                    self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
                     transaction_batch.clear();
                     transaction_payload = 0;
                     expected_heads.clear();
                 }
-                self.append_transaction(&[(*id, replay.clone(), Arc::clone(durable_head))], None)?;
+                self.append_transaction_with_shutdown(
+                    &[(*id, replay.clone(), Arc::clone(durable_head))],
+                    None,
+                    shutdown,
+                )?;
                 continue;
             }
             for (index, chunks) in groups.iter().enumerate() {
@@ -2728,13 +2892,17 @@ impl StateStore {
                         > MAX_TRANSACTION_PAYLOAD_BYTES
                         || !is_fresh_contiguous)
                 {
-                    self.append_transaction(&transaction_batch, None)?;
+                    self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
                     transaction_batch.clear();
                     transaction_payload = 0;
                     expected_heads.clear();
                 }
                 if !is_fresh_contiguous {
-                    self.append_transaction(&[(*id, partial, Arc::clone(durable_head))], None)?;
+                    self.append_transaction_with_shutdown(
+                        &[(*id, partial, Arc::clone(durable_head))],
+                        None,
+                        shutdown,
+                    )?;
                     continue;
                 }
                 transaction_payload = transaction_payload.saturating_add(partial_payload);
@@ -2743,12 +2911,13 @@ impl StateStore {
             }
         }
         if !transaction_batch.is_empty() {
-            self.append_transaction(&transaction_batch, None)?;
+            self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
         }
         Ok(())
     }
 
-    fn finalize(
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_with_shutdown(
         &mut self,
         id: RunId,
         actual_pid: u32,
@@ -2756,6 +2925,7 @@ impl StateStore {
         state: &RunState,
         durable_head: &Arc<AtomicU64>,
         metadata_owner: &Arc<AtomicU64>,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<(), PersistenceError> {
         if state.is_running() {
             return Err(PersistenceError::Mutation(
@@ -2783,7 +2953,11 @@ impl StateStore {
                 latest_output_bytes: chunk_group.last().map_or(0, |chunk| chunk.end_byte),
                 truncated: replay.truncated,
             };
-            self.append_transaction(&[(id, prefix_replay, Arc::clone(durable_head))], None)?;
+            self.append_transaction_with_shutdown(
+                &[(id, prefix_replay, Arc::clone(durable_head))],
+                None,
+                shutdown,
+            )?;
         }
         let terminal_replay = OutputReplay {
             chunks: final_chunks,
@@ -2791,9 +2965,10 @@ impl StateStore {
             latest_output_bytes: replay.latest_output_bytes,
             truncated: replay.truncated,
         };
-        self.append_transaction(
+        self.append_transaction_with_shutdown(
             &[(id, terminal_replay, Arc::clone(durable_head))],
             Some((id, actual_pid, state, metadata_owner)),
+            shutdown,
         )
     }
 
@@ -2820,10 +2995,11 @@ impl StateStore {
             .collect())
     }
 
-    fn append_transaction(
+    fn append_transaction_with_shutdown(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
         terminal: Option<(RunId, u32, &RunState, &Arc<AtomicU64>)>,
+        shutdown: Option<&AtomicBool>,
     ) -> Result<(), PersistenceError> {
         let payload = batch
             .iter()
@@ -2834,7 +3010,10 @@ impl StateStore {
                 "output transaction payload {payload} exceeds the 1 MiB admission ceiling"
             )));
         }
-        self.admit_transaction((payload as u64).saturating_mul(4) + 1024 * 1024)?;
+        self.admit_transaction_with_shutdown(
+            (payload as u64).saturating_mul(4) + 1024 * 1024,
+            shutdown,
+        )?;
         let transaction = self
             .connection
             .transaction()
@@ -2918,7 +3097,11 @@ impl StateStore {
         self.finish_transaction()
     }
 
-    fn admit_transaction(&mut self, worst_case_bytes: u64) -> Result<(), PersistenceError> {
+    fn admit_transaction_with_shutdown(
+        &mut self,
+        worst_case_bytes: u64,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<(), PersistenceError> {
         if worst_case_bytes > WAL_CHECKPOINT_BYTES {
             return Err(PersistenceError::Mutation(format!(
                 "transaction WAL estimate {worst_case_bytes} exceeds 8 MiB"
@@ -2926,17 +3109,7 @@ impl StateStore {
         }
         let wal_bytes = file_len(&self.wal_path)?;
         if wal_bytes > WAL_CHECKPOINT_BYTES {
-            let (busy, _, _): (i64, i64, i64) = self
-                .connection
-                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })
-                .map_err(PersistenceError::database)?;
-            if busy != 0 || file_len(&self.wal_path)? != 0 {
-                return Err(PersistenceError::Mutation(
-                    "WAL truncate checkpoint could not reach zero bytes".to_owned(),
-                ));
-            }
+            self.truncate_wal_to_zero_with_shutdown(shutdown)?;
         }
         let current = file_len(&self.wal_path)?;
         if current.saturating_add(worst_case_bytes) > WAL_MAX_BYTES {
@@ -4047,8 +4220,9 @@ mod tests {
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
         PersistentCandidate, PersistentStartCompletion, RUN_RECORDS, SHM_MAX_BYTES,
         STATE_FILES_MAX_BYTES, StartCommitCrashPhase, StartDisposition, StartReceipt,
-        StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_MAX_BYTES, append_replay,
-        create_schema, metadata_size, mutex_lock, prune_global_replay_to, retry_disk_full,
+        StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES,
+        WAL_MAX_BYTES, append_replay, create_schema, metadata_size, mutex_lock,
+        prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
         validate_existing_schema, wal_charge_for_cache,
     };
     use crate::creation::MAX_RETAINED_RUNS;
@@ -4748,13 +4922,192 @@ mod tests {
     fn disk_full_retry_observes_shutdown() {
         let shutdown = AtomicBool::new(false);
         let mut attempts = 0_u8;
-        let result = retry_disk_full(&shutdown, || {
+        let result = retry_transient_storage(&shutdown, || {
             attempts = attempts.saturating_add(1);
             shutdown.store(true, Ordering::Release);
             Err(PersistenceError::injected_disk_full())
         });
         assert!(result.is_none());
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn wal_checkpoint_retries_a_transient_busy_result_until_zero() {
+        let mut checkpoint_calls = 0_u8;
+        let mut wal_lengths = [4096_u64, 4096, 0].into_iter();
+        let result = retry_wal_checkpoint(
+            None,
+            || {
+                checkpoint_calls = checkpoint_calls.saturating_add(1);
+                Ok(match checkpoint_calls {
+                    1 | 2 => (1, 32, 0),
+                    3 => (0, 0, 0),
+                    other => panic!("unexpected checkpoint attempt {other}"),
+                })
+            },
+            || Ok(wal_lengths.next().expect("one WAL length per checkpoint")),
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(checkpoint_calls, 3);
+    }
+
+    #[test]
+    fn wal_checkpoint_retries_a_typed_busy_error_but_not_other_errors() {
+        let mut busy_calls = 0_u8;
+        let busy_result = retry_wal_checkpoint(
+            None,
+            || {
+                busy_calls = busy_calls.saturating_add(1);
+                if busy_calls == 1 {
+                    Err(sqlite_busy_error())
+                } else {
+                    Ok((0, 0, 0))
+                }
+            },
+            || Ok(0),
+        );
+        assert!(busy_result.is_ok());
+        assert_eq!(busy_calls, 2);
+
+        let mut fatal_calls = 0_u8;
+        let fatal_result = retry_wal_checkpoint(
+            None,
+            || {
+                fatal_calls = fatal_calls.saturating_add(1);
+                Err(PersistenceError::injected_disk_full())
+            },
+            || Ok(0),
+        );
+        assert!(matches!(
+            fatal_result,
+            Err(PersistenceError::Database {
+                code: Some(rusqlite::ErrorCode::DiskFull),
+                ..
+            })
+        ));
+        assert_eq!(fatal_calls, 1);
+    }
+
+    #[test]
+    fn wal_checkpoint_exhaustion_is_bounded_and_fail_closed() {
+        let started = Instant::now();
+        let mut calls = 0_usize;
+        let result = retry_wal_checkpoint(
+            None,
+            || {
+                calls += 1;
+                Ok((1, 16, 0))
+            },
+            || Ok(WAL_CHECKPOINT_BYTES),
+        );
+
+        let Err(PersistenceError::WalCheckpointBusy { detail, .. }) = result else {
+            panic!("checkpoint exhaustion must fail closed as retryable storage pressure");
+        };
+        assert!(detail.contains("busy=1"));
+        assert_eq!(calls, WAL_CHECKPOINT_MAX_RETRIES + 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "checkpoint retry exceeded its bounded budget"
+        );
+    }
+
+    #[test]
+    fn wal_checkpoint_retry_stops_when_shutdown_is_requested() {
+        let shutdown = AtomicBool::new(false);
+        let mut calls = 0_u8;
+        let result = retry_wal_checkpoint(
+            Some(&shutdown),
+            || {
+                calls = calls.saturating_add(1);
+                shutdown.store(true, Ordering::Release);
+                Ok((1, 1, 0))
+            },
+            || Ok(WAL_CHECKPOINT_BYTES),
+        );
+
+        assert!(matches!(result, Err(PersistenceError::ActorStopped)));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn persistence_actor_survives_a_short_lived_external_checkpoint_reader() {
+        let temp = TempDir::new().expect("create WAL reader fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+        let info = running_info(RunId::new());
+        let _durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert reader fixture Run");
+        let hooks = Arc::clone(&persistence.inner.test_hooks);
+        hooks.checkpoint_attempts.store(0, Ordering::Release);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let database_path = state_dir.join(DATABASE_FILE);
+        let reader = thread::spawn(move || {
+            let connection = Connection::open(database_path).expect("open reader connection");
+            connection
+                .execute_batch("PRAGMA busy_timeout=0; BEGIN;")
+                .expect("hold a WAL reader snapshot");
+            let _: i64 = connection
+                .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+                .expect("read a WAL snapshot");
+            ready_tx.send(()).expect("signal reader snapshot");
+            release_rx.recv().expect("wait for checkpoint retry");
+            connection
+                .execute_batch("ROLLBACK")
+                .expect("release reader snapshot");
+        });
+        ready_rx.recv().expect("reader reaches snapshot");
+
+        let releaser_hooks = Arc::clone(&hooks);
+        let releaser = thread::spawn(move || {
+            while releaser_hooks.checkpoint_attempts.load(Ordering::Acquire) < 2 {
+                thread::yield_now();
+            }
+            release_tx
+                .send(())
+                .expect("release reader after checkpoint retries begin");
+        });
+        let next = running_info(RunId::new());
+        let prepared = persistence
+            .prepare_start(&test_operation_key(next.id), &next)
+            .expect("prepare reader fixture start");
+        let staged = persistence
+            .stage_start(prepared, Vec::new())
+            .expect("checkpoint retry eventually stages the next start");
+        staged
+            .abort()
+            .expect("abort staged fixture after checkpoint proof");
+        releaser.join().expect("join reader releaser");
+        reader.join().expect("join reader fixture");
+
+        assert!(!persistence.is_failed());
+        assert!(
+            persistence.checkpoint_attempts() >= 2,
+            "the owner must have observed and retried the busy checkpoint"
+        );
+    }
+
+    #[test]
+    fn exhausted_checkpoint_pressure_retries_without_latching_the_actor() {
+        let shutdown = AtomicBool::new(false);
+        let mut attempts = 0_u8;
+        let result = retry_transient_storage(&shutdown, || {
+            attempts = attempts.saturating_add(1);
+            if attempts < 2 {
+                Err(super::wal_checkpoint_retry_exhausted(
+                    WAL_CHECKPOINT_MAX_RETRIES + 1,
+                    Some("busy=1, wal_bytes=4096".to_owned()),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(result, Some(Ok(()))));
+        assert_eq!(attempts, 2);
     }
 
     #[test]
@@ -5261,6 +5614,13 @@ mod tests {
 
     fn test_operation_key(id: RunId) -> CreateOperationKey {
         CreateOperationKey::new(format!("test-{id}")).expect("valid test operation key")
+    }
+
+    fn sqlite_busy_error() -> PersistenceError {
+        PersistenceError::database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is busy".to_owned()),
+        ))
     }
 
     const fn exited_state() -> RunState {

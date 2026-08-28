@@ -657,11 +657,15 @@ fail-stop. The version-2 handoff manifest and every carried descriptor are
 strictly bounded, unique, and validated; generation 13 gains no upgrade wire
 operation.
 
-An output append or terminal finalize that receives SQLite's typed `DiskFull`
-does not permanently poison the serving daemon. The persistence actor retries
-that same ordered unit after a short delay and admits no later durable mutation
-ahead of it. Its bounded queue applies backpressure while storage is unavailable;
-daemon shutdown cancels the wait. Other database, I/O, replay-conflict,
+An output append or terminal finalize that receives SQLite's typed `DiskFull`,
+or whose WAL admission is temporarily blocked by a reader during
+`wal_checkpoint(TRUNCATE)`, does not permanently poison the serving daemon. The
+persistence actor retries that same ordered unit after a short delay and admits
+no later durable mutation ahead of it. Its bounded queue applies backpressure
+while storage is unavailable; daemon shutdown cancels the wait. A checkpoint
+that remains busy through its bounded local retry budget is reported as
+retryable storage pressure and the ordered unit continues waiting; it is not
+latched as durable corruption. Other database, I/O, replay-conflict,
 file-budget, integrity, and owner-invariant failures still latch persistence and
 reject later durable mutations. This changes no wire frame or error code: a
 client may observe output progress stall until storage recovers, and a client
