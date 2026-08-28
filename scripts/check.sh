@@ -100,7 +100,12 @@ if [[ $ctxmux_check_coverage == true ]]
 then
 scripts/check-coverage.sh
 else
-cargo test --workspace --all-targets
+# Run every test binary before reporting. Without --no-fail-fast cargo stops at
+# the first failing binary, so one failure hides every later binary's result and
+# a second, unrelated defect stays invisible until the first is fixed. This is
+# not a retry: a failure still fails the gate, it just fails with the complete
+# picture.
+cargo test --workspace --all-targets --no-fail-fast
 cargo run --quiet --package ctxmux -- --version
 cargo run --quiet --package ctxmux-daemon -- --version
 scripts/smoke-cli.sh

@@ -49,7 +49,7 @@ export { deriveBudgetCeiling } from "./reliability-budget-contract.mjs";
 
 const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
 const EXPECTED_CHECK_CORE_SHA256 =
-  "590e163fd02a18ab0e57da97d1e7ca55ea455c7b2da1935b4d5ef6aa51381f37";
+  "bec5c918ddece9668262cc41858d99364e95a910941c4f94f9f04cafbf8cc1ac";
 const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
   "ea4b034e70736db01d40e61dc530d81efdc1752f455f56697c93c222b4e11f9b";
 const EXPECTED_QUALIFICATION_POLICY = {
