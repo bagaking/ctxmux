@@ -447,6 +447,10 @@ const V3_PASSING_ACTIONS = new Set([
   "stress.soak",
   "stress.fanout",
   "resource.measurement",
+  // Descriptive latency and throughput observations. Admitted to the trace so
+  // a variance trend can accumulate; deliberately carries no budget, because
+  // a per-platform ceiling must be machine-derived from a fresh baseline.
+  "observation.latency",
   "gc.turnover",
   "gc.replay_pressure",
 ]);
