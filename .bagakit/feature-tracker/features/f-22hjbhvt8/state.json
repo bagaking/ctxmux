@@ -15,19 +15,19 @@
   "counters": {
     "gate_fail_streak": 0,
     "no_progress_rounds": 0,
-    "round_count": 6
+    "round_count": 7
   },
   "gate": {
     "last_result": "pass",
-    "last_task_id": "T-005",
+    "last_task_id": "T-006",
     "last_check_commands": [
       {
-        "command": "scripts/check-remote-runtime.sh --stage supervision",
+        "command": "scripts/check-remote-runtime.sh --stage capability",
         "exit_code": 0,
         "status": "pass"
       }
     ],
-    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-005-r6-0001.log"
+    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-006-r7-0001.log"
   },
   "history": [
     {
@@ -117,6 +117,34 @@
     {
       "action": "task_started",
       "detail": "T-006"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-006 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-006 => done"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=5; supersedes_revision=4"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-003"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-007"
     }
   ],
   "depends_on": []

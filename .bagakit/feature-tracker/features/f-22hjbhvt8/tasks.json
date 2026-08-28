@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22hjbhvt8",
   "plan_status": "reviewed",
-  "plan_revision": 4,
-  "supersedes_revision": 3,
-  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md",
+  "plan_revision": 5,
+  "supersedes_revision": 4,
+  "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r5.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -124,6 +124,40 @@
           "T-002"
         ]
       }
+    },
+    {
+      "revision": 5,
+      "supersedes_revision": 4,
+      "review_ref": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r5.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/proposal.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r2.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r3.md",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r4.md"
+      ],
+      "task_ids": [
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006",
+        "T-007",
+        "T-008"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {
+        "T-005": [
+          "T-001"
+        ],
+        "T-006": [
+          "T-002"
+        ]
+      }
     }
   ],
   "tasks": [
@@ -160,7 +194,7 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 2,
-      "status": "todo",
+      "status": "in_progress",
       "gate_result": null,
       "last_gate_commands": [],
       "notes": []
@@ -169,7 +203,8 @@
       "id": "T-004",
       "depends_on": [
         "T-003",
-        "T-006"
+        "T-006",
+        "T-008"
       ],
       "title": "Bind the Remote Runtime contract to documentation SSOT and one exact commit",
       "objective": "Publish the qualified remote endpoint contract through the owning documents and close the Feature on one exact commit whose evidence a downstream consumer can cite.",
@@ -292,7 +327,86 @@
         "T-002"
       ],
       "introduced_in_revision": 4,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check-remote-runtime.sh --stage capability",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "id": "T-007",
+      "depends_on": [],
+      "title": "Provide race-safe TypeScript Runtime activation",
+      "objective": "Expose a framework-neutral TypeScript helper that connects to or activates one compatible local ctxmux Runtime while the daemon remains the Run owner.",
+      "outcome": "An embedding product can activate, prove readiness, exit, and later reconnect without private spawning logic or coupling daemon life to Node.",
+      "acceptance": [
+        "Concurrent activators converge on one compatible Runtime or return a typed conflict using public identity and readiness, not fixed sleeps.",
+        "Live, stale, ordinary-file, symlink, permission, timeout, crashed-launcher, and incompatible-Runtime cases never kill or replace an unrelated target.",
+        "The helper exposes explicit executable, socket, state, environment, deadline, and child-disposition inputs and performs no download, global mutation, credential handling, Electron coupling, or SSH fallback.",
+        "The activating Node process may exit while daemon-owned Runs survive and a fresh clean consumer reconnects to the same Run and replay."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "Activation races, socket safety, readiness, compatibility, caller-exit survival, and SDK regressions pass."
+        },
+        {
+          "kind": "artifact",
+          "ref": "packages/sdk/README.md",
+          "proves": "Activation inputs, lifecycle, errors, security boundary, and non-goals are consumer-visible."
+        }
+      ],
+      "source_refs": [
+        "docs/architecture.md#stable-boundary",
+        "docs/protocol.md#transport-and-framing",
+        "packages/sdk/README.md",
+        "packages/sdk/src/index.ts",
+        ".bagakit/feature-tracker/features/f-22ecztapc/tasks.json",
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r5.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 5,
       "status": "in_progress",
+      "gate_result": null,
+      "last_gate_commands": [],
+      "notes": []
+    },
+    {
+      "id": "T-008",
+      "depends_on": [
+        "T-003",
+        "T-007"
+      ],
+      "title": "Prove the complete gate on real Linux before merge",
+      "objective": "Close the macOS-only verification gap that admitted a cfg-gated compile error, by running the complete repository gate on a real Linux target rather than inferring it from a cross-build.",
+      "outcome": "No platform-conditional code path merges unverified: the complete gate is observed passing on real Linux, and the route that proves it is recorded rather than assumed.",
+      "acceptance": [
+        "The complete repository gate runs to its completion boundary on a real Linux x86_64 target, executed there rather than cross-compiled, at the exact candidate being merged.",
+        "Every cfg-gated path that a macOS build never compiles is enumerated, and the report states which of them the Linux run actually compiled and which remain unexercised.",
+        "The Owner's provisioning constraint holds: only a compiled binary is placed on the owner host, and no repository clone or toolchain is installed there. A route needing more than that is proposed with its justification rather than taken silently.",
+        "A failure found on Linux is reported with its real output and fixed at the defect, never by narrowing the gate, weakening an assertion, or skipping the platform."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "scripts/check.sh",
+          "proves": "The complete repository gate, including the wired remote qualification, reaches its completion boundary on the merge candidate."
+        }
+      ],
+      "source_refs": [
+        ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/plan-review-r5.md",
+        "crates/ctxmux-daemon/src/native_session.rs",
+        ".github/workflows/ci.yml"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 5,
+      "status": "todo",
       "gate_result": null,
       "last_gate_commands": [],
       "notes": []
