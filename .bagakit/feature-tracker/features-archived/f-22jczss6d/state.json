@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "feat_id": "f-22jczss6d",
+  "title": "Review the next ctxmux Runtime refinements",
+  "slug": "peer-runtime-refinement-discussion",
+  "goal": "Discuss and decide how the second DeepSeek Harness, Paseo, Herdr, and Orca mechanism study should sharpen existing ctxmux Feature contracts without starting implementation, duplicating active owners, or crossing the Agent-neutral Run Runtime boundary.",
+  "status": "archived",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "current_task_id": null,
+  "runtime_role": "standalone",
+  "blocked_reason_class": "none",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 4,
+    "no_progress_rounds": 0,
+    "round_count": 4
+  },
+  "gate": {
+    "last_result": "fail",
+    "last_task_id": "T-001",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 1,
+        "status": "fail"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/gate-T-001-r4-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=proposal_only; base_ref=main; root_branch=main"
+    },
+    {
+      "action": "task_plan_set",
+      "detail": "revision=1; supersedes_revision=none"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "proposal_only -> current_tree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "blocked_reason_set",
+      "detail": "T-001 => internal_blocker"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "tracker metadata closed; Git workspace unchanged"
+    }
+  ],
+  "closed_from_status": "blocked"
+}

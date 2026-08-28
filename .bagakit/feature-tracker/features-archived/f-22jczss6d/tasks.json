@@ -1,0 +1,100 @@
+{
+  "version": 2,
+  "feat_id": "f-22jczss6d",
+  "plan_status": "reviewed",
+  "plan_revision": 1,
+  "supersedes_revision": null,
+  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+  "source_refs": [
+    ".bagakit/feature-tracker/features/f-22jczss6d/proposal.md",
+    ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md",
+    ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+      "source_refs": [
+        ".bagakit/feature-tracker/features/f-22jczss6d/proposal.md",
+        ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md"
+      ],
+      "task_ids": [
+        "T-001"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "title": "Close the peer Runtime refinement discussion",
+      "objective": "Install the user-confirmed peer-study dispositions in their existing Feature owners and close this proposal without starting implementation or duplicating requirements.",
+      "outcome": "The local Runtime embedding plan owns the accepted refinements, trigger-gated candidates remain inactive, and this discussion Feature can be archived as evidence rather than retained as a second plan.",
+      "acceptance": [
+        "f-22ecztapc reviewed plan revision 4 sharpens only T-003 and T-004 while preserving every Task ID, status, dependency, and execution order.",
+        "The daemon-owned observation and identity-qualified race-free wait contracts match the direct user confirmation recorded in revision-4-plan-review.md.",
+        "Every trigger-gated candidate remains outside active Tasks until a concrete consumer failure supplies a separate owner and oracle.",
+        "No implementation, workspace code change, release, package action, push, or external message is performed by this discussion Feature."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "jq -e '.plan_revision == 4 and .review_ref == \".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md\" and ([.tasks[] | select(.id == \"T-003\" and .status == \"in_progress\")] | length == 1) and ([.tasks[] | select(.id == \"T-004\" and .status == \"todo\")] | length == 1)' .bagakit/feature-tracker/features/f-22ecztapc/tasks.json",
+          "proves": "The owning Feature contains reviewed revision 4 with the unchanged active execution position."
+        },
+        {
+          "kind": "artifact",
+          "ref": ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md",
+          "proves": "Revision-pinned peer evidence and every accepted, unchanged, gated, and rejected disposition remain auditable."
+        }
+      ],
+      "source_refs": [
+        ".bagakit/feature-tracker/features/f-22jczss6d/proposal.md",
+        ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "blocked",
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 1,
+          "status": "fail"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "internal_blocker",
+        "reason": "The owning plan revision is installed and exact affected tests pass, but scripts/check.sh cannot produce a green repository receipt because pre-existing tmux_adapter fake-version probes exceed their execution deadline only under the full suite load; the failure is outside this proposal-only documentation scope."
+      }
+    }
+  ],
+  "closeout_review": {
+    "schema": "bagakit.feature-closeout-review.v1",
+    "documentation": {
+      "disposition": "updated",
+      "rationale": "The user-confirmed peer refinements are installed in the owning local Runtime embedding Feature as reviewed task-plan revision 4; no second planning document or product-boundary edit is needed.",
+      "refs": [
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md"
+      ]
+    },
+    "learning": {
+      "disposition": "candidates_reviewed",
+      "rationale": "Revision-pinned peer mechanisms were distilled into existing owners, trigger-gated candidates remain inactive, and the unrelated full-suite tmux deadline flake is preserved as blocker evidence instead of being misreported as a green gate.",
+      "refs": [
+        ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/pass-002-peer-distillation.md",
+        ".bagakit/feature-tracker/features/f-22jczss6d/artifacts/gate-T-001-r4-0001.log"
+      ]
+    },
+    "promotion": {
+      "disposition": "not_needed",
+      "rationale": "The accepted refinements now live in f-22ecztapc revision 4 and remaining candidates have explicit trigger gates; no separate knowledge or principle owner is required.",
+      "refs": []
+    }
+  }
+}

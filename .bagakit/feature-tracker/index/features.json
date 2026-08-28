@@ -185,8 +185,8 @@
     {
       "feat_id": "f-22jczss6d",
       "title": "Review the next ctxmux Runtime refinements",
-      "status": "proposal",
-      "workspace_mode": "proposal_only",
+      "status": "archived",
+      "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",
       "runtime_role": "standalone",

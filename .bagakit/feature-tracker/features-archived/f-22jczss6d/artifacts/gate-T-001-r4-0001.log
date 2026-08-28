@@ -1,0 +1,9 @@
+project_type=non_ui
+execution_root=.
+workspace_mode=current_tree
+execution_detail=current_tree uses the tracker root
+result=fail
+reasons:
+- command failed: scripts/check.sh
+commands:
+- scripts/check.sh => fail (1)

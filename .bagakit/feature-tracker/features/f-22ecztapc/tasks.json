@@ -2,9 +2,9 @@
   "version": 2,
   "feat_id": "f-22ecztapc",
   "plan_status": "reviewed",
-  "plan_revision": 3,
-  "supersedes_revision": 2,
-  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md",
+  "plan_revision": 4,
+  "supersedes_revision": 3,
+  "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
   "source_refs": [
     "AGENTS.md",
     "docs/vision.md",
@@ -12,7 +12,8 @@
     "docs/protocol.md",
     "docs/roadmap.md",
     "packages/sdk/README.md",
-    ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md"
+    ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+    ".bagakit/feature-tracker/features-archived/f-22jczss6d/artifacts/pass-002-peer-distillation.md"
   ],
   "plan_history": [
     {
@@ -76,6 +77,32 @@
         "docs/roadmap.md",
         "packages/sdk/README.md",
         ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-3-plan-review.md"
+      ],
+      "task_ids": [
+        "T-000",
+        "T-001",
+        "T-002",
+        "T-003",
+        "T-004",
+        "T-005",
+        "T-006"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    },
+    {
+      "revision": 4,
+      "supersedes_revision": 3,
+      "review_ref": ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/roadmap.md",
+        "packages/sdk/README.md",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+        ".bagakit/feature-tracker/features-archived/f-22jczss6d/artifacts/pass-002-peer-distillation.md"
       ],
       "task_ids": [
         "T-000",
@@ -232,10 +259,11 @@
       "objective": "Make Run snapshots and observations orderable without asking clients to infer freshness from receipt arrival or wall-clock polling.",
       "outcome": "Public Run metadata carries one owner-issued revision and well-defined lifecycle timestamps that Rust and TypeScript observers can compare safely.",
       "acceptance": [
-        "Run revision is monotonic for one Run and changes exactly with publicly observable metadata; clients do not use local receipt order as a substitute.",
-        "Creation, start, terminal, interruption, and latest observation timestamps use documented clocks and nullability, survive persistence where claimed, and do not pretend to provide distributed causal time.",
-        "Snapshot, attach, event, list, status, fork, cold recovery, and exec-upgrade paths agree on revision and timestamp truth.",
-        "Protocol generation, generated TypeScript declarations, SDK validation, persistence schema, CLI presentation, and wrong-case fixtures move together with no compatibility fallback."
+        "The daemon stamps lifecycle/backend state revision and occurrence time at the authoritative Run transition. Revision is the ordering authority; owner-authored UTC time is display and audit evidence, never SDK receipt time, a monotonic clock, or distributed causal time.",
+        "The public contract enumerates the lifecycle/backend metadata changes that advance one Run state revision monotonically. Output byte progress, applied-input progress, attachment count or delivery, replay retention, and delivery gaps retain their existing distinct cursors or transport semantics and do not advance lifecycle revision.",
+        "Authoritative snapshots and live observations join at an exact revision and carry exact runtimeId, daemonInstanceId, and runId identity so a client can distinguish the selected Run from Runtime replacement or another Run.",
+        "Create, start, exit, interrupt, attach snapshot, fork, cold recovery, and planned-exec paths preserve the declared revision/timestamp truth; persistent recovery cannot regress the latest revision or terminal occurrence time, and delayed delivery preserves the daemon-authored occurredAt value.",
+        "A private pure or table-driven transition oracle may centralize mutation and tests, but Phase 1 adds no public projection registry, durable observation journal, checkpoint cache, plugin surface, compatibility fallback, or client-authored lifecycle timestamp."
       ],
       "verification": [
         {
@@ -253,7 +281,9 @@
         "docs/protocol.md#run-operations",
         "docs/architecture.md#run-domain-model",
         "crates/ctxmux-protocol/src/lib.rs",
-        "crates/ctxmux-daemon/src/persistence.rs"
+        "crates/ctxmux-daemon/src/persistence.rs",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+        ".bagakit/feature-tracker/features-archived/f-22jczss6d/artifacts/pass-002-peer-distillation.md"
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
@@ -268,10 +298,11 @@
       "objective": "Provide one public, deadline-bounded way to wait for Run predicates and terminal state without open-coded polling races across clients.",
       "outcome": "Rust, TypeScript, and CLI consumers share explicit wait semantics over revisioned observations, reconnect, gaps, and terminal outcomes.",
       "acceptance": [
-        "Rust and TypeScript helpers accept explicit predicates or terminal waits, absolute or duration deadlines, cancellation, and typed timeout, disappearance, transport, and protocol outcomes.",
-        "Wait uses public status, attach, event, gap, and reconnect behavior without busy loops, hidden daemon state, unbounded retries, or semantic Agent-status inference.",
-        "The CLI wait command reuses the Rust client helper instead of maintaining a second lifecycle algorithm.",
-        "Real process tests cover already-satisfied, later-satisfied, exit, interruption, reconnect, gap, cancellation, timeout, daemon replacement, and concurrent waiters."
+        "Rust and TypeScript expose equivalent bounded helpers for waiting on declared Run lifecycle states and output-byte advance. Each wait captures its observation cursor before reading initial state, returns immediately when the authoritative snapshot matches, and otherwise follows the existing attach-before-snapshot boundary without a snapshot/subscribe lost wakeup.",
+        "Every wait is pinned to exact runtimeId, daemonInstanceId, and runId plus the relevant lifecycle revision or output byte cursor. A same label, recreated or collected Run, observation gap, or replacement daemon cannot satisfy the old wait.",
+        "Public results distinguish matched, timeout, cancelled, collected, output gap, and runtime replacement. Timeout or cancellation ends only the wait and never stops, interrupts, or otherwise mutates the Run.",
+        "The CLI wait command reuses the Rust helper, and Rust, TypeScript, and CLI share one semantic contract without busy polling, hidden daemon state, Agent predicates, rendered-screen matching, a new daemon wait verb, compatibility fallback, or unbounded retry.",
+        "Real-process tests cover an already-satisfied snapshot, a transition between cursor capture and snapshot, unrelated observations before a match, terminal exit/interruption, output advance, timeout, cancellation, collection, gap, daemon replacement, concurrent waiters, and a different Run with the same external label."
       ],
       "verification": [
         {
@@ -284,7 +315,9 @@
         "docs/protocol.md#output-and-reconnect",
         "crates/ctxmux-client/src/lib.rs",
         "crates/ctxmux/src/main.rs",
-        "packages/sdk/src/index.ts"
+        "packages/sdk/src/index.ts",
+        ".bagakit/feature-tracker/features/f-22ecztapc/artifacts/revision-4-plan-review.md",
+        ".bagakit/feature-tracker/features-archived/f-22jczss6d/artifacts/pass-002-peer-distillation.md"
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
