@@ -98,10 +98,20 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 1,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
-      "notes": []
+      "status": "blocked",
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check-remote-runtime.sh --stage vertical",
+          "exit_code": 1,
+          "status": "fail"
+        }
+      ],
+      "notes": [],
+      "last_blocker": {
+        "class": "external_blocker",
+        "reason": "The vertical is implemented and its supervision lane, argument-shape lane, and the complete repository gate all pass. The real-OpenSSH lane its acceptance requires cannot run here: this machine has no SSH boundary to an owner host (ssh localhost is refused). That lane fails rather than skips by design, so remote cannot be reported as qualified by a run that never spoke SSH. Unblock by enabling a loopback or remote owner host and rerunning scripts/check-remote-runtime.sh --stage vertical; see verification.md."
+      }
     },
     {
       "id": "T-002",

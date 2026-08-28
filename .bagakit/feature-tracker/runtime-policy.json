@@ -13,38 +13,6 @@
     "max_round_count": 8
   },
   "gate": {
-    "project_type": "auto",
-    "verification_policy": "on_demand",
-    "project_type_rules": {
-      "ui": {
-        "any_path_exists": [
-          "vite.config.js",
-          "vite.config.ts",
-          "next.config.js",
-          "next.config.mjs",
-          "tailwind.config.js",
-          "tailwind.config.ts",
-          "src/components",
-          "components",
-          "frontend",
-          "web",
-          "app",
-          "pages"
-        ]
-      },
-      "non_ui": {
-        "any_path_exists": [
-          "pyproject.toml",
-          "requirements.txt",
-          "pytest.ini",
-          "go.mod",
-          "Cargo.toml",
-          "package.json"
-        ]
-      },
-      "default": "non_ui"
-    },
-    "ui_commands": [],
-    "non_ui_commands": ["scripts/check.sh"]
+    "verification_policy": "on_demand"
   }
 }

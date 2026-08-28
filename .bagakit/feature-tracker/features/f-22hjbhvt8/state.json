@@ -4,7 +4,7 @@
   "title": "Carry Runs through an owner-host Remote Runtime",
   "slug": "remote-runtime-transport",
   "goal": "After the local Runtime contract is qualified, carry the existing public ctxmux protocol through a system OpenSSH StreamLocal tunnel to an owner-host ctxmuxd while preserving remote lifecycle truth, exact Runtime and Run identity, reconnect and replay, owner-issued Stop receipts, and fail-closed mixed capabilities without adding Relay, accounts, a control plane, orchestration, or derivation metadata.",
-  "status": "ready",
+  "status": "blocked",
   "workspace_mode": "worktree",
   "base_ref": "main",
   "branch": "feat/f-22hjbhvt8",
@@ -13,15 +13,21 @@
   "runtime_role": "standalone",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 0,
+    "gate_fail_streak": 2,
     "no_progress_rounds": 0,
-    "round_count": 0
+    "round_count": 2
   },
   "gate": {
-    "last_result": null,
-    "last_task_id": null,
-    "last_check_commands": [],
-    "last_log_path": null
+    "last_result": "fail",
+    "last_task_id": "T-001",
+    "last_check_commands": [
+      {
+        "command": "scripts/check-remote-runtime.sh --stage vertical",
+        "exit_code": 1,
+        "status": "fail"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-001-r2-0001.log"
   },
   "history": [
     {
@@ -47,6 +53,26 @@
     {
       "action": "workspace_assigned",
       "detail": "proposal_only -> worktree; root_branch=fix/test-load-resilience-and-doc-drift"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => fail"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => blocked"
+    },
+    {
+      "action": "task_blocker_set",
+      "detail": "T-001 => external_blocker"
     }
   ],
   "depends_on": []
