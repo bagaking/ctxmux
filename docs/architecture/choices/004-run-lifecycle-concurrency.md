@@ -124,8 +124,6 @@ panics but is not a declared consistency-recovery strategy.
 
 ## Wrong-case corpus
 
-Evidence pack: [lifecycle-concurrency track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/lifecycle-concurrency.md), claim `C004`.
-
 - `LC-001` (`d01`, `d02`): confusing the broadcast receiver cursor, daemon head, and caller's last delivered byte can skip or duplicate recoverable output after lag.
 - `LC-002` (`d02`): a terminal event can make the last retained data unreachable if exit closes delivery before replay recovery. Final bytes must remain available through attachment or reattach.
 - `LC-003` (`d03`): the native lifecycle owner can reap a child before public state changes;

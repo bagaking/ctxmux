@@ -458,6 +458,11 @@ already-sent command and returns the actual reap receipt rather than unknown.
 
 ### Benchmarks and performance regression
 
+None of this is implemented yet; the repository has no `benches/` directory and
+no benchmark dependency. [External quality comparison](architecture/external-quality-comparison.md)
+records how comparable projects measure these dimensions, which of their
+practices transfer to a headless daemon, and which must be refused.
+
 Create a repository-owned harness for:
 
 - daemon cold start and Run start-to-accepted latency;

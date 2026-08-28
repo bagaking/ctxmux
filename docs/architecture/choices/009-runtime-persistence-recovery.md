@@ -232,8 +232,6 @@ and state paths still do not provide discovery or activation policy.
 
 ## Wrong-case corpus
 
-Evidence pack: [persistence-recovery track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/persistence-recovery.md), claim `C009`.
-
 - `PERSIST-01` (`i01`, `i02`): a persisted numeric PID can refer to an unrelated live process after restart. Ambiguous identity must become a non-recoverable typed state, never guessed adoption.
 - `PERSIST-02` (`i03`): interruption between state writes, flushes, rename, and directory durability can expose a parseable mixed generation. Recovery must select one validated generation or report corruption.
 
@@ -298,5 +296,5 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - `crates/ctxmux-daemon/src/lib.rs`: live and recovered `RunManager` paths
 - `docs/protocol.md`: public persistent-mode lifetime boundary
 - `docs/roadmap.md`: M3.5 recovery acceptance
-- `.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/persistence-recovery.md`:
-  PID reuse and atomic-generation evidence with transfer limits
+- `fixtures/wrong-cases.json`: `PERSIST-01` and `PERSIST-02` with external
+  `source_refs` for PID reuse and atomic-generation evidence and transfer limits

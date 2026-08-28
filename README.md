@@ -152,7 +152,8 @@ target/debug/ctxmux attach <imported-run-id>
 
 Import binds one pane identity at that moment. Input, resize, stop, and fork
 are rejected. Closing the ctxmux client leaves the tmux pane running.
-`Ctrl-b d` still detaches the local view. Details live in
+`Ctrl-b d` still detaches the local view. Import is memory-only and is rejected
+when the daemon runs with `--state-dir`. Details live in
 [Architecture](docs/architecture.md) and [Protocol](docs/protocol.md).
 
 ## Docs

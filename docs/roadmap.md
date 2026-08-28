@@ -53,11 +53,16 @@ packages, Git refs, hosted releases, or benchmark results.
 
 A frozen external embedding comparison exposed one bounded native-owner gap
 before the broader peer cycle: a fresh daemon used a host-sized Tokio worker
-pool, and every live native Run permanently owned one reader thread plus one
-waiter thread. Three existing ctxmux resource censuses independently reproduced
-approximately 142--145 KiB and two threads per live Run. Historical T-004 owns
-the delivered substrate and its blocker evidence. `f-22aczwza9/T-005` now owns
-only the remaining ctxmux qualification: the frozen 1/32/128 census,
+pool, and the earlier substrate gave every live native Run its own reader and
+waiter thread. The frozen pre-optimization census still records that shape:
+approximately 142--145 KiB and two threads per live Run across 1/32/128. Both
+are superseded history, not current behavior: the daemon now pins two Tokio
+workers, and a single daemon-wide native owner polls every Run reader in one
+loop, so no permanent per-Run thread remains. ADR 001
+(`docs/architecture/choices/001-rust-tokio-daemon.md`) is the current
+description of that substrate. Historical T-004 owns the delivered substrate
+and its blocker evidence. `f-22aczwza9/T-005` now owns only the remaining
+ctxmux qualification: the frozen 1/32/128 census,
 fresh-daemon and zero-per-Run permanent-worker truth, clean reliability gate,
 independent owner-boundary review, and exact commit. It must not change output
 fan-out, protocol encoding, thresholds, compatibility behavior, tmux semantics,
