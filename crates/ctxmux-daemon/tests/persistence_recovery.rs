@@ -17,6 +17,7 @@ use ctxmux_protocol::{
     RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent,
     RunId, RunInfo, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
 };
+use ctxmux_test_support::{daemon_spawn_permit, scaled};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::{sleep, timeout};
@@ -90,6 +91,7 @@ async fn recovered_creation_keys_resolve_before_current_fork_state_checks() {
 
 impl Daemon {
     async fn start(socket: PathBuf, state_dir: &Path) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
@@ -110,7 +112,7 @@ impl Daemon {
     }
 
     async fn wait_ready(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + scaled(Duration::from_secs(10));
         loop {
             if self.client().ping().await.is_ok() {
                 return;
@@ -193,7 +195,7 @@ async fn wait_terminal(client: &Client, id: RunId) -> RunInfo {
 }
 
 async fn wait_terminal_within(client: &Client, id: RunId, budget: Duration) -> RunInfo {
-    timeout(budget, async {
+    timeout(scaled(budget), async {
         loop {
             let info = client.status(id).await.expect("read Run status");
             if !info.state.is_running() {
@@ -207,7 +209,7 @@ async fn wait_terminal_within(client: &Client, id: RunId, budget: Duration) -> R
 }
 
 async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match attachment
                 .next_event()
@@ -366,7 +368,7 @@ async fn running_record_becomes_interrupted_without_adopting_or_signalling_its_p
         .await
         .expect("start HUP-ignoring sentinel");
     let sentinel_pid = live.pid.expect("sentinel has a PID");
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let info = first_client
                 .status(live.id)

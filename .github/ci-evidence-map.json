@@ -33,8 +33,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -47,8 +53,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -62,8 +74,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -76,8 +94,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -90,8 +114,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -104,8 +134,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -118,8 +154,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -132,8 +174,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -144,8 +192,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -158,8 +212,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -174,8 +234,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -188,8 +254,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -202,8 +274,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -216,8 +294,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -230,8 +314,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -244,8 +334,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -258,8 +354,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -272,8 +374,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -286,8 +394,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -300,8 +414,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -314,8 +434,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -328,8 +454,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node scripts/reliability-policy.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -342,8 +474,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -378,8 +516,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -392,8 +536,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -406,8 +556,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -420,8 +576,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -435,8 +597,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -449,8 +617,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -463,8 +637,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -479,8 +659,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -497,7 +683,10 @@
           "job": "critical",
           "platforms": ["ubuntu-24.04", "macos-15"]
         },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -511,8 +700,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -526,8 +721,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -541,8 +742,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -555,8 +762,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -569,8 +782,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -590,8 +809,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -607,8 +832,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -621,8 +852,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -636,8 +873,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -651,8 +894,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -665,8 +914,35 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
+      "id": "test-support-load-model",
+      "kind": "test",
+      "path": "crates/ctxmux-test-support/src/lib.rs",
+      "invariants": [
+        "an unset environment preserves every original test budget, so the default suite observes true timing",
+        "the daemon spawn gate bounds only concurrent startups and extends no deadline, so a genuinely slow readiness still fails"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -677,8 +953,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/index.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -691,8 +973,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/integration.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -705,8 +993,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/shell-integration.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -721,8 +1015,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/wrong-cases.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -735,8 +1035,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/parser-fuzz.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -751,8 +1057,14 @@
       "selection_ref": "packages/sdk/package.json",
       "selection_anchor": "test/client-parity.test.ts",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -765,8 +1077,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -781,8 +1099,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "npm run test:local-consumer",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -795,8 +1119,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "scripts/smoke-cli.sh",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -809,8 +1139,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "CTXMUX_TMUX_QUALIFICATION",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -823,8 +1159,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "scripts/check-protocol-types.sh",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     },
     {
@@ -837,8 +1179,14 @@
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "scripts/check-reliability.sh --profile smoke",
       "reach": [
-        { "job": "critical", "platforms": ["ubuntu-24.04", "macos-15"] },
-        { "job": "coverage", "platforms": ["ubuntu-24.04"] }
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
       ]
     }
   ],

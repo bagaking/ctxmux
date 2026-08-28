@@ -21,6 +21,7 @@ use ctxmux_protocol::{
     RunSignal, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, ServerFrame,
     StopDisposition, StopOperationKey, TerminalSize, decode_frame, encode_frame,
 };
+use ctxmux_test_support::{daemon_spawn_permit, scaled, scaled_polls};
 use futures_util::{SinkExt, StreamExt, future::join_all};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -60,6 +61,7 @@ impl TestDaemon {
     }
 
     async fn start_memory_only_at(directory: Arc<TempDir>, socket: PathBuf) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
@@ -72,6 +74,7 @@ impl TestDaemon {
     }
 
     async fn start_with_inherited_fd(sentinel: &Path) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
@@ -91,6 +94,7 @@ impl TestDaemon {
     }
 
     async fn start_with_qualification_stats_fd(sentinel: &Path) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
@@ -110,6 +114,7 @@ impl TestDaemon {
     }
 
     async fn start_with_readiness_fd(receipt: &Path) -> Self {
+        let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let child = Command::new("/bin/sh")
@@ -142,6 +147,7 @@ impl TestDaemon {
     /// never blocked on the synchronous pipe. The thread ends when the daemon
     /// dies and closes the pipe (see `Drop`).
     async fn start_persistent() -> Self {
+        let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
         let state_dir = directory.path().join("state");
@@ -195,7 +201,7 @@ impl TestDaemon {
             stderr_lines,
         };
 
-        timeout(Duration::from_secs(5), async {
+        timeout(scaled(Duration::from_secs(5)), async {
             loop {
                 if let Some(status) = daemon.child.try_wait().expect("poll ctxmuxd") {
                     panic!("ctxmuxd exited before accepting connections: {status}");
@@ -233,7 +239,7 @@ impl TestDaemon {
         if !interrupted.success() {
             return Err(format!("SIGINT command failed with {interrupted}"));
         }
-        for _ in 0..100 {
+        for _ in 0..scaled_polls(100) {
             match self.child.try_wait() {
                 Ok(Some(_)) => return Ok(()),
                 Ok(None) => std::thread::sleep(Duration::from_millis(20)),
@@ -275,7 +281,7 @@ impl TestDaemon {
             .stderr_lines
             .as_ref()
             .expect("stderr matching requires a stderr-piped daemon");
-        timeout(Duration::from_secs(timeout_secs), async {
+        timeout(scaled(Duration::from_secs(timeout_secs)), async {
             loop {
                 {
                     let captured = lines.lock().expect("stderr buffer lock");
@@ -295,7 +301,7 @@ impl TestDaemon {
             .stderr_lines
             .as_ref()
             .expect("stderr counting requires a stderr-piped daemon");
-        timeout(Duration::from_secs(10), async {
+        timeout(scaled(Duration::from_secs(10)), async {
             loop {
                 let count = lines
                     .lock()
@@ -482,7 +488,7 @@ fn recoverable_stop_marker_shell(marker: &Path, exit_on_term: bool) -> RunSpec {
 }
 
 async fn wait_for_stop_marker_lines(marker: &Path, expected: usize) -> Vec<String> {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let lines = std::fs::read_to_string(marker)
                 .unwrap_or_default()
@@ -500,7 +506,7 @@ async fn wait_for_stop_marker_lines(marker: &Path, expected: usize) -> Vec<Strin
 }
 
 async fn wait_for_marker_pids(marker: &Path, expected: usize) -> Vec<u32> {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let pids = std::fs::read_to_string(marker)
                 .unwrap_or_default()
@@ -579,7 +585,7 @@ async fn receive_server_frame(
     wire: &mut Framed<UnixStream, LinesCodec>,
     context: &str,
 ) -> ServerFrame {
-    let line = timeout(Duration::from_secs(5), wire.next())
+    let line = timeout(scaled(Duration::from_secs(5)), wire.next())
         .await
         .unwrap_or_else(|_| panic!("timed out while {context}"))
         .unwrap_or_else(|| panic!("daemon closed while {context}"))
@@ -589,7 +595,7 @@ async fn receive_server_frame(
 }
 
 async fn wait_for_run_count(client: &Client, expected: usize) -> Vec<ctxmux_protocol::RunInfo> {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let runs = client.list().await.expect("list response-loss Runs");
             if runs.len() == expected {
@@ -622,7 +628,7 @@ async fn wait_for_output(
     last_byte: &mut u64,
     expected: &[u8],
 ) {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         while !observed
             .windows(expected.len())
             .any(|window| window == expected)
@@ -659,7 +665,7 @@ async fn wait_for_output(
 }
 
 async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match attachment
                 .next_event()
@@ -687,7 +693,7 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
 }
 
 async fn wait_until_exited(client: &Client, id: RunId) -> RunState {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let state = client.status(id).await.expect("read Run state").state;
             if !state.is_running() {
@@ -741,7 +747,7 @@ async fn assert_malformed_request_closes(client: &Client, frame: &[u8]) {
     )
     .await
     .expect("send fixture handshake");
-    let response = timeout(Duration::from_secs(5), wire.next())
+    let response = timeout(scaled(Duration::from_secs(5)), wire.next())
         .await
         .expect("fixture handshake should settle")
         .expect("daemon sends fixture handshake response")
@@ -766,7 +772,7 @@ async fn assert_malformed_request_closes(client: &Client, frame: &[u8]) {
 
 async fn assert_connection_closes(mut stream: UnixStream) {
     let mut byte = [0];
-    let result = timeout(Duration::from_secs(5), stream.read(&mut byte))
+    let result = timeout(scaled(Duration::from_secs(5)), stream.read(&mut byte))
         .await
         .expect("daemon should settle malformed connection");
     match result {
@@ -970,7 +976,7 @@ fn process_thread_count(pid: u32) -> usize {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn stable_process_resources(pid: u32) -> (usize, usize) {
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         let mut previous = None;
         let mut stable_samples = 0;
         loop {
@@ -1104,7 +1110,7 @@ async fn run_survives_attachment_disconnect_and_reconnects_to_the_same_child() {
     .await;
 
     drop(first_attachment);
-    let status_after_disconnect = timeout(Duration::from_secs(5), async {
+    let status_after_disconnect = timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let status = daemon.client.status(run.id).await.expect("read Run status");
             if status.attachments == 0 {
@@ -1298,7 +1304,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
     let mut stop = Box::pin(attachment.stop(stop_operation));
     let mut stop_command_id = None;
     let mut after_stop_output = Vec::new();
-    let terminal = timeout(Duration::from_secs(5), async {
+    let terminal = timeout(scaled(Duration::from_secs(5)), async {
         loop {
             tokio::select! {
                 biased;
@@ -1412,20 +1418,23 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
         rows: 43,
         cols: 127,
     };
-    let resize = timeout(Duration::from_secs(2), control.resize(requested_size))
-        .await
-        .expect("resize is not starved by saturated input")
-        .expect("resize reaches the PTY owner");
+    let resize = timeout(
+        scaled(Duration::from_secs(2)),
+        control.resize(requested_size),
+    )
+    .await
+    .expect("resize is not starved by saturated input")
+    .expect("resize reaches the PTY owner");
     assert_eq!(resize.command_id.get(), 1);
     assert_eq!(resize.receipt.applied_size, requested_size);
     let stop_operation = fresh_stop(&daemon.client, run.id).await;
-    let stop = timeout(Duration::from_secs(3), control.stop(stop_operation))
+    let stop = timeout(scaled(Duration::from_secs(3)), control.stop(stop_operation))
         .await
         .expect("stop is not starved by saturated input")
         .expect("stop reaches the child owner");
     assert_eq!(stop.command_id.get(), 2);
 
-    let terminal = timeout(Duration::from_secs(5), async {
+    let terminal = timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match control
                 .next_event()
@@ -1452,7 +1461,7 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
 
     let mut not_applied = 0;
     for task in seed_tasks {
-        let results = timeout(Duration::from_secs(5), task)
+        let results = timeout(scaled(Duration::from_secs(5)), task)
             .await
             .expect("saturated input task resolves after stop")
             .expect("saturated input task does not panic");
@@ -1558,7 +1567,7 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
         }
     }
     assert!(
-        timeout(Duration::from_secs(5), wire.next())
+        timeout(scaled(Duration::from_secs(5)), wire.next())
             .await
             .expect("fatal attachment close is bounded")
             .is_none(),
@@ -1804,10 +1813,13 @@ async fn recoverable_stop_response_loss_recovers_from_a_fresh_client() {
     .await;
 
     let fresh_client = Client::new(daemon.client.socket_path());
-    let recovered = timeout(Duration::from_secs(5), fresh_client.stop(operation.clone()))
-        .await
-        .expect("daemon-owned Stop settlement remains live after response loss")
-        .expect("fresh client recovers the exact Stop result");
+    let recovered = timeout(
+        scaled(Duration::from_secs(5)),
+        fresh_client.stop(operation.clone()),
+    )
+    .await
+    .expect("daemon-owned Stop settlement remains live after response loss")
+    .expect("fresh client recovers the exact Stop result");
     let replayed = fresh_client
         .stop(operation)
         .await
@@ -1950,13 +1962,13 @@ async fn recoverable_stop_terminal_attach_eofs_and_explicit_composite_replays() 
         })
     );
     assert_eq!(
-        timeout(Duration::from_secs(2), attachment.next_event())
+        timeout(scaled(Duration::from_secs(2)), attachment.next_event())
             .await
             .expect("terminal attachment reaches EOF without a recovery command")
             .expect("read terminal attachment EOF"),
         None
     );
-    timeout(Duration::from_secs(2), async {
+    timeout(scaled(Duration::from_secs(2)), async {
         loop {
             if daemon
                 .client
@@ -1992,10 +2004,13 @@ async fn recoverable_stop_terminal_attach_eofs_and_explicit_composite_replays() 
         })
     );
     assert_eq!(
-        timeout(Duration::from_secs(2), recovered.attachment.next_event())
-            .await
-            .expect("composite terminal attachment reaches EOF")
-            .expect("read composite terminal attachment EOF"),
+        timeout(
+            scaled(Duration::from_secs(2)),
+            recovered.attachment.next_event()
+        )
+        .await
+        .expect("composite terminal attachment reaches EOF")
+        .expect("read composite terminal attachment EOF"),
         None
     );
     assert_eq!(wait_for_stop_marker_lines(&marker, 1).await, ["TERM"]);
@@ -2114,12 +2129,12 @@ async fn recoverable_stop_same_attachment_duplicates_join_and_conflicts_fail_clo
         CommandDisposition::NotApplied,
     );
 
-    let first = timeout(Duration::from_secs(5), first)
+    let first = timeout(scaled(Duration::from_secs(5)), first)
         .await
         .expect("first attachment Stop settles")
         .expect("join first attachment Stop task")
         .expect("first attachment Stop is accepted");
-    let duplicate = timeout(Duration::from_secs(5), duplicate)
+    let duplicate = timeout(scaled(Duration::from_secs(5)), duplicate)
         .await
         .expect("duplicate attachment Stop settles")
         .expect("join duplicate attachment Stop task")
@@ -2166,7 +2181,7 @@ async fn recoverable_stop_attachment_disconnect_keeps_upgrade_drain_on_settlemen
     assert!(!abandoned.is_finished(), "forced Stop remains in flight");
 
     daemon.sighup();
-    timeout(Duration::from_secs(2), async {
+    timeout(scaled(Duration::from_secs(2)), async {
         loop {
             match attachment.resize(TerminalSize { rows: 25, cols: 81 }).await {
                 Err(ClientError::ControlRejected { failure })
@@ -2541,7 +2556,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         },
     )
     .await;
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             if daemon
                 .client
@@ -2877,7 +2892,7 @@ async fn daemon_rejects_generation_12_before_request_dispatch() {
         .await
         .expect("send coalesced old hello and start request");
     let mut wire = Framed::new(stream, LinesCodec::new_with_max_length(MAX_FRAME_BYTES));
-    let line = timeout(Duration::from_secs(5), wire.next())
+    let line = timeout(scaled(Duration::from_secs(5)), wire.next())
         .await
         .expect("version mismatch response must be bounded")
         .expect("daemon responds")
@@ -2887,7 +2902,7 @@ async fn daemon_rejects_generation_12_before_request_dispatch() {
         other => panic!("expected version mismatch, got {other:?}"),
     }
     assert!(
-        timeout(Duration::from_secs(5), wire.next())
+        timeout(scaled(Duration::from_secs(5)), wire.next())
             .await
             .expect("old-generation connection close must be bounded")
             .is_none(),
@@ -2924,7 +2939,7 @@ async fn protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation() {
     wire.send(exact_frame)
         .await
         .expect("send exact-limit handshake");
-    let line = timeout(Duration::from_secs(5), wire.next())
+    let line = timeout(scaled(Duration::from_secs(5)), wire.next())
         .await
         .expect("exact-limit handshake should settle")
         .expect("daemon sends handshake response")
@@ -3441,7 +3456,7 @@ async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
         let id = run.id;
         accepted.push(tokio::spawn(async move {
             let operation = fresh_stop(&client, id).await;
-            timeout(Duration::from_secs(3), client.stop(operation))
+            timeout(scaled(Duration::from_secs(3)), client.stop(operation))
                 .await
                 .expect("accepted stubborn Stop stays inside its receipt fence")
         }));
@@ -3848,7 +3863,7 @@ async fn upgrade_drains_crossing_input_through_its_ack_response() {
         ))
         .await
         .expect("start crossing-control reader");
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         while !ready.exists() {
             sleep(Duration::from_millis(10)).await;
         }
@@ -3872,7 +3887,7 @@ async fn upgrade_drains_crossing_input_through_its_ack_response() {
     );
 
     daemon.sighup();
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match attachment.resize(TerminalSize { rows: 25, cols: 81 }).await {
                 Err(ClientError::ControlRejected { failure })
@@ -3893,7 +3908,7 @@ async fn upgrade_drains_crossing_input_through_its_ack_response() {
     );
 
     std::fs::write(&release, b"release").expect("release the child reader externally");
-    let accepted = timeout(Duration::from_secs(10), input)
+    let accepted = timeout(scaled(Duration::from_secs(10)), input)
         .await
         .expect("crossing Input ACK precedes upgrade resume")
         .expect("join crossing Input task")
@@ -3905,7 +3920,7 @@ async fn upgrade_drains_crossing_input_through_its_ack_response() {
 
     let resume = daemon.wait_resume_signal(10).await;
     assert!(resume.contains(" 1 run(s)"), "unexpected resume: {resume}");
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match attachment.next_event().await {
                 Ok(Some(_)) => {}
@@ -3983,7 +3998,7 @@ async fn repeated_upgrades_have_zero_settled_fd_and_thread_delta() {
         daemon
             .wait_stderr_occurrences("adopted inherited listener for handoff", upgrade)
             .await;
-        timeout(Duration::from_secs(5), async {
+        timeout(scaled(Duration::from_secs(5)), async {
             loop {
                 if daemon.client.ping().await.is_ok() {
                     break;
@@ -4114,7 +4129,7 @@ async fn upgrade_preserves_live_run() {
 
     // 4. Same-child survival: the run reports the same pid and the child is
     //    still alive. The client reconnects to the unchanged socket inode.
-    let status = timeout(Duration::from_secs(10), async {
+    let status = timeout(scaled(Duration::from_secs(10)), async {
         loop {
             match daemon.client.status(run.id).await {
                 Ok(status) => return status,
@@ -4140,7 +4155,7 @@ async fn upgrade_preserves_live_run() {
     // Connections are deliberately not migrated. Observe the old attachment's
     // transport terminate, then prove any later command is rejected locally as
     // not-applied rather than crossing into the incoming image ambiguously.
-    timeout(Duration::from_secs(5), async {
+    timeout(scaled(Duration::from_secs(5)), async {
         loop {
             match first_attachment.next_event().await {
                 Ok(Some(RunEvent::Output { chunk })) => {
@@ -4174,7 +4189,7 @@ async fn upgrade_preserves_live_run() {
     // 5. Master + writer re-adopted: attach fresh at C0 and observe an echo.
     //    Observing OUT:resumed proves both the pty master (read path) and the
     //    input writer were re-bound by Run::readopt on the incoming image.
-    let (second_attachment, second_snapshot) = timeout(Duration::from_secs(10), async {
+    let (second_attachment, second_snapshot) = timeout(scaled(Duration::from_secs(10)), async {
         loop {
             match daemon.client.attach(run.id, c0).await {
                 Ok(pair) => return pair,
@@ -4354,7 +4369,7 @@ async fn upgrade_preserves_output_across_the_reader_window() {
     //    (replay, contiguous by construction) instead of the live broadcast
     //    channel, whose bounded capacity would raise a spurious lag `Gap` on a
     //    68KB in-flight burst and mask the real defect either way.
-    let settled = timeout(Duration::from_secs(15), async {
+    let settled = timeout(scaled(Duration::from_secs(15)), async {
         let mut stable_at = None;
         let mut stable_polls = 0;
         loop {
@@ -4378,7 +4393,7 @@ async fn upgrade_preserves_output_across_the_reader_window() {
     .expect("burst output should settle on the incoming image");
 
     // 6. Attach fresh at C0 on the incoming image and take the settled snapshot.
-    let (second_attachment, second_snapshot) = timeout(Duration::from_secs(10), async {
+    let (second_attachment, second_snapshot) = timeout(scaled(Duration::from_secs(10)), async {
         loop {
             match daemon.client.attach(run.id, c0).await {
                 Ok(pair) => return pair,
