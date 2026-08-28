@@ -124,8 +124,8 @@
       "objective": "Record the already delivered persistent-daemon exec-in-place continuity as the clean baseline for the remaining local Runtime embedding work.",
       "outcome": "The next tasks build on one committed, gated baseline that preserves live Run ownership, replay, and recoverable-Input retry truth across an intentional upgrade.",
       "acceptance": [
-        "Commit e88bdc5 is reachable from the current tree and contains the bounded handoff manifest, request drain, owner transfer, re-adoption, retry-ledger continuity, and public lifecycle evidence.",
-        "The complete repository gate passes from a clean e88bdc5 tree without weakening the checked-in reliability, coverage, fixture, or CI reachability policy.",
+        "The delivered exec-upgrade baseline is present on main (convenience pointer 21e241b) and contains the bounded handoff manifest, request drain, owner transfer, re-adoption, retry-ledger continuity, and public lifecycle evidence; the code on main is the evidence, the SHA is only a pointer to it.",
+        "The complete repository gate passes from a clean main tree at that baseline (21e241b) without weakening the checked-in reliability, coverage, fixture, or CI reachability policy.",
         "Cold restart, intentional exec upgrade, Provider-specific resume, and future remote execution remain distinct ownership classes in architecture and protocol truth."
       ],
       "verification": [

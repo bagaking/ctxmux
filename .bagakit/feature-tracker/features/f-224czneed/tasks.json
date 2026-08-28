@@ -108,7 +108,7 @@
       "notes": [],
       "last_blocker": {
         "class": "external_blocker",
-        "reason": "Exact b4dcbb355a5940eea839d70dd6736a8d472b4737 is not published; required Ubuntu tmux 3.4 and macOS-current CI receipts cannot run without user-authorized GitHub publication and authenticated CI access."
+        "reason": "The tmux Control resource release is present on main (convenience pointer 91dfc4c73cfc06234d8812ff4eb411e7a893e5f8); the code on main is the evidence, the SHA is only a pointer to it. The required Ubuntu tmux 3.4 and macOS-current CI receipts still cannot run without user-authorized GitHub publication and authenticated CI access."
       }
     },
     {

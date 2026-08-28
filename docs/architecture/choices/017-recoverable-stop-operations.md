@@ -21,7 +21,7 @@ Run itself.
 
 ## Decision
 
-Generation 12 requires every native Stop path to carry one
+Generation 11 requires every native Stop path to carry one
 `RecoverableStop` containing the original daemon incarnation, a caller-retained
 opaque `StopOperationKey`, and the exact `RunId`. Keys are non-empty UTF-8 of at
 most 128 bytes and are compared byte-exactly.

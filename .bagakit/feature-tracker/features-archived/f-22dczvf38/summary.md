@@ -10,6 +10,15 @@
 - Discard Reason: 
 - Replacement Feat: 
 
+## Terminal Acceptance Distinction
+
+This Feature was archived from status done, but two of its tasks remain blocked:
+T-002 on an internal_blocker and T-003 on an external_blocker. Its hosted
+exact-commit CI acceptance was never satisfied and stays attributed to T-003 as
+an external residual. Archived here means the delivered public consumer gaps
+closed with local evidence; it does not assert that the blocked tasks'
+acceptance criteria, including the hosted CI receipts, were met.
+
 ## Requirement Authority
 - Archive Synthesis: none; archive does not reinterpret or rewrite requirements
 - Canonical Truth: tasks.json

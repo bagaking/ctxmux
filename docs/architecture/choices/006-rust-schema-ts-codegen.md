@@ -11,7 +11,7 @@ The Rust daemon and TypeScript SDK must not maintain parallel handwritten protoc
 
 Rust types in `ctxmux-protocol` are authoritative. `ts-rs` exports the recursive `ClientFrame` and `ServerFrame` graph plus generated protocol constants. The generator formats output with Prettier. The repository gate regenerates into a temporary directory and diffs it against checked-in declarations.
 
-Generated declarations provide static parity. The SDK separately validates full generation-6 frames at runtime and rejects unsafe integer cursors. Protocol compatibility policy remains a separate responsibility.
+Generated declarations provide static parity. The SDK separately validates full generation-13 frames at runtime and rejects unsafe integer cursors. Protocol compatibility policy remains a separate responsibility.
 
 ## Quality attributes and invariants
 
@@ -34,8 +34,6 @@ Serde attributes unsupported or interpreted differently by the generator remain 
 
 ## Wrong-case corpus
 
-Evidence pack: [schema-codegen track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/schema-codegen.md), claim `C006`.
-
 - `SC-01` (`f01`-`f03`): current `.with_large_int("number")` silently rounds a `u64` cursor above `2^53 - 1`. The SDK must preserve it exactly or reject it before replay.
 - `SC-02` (`f02`, `f04`): TypeScript declarations are erased. A known top-level tag with malformed nested fields currently crosses `serverFrame` through a cast.
 - `SC-03` (`f02`): unsupported or suppressed serde attributes can make serialization and declarations diverge even when generated text looks plausible. Golden Rust frames need TypeScript runtime validation.
@@ -54,7 +52,7 @@ The generated-directory diff remains valuable. It solves checked-in declaration 
 
 - Should `u64` values become strings, `bigint` adapters, or bounded protocol integers?
 - Which changes are wire-breaking and how is the generation-bump gate enforced?
-- Does a future replacement for generation 6 need generated runtime validation
+- Does a future replacement for generation 13 need generated runtime validation
   rather than the current handwritten boundary validator?
 - How are golden wire fixtures versioned without preserving obsolete pre-stable contracts?
 

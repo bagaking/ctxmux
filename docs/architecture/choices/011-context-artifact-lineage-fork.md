@@ -17,7 +17,7 @@ The target contract has two supported fidelity levels and one non-goal:
 
 The caller requests a level. The runtime never silently substitutes a lower one.
 
-In generation 6, `RunSpec.declared_inputs` is the sole immutable truth for
+In generation 13, `RunSpec.declared_inputs` is the sole immutable truth for
 ordered workspace, artifact, and context references. Values are non-empty and
 opaque; the daemon records them but does not dereference, normalize, copy, or
 infer ownership. `RunInfo.lineage` records derivation only: the immediate parent
@@ -65,8 +65,6 @@ does not turn the host into a security boundary against callers that bypass the
 Integration and invoke raw fork directly.
 
 ## Wrong-case corpus
-
-Evidence pack: [context-fork track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/context-fork.md), claim `C011`.
 
 - `FORK-01` (`k01`): commits, default stash, untracked files, and ignored files are different inclusion sets. A fidelity label without an inspectable manifest silently omits material context.
 - `FORK-02` (`k02`): a `--shared` clone can borrow objects later deleted by source maintenance. A fork advertised as independent must own its artifacts or declare its dependency.

@@ -30,7 +30,7 @@ The SDK exposes byte input as string or `Uint8Array`; strings are UTF-8 encoded 
 
 Node 24 or newer and Unix sockets are required. There is no timeout, `AbortSignal`, reconnection helper, request ID, or packaging release. Concurrent `receive()` semantics are not documented.
 
-The SDK validates full nested generation-6 frames, rejects unsafe cursors, and
+The SDK validates full nested generation-13 frames, rejects unsafe cursors, and
 bounds the JSON-lines transport before pausing the socket. Each Attachment has
 one receive pump, a 64-command pending map with separate 32-command/1 MiB input
 bounds, and a 256-event/1 MiB delivery inbox. `input()`, `resize()`, and
@@ -39,8 +39,6 @@ fences new commands, drains pending results, and waits for `Detached`; abrupt
 close makes unresolved commands unknown without stopping the Run.
 
 ## Wrong-case corpus
-
-Evidence pack: [typescript-sdk track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/typescript-sdk.md), claim `C007`.
 
 - `SDK-01` (`g01`, `g02`, `g04`): a write callback is transport progress, not daemon acceptance; close races can make `drain` impossible and the per-write callback the only error path.
 - `SDK-02` (`g01`-`g03`): the permanent `data` listener puts the socket in flowing mode and transfers frames into an unbounded `#lines` array when the consumer pauses.

@@ -38,8 +38,8 @@
       ],
       "source_refs": [
         "docs/protocol.md",
-        "docs/decisions/protocol-and-transport.md",
-        "docs/testing/strategy.md"
+        "docs/architecture/choices/003-unix-socket-json-lines-protocol.md",
+        "docs/testing-strategy.md"
       ],
       "supersedes": []
     },
@@ -71,8 +71,9 @@
       "source_refs": [
         "docs/architecture.md",
         "docs/protocol.md",
-        "docs/decisions/pty-process-and-signals.md",
-        "docs/testing/strategy.md"
+        "docs/architecture/choices/002-portable-pty-native-backend.md",
+        "docs/architecture/choices/017-recoverable-stop-operations.md",
+        "docs/testing-strategy.md"
       ],
       "supersedes": ["T-002"]
     },
@@ -100,14 +101,14 @@
         },
         {
           "kind": "artifact",
-          "ref": "docs/testing/strategy.md",
+          "ref": "docs/testing-strategy.md",
           "proves": "Required CI classification and clean-consumer evidence are durable."
         }
       ],
       "source_refs": [
         "docs/roadmap.md",
         "docs/release.md",
-        "docs/testing/strategy.md",
+        "docs/testing-strategy.md",
         "docs/plans/public-local-consumer-contract-review.md"
       ],
       "supersedes": []

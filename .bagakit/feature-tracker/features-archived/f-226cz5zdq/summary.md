@@ -10,6 +10,15 @@
 - Discard Reason: 
 - Replacement Feat: 
 
+## Terminal Acceptance Distinction
+
+This Feature was archived from status done, but its own goal required closing
+only after reproducible peer benchmark wins. That benchmark-win half was
+descoped to successor f-22aczwza9 rather than satisfied here. Archived here
+means the correctness and qualification work converged and transferred; it does
+not assert that the reproducible peer benchmark wins named in the original goal
+were achieved.
+
 ## Requirement Authority
 - Archive Synthesis: none; archive does not reinterpret or rewrite requirements
 - Canonical Truth: tasks.json

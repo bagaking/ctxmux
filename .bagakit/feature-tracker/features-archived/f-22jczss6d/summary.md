@@ -10,6 +10,15 @@
 - Discard Reason:
 - Replacement Feat:
 
+## Terminal Acceptance Distinction
+
+This Feature was archived from status blocked, not from satisfied acceptance.
+Its single task T-001 finished blocked, the gate last result was fail with a
+gate-fail streak of 4, and no task is done (0 done, 1 blocked). Archived here
+records that the review was closed out and its accepted peer refinements were
+transferred into f-22ecztapc revision 4; it does not assert that this Feature's
+own acceptance criteria passed.
+
 ## Requirement Authority
 - Archive Synthesis: none; archive does not reinterpret or rewrite requirements
 - Canonical Truth: tasks.json

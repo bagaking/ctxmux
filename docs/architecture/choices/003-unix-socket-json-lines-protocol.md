@@ -90,8 +90,6 @@ Compatibility policy is not yet a release guarantee.
 
 ## Wrong-case corpus
 
-Evidence pack: [local-protocol track](../../../.bagakit/researcher/topics/engineering/ctxmux-wrong-case-corpus/tracks/local-protocol.md), claim `C003`.
-
 - `LP-01` (`c01`): bind-then-chmod has a window when the parent directory is shared, socket mode is not a portable Unix authentication guarantee, and stale cleanup is a check-then-unlink operation.
 - `LP-02` (`c02`, `c03`): an unterminated line can force unbounded buffering without an exact byte cap. Exactly-at-limit and over-limit behavior must match in Rust and Node.
 - `LP-03` (`c03`): Node UTF-8 replacement and last-wins duplicate JSON keys can disagree with Rust rejection. A shared malformed-wire corpus must fail before Run mutation.

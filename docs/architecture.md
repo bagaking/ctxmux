@@ -642,6 +642,6 @@ Each decision record contains a `Wrong-case corpus（错题集）` section and a
 - characterization: the failure shape is retained while the product contract or oracle remains undecided;
 - rejected: the case does not transfer to ctxmux, with a recorded reason.
 
-The source corpus lives under `.bagakit/researcher/`; architecture pages cite it rather than copying an untraceable list of web folklore.
+The formal docs deliberately do not depend on the local research corpus that seeded these cases; that working material stays a developer-local aid. The retained cases and their dispositions live in tracked sources instead: `fixtures/wrong-cases.json` carries the machine-readable trace with external `source_refs`, and each decision record restates its cases inline. The point is to keep a checkable disposition for every failure mode rather than an untraceable list of web folklore.
 
 The governing rule is compact: terminals are views, Runs are durable, and every stronger claim needs public-behavior evidence.

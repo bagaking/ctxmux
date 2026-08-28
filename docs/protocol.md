@@ -517,7 +517,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 8 import accepts only socket path plus pane ID, so it
+associations. Generation 13 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -532,7 +532,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 8 does not claim general tmux command correlation beyond those bounded
+Generation 13 does not claim general tmux command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
