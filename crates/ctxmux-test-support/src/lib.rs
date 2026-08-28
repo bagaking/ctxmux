@@ -23,7 +23,10 @@
 //! Call sites keep those as literal durations.
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -85,14 +88,68 @@ pub fn scaled_polls(base: usize) -> usize {
 ///
 /// Two is deliberate rather than derived from the core count. Core count says
 /// how wide the machine is, not how much of it is already busy, and the
-/// measured failures happen precisely when something else owns most of the
-/// cores. On a 14-core host under load average 138, a limit of two completes
-/// all 46 tests while four leaves five of them failing on readiness; at idle
-/// the same limit costs a few seconds of wall time. A fixed small bound is
-/// therefore both simpler and more robust than probing parallelism.
+/// observed failures happen precisely when something else owns most of the
+/// cores. A fixed small bound is therefore both simpler and more robust than
+/// probing parallelism.
+///
+/// Evidence, and its limits. On a 14-core host at load average 138 the suite
+/// failed 5 of 46 tests on daemon readiness with a limit of four, and passed
+/// 46 of 46 with a limit of two; raising `CTXMUX_TEST_TIME_SCALE` to four
+/// instead only reduced failures from five to three, which is why the gate and
+/// not the multiplier is the primary lever. That comparison was opportunistic
+/// rather than controlled: at load average 40 or below, every limit from two to
+/// effectively unbounded passes, so the ordinary machine cannot reproduce the
+/// failure and cannot confirm the fix either. Wall-clock cost of the bound is
+/// within run-to-run noise at that load. Treat the limit as a bound justified by
+/// the failure mode, not as a value proven optimal.
 ///
 /// Raise it with `CTXMUX_TEST_DAEMON_SPAWN_LIMIT` on a dedicated machine.
 const DEFAULT_DAEMON_SPAWN_LIMIT: u64 = 2;
+
+/// Peak number of permits ever held at once, for the gate's own assertion.
+///
+/// The gate is a process-wide `OnceLock`, so a test cannot rebuild it. This
+/// counter lets one deterministic test prove the bound actually holds without
+/// depending on host load, which is the only way the property is checkable on
+/// an idle machine.
+static PEAK_CONCURRENT_STARTUPS: AtomicUsize = AtomicUsize::new(0);
+static LIVE_STARTUPS: AtomicUsize = AtomicUsize::new(0);
+
+/// Highest number of daemon startups this binary ever ran concurrently.
+#[must_use]
+pub fn peak_concurrent_startups() -> usize {
+    PEAK_CONCURRENT_STARTUPS.load(Ordering::Acquire)
+}
+
+/// Permits this binary allows to race, after the environment override.
+#[must_use]
+pub fn daemon_spawn_limit() -> usize {
+    let permits = environment_u64("CTXMUX_TEST_DAEMON_SPAWN_LIMIT", DEFAULT_DAEMON_SPAWN_LIMIT);
+    usize::try_from(permits).unwrap_or(usize::MAX).max(1)
+}
+
+/// Tracks one live startup and keeps the peak, releasing on drop.
+struct StartupCensus;
+
+impl StartupCensus {
+    fn enter() -> Self {
+        let live = LIVE_STARTUPS.fetch_add(1, Ordering::AcqRel) + 1;
+        PEAK_CONCURRENT_STARTUPS.fetch_max(live, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for StartupCensus {
+    fn drop(&mut self) {
+        LIVE_STARTUPS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// One daemon-startup slot, held for the caller's spawn and readiness wait.
+pub struct DaemonSpawnPermit {
+    _permit: OwnedSemaphorePermit,
+    _census: StartupCensus,
+}
 
 /// Reserve one daemon-startup slot for this test binary.
 ///
@@ -103,17 +160,17 @@ const DEFAULT_DAEMON_SPAWN_LIMIT: u64 = 2;
 ///
 /// Panics if the process-wide gate has been closed, which this crate never
 /// does.
-pub async fn daemon_spawn_permit() -> OwnedSemaphorePermit {
+pub async fn daemon_spawn_permit() -> DaemonSpawnPermit {
     static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
-    let gate = GATE.get_or_init(|| {
-        let permits = environment_u64("CTXMUX_TEST_DAEMON_SPAWN_LIMIT", DEFAULT_DAEMON_SPAWN_LIMIT);
-        let permits = usize::try_from(permits).unwrap_or(usize::MAX).max(1);
-        Arc::new(Semaphore::new(permits))
-    });
-    Arc::clone(gate)
+    let gate = GATE.get_or_init(|| Arc::new(Semaphore::new(daemon_spawn_limit())));
+    let permit = Arc::clone(gate)
         .acquire_owned()
         .await
-        .expect("daemon spawn gate stays open for the test binary")
+        .expect("daemon spawn gate stays open for the test binary");
+    DaemonSpawnPermit {
+        _permit: permit,
+        _census: StartupCensus::enter(),
+    }
 }
 
 #[cfg(test)]
@@ -136,6 +193,44 @@ mod tests {
         assert!(
             (2..=4).contains(&DEFAULT_DAEMON_SPAWN_LIMIT),
             "spawn limit {DEFAULT_DAEMON_SPAWN_LIMIT} must stay a small bound above one"
+        );
+    }
+
+    /// The gate's bound is checkable without a busy machine.
+    ///
+    /// The failure this gate exists to prevent only appears when the host is
+    /// already loaded, so an idle machine cannot reproduce it. Counting the peak
+    /// concurrent startups instead makes the property exact and load-independent:
+    /// far more tasks than permits are released at once, and the observed peak
+    /// must still never exceed the limit.
+    #[test]
+    fn concurrent_startups_never_exceed_the_permit_limit() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("build census runtime");
+        let limit = super::daemon_spawn_limit();
+        runtime.block_on(async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for _ in 0..64 {
+                tasks.spawn(async {
+                    let permit = super::daemon_spawn_permit().await;
+                    // Hold the slot long enough that a broken gate would let
+                    // other tasks in and lift the observed peak.
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    drop(permit);
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                joined.expect("census task completes");
+            }
+        });
+        let peak = super::peak_concurrent_startups();
+        assert!(peak > 0, "census must observe at least one startup");
+        assert!(
+            peak <= limit,
+            "gate admitted {peak} concurrent startups above its limit of {limit}"
         );
     }
 }
