@@ -5111,6 +5111,96 @@ mod tests {
     }
 
     #[test]
+    fn corrupted_data_page_fails_closed_through_the_quick_check_guard() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let temp = TempDir::new().expect("create quick_check corruption fixture");
+        let state_dir = temp.path().join("state");
+
+        // Seed real durable rows with replay payloads so the main database holds
+        // several b-tree data pages beyond the schema for quick_check to scan.
+        {
+            let (persistence, recovered) =
+                Persistence::open(&state_dir).expect("open corruption fixture");
+            assert!(recovered.is_empty());
+            for _ in 0..8 {
+                let info = running_info(RunId::new());
+                let durable = persistence
+                    .insert_start(&test_operation_key(info.id), &info)
+                    .expect("insert corruption fixture Run");
+                let payload = replay(vec![chunk(0, &[0x5a_u8; 2048])]);
+                durable.append(info.id, payload.clone());
+                durable.finalize(info.id, 7, payload, exited_state());
+            }
+            persistence.assert_exclusive_owner();
+            drop(persistence);
+        }
+
+        let database_path = state_dir.join(DATABASE_FILE);
+
+        // Fold the WAL into the main database (autocheckpoint is disabled) so the
+        // durable pages live in the file we damage, then prove the fixture is
+        // healthy before corruption. query_row fetches only the first row, which
+        // for a healthy database is the literal "ok".
+        {
+            let connection = Connection::open(&database_path).expect("open fixture for checkpoint");
+            connection
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .expect("fold WAL into the main database");
+            let quick_check: String = connection
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .expect("healthy fixture quick_check");
+            assert_eq!(
+                quick_check, "ok",
+                "fixture must be healthy before we damage it"
+            );
+        }
+
+        // Overwrite real on-disk bytes across the data pages (page 4 onward). The
+        // schema page (1), the auto-vacuum pointer map (2) and the runtime_meta
+        // root (3) are left intact so validate_existing_schema still passes and
+        // the malformation surfaces specifically at the quick_check integrity
+        // guard rather than at schema validation. This mangles genuine SQLite
+        // pages on disk; it is not a fabricated error object.
+        let file_len = fs::metadata(&database_path)
+            .expect("stat fixture database")
+            .len();
+        let first_data_page_offset = 3 * PAGE_SIZE_BYTES;
+        assert!(
+            file_len > first_data_page_offset + PAGE_SIZE_BYTES,
+            "checkpointed fixture must hold data pages beyond the schema, got {file_len} bytes"
+        );
+        {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .open(&database_path)
+                .expect("open fixture database for corruption");
+            let mut offset = first_data_page_offset;
+            while offset + 512 <= file_len {
+                file.seek(SeekFrom::Start(offset + 16))
+                    .expect("seek into a data page header");
+                file.write_all(&[0xff_u8; 128])
+                    .expect("inject garbage bytes into the cell pointer region");
+                file.write_all(&[0x00_u8; 128])
+                    .expect("inject NUL bytes into the cell content region");
+                offset += PAGE_SIZE_BYTES;
+            }
+            file.flush().expect("flush the corruption to disk");
+        }
+
+        let Err(error) = Persistence::open(&state_dir) else {
+            panic!("a malformed data page must fail closed, not open silently");
+        };
+        let PersistenceError::Corrupt(message) = &error else {
+            panic!("on-disk corruption must classify as Corrupt, got {error:?}");
+        };
+        assert!(
+            message.contains("quick_check returned"),
+            "corruption must be caught by the quick_check integrity guard, got {message:?}"
+        );
+    }
+
+    #[test]
     fn sqlite_disk_full_code_survives_error_translation() {
         let disk_full = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
