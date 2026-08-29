@@ -48,8 +48,17 @@ import { validateQualificationStatsArtifact } from "./reliability-gc-stats.mts";
 export { deriveBudgetCeiling } from "./reliability-budget-contract.mjs";
 
 const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
+/// Normalized hash of scripts/check.sh's core body.
+///
+/// This pin exists so a step cannot be quietly deleted from the required gate.
+/// It therefore also fires for a legitimate addition, which is the intended
+/// cost: changing what the gate runs must be a deliberate edit here, not a
+/// side effect of editing check.sh. When updating it, verify the delta is only
+/// the step you meant to add or remove — recompute from the trimmed, non-empty
+/// lines between `ctxmux_check_core() (` and the completion-token line, which is
+/// what `coreHash` below hashes — and say which step moved in the commit.
 const EXPECTED_CHECK_CORE_SHA256 =
-  "bec5c918ddece9668262cc41858d99364e95a910941c4f94f9f04cafbf8cc1ac";
+  "cda3a0c863328abec89548ecd8fdc23686bc7cfc8affe0c6788d371527c10e87";
 const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
   "ea4b034e70736db01d40e61dc530d81efdc1752f455f56697c93c222b4e11f9b";
 const EXPECTED_QUALIFICATION_POLICY = {
