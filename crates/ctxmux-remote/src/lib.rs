@@ -25,6 +25,15 @@
 //! - **Provisioning.** Nothing is uploaded, installed, version-matched, or
 //!   spawned on the owner host. A missing owner-host listener is an explicit
 //!   error, never an invitation to provision one.
+//! - **Connection reuse.** No connection cache lives here. Measurement is the
+//!   reason rather than restraint: per-tunnel establishment *falls* from a
+//!   4.165ms median at one concurrent tunnel to 0.908ms at eight, so this
+//!   crate's own path has no per-tunnel cost that caching would remove. What
+//!   reuse would save is the handshake, which OpenSSH already sells as
+//!   `ControlMaster`/`ControlPersist`; a caller enables it through
+//!   `~/.ssh/config` or `with_extra_args`, and the fixed option list stays
+//!   silent about it so that choice keeps working. Re-measure with
+//!   `scripts/check-remote-cost.sh --stage fanout`.
 //!
 //! Because remote reuses the same socket contract, the ordered-byte cursor,
 //! replay, truncation, and gap semantics are the local ones verbatim. There is
@@ -760,6 +769,36 @@ mod tests {
                 < first_caller,
             "every fixed option must precede the caller's argument list"
         );
+    }
+
+    /// Connection reuse stays OpenSSH's to own, so the fixed list must not claim it.
+    ///
+    /// Reuse was measured rather than assumed: per-tunnel establishment *falls*
+    /// from a 4.165ms median at one tunnel to 0.908ms at eight (ratio 0.218,
+    /// `scripts/check-remote-cost.sh --stage fanout`), so nothing in this crate's
+    /// own path gets cheaper by caching a connection. What reuse would actually
+    /// save is the handshake, and OpenSSH already implements exactly that as
+    /// `ControlMaster`/`ControlPath`/`ControlPersist` — reachable here only
+    /// because the fixed list stays silent about all three and `extra_args`
+    /// precedes nothing. Pinning any of them would convert a caller's
+    /// `~/.ssh/config` choice into a value it could no longer change, since a
+    /// repeated option resolves to its first occurrence. So this asserts the
+    /// absence: the decision not to build a connection cache is only honest
+    /// while the delegated route it defers to is still open.
+    #[test]
+    fn multiplexing_is_left_to_the_caller_rather_than_pinned_here() {
+        let args = tunnel_args(&endpoint(), Path::new("/tmp/private/owner-host.sock"));
+        for option in ["ControlMaster", "ControlPath", "ControlPersist"] {
+            assert!(
+                !args.iter().any(|arg| {
+                    arg.to_str()
+                        .is_some_and(|text| text.starts_with(&format!("{option}=")))
+                }),
+                "{option} must stay unset here; pinning it would take reuse away \
+                 from the caller's ssh configuration, which is the only place \
+                 that can weigh a handshake this crate never performs"
+            );
+        }
     }
 
     /// A dead idle link must become an exit, and only a probe can make it one.
