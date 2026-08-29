@@ -60,9 +60,13 @@ Runs does not change the thread count; blocking cleanup can temporarily add at
 most eight bounded workers. A stalled cleanup can retain one of those slots.
 Creation admission independently limits concurrent launches to eight,
 while its bounded shutdown drain cannot hard-cancel a launch thread that
-exceeds the deadline. Shutdown joins already-started native cleanup work and
-retains unresolved child authority fail-stop; it does not invent a graceful
-live-native-Run shutdown policy.
+exceeds the deadline. Native-owner shutdown is itself bounded: the owner loop
+wakes, detaches already-started blocking cleanup workers, and then quiesces;
+the shutdown wrapper joins the loop only if it reaches that point before its
+deadline. Queued or still-watched children whose wait authority cannot be
+completed are retained fail-stop, while a detached cleanup worker may finish
+its own child cleanup without extending daemon shutdown. This does not invent
+a graceful live-native-Run shutdown policy.
 
 ## Wrong-case corpus
 
