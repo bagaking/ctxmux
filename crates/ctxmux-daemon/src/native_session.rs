@@ -462,11 +462,7 @@ fn process_ids() -> Result<Vec<u32>, String> {
 fn process_ids() -> Result<Vec<u32>, String> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
-    Ok(system
-        .processes()
-        .keys()
-        .map(sysinfo::Pid::as_u32)
-        .collect())
+    Ok(system.processes().keys().map(|pid| pid.as_u32()).collect())
 }
 
 #[cfg(test)]
