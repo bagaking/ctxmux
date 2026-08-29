@@ -857,6 +857,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "crates/ctxmux-rss-sampler/src/main.rs",
           "crates/ctxmux-client/src/lib.rs",
           "crates/ctxmux-client/src/attachment.rs",
+          "crates/ctxmux-remote/src/lib.rs",
           "crates/ctxmux/src/main.rs",
           "crates/ctxmux/src/daemon.rs",
           "crates/ctxmux/src/screen.rs",
@@ -902,6 +903,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
         paths: [
           "packages/sdk/src/client.ts",
           "packages/sdk/src/attachment.ts",
+          "packages/sdk/src/activation.ts",
           "packages/sdk/src/control.ts",
           "packages/sdk/src/stop-operation.ts",
           "packages/sdk/src/index.ts",
@@ -949,6 +951,12 @@ test("checked-in policy fixes every current product owner and floor", () => {
         category: "test_only",
         language: "rust",
         glob: "crates/ctxmux-test-support/src/**",
+      },
+      {
+        id: "rust-remote-test-forwarder",
+        category: "test_only",
+        language: "rust",
+        glob: "crates/ctxmux-daemon/src/bin/fake-ssh.rs",
       },
       {
         id: "macos-process-statistics-leaf",

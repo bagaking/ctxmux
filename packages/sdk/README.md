@@ -110,6 +110,84 @@ that a particular Run, target, external tmux server, or caller plan is usable.
 `run.capabilities` remains the per-Run Backend truth, while Integration
 detection and materialization capabilities remain host-local Integration truth.
 
+## Activate a local Runtime
+
+Use `activateRuntime` (or its `connectOrActivate` alias) when the embedding
+application wants one explicit connect-or-spawn transaction. The helper accepts
+the daemon `executable`, a caller-owned Unix `socketPath`, and optional
+`stateDir`, `env`, `deadline`/`timeoutMs`, and `childDisposition` values. It
+never chooses a binary, downloads anything, edits global configuration, or
+falls back to SSH. `env` is an overlay copied for the child; it does not mutate
+`process.env`.
+
+```ts
+import {
+  activateRuntime,
+  CtxmuxActivationConflictError,
+  CtxmuxActivationError,
+} from "@ctxmux/sdk";
+
+const activation = await activateRuntime({
+  executable: "/opt/ctxmux/bin/ctxmuxd",
+  socketPath: "/tmp/my-product/ctxmux.sock",
+  stateDir: "/tmp/my-product/state",
+  env: { CTXMUX_LOG: "warn" },
+  timeoutMs: 30_000,
+  childDisposition: "detached",
+  requiredCapabilities: { "native.start": 1 },
+});
+
+const run = await activation.client.start({
+  program: "/bin/sh",
+  args: ["-c", "printf 'hello\\n'; sleep 30"],
+  cwd: null,
+  env: {},
+  size: { cols: 80, rows: 24 },
+  declared_inputs: [],
+});
+
+await activation.dispose(); // client-only: the daemon and Run remain alive
+```
+
+Activation first `lstat`s the target without following symlinks, probes an
+existing socket with the public generation-13 Hello, and reuses it only when
+the requested Runtime identity/build/capabilities match. An inactive Unix
+socket is treated as stale; the daemon performs its own identity-checked socket
+cleanup. If a launch is needed, the helper passes `--readiness-fd 3` and waits
+for the daemon's `ctxmux.daemon-ready.v1` record. It then requires the record's
+`daemon_instance` to equal the `daemonInstanceId` in a public Hello before
+returning. Concurrent launchers therefore converge on the Runtime that proves
+both conditions rather than relying on a delay.
+
+A launcher that fails is still followed by a search for the activator that won
+the socket path, because a loser must reuse the Runtime that beat it. That
+search reads the socket path as evidence: a path that exists but does not yet
+serve Hello means a winner is mid-handshake and keeps the caller's full
+deadline, while a path nothing has bound is bounded by a short grace window.
+A launcher that simply crashed is therefore reported as `launcher_exited` when
+the crash is observed rather than when the deadline expires, and a winner that
+binds inside that window is still found and reused.
+
+The returned `RuntimeActivation` exposes the selected `client`, immutable
+`runtime` identity, `spawned`, `childPid`, `socketPath`, and `disposed` state.
+`dispose()` only releases the SDK handle. The Node process may exit while the
+detached daemon owns its Runs; a later clean `CtxmuxClient` can reconnect and
+replay the same Run. Call `shutdown()` (or `dispose({ shutdown: true })`) only
+when this activation spawned the daemon. A reused activation cannot terminate
+an existing daemon, and shutdown removes a socket only after checking the
+proven device/inode identity and a final liveness probe.
+
+Failures are typed `CtxmuxActivationError` values. `CtxmuxActivationTargetError`
+reports an ordinary file, directory, symlink, permission boundary, or target
+race; `CtxmuxActivationConflictError` reports identity, build, capability,
+protocol, or probe conflicts; `CtxmuxActivationLaunchError` reports spawn and
+early-exit failures; and `CtxmuxActivationReadinessError` reports timeout,
+malformed/closed readiness, or readiness/Hello disagreement. These errors fail
+closed: an incompatible live endpoint is left running, and an ordinary file,
+symlink, stale replacement, or unrelated socket is never unlinked by the SDK.
+The helper owns only the child it started and has no credential, Electron,
+plugin-discovery, Provider, or remote-runtime policy.
+
 `start` and `fork` accept an optional caller-retained creation operation key.
 When a connection closes before its response is known, retry the exact request
 with that same key: while the Run is retained, ctxmux returns that Run's current

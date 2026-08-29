@@ -24,7 +24,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "test": "tsx --test test/index.test.ts test/integration.test.ts test/shell-integration.test.ts test/wrong-cases.test.ts test/parser-fuzz.test.ts",
-    "test:e2e": "tsx --test test/client-parity.test.ts test/remote-endpoint.test.ts",
+    "test:e2e": "tsx --test test/activation.test.ts test/client-parity.test.ts test/remote-endpoint.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   }
 }

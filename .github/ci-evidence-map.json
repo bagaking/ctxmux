@@ -1190,6 +1190,31 @@
       ]
     },
     {
+      "id": "runtime-activation-race-safety",
+      "kind": "test",
+      "path": "packages/sdk/test/activation.test.ts",
+      "invariants": [
+        "activation is connect-or-start: a live compatible Runtime is reused, and concurrent activators converge on exactly one public Runtime rather than racing to spawn a second",
+        "a requirement the target cannot satisfy fails closed before dispatch, and a live incompatible or permission-refused target is never terminated to make room",
+        "only a socket activation itself started is replaced, so a stale Unix socket is reclaimed through the daemon's guarded startup while ordinary files, directories, and symlinks are left untouched",
+        "a startup that times out, crashes, or reports a readiness instance disagreeing with Hello cleans up only what activation owned",
+        "a launcher that crashes with no concurrent winner is reported when the crash is observed rather than when the caller's deadline elapses",
+        "disposal is client-only: a consumer process exits cleanly while the Run its daemon owns survives"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/activation.test.ts",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "remote-endpoint-client-contracts",
       "kind": "test",
       "path": "packages/sdk/test/remote-endpoint.test.ts",
