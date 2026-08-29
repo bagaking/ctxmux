@@ -37,10 +37,15 @@ The value 128 preserves the already qualified 1/32/128 live-Run matrix while
 avoiding the false safety of reusing SQLite's historical 4,096-row format
 envelope. The existing 4 MiB per-Run retention contract therefore derives a
 512 MiB live memory-only `OutputLog` payload ceiling without another hot-path
-byte quota. Up to 128 live native Runs retain one reader descriptor each; the
-daemon-wide owner uses one 8 KiB stack buffer for each sequential ready read,
-not one permanent buffer or thread per Run. Persistent mode uses the same live
-bound while its 256 MiB durable SQLite
+byte quota. Up to 128 live native Runs retain three descriptors each, all of
+them referring to the same PTY master: the master itself in the control owner,
+one reader dup owned by the daemon-wide output reactor, and one writer dup from
+`take_writer`. The three are deliberately distinct owned descriptors so each is
+closed exactly once and the reactor can stop reading a Run without racing the
+control owner's close; the compaction step below sheds the master and writer at
+end of life. The daemon-wide owner uses one 8 KiB stack buffer for each
+sequential ready read, not one permanent buffer or thread per Run. Persistent
+mode uses the same live bound while its 256 MiB durable SQLite
 logical replay limit remains independently authoritative.
 
 A retained Run always owns its replay and lifecycle truth, but it does not
