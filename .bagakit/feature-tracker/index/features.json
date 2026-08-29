@@ -89,10 +89,10 @@
     {
       "feat_id": "f-22aczwza9",
       "title": "Run one bounded ctxmux peer-performance cycle",
-      "status": "ready",
-      "workspace_mode": "current_tree",
-      "branch": "",
-      "worktree_name": "",
+      "status": "in_progress",
+      "workspace_mode": "worktree",
+      "branch": "featf-22aczwza9",
+      "worktree_name": "wt-f-22aczwza9",
       "runtime_role": "standalone",
       "runtime_relations": []
     },

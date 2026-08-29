@@ -130,9 +130,20 @@
         "T-004"
       ],
       "introduced_in_revision": 3,
-      "status": "todo",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "status": "in_progress",
+      "gate_result": "fail",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 101,
+          "status": "fail"
+        },
+        {
+          "command": "scripts/check-reliability.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
       "notes": []
     },
     {

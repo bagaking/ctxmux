@@ -4,24 +4,35 @@
   "title": "Run one bounded ctxmux peer-performance cycle",
   "slug": "bounded-peer-performance-cycle",
   "goal": "Execute one pre-registered and budget-bounded performance cycle over genuinely comparable ctxmux, tmux, and Zellij workloads; preserve correctness and raw evidence, accept wins, ties, and losses honestly, and stop after the fixed cycle with the best valid result and an explicit next-cycle decision.",
-  "status": "ready",
-  "workspace_mode": "current_tree",
+  "status": "in_progress",
+  "workspace_mode": "worktree",
   "base_ref": "main",
-  "branch": "",
-  "worktree_name": "",
-  "worktree_path": "",
+  "branch": "featf-22aczwza9",
+  "worktree_name": "wt-f-22aczwza9",
+  "worktree_path": ".worktrees/wt-f-22aczwza9",
   "runtime_role": "standalone",
   "runtime_relations": [],
   "counters": {
-    "gate_fail_streak": 0,
-    "no_progress_rounds": 0,
-    "round_count": 0
+    "gate_fail_streak": 3,
+    "no_progress_rounds": 3,
+    "round_count": 3
   },
   "gate": {
-    "last_result": null,
-    "last_task_id": null,
-    "last_check_commands": [],
-    "last_log_path": null
+    "last_result": "fail",
+    "last_task_id": "T-005",
+    "last_check_commands": [
+      {
+        "command": "scripts/check.sh",
+        "exit_code": 101,
+        "status": "fail"
+      },
+      {
+        "command": "scripts/check-reliability.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22aczwza9/artifacts/gate-T-005-r3-0001.log"
   },
   "history": [
     {
@@ -59,6 +70,34 @@
     {
       "action": "task_plan_set",
       "detail": "revision=3; supersedes_revision=2"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_unstarted",
+      "detail": "T-005"
+    },
+    {
+      "action": "workspace_assigned",
+      "detail": "current_tree -> worktree; root_branch=main"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-005"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-005 => fail"
     }
   ],
   "goal_contract": {
