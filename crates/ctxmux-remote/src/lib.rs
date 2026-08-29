@@ -38,6 +38,23 @@
 //! Because remote reuses the same socket contract, the ordered-byte cursor,
 //! replay, truncation, and gap semantics are the local ones verbatim. There is
 //! no second recovery state machine to keep in agreement.
+//!
+//! # What the figures quoted below are, and are not
+//!
+//! Every millisecond figure in this crate's documentation came from
+//! `scripts/check-remote-cost.sh` on one developer machine (darwin/arm64, 14
+//! cpus) driving the stand-in forwarder, which performs no authentication, no
+//! crypto, and no network round trip. They are a floor for this crate's own
+//! overhead, not a prediction of any real client's, and a figure obtained there
+//! is not a claim about your host.
+//!
+//! They are quoted because a decision needs a reason a reader can re-derive,
+//! and each one names the stage that reproduces it. Treat them as the evidence
+//! for a *shape* — that a fixed poll dominated what it waited for, that
+//! per-tunnel cost does not climb with concurrency — and re-measure before
+//! treating any number as a budget. A real SSH boundary is measured only when
+//! `CTXMUX_REMOTE_SSH_DESTINATION` is set; absent it, the harness labels every
+//! figure as a stand-in one rather than presenting it as a real-client result.
 
 #[cfg(not(unix))]
 compile_error!("the ctxmux remote endpoint currently requires Unix sockets");
@@ -76,15 +93,17 @@ pub const DEFAULT_KEEPALIVE_COUNT_MAX: NonZeroU32 = NonZeroU32::new(3).unwrap();
 ///
 /// This is the *ceiling* of a backoff, not a fixed period. A fixed 50ms wait
 /// was measured to dominate what it was waiting for: the stand-in forward
-/// becomes usable at a 3.4ms median (60 samples), and reporting that at 50ms
-/// made 93% of the observed establishment latency an artifact of the poll rather
-/// than of any handshake. Backing off from [`READY_POLL_MIN`] reports the same
-/// readiness at 7ms while reaching this ceiling within a few attempts, so a slow
-/// real handshake still waits at this coarse interval instead of spinning.
+/// becomes usable at a 3.488ms median (30 samples), and reporting that at 50ms
+/// made 0.9302 of the observed establishment latency an artifact of the poll
+/// rather than of any handshake. Backing off from [`READY_POLL_MIN`] reports the
+/// same readiness at 7ms with a 0.5017 dead-time share, while reaching this
+/// ceiling within a few attempts, so a slow real handshake still waits at this
+/// coarse interval instead of spinning.
 ///
 /// Measure with `scripts/check-remote-cost.sh --stage establishment`; that
 /// harness reads this constant so its dead-time figure cannot describe an
-/// interval nothing polls at.
+/// interval nothing polls at. See [`self`] on what machine these figures
+/// describe — they justify the shape of the schedule, not a value to expect.
 const READY_POLL: Duration = Duration::from_millis(50);
 
 /// First readiness probe interval, doubled up to [`READY_POLL`].

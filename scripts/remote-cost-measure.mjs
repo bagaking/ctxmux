@@ -204,6 +204,61 @@ async function verifyPollSchedule() {
   };
 }
 
+/// The crate quotes this harness's figures; refuse to let them lose their lane.
+///
+/// A millisecond figure in the endpoint's documentation is only honest while it
+/// says which machine and which forwarder produced it. That caveat is prose, so
+/// nothing but a check keeps it alive: a later edit can delete the paragraph and
+/// leave the numbers reading like a budget any host should meet, which is
+/// exactly the claim this harness refuses to make in its own report. So the
+/// guard is symmetrical with `verifyPollSchedule` — that one keeps the harness
+/// honest about the endpoint, this one keeps the endpoint honest about the
+/// harness.
+///
+/// It deliberately checks for the caveat rather than for specific numbers.
+/// Pinning the values here would make every re-measurement a two-file edit and
+/// would tempt the next author to update the copy instead of the reasoning.
+/// The required phrases are plain substrings rather than patterns, so the checks
+/// stay readable and cannot be mistaken for paths by tooling that scans this
+/// file.
+async function verifyQuotedFiguresNameTheirLane() {
+  const path = "crates/ctxmux-remote/src/lib.rs";
+  const source = await import("node:fs/promises").then((fs) =>
+    fs.readFile(path, "utf8"),
+  );
+  // Only the crate-level docs make the promise; a figure inside an item's docs
+  // is covered by the same section, which is why it must exist at all.
+  const docs = source
+    .split("\n")
+    .filter((line) => line.startsWith("//!"))
+    .join("\n");
+  const quotesAFigure = /\b\d+\.\d+ms\b/u.test(docs) || /\b\d+ms\b/u.test(docs);
+  if (!quotesAFigure) {
+    // Nothing quoted, nothing to qualify. Not a failure: a crate that stops
+    // citing measurements does not owe a caveat about them.
+    return "no measured figure is quoted in the crate docs";
+  }
+  const required = [
+    ["the stand-in lane", "stand-in"],
+    ["the measuring platform", "darwin"],
+    ["the measuring architecture", "arm64"],
+    ["the harness that produced them", "check-remote-cost"],
+    ["that one machine's number is not a claim about another", "not a claim"],
+  ];
+  const missing = required
+    .filter(([, phrase]) => !docs.includes(phrase))
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(
+      `${path} quotes a measured figure but its crate docs no longer name ` +
+        `${missing.join(", ")}; a number that has lost its lane reads as a ` +
+        "budget every host should meet, which is a claim this harness refuses " +
+        "to make about a machine it never measured",
+    );
+  }
+  return "quoted figures still name their lane";
+}
+
 function startOwnerListener(socketPath) {
   return new Promise((resolve, reject) => {
     // Echo, so a throughput sample can observe a full round trip rather than
@@ -584,6 +639,10 @@ async function selfTest(forwarder) {
     const schedule = await verifyPollSchedule();
     return `READY_POLL_MIN=${schedule.first_ms}ms -> READY_POLL=${schedule.ceiling_ms}ms`;
   });
+  await expectSuccess(
+    "figures quoted by the endpoint still name their lane",
+    () => verifyQuotedFiguresNameTheirLane(),
+  );
 
   await expectFailure("a sample set below the floor is refused", () => {
     summarise([1, 2], "self-test");
