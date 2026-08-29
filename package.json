@@ -17,7 +17,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "npm run test:unit && npm run test:e2e",
-    "test:e2e": "cargo build --quiet --package ctxmux --package ctxmux-daemon && CTXMUX_BIN=\"$PWD/target/debug/ctxmux\" CTXMUXD_BIN=\"$PWD/target/debug/ctxmuxd\" npm run test:e2e --workspace @ctxmux/sdk",
+    "test:e2e": "cargo build --quiet --package ctxmux --package ctxmux-daemon && CTXMUX_BIN=\"$PWD/target/debug/ctxmux\" CTXMUXD_BIN=\"$PWD/target/debug/ctxmuxd\" CTXMUX_FAKE_SSH_BIN=\"$PWD/target/debug/fake-ssh\" npm run test:e2e --workspace @ctxmux/sdk",
     "test:local-consumer": "node scripts/check-local-consumer.mjs",
     "test:reliability": "scripts/check-reliability.sh",
     "test:seeded-qualification": "node scripts/run-seeded-qualification.mjs",
