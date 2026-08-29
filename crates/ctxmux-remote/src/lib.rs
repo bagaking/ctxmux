@@ -36,6 +36,7 @@ compile_error!("the ctxmux remote endpoint currently requires Unix sockets");
 use std::{
     ffi::{OsStr, OsString},
     fs, io,
+    num::NonZeroU32,
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -46,6 +47,21 @@ use tokio::{net::UnixStream, process::Child, time::Instant};
 
 /// Default ceiling for observing the forwarded socket accept a connection.
 pub const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default seconds of silence before the tunnel probes the owner host.
+///
+/// Ten seconds times [`DEFAULT_KEEPALIVE_COUNT_MAX`] bounds idle-death detection
+/// at the same thirty seconds as [`DEFAULT_READY_TIMEOUT`], so one number
+/// describes this crate's patience in both phases instead of introducing a
+/// second unrelated bound.
+pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: NonZeroU32 = NonZeroU32::new(10).unwrap();
+
+/// Default number of unanswered probes tolerated before the tunnel gives up.
+///
+/// This is OpenSSH's own `ServerAliveCountMax` default, so the tolerance for a
+/// briefly congested link keeps its familiar meaning rather than becoming a
+/// value a reader has to look up here.
+pub const DEFAULT_KEEPALIVE_COUNT_MAX: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 /// Interval between forwarded-socket readiness probes.
 const READY_POLL: Duration = Duration::from_millis(50);
@@ -135,6 +151,8 @@ pub struct RemoteEndpoint {
     ssh_program: OsString,
     extra_args: Vec<OsString>,
     ready_timeout: Duration,
+    keepalive_interval_secs: NonZeroU32,
+    keepalive_count_max: NonZeroU32,
 }
 
 impl RemoteEndpoint {
@@ -163,6 +181,8 @@ impl RemoteEndpoint {
             ssh_program: OsString::from("ssh"),
             extra_args: Vec::new(),
             ready_timeout: DEFAULT_READY_TIMEOUT,
+            keepalive_interval_secs: DEFAULT_KEEPALIVE_INTERVAL_SECS,
+            keepalive_count_max: DEFAULT_KEEPALIVE_COUNT_MAX,
         })
     }
 
@@ -195,6 +215,30 @@ impl RemoteEndpoint {
     #[must_use]
     pub fn with_ready_timeout(mut self, timeout: Duration) -> Self {
         self.ready_timeout = timeout;
+        self
+    }
+
+    /// Retune how quickly a dead idle link is detected.
+    ///
+    /// This is a typed setter rather than something a caller expresses through
+    /// [`Self::with_extra_args`], because it cannot be expressed there. The
+    /// keepalive options are fixed options, and OpenSSH resolves a repeated
+    /// option to its *first* occurrence, so a later caller value never wins —
+    /// in either direction. A command-line `-o` also outranks `~/.ssh/config`
+    /// unconditionally, so the config file cannot retune it either. Leaving only
+    /// argument order would therefore mean the crate's default were the single
+    /// possible policy, which is not a policy this crate can justify for every
+    /// link. Hence one narrow typed knob.
+    ///
+    /// `interval_secs` is the silence tolerated before a probe, and `count_max`
+    /// the unanswered probes tolerated before the tunnel exits, so detection is
+    /// bounded by their product. Both are [`NonZeroU32`] because zero means
+    /// "never probe" to OpenSSH: accepting it here would let a caller reopen the
+    /// silent-hang wrong-case through a setter whose name promises the opposite.
+    #[must_use]
+    pub fn with_keepalive(mut self, interval_secs: NonZeroU32, count_max: NonZeroU32) -> Self {
+        self.keepalive_interval_secs = interval_secs;
+        self.keepalive_count_max = count_max;
         self
     }
 }
@@ -446,6 +490,17 @@ fn create_tunnel_dir(parent: &Path) -> Result<PathBuf, RemoteEndpointError> {
 ///   caller gets a fast, explicit failure and can fix their SSH setup.
 /// - `-o ExitOnForwardFailure=yes` makes a refused forward fail the connection
 ///   instead of yielding a live session whose socket silently forwards nothing.
+/// - `-o ServerAliveInterval` and `-o ServerAliveCountMax` turn a dead idle link
+///   into an exit. OpenSSH ships `ServerAliveInterval=0`, meaning it never
+///   probes, so without these a NAT or firewall that silently drops an idle
+///   forward leaves ssh believing it is connected: the local socket stays bound,
+///   `connect` keeps succeeding, and bytes never arrive. The caller observes an
+///   indefinite hang rather than an error, which is the worst shape for a
+///   terminal that idles by nature. `TCPKeepAlive` is deliberately not set: it
+///   already defaults to `yes`, and it probes the TCP layer rather than the
+///   encrypted channel this forward actually rides on. Retune through
+///   [`RemoteEndpoint::with_keepalive`], which explains why caller arguments
+///   cannot express this.
 ///
 /// Caller arguments are appended after these, then the destination last, so a
 /// caller can still add options while the destination cannot be mistaken for
@@ -462,6 +517,16 @@ fn tunnel_args(endpoint: &RemoteEndpoint, local_socket: &Path) -> Vec<OsString> 
         OsString::from("BatchMode=yes"),
         OsString::from("-o"),
         OsString::from("ExitOnForwardFailure=yes"),
+        OsString::from("-o"),
+        OsString::from(format!(
+            "ServerAliveInterval={}",
+            endpoint.keepalive_interval_secs
+        )),
+        OsString::from("-o"),
+        OsString::from(format!(
+            "ServerAliveCountMax={}",
+            endpoint.keepalive_count_max
+        )),
         OsString::from("-L"),
         forward,
     ];
@@ -567,10 +632,11 @@ fn validate_remote_socket(path: &Path) -> Result<(), RemoteEndpointError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        RemoteEndpoint, RemoteEndpointError, create_tunnel_dir, kill_tunnel_group, spawn_tunnel,
-        tunnel_args, validate_destination, validate_remote_socket,
+        DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_READY_TIMEOUT, RemoteEndpoint,
+        RemoteEndpointError, create_tunnel_dir, kill_tunnel_group, spawn_tunnel, tunnel_args,
+        validate_destination, validate_remote_socket,
     };
-    use std::{ffi::OsString, path::Path};
+    use std::{ffi::OsString, num::NonZeroU32, path::Path};
 
     fn endpoint() -> RemoteEndpoint {
         RemoteEndpoint::new("owner-host", "/run/ctxmux/ctxmux.sock").expect("valid endpoint")
@@ -599,7 +665,14 @@ mod tests {
         // which is exactly the regression that reopens the interactive stall and
         // the inert-forward wrong-cases, so assert the index relationship.
         let args = tunnel_args(
-            &endpoint().with_extra_args(["-o", "BatchMode=no", "-o", "ExitOnForwardFailure=no"]),
+            &endpoint().with_extra_args([
+                "-o",
+                "BatchMode=no",
+                "-o",
+                "ExitOnForwardFailure=no",
+                "-o",
+                "ServerAliveInterval=0",
+            ]),
             Path::new("/tmp/private/owner-host.sock"),
         );
         let first = |needle: &str| {
@@ -609,11 +682,17 @@ mod tests {
         };
         let fixed_batch_mode = first("BatchMode=yes");
         let fixed_forward_failure = first("ExitOnForwardFailure=yes");
+        let fixed_keepalive = first(&format!(
+            "ServerAliveInterval={DEFAULT_KEEPALIVE_INTERVAL_SECS}"
+        ));
         assert!(args.contains(&OsString::from("-N")));
         assert!(args.contains(&OsString::from("-T")));
         // Each fixed value must be reached before the caller's contrary value.
         let caller_batch_mode = first("BatchMode=no");
         let caller_forward_failure = first("ExitOnForwardFailure=no");
+        // `ServerAliveInterval=0` is OpenSSH's "never probe" value, so a caller
+        // reaching it first would silently restore the indefinite-hang case.
+        let caller_keepalive = first("ServerAliveInterval=0");
         assert!(
             fixed_batch_mode < caller_batch_mode,
             "fixed BatchMode=yes must precede a caller's BatchMode=no to win"
@@ -622,11 +701,87 @@ mod tests {
             fixed_forward_failure < caller_forward_failure,
             "fixed ExitOnForwardFailure=yes must precede a caller's contrary value"
         );
-        // And no caller argument may be reached before any fixed option at all.
-        let first_caller = caller_batch_mode.min(caller_forward_failure);
         assert!(
-            fixed_batch_mode.max(fixed_forward_failure) < first_caller,
+            fixed_keepalive < caller_keepalive,
+            "fixed ServerAliveInterval must precede a caller's ServerAliveInterval=0, \
+             or an idle tunnel silently returns to hanging instead of exiting"
+        );
+        // And no caller argument may be reached before any fixed option at all.
+        let first_caller = caller_batch_mode
+            .min(caller_forward_failure)
+            .min(caller_keepalive);
+        assert!(
+            fixed_batch_mode
+                .max(fixed_forward_failure)
+                .max(fixed_keepalive)
+                < first_caller,
             "every fixed option must precede the caller's argument list"
+        );
+    }
+
+    /// A dead idle link must become an exit, and only a probe can make it one.
+    ///
+    /// OpenSSH ships `ServerAliveInterval=0`, so the absence of these options is
+    /// not a milder default — it is detection switched off entirely. This asserts
+    /// both names carry usable values and that their product is a bounded
+    /// detection window, because an interval with no count bound (or the reverse)
+    /// would leave the wrong-case only half closed.
+    #[test]
+    fn an_idle_tunnel_probes_so_a_dead_link_ends_it() {
+        let args = tunnel_args(&endpoint(), Path::new("/tmp/private/owner-host.sock"));
+        let value_of = |key: &str| -> u32 {
+            args.iter()
+                .find_map(|arg| {
+                    arg.to_str()
+                        .and_then(|text| text.strip_prefix(&format!("{key}=")))
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap_or_else(|| panic!("{key} must be set to a parsable value"))
+        };
+        let interval = value_of("ServerAliveInterval");
+        let count_max = value_of("ServerAliveCountMax");
+        assert_ne!(
+            interval, 0,
+            "ServerAliveInterval=0 is OpenSSH's never-probe value, which is the \
+             indefinite-hang wrong-case this option exists to close"
+        );
+        assert_ne!(count_max, 0, "a zero probe budget cannot end a dead link");
+        // Detection must be bounded by the same patience the readiness phase
+        // uses, so one number describes this crate's tolerance throughout.
+        assert_eq!(
+            u64::from(interval) * u64::from(count_max),
+            DEFAULT_READY_TIMEOUT.as_secs(),
+            "idle detection must be bounded by the same window as readiness"
+        );
+    }
+
+    /// The knob exists because caller arguments provably cannot reach this.
+    ///
+    /// A retuned value must still occupy the fixed position: were it appended
+    /// instead, the crate's own default would precede it and win, so the setter
+    /// would silently do nothing.
+    #[test]
+    fn a_retuned_keepalive_replaces_the_default_in_place() {
+        let interval = NonZeroU32::new(5).expect("nonzero");
+        let count_max = NonZeroU32::new(2).expect("nonzero");
+        let args = tunnel_args(
+            &endpoint().with_keepalive(interval, count_max),
+            Path::new("/tmp/private/owner-host.sock"),
+        );
+        assert!(
+            args.contains(&OsString::from("ServerAliveInterval=5")),
+            "the retuned interval must appear in the invocation"
+        );
+        assert!(
+            args.contains(&OsString::from("ServerAliveCountMax=2")),
+            "the retuned probe budget must appear in the invocation"
+        );
+        assert!(
+            !args.contains(&OsString::from(format!(
+                "ServerAliveInterval={DEFAULT_KEEPALIVE_INTERVAL_SECS}"
+            ))),
+            "the default must be replaced rather than joined by the retuned value, \
+             since OpenSSH would resolve the repeated option to whichever came first"
         );
     }
 
