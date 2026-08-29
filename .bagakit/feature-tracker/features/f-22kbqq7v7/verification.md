@@ -4,7 +4,7 @@
 - Command: `cargo fmt --all -- --check`; `npm run format:check`; `cargo check --workspace --all-targets`; `cargo test -p ctxmux-protocol`; `cargo test -p ctxmux-daemon`; `cargo test -p ctxmux-client -p ctxmux --all-targets --no-fail-fast`; `npm test`; `npm run typecheck`; `npm run build`; `scripts/check-protocol-types.sh`; `scripts/smoke-cli.sh`
 - Result: All commands passed. The protocol suite executed 19 unit tests plus one seeded fuzz test; daemon, client, SDK unit, and end-to-end suites all reported non-zero passing counts. The SDK suite reported 59 passing tests, including malformed base64/range checks and raw-byte queue accounting.
 - Command: `scripts/check-reliability.sh --profile smoke`
-- Result: The pre-commit attempt reached the workload and SDK stages but the provenance policy correctly rejected the dirty source tree. A clean committed-source qualification is required and is run after the implementation commit; the frozen budget file is unchanged.
+- Result: Passed from a clean committed source with source-bound v3 evidence. Idle and active resource cells stayed within the frozen budgets; the policy and receipt both passed.
 
 ## Manual Checks
 - Step: Temporarily serialize `OutputChunk` with JSON integer-array bytes and run the exact generation-14 Rust wire-shape test.
@@ -19,4 +19,4 @@
 - Outcome: `output_chunk_bytes` and `decodeOutputBytes` are private owner helpers; no uncalled public export was added. `attachment.ts` continues to use decoded `chunk.data.length`.
 
 ## Residual Risks
-- Reliability provenance and the local-consumer artifact audit require a clean committed source tree; they are deliberately run after the final implementation commit rather than against a dirty worktree. No reliability budget values were changed.
+- The measured qualification is the smoke profile; nightly/release duration and other platforms remain separate evidence. No reliability budget values were changed.
