@@ -1217,6 +1217,27 @@
       ]
     },
     {
+      "id": "remote-tunnel-cost-harness",
+      "kind": "contract_check",
+      "path": "scripts/check-remote-cost.sh",
+      "invariants": [
+        "the tunnel cost harness refuses a sample set, timing source, or forwarder it cannot measure instead of reporting a silent zero",
+        "the readiness-poll dead time it reports stays tied to the interval the endpoint actually polls at"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "scripts/check-remote-cost.sh --self-test",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "public-reliability-smoke",
       "kind": "public_smoke",
       "path": "scripts/check-reliability.sh",
