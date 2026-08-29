@@ -32,7 +32,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
 const CANONICAL_RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-/** A daemon frame failed the runtime half of the generation-13 wire contract. */
+/** A daemon frame failed the runtime half of the generation-14 wire contract. */
 export class CtxmuxInvalidFrameError extends TypeError {
   public readonly path: string;
 
@@ -217,7 +217,7 @@ function nonEmptyString(value: unknown, path: string): string {
   return result;
 }
 
-/** Reject a generation-13 u64 before JavaScript can round a replay cursor. */
+/** Reject a generation-14 u64 before JavaScript can round a replay cursor. */
 export function validateCursor(value: number, path: string): void {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, "a non-negative safe integer cursor");
@@ -532,16 +532,40 @@ function outputChunk(value: unknown, path: string): void {
   const chunk = record(value, path);
   validateCursorValue(chunk.start_byte, `${path}.start_byte`);
   validateCursorValue(chunk.end_byte, `${path}.end_byte`);
-  const data = array(chunk.data, `${path}.data`);
-  data.forEach((byte, index) =>
-    unsignedInteger(byte, `${path}.data[${index}]`, 0xff),
-  );
+  const data = decodeOutputBytes(chunk.data, `${path}.data`);
   if (
     (chunk.end_byte as number) <= (chunk.start_byte as number) ||
     (chunk.end_byte as number) - (chunk.start_byte as number) !== data.length
   ) {
     throw invalid(path, "a non-empty byte range matching data length");
   }
+  chunk.data = data;
+}
+
+const PADDED_BASE64 =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const BASE64_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function decodeOutputBytes(value: unknown, path: string): Uint8Array {
+  if (value instanceof Uint8Array) {
+    return value;
+  }
+  const encoded = string(value, path);
+  if (!PADDED_BASE64.test(encoded)) {
+    throw invalid(path, "a canonical padded base64 string");
+  }
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  if (padding > 0) {
+    const symbol = encoded.charCodeAt(encoded.length - padding - 1);
+    const value = BASE64_ALPHABET.indexOf(String.fromCharCode(symbol));
+    const unusedBits = padding === 2 ? 4 : 2;
+    if (value < 0 || (value & ((1 << unusedBits) - 1)) !== 0) {
+      throw invalid(path, "a canonical padded base64 string");
+    }
+  }
+  const decoded = Buffer.from(encoded, "base64");
+  return new Uint8Array(decoded.buffer, decoded.byteOffset, decoded.byteLength);
 }
 
 function attachmentCommandId(value: unknown, path: string): void {

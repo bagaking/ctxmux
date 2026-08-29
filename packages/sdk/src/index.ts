@@ -92,7 +92,6 @@ export type { Request } from "./generated/Request.js";
 export type { Response } from "./generated/Response.js";
 export type { RunBackend } from "./generated/RunBackend.js";
 export type { RunCapabilities } from "./generated/RunCapabilities.js";
-export type { RunEvent } from "./generated/RunEvent.js";
 export type { RunId } from "./generated/RunId.js";
 export type { RunInfo } from "./generated/RunInfo.js";
 export type { RunInputKind } from "./generated/RunInputKind.js";
@@ -105,9 +104,10 @@ export type { RuntimeId } from "./generated/RuntimeId.js";
 export type { RuntimeIdPersistence } from "./generated/RuntimeIdPersistence.js";
 export type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 export type { RunSignal } from "./generated/RunSignal.js";
+export type { RunEvent } from "./generated/RunEvent.js";
+export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { StopDisposition } from "./generated/StopDisposition.js";
 export type { StopOperationKey } from "./generated/StopOperationKey.js";
-export type { ServerFrame } from "./generated/ServerFrame.js";
 export type { TerminalSize } from "./generated/TerminalSize.js";
 export type { TmuxPaneInfo } from "./generated/TmuxPaneInfo.js";
 export type { TmuxRunEvent } from "./generated/TmuxRunEvent.js";
@@ -132,7 +132,7 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 13. */
+/** Fill the portable defaults required by protocol generation 14. */
 export function defineRun(
   program: string,
   options: {
