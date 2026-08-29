@@ -186,6 +186,49 @@ impl TestDaemon {
         Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
     }
 
+    /// Start a memory-only daemon whose `RLIMIT_NOFILE` soft limit is clamped to
+    /// `fd_limit` before exec, so a connection flood drives a real `EMFILE` on
+    /// the daemon's `accept(2)`. Stderr is piped (as in `start_persistent`) so
+    /// the transient-accept log line can be scanned. The `sh` wrapper mirrors
+    /// the other inherited-fd fixtures: positional args feed `ulimit` before
+    /// `exec`.
+    async fn start_memory_only_with_fd_limit(fd_limit: u64) -> Self {
+        let _permit = daemon_spawn_permit().await;
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
+        let socket = directory.path().join("ctxmux.sock");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n \"$1\"; shift; exec \"$@\"")
+            .arg("ctxmux-fd-limit-fixture")
+            .arg(fd_limit.to_string())
+            .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn fd-limited ctxmuxd");
+
+        let stderr = child.stderr.take().expect("fd-limited daemon exposes stderr");
+        let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+        let drain = Arc::clone(&stderr_lines);
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        eprintln!("[ctxmuxd stderr] {line}");
+                        drain.lock().expect("stderr buffer lock").push(line);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+    }
+
     async fn from_spawned_with_stderr(
         child: Child,
         directory: Arc<TempDir>,
@@ -4494,4 +4537,64 @@ async fn upgrade_preserves_output_across_the_reader_window() {
         },
         "the re-adopted run should exit through its own quit path"
     );
+}
+
+/// A transient `accept(2)` failure (here a real `EMFILE` from an exhausted
+/// descriptor table) must not kill the daemon: it should log, back off, and keep
+/// serving every Run it owns — the same resilience the spawn path already has
+/// when `openpty` hits the descriptor ceiling. Regression guard for the accept
+/// loop that used to propagate any accept error into process exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_survives_transient_accept_failure_and_keeps_serving() {
+    // Boot headroom (15 resting fds) plus a small ceiling so a modest connection
+    // flood exhausts the daemon's descriptor table on accept.
+    let mut daemon = TestDaemon::start_memory_only_with_fd_limit(24).await;
+    daemon
+        .client
+        .ping()
+        .await
+        .expect("fd-limited daemon serves before the flood");
+
+    // Hold many connections open concurrently. The daemon accepts until its
+    // descriptor table is full, then every further accept returns EMFILE while
+    // the socket stays readable — the hot-spin condition the backoff defends.
+    let socket = daemon.client.socket_path().to_path_buf();
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        // A connect may be refused once the daemon's table is full; that is
+        // expected mid-flood. The point is to keep its accept under pressure.
+        if let Ok(stream) = UnixStream::connect(&socket).await {
+            held.push(stream);
+        }
+    }
+
+    // Prove the daemon hit the transient path rather than exiting.
+    daemon
+        .wait_stderr_line(
+            "transient accept error",
+            10,
+            "daemon should log a transient accept failure under the flood",
+        )
+        .await;
+    assert!(
+        daemon
+            .child
+            .try_wait()
+            .expect("poll fd-limited daemon")
+            .is_none(),
+        "daemon must survive the transient accept failure"
+    );
+
+    // Release the descriptor pressure and prove it resumes serving.
+    drop(held);
+    timeout(scaled(Duration::from_secs(5)), async {
+        loop {
+            if daemon.client.ping().await.is_ok() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("daemon serves again once descriptors free");
 }
