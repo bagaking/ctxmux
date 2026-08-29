@@ -43,6 +43,29 @@ pub const RUNTIME_CAPABILITY_PERSISTENT_STATE: &str = "services.persistent_state
 pub const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY: &str =
     "services.planned_exec_upgrade_continuity";
 
+/// Owner-host endpoint contract implemented by this client library.
+///
+/// This is a **client-side** fact, deliberately not a daemon capability and not a
+/// wire field. A daemon reached through a forwarded socket observes an ordinary
+/// local connection and cannot tell it apart from a same-machine client, so it
+/// has no basis for advertising anything about the caller's network position.
+/// The side that forwards is the local side, and this constant is what that side
+/// publishes about itself.
+///
+/// A consumer therefore probes two separately owned facts:
+///
+/// - this constant, for the endpoint contract the linked client implements;
+/// - the ordinary [`RuntimeIdentity::capabilities`] record, for what the
+///   owner-host daemon can actually do, enforced byte-exactly and fail-closed
+///   before any business frame.
+///
+/// It names the argument shape, readiness rule, reachability semantics, and
+/// teardown guarantees of that contract. It does not promise that a host is
+/// reachable, that credentials work, that a daemon is listening, or that a Run is
+/// controllable; those remain typed runtime failures rather than capability
+/// answers.
+pub const REMOTE_ENDPOINT_CONTRACT_VERSION: u32 = 1;
+
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -1571,7 +1594,7 @@ mod tests {
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
         MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION,
         MAX_STOP_OPERATION_KEY_BYTES, OutputChunk, PROTOCOL_VERSION, ProtocolError,
-        RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+        REMOTE_ENDPOINT_CONTRACT_VERSION, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
         RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
         RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
@@ -1580,6 +1603,16 @@ mod tests {
         RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey, TerminalSize,
         decode_frame, encode_frame,
     };
+
+    /// The endpoint contract version is a client-side fact with a stable value.
+    ///
+    /// Pinned so a bump is a deliberate edit rather than silent drift. Consumers
+    /// compare this value, and the generated TypeScript constant is checked
+    /// against it by `scripts/check-protocol-types.sh`.
+    #[test]
+    fn remote_endpoint_contract_version_is_one() {
+        assert_eq!(REMOTE_ENDPOINT_CONTRACT_VERSION, 1);
+    }
 
     fn sample_run_info() -> RunInfo {
         RunInfo {

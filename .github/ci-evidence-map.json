@@ -1190,6 +1190,28 @@
       ]
     },
     {
+      "id": "remote-endpoint-client-contracts",
+      "kind": "test",
+      "path": "packages/sdk/test/remote-endpoint.test.ts",
+      "invariants": [
+        "the TypeScript SDK reaches an owner-host Runtime through a forwarded socket and observes the byte-exact identity a direct caller observes, with no SDK change",
+        "the owner-host daemon advertises no capability describing the caller's network position, so the endpoint contract is a client-side exported constant instead",
+        "capability enforcement stays fail-closed before dispatch through a forwarded socket, while a satisfiable requirement still dispatches"
+      ],
+      "selection_ref": "packages/sdk/package.json",
+      "selection_anchor": "test/remote-endpoint.test.ts",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "remote-endpoint-argument-and-permission-contract",
       "kind": "test",
       "path": "crates/ctxmux-remote/src/lib.rs",
