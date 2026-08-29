@@ -179,7 +179,7 @@
     {
       "feat_id": "f-22kbqq7v7",
       "title": "Replace PTY output integer arrays with generation-14 base64",
-      "status": "done",
+      "status": "archived",
       "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",

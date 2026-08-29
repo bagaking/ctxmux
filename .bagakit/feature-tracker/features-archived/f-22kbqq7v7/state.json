@@ -4,7 +4,7 @@
   "title": "Replace PTY output integer arrays with generation-14 base64",
   "slug": "output-binary-encoding",
   "goal": "Carry PTY output as canonical padded base64 on the generation-14 JSON wire while exposing decoded bytes to SDK callers and preserving raw-byte replay, accounting, and frozen reliability budgets.",
-  "status": "done",
+  "status": "archived",
   "workspace_mode": "current_tree",
   "base_ref": "main",
   "branch": "",
@@ -75,6 +75,11 @@
     {
       "action": "task_finished",
       "detail": "T-001 => done"
+    },
+    {
+      "action": "feat_archived",
+      "detail": "tracker metadata closed; Git workspace unchanged"
     }
-  ]
+  ],
+  "closed_from_status": "done"
 }
