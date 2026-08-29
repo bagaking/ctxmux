@@ -1188,11 +1188,60 @@
           "platforms": ["ubuntu-24.04"]
         }
       ]
+    },
+    {
+      "id": "remote-endpoint-argument-and-permission-contract",
+      "kind": "test",
+      "path": "crates/ctxmux-remote/src/lib.rs",
+      "invariants": [
+        "the owner-host forward refuses interactive prompting and silent forward failure, keeps the destination unable to be read as an option, and creates its local socket directory owner-only"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
+      "id": "remote-owner-host-endpoint",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+      "invariants": [
+        "a forwarded socket reaches the same owner-host Runtime and its Run, and a missing owner-host listener fails closed without provisioning one",
+        "transport loss publishes no lifecycle transition: the remote child keeps running with the same pid and reconnect binds the exact Runtime and Run",
+        "output written while the caller was disconnected replays from that caller's own byte cursor through the unchanged local replay contract",
+        "explicit shutdown and guard drop both remove the forwarded socket and its private directory"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
     }
   ],
   "non_required_evidence": {
     "skipped": [],
-    "ignored": [],
+    "ignored": [
+      {
+        "id": "remote-real-openssh-vertical",
+        "path": "crates/ctxmux-daemon/tests/remote_real_openssh.rs",
+        "reason": "Carries the owner-host vertical over the real system ssh client, which needs an SSH boundary to an owner host that a PR runner does not have. Driven by scripts/check-remote-runtime.sh --stage partition, which fails rather than skips when that boundary is absent, so remote cannot be reported as qualified by a run that never spoke SSH. The stand-in supervision lane in remote_owner_host_endpoint.rs remains required PR evidence."
+      }
+    ],
     "conditional": [],
     "schedule_only": [
       {

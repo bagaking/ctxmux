@@ -269,10 +269,15 @@ export async function buildLocalArtifacts({
         "build",
         "--locked",
         "--release",
-        "--package",
+        // Name the shipped binaries rather than their packages. `--package`
+        // builds every bin the package declares, which includes the test-only
+        // forwarder stand-in in ctxmux-daemon. Selecting binaries keeps a test
+        // binary out of a release build by construction instead of relying on
+        // the copy allowlist below to exclude it afterwards.
+        "--bin",
         "ctxmux",
-        "--package",
-        "ctxmux-daemon",
+        "--bin",
+        "ctxmuxd",
       ],
       { cwd: resolvedRoot, environment },
     );

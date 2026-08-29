@@ -7,10 +7,21 @@ rust-version.workspace = true
 repository.workspace = true
 license.workspace = true
 publish = false
+default-run = "ctxmuxd"
 
 [[bin]]
 name = "ctxmuxd"
 path = "src/main.rs"
+
+# Test-only stand-in for the system ssh client, needed by the remote-endpoint
+# test lane. It must stay an ordinary bin of this crate: CARGO_BIN_EXE_fake-ssh
+# is defined only for test targets of the crate declaring it, and gating it
+# behind required-features makes the test compile and then fail at runtime with
+# no binary. Release artifacts are bounded by the packaging allowlist in
+# scripts/build-local-artifacts.mjs, which copies only ctxmux and ctxmuxd.
+[[bin]]
+name = "fake-ssh"
+path = "src/bin/fake-ssh.rs"
 
 [dependencies]
 base64.workspace = true
@@ -40,6 +51,7 @@ workspace = true
 
 [dev-dependencies]
 ctxmux-client = { path = "../ctxmux-client" }
+ctxmux-remote = { path = "../ctxmux-remote" }
 ctxmux-test-support = { path = "../ctxmux-test-support" }
 serde_json.workspace = true
 tempfile.workspace = true

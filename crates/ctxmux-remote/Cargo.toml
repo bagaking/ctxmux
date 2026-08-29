@@ -1,0 +1,26 @@
+[package]
+name = "ctxmux-remote"
+description = "Owner-host endpoint that maps a remote ctxmuxd socket to a local one through the system OpenSSH client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# Signalling the tunnel's whole process group without unsafe code; the workspace
+# forbids unsafe, and this crate must reach ssh's ControlMaster/ProxyCommand
+# helpers rather than only its direct child.
+rustix = { workspace = true }
+thiserror.workspace = true
+# The workspace tokio features do not include `process`; supervising the system
+# ssh client is the only place that needs it, so it is enabled here rather than
+# widened for every crate.
+tokio = { workspace = true, features = ["process"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
