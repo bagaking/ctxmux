@@ -85,7 +85,7 @@ network blip must not be indistinguishable from an exit.
 
 ### Fixed `ssh` options
 
-Four options are fixed rather than left to the caller:
+Six options are fixed rather than left to the caller:
 
 - `-N` and `-T`, because this connection exists only to carry a forward.
 - `-o BatchMode=yes`, because without it a missing credential turns a
@@ -93,6 +93,14 @@ Four options are fixed rather than left to the caller:
   a fast explicit failure and can repair their own SSH setup.
 - `-o ExitOnForwardFailure=yes`, because without it `ssh` can hold a live session
   whose forwarded socket carries nothing — a socket that looks usable and is not.
+- `-o ServerAliveInterval` and `-o ServerAliveCountMax`, because OpenSSH ships
+  `ServerAliveInterval=0`. That default is not a milder setting; it is idle-death
+  detection switched off, so a link that dies while quiet leaves the tunnel alive
+  and the caller waiting on a socket nothing will ever answer. Their product is
+  the same window as the readiness timeout, so one number describes this crate's
+  patience in both phases. Both are retunable through the endpoint builder rather
+  than only through `extra_args`, so a caller on a slow link changes the value in
+  place instead of appending a second one that would lose to the first.
 
 Caller arguments are appended after these, and the destination is passed last so
 it cannot be parsed as an option. A destination beginning with `-` is refused
@@ -105,6 +113,30 @@ the fixed value instead of overriding it. Extending `extra_args` ahead of the
 fixed list would silently reopen both the interactive-stall and inert-forward
 wrong-cases, so the unit test asserts the index relationship against a caller
 supplying contrary values, not mere membership.
+
+### No connection cache
+
+There is no connection pool, multiplexing cache, or reuse layer here, and that
+absence is a measured decision rather than an omission. Per-tunnel establishment
+_falls_ as concurrency widens — a 4.165ms median at one concurrent tunnel against
+0.908ms at eight — so there is no per-tunnel cost in this crate's own path for a
+cache to remove. Adding one would introduce a lifetime, an eviction rule, and a
+second teardown owner in exchange for nothing the measurement can show.
+
+What reuse would genuinely save is the TCP and cryptographic handshake, which
+this crate never performs. OpenSSH already implements exactly that as
+`ControlMaster`, `ControlPath`, and `ControlPersist`. So the fixed option list
+names none of the three, which is what keeps a caller's `~/.ssh/config` or
+`with_extra_args` choice authoritative: because a repeated option resolves to its
+first occurrence, pinning any of them here would convert a caller's decision into
+one it could no longer change. A test asserts that absence, so the delegation
+cannot be closed off by a later edit that means well.
+
+The figures come from `scripts/check-remote-cost.sh --stage fanout` on one
+developer machine driving a stand-in forwarder with no crypto or network. They
+are a floor for this crate's overhead, not a prediction for a real link — which
+is the second reason to delegate: the party who can weigh a handshake is the one
+whose link can be measured, and that is the caller's, not this crate's.
 
 ### No provisioning
 
@@ -122,6 +154,15 @@ another machine.
   proven by the Hello exchange the dispatch connection performs immediately
   after, which is where a dead owner fails closed. Readiness bounds the endpoint;
   it does not attest the far side.
+- The readiness probe backs off rather than polling on a fixed period, because a
+  fixed interval decides the reported latency instead of observing it: a 50ms poll
+  reported a 3.488ms median readiness at 50ms, making 0.9302 of the observed
+  establishment latency an artifact of the poll. Doubling from 1ms to the same
+  ceiling reports it at 7ms while still reaching that coarse ceiling within a few
+  attempts, so a slow real handshake waits cheaply and the attempt count stays
+  bounded — 605 to exhaust the 30s default against 600 for a fixed interval. The
+  cost harness reads the endpoint's own constants, so a dead-time figure cannot
+  describe a schedule nothing polls on.
 - The forwarded socket lives in an owner-only directory and is removed with its
   tunnel, including on abnormal client exit.
 - An unobservable tunnel process is never reported as a healthy one.
@@ -199,6 +240,31 @@ model exists to prevent.
   asserts a real client accepts that shape, but the script restates the list
   rather than calling the builder, so the two can drift together. See the
   qualification boundary.
+- **A dead idle link that never becomes an error.** OpenSSH ships
+  `ServerAliveInterval=0`, so a tunnel whose peer disappears while the link is
+  quiet stays alive locally: the socket keeps accepting, and the caller waits on
+  an answer that will never come. Nothing else closes this — `TCPKeepAlive` is
+  already `yes` by default and did not close it, because it detects a broken
+  connection rather than an unresponsive peer. _Disposition: active_ — bounded
+  probing is fixed ahead of caller arguments, and a test asserts both names carry
+  usable values, that a caller's `ServerAliveInterval=0` loses to the fixed value,
+  and that the product is a bounded detection window rather than one half of the
+  pair being set alone.
+- **A reported latency that is really the poll's.** A readiness poll coarser than
+  what it waits for makes its own interval the answer: at a fixed 50ms it reported
+  0.9302 of establishment latency as poll artifact. That is a measurement defect
+  rather than a runtime one, but it misleads exactly when someone is deciding
+  whether the transport is fast enough. _Disposition: active_ — the probe backs
+  off, and the cost harness reads the endpoint's poll constants so a reported
+  dead time cannot describe a schedule nothing runs.
+- **A quoted figure that has lost its lane.** A millisecond number in the crate's
+  documentation reads as a budget every host should meet, though it was obtained
+  on one developer machine against a forwarder with no crypto or network.
+  _Disposition: active_ — the harness fails when the crate quotes a figure while
+  dropping the caveat naming the stand-in lane, the measuring platform, the
+  harness, and that one machine's number is not a claim about another. The guard
+  checks for the caveat rather than the values, so re-measuring stays a one-file
+  edit.
 - **A reused local socket path resolving to a different Runtime.** A stale path
   could reach an unrelated daemon. _Disposition: covered_ — the existing
   exact-identity comparison on the dispatch connection rejects it before any
@@ -206,23 +272,27 @@ model exists to prevent.
 
 ## Fixture mapping
 
-| Case                                                       | Evidence                                                                                                                                                                                       |
-| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| forward reaches the same Runtime                           | `crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs`                                                                                                                                     |
-| transport loss is not lifecycle truth                      | same, `losing_the_tunnel_is_not_lifecycle_truth`                                                                                                                                               |
-| cursor replay across a partition                           | same, `output_written_while_disconnected_replays_from_the_caller_cursor`                                                                                                                       |
-| missing owner-host listener fails closed                   | same, `a_missing_owner_host_listener_fails_closed` — asserts refusal on first use plus that nothing was provisioned, which is where a `-L` forward actually fails closed                       |
-| socket, directory, and process cleanup                     | same, `shutdown_removes_the_socket_directory_and_process` and `dropping_the_guard_cleans_up`                                                                                                   |
-| exact-identity selection fails closed through a tunnel     | same, `a_tunnel_to_another_runtime_fails_closed_before_dispatch`                                                                                                                               |
-| teardown reaches the helpers, not just the direct child    | `crates/ctxmux-remote/src/lib.rs`, `the_tunnel_child_leads_a_group_that_teardown_reaches` — drives a real background helper, since no argument list can show a process group                   |
-| real system OpenSSH carries the vertical, including replay | `crates/ctxmux-daemon/tests/remote_real_openssh.rs`, `real_openssh_carries_the_owner_host_vertical` — qualified against a real owner host; the lane fails rather than skips without a boundary |
-| owner Stop settlement survives losing the tunnel           | same, `real_openssh_stop_receipt_survives_tunnel_loss`                                                                                                                                         |
-| a replaced daemon incarnation is refused, not adopted      | same, `real_openssh_rejects_a_replaced_daemon_instance` — restarts the real owner daemon rather than forging an identity                                                                       |
-| eviction during an outage is reported as truncation        | same, `real_openssh_reports_truncation_after_outage_eviction`                                                                                                                                  |
-| version skew is refused in both directions                 | same, `real_openssh_rejects_bidirectional_build_skew` — two genuinely distinct builds, each rejecting the other                                                                                |
-| argument, permission, and validation contract              | `crates/ctxmux-remote/src/lib.rs` unit tests                                                                                                                                                   |
-| production arguments accepted by real `ssh`                | `scripts/check-remote-runtime.sh --stage supervision`                                                                                                                                          |
-| the TypeScript SDK reaches the owner host unchanged        | `packages/sdk/test/remote-endpoint.test.ts`, driven by `--stage capability`                                                                                                                    |
+| Case                                                       | Evidence                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| forward reaches the same Runtime                           | `crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs`                                                                                                                                                                                                              |
+| transport loss is not lifecycle truth                      | same, `losing_the_tunnel_is_not_lifecycle_truth`                                                                                                                                                                                                                        |
+| cursor replay across a partition                           | same, `output_written_while_disconnected_replays_from_the_caller_cursor`                                                                                                                                                                                                |
+| missing owner-host listener fails closed                   | same, `a_missing_owner_host_listener_fails_closed` — asserts refusal on first use plus that nothing was provisioned, which is where a `-L` forward actually fails closed                                                                                                |
+| socket, directory, and process cleanup                     | same, `shutdown_removes_the_socket_directory_and_process` and `dropping_the_guard_cleans_up`                                                                                                                                                                            |
+| exact-identity selection fails closed through a tunnel     | same, `a_tunnel_to_another_runtime_fails_closed_before_dispatch`                                                                                                                                                                                                        |
+| teardown reaches the helpers, not just the direct child    | `crates/ctxmux-remote/src/lib.rs`, `the_tunnel_child_leads_a_group_that_teardown_reaches` — drives a real background helper, since no argument list can show a process group                                                                                            |
+| real system OpenSSH carries the vertical, including replay | `crates/ctxmux-daemon/tests/remote_real_openssh.rs`, `real_openssh_carries_the_owner_host_vertical` — qualified against a real owner host; the lane fails rather than skips without a boundary                                                                          |
+| owner Stop settlement survives losing the tunnel           | same, `real_openssh_stop_receipt_survives_tunnel_loss`                                                                                                                                                                                                                  |
+| a replaced daemon incarnation is refused, not adopted      | same, `real_openssh_rejects_a_replaced_daemon_instance` — restarts the real owner daemon rather than forging an identity                                                                                                                                                |
+| eviction during an outage is reported as truncation        | same, `real_openssh_reports_truncation_after_outage_eviction`                                                                                                                                                                                                           |
+| version skew is refused in both directions                 | same, `real_openssh_rejects_bidirectional_build_skew` — two genuinely distinct builds, each rejecting the other                                                                                                                                                         |
+| argument, permission, and validation contract              | `crates/ctxmux-remote/src/lib.rs` unit tests                                                                                                                                                                                                                            |
+| a dead idle link ends instead of hanging                   | `crates/ctxmux-remote/src/lib.rs`, `an_idle_tunnel_probes_so_a_dead_link_ends_it` and `a_retuned_keepalive_replaces_the_default_in_place`; the fixed value's precedence over a caller's `=0` is asserted in `fixed_options_refuse_prompting_and_silent_forward_failure` |
+| the readiness backoff cannot become a spin                 | same, `the_readiness_backoff_is_bounded_and_never_spins` and `the_readiness_backoff_reaches_its_ceiling_quickly` — walks the real schedule rather than restating it                                                                                                     |
+| multiplexing stays the caller's to enable                  | same, `multiplexing_is_left_to_the_caller_rather_than_pinned_here` — asserts the absence the delegation depends on                                                                                                                                                      |
+| the cost harness refuses what it cannot measure            | `scripts/check-remote-cost.sh --self-test`, run by `scripts/check.sh`                                                                                                                                                                                                   |
+| production arguments accepted by real `ssh`                | `scripts/check-remote-runtime.sh --stage supervision`                                                                                                                                                                                                                   |
+| the TypeScript SDK reaches the owner host unchanged        | `packages/sdk/test/remote-endpoint.test.ts`, driven by `--stage capability`                                                                                                                                                                                             |
 
 ## Qualification boundary
 
@@ -290,3 +360,10 @@ and derivation metadata remain out of scope.
   real system client. Separate because required evidence must contain no ignored
   test, and this lane needs an SSH boundary a PR runner does not have.
 - `scripts/check-remote-runtime.sh` — the staged qualification entrypoint.
+- `scripts/check-remote-cost.sh` — the cost harness behind the establishment,
+  reuse, and readiness decisions above. It refuses a sample set, timing source, or
+  forwarder it cannot measure rather than reporting a silent zero, and its
+  `--self-test` stage runs inside the required gate so the refusals stay real.
+  Absent `CTXMUX_REMOTE_SSH_DESTINATION` it measures the stand-in forwarder and
+  labels every figure accordingly; it never presents a stand-in number as a
+  real-client one.
