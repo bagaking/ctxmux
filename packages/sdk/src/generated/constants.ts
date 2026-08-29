@@ -21,3 +21,4 @@ export const RUNTIME_CAPABILITY_PERSISTENT_STATE =
   "services.persistent_state" as const;
 export const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY =
   "services.planned_exec_upgrade_continuity" as const;
+export const REMOTE_ENDPOINT_CONTRACT_VERSION = 1 as const;
