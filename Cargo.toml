@@ -9,6 +9,7 @@ members = [
   "crates/ctxmux-process-stats",
   "crates/ctxmux-rss-sampler",
   "crates/ctxmux-protocol",
+  "crates/ctxmux-remote",
   "crates/ctxmux-sqlite-status",
   "crates/ctxmux-test-support",
 ]

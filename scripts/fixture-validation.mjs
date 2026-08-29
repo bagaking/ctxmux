@@ -72,6 +72,10 @@ export function loadFixtureTestTargetContext(root) {
   const errors = [];
   const check = readText(resolve(root, "scripts/check.sh"), errors, "check.sh");
   const commands = check === null ? [] : topLevelCommands(check);
+  // The requirement is that every fixture binary actually runs, so the check
+  // matches the command's words rather than an exact string: a flag that
+  // strengthens that guarantee — `--no-fail-fast`, which reports every binary
+  // instead of stopping at the first failure — must not read as a missing gate.
   if (!hasWorkspaceAllTargetsCargoTest(commands)) {
     errors.push(
       "check.sh must directly execute `cargo test --workspace --all-targets`",
