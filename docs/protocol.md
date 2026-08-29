@@ -137,6 +137,21 @@ any business frame, and never falls back. Keys are compared byte-exactly: the
 clients do not whitelist, normalize, case-fold, map from operations, or infer
 them from platform or executable state.
 
+One published fact is deliberately not in the record above. Both public client
+libraries export `REMOTE_ENDPOINT_CONTRACT_VERSION`, the version of the
+owner-host endpoint contract that client implements: the forwarding argument
+shape, the readiness rule, the reachability semantics, and the teardown
+guarantees.
+
+It is a client-side constant and never a capability key, because a daemon reached
+through a forwarded socket observes an ordinary local connection and cannot tell
+it apart from a same-machine caller. The side that forwards is the local side, so
+it is the side that may state this. A consumer therefore probes two separately
+owned facts: this constant for what its linked client can establish, and the
+capability record above for what the owner-host daemon can do once reached. The
+constant promises no host is reachable, no credentials work, no daemon is
+listening, and no Run is controllable; those stay typed runtime failures.
+
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
 configured identity and capability requirements; framing, the exact identity shape,

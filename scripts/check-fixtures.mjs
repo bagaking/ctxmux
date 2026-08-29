@@ -194,9 +194,10 @@ const sourceRegistry = new Map();
 const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
-  if (corpus.cases.length !== 41) {
+  // 41 retained cases plus the six REMOTE cases owned by decision 018.
+  if (corpus.cases.length !== 47) {
     fail(
-      `corpus must contain all 41 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 47 retained cases, got ${corpus.cases.length}`,
     );
   }
 
@@ -389,9 +390,13 @@ if (actualChoiceFiles.join("\0") !== expectedChoiceFiles.join("\0")) {
     `choice coverage drifted: expected [${expectedChoiceFiles.join(", ")}], got [${actualChoiceFiles.join(", ")}]`,
   );
 }
-if (sourceRegistry.size !== 41) {
+// This count is an explicit gate: adding an external source must be an
+// acknowledged decision, not a silent import. 41 for the runtime, protocol,
+// SDK, and persistence decisions, plus n02/n03 for the OpenSSH manual pages
+// that own the remote endpoint's transport behavior.
+if (sourceRegistry.size !== 43) {
   fail(
-    `source coverage drifted: expected 41 retained source ids, got ${sourceRegistry.size}`,
+    `source coverage drifted: expected 43 retained source ids, got ${sourceRegistry.size}`,
   );
 }
 

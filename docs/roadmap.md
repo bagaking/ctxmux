@@ -345,9 +345,23 @@ gate or move its policy into ctxmux.
 
 ## Remote Runtime transport — Phase 2
 
-Status: reviewed proposal only under Feature `f-22hjbhvt8`; depends on complete
-Phase 1 evidence from `f-22ecztapc` and must not be mixed into the current local
-Runtime implementation.
+Status: the minimal vertical and its supervision contract are delivered under
+`f-22hjbhvt8` T-005, the probeable endpoint contract under T-006, and partition
+and mixed-capability qualification against a real SSH boundary under T-003, all
+recorded in [018](architecture/choices/018-remote-endpoint-transport.md). The
+contract is published as the client-side `REMOTE_ENDPOINT_CONTRACT_VERSION`
+constant rather than a daemon capability key, because a daemon behind a forwarded
+socket cannot know it is remote. T-003 ran against a Linux owner host holding
+binaries only — no repository and no toolchain — and proved owner Stop settlement
+across tunnel loss, refusal of a replaced daemon incarnation, truncation after
+outage eviction, cursor replay, and bidirectional version skew against two
+genuinely distinct builds. A real-Linux run of the complete gate (T-008) and
+documentation and commit closure (T-004) remain open.
+
+The blocking dependency on all of `f-22ecztapc` was narrowed to its delivered
+Runtime identity and capability contract, which is what a tunnel reusing the
+existing client boundary actually requires. That Feature keeps its own remaining
+tasks and its own closure.
 
 1. Use the maintained system OpenSSH client and StreamLocal forwarding to map
    the owner-host ctxmuxd Unix socket to one bounded local Unix socket, reusing
