@@ -64,7 +64,29 @@ pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: NonZeroU32 = NonZeroU32::new(10).unwr
 pub const DEFAULT_KEEPALIVE_COUNT_MAX: NonZeroU32 = NonZeroU32::new(3).unwrap();
 
 /// Interval between forwarded-socket readiness probes.
+///
+/// This is the *ceiling* of a backoff, not a fixed period. A fixed 50ms wait
+/// was measured to dominate what it was waiting for: the stand-in forward
+/// becomes usable at a 3.4ms median (60 samples), and reporting that at 50ms
+/// made 93% of the observed establishment latency an artifact of the poll rather
+/// than of any handshake. Backing off from [`READY_POLL_MIN`] reports the same
+/// readiness at 7ms while reaching this ceiling within a few attempts, so a slow
+/// real handshake still waits at this coarse interval instead of spinning.
+///
+/// Measure with `scripts/check-remote-cost.sh --stage establishment`; that
+/// harness reads this constant so its dead-time figure cannot describe an
+/// interval nothing polls at.
 const READY_POLL: Duration = Duration::from_millis(50);
+
+/// First readiness probe interval, doubled up to [`READY_POLL`].
+///
+/// One millisecond rather than something smaller because the runtime's own
+/// timer overshoot was measured at ~0.24ms for a 1ms sleep: asking for less
+/// would not arrive sooner and would only add attempts. Each attempt still
+/// awaits, so this is a shorter yield rather than a busy-wait, and the whole
+/// schedule stays bounded — 605 attempts to exhaust the 30s default, against
+/// 600 for the fixed interval it replaces.
+const READY_POLL_MIN: Duration = Duration::from_millis(1);
 
 /// Bound on how long a terminating tunnel is given to exit before it is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
@@ -560,11 +582,23 @@ fn spawn_tunnel(
         })
 }
 
+/// Wait until the forwarded socket carries traffic, or fail explicitly.
+///
+/// The probe interval backs off from [`READY_POLL_MIN`] to [`READY_POLL`] rather
+/// than staying fixed. A fixed interval decides the *reported* establishment
+/// latency whenever the forward is ready faster than one period, which measurement
+/// showed is the common case; backing off reports a fast forward promptly while a
+/// slow one settles onto the coarse interval instead of being polled hard.
+///
+/// What is deliberately unchanged: readiness still means a successful `connect`
+/// and never the socket file's existence, a forwarder that exits is reported as
+/// an exit rather than waited out, and the caller's timeout still bounds the wait.
 async fn await_ready(
     tunnel: &mut RemoteTunnel,
     endpoint: &RemoteEndpoint,
 ) -> Result<(), RemoteEndpointError> {
     let deadline = Instant::now() + endpoint.ready_timeout;
+    let mut backoff = READY_POLL_MIN;
     loop {
         // A connect proves the forward is actually carrying traffic. Checking
         // for the file's existence would accept a socket ssh has not bound yet.
@@ -590,8 +624,17 @@ async fn await_ready(
                 timeout: endpoint.ready_timeout,
             });
         }
-        tokio::time::sleep(READY_POLL).await;
+        tokio::time::sleep(backoff).await;
+        backoff = next_ready_poll(backoff);
     }
+}
+
+/// The next readiness probe interval: double, capped at [`READY_POLL`].
+///
+/// Saturating so the schedule cannot wrap into a short interval, which would
+/// turn a long wait back into a hot loop.
+fn next_ready_poll(current: Duration) -> Duration {
+    current.saturating_mul(2).min(READY_POLL)
 }
 
 fn validate_destination(destination: &OsStr) -> Result<(), RemoteEndpointError> {
@@ -632,11 +675,11 @@ fn validate_remote_socket(path: &Path) -> Result<(), RemoteEndpointError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_READY_TIMEOUT, RemoteEndpoint,
-        RemoteEndpointError, create_tunnel_dir, kill_tunnel_group, spawn_tunnel, tunnel_args,
-        validate_destination, validate_remote_socket,
+        DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_READY_TIMEOUT, READY_POLL, READY_POLL_MIN,
+        RemoteEndpoint, RemoteEndpointError, create_tunnel_dir, kill_tunnel_group, next_ready_poll,
+        spawn_tunnel, tunnel_args, validate_destination, validate_remote_socket,
     };
-    use std::{ffi::OsString, num::NonZeroU32, path::Path};
+    use std::{ffi::OsString, num::NonZeroU32, path::Path, time::Duration};
 
     fn endpoint() -> RemoteEndpoint {
         RemoteEndpoint::new("owner-host", "/run/ctxmux/ctxmux.sock").expect("valid endpoint")
@@ -782,6 +825,76 @@ mod tests {
             ))),
             "the default must be replaced rather than joined by the retuned value, \
              since OpenSSH would resolve the repeated option to whichever came first"
+        );
+    }
+
+    /// A faster first probe must not become a busy-wait.
+    ///
+    /// The backoff exists to stop reporting a fast forward at a coarse interval,
+    /// not to poll harder. So assert both halves of that: it reaches the ceiling
+    /// and stays there, and the attempts needed to exhaust the default timeout
+    /// stay within a few of what the fixed interval it replaced would have used.
+    /// An unbounded or wrapping schedule would show up here as an attempt count
+    /// far above that.
+    #[test]
+    fn the_readiness_backoff_is_bounded_and_never_spins() {
+        assert!(
+            READY_POLL_MIN < READY_POLL,
+            "the first probe must be shorter than the ceiling, or there is no backoff"
+        );
+        assert!(
+            !READY_POLL_MIN.is_zero(),
+            "a zero first interval would be a busy-wait rather than a yield"
+        );
+
+        // Walk the real schedule the loop uses, accumulating both the wait it
+        // would have spent and the attempts it would have made.
+        let mut interval = READY_POLL_MIN;
+        let mut waited = Duration::ZERO;
+        let mut attempts: u32 = 0;
+        while waited < DEFAULT_READY_TIMEOUT {
+            waited += interval;
+            attempts += 1;
+            interval = next_ready_poll(interval);
+            assert!(
+                interval <= READY_POLL,
+                "the backoff must never exceed its ceiling"
+            );
+        }
+        assert_eq!(
+            interval, READY_POLL,
+            "the schedule must settle on the coarse ceiling rather than staying fast"
+        );
+
+        // What the fixed interval this replaced would have needed.
+        let fixed_attempts =
+            u32::try_from(DEFAULT_READY_TIMEOUT.as_millis() / READY_POLL.as_millis())
+                .expect("in range");
+        assert!(
+            attempts <= fixed_attempts + 16,
+            "backoff used {attempts} attempts against {fixed_attempts} for the fixed \
+             interval; a materially larger count means it is polling hard rather \
+             than merely starting sooner"
+        );
+    }
+
+    /// The ceiling must be reached in a handful of attempts, not gradually.
+    ///
+    /// If the climb were slow, a genuinely slow handshake would spend most of its
+    /// wait at short intervals — the busy-wait this must avoid.
+    #[test]
+    fn the_readiness_backoff_reaches_its_ceiling_quickly() {
+        let mut interval = READY_POLL_MIN;
+        let mut climbs = 0;
+        while interval < READY_POLL {
+            interval = next_ready_poll(interval);
+            climbs += 1;
+            assert!(climbs < 32, "the backoff must reach its ceiling, not crawl");
+        }
+        assert!(
+            climbs <= 8,
+            "reaching the {READY_POLL:?} ceiling took {climbs} doublings; a slow climb \
+             leaves a slow handshake being polled at short intervals"
         );
     }
 

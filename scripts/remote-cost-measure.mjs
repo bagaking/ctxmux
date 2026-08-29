@@ -20,13 +20,19 @@ import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import process from "node:process";
 
-/// The readiness poll interval the endpoint actually uses.
+/// The readiness poll ceiling the endpoint actually uses.
 ///
 /// This mirrors READY_POLL in crates/ctxmux-remote/src/lib.rs. It is duplicated
 /// rather than imported because a shell-invoked Node script cannot read a Rust
-/// constant, and the drift guard is the assertion in `verifyPollInterval` below
+/// constant, and the drift guard is the assertion in `verifyPollSchedule` below
 /// rather than a comment asking a reader to remember.
 const READY_POLL_MS = 50;
+
+/// The endpoint's first readiness probe interval, doubled up to the ceiling.
+///
+/// The endpoint backs off rather than polling on a fixed period, so modelling a
+/// fixed one would attribute dead time to a schedule nothing runs.
+const READY_POLL_MIN_MS = 1;
 
 /// Ceiling for one establishment sample before the harness declares it stuck.
 ///
@@ -160,31 +166,42 @@ function verifyTimingSource() {
   return round(resolution, 6);
 }
 
-/// Guard the duplicated poll interval against drift from the Rust owner.
+/// Guard the duplicated poll schedule against drift from the Rust owner.
 ///
-/// The dead-time figure is only meaningful while this constant matches the one
-/// the endpoint actually polls at, so read the owner and compare rather than
-/// trusting the copy.
-async function verifyPollInterval() {
+/// The dead-time figure is only meaningful while this schedule matches the one
+/// the endpoint actually polls on, so read the owner and compare rather than
+/// trusting the copy. Both ends of the backoff are checked: a changed ceiling or
+/// a changed first interval would each make the reported dead time describe a
+/// schedule nothing polls on.
+async function verifyPollSchedule() {
   const source = await import("node:fs/promises").then((fs) =>
     fs.readFile("crates/ctxmux-remote/src/lib.rs", "utf8"),
   );
-  const match =
-    /const READY_POLL: Duration = Duration::from_millis\((\d+)\)/u.exec(source);
-  if (!match) {
-    throw new Error(
-      "could not find READY_POLL in crates/ctxmux-remote/src/lib.rs, so the " +
-        "dead-time figure cannot be tied to the interval the endpoint polls at",
+  const readConstant = (name, expected) => {
+    const pattern = new RegExp(
+      `const ${name}: Duration = Duration::from_millis\\((\\d+)\\)`,
+      "u",
     );
-  }
-  const owner = Number(match[1]);
-  if (owner !== READY_POLL_MS) {
-    throw new Error(
-      `READY_POLL is ${owner}ms in the endpoint but ${READY_POLL_MS}ms here; ` +
-        "the dead-time figure would describe an interval nothing polls at",
-    );
-  }
-  return owner;
+    const match = pattern.exec(source);
+    if (!match) {
+      throw new Error(
+        `could not find ${name} in crates/ctxmux-remote/src/lib.rs, so the ` +
+          "dead-time figure cannot be tied to the schedule the endpoint polls on",
+      );
+    }
+    const owner = Number(match[1]);
+    if (owner !== expected) {
+      throw new Error(
+        `${name} is ${owner}ms in the endpoint but ${expected}ms here; the ` +
+          "dead-time figure would describe a schedule nothing polls on",
+      );
+    }
+    return owner;
+  };
+  return {
+    ceiling_ms: readConstant("READY_POLL", READY_POLL_MS),
+    first_ms: readConstant("READY_POLL_MIN", READY_POLL_MIN_MS),
+  };
 }
 
 function startOwnerListener(socketPath) {
@@ -310,16 +327,29 @@ async function measureEstablishment(forwarder, dir, ownerSocket, index) {
   }
 }
 
-/// What a poll of the given granularity would have reported for a true instant.
+/// What the endpoint's backoff schedule would have reported for a true instant.
 ///
-/// The endpoint checks, then sleeps, so an instant landing between two checks is
-/// reported at the next one. A sample already at a multiple is reported there.
-function polledObservation(trueMs, intervalMs) {
-  return Math.ceil(trueMs / intervalMs) * intervalMs;
+/// The endpoint checks, then sleeps its current interval, then doubles it up to
+/// the ceiling. So walk that schedule until a check lands at or after the true
+/// readiness instant, and return where that check happened. Modelling a fixed
+/// interval instead would attribute dead time to a schedule the endpoint stopped
+/// using, which is the specific way this figure could go quietly wrong.
+///
+/// `firstMs` of zero or a non-doubling schedule would not terminate, so both
+/// bounds come from the verified owner constants rather than from arguments a
+/// caller could pick freely.
+function polledObservation(trueMs, firstMs, ceilingMs) {
+  let checkedAt = 0;
+  let interval = firstMs;
+  while (checkedAt < trueMs) {
+    checkedAt += interval;
+    interval = Math.min(interval * 2, ceilingMs);
+  }
+  return checkedAt;
 }
 
 async function establishmentStage(forwarder, dir, ownerSocket, samples) {
-  const pollInterval = await verifyPollInterval();
+  const schedule = await verifyPollSchedule();
   const trueLatencies = [];
   for (let index = 0; index < samples; index += 1) {
     trueLatencies.push(
@@ -327,16 +357,30 @@ async function establishmentStage(forwarder, dir, ownerSocket, samples) {
     );
   }
   const polled = trueLatencies.map((value) =>
-    polledObservation(value, pollInterval),
+    polledObservation(value, schedule.first_ms, schedule.ceiling_ms),
   );
   const deadTime = trueLatencies.map((value, index) => polled[index] - value);
   const trueSummary = summarise(trueLatencies, "establishment");
   const polledSummary = summarise(polled, "establishment as polled");
+  // What a fixed poll at the ceiling would have reported, so the backoff's
+  // effect on this metric is visible in the same report rather than needing a
+  // reader to remember a previous run's numbers.
+  const atCeiling = trueLatencies.map((value) =>
+    polledObservation(value, schedule.ceiling_ms, schedule.ceiling_ms),
+  );
+  const ceilingSummary = summarise(
+    atCeiling,
+    "establishment at a fixed ceiling",
+  );
   return {
-    poll_interval_ms: pollInterval,
+    poll_schedule: {
+      first_ms: schedule.first_ms,
+      ceiling_ms: schedule.ceiling_ms,
+      shape: "double the interval each attempt, capped at the ceiling",
+    },
     // What the forward actually costs.
     true_establishment: trueSummary,
-    // What a caller of the endpoint currently observes.
+    // What a caller of the endpoint observes.
     reported_establishment: polledSummary,
     // The gap between them, which is the poll's contribution and nothing else.
     readiness_poll_dead_time: summarise(deadTime, "readiness-poll dead time"),
@@ -344,6 +388,14 @@ async function establishmentStage(forwarder, dir, ownerSocket, samples) {
       1 - trueSummary.p50_ms / polledSummary.p50_ms,
       4,
     ),
+    // The comparison the backoff was chosen by.
+    if_polled_at_a_fixed_ceiling: {
+      reported_establishment: ceilingSummary,
+      dead_time_share_of_reported_p50: round(
+        1 - trueSummary.p50_ms / ceilingSummary.p50_ms,
+        4,
+      ),
+    },
   };
 }
 
@@ -528,10 +580,10 @@ async function selfTest(forwarder) {
     "timing source resolves finer than the poll",
     () => `${verifyTimingSource()}ms resolution`,
   );
-  await expectSuccess(
-    "poll interval matches the endpoint",
-    async () => `READY_POLL=${await verifyPollInterval()}ms`,
-  );
+  await expectSuccess("poll schedule matches the endpoint", async () => {
+    const schedule = await verifyPollSchedule();
+    return `READY_POLL_MIN=${schedule.first_ms}ms -> READY_POLL=${schedule.ceiling_ms}ms`;
+  });
 
   await expectFailure("a sample set below the floor is refused", () => {
     summarise([1, 2], "self-test");
@@ -563,23 +615,55 @@ async function selfTest(forwarder) {
   });
 
   // The dead-time arithmetic is the harness's central claim, so check it against
-  // hand-worked values rather than trusting the expression.
-  await expectSuccess("polled observation rounds up to the next check", () => {
-    const cases = [
-      [3, 50, 50],
-      [50, 50, 50],
-      [51, 50, 100],
-      [99.9, 50, 100],
-    ];
-    for (const [trueMs, interval, expected] of cases) {
-      const actual = polledObservation(trueMs, interval);
-      if (actual !== expected) {
-        throw new Error(
-          `polledObservation(${trueMs}, ${interval}) was ${actual}, want ${expected}`,
-        );
+  // hand-worked values rather than trusting the expression. The backoff from 1ms
+  // sleeps 1, 2, 4, 8, 16, 32, then 50, so checks land at 1, 3, 7, 15, 31, 63,
+  // 113, ... and each case below is the first of those at or after the true
+  // instant. Working these out by hand is the point: the first draft of this
+  // table had 62ms landing at 111 rather than 63, and the case caught it.
+  await expectSuccess(
+    "polled observation walks the endpoint's backoff schedule",
+    () => {
+      const cases = [
+        // [trueMs, firstMs, ceilingMs, expected]
+        [0.5, 1, 50, 1],
+        [1, 1, 50, 1],
+        [3.418, 1, 50, 7],
+        [7, 1, 50, 7],
+        [8, 1, 50, 15],
+        [32, 1, 50, 63],
+        [62, 1, 50, 63],
+        [64, 1, 50, 113],
+        // A fixed schedule is the degenerate case where first equals the ceiling,
+        // which is what the comparison figure in the report relies on.
+        [3, 50, 50, 50],
+        [51, 50, 50, 100],
+      ];
+      for (const [trueMs, firstMs, ceilingMs, expected] of cases) {
+        const actual = polledObservation(trueMs, firstMs, ceilingMs);
+        if (actual !== expected) {
+          throw new Error(
+            `polledObservation(${trueMs}, ${firstMs}, ${ceilingMs}) was ${actual}, ` +
+              `want ${expected}`,
+          );
+        }
       }
+      return `${cases.length} cases`;
+    },
+  );
+
+  // The backoff must actually beat a fixed ceiling on the metric it was chosen
+  // by, or the change it justified was not an improvement.
+  await expectSuccess("the backoff reports a fast forward sooner", () => {
+    const fast = 3.418;
+    const backoff = polledObservation(fast, READY_POLL_MIN_MS, READY_POLL_MS);
+    const fixed = polledObservation(fast, READY_POLL_MS, READY_POLL_MS);
+    if (!(backoff < fixed)) {
+      throw new Error(
+        `backoff reported ${backoff}ms and a fixed ceiling ${fixed}ms; the backoff ` +
+          "must report a fast forward sooner or it buys nothing",
+      );
     }
-    return `${cases.length} cases`;
+    return `${fast}ms readiness reported at ${backoff}ms, not ${fixed}ms`;
   });
 
   // And prove the real measurement path produces a usable distribution, so a
