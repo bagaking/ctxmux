@@ -416,10 +416,31 @@ declarations and the checker change that honors a non-required lane sat in a
 later commit, which would have left an unbuildable-gate point in history. Both
 were moved into the commit that introduces the suites.
 
-What this section does not claim: no new gate run. The complete-gate evidence
-above stands on the retired candidates. Re-running `scripts/check.sh` on the new
-`main` tip is required before this Feature's closeout, and T-008's real-Linux
-requirement is unaffected.
+The six commits now on `main` are `72df308`, `1495525`, `a1afce2`, `141305b`,
+`0167e99`, and `1f75135`. `main` moved by fast-forward from `78faff0` and was
+pushed; no history reachable from `origin/main` was rewritten.
+
+## Automated Checks (rebuilt `main` tip)
+
+- Command: `scripts/check.sh`
+- Candidate: `1f75135`, the pushed `main` tip, on a clean worktree.
+- Result: complete run. The failure sentinel
+  `repository check core did not reach its completion boundary` is absent, and
+  the run's final line is the reliability receipt, which is the gate's true
+  terminal step rather than merely the last line captured. 44 Rust test binaries
+  reported `ok` totalling 372 passing tests; 4 Node suites totalled 269 passing.
+  No `test result:` line and no Node summary reported a non-zero failure count.
+- Coverage of this round's changes was confirmed positively rather than by the
+  absence of errors: `remote_owner_host_endpoint`, `remote-endpoint.test`,
+  `activation.test`, `storage_pressure_is_classified_by_extended_code_not_primary_code`,
+  `a_wal_write_io_failure_retries_instead_of_latching_the_actor`, and
+  `sqlite_io_error_is_visible_and_reopen_recovers_the_isolated_state` each appear
+  by name in the run, so this is not a green summary produced by a half run that
+  skipped the new work.
+
+This closes the re-run the rebuild required. It does **not** satisfy T-008: this
+is macOS on `aarch64`, and T-008 requires the same completion boundary on real
+Linux x86_64.
 
 ## Residual Risks
 
@@ -429,11 +450,11 @@ Remaining gates:
   completion boundary on a real Linux x86_64 candidate. The successful Zig
   all-workspace/all-targets cross-build proves Linux compilation, including the
   macOS-invisible cfg islands, but does not satisfy real Linux execution.
-- The complete gate has been run on the merge candidate `6a0e22a`: exit 0 as a
-  complete run, with this round's persistence, activation, and teardown changes
+- The complete gate has been run twice as a complete run: on the retired merge
+  candidate `6a0e22a`, and again on the pushed `main` tip `1f75135` after the
+  rebuild, both with this round's persistence, activation, and teardown changes
   confirmed present in the passing output by name. What remains for T-008 is that
-  the same gate reach its completion boundary on real Linux, not that it be
-  re-run here.
+  the same gate reach its completion boundary on real Linux.
 - A consumer still cannot tell a transient storage failure from a fail-closed one
   without reading the message string. The daemon now classifies correctly and
   retries internally, so the reported incident cannot recur, but the distinction
