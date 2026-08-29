@@ -586,8 +586,30 @@ export function validateCiReachability({ root, map, workflow }) {
     }
   }
 
+  // A suite whose evidence cannot run in a PR job is declared under
+  // non_required_evidence.ignored with a path and a reason. Two rules would
+  // otherwise deadlock for an environment-dependent lane: every checked-in test
+  // must be mapped to a required job, and a mapped Rust suite must contain no
+  // ignored test. Requiring the declaration keeps the exemption explicit and
+  // reviewable instead of letting a lane silently drop out of the gate.
+  const declaredIgnored = new Set(
+    (map.non_required_evidence?.ignored ?? [])
+      .map((item) => item.path)
+      .filter(Boolean),
+  );
+  for (const declared of declaredIgnored) {
+    if (!fs.existsSync(path.join(root, declared))) {
+      errors.push(
+        `non-required ignored evidence names a missing path: ${declared}`,
+      );
+    } else if (suitePaths.has(declared)) {
+      errors.push(
+        `non-required ignored evidence must not also be mapped as required: ${declared}`,
+      );
+    }
+  }
   for (const discovered of discoverCriticalTests(root)) {
-    if (!suitePaths.has(discovered)) {
+    if (!suitePaths.has(discovered) && !declaredIgnored.has(discovered)) {
       errors.push(
         `checked-in critical test has no job-to-invariant mapping: ${discovered}`,
       );

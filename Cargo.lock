@@ -140,6 +140,7 @@ dependencies = [
  "ctxmux-process-stats",
  "ctxmux-protocol",
  "ctxmux-pty-signal",
+ "ctxmux-remote",
  "ctxmux-sqlite-status",
  "ctxmux-test-support",
  "futures-util",
@@ -188,6 +189,16 @@ name = "ctxmux-pty-signal"
 version = "0.1.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "ctxmux-remote"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
