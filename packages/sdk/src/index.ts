@@ -25,6 +25,29 @@ export type {
 } from "./client.js";
 export type { RecoverableStopOperation } from "./stop-operation.js";
 export {
+  DEFAULT_RUNTIME_ACTIVATION_TIMEOUT_MS,
+  RUNTIME_ACTIVATION_SHUTDOWN_GRACE_MS,
+  CtxmuxActivationConflictError,
+  CtxmuxActivationError,
+  CtxmuxActivationLaunchError,
+  CtxmuxActivationOwnershipError,
+  CtxmuxActivationReadinessError,
+  CtxmuxActivationTargetError,
+  RuntimeActivation,
+  activateRuntime,
+  connectOrActivate,
+} from "./activation.js";
+export type {
+  RuntimeActivationDisposeOptions,
+  RuntimeActivationEnvironment,
+  RuntimeActivationErrorCode,
+  RuntimeActivationOptions,
+  RuntimeActivationTargetKind,
+  RuntimeActivationConflictReason,
+  RuntimeChildDisposition,
+  RuntimeChildDispositionOptions,
+} from "./activation.js";
+export {
   INTEGRATION_API_VERSION,
   IntegrationCapabilityError,
   IntegrationMaterializationError,

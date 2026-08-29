@@ -42,6 +42,14 @@
         "evidence": ".github/ci-evidence-map.json#test-support-load-model"
       },
       {
+        "id": "rust-remote-test-forwarder",
+        "category": "test_only",
+        "language": "rust",
+        "glob": "crates/ctxmux-daemon/src/bin/fake-ssh.rs",
+        "reason": "A test-only stand-in for the system ssh client, so the endpoint supervision contract can be proven without an SSH boundary. The shipped transport is the system client, qualified by the real-OpenSSH lane.",
+        "evidence": "scripts/check-remote-runtime.sh"
+      },
+      {
         "id": "macos-process-statistics-leaf",
         "category": "platform_impossible",
         "language": "rust",
@@ -80,6 +88,7 @@
         "crates/ctxmux-rss-sampler/src/main.rs",
         "crates/ctxmux-client/src/lib.rs",
         "crates/ctxmux-client/src/attachment.rs",
+        "crates/ctxmux-remote/src/lib.rs",
         "crates/ctxmux/src/main.rs",
         "crates/ctxmux/src/daemon.rs",
         "crates/ctxmux/src/screen.rs"
@@ -125,6 +134,7 @@
       "paths": [
         "packages/sdk/src/client.ts",
         "packages/sdk/src/attachment.ts",
+        "packages/sdk/src/activation.ts",
         "packages/sdk/src/control.ts",
         "packages/sdk/src/stop-operation.ts",
         "packages/sdk/src/index.ts",
