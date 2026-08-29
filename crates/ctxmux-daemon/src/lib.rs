@@ -99,6 +99,11 @@ const TMUX_IMPORT_PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
 const TMUX_IMPORT_TOTAL_TIMEOUT: Duration = Duration::from_secs(7);
 const TMUX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(8);
 const UPGRADE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
+/// Pause after a transient `accept(2)` failure. Under `EMFILE`/`ENFILE` the
+/// listening socket stays readable, so an immediate retry would spin the accept
+/// loop at 100% CPU until a descriptor frees. A short fixed sleep drains that
+/// window without any backpressure state to reason about.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 fn runtime_build_id() -> RuntimeBuildId {
     RuntimeBuildId::new(concat!("ctxmuxd/", env!("CARGO_PKG_VERSION")))
@@ -371,6 +376,32 @@ fn adopt_listener(listener_fd: RawFd) -> Result<UnixListener, ServerError> {
         .map_err(|source| ServerError::io("<handoff listener fd>", source))
 }
 
+/// Whether an `accept(2)` failure means the listening socket itself is gone and
+/// the daemon must exit, as opposed to a transient resource shortage it should
+/// ride out.
+///
+/// Descriptor exhaustion (`EMFILE`/`ENFILE`), a kernel buffer shortage
+/// (`ENOBUFS`/`ENOMEM`, which BSD/macOS raise under pressure), an aborted
+/// client handshake (`ECONNABORTED`), and a signal interruption (`EINTR`) are
+/// all expected and recoverable: the listener is intact and later accepts will
+/// succeed once the pressure clears. Anything else — a dead or invalid listener
+/// (`EBADF`, `EINVAL`, `ENOTSOCK`), or an errno the OS did not attach — leaves
+/// no connection to serve, so the daemon fails stop.
+fn accept_error_is_fatal(source: &io::Error) -> bool {
+    use rustix::io::Errno;
+    !matches!(
+        Errno::from_io_error(source),
+        Some(
+            Errno::MFILE
+                | Errno::NFILE
+                | Errno::NOBUFS
+                | Errno::NOMEM
+                | Errno::CONNABORTED
+                | Errno::INTR,
+        )
+    )
+}
+
 async fn serve_with_manager(
     socket_path: PathBuf,
     listener: UnixListener,
@@ -408,7 +439,22 @@ async fn serve_with_manager(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, _) = result.map_err(|source| ServerError::io(&socket_path, source))?;
+                let stream = match result {
+                    Ok((stream, _)) => stream,
+                    Err(source) if accept_error_is_fatal(&source) => {
+                        return Err(ServerError::io(&socket_path, source));
+                    }
+                    Err(source) => {
+                        // The listener is intact; a descriptor or buffer shortage
+                        // rejected this one connection. Log and keep serving every
+                        // Run we still own. Back off inside this arm — a bare retry
+                        // spins at 100% CPU while the socket stays readable, and
+                        // staying in this arm keeps SIGHUP/ctrl_c responsive.
+                        eprintln!("ctxmuxd: transient accept error, continuing to serve: {source}");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
+                };
                 let manager = Arc::clone(&manager);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, manager).await {
@@ -7764,5 +7810,44 @@ mod tests {
             .expect("adopted listener accepts before timeout")
             .expect("accept task joins");
         accepted.expect("adopted listener yields the connection");
+    }
+
+    #[test]
+    fn accept_errors_are_classified_transient_or_fatal() {
+        use rustix::io::Errno;
+
+        // Resource pressure and interruptions leave the listener intact: the
+        // daemon must ride these out, mirroring the openpty→SpawnFailed path
+        // that already survives descriptor exhaustion on spawn.
+        for transient in [
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+            Errno::CONNABORTED,
+            Errno::INTR,
+        ] {
+            let error = io::Error::from_raw_os_error(transient.raw_os_error());
+            assert!(
+                !super::accept_error_is_fatal(&error),
+                "{transient:?} must be treated as transient"
+            );
+        }
+
+        // A dead or invalid listener has no connection to serve: fail-stop.
+        for fatal in [Errno::BADF, Errno::INVAL, Errno::NOTSOCK] {
+            let error = io::Error::from_raw_os_error(fatal.raw_os_error());
+            assert!(
+                super::accept_error_is_fatal(&error),
+                "{fatal:?} must be treated as fatal"
+            );
+        }
+
+        // An error the OS did not attach an errno to cannot be proven
+        // recoverable, so it fails closed.
+        assert!(
+            super::accept_error_is_fatal(&io::Error::other("no errno")),
+            "an errno-less accept error must be treated as fatal"
+        );
     }
 }
