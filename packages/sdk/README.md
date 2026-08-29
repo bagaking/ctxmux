@@ -234,7 +234,7 @@ const attachment = await client.attach(run.id);
 console.log(tmuxVersion, run.backend, run.capabilities);
 for await (const event of attachment.events()) {
   if (event.type === "output") {
-    process.stdout.write(Uint8Array.from(event.chunk.data));
+    process.stdout.write(event.chunk.data);
   }
 }
 ```
@@ -248,7 +248,7 @@ server replacement interrupts the Run rather than silently following it.
 The server/session/window/pane fields live in `run.backend`; the pane PID
 observed at import is `run.pid`. For tmux that PID is identity evidence, not
 ctxmux process authority. A linked pane may appear in multiple discovery rows;
-because generation 13 imports by socket path plus pane ID, an ambiguous linked
+because generation 14 imports by socket path plus pane ID, an ambiguous linked
 target is rejected rather than selected by row order.
 
 The tmux slice is read-only and memory-only. `run.spec` is `null`; input,
@@ -322,7 +322,7 @@ console.log(resize.commandId, resize.receipt.applied_size);
 
 for await (const event of attachment.events()) {
   if (event.type === "output") {
-    process.stdout.write(Uint8Array.from(event.chunk.data));
+    process.stdout.write(event.chunk.data);
   }
 }
 ```
@@ -363,7 +363,7 @@ result, sends `Detach`, and resolves only after the daemon acknowledgement.
 
 `attach(id, afterByte)` resumes ordered output after the last observed cumulative byte cursor.
 Inspect `attachment.snapshot.replay.truncated` before assuming the retained
-4 MiB replay contains the complete history. Generation 13 represents cursors as
+4 MiB replay contains the complete history. Generation 14 represents cursors as
 JavaScript numbers, so the SDK rejects values above `Number.MAX_SAFE_INTEGER`
 instead of allowing replay positions to round silently.
 

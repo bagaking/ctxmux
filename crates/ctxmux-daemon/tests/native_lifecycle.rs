@@ -2862,7 +2862,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 13,
+        PROTOCOL_VERSION, 14,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
@@ -2969,9 +2969,9 @@ async fn protocol_frame_ceiling_and_duplicate_names_fail_before_run_mutation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
-    // A 4 MiB raw replay expands far beyond the 1 MiB JSON frame cap when
-    // bytes are integer arrays. The public client must receive ordered replay
-    // chunks across frames instead of losing the retained contract at attach.
+    // A 4 MiB raw replay still spans many 1 MiB JSON frames. The public client
+    // must receive ordered replay chunks across frames instead of losing the
+    // retained contract at attach.
     let daemon = TestDaemon::start().await;
     let run = daemon
         .client

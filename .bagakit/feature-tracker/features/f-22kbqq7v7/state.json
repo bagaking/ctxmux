@@ -1,0 +1,80 @@
+{
+  "version": 1,
+  "feat_id": "f-22kbqq7v7",
+  "title": "Replace PTY output integer arrays with generation-14 base64",
+  "slug": "output-binary-encoding",
+  "goal": "Carry PTY output as canonical padded base64 on the generation-14 JSON wire while exposing decoded bytes to SDK callers and preserving raw-byte replay, accounting, and frozen reliability budgets.",
+  "status": "done",
+  "workspace_mode": "current_tree",
+  "base_ref": "main",
+  "branch": "",
+  "worktree_name": "",
+  "worktree_path": "",
+  "runtime_role": "standalone",
+  "runtime_relations": [],
+  "counters": {
+    "gate_fail_streak": 0,
+    "no_progress_rounds": 0,
+    "round_count": 1
+  },
+  "gate": {
+    "last_result": "pass",
+    "last_task_id": "T-001",
+    "last_check_commands": [
+      {
+        "command": "cargo fmt --all -- --check",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "npm run format:check",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "cargo test -p ctxmux-protocol",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "npm test",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "npm run typecheck && npm run build && scripts/check-protocol-types.sh",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "cargo check --workspace --all-targets",
+        "exit_code": 0,
+        "status": "pass"
+      },
+      {
+        "command": "scripts/smoke-cli.sh",
+        "exit_code": 0,
+        "status": "pass"
+      }
+    ],
+    "last_log_path": ".bagakit/feature-tracker/features/f-22kbqq7v7/artifacts/gate-T-001-r1-0001.log"
+  },
+  "history": [
+    {
+      "action": "feat_created",
+      "detail": "workspace_mode=current_tree; base_ref=main; root_branch=feat/output-binary-encoding"
+    },
+    {
+      "action": "task_started",
+      "detail": "T-001"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-001 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-001 => done"
+    }
+  ]
+}

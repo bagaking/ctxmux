@@ -1,0 +1,146 @@
+{
+  "version": 2,
+  "feat_id": "f-22kbqq7v7",
+  "plan_status": "reviewed",
+  "plan_revision": 1,
+  "supersedes_revision": null,
+  "review_ref": "docs/protocol.md",
+  "source_refs": [
+    "AGENTS.md",
+    "docs/vision.md",
+    "docs/architecture.md",
+    "docs/protocol.md",
+    "docs/testing-strategy.md",
+    "README.md"
+  ],
+  "plan_history": [
+    {
+      "revision": 1,
+      "supersedes_revision": null,
+      "review_ref": "docs/protocol.md",
+      "source_refs": [
+        "AGENTS.md",
+        "docs/vision.md",
+        "docs/architecture.md",
+        "docs/protocol.md",
+        "docs/testing-strategy.md",
+        "README.md"
+      ],
+      "task_ids": [
+        "T-001"
+      ],
+      "superseded_task_ids": [],
+      "supersedes_by_task": {}
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-001",
+      "depends_on": [],
+      "title": "Replace PTY output integer arrays with generation-14 base64",
+      "objective": "Deliver the smallest end-to-end protocol and SDK change that carries PTY output as canonical padded base64 while preserving raw-byte replay, validation, queue accounting, and public client behavior.",
+      "outcome": "Rust daemon and TypeScript SDK agree on generation 14: JSON output chunks are strict padded standard-base64, SDK callers receive decoded Uint8Array bytes, malformed or non-canonical payloads fail closed, and frozen reliability budgets remain unchanged.",
+      "acceptance": [
+        "The protocol generation advances to 14 and OutputChunk retains raw Vec<u8> internally while its only JSON representation is canonical padded standard base64; old integer-array and dual-encoding fallbacks are removed.",
+        "Rust wire-shape tests prove exact encoding, round-trip decoding, and rejection of invalid, unpadded, non-canonical, whitespace-containing, and non-zero trailing-bit base64.",
+        "The SDK decodes output bytes once to Uint8Array, rejects malformed base64 and range/decoded-length mismatches at the owning paths, and does not perform per-byte validation calls; input payload encoding remains unchanged.",
+        "Attachment event budgeting and replay helpers count decoded raw bytes, with a bounded two-chunk test proving one-megabyte raw accounting differs from base64 character accounting.",
+        "The frozen reliability-budgets.json numbers and frozen_before_optimization marker are unchanged, and reliability qualification passes from a clean committed source tree.",
+        "Generated protocol declarations, public documentation, CLI/SDK smoke paths, full unit/integration tests, formatting, static checks, and local-consumer checks agree on generation 14 and the decoded-byte API.",
+        "Four temporary implementation mutations are exercised and reverted: integer-array serialization, missing range-length validation, illegal-character acceptance, and encoded-character queue accounting; each owning assertion turns red without leaving a mutation behind."
+      ],
+      "verification": [
+        {
+          "kind": "command",
+          "ref": "cargo fmt --all -- --check",
+          "proves": "Rust formatting is clean for the protocol and client changes."
+        },
+        {
+          "kind": "command",
+          "ref": "npm run format:check",
+          "proves": "Repository TypeScript and Markdown formatting is clean."
+        },
+        {
+          "kind": "command",
+          "ref": "cargo test -p ctxmux-protocol",
+          "proves": "Generation-14 wire encoding, strict decoding, and protocol fuzz tests pass with non-zero executed counts."
+        },
+        {
+          "kind": "command",
+          "ref": "npm test",
+          "proves": "SDK unit, malformed-input, parser-fuzz, and public Rust/TypeScript end-to-end tests pass."
+        },
+        {
+          "kind": "command",
+          "ref": "npm run typecheck && npm run build && scripts/check-protocol-types.sh",
+          "proves": "SDK/scripts static checks, build output, and generated protocol declarations are consistent."
+        },
+        {
+          "kind": "command",
+          "ref": "cargo check --workspace --all-targets",
+          "proves": "All Rust workspace targets compile after the protocol change."
+        },
+        {
+          "kind": "command",
+          "ref": "scripts/smoke-cli.sh",
+          "proves": "The public CLI smoke path observes generation 14 and preserves Run lifecycle behavior."
+        },
+        {
+          "kind": "artifact",
+          "ref": "docs/protocol.md",
+          "proves": "The public protocol SSOT records generation-14 base64 wire semantics and decoded SDK behavior."
+        }
+      ],
+      "source_refs": [
+        "crates/ctxmux-protocol/src/lib.rs",
+        "packages/sdk/src/validation.ts",
+        "packages/sdk/src/attachment.ts",
+        "packages/sdk/test/wrong-cases.test.ts",
+        "reliability-budgets.json",
+        "docs/protocol.md"
+      ],
+      "supersedes": [],
+      "introduced_in_revision": 1,
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "cargo fmt --all -- --check",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "npm run format:check",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "cargo test -p ctxmux-protocol",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "npm test",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "npm run typecheck && npm run build && scripts/check-protocol-types.sh",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "cargo check --workspace --all-targets",
+          "exit_code": 0,
+          "status": "pass"
+        },
+        {
+          "command": "scripts/smoke-cli.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
+      "notes": []
+    }
+  ]
+}

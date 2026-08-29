@@ -83,7 +83,7 @@ bootstrap epoch immediately so an interrupted first open remains structurally
 reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
-application and operational invariants are revalidated. Protocol generation 13
+application and operational invariants are revalidated. Protocol generation 14
 and persistence schema 4 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed

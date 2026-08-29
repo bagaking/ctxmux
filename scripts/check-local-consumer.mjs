@@ -368,8 +368,16 @@ const readiness = new Promise((resolve, reject) => {
   });
 });
 
+function decodedOutputBytes(value) {
+  assert(value instanceof Uint8Array, "SDK must expose decoded PTY bytes");
+  return value;
+}
+
 function replayBytes(chunks) {
-  return Uint8Array.from(chunks.flatMap((chunk) => [...chunk.data]));
+  return chunks.reduce(
+    (output, chunk) => append(output, decodedOutputBytes(chunk.data)),
+    new Uint8Array(),
+  );
 }
 
 function append(left, right) {
@@ -415,7 +423,7 @@ async function waitForText(attachment, observed, lastByte, expected) {
     if (event.type === "output") {
       assert.equal(event.chunk.start_byte, lastByte);
       lastByte = event.chunk.end_byte;
-      observed = append(observed, Uint8Array.from(event.chunk.data));
+      observed = append(observed, decodedOutputBytes(event.chunk.data));
     } else if (event.type === "gap") {
       throw new Error("unexpected artifact-consumer output gap");
     } else if (event.type === "exited" || event.type === "interrupted") {

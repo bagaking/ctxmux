@@ -3,7 +3,7 @@
   "generated_by": "bagakit-feature-tracker",
   "feature_id_issuance": {
     "scheme": "feature-tracker-id-v1-c3n2g4",
-    "next_cursor": 17
+    "next_cursor": 18
   },
   "features": [
     {
@@ -170,6 +170,16 @@
       "feat_id": "f-22jczss6d",
       "title": "Review the next ctxmux Runtime refinements",
       "status": "archived",
+      "workspace_mode": "current_tree",
+      "branch": "",
+      "worktree_name": "",
+      "runtime_role": "standalone",
+      "runtime_relations": []
+    },
+    {
+      "feat_id": "f-22kbqq7v7",
+      "title": "Replace PTY output integer arrays with generation-14 base64",
+      "status": "done",
       "workspace_mode": "current_tree",
       "branch": "",
       "worktree_name": "",

@@ -168,8 +168,9 @@ when the daemon runs with `--state-dir`. Details live in
 
 Pre-alpha. The daemon owns a real native PTY Run. The CLI and SDK are both
 clients of that Run. Interactive attach reconstructs the current screen;
-the generation-13 protocol still carries raw bytes. A raw-output `Gap` can be
-recovered by reattaching from the caller's last observed byte cursor; a
+the generation-14 protocol carries raw PTY bytes as strict padded base64 on
+the JSON wire and exposes decoded `Uint8Array` chunks to SDK callers. A
+raw-output `Gap` can be recovered by reattaching from the caller's last observed byte cursor; a
 non-output observation discontinuity ends that attachment because byte replay
 cannot restore the missing semantics. Persistent mode recovers committed
 history after cold restart, retries an exact ordered mutation while SQLite

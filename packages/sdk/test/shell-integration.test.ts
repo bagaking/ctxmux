@@ -60,7 +60,7 @@ test("shell Integration has a disposable observer with no semantic claims", () =
   assert.deepEqual(
     shellIntegration.createObserver().observe({
       type: "output",
-      chunk: { start_byte: 0, end_byte: 1, data: [65] },
+      chunk: { start_byte: 0, end_byte: 1, data: new Uint8Array([65]) },
     }),
     [],
   );
