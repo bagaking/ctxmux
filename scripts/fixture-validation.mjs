@@ -34,6 +34,18 @@ function topLevelCommands(source) {
     );
 }
 
+function hasWorkspaceAllTargetsCargoTest(commands) {
+  return commands.some((command) => {
+    const words = command.split(/\s+/u);
+    return (
+      words[0] === "cargo" &&
+      words[1] === "test" &&
+      words.includes("--workspace") &&
+      words.includes("--all-targets")
+    );
+  });
+}
+
 function collectWorkspaceScripts(scripts, name, result, visited = new Set()) {
   if (visited.has(name) || typeof scripts[name] !== "string") return;
   visited.add(name);
@@ -60,7 +72,7 @@ export function loadFixtureTestTargetContext(root) {
   const errors = [];
   const check = readText(resolve(root, "scripts/check.sh"), errors, "check.sh");
   const commands = check === null ? [] : topLevelCommands(check);
-  if (!commands.includes("cargo test --workspace --all-targets")) {
+  if (!hasWorkspaceAllTargetsCargoTest(commands)) {
     errors.push(
       "check.sh must directly execute `cargo test --workspace --all-targets`",
     );
