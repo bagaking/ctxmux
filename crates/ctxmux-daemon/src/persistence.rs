@@ -15,7 +15,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::sync::atomic::AtomicU8;
+use std::sync::atomic::{AtomicI32, AtomicU8};
 
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
@@ -95,6 +95,12 @@ pub enum PersistenceError {
     Database {
         message: String,
         code: Option<rusqlite::ErrorCode>,
+        /// `SQLite`'s extended result code, retained because the primary code is
+        /// too coarse to classify an I/O failure. Every `SQLITE_IOERR_*` shares
+        /// the primary `SystemIoFailure`, but only some of them describe a
+        /// condition an operator can clear (a full filesystem) rather than a
+        /// broken store.
+        extended_code: Option<i32>,
     },
     #[error("ctxmux persistence actor stopped")]
     ActorStopped,
@@ -121,8 +127,13 @@ impl PersistenceError {
         reason = "the owned signature is used directly by Result::map_err while preserving SQLite's typed code"
     )]
     fn database(error: rusqlite::Error) -> Self {
+        let extended_code = match &error {
+            rusqlite::Error::SqliteFailure(failure, _) => Some(failure.extended_code),
+            _ => None,
+        };
         Self::Database {
             code: error.sqlite_error_code(),
+            extended_code,
             message: error.to_string(),
         }
     }
@@ -131,6 +142,7 @@ impl PersistenceError {
         Self::Database {
             message: error.to_string(),
             code: None,
+            extended_code: None,
         }
     }
 
@@ -141,6 +153,40 @@ impl PersistenceError {
                 code: Some(rusqlite::ErrorCode::DiskFull),
                 ..
             }
+        )
+    }
+
+    /// A `SQLITE_IOERR` whose extended code names a write path that a full
+    /// filesystem defeats.
+    ///
+    /// `SQLITE_FULL` is not the only way a full disk arrives. It is what `SQLite`
+    /// reports when the database file itself cannot grow, but a write to the WAL,
+    /// the rollback journal, or an `fsync` that flushes either one surfaces the
+    /// underlying `ENOSPC` as an `SQLITE_IOERR_*` instead. Those share the
+    /// primary `SystemIoFailure` code with genuinely broken storage, so the
+    /// extended code is the only thing that separates "the operator can free
+    /// space and the store is intact" from "this store cannot be trusted".
+    ///
+    /// The list is deliberately an allowlist of write-side failures rather than
+    /// "any `SystemIoFailure`". Read, lock, delete, and mmap I/O errors, and
+    /// every unrecognized extended code, stay fail-closed: retrying those would
+    /// convert an unreadable or corrupt store into an unbounded hang, which is
+    /// strictly worse than a latched actor an operator can see.
+    fn is_storage_pressure_io_failure(&self) -> bool {
+        let Self::Database {
+            code: Some(rusqlite::ErrorCode::SystemIoFailure),
+            extended_code: Some(extended),
+            ..
+        } = self
+        else {
+            return false;
+        };
+        matches!(
+            *extended,
+            rusqlite::ffi::SQLITE_IOERR_WRITE
+                | rusqlite::ffi::SQLITE_IOERR_FSYNC
+                | rusqlite::ffi::SQLITE_IOERR_DIR_FSYNC
+                | rusqlite::ffi::SQLITE_IOERR_TRUNCATE
         )
     }
 
@@ -155,7 +201,9 @@ impl PersistenceError {
     }
 
     fn is_transient_storage(&self) -> bool {
-        self.is_disk_full() || matches!(self, Self::WalCheckpointBusy { .. })
+        self.is_disk_full()
+            || self.is_storage_pressure_io_failure()
+            || matches!(self, Self::WalCheckpointBusy { .. })
     }
 
     #[cfg(test)]
@@ -163,7 +211,27 @@ impl PersistenceError {
         Self::Database {
             message: "injected database or disk is full".to_owned(),
             code: Some(rusqlite::ErrorCode::DiskFull),
+            extended_code: Some(rusqlite::ffi::SQLITE_FULL),
         }
+    }
+
+    /// Build the exact error shape a full filesystem produces when the write
+    /// lands on the WAL rather than on the database file.
+    #[cfg(test)]
+    fn injected_io_failure(extended_code: i32) -> Self {
+        Self::Database {
+            message: format!("injected disk I/O error ({extended_code})"),
+            code: Some(rusqlite::ErrorCode::SystemIoFailure),
+            extended_code: Some(extended_code),
+        }
+    }
+
+    #[cfg(test)]
+    fn injected_io_error() -> Self {
+        Self::database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+            Some("disk I/O error".to_owned()),
+        ))
     }
 
     fn serialization(error: impl std::fmt::Display) -> Self {
@@ -229,7 +297,12 @@ struct PersistenceTestHooks {
     start_commit_crash_phase: AtomicU8,
     fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
     fail_next_append_as_disk_full: AtomicBool,
+    fail_next_append_as_io_error: AtomicBool,
     fail_next_finalize_as_disk_full: AtomicBool,
+    /// Extended `SQLite` result code to inject once on the next append, standing
+    /// in for the `SQLITE_IOERR_*` shape a full filesystem produces when the
+    /// write lands on the WAL rather than on the database file.
+    fail_next_append_as_io_failure: AtomicI32,
     checkpoint_attempts: AtomicU64,
 }
 
@@ -792,6 +865,18 @@ impl Persistence {
     }
 
     #[cfg(test)]
+    fn fail_next_append_as_io_error(&self) {
+        assert!(
+            !self
+                .inner
+                .test_hooks
+                .fail_next_append_as_io_error
+                .swap(true, Ordering::AcqRel),
+            "only one append SQLITE_IOERR fixture may be armed"
+        );
+    }
+
+    #[cfg(test)]
     fn fail_next_finalize_as_disk_full(&self) {
         assert!(
             !self
@@ -800,6 +885,22 @@ impl Persistence {
                 .fail_next_finalize_as_disk_full
                 .swap(true, Ordering::AcqRel),
             "only one finalize DiskFull fixture may be armed"
+        );
+    }
+
+    /// Arm one append to fail with a raw `SQLITE_IOERR_*`, the shape a full
+    /// filesystem produces when the failing write is to the WAL rather than to
+    /// the database file.
+    #[cfg(test)]
+    fn fail_next_append_as_io_failure(&self, extended_code: i32) {
+        assert_ne!(extended_code, 0, "an injected I/O failure needs a code");
+        assert_eq!(
+            self.inner
+                .test_hooks
+                .fail_next_append_as_io_failure
+                .swap(extended_code, Ordering::AcqRel),
+            0,
+            "only one append I/O-failure fixture may be armed"
         );
     }
 
@@ -1130,6 +1231,22 @@ fn actor_main(
                             .swap(false, Ordering::AcqRel)
                         {
                             return Err(PersistenceError::injected_disk_full());
+                        }
+                        #[cfg(test)]
+                        if test_hooks
+                            .fail_next_append_as_io_error
+                            .swap(false, Ordering::AcqRel)
+                        {
+                            return Err(PersistenceError::injected_io_error());
+                        }
+                        #[cfg(test)]
+                        {
+                            let injected = test_hooks
+                                .fail_next_append_as_io_failure
+                                .swap(0, Ordering::AcqRel);
+                            if injected != 0 {
+                                return Err(PersistenceError::injected_io_failure(injected));
+                            }
                         }
                         store.append_batch_with_shutdown(&batch, Some(shutdown))
                     });
@@ -4919,6 +5036,67 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_io_error_is_visible_and_reopen_recovers_the_isolated_state() {
+        let temp = TempDir::new().expect("create SQLite I/O error fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(first.id), &first)
+            .expect("insert SQLite I/O error fixture Run");
+        let output = replay(vec![chunk(0, b"must not be acknowledged")]);
+        persistence.fail_next_append_as_io_error();
+        durable.append(first.id, output);
+
+        let error = persistence
+            .barrier()
+            .expect_err("injected SQLite I/O error must reach the barrier");
+        assert!(error.to_string().contains("disk I/O error"));
+        assert!(
+            persistence.is_failed(),
+            "non-transient I/O must latch this actor"
+        );
+
+        let later = running_info(RunId::new());
+        let rejected = persistence.insert_start(&test_operation_key(later.id), &later);
+        assert!(
+            rejected.is_err(),
+            "a latched actor must reject mutations until its daemon is reopened"
+        );
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        // Reopening the same isolated state models a daemon restart. The failed
+        // append was never acknowledged, while the committed start remains
+        // recoverable and the new actor accepts subsequent mutations.
+        let (reopened, recovered) =
+            Persistence::open(&state_dir).expect("reopen the isolated state after daemon restart");
+        let recovered_first = recovered
+            .iter()
+            .find(|run| run.info.id == first.id)
+            .expect("the committed Run remains durable after the injected I/O error");
+        assert_eq!(recovered_first.replay, replay(Vec::new()));
+        assert!(matches!(
+            recovered_first.info.state,
+            RunState::Interrupted {
+                reason: InterruptionReason::DaemonRestart
+            }
+        ));
+
+        let later_durable = reopened
+            .insert_start(&test_operation_key(later.id), &later)
+            .expect("a fresh persistence actor accepts a new mutation");
+        later_durable.finalize(later.id, 43, replay(Vec::new()), exited_state());
+        drop(later_durable);
+        reopened.assert_exclusive_owner();
+        drop(reopened);
+    }
+
+    #[test]
     fn disk_full_retry_observes_shutdown() {
         let shutdown = AtomicBool::new(false);
         let mut attempts = 0_u8;
@@ -5213,6 +5391,185 @@ mod tests {
             Some("database is busy".to_owned()),
         );
         assert!(!PersistenceError::database(busy).is_disk_full());
+    }
+
+    /// A full filesystem does not always arrive as `SQLITE_FULL`. When the write
+    /// that runs out of space is to the WAL, the journal, or an `fsync` of
+    /// either, `SQLite` reports the underlying `ENOSPC` as `SQLITE_IOERR_*`, whose
+    /// primary code is the same `SystemIoFailure` that genuinely broken storage
+    /// uses. Classification therefore has to read the extended code, and this
+    /// pins both halves: the write-side codes retry, everything else stays
+    /// fail-closed.
+    #[test]
+    fn storage_pressure_is_classified_by_extended_code_not_primary_code() {
+        let write_side = [
+            rusqlite::ffi::SQLITE_IOERR_WRITE,
+            rusqlite::ffi::SQLITE_IOERR_FSYNC,
+            rusqlite::ffi::SQLITE_IOERR_DIR_FSYNC,
+            rusqlite::ffi::SQLITE_IOERR_TRUNCATE,
+        ];
+        for extended in write_side {
+            let error = PersistenceError::database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(extended),
+                Some("disk I/O error".to_owned()),
+            ));
+            assert!(
+                error.is_transient_storage(),
+                "extended code {extended} names a write a full disk defeats, so it must retry"
+            );
+            assert!(
+                !error.is_disk_full(),
+                "extended code {extended} arrives as SystemIoFailure, not DiskFull: \
+                 if is_disk_full covered it, reading the extended code would be pointless"
+            );
+        }
+
+        // Everything else keeps latching. Retrying an unreadable or corrupt
+        // store would replace a visible outage with an unbounded hang.
+        let fail_closed = [
+            rusqlite::ffi::SQLITE_IOERR_READ,
+            rusqlite::ffi::SQLITE_IOERR_SHORT_READ,
+            rusqlite::ffi::SQLITE_IOERR_DELETE,
+            rusqlite::ffi::SQLITE_IOERR_LOCK,
+            rusqlite::ffi::SQLITE_IOERR,
+            rusqlite::ffi::SQLITE_CORRUPT,
+            rusqlite::ffi::SQLITE_NOTADB,
+        ];
+        for extended in fail_closed {
+            let error = PersistenceError::database(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(extended),
+                Some("not a storage-pressure failure".to_owned()),
+            ));
+            assert!(
+                !error.is_transient_storage(),
+                "extended code {extended} is not storage pressure and must stay fail-closed"
+            );
+        }
+    }
+
+    /// The reported incident, as a drill: a single `SQLITE_IOERR` during an
+    /// append used to latch the actor and reject every later mutation, even
+    /// though the store was intact — which a clean reopen proved.
+    ///
+    /// The four steps are the ones the incident report named: inject one
+    /// `ENOSPC`-shaped I/O error, confirm the actor is not latched and later
+    /// mutations still land, reopen the same state directory, and confirm the
+    /// existing Run recovered with its exact bytes.
+    #[test]
+    fn a_wal_write_io_failure_retries_instead_of_latching_the_actor() {
+        let temp = TempDir::new().expect("create append I/O-failure fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let first = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(first.id), &first)
+            .expect("insert append I/O-failure fixture");
+        let first_replay = replay(vec![chunk(0, b"survives ENOSPC on the WAL")]);
+
+        // Step 1: one write-side I/O failure, the shape ENOSPC takes when the
+        // failing write lands on the WAL rather than on the database file.
+        persistence.fail_next_append_as_io_failure(rusqlite::ffi::SQLITE_IOERR_WRITE);
+        durable.append(first.id, first_replay.clone());
+        durable.finalize(first.id, 42, first_replay.clone(), exited_state());
+
+        // Step 2: the actor is not latched, and the retried append committed.
+        assert!(
+            !persistence.is_failed(),
+            "a full filesystem is an operator-clearable condition, not durable corruption"
+        );
+        assert_eq!(
+            durable.durable_head(),
+            first_replay.latest_output_bytes,
+            "the queued finalize must run after the retried append"
+        );
+
+        // Step 3: later mutations still succeed, which is exactly what the
+        // incident reported as broken.
+        let later = running_info(RunId::new());
+        let later_durable = persistence
+            .insert_start(&test_operation_key(later.id), &later)
+            .expect("later start remains writable after a recovered I/O failure");
+        later_durable.finalize(later.id, 43, replay(Vec::new()), exited_state());
+
+        drop(later_durable);
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        // Step 4: reopening the same state directory recovers both Runs with
+        // their exact bytes. The retry committed once, not twice.
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen recovered state");
+        let recovered_first = recovered
+            .iter()
+            .find(|run| run.info.id == first.id)
+            .expect("first Run remains durable");
+        assert_eq!(recovered_first.info.state, exited_state());
+        assert_eq!(
+            recovered_first.replay, first_replay,
+            "an idempotent retry must not duplicate or corrupt the committed bytes"
+        );
+        assert!(recovered.iter().any(|run| run.info.id == later.id));
+        drop(reopened);
+    }
+
+    /// Retrying a mutation whose commit result is unknown must not double-commit.
+    ///
+    /// This is the risk the retry introduces: an `fsync` can fail with `ENOSPC`
+    /// *after* the transaction already reached the disk, so a retry may re-run a
+    /// write that landed. The store is what makes that safe, and this pins the
+    /// mechanism rather than assuming it. `append_replay` classifies each chunk
+    /// against the durable head — bytes at or below it are re-verified for exact
+    /// equality and skipped, a chunk that does not abut the head is refused as a
+    /// gap, and only an exactly-abutting chunk inserts. Replaying the same append
+    /// is therefore a checked no-op, not a duplicate row.
+    #[test]
+    fn replaying_a_committed_append_verifies_instead_of_duplicating() {
+        let temp = TempDir::new().expect("create replay-idempotence fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert replay-idempotence fixture");
+        let committed = replay(vec![chunk(0, b"committed once")]);
+        durable.append(info.id, committed.clone());
+        persistence.barrier().expect("first append commits");
+        assert!(!persistence.is_failed());
+        let head_after_first = durable.durable_head();
+        assert_eq!(head_after_first, committed.latest_output_bytes);
+
+        // Re-submit the identical append, exactly as a retry after an uncertain
+        // commit would. It must be accepted as an already-durable no-op.
+        durable.append(info.id, committed.clone());
+        persistence
+            .barrier()
+            .expect("a replayed append is a verified no-op, not a commit failure");
+        assert!(
+            !persistence.is_failed(),
+            "re-appending already-durable bytes must verify, not fail the actor"
+        );
+        assert_eq!(
+            durable.durable_head(),
+            head_after_first,
+            "a replayed append must not advance the durable head twice"
+        );
+
+        durable.finalize(info.id, 42, committed.clone(), exited_state());
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen recovered state");
+        assert_eq!(recovered.len(), 1, "one Run, not one per append attempt");
+        assert_eq!(
+            recovered[0].replay, committed,
+            "the recovered bytes must be the single committed copy"
+        );
+        drop(reopened);
     }
 
     #[test]
