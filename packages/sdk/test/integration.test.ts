@@ -240,7 +240,7 @@ test("registerIntegration rejects incomplete or downgraded Level B implementatio
       return { type: "level_a" } as unknown as LevelBForkPlan;
     },
   };
-  const chunk = { start_byte: 0, end_byte: 1, data: [65] };
+  const chunk = { start_byte: 0, end_byte: 1, data: new Uint8Array([65]) };
   rememberRunEventSource({ type: "output", chunk }, parent.id);
   const registered = registerIntegration(client, downgraded);
   const receipt = registered

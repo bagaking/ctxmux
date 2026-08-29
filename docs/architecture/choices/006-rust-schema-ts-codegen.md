@@ -11,7 +11,10 @@ The Rust daemon and TypeScript SDK must not maintain parallel handwritten protoc
 
 Rust types in `ctxmux-protocol` are authoritative. `ts-rs` exports the recursive `ClientFrame` and `ServerFrame` graph plus generated protocol constants. The generator formats output with Prettier. The repository gate regenerates into a temporary directory and diffs it against checked-in declarations.
 
-Generated declarations provide static parity. The SDK separately validates full generation-13 frames at runtime and rejects unsafe integer cursors. Protocol compatibility policy remains a separate responsibility.
+Generated declarations provide static parity. The SDK separately validates full
+generation-14 frames at runtime, decodes strict base64 output chunks to
+`Uint8Array`, and rejects unsafe integer cursors. Protocol compatibility policy
+remains a separate responsibility.
 
 ## Quality attributes and invariants
 
@@ -52,7 +55,7 @@ The generated-directory diff remains valuable. It solves checked-in declaration 
 
 - Should `u64` values become strings, `bigint` adapters, or bounded protocol integers?
 - Which changes are wire-breaking and how is the generation-bump gate enforced?
-- Does a future replacement for generation 13 need generated runtime validation
+- Does a future replacement for generation 14 need generated runtime validation
   rather than the current handwritten boundary validator?
 - How are golden wire fixtures versioned without preserving obsolete pre-stable contracts?
 

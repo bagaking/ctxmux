@@ -448,7 +448,7 @@ test("SC-02 rejects malformed nested runtime frames", () => {
           chunk: { start_byte: 0, end_byte: 2, data: [0, 256] },
         },
       },
-      "$frame.event.chunk.data[1]",
+      "$frame.event.chunk.data",
     ],
     [
       {
@@ -614,6 +614,56 @@ test("SC-02 rejects malformed nested runtime frames", () => {
       `${spelling} is the same safe-integer numeric value`,
     );
   }
+});
+
+test("SC-02 decodes only canonical padded base64 output chunks", () => {
+  const parsed = parseJsonFrame(
+    JSON.stringify({
+      type: "event",
+      event: {
+        type: "output",
+        chunk: { start_byte: 7, end_byte: 9, data: "AP8=" },
+      },
+    }),
+  );
+  const validated = validateServerFrame(parsed);
+  assert.equal(validated.type, "event");
+  if (validated.type === "event" && validated.event.type === "output") {
+    assert.ok(validated.event.chunk.data instanceof Uint8Array);
+    assert.deepEqual(validated.event.chunk.data, new Uint8Array([0, 255]));
+  }
+
+  for (const encoded of ["!!!!", "AA", "AA=", "AB==", "A A==", "AA==\n"]) {
+    assert.throws(
+      () =>
+        validateServerFrame({
+          type: "event",
+          event: {
+            type: "output",
+            chunk: { start_byte: 0, end_byte: 1, data: encoded },
+          },
+        }),
+      (error: unknown) =>
+        error instanceof CtxmuxInvalidFrameError &&
+        error.path === "$frame.event.chunk.data",
+      `invalid base64 must fail at the data field: ${encoded}`,
+    );
+  }
+
+  assert.throws(
+    () =>
+      validateServerFrame({
+        type: "event",
+        event: {
+          type: "output",
+          chunk: { start_byte: 0, end_byte: 3, data: "AP8=" },
+        },
+      }),
+    (error: unknown) =>
+      error instanceof CtxmuxInvalidFrameError &&
+      error.path === "$frame.event.chunk",
+    "a range mismatch must produce one byte-range assertion after decoding",
+  );
 });
 
 test("SC-02 rejects incompatible Runtime generations before dispatch", async (context) => {
@@ -878,7 +928,11 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
       type: "event",
       event: {
         type: "output",
-        chunk: { start_byte: 0, end_byte: 3, data: [0, 10, 255] },
+        chunk: {
+          start_byte: 0,
+          end_byte: 3,
+          data: new Uint8Array([0, 10, 255]),
+        },
       },
     },
     {
@@ -1229,14 +1283,14 @@ test("LP-02 reassembles retained replay streamed across bounded frames", async (
       type: "event",
       event: {
         type: "output",
-        chunk: { start_byte: 0, end_byte: 2, data: [0, 255] },
+        chunk: { start_byte: 0, end_byte: 2, data: new Uint8Array([0, 255]) },
       },
     });
     peer.send({
       type: "event",
       event: {
         type: "output",
-        chunk: { start_byte: 2, end_byte: 5, data: [1, 2, 3] },
+        chunk: { start_byte: 2, end_byte: 5, data: new Uint8Array([1, 2, 3]) },
       },
     });
   });
@@ -1245,16 +1299,16 @@ test("LP-02 reassembles retained replay streamed across bounded frames", async (
     socketPath: daemon.socketPath,
   }).attach(RUN_ID);
   assert.deepEqual(attachment.snapshot.replay.chunks, [
-    { start_byte: 0, end_byte: 2, data: [0, 255] },
-    { start_byte: 2, end_byte: 5, data: [1, 2, 3] },
+    { start_byte: 0, end_byte: 2, data: new Uint8Array([0, 255]) },
+    { start_byte: 2, end_byte: 5, data: new Uint8Array([1, 2, 3]) },
   ]);
   attachment.close();
 });
 
 test("LP-02 rejects replay overshoot, non-progress, and EOF before the advertised byte boundary", async (context) => {
   for (const [label, chunk] of [
-    ["overshoot", { start_byte: 0, end_byte: 2, data: [1, 2] }],
-    ["non-progress", { start_byte: 0, end_byte: 0, data: [] }],
+    ["overshoot", { start_byte: 0, end_byte: 2, data: new Uint8Array([1, 2]) }],
+    ["non-progress", { start_byte: 0, end_byte: 0, data: new Uint8Array() }],
   ] satisfies ReadonlyArray<readonly [string, OutputChunk]>) {
     const daemon = await mockDaemon(context, async (socket) => {
       const peer = new MockPeer(socket);
@@ -1366,7 +1420,7 @@ test("LP-02 resumes after a retained source gap from the caller cursor", async (
       type: "event",
       event: {
         type: "output",
-        chunk: { start_byte: 2, end_byte: 3, data: [3] },
+        chunk: { start_byte: 2, end_byte: 3, data: new Uint8Array([3]) },
       },
     });
   });
@@ -1377,7 +1431,7 @@ test("LP-02 resumes after a retained source gap from the caller cursor", async (
   );
   assert.equal(attachment.snapshot.replay.truncated, true);
   assert.deepEqual(attachment.snapshot.replay.chunks, [
-    { start_byte: 2, end_byte: 3, data: [3] },
+    { start_byte: 2, end_byte: 3, data: new Uint8Array([3]) },
   ]);
   attachment.close();
 });
@@ -2192,7 +2246,7 @@ test(
             chunk: {
               start_byte: startByte,
               end_byte: startByte + 1,
-              data: [65],
+              data: new Uint8Array([65]),
             },
           },
         });
@@ -2218,7 +2272,11 @@ test(
     for (let expected = 0; expected < 256; expected += 1) {
       assert.deepEqual(await attachment.nextEvent(), {
         type: "output",
-        chunk: { start_byte: expected, end_byte: expected + 1, data: [65] },
+        chunk: {
+          start_byte: expected,
+          end_byte: expected + 1,
+          data: new Uint8Array([65]),
+        },
       });
     }
     const gap = await attachment.nextEvent();
@@ -2235,6 +2293,86 @@ test(
   },
 );
 
+test(
+  "SDK-02 counts decoded output bytes rather than base64 wire characters",
+  { timeout: 10_000 },
+  async (context) => {
+    const firstBytes = 700_000;
+    const secondBytes = 300_000;
+    const first = new Uint8Array(firstBytes).fill(0x41);
+    const second = new Uint8Array(secondBytes).fill(0x42);
+    const firstFrame = {
+      type: "event" as const,
+      event: {
+        type: "output" as const,
+        chunk: { start_byte: 0, end_byte: firstBytes, data: first },
+      },
+    };
+    const secondFrame = {
+      type: "event" as const,
+      event: {
+        type: "output" as const,
+        chunk: {
+          start_byte: firstBytes,
+          end_byte: firstBytes + secondBytes,
+          data: second,
+        },
+      },
+    };
+    assert.equal(firstBytes + secondBytes, 1_000_000);
+    assert.ok(
+      Buffer.byteLength(wireJson(firstFrame)) +
+        Buffer.byteLength(wireJson(secondFrame)) >
+        MAX_FRAME_BYTES,
+      "the encoded characters must exceed the one-megabyte queue budget",
+    );
+    assert.ok(
+      Buffer.byteLength(wireJson(firstFrame)) <= MAX_FRAME_BYTES,
+      "the first encoded output event must fit one frame",
+    );
+    assert.ok(
+      Buffer.byteLength(wireJson(secondFrame)) <= MAX_FRAME_BYTES,
+      "the second encoded output event must fit one frame",
+    );
+
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      assert.deepEqual(await peer.receive(), {
+        type: "request",
+        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+      });
+      peer.send({ type: "attached", snapshot: attachedHeader() });
+      await peer.sendWithBackpressure(firstFrame);
+      await peer.sendWithBackpressure(secondFrame);
+    });
+
+    const attachment = await new CtxmuxClient({
+      socketPath: daemon.socketPath,
+    }).attach(RUN_ID);
+    await delay(50);
+    const firstEvent = await attachment.nextEvent();
+    assert.equal(firstEvent?.type, "output");
+    if (firstEvent?.type === "output") {
+      assert.equal(firstEvent.chunk.data.length, firstBytes);
+      assert.equal(firstEvent.chunk.data[0], 0x41);
+      assert.equal(firstEvent.chunk.data.at(-1), 0x41);
+    }
+    const secondEvent = await attachment.nextEvent();
+    assert.equal(
+      secondEvent?.type,
+      "output",
+      "raw-byte accounting must retain the second chunk instead of synthesizing a Gap",
+    );
+    if (secondEvent?.type === "output") {
+      assert.equal(secondEvent.chunk.data.length, secondBytes);
+      assert.equal(secondEvent.chunk.data[0], 0x42);
+      assert.equal(secondEvent.chunk.data.at(-1), 0x42);
+    }
+    attachment.close();
+  },
+);
+
 test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturation", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
@@ -2246,7 +2384,11 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
         type: "event",
         event: {
           type: "output",
-          chunk: { start_byte: startByte, end_byte: startByte + 1, data: [65] },
+          chunk: {
+            start_byte: startByte,
+            end_byte: startByte + 1,
+            data: new Uint8Array([65]),
+          },
         },
       });
     }
@@ -2259,7 +2401,7 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
       type: "event",
       event: {
         type: "output",
-        chunk: { start_byte: 257, end_byte: 258, data: [66] },
+        chunk: { start_byte: 257, end_byte: 258, data: new Uint8Array([66]) },
       },
     });
     peer.send({
@@ -2289,7 +2431,11 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
   for (let expected = 2; expected < 256; expected += 1) {
     assert.deepEqual(await attachment.nextEvent(), {
       type: "output",
-      chunk: { start_byte: expected, end_byte: expected + 1, data: [65] },
+      chunk: {
+        start_byte: expected,
+        end_byte: expected + 1,
+        data: new Uint8Array([65]),
+      },
     });
   }
   assert.deepEqual(await attachment.nextEvent(), {
@@ -2547,7 +2693,7 @@ class MockPeer {
   }
 
   public send(frame: ServerFrame): void {
-    this.#socket.write(`${JSON.stringify(frame)}\n`);
+    this.#socket.write(`${wireJson(frame)}\n`);
   }
 
   public sendRaw(frame: Uint8Array): void {
@@ -2555,7 +2701,7 @@ class MockPeer {
   }
 
   public async sendWithBackpressure(frame: ServerFrame): Promise<void> {
-    if (!this.#socket.write(`${JSON.stringify(frame)}\n`)) {
+    if (!this.#socket.write(`${wireJson(frame)}\n`)) {
       await once(this.#socket, "drain");
     }
   }
@@ -2574,6 +2720,14 @@ class MockPeer {
       ? undefined
       : (JSON.parse(result.value) as unknown);
   }
+}
+
+function wireJson(value: unknown): string {
+  return JSON.stringify(value, (_key, nested) =>
+    nested instanceof Uint8Array
+      ? Buffer.from(nested).toString("base64")
+      : nested,
+  );
 }
 
 async function mockDaemon(

@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 13
+# 003 — Unix socket and NDJSON protocol generation 14
 
-- Status: accepted for generation 13; pre-stable
+- Status: accepted for generation 14; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -26,6 +26,12 @@ compatibility value sent in the handshake is `ClientHello.protocol`; a public
 client validates RuntimeIdentity and compares its exact requirements before it
 sends any Request or Attach frame. A mismatch closes locally with
 `unsupported_capability`, so this decision adds no negotiation frame.
+
+`OutputChunk.data` is encoded as one strict padded standard-base64 string on
+the JSON wire. The Rust owner and persistence layer keep raw `Vec<u8>` values;
+the TypeScript SDK decodes each chunk once to `Uint8Array` before exposing it or
+applying byte-based queue limits. There is no integer-array or dual-encoding
+fallback.
 
 ## Quality attributes and invariants
 
@@ -55,8 +61,8 @@ sends any Request or Attach frame. A mismatch closes locally with
 ## Known constraints
 
 The socket has no peer-credential check, short-request ID, timeout,
-cancellation, or Windows equivalent. JSON
-represents bytes as integer arrays. Attachment command IDs provide correlation
+cancellation, or Windows equivalent. JSON represents output bytes as strict
+padded base64 strings. Attachment command IDs provide correlation
 only inside one live connection. Startup revalidation closes the known
 probe-to-unlink replacement schedule. The shutdown guard retains the bound
 path's device/inode and removes the pathname only while its current socket
@@ -66,10 +72,12 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 13 directly replaces generation 12. It separates
+Protocol generation 14 directly replaces generation 13. It separates
 cursor-free non-output `observation_discontinuity` from raw-output `gap`; there
 is no fallback encoding that falsely treats tmux observation loss as byte
-replay. Generation 12 added one explicit `attach_recoverable_stop` composite so
+replay. Generation 13 used integer-array output bytes; generation 14 replaces
+that wire shape with strict padded base64. Generation 12 added one explicit
+`attach_recoverable_stop` composite so
 terminal attachment recovery intent is present before the ordinary
 terminal-event/EOF boundary. Generation 11
 requires one caller-retained recoverable native Stop operation and advertises
@@ -84,7 +92,7 @@ keys and receipts; generation 6 introduced the narrow `run_capacity` error;
 generation 5 introduced correlated attachment controls, typed owner receipts,
 failure dispositions, and applied PTY-size readback; generation 4 introduced
 bounded creation keys. An older peer fails the exact generation handshake
-before request dispatch; ctxmux does not provide a generation-12 fallback,
+before request dispatch; ctxmux does not provide a generation-13 fallback,
 migration, alias, version range, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 

@@ -13,7 +13,7 @@ export type OutputChunk = {
    */
   end_byte: number;
   /**
-   * Raw PTY bytes. JSON represents these as an integer array in generation 13.
+   * Raw PTY bytes. JSON represents these as strict padded base64 in generation 14.
    */
-  data: Array<number>;
+  data: Uint8Array;
 };

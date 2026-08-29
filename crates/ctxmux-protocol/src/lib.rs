@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 13;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -913,8 +913,35 @@ pub struct OutputChunk {
     pub start_byte: u64,
     /// Exclusive cumulative byte offset immediately after `data`.
     pub end_byte: u64,
-    /// Raw PTY bytes. JSON represents these as an integer array in generation 13.
+    /// Raw PTY bytes. JSON represents these as strict padded base64 in generation 14.
+    #[serde(with = "output_chunk_bytes")]
+    #[ts(type = "Uint8Array")]
     pub data: Vec<u8>,
+}
+
+/// The only wire representation for retained PTY bytes.
+///
+/// Keeping this codec next to the protocol owner makes the generation-14
+/// replacement explicit: persistence and native owners continue to use raw
+/// `Vec<u8>`, while JSON frames carry one canonical padded base64 string.
+mod output_chunk_bytes {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
+
+    pub(super) fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(D::Error::custom)
+    }
 }
 
 /// Bounded output retained for a newly attached client.
@@ -1543,7 +1570,7 @@ mod tests {
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
         ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
         MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION,
-        MAX_STOP_OPERATION_KEY_BYTES, PROTOCOL_VERSION, ProtocolError,
+        MAX_STOP_OPERATION_KEY_BYTES, OutputChunk, PROTOCOL_VERSION, ProtocolError,
         RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
         RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
@@ -1644,7 +1671,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_13_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_14_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1662,7 +1689,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 13,
+                    "protocolGeneration": 14,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -1735,7 +1762,48 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_stop_requests_have_exact_generation_13_wire_shapes() {
+    fn output_chunks_use_strict_padded_base64_on_the_generation_14_wire() {
+        let chunk = OutputChunk {
+            start_byte: 7,
+            end_byte: 9,
+            data: vec![0, 255],
+        };
+        assert_eq!(
+            serde_json::to_value(RunEvent::Output {
+                chunk: chunk.clone(),
+            })
+            .unwrap(),
+            serde_json::json!({
+                "type": "output",
+                "chunk": {"start_byte": 7, "end_byte": 9, "data": "AP8="},
+            })
+        );
+        let encoded = encode_frame(&ServerFrame::Event {
+            event: RunEvent::Output {
+                chunk: chunk.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encoded).unwrap(),
+            ServerFrame::Event {
+                event: RunEvent::Output { chunk },
+            }
+        );
+
+        for invalid in ["!!!!", "AA", "AA=", "AB==", "A A==", "AA==\n"] {
+            let frame = format!(
+                r#"{{"type":"event","event":{{"type":"output","chunk":{{"start_byte":0,"end_byte":1,"data":"{invalid}"}}}}}}"#
+            );
+            assert!(
+                decode_frame::<ServerFrame>(frame).is_err(),
+                "non-canonical or invalid base64 must fail: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn recoverable_stop_requests_have_exact_generation_14_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();

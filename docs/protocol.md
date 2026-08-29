@@ -1,4 +1,4 @@
-# Local Protocol Generation 13
+# Local Protocol Generation 14
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -13,7 +13,9 @@ fallbacks or migrations.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
 - A frame may not exceed 1 MiB.
-- Raw PTY bytes are represented as integer arrays in generation 13.
+- Raw PTY bytes are represented as strict padded standard-base64 strings in
+  generation 14. SDK clients decode them once to `Uint8Array` values before
+  exposing events or applying byte-based queue limits.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
 the daemon refuses to replace it. A stale socket is removed only after verifying
@@ -28,7 +30,7 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. A successful generation-13
+The generation fence covers the wire contract only. A successful generation-14
 Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
 ```ts
@@ -138,7 +140,7 @@ them from platform or executable state.
 Rust `ping` and `runtime_info`, TypeScript `runtimeInfo`, and CLI
 connect-or-spawn readiness remain raw identity inspection paths. “Raw” bypasses
 configured identity and capability requirements; framing, the exact identity shape,
-and protocol generation are still validated. Generation 13 adds no
+and protocol generation are still validated. Generation 14 adds no
 version-range or capability negotiation, endpoint discovery, dynamic registry,
 Provider catalog, plugin discovery, or host/credential identity.
 
@@ -220,14 +222,14 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 13.
+ownership in generation 14.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
 Run are distinct public error categories. Unsupported or invalid behavior never
 silently succeeds.
 
-Generation 13 retains `run_capacity` for the global retained-Run admission
+Generation 14 retains `run_capacity` for the global retained-Run admission
 boundary owned by Decision 013. In memory-only mode it means no exact eligible
 terminal replacement can satisfy projected record capacity and is returned
 before native spawn or tmux Control startup. In persistent mode it also means
@@ -236,7 +238,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-13 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-14 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -259,7 +261,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-13 decoding and
+The daemon compares canonical typed requests after generation-14 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -517,7 +519,7 @@ change.
 
 A linked pane can appear in more than one discovery row with the same pane ID
 but different session/window associations. Discovery preserves those public
-associations. Generation 13 import accepts only socket path plus pane ID, so it
+associations. Generation 14 import accepts only socket path plus pane ID, so it
 fails with `target_changed` unless that pair resolves to exactly one complete
 tuple; it never chooses an association by row order.
 
@@ -532,7 +534,7 @@ faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
 readiness rejects import; after readiness it interrupts the Run with
 `tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
-Generation 13 does not claim general tmux command correlation beyond those bounded
+Generation 14 does not claim general tmux command correlation beyond those bounded
 serial operations.
 
 Tmux owns the pane process and PTY throughout. Disconnecting ctxmux clients or
@@ -578,7 +580,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-13 peer that puts `chunks` back into the header is invalid.
+generation-14 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports raw-output delivery discontinuity only.
 It is not a recovery cursor: the caller must reattach using its own last
@@ -626,7 +628,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemonInstanceId` in the ordinary generation-13 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-14 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -654,7 +656,7 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 13 gains no upgrade wire
+strictly bounded, unique, and validated; generation 14 gains no upgrade wire
 operation.
 
 An output append or terminal finalize that receives SQLite's typed `DiskFull`,
@@ -702,6 +704,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-13 frame at runtime, rejects duplicate
+validates the complete nested generation-14 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

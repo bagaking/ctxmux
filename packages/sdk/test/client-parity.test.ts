@@ -948,7 +948,7 @@ async function waitForOutput(
     if (event?.type === "output") {
       assert.equal(event.chunk.start_byte, lastByte);
       lastByte = event.chunk.end_byte;
-      observed = append(observed, Uint8Array.from(event.chunk.data));
+      observed = append(observed, event.chunk.data);
     } else if (event?.type === "gap") {
       throw new Error(`unexpected output gap at ${event.latest_output_bytes}`);
     } else if (event?.type === "exited") {
@@ -1087,9 +1087,12 @@ async function terminate(child: ChildProcess): Promise<void> {
 }
 
 function replayBytes(
-  chunks: readonly { readonly data: readonly number[] }[],
+  chunks: readonly { readonly data: Uint8Array }[],
 ): Uint8Array {
-  return Uint8Array.from(chunks.flatMap((chunk) => [...chunk.data]));
+  return append(
+    new Uint8Array(),
+    Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.data))),
+  );
 }
 
 function append(left: Uint8Array, right: Uint8Array): Uint8Array {
