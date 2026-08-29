@@ -194,9 +194,15 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 2,
-      "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check-remote-runtime.sh --stage partition",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
       "notes": []
     },
     {
@@ -372,9 +378,15 @@
       ],
       "supersedes": [],
       "introduced_in_revision": 5,
-      "status": "in_progress",
-      "gate_result": null,
-      "last_gate_commands": [],
+      "status": "done",
+      "gate_result": "pass",
+      "last_gate_commands": [
+        {
+          "command": "scripts/check.sh",
+          "exit_code": 0,
+          "status": "pass"
+        }
+      ],
       "notes": []
     },
     {

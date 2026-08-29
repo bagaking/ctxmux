@@ -4,7 +4,7 @@
   "title": "Carry Runs through an owner-host Remote Runtime",
   "slug": "remote-runtime-transport",
   "goal": "After the local Runtime contract is qualified, carry the existing public ctxmux protocol through a system OpenSSH StreamLocal tunnel to an owner-host ctxmuxd while preserving remote lifecycle truth, exact Runtime and Run identity, reconnect and replay, owner-issued Stop receipts, and fail-closed mixed capabilities without adding Relay, accounts, a control plane, orchestration, or derivation metadata.",
-  "status": "in_progress",
+  "status": "ready",
   "workspace_mode": "worktree",
   "base_ref": "main",
   "branch": "feat/f-22hjbhvt8",
@@ -15,19 +15,19 @@
   "counters": {
     "gate_fail_streak": 0,
     "no_progress_rounds": 0,
-    "round_count": 7
+    "round_count": 13
   },
   "gate": {
     "last_result": "pass",
-    "last_task_id": "T-006",
+    "last_task_id": "T-007",
     "last_check_commands": [
       {
-        "command": "scripts/check-remote-runtime.sh --stage capability",
+        "command": "scripts/check.sh",
         "exit_code": 0,
         "status": "pass"
       }
     ],
-    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-006-r7-0001.log"
+    "last_log_path": ".bagakit/feature-tracker/features/f-22hjbhvt8/artifacts/gate-T-007-r13-0001.log"
   },
   "history": [
     {
@@ -145,6 +145,38 @@
     {
       "action": "task_started",
       "detail": "T-007"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-003 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-003 => done"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-007 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-007 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-007 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-007 => fail"
+    },
+    {
+      "action": "task_gate",
+      "detail": "T-007 => pass"
+    },
+    {
+      "action": "task_finished",
+      "detail": "T-007 => done"
     }
   ],
   "depends_on": []

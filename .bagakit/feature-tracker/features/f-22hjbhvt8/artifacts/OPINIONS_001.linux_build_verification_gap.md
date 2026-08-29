@@ -1,6 +1,8 @@
 # Observation — `main` does not compile for Linux, and a fix was already written
 
-- Recorded: 2026-08-29, during `f-22hjbhvt8` revision 5 execution.
+- Recorded: 2026-08-29, during `f-22hjbhvt8` revision 5 execution. Revised the
+  same day once a local Linux compile was actually produced, which narrowed the
+  root cause and retired the claim that no local route existed.
 - Source: independent read-only forensic audit commissioned by the supervisor
   after a Linux cross-build for the remote qualification host failed to compile.
 - Status: **outside this Feature's scope.** Recorded here because this Feature
@@ -17,7 +19,7 @@ Ok(system.processes().keys().map(sysinfo::Pid::as_u32).collect())
 
 `Pid::as_u32` takes `self`; `HashMap::keys()` yields `&Pid`. The function-item
 path therefore needs `FnMut(&Pid) -> u32` and does not type-check. This is
-present verbatim in both local `main` (`1c917ff`) and `origin/main` (`a089708`)
+present verbatim in both local `main` (`e0f3d69`) and `origin/main` (`a089708`)
 at the time of writing — verified by reading both trees, not inferred.
 
 `crates/ctxmux-daemon/src/lib.rs:31` declares `mod native_session;` with no cfg,
@@ -77,26 +79,52 @@ under `macos`. Linux-only test helpers in `native_lifecycle.rs` and
 An audit of "are there other Linux errors" run *before* the fix cannot answer the
 question: rustc stops after it cannot compile an item, so everything downstream
 was never type-checked. A complete Linux compile is required to make that claim,
-and T-008 owns producing one.
+and the run recorded in the next section makes it: with the fix in place, every
+one of these islands type-checks. The downstream surface was clean; only the one
+line was broken.
 
-## No local route currently proves a Linux build
+## A local route does prove a Linux build, once zig is present
 
 `cargo check --target x86_64-unknown-linux-gnu` fails inside `cc-rs` looking for
 `x86_64-linux-gnu-gcc`, because `rusqlite` bundles SQLite and needs a cross C
-toolchain. The target is installed; the C toolchain is not. A `zig`-based
-cross-build did get through.
+toolchain. The rustc target is installed; the C toolchain is not. Docker is
+installed but its daemon hangs, so it is not a route either.
 
-This is the defect behind the defect: a repository whose CI declares Linux
-support, but which offers no local way to prove a Linux build before merge, will
-keep admitting `cfg`-gated breakage. T-008 makes a real-Linux run of the complete
-gate a merge condition for this Feature. Making it a standing repository
-guarantee is a separate decision the Owner owns.
+`cargo-zigbuild` is the route that works, because zig supplies the cross C
+compiler:
+
+```
+PATH="<zig-0.16.0-dir>:$PATH" cargo zigbuild --locked \
+  --target x86_64-unknown-linux-gnu --workspace --all-targets
+```
+
+Run on 2026-08-29 against this Feature's branch: the whole workspace, all 11
+crates and every test target, compiled with **0 errors and 0 warnings**.
+
+Two checks make that result meaningful rather than vacuous. `sysinfo` appears in
+`target/x86_64-unknown-linux-gnu/debug/deps/`, and it links only under
+`not(macos)` — so the gated islands were genuinely compiled. And reintroducing
+the original `.map(sysinfo::Pid::as_u32)` reproduces the exact `main` failure
+(`expected fn(&sysinfo::Pid) -> _`), which proves the route type-checks that
+specific line rather than reaching a cached result.
+
+So the defect behind the defect is narrower than first recorded: the repository
+is not missing a *possible* local Linux build, it is missing a *routine* one.
+Nothing in the toolchain needs inventing; a documented command needs running
+before merge. T-008 requires a real-Linux *execution* of the complete gate, which
+the cross-build above does not supply: it proves the workspace compiles for
+Linux, including the cfg islands macOS never sees, and nothing about running the
+suites there. T-008 stays open on that basis. Whether a local Linux compile
+becomes a standing repository guarantee — a script, a `check.sh` stage, or a
+pre-merge hook — is a separate decision the Owner owns, and this Feature
+deliberately does not make it.
 
 ## What this Feature did and did not do
 
-Did: fixed the line on the feature branch (`547b720`), because the remote
-qualification host needs a daemon that compiles for Linux, and opened T-008 to
-close the verification gap for this Feature's merge.
+Did: fixed the line on the feature branch (`0a97cd8`), because the remote
+qualification host needs a daemon that compiles for Linux, and produced a
+complete Linux compile of the workspace. That compile is evidence *for* T-008,
+not its closure: T-008 asks for the gate to run on real Linux.
 
 Did not: fix `main`, merge `origin/fix/linux-pid-as-u32`, or change CI. Landing a
 `main` repair inside a transport Feature would blur attribution for both. The

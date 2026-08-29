@@ -18,7 +18,7 @@ Second, that Linux cross-build immediately exposed a compile error the local
 macOS build could never see: `native_session.rs`'s
 `#[cfg(not(target_os = "macos"))] fn process_ids()` did not type-check, because
 `Pid::as_u32` takes `self` while `HashMap::keys()` yields references. The line
-was fixed in `547b720`.
+was fixed in `0a97cd8`.
 
 The line mattered less than what it revealed. Local verification is macOS-only,
 so every `cfg` branch macOS does not compile is unverified before merge. Fixing
@@ -79,7 +79,7 @@ every commit. That keeps a small change from triggering a whole-repository
 regression, which is a standing project principle, while still ensuring no
 verified result sits only in an uncommitted tree.
 
-`547b720` is the first such checkpoint and already landed.
+`0a97cd8` is the first such checkpoint and already landed.
 
 ## What does not change
 

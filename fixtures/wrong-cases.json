@@ -999,6 +999,142 @@
           "anchor": "Recoverable Stop replays one receipt after response loss and client replacement"
         }
       ]
+    },
+    {
+      "id": "REMOTE-01",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n02"],
+      "source_refs": ["https://man.openbsd.org/ssh_config"],
+      "failure_mechanism": "Without ExitOnForwardFailure, ssh can keep a live session after a refused forward, so a local socket exists and carries nothing. A client then connects to a path that looks usable and never reaches the owner host.",
+      "invariant": "A refused forward fails the endpoint. Readiness is proven by an actual connection to the forwarded socket, never by the path existing or by elapsed time.",
+      "preconditions": "An endpoint whose owner-host socket is absent, so the forward cannot be established.",
+      "action": "Request an endpoint against a missing owner-host listener and inspect the returned result and the emitted ssh option list.",
+      "oracle": "The endpoint fails explicitly instead of returning a socket path, and the fixed option list contains ExitOnForwardFailure=yes.",
+      "platform": ["unix"],
+      "tags": ["remote", "transport", "fail-closed", "readiness"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "a_missing_owner_host_listener_fails_closed"
+        },
+        {
+          "path": "crates/ctxmux-remote/src/lib.rs",
+          "anchor": "fixed_options_refuse_prompting_and_silent_forward_failure"
+        }
+      ]
+    },
+    {
+      "id": "REMOTE-02",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n02"],
+      "source_refs": ["https://man.openbsd.org/ssh_config"],
+      "failure_mechanism": "A missing credential without BatchMode turns a programmatic endpoint request into an invisible wait on an interactive prompt no caller is reading.",
+      "invariant": "The endpoint never prompts. A credential or host-trust problem is a fast explicit failure the caller can act on.",
+      "preconditions": "The production argument builder is inspected directly.",
+      "action": "Build the argument list for one endpoint and assert the non-interactive options are present and fixed.",
+      "oracle": "BatchMode=yes is always present and is not caller-overridable ahead of the destination.",
+      "platform": ["unix"],
+      "tags": ["remote", "transport", "credentials", "fail-closed"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-remote/src/lib.rs",
+          "anchor": "fixed_options_refuse_prompting_and_silent_forward_failure"
+        }
+      ]
+    },
+    {
+      "id": "REMOTE-03",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n03"],
+      "source_refs": ["https://man.openbsd.org/ssh"],
+      "failure_mechanism": "A destination beginning with '-' is parsed by ssh as an option, so a caller-supplied string such as an option-shaped value could change the connection's behavior instead of naming a host.",
+      "invariant": "An option-shaped destination is refused at construction, and the destination is always passed last so it cannot be read as an option.",
+      "preconditions": "Endpoint construction with a hostile destination string.",
+      "action": "Construct endpoints with an option-shaped and an empty destination, and inspect argument order for a valid one.",
+      "oracle": "Construction fails for both hostile inputs, and a valid destination is the final argument.",
+      "platform": ["unix"],
+      "tags": ["remote", "transport", "security", "argument-safety"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-remote/src/lib.rs",
+          "anchor": "option_shaped_destination_is_refused"
+        },
+        {
+          "path": "crates/ctxmux-remote/src/lib.rs",
+          "anchor": "destination_is_last_so_it_cannot_be_read_as_an_option"
+        }
+      ]
+    },
+    {
+      "id": "REMOTE-04",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n02"],
+      "source_refs": ["https://man.openbsd.org/ssh_config"],
+      "failure_mechanism": "A dropped or shut-down endpoint that leaves its ssh child running holds an authenticated channel and a bound socket open after the caller believes the endpoint is closed.",
+      "invariant": "Explicit shutdown and guard drop both remove the forwarded socket, its owner-only private directory, and the forwarding process. Shutdown is bounded, so a wedged forwarder cannot hold the caller open.",
+      "preconditions": "A live endpoint against a real owner-host daemon.",
+      "action": "Establish an endpoint and close it explicitly; separately establish one and let its guard drop without shutdown.",
+      "oracle": "In both cases the forwarded socket and the private directory are gone afterwards, and a live endpoint reports connected beforehand.",
+      "platform": ["unix"],
+      "tags": ["remote", "transport", "resource-leak", "cleanup"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "shutdown_removes_the_socket_directory_and_process"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "dropping_the_guard_cleans_up"
+        }
+      ]
+    },
+    {
+      "id": "REMOTE-05",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n02"],
+      "source_refs": ["https://man.openbsd.org/ssh_config"],
+      "failure_mechanism": "A consumer that reads transport loss as lifecycle truth treats a network partition as an exited Run, so work that is still running is reported dead and may be restarted or discarded.",
+      "invariant": "Transport loss changes only client-local reachability. It publishes no exit, interruption, or synthetic RunState, and only the owner-host daemon may publish lifecycle truth. Reconnect binds the exact Runtime and Run and finds the same remote child.",
+      "preconditions": "A running Run owned by an owner-host daemon, reached through an endpoint that can be destroyed independently.",
+      "action": "Start a Run through the endpoint, destroy the endpoint, then observe the Run directly at the owner and reconnect through a fresh endpoint.",
+      "oracle": "The owner still reports the Run running with the same pid, the removed local socket answers nothing, and reconnect resolves the same Runtime, Run, and pid.",
+      "platform": ["unix"],
+      "tags": ["remote", "lifecycle", "partition", "reachability"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "losing_the_tunnel_is_not_lifecycle_truth"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "forwarded_socket_reaches_the_owner_host_runtime"
+        }
+      ]
+    },
+    {
+      "id": "REMOTE-06",
+      "choice": "018-remote-endpoint-transport",
+      "source_ids": ["n02"],
+      "source_refs": ["https://man.openbsd.org/ssh_config"],
+      "failure_mechanism": "A remote transport that adds its own replay or gap representation creates a second recovery state machine, so a consumer must reconcile two disagreeing notions of what was missed.",
+      "invariant": "Remote reuses the local ordered-byte contract verbatim. Output produced while a caller was disconnected replays from that caller's own byte cursor, or reports explicit truncation; no remote-specific cursor authority exists.",
+      "preconditions": "A Run whose second output burst can be caused after the caller's transport is already gone, so the bytes are provably produced while disconnected.",
+      "action": "Observe a first burst and retain the cursor, destroy the endpoint, cause the second burst through the owner, then reconnect and replay from the retained cursor.",
+      "oracle": "Replay from the caller's own cursor contains the bytes written while disconnected and does not report truncation for retained history.",
+      "platform": ["unix"],
+      "tags": ["remote", "replay", "ordered-bytes", "partition"],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
+          "anchor": "output_written_while_disconnected_replays_from_the_caller_cursor"
+        }
+      ]
     }
   ]
 }
