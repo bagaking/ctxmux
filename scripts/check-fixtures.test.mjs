@@ -166,6 +166,16 @@ test("rejects test commands removed from check.sh", (context) => {
   );
 });
 
+test("accepts required cargo test options in check.sh", (context) => {
+  const root = setup(context);
+  write(
+    root,
+    "scripts/check.sh",
+    "cargo test --workspace --all-targets --no-fail-fast\nnpm test\n",
+  );
+  assert.deepEqual(loadFixtureTestTargetContext(root).errors, []);
+});
+
 test("requires T-nnn activation owners in the current Feature", (context) => {
   const root = setup(context);
   write(
