@@ -5536,6 +5536,63 @@ mod tests {
         transaction.commit().expect("commit replay pruning");
     }
 
+    /// An empty replay reaches a real COMMIT -- and that COMMIT is cheap.
+    ///
+    /// Every create ends in `activate_persistence_after_publication`, which
+    /// appends `replay(0)` unconditionally. On a Run that has produced nothing
+    /// -- the common case, since activation happens microseconds after spawn --
+    /// that replay is empty, and `append_batch` does not skip it: the
+    /// `groups.is_empty()` arm issues its own `append_transaction`.
+    ///
+    /// Counting stops there, so this test only pins the count. It is NOT a
+    /// standing invitation to remove the append: the commit was measured at
+    /// 0.043 ms median against 0.303 ms for the same path carrying three bytes.
+    /// A COMMIT with no dirty page to flush is ~7x cheaper than one with, so
+    /// the create path would reclaim ~0.6% by skipping it. Guarding the call
+    /// site was investigated and rejected on that measurement.
+    ///
+    /// Kept because the count is a real fact worth pinning: if a future change
+    /// makes this empty append expensive (a dirty page, a schema bump, an
+    /// autocheckpoint), the cost moves but this assertion will not notice --
+    /// re-measure rather than trusting the count alone.
+    #[test]
+    fn an_empty_replay_still_costs_one_commit() {
+        let temp = TempDir::new().expect("create empty-append fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open empty-append store");
+        assert!(recovered.is_empty());
+        let id = RunId::new();
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start empty-append fixture transaction");
+        insert_test_run(&transaction, id, "running", 1);
+        transaction
+            .commit()
+            .expect("commit empty-append fixture Run");
+
+        hooks.append_transaction_commits.store(0, Ordering::Release);
+        let head = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        store
+            .append_batch(&[(id, replay(Vec::new()), Arc::clone(&head))])
+            .expect("append an empty replay");
+
+        assert_eq!(
+            hooks.append_transaction_commits.load(Ordering::Acquire),
+            1,
+            "an empty replay reaches a real COMMIT (measured cheap: 0.043 ms \
+             vs 0.303 ms carrying bytes)"
+        );
+        assert_eq!(head.load(Ordering::Acquire), 0, "no bytes became durable");
+    }
+
     #[test]
     fn append_batch_commits_one_collected_payload_unit() {
         let temp = TempDir::new().expect("create append-batch fixture");
