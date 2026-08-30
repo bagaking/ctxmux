@@ -603,11 +603,21 @@ function tierRefusalReasons(tierVerdicts) {
   if (breaches.length > 0) {
     reasons.push(`a derived ceiling was exceeded: ${breaches.join(", ")}`);
   }
+  const VERDICT_SUFFIX = "_verdict";
   for (const entry of tierVerdicts) {
-    for (const verdict of [entry.list_verdict, entry.admission_verdict]) {
+    // Every named sub-verdict a cell carries, not a hand-listed pair. A verdict
+    // whose reason is not collected here still fails the cell — `pass` is
+    // computed independently — but it fails it silently, with the top-level
+    // refusal saying nothing about why. Deriving the list from the cell means
+    // adding a sub-verdict cannot leave the reader without an explanation.
+    const verdicts = Object.entries(entry).filter(([key]) =>
+      key.endsWith(VERDICT_SUFFIX),
+    );
+    for (const [key, verdict] of verdicts) {
       if (verdict && !verdict.pass) {
+        const name = key.slice(0, -VERDICT_SUFFIX.length);
         reasons.push(
-          verdict.reason ?? `tier ${entry.tier} ${entry.mode}: verdict failed`,
+          verdict.reason ?? `tier ${entry.tier} ${entry.mode}: ${name} failed`,
         );
       }
     }
@@ -661,21 +671,17 @@ function renderVerdict({ thresholds, receipt, root }) {
         // further, so retained bytes can fall while this only ever rises.
         // Grading it against the 1 GiB cap of #47 would fail a healthy daemon
         // as soon as its Runs had *emitted* a gigabyte, whenever emitted.
-        //
-        // So #47's daemon-wide cap has no proof at farm scale, and this field
-        // is not it. The number that would prove it — OutputLog::retained_bytes
-        // — is computed in the daemon but absent from the protocol, so the
-        // census cannot read it (the darwin gate reaches it only by replaying
-        // every Run, which does not survive thousands of Runs). Closing the
-        // gap needs the wire change first; until then this stays a reported
-        // observation, because a check that grades the wrong quantity is worse
-        // than a documented hole.
+        // `aggregate_retained_bytes`, judged below, is the quantity that cap
+        // actually bounds; this one stays context.
         aggregate_output_bytes_lifetime:
           cell.aggregate_output_bytes_lifetime ?? null,
+        aggregate_retained_bytes: cell.aggregate_retained_bytes ?? null,
+        retention_verdict: judgeRetentionBudget(cell),
         pass:
           checks.every((entry) => entry.pass) &&
           judgeListBehaviour(cell, tier, mode).pass &&
-          judgeAdmissionBehaviour(cell, tier, mode).pass,
+          judgeAdmissionBehaviour(cell, tier, mode).pass &&
+          judgeRetentionBudget(cell).pass,
         list_verdict: judgeListBehaviour(cell, tier, mode),
         admission_verdict: judgeAdmissionBehaviour(cell, tier, mode),
       });
@@ -778,6 +784,67 @@ function judgeListBehaviour(cell, tier, mode) {
   return { pass: true, latency_ms: round(latency) };
 }
 
+/// The daemon-wide retained-byte ceiling, mirrored from
+/// `RETENTION_BUDGET_BYTES` in crates/ctxmux-daemon/src/retention.rs.
+///
+/// HARDCODED ON PURPOSE, and this is the whole point of the check. Every other
+/// cost ceiling in this harness is derived from the same run that produces the
+/// receipt (observed x 1.5), so a daemon that regressed simply authorizes its
+/// own new cost. A retention cap cannot be graded that way: the quantity is a
+/// promise the daemon makes, so the number must come from the source and be
+/// changed only by editing both places together.
+const RETENTION_BUDGET_CEILING_BYTES = 1024 * 1024 * 1024;
+
+/// Verdict on the fleet-wide retained-byte cap of #47.
+///
+/// The daemon promises that the sum of what every Run is holding stays at or
+/// under RETENTION_BUDGET_BYTES, trimming across Run boundaries to keep it
+/// there. This re-derives that sum from the listing rows — independently of the
+/// daemon's own running total — and refuses if the fleet is over.
+///
+/// A cell that carries no `aggregate_retained_bytes` at all is NOT waved
+/// through. Absence used to be the normal case (the field was not on the wire),
+/// so treating it as "nothing to check" is exactly how this cap went unproven
+/// through an entire campaign. Now that every listing row carries it, a missing
+/// value means the census could not read it, and an unmeasured cap fails.
+function judgeRetentionBudget(cell) {
+  const retained = cell.aggregate_retained_bytes;
+  if (typeof retained !== "number" || !Number.isFinite(retained)) {
+    return {
+      pass: false,
+      reason:
+        "aggregate_retained_bytes is absent from this cell, so the daemon-wide " +
+        "retention cap was not measured. Every listing row carries retained= " +
+        "now, so absence means the census could not read it — an unmeasured " +
+        "cap is not a satisfied one",
+    };
+  }
+  if (retained < 0) {
+    return {
+      pass: false,
+      reason: `aggregate_retained_bytes is ${retained}; retained bytes cannot be negative, so the sum is corrupt`,
+    };
+  }
+  if (retained > RETENTION_BUDGET_CEILING_BYTES) {
+    return {
+      pass: false,
+      retained_bytes: retained,
+      ceiling_bytes: RETENTION_BUDGET_CEILING_BYTES,
+      reason:
+        `the fleet is holding ${retained} retained output bytes, past the ` +
+        `${RETENTION_BUDGET_CEILING_BYTES} byte daemon-wide cap. Cross-Run ` +
+        "reclamation is meant to hold this line no matter how many Runs stream " +
+        "at once; over it, an agent runtime's memory grows with fleet size " +
+        "instead of staying bounded",
+    };
+  }
+  return {
+    pass: true,
+    retained_bytes: retained,
+    ceiling_bytes: RETENTION_BUDGET_CEILING_BYTES,
+  };
+}
+
 /// Verdict on admission behaviour at the descriptor ceiling.
 ///
 /// The daemon must refuse excess Runs cleanly with run_capacity and never hit
@@ -871,6 +938,8 @@ function selfTest() {
     list_success: true,
     list_latency_ms: 5,
     aggregate_output_bytes_lifetime: 0,
+    // A healthy fleet well under the 1 GiB daemon-wide cap.
+    aggregate_retained_bytes: 64 * 1024 * 1024,
     admission_at_ceiling: {
       refused_cleanly: true,
       emfile: false,
@@ -1056,6 +1125,101 @@ function selfTest() {
     if (entry.agree) throw new Error("a stale baseline was silently accepted");
     return "below-baseline disagreement still fails closed";
   });
+
+  // The fleet-wide retention cap of #47. Unlike every other ceiling here, this
+  // one is hardcoded from the daemon source rather than derived from the run,
+  // so these cases also guard that property.
+  expectSuccess("a fleet under the retention cap passes", () => {
+    const verdict = judgeRetentionBudget(
+      goodCell({ aggregate_retained_bytes: 900 * 1024 * 1024 }),
+    );
+    if (!verdict.pass)
+      throw new Error(`under-cap fleet failed: ${verdict.reason}`);
+    return "900 MiB retained is under the 1 GiB cap";
+  });
+  expectSuccess("a fleet over the retention cap fails", () => {
+    const verdict = judgeRetentionBudget(
+      goodCell({ aggregate_retained_bytes: 1024 * 1024 * 1024 + 1 }),
+    );
+    if (verdict.pass) throw new Error("an over-cap fleet was scored as a pass");
+    if (!verdict.reason.includes("daemon-wide cap")) {
+      throw new Error(`unexpected reason: ${verdict.reason}`);
+    }
+    return "one byte over the cap refuses";
+  });
+  expectSuccess(
+    "a huge lifetime total with small retention still passes",
+    () => {
+      // The exact confusion this field was added to prevent. A long-lived fleet
+      // has emitted far more than the cap while holding almost nothing; grading
+      // the lifetime total would fail a perfectly healthy daemon.
+      const verdict = judgeRetentionBudget(
+        goodCell({
+          aggregate_output_bytes_lifetime: 500 * 1024 * 1024 * 1024,
+          aggregate_retained_bytes: 32 * 1024 * 1024,
+        }),
+      );
+      if (!verdict.pass) {
+        throw new Error(
+          `an aged but well-trimmed fleet failed: ${verdict.reason}`,
+        );
+      }
+      return "500 GiB emitted, 32 MiB held, passes";
+    },
+  );
+  expectSuccess("an unmeasured retention total fails closed", () => {
+    // Absence was the normal case before the wire carried this field, which is
+    // how the cap went unproven through a whole campaign. It must not read as
+    // "nothing to check".
+    const cell = goodCell();
+    delete cell.aggregate_retained_bytes;
+    const verdict = judgeRetentionBudget(cell);
+    if (verdict.pass) {
+      throw new Error("a cell with no retention measurement was passed");
+    }
+    return "missing measurement refuses";
+  });
+  expectSuccess("the retention ceiling matches the daemon constant", () => {
+    // Pins the mirrored constant. If RETENTION_BUDGET_BYTES moves in
+    // retention.rs and this does not, the gate silently grades against a stale
+    // promise -- passing a daemon that exceeds its real cap, or failing one
+    // that does not.
+    if (RETENTION_BUDGET_CEILING_BYTES !== 1024 * 1024 * 1024) {
+      throw new Error(
+        `ceiling drifted to ${RETENTION_BUDGET_CEILING_BYTES}; update ` +
+          "crates/ctxmux-daemon/src/retention.rs and this constant together",
+      );
+    }
+    return "1 GiB, mirrored from retention.rs";
+  });
+  expectSuccess(
+    "a failing retention verdict reaches the refusal reasons",
+    () => {
+      // The aggregator used to iterate a hand-listed pair of sub-verdicts, so a
+      // new one would fail its cell with no explanation at the top level.
+      const reasons = tierRefusalReasons([
+        {
+          tier: 128,
+          mode: "idle",
+          checks: [],
+          list_verdict: { pass: true },
+          admission_verdict: { pass: true },
+          retention_verdict: {
+            pass: false,
+            reason: "over the daemon-wide cap",
+          },
+        },
+      ]);
+      if (
+        !reasons.some((reason) => reason.includes("over the daemon-wide cap"))
+      ) {
+        throw new Error(
+          `retention refusal was not surfaced; got ${JSON.stringify(reasons)}`,
+        );
+      }
+      return "the reason is carried up";
+    },
+  );
 
   // Verdict wiring: a passing cell passes, a breaching cell fails.
   expectSuccess("a within-ceiling cell passes its verdict", () => {

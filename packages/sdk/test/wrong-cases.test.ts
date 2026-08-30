@@ -2818,6 +2818,10 @@ function runSummary() {
     pid: 42,
     state: { type: "running" as const },
     latest_output_bytes: 1,
+    // Deliberately below latest_output_bytes: a listing row reports what the
+    // Run holds now, not what it has ever emitted, and the two are equal only
+    // before anything has been trimmed.
+    retained_output_bytes: 0,
     attachments: 1,
   };
 }
