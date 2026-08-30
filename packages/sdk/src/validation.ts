@@ -298,6 +298,12 @@ function runEvent(value: unknown, path: string): void {
       return;
     case "observation_discontinuity":
       return;
+    case "resized":
+      // The owner only publishes a size it read back from the PTY, and it
+      // rejects a zero read-back rather than reporting it, so a zero here is
+      // a contract violation rather than a degenerate-but-legal terminal.
+      terminalSize(event.size, `${path}.size`, true);
+      return;
     case "gap":
       validateCursorValue(
         event.latest_output_bytes,
@@ -376,6 +382,14 @@ function runInfo(value: unknown, path: string): void {
   }
   if (backend === "tmux" && run.applied_input_bytes !== null) {
     throw invalid(`${path}.applied_input_bytes`, "null for a tmux Run");
+  }
+  if (run.current_size !== null) {
+    terminalSize(run.current_size, `${path}.current_size`, true);
+  }
+  // Only a live PTY owner can confirm a size, and tmux owns its own panes, so
+  // a dimension pair here would be an unconfirmed guess dressed as an answer.
+  if (backend === "tmux" && run.current_size !== null) {
+    throw invalid(`${path}.current_size`, "null for a tmux Run");
   }
 }
 

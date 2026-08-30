@@ -56,6 +56,7 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         first_available_byte: 0,
         attachments: 0,
         applied_input_bytes: 0,
+        current_size: { cols: 80, rows: 24 },
       };
     },
     async fork(): Promise<RunInfo> {
@@ -351,5 +352,6 @@ function rootRun(): RunInfo {
     first_available_byte: 0,
     attachments: 0,
     applied_input_bytes: 0,
+    current_size: { cols: 80, rows: 24 },
   };
 }

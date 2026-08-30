@@ -1120,6 +1120,9 @@ async fn wait_for_output(
             {
                 RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
                 RunEvent::Tmux { .. } => {}
+                RunEvent::Resized { size } => {
+                    panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
+                }
                 RunEvent::ObservationDiscontinuity => {
                     panic!("unexpected tmux observation discontinuity")
                 }
@@ -1152,6 +1155,9 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                 }
                 RunEvent::ObservationDiscontinuity => {
                     panic!("observation continuity was lost while waiting for {expected:?}")
+                }
+                RunEvent::Resized { size } => {
+                    panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
                 }
                 RunEvent::Output { .. } => {}
                 RunEvent::Gap {
@@ -1469,6 +1475,9 @@ async fn collect_exact_output_with_gap_replay(
                         break;
                     }
                     RunEvent::Tmux { .. } => {}
+                    RunEvent::Resized { size } => {
+                        panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
+                    }
                     RunEvent::Exited { state } => {
                         panic!("tmux Run exited during queued output: {state:?}")
                     }

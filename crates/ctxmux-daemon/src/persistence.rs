@@ -4422,6 +4422,11 @@ fn decode_recovered_row(
             first_available_byte,
             attachments: 0,
             applied_input_bytes: None,
+            // A recovered Run is historical: the replacement daemon holds its
+            // stored spec but no PTY to ask, exactly as with the input cursor
+            // above. The stored `spec.size` is the size once requested, not one
+            // any terminal is confirming now.
+            current_size: None,
         },
         replay: OutputReplay {
             chunks: load_recovered_chunks(connection, &id_text)?,
@@ -6690,6 +6695,7 @@ mod tests {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
         }
     }
 

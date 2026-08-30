@@ -910,6 +910,34 @@ pub struct RunInfo {
     /// Bytes successfully applied by the current native Input owner, or
     /// `None` when this Run has no current-incarnation native cursor authority.
     pub applied_input_bytes: Option<u64>,
+    /// Live PTY dimensions last confirmed by the owning terminal, or `None`
+    /// when no owner can confirm them.
+    ///
+    /// Distinct from `spec.size`, which is only the size *requested* at launch
+    /// and never changes afterwards. This field is the size the owning PTY
+    /// itself reported: it is seeded from the owner's read-back at creation and
+    /// replaced by the read-back of every applied resize, so a Run started at
+    /// 80x24 and resized to 200x87 reports `spec.size` 80x24 beside a
+    /// `current_size` of 200x87. A resize that fails, or whose read-back the
+    /// owner cannot complete, leaves the previous confirmed value in place
+    /// rather than recording a size no terminal ever acknowledged.
+    ///
+    /// `None` is a real answer, not a missing one, and it means exactly that no
+    /// owner is in a position to confirm a size:
+    ///
+    /// - a tmux-backed Run, whose pane is owned and resized by tmux — ctxmux
+    ///   observes that pane through public Control Mode and does not resize it
+    ///   (`RunCapabilities::TMUX_READ_ONLY.resize` is false), so any size it
+    ///   reported would be an import-time observation presented as live truth;
+    /// - a historical Run recovered by a replacement daemon, which holds a
+    ///   stored spec but no live PTY to ask.
+    ///
+    /// This is one dimension pair, not terminal contents. It does not record
+    /// when a resize happened, does not retain the sizes a Run passed through,
+    /// and does not let a caller reconstruct how a TUI was laid out at any
+    /// earlier point in the Run. A client that needs historical geometry must
+    /// observe [`RunEvent::Resized`] on a live attachment and retain it itself.
+    pub current_size: Option<TerminalSize>,
 }
 
 /// Backend owner of one Run, without any backend-specific identity payload.
@@ -1503,6 +1531,20 @@ pub struct AttachedHeader {
 pub enum RunEvent {
     /// New ordered PTY output.
     Output { chunk: OutputChunk },
+    /// The owning PTY confirmed new live dimensions.
+    ///
+    /// Published once per *applied* resize, carrying the size read back from
+    /// the owning terminal rather than the size the caller asked for — the
+    /// same value that command's `resize { applied_size }` receipt returns, and
+    /// the value the Run's `current_size` now reports. A resize that fails, or
+    /// whose read-back the owner cannot complete, publishes nothing: there is no
+    /// event for a size no terminal acknowledged.
+    ///
+    /// The daemon confirms the size and publishes this event under one owner
+    /// lock, so concurrent resizes are ordered and the last event an attachment
+    /// receives always matches the Run's `current_size`. A tmux-backed Run never
+    /// publishes it — ctxmux does not resize that pane.
+    Resized { size: TerminalSize },
     /// Terminal lifecycle state.
     Exited { state: RunState },
     /// Historical terminal state produced by restart reconciliation.
@@ -1809,6 +1851,13 @@ mod tests {
             first_available_byte: 0,
             attachments: 1,
             applied_input_bytes: Some(0),
+            // Deliberately not `spec.size`: a fixture that repeated the
+            // requested size would round-trip identically whether or not the
+            // two fields are actually independent on the wire.
+            current_size: Some(TerminalSize {
+                cols: 200,
+                rows: 87,
+            }),
         }
     }
 

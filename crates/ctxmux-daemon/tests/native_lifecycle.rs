@@ -769,6 +769,11 @@ async fn wait_for_output(
                 RunEvent::Exited { state } => {
                     panic!("Run exited before expected output: {state:?}")
                 }
+                // This helper is shared by tests that do resize while waiting
+                // for output. A confirmed resize is ordinary progress here, not
+                // a failure -- only the tests that assert a Run is never
+                // resized treat it as one.
+                RunEvent::Resized { .. } => {}
                 RunEvent::Interrupted { reason } => {
                     panic!("Run was interrupted before expected output: {reason:?}")
                 }
@@ -793,7 +798,9 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                 .expect("exit event arrives before attachment closes")
             {
                 RunEvent::Exited { state } => return state,
-                RunEvent::Output { .. } => {}
+                // Shared with tests that resize; a confirmed resize is no
+                // more a reason to fail here than an output chunk is.
+                RunEvent::Output { .. } | RunEvent::Resized { .. } => {}
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
@@ -1447,6 +1454,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
                         }
                         RunEvent::Gap { latest_output_bytes } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
                         RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
+                        RunEvent::Resized { .. } => {}
                         RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
                         RunEvent::ObservationDiscontinuity => panic!("unexpected non-output observation discontinuity"),
                     }
@@ -1562,7 +1570,9 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
                 .expect("Exited precedes attachment EOF")
             {
                 RunEvent::Exited { state } => return state,
-                RunEvent::Output { .. } => {}
+                // Shared with tests that resize; a confirmed resize is no
+                // more a reason to fail here than an output chunk is.
+                RunEvent::Output { .. } | RunEvent::Resized { .. } => {}
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected saturation gap at {latest_output_bytes}"),
@@ -5089,4 +5099,154 @@ async fn stop_once_reaches_the_daemon_in_a_single_connection() {
     );
 
     pump.abort();
+}
+
+/// `current_size` reports the owner-confirmed geometry, independently of the
+/// spec, and every applied resize reaches existing attachments in order.
+///
+/// The two fields answer different questions and a client needs both: `spec`
+/// records what the Run was *asked* to start at and never changes, while
+/// `current_size` is what the PTY says it is *now*. Before this existed the
+/// applied size survived only inside the receipt of the one call that caused
+/// it, so a client that attached later, or lost that response, had no way to
+/// learn the geometry short of asking the child to run `stty`.
+///
+/// `stty size` is the proof that matters: it is the child reading the kernel's
+/// window size through its own tty, so it cannot agree with `current_size`
+/// unless the daemon really applied the resize rather than merely recording it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn current_size_tracks_confirmed_resizes_independently_of_the_spec() {
+    let daemon = TestDaemon::start().await;
+    let spec_size = TerminalSize { cols: 80, rows: 24 };
+    let mut spec = interactive_shell();
+    spec.size = spec_size;
+    let run = daemon.client.start(spec).await.expect("start sized Run");
+
+    // At rest the two agree, but only because nothing has resized yet -- and
+    // this value came from the PTY, not from echoing the request back.
+    assert_eq!(
+        run.current_size,
+        Some(spec_size),
+        "a fresh Run reports the size its PTY confirms"
+    );
+
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach before resizing");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
+
+    let resized = TerminalSize {
+        cols: 200,
+        rows: 87,
+    };
+    let receipt = daemon
+        .client
+        .resize(run.id, resized)
+        .await
+        .expect("resize the live PTY");
+    assert_eq!(receipt.receipt.applied_size, resized);
+
+    // Criterion 2: the resize reaches an attachment that was already open, and
+    // carries the confirmed size rather than the requested one.
+    assert_eq!(
+        next_resized_event(&mut attachment, &mut observed, &mut last_seq).await,
+        resized,
+        "an existing attachment observes the applied resize"
+    );
+
+    // Criterion 1: status separates the two. The spec still says what it always
+    // said; only the confirmed size moved.
+    let status = daemon.client.status(run.id).await.expect("read status");
+    assert_eq!(status.current_size, Some(resized));
+    assert_eq!(
+        status
+            .spec
+            .as_ref()
+            .expect("native Run retains its spec")
+            .size,
+        spec_size,
+        "the launch spec is immutable and must not follow the live size"
+    );
+
+    // Criterion 3: a client attaching *after* the resize is told the new size by
+    // the snapshot itself, with no event replay required.
+    let (mut late, late_snapshot) = daemon
+        .client
+        .attach(run.id, last_seq)
+        .await
+        .expect("attach after resizing");
+    assert_eq!(
+        late_snapshot.run.current_size,
+        Some(resized),
+        "an attachment snapshot cannot report a size older than the Run's"
+    );
+
+    // The child's own view of its tty agrees, which is what makes the reported
+    // size a fact about the terminal instead of a daemon-side bookkeeping entry.
+    let mut late_observed = replay_bytes(&late_snapshot.replay.chunks);
+    let mut late_seq = late_snapshot.replay.latest_output_bytes;
+    late.input(b"size\n".to_vec())
+        .await
+        .expect("ask the child for its window size");
+    wait_for_output(&mut late, &mut late_observed, &mut late_seq, b"SIZE:87 200").await;
+
+    // A rejected resize publishes nothing and moves nothing: the last confirmed
+    // size stands rather than being replaced by one no terminal acknowledged.
+    assert_protocol_error(
+        daemon
+            .client
+            .resize(run.id, TerminalSize { cols: 0, rows: 40 })
+            .await
+            .expect_err("zero width is rejected"),
+        ErrorCode::InvalidRequest,
+    );
+    assert_eq!(
+        daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("read status after the rejected resize")
+            .current_size,
+        Some(resized),
+        "a failed resize leaves the previously confirmed size in place"
+    );
+
+    drop(late);
+    drop(attachment);
+    stop_run(&daemon.client, run.id).await;
+}
+
+/// Read events until the next `Resized`, tolerating interleaved output.
+///
+/// Output and resize share one ordered stream, so a resize issued while the
+/// child is talking arrives behind whatever bytes were already queued.
+async fn next_resized_event(
+    attachment: &mut Attachment,
+    observed: &mut Vec<u8>,
+    last_seq: &mut u64,
+) -> TerminalSize {
+    timeout(scaled(Duration::from_secs(10)), async {
+        loop {
+            match attachment
+                .next_event()
+                .await
+                .expect("read event while awaiting a resize")
+                .expect("attachment remains live")
+            {
+                RunEvent::Resized { size } => return size,
+                RunEvent::Output { chunk } => {
+                    assert_eq!(chunk.start_byte, *last_seq);
+                    *last_seq = chunk.end_byte;
+                    observed.extend_from_slice(&chunk.data);
+                }
+                event => panic!("unexpected event while awaiting a resize: {event:?}"),
+            }
+        }
+    })
+    .await
+    .expect("the applied resize reaches the open attachment")
 }

@@ -287,6 +287,15 @@ enum ChildReapState {
 
 struct NativeControlState {
     phase: ControlPhase,
+    /// Live PTY dimensions last read back from the owning terminal.
+    ///
+    /// Seeded at construction from the freshly opened master and replaced by
+    /// the read-back of each applied resize. It lives under this lock, rather
+    /// than beside the `pty` handle, because that makes confirming a new size
+    /// and publishing it one atomic step: see `resize`.
+    ///
+    /// `None` only when the owner could not read the master at construction.
+    confirmed_size: Option<TerminalSize>,
     input_failure: Option<ProtocolError>,
     input_queue: VecDeque<InputCommand>,
     input_commands: usize,
@@ -794,6 +803,10 @@ impl NativeControlOwner {
     ) -> Self {
         debug_assert!(input_result_max_entries > 0);
         debug_assert!(input_result_max_request_bytes > 0);
+        // Read the master before it moves into the mutex. A failure here is not
+        // fatal: the Run is fully usable, it just has no confirmed size to
+        // report until its first resize supplies one.
+        let pty_size = pty.get_size().ok();
         input_state
             .validate()
             .expect("re-adopted native Input state is validated before construction");
@@ -853,6 +866,12 @@ impl NativeControlOwner {
                 writer: Mutex::new(Some(writer)),
                 state: Mutex::new(NativeControlState {
                     phase: ControlPhase::Open,
+                    // Ask the master what it actually opened rather than
+                    // echoing the requested size back. The kernel is free to
+                    // clamp, and the requested value already lives in the
+                    // Run's `spec` -- a `current_size` that merely repeated it
+                    // would report an unconfirmed number as confirmed truth.
+                    confirmed_size: confirmed_size(pty_size),
                     input_failure: input_state.input_failure,
                     input_queue: VecDeque::new(),
                     input_commands: 0,
@@ -1597,11 +1616,35 @@ impl PendingSignal {
 }
 
 impl NativeControlOwner {
-    pub(crate) fn resize(&self, size: TerminalSize) -> ControlResult {
+    /// Last size the owning PTY confirmed, or `None` when none is confirmed.
+    pub(crate) fn confirmed_size(&self) -> Option<TerminalSize> {
+        mutex_lock(&self.inner.state).confirmed_size
+    }
+
+    /// Apply one resize, then confirm and publish the size the PTY reports.
+    ///
+    /// `publish` is invoked with the read-back size while this owner's state
+    /// lock is held, and only for a resize that actually applied. Holding the
+    /// lock across it is the whole ordering guarantee: two concurrent resizes
+    /// serialize here, so the stored `confirmed_size` and the order observers
+    /// see the events in cannot disagree. Publishing after releasing the lock
+    /// would let 80x24 and 200x87 be confirmed in one order and published in
+    /// the other, and an observer would watch the size go backwards.
+    ///
+    /// The callback therefore must not resize, read this Run's size, or take
+    /// the Run's `output`/`state` locks. Its one production caller hands it
+    /// straight to the live-event owner, whose `events.state` lock is never
+    /// held while this owner's lock is taken -- so the reverse edge does not
+    /// exist and this pair cannot cycle.
+    pub(crate) fn resize(
+        &self,
+        size: TerminalSize,
+        publish: impl FnOnce(TerminalSize),
+    ) -> ControlResult {
         // The phase lock makes stop/exit a fence for new resize operations.
         // portable-pty resize/get_size are short ioctl calls; no lock crosses
         // an await or the broader Run metadata path.
-        let state = mutex_lock(&self.inner.state);
+        let mut state = mutex_lock(&self.inner.state);
         if state.phase != ControlPhase::Open {
             return Err(not_applied(invalid_phase_error(
                 self.inner.run_id,
@@ -1631,7 +1674,11 @@ impl NativeControlOwner {
                 ),
             ))
         })?;
-        if applied.rows == 0 || applied.cols == 0 {
+        // A read-back the owner cannot vouch for publishes nothing and leaves
+        // the previously confirmed size standing. The mutation did cross the
+        // boundary, so the caller is told `unknown` -- but no observer is told
+        // a size that no terminal acknowledged.
+        let Some(applied) = confirmed_size(Some(applied)) else {
             return Err(unknown(ProtocolError::new(
                 ErrorCode::Io,
                 format!(
@@ -1639,12 +1686,12 @@ impl NativeControlOwner {
                     self.inner.run_id
                 ),
             )));
-        }
+        };
+        state.confirmed_size = Some(applied);
+        publish(applied);
+        drop(state);
         Ok(ControlReceipt::Resize {
-            applied_size: TerminalSize {
-                rows: applied.rows,
-                cols: applied.cols,
-            },
+            applied_size: applied,
         })
     }
 }
@@ -2046,6 +2093,20 @@ const fn to_pty_size(size: TerminalSize) -> PtySize {
     }
 }
 
+/// One PTY read-back accepted as a confirmed size, or `None`.
+///
+/// A zero row or column count is what the master reports when it has no
+/// window size to give. It is rejected rather than stored: `current_size` is
+/// meant to name a size some terminal acknowledged, and 0x0 names nothing.
+const fn confirmed_size(size: Option<PtySize>) -> Option<TerminalSize> {
+    match size {
+        Some(PtySize { rows, cols, .. }) if rows != 0 && cols != 0 => {
+            Some(TerminalSize { rows, cols })
+        }
+        _ => None,
+    }
+}
+
 fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -2438,10 +2499,13 @@ mod tests {
         // master) and the fd number is unchanged afterward. A cached number
         // could not carry a resize; only an open master fd can.
         let applied = owner
-            .resize(TerminalSize {
-                rows: 40,
-                cols: 132,
-            })
+            .resize(
+                TerminalSize {
+                    rows: 40,
+                    cols: 132,
+                },
+                |_| {},
+            )
             .expect("resize the live master exposed for handoff");
         assert_eq!(
             applied,
@@ -2573,7 +2637,7 @@ mod tests {
         );
         assert_eq!(
             owner
-                .resize(TerminalSize { rows: 24, cols: 80 })
+                .resize(TerminalSize { rows: 24, cols: 80 }, |_| {})
                 .expect_err("compacted closed control rejects resize")
                 .error
                 .code,
@@ -3200,13 +3264,30 @@ mod tests {
             CommandDisposition::NotApplied
         );
 
+        // This fake master clamps rows 30 -> 31, which is the only way to tell
+        // a read-back apart from an echo of the request: every field the owner
+        // reports -- receipt, published event, and retained `confirmed_size` --
+        // must carry 31, the size the terminal acknowledged, not the 30 asked
+        // for.
+        let mut published = Vec::new();
         assert_eq!(
             owner
-                .resize(TerminalSize { rows: 30, cols: 90 })
+                .resize(TerminalSize { rows: 30, cols: 90 }, |size| published
+                    .push(size))
                 .expect("resize remains available"),
             ControlReceipt::Resize {
                 applied_size: TerminalSize { rows: 31, cols: 90 },
             }
+        );
+        assert_eq!(
+            published,
+            vec![TerminalSize { rows: 31, cols: 90 }],
+            "exactly one event is published, carrying the clamped read-back"
+        );
+        assert_eq!(
+            owner.confirmed_size(),
+            Some(TerminalSize { rows: 31, cols: 90 }),
+            "the retained size is the clamped read-back, not the request"
         );
         let stop = owner.begin_stop().expect("stop remains available");
         let super::ChildCommand::Stop { reply, deadline: _ } = child
@@ -3314,5 +3395,103 @@ mod tests {
             .await
             .expect("global slot is handed to healthy Run");
         assert_eq!(*mutex_lock(&written), vec![3]);
+    }
+
+    /// Concurrent resizes publish in the same order they are confirmed.
+    ///
+    /// The store and the publish must be one atomic step. If the owner released
+    /// its lock before publishing, two resizes could be confirmed as 24 then 87
+    /// but published as 87 then 24 -- an observer would watch the terminal
+    /// shrink back, and the last event it received would disagree with the
+    /// Run's `current_size`.
+    ///
+    /// The gate has to sit in the publish callback, not in the PTY: a PTY that
+    /// stalls stalls *inside* the lock either way, so both orderings look
+    /// identical from there. Blocking the first resize's callback before it
+    /// records anything is what separates them -- while it waits, a second
+    /// resize either cannot proceed (lock held across publish, correct) or runs
+    /// to completion and publishes first (lock released early, the bug).
+    #[test]
+    fn concurrent_resizes_publish_in_confirmation_order() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+        let (owner, _commands) = owner(
+            Box::new(RecordingWriter(Arc::new(Mutex::new(Vec::new())))),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::with_limits(1, 64, 256 * 1024),
+        );
+
+        // The first callback parks while holding this log's lock, so a second
+        // publish that does slip through blocks here rather than recording --
+        // which is exactly what must be observed. The assertion below therefore
+        // checks the log is EMPTY at a point where a correct implementation has
+        // not even entered the second publish, rather than trying to catch the
+        // push itself.
+        let published = Arc::new(Mutex::new(Vec::new()));
+        let first = {
+            let owner = owner.clone();
+            let published = Arc::clone(&published);
+            std::thread::spawn(move || {
+                owner
+                    .resize(TerminalSize { rows: 24, cols: 80 }, |size| {
+                        // Announce and wait BEFORE recording. Recording first
+                        // would make both orderings produce the same log.
+                        entered_tx.send(()).expect("report publish entry");
+                        release_rx.recv().expect("await release inside publish");
+                        mutex_lock(&published).push(size);
+                    })
+                    .expect("first resize applies");
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first resize reaches its publish callback");
+
+        let second = {
+            let owner = owner.clone();
+            let published = Arc::clone(&published);
+            std::thread::spawn(move || {
+                owner
+                    .resize(
+                        TerminalSize {
+                            rows: 87,
+                            cols: 200,
+                        },
+                        |size| {
+                            mutex_lock(&published).push(size);
+                        },
+                    )
+                    .expect("second resize applies");
+            })
+        };
+
+        // Long enough for the second resize to finish if nothing holds it back.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            mutex_lock(&published).is_empty(),
+            "a second resize must not publish while the first holds the owner"
+        );
+
+        release_tx.send(()).expect("release the gated publish");
+        first.join().expect("first resize thread finishes");
+        second.join().expect("second resize thread finishes");
+
+        let published = mutex_lock(&published).clone();
+        assert_eq!(
+            published,
+            vec![
+                TerminalSize { rows: 24, cols: 80 },
+                TerminalSize {
+                    rows: 87,
+                    cols: 200
+                },
+            ],
+            "resizes publish in the order they were confirmed"
+        );
+        assert_eq!(
+            owner.confirmed_size(),
+            published.last().copied(),
+            "the retained size equals the last size published"
+        );
     }
 }

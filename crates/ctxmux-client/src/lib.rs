@@ -1436,6 +1436,7 @@ mod replay_tests {
                 first_available_byte: 0,
                 attachments: 1,
                 applied_input_bytes: Some(0),
+                current_size: None,
             },
             replay: OutputReplay {
                 chunks: Vec::new(),

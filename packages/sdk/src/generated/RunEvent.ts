@@ -2,6 +2,7 @@
 import type { InterruptionReason } from "./InterruptionReason.js";
 import type { OutputChunk } from "./OutputChunk.js";
 import type { RunState } from "./RunState.js";
+import type { TerminalSize } from "./TerminalSize.js";
 import type { TmuxRunEvent } from "./TmuxRunEvent.js";
 
 /**
@@ -9,6 +10,7 @@ import type { TmuxRunEvent } from "./TmuxRunEvent.js";
  */
 export type RunEvent =
   | { type: "output"; chunk: OutputChunk }
+  | { type: "resized"; size: TerminalSize }
   | { type: "exited"; state: RunState }
   | { type: "interrupted"; reason: InterruptionReason }
   | { type: "tmux"; event: TmuxRunEvent }

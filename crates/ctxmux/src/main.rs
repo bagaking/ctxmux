@@ -537,7 +537,11 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
             Ok(true)
         }
         RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
-        RunEvent::Tmux { .. } => Ok(true),
+        // This stream is the Run's raw PTY bytes. The local terminal already
+        // resized itself -- that is what produced the resize we are being told
+        // about -- so printing a notice here would only inject text the
+        // attached program never emitted.
+        RunEvent::Tmux { .. } | RunEvent::Resized { .. } => Ok(true),
         RunEvent::ObservationDiscontinuity => Err(
             "attachment lost one or more non-output observations; output replay cannot reconstruct their semantics"
                 .to_owned(),
@@ -751,7 +755,7 @@ fn print_run(run: &RunInfo) {
         ctxmux_protocol::RunBackend::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
     };
     println!(
-        "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}",
+        "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}\tsize={}",
         run.id,
         state,
         run.pid
@@ -761,15 +765,41 @@ fn print_run(run: &RunInfo) {
         run.attachments,
         run.latest_output_bytes,
         run.durable_output_bytes
-            .map_or_else(|| "memory-only".to_owned(), |seq| seq.to_string())
+            .map_or_else(|| "memory-only".to_owned(), |seq| seq.to_string()),
+        // The owner-confirmed size, not `spec.size`: a Run started at 80x24 and
+        // resized to 200x87 reports 200x87 here. "unknown" is a real answer --
+        // no owner can confirm a tmux pane or a recovered Run -- so it is not
+        // filled in from the spec.
+        format_current_size(run.current_size)
     );
+}
+
+fn format_current_size(size: Option<TerminalSize>) -> String {
+    size.map_or_else(
+        || "unknown".to_owned(),
+        |size| format!("{}x{}", size.cols, size.rows),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use ctxmux_protocol::{RunEvent, TerminalSize};
 
-    use super::{PrefixRouter, normalize_terminal_size, write_event};
+    use super::{PrefixRouter, format_current_size, normalize_terminal_size, write_event};
+
+    #[test]
+    fn status_reports_the_confirmed_size_and_admits_when_there_is_none() {
+        assert_eq!(
+            format_current_size(Some(TerminalSize {
+                cols: 200,
+                rows: 87
+            })),
+            "200x87"
+        );
+        // A Run nobody can ask -- an imported tmux pane, or one recovered
+        // without a live PTY -- says so rather than echoing its requested size.
+        assert_eq!(format_current_size(None), "unknown");
+    }
 
     fn route_with_partitions(input: &[u8], boundary_mask: usize) -> (Vec<u8>, bool) {
         let mut router = PrefixRouter::default();
