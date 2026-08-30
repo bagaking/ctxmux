@@ -1301,6 +1301,27 @@
       ]
     },
     {
+      "id": "fleet-scale-acceptance-harness",
+      "kind": "contract_check",
+      "path": "scripts/check-fleet-scale.sh",
+      "invariants": [
+        "the fleet-scale acceptance harness refuses a short fleet, a silent zero, a foreign host class, or a ceiling breach instead of rendering a false pass verdict",
+        "its farm thresholds are derived by the frozen budget contract's rules and bound to the host class that produced them, and its 128 tier is cross-checked against the darwin gate on the platform-invariant per-Run costs"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "scripts/check-fleet-scale.sh --self-test",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "public-reliability-smoke",
       "kind": "public_smoke",
       "path": "scripts/check-reliability.sh",
