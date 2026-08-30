@@ -3844,11 +3844,29 @@ impl Run {
     }
 
     fn info(&self) -> RunInfo {
-        let output = mutex_lock(&self.output);
+        // Read the native control cursor BEFORE taking `output`. That was the
+        // one gratuitous edge here: `output -> native_control.state` exists
+        // nowhere else in the daemon and nothing in this method needs the log
+        // to read the input cursor.
+        //
+        // The other two pairs are deliberately kept, because they are the
+        // daemon's established order rather than an artifact of this method:
+        //   `output -> state`       also held by `record_output`, and by
+        //                           `publish_terminal`, which holds `output`
+        //                           across the terminal `state` write so that a
+        //                           caller cannot observe `Exited` beside an
+        //                           output count that predates the Run's final
+        //                           bytes.
+        //   `output -> persistence` also held by `record_output` and
+        //                           `activate_persistence_after_publication`.
+        //                           Hoisting the persistence read above
+        //                           `output` here would INVERT that and create
+        //                           the cycle it was meant to avoid.
         let applied_input_bytes = match &self.incarnation_control {
             Some(RunControl::Native(control)) => Some(control.applied_input_bytes()),
             Some(RunControl::Tmux(_)) | None => None,
         };
+        let output = mutex_lock(&self.output);
         RunInfo {
             id: self.id,
             spec: self.spec.clone(),
