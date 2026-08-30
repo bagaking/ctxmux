@@ -26,9 +26,11 @@
 #
 # Tiers: 128, 512, 2048, 4000. The 128 tier is load-bearing. It overlaps the
 # existing darwin gate, so the harness cross-checks the farm's 128 numbers
-# against the darwin baseline on the platform-invariant per-Run costs. If they
-# disagree, the harness is measuring something different from the gate and its
-# larger tiers cannot be trusted — this is stated in the output, not just here.
+# against the darwin baseline on the platform-invariant per-Run costs. A
+# disagreement refuses either way, but the report names the direction, because
+# above the baseline means a regression or a measurement mismatch while below it
+# means the daemon got cheaper and the frozen baseline is stale. Only one of
+# those is a defect — this is stated in the output, not just here.
 #
 # WHAT THESE NUMBERS MAY NOT BE COMPARED AGAINST. The farm is Linux x86_64; the
 # darwin baseline is arm64 macOS. RSS and CPU legitimately differ by platform
