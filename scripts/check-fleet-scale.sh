@@ -42,12 +42,12 @@
 #
 # PROVISIONING. The repository must not leave this Mac: no clone, no copy of
 # repository code to the farm. So --profile accept runs ON the Mac and drives
-# the farm node (ssh alias cn2) over ssh, keeping the verdict logic here where
-# it is reviewed. Only the daemon and client BINARIES are copied, cross-compiled
-# from THIS worktree with cargo-zigbuild, stripped, and verified by SHA-256 on
-# both ends before they are run — a truncated transfer produces a bogus
-# measurement that looks exactly like a real one, so the transfer is checked,
-# not trusted. Everything left on the farm is removed on exit.
+# the farm node named by CTXMUX_FLEET_HOST over ssh, keeping the verdict logic
+# here where it is reviewed. Only the daemon and client BINARIES are copied,
+# cross-compiled from THIS worktree with cargo-zigbuild, stripped, and verified
+# by SHA-256 on both ends before they are run — a truncated transfer produces a
+# bogus measurement that looks exactly like a real one, so the transfer is
+# checked, not trusted. Everything left on the farm is removed on exit.
 
 set -euo pipefail
 
@@ -65,16 +65,18 @@ profiles:
           fleet-scale acceptance: the local host is not the farm and its numbers
           are labelled accordingly.
   accept  the real acceptance. Cross-builds the daemon and client from this
-          worktree, ships the stripped binaries to the farm node (ssh alias
-          cn2), verifies them by SHA-256 on both ends, runs three observation
-          rounds per tier, derives farm thresholds, and renders the verdict.
-          Requires the farm.
+          worktree, ships the stripped binaries to the farm node (the ssh alias
+          in CTXMUX_FLEET_HOST), verifies them by SHA-256 on both ends, runs
+          three observation rounds per tier, derives farm thresholds, and
+          renders the verdict. Requires the farm.
 
   --json <path>  also write the machine-readable verdict to this path
   --self-test    prove the harness fails loudly rather than rendering a false
                  verdict, then exit. Runs anywhere in seconds without a fleet.
 
-The farm node is reached as the ssh alias cn2. This harness never clones or
+The farm node is reached as the ssh alias in CTXMUX_FLEET_HOST, defaulting to
+cn4. Farm placement is the farm's policy, not this repository's, so the
+destination is overridable rather than pinned here. This harness never clones or
 copies repository code to the farm; only the built binaries are transferred, and
 only after their SHA-256 is confirmed identical on both ends.
 EOF
@@ -457,9 +459,13 @@ then
 fi
 
 # ---- accept profile: the real fleet-scale acceptance on the farm ----
-echo "== fleet-scale accept: driving the farm node cn2 over ssh =="
+# The destination is an ssh alias, overridable because farm placement is the
+# farm's policy and not this repo's: new validation is currently steered to the
+# canary workers so the CN farm server's existing development work is not
+# disturbed. Pinning one host here would silently outlive that policy.
+ctxmux_fleet_dest=${CTXMUX_FLEET_HOST:-cn4}
+echo "== fleet-scale accept: driving the farm node $ctxmux_fleet_dest over ssh =="
 
-ctxmux_fleet_dest=cn2
 if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$ctxmux_fleet_dest" true 2>/dev/null
 then
   echo "error: the farm node $ctxmux_fleet_dest is not reachable over ssh (BatchMode)." >&2
