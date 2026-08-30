@@ -134,6 +134,7 @@ dependencies = [
 name = "ctxmux-daemon"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "base64",
  "ctxmux-client",
  "ctxmux-inherited-fd",
