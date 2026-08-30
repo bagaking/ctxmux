@@ -674,12 +674,23 @@ replaying any event.
 Each applied resize also publishes one `resized { size }` event to existing
 attachments, carrying the same read-back value the command's
 `resize { applied_size }` receipt returns. The daemon stores the confirmed size
-and publishes that event under one owner lock, so concurrent resizes are ordered
-and the last `resized` an attachment receives always agrees with the Run's
-`current_size`. A resize that is rejected, or whose read-back the owner cannot
+and publishes that event under one owner lock, so concurrent resizes are
+ordered: two racing resizes can never be stored in one order and observed in
+another. A resize that is rejected, or whose read-back the owner cannot
 complete, publishes nothing and leaves the previously confirmed size standing:
 there is no event, and no reported size, for dimensions no terminal
 acknowledged. Like `input` and `signal`, an uncertain resize is not replayable.
+
+The event stream is ordered but not lossless. An attachment that falls far
+enough behind can have a `resized` evicted from the daemon's bounded live-event
+ring, and lag recovery does not synthesize a marker for it: unlike a lost
+observation, which closes the attachment, and unlike lost output, which becomes
+a `gap`, a missed resize is silently absent. This is deliberate, because the
+size is recoverable — `RunInfo.current_size` is authoritative, and re-reading
+`status` or reattaching yields the current geometry. A client that tracks
+geometry from `resized` alone can therefore hold a stale value after a lag
+event; one that needs certainty should reconcile against `current_size` rather
+than assume the last event it saw is current.
 
 `current_size` is `null` when no owner can confirm a size, which is a definite
 answer rather than a missing one:
@@ -691,6 +702,10 @@ answer rather than a missing one:
   `resized`.
 - a historical Run recovered by a replacement daemon holds a stored spec but no
   live PTY to ask, exactly as with `applied_input_bytes`.
+- a native Run whose PTY could not be read at creation. The read-back is not
+  fatal to starting the Run, so the Run is live and resizable while its size is
+  still unconfirmed; the first applied resize replaces the `null` with a
+  confirmed pair.
 
 This is one dimension pair, not terminal contents, and it does not weaken the
 preceding paragraph. `current_size` does not record when a resize happened, does

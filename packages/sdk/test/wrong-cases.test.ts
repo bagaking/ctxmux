@@ -2657,10 +2657,15 @@ test("SDK-02 surfaces a confirmed resize and keeps it out of the byte budget", a
     await peer.handshake();
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
-    peer.send({
-      type: "event",
-      event: { type: "resized", size: { cols: 200, rows: 87 } },
-    });
+    // A resize carries dimensions, not payload, so it weighs zero against the
+    // byte budget: a full queue's worth must fit where even one large output
+    // chunk would not.
+    for (let sequence = 1; sequence <= 256; sequence += 1) {
+      peer.send({
+        type: "event",
+        event: { type: "resized", size: { cols: 100 + sequence, rows: 87 } },
+      });
+    }
     peer.send({
       type: "event",
       event: { type: "resized", size: { cols: 0, rows: 87 } },
@@ -2670,10 +2675,13 @@ test("SDK-02 surfaces a confirmed resize and keeps it out of the byte budget", a
   const attachment = await new CtxmuxClient({
     socketPath: daemon.socketPath,
   }).attach(RUN_ID);
-  assert.deepEqual(await attachment.nextEvent(), {
-    type: "resized",
-    size: { cols: 200, rows: 87 },
-  });
+  await delay(50);
+  for (let sequence = 1; sequence <= 256; sequence += 1) {
+    assert.deepEqual(await attachment.nextEvent(), {
+      type: "resized",
+      size: { cols: 100 + sequence, rows: 87 },
+    });
+  }
   // The owner never publishes a zero read-back, so a zero on the wire is a
   // broken peer rather than a terminal that legitimately has no columns.
   await assert.rejects(
