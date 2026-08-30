@@ -4004,31 +4004,58 @@ impl Run {
                     let chunk = output.push(data);
                     let running = mutex_lock(&self.state).is_running();
                     let persistence = mutex_lock(&self.persistence).active().cloned();
-                    // Render the catch-up from the DURABLE watermark, not from
-                    // this push's start byte. `append` is allowed to drop when
-                    // the actor is behind, and that is only sound because this
-                    // replay is idempotent: the watermark advances only after a
-                    // commit, so a dropped append leaves it put and the next
-                    // push re-renders a replay that still begins exactly at
-                    // `durable_head`, carrying the skipped bytes with it.
+                    // Skip the render entirely when the queue is already full.
                     //
-                    // Sending `chunk.start_byte` instead would make a drop a
-                    // forward gap, which `append_replay` rejects and
-                    // `remember_failure` then latches daemon-wide.
+                    // Rendering is the expensive half, and the send that would
+                    // reject it comes after. Under sustained overload that order
+                    // means the reactor thread builds a replay for every push and
+                    // throws every one of them away. Asking first costs one atomic
+                    // load and turns the overloaded path into no work at all.
                     //
-                    // Re-sent durable bytes are not duplicated: `append_replay`
-                    // verifies any chunk at or below the watermark against the
-                    // stored bytes and moves on. Retention bounds the size —
-                    // the log can only render what it still retains.
-                    let replay = persistence
-                        .as_ref()
-                        .map_or_else(|| output.replay(chunk.start_byte), |durable| {
-                            output.replay(durable.durable_head())
-                        });
+                    // Nothing is lost by skipping: `defer_append` arms the same
+                    // debt a refusal arms, so the next push that does get through
+                    // carries these bytes in its catch-up.
+                    let replay = match persistence.as_ref() {
+                        None => Some(output.replay(chunk.start_byte)),
+                        Some(durable) if durable.queue_has_room() => {
+                            // Render only what is actually outstanding. Normally
+                            // that is this push alone, because the previous append
+                            // was accepted and the actor stitches queued deltas
+                            // together against its own pending watermark — the
+                            // queue does not have to have committed anything for
+                            // the chain to be contiguous.
+                            //
+                            // After a refusal or a skip, `next_replay_start` hands
+                            // back `durable_head` instead, so the replay carries
+                            // the dropped bytes too. That is what keeps a drop from
+                            // becoming a forward gap, which `append_replay` rejects
+                            // and `remember_failure` then latches daemon-wide.
+                            //
+                            // Re-sent durable bytes are not duplicated:
+                            // `append_replay` verifies any chunk at or below the
+                            // watermark against the stored bytes and moves on.
+                            //
+                            // Rendering the catch-up unconditionally is what wedged
+                            // the fleet: `replay` copies every retained chunk above
+                            // the start byte, so once the actor lagged, each push
+                            // copied up to `OUTPUT_RETENTION_BYTES` inline on the
+                            // single reactor thread and the lag fed itself.
+                            Some(output.replay(durable.next_replay_start(chunk.start_byte)))
+                        }
+                        Some(durable) => {
+                            durable.defer_append();
+                            None
+                        }
+                    };
                     (chunk, replay, running, persistence)
                 };
-                if running && let Some(persistence) = persistence {
-                    persistence.append(self.id, replay);
+                if running
+                    && let Some(persistence) = persistence
+                    && let Some(replay) = replay
+                {
+                    // The refusal is recorded inside `append`, which re-arms the
+                    // catch-up for the next push.
+                    let _accepted = persistence.append(self.id, replay);
                 }
                 chunk
             }
@@ -4283,7 +4310,11 @@ impl Run {
             self.publish_terminal_state(terminal.clone());
             self.publish_event(RunEvent::Exited { state: terminal });
         } else {
-            persistence.append(self.id, replay);
+            // This is the whole log from byte 0, the one append that is
+            // deliberately not a delta. If the actor refuses it, `append` arms
+            // the catch-up so the next push re-sends from `durable_head` (still
+            // 0 here) rather than a delta that would strand these bytes.
+            let _accepted = persistence.append(self.id, replay);
         }
     }
 
@@ -7817,6 +7848,231 @@ mod tests {
              appends; a short count means the offer was a delta, not a catch-up"
         );
         drop(reopened);
+    }
+
+    #[test]
+    fn a_steady_run_offers_only_new_bytes_instead_of_recopying_the_whole_log() {
+        // The companion to the test above, guarding the OPPOSITE failure.
+        //
+        // Rendering the durable-watermark catch-up on EVERY push is safe but
+        // ruinous: `OutputLog::replay` copies every retained chunk above the
+        // start byte, so as soon as the actor lags at all, each push copies up
+        // to `OUTPUT_RETENTION_BYTES` — inline, on the single daemon-wide thread
+        // that reads every Run's pty. The lag then feeds itself. Measured on
+        // a 512-Run fleet at 40 chunks/s that wedged admission at 211 Runs with
+        // the reactor thread at 97.4% USER time, against 512/512 admitted for
+        // the same load with persistence off.
+        //
+        // So this asserts the steady-state offer is the DELTA. The check is on
+        // an observable effect — the bytes the persistence layer is actually
+        // handed — not on a re-derivation of the expression under test, which
+        // is what let this class of bug survive two earlier attempts.
+        let directory = tempfile::tempdir().expect("create steady-append run directory");
+        let (persistence, _recovered) =
+            Persistence::open(directory.path().join("state")).expect("open steady-append state");
+
+        let run_id = RunId::new();
+        let info = RunInfo {
+            id: run_id,
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
+            attachments: 0,
+            applied_input_bytes: Some(0),
+        };
+        let operation_key =
+            CreateOperationKey::new("steady-append").expect("valid steady-append key");
+        let durable = persistence
+            .insert_start(&operation_key, &info)
+            .expect("seed the steady-append row")
+            .durable;
+        let run = Run::recover(
+            RecoveredRun {
+                operation_key,
+                info,
+                replay: OutputReplay {
+                    chunks: Vec::new(),
+                    first_available_byte: 0,
+                    latest_output_bytes: 0,
+                    truncated: false,
+                },
+                metadata_bytes: 0,
+            },
+            durable,
+            16,
+            TerminalPublicationOwner::default(),
+            crate::qualification_stats::QualificationStats::default(),
+            crate::retention::RetentionBudget::with_limit(u64::MAX),
+        );
+
+        // Hold the actor BEHIND for the whole test.
+        //
+        // This is the load-bearing setup, and getting it wrong is what made an
+        // earlier version of this test useless: if the actor is allowed to
+        // drain, `durable_head` equals the head and the catch-up render and the
+        // delta render produce byte-identical offers. The bug then survives the
+        // test by construction. The wedge only exists while the actor LAGS —
+        // that is the whole shape of the positive feedback — so the test must
+        // reproduce a lagging actor, not a drained one.
+        //
+        // The barrier stops the actor inside its first append, so `durable_head`
+        // stays at 0 while the log grows. Every push after that renders against
+        // a watermark far below the head, which is precisely when a catch-up
+        // costs the entire retained log.
+        let (reached, _release) = persistence.pause_next_append();
+
+        // A recovered Run starts owing one catch-up (its log may hold bytes
+        // above the recovered watermark), so spend that debt first. From here
+        // on every append is accepted and nothing more is owed.
+        run.record_output(b"prime".to_vec());
+        reached.recv().expect("the actor reaches the append barrier");
+
+        // Build a log far larger than any single push. If the offer were the
+        // catch-up, it would carry all of these bytes again.
+        let filler = vec![b'f'; 4096];
+        for _ in 0..64 {
+            run.record_output(filler.clone());
+        }
+
+        // The actor is parked, so this is genuinely un-committed: a catch-up
+        // from the durable head would copy all of it on every single push.
+        let before_final_push = mutex_lock(&run.output).latest_output_bytes();
+        assert_eq!(
+            mutex_lock(&run.persistence)
+                .active()
+                .expect("a recovered Run has active persistence")
+                .durable_head(),
+            0,
+            "the barrier must hold the actor behind; a drained actor makes the \
+             delta and the catch-up identical and the assertion below vacuous"
+        );
+        assert!(
+            before_final_push > 256 * 1024,
+            "the log must be big enough that a whole-log recopy is unmistakable"
+        );
+
+        // Observe what the NEXT push actually hands to persistence.
+        let observed = persistence.capture_next_append_payload();
+        run.record_output(b"final".to_vec());
+        let offered = observed.take().expect("the push offers exactly one append");
+
+        assert_eq!(
+            offered.first_byte,
+            Some(before_final_push),
+            "a steady Run must offer only the bytes it just produced; an offer \
+             starting at the durable head means every push recopies the log"
+        );
+        assert_eq!(
+            offered.payload_bytes,
+            b"final".len(),
+            "the steady-state offer must cost one chunk, not the retained log"
+        );
+    }
+
+    #[test]
+    fn an_overloaded_run_renders_no_replay_at_all_instead_of_one_it_will_discard() {
+        // The half of #79 that bounding the render did NOT fix.
+        //
+        // Rendering is the expensive part of an append and the `try_send` that
+        // rejects it comes AFTER. So under sustained overload — every send
+        // refused — the reactor thread renders a replay for every push and
+        // throws every one away. Bounding the render's size does not help here,
+        // because a refusal arms `catch_up_owed`, so the very next push renders
+        // the unbounded catch-up again. Measured at 512 Runs x 40 chunks/s,
+        // bounding alone moved admission from 199/512 to 325/512 and still
+        // stalled with the owner thread at 96.8% USER time.
+        //
+        // The invariant: when the queue is visibly full, do NO per-chunk work
+        // proportional to the log. This asserts the observable effect — that
+        // nothing is offered to persistence at all — rather than re-deriving
+        // the predicate under test.
+        let directory = tempfile::tempdir().expect("create overloaded run directory");
+        let (persistence, _recovered) =
+            Persistence::open(directory.path().join("state")).expect("open overloaded state");
+
+        let run_id = RunId::new();
+        let info = RunInfo {
+            id: run_id,
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
+            attachments: 0,
+            applied_input_bytes: Some(0),
+        };
+        let operation_key = CreateOperationKey::new("overloaded").expect("valid overloaded key");
+        let durable = persistence
+            .insert_start(&operation_key, &info)
+            .expect("seed the overloaded row")
+            .durable;
+        let run = Run::recover(
+            RecoveredRun {
+                operation_key,
+                info,
+                replay: OutputReplay {
+                    chunks: Vec::new(),
+                    first_available_byte: 0,
+                    latest_output_bytes: 0,
+                    truncated: false,
+                },
+                metadata_bytes: 0,
+            },
+            durable,
+            16,
+            TerminalPublicationOwner::default(),
+            crate::qualification_stats::QualificationStats::default(),
+            crate::retention::RetentionBudget::with_limit(u64::MAX),
+        );
+
+        // Park the actor inside its first append, then fill the queue behind it.
+        let (reached, _release) = persistence.pause_next_append();
+        run.record_output(b"prime".to_vec());
+        reached.recv().expect("the actor reaches the append barrier");
+        for _ in 0..(crate::persistence::PERSISTENCE_QUEUE_CAPACITY * 2) {
+            run.record_output(b"flood".to_vec());
+        }
+
+        // With the queue saturated, the next push must not build anything.
+        let observed = persistence.capture_next_append_payload();
+        run.record_output(b"after saturation".to_vec());
+        assert!(
+            observed.take().is_none(),
+            "an overloaded Run must skip the render entirely; offering anything \
+             here means the reactor thread paid to build a message the full \
+             queue was always going to reject"
+        );
+
+        // The bytes are not lost — the skip owes a catch-up exactly as a refusal
+        // does, so what the Run holds still covers everything written.
+        assert!(
+            mutex_lock(&run.output).latest_output_bytes() > 0,
+            "the skip must not drop the Run's own retained bytes"
+        );
     }
 
     #[test]
