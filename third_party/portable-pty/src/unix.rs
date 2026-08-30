@@ -43,7 +43,13 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
     };
 
     if result != 0 {
-        bail!("failed to openpty: {:?}", io::Error::last_os_error());
+        // LOCAL FORK. Upstream formats the errno into the message with
+        // `bail!("...{:?}", err)`, which leaves a caller no way to tell pty
+        // exhaustion from a genuinely broken request except by string-matching a
+        // Debug rendering. Attaching the io::Error as the source instead keeps
+        // errno recoverable via downcast while displaying the same text under
+        // the alternate `{:#}` formatter.
+        return Err(Error::new(io::Error::last_os_error()).context("failed to openpty"));
     }
 
     let tty_name = tty_name(slave);

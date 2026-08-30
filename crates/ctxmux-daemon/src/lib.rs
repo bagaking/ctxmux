@@ -3355,7 +3355,7 @@ impl Run {
         let qualification_stats = config.qualification_stats.clone();
         let pair = native_pty_system()
             .openpty(to_pty_size(config.spec.size))
-            .map_err(|error| spawn_error("open PTY", error))?;
+            .map_err(|error| pty_open_error(&error))?;
         // Prepare every fallible PTY view before physical launch. Once a child
         // exists, native control and PendingPublication can be built without a
         // setup error window that lacks exact-key cleanup ownership.
@@ -5122,6 +5122,53 @@ fn spawn_error(action: &str, error: impl fmt::Display) -> ProtocolError {
         ErrorCode::SpawnFailed,
         format!("failed to {action}: {error}"),
     )
+}
+
+/// Errnos that mean the host has no pty device left, as opposed to something
+/// being wrong with this particular request.
+///
+/// Both were measured rather than read off a man page, because the two
+/// platforms disagree and the Linux one is a false friend:
+///
+/// * Linux reports `ENOSPC` — reproduced in a `devpts` mount with
+///   `newinstance,max=4`, where the fifth `openpty` fails. The name says "no
+///   space left on device" and is easy to misread as a full disk; here the
+///   exhausted "device" is the pty allocation table.
+/// * macOS reports `ENXIO` — reproduced against the default
+///   `kern.tty.ptmx_max=511`, where `openpty` fails once the table is full.
+///
+/// macOS is the reason this classification is load-bearing and not cosmetic:
+/// its ceiling sits far below [`fd_budget::FD_BUDGET_LIVE_RUNS`], so pty
+/// exhaustion *is* the effective admission ceiling on that platform. Reported
+/// as `SpawnFailed` it would be indistinguishable from a bad command, and a
+/// macOS fleet could never refuse cleanly at all.
+const PTY_EXHAUSTION_ERRNOS: [rustix::io::Errno; 2] =
+    [rustix::io::Errno::NOSPC, rustix::io::Errno::NXIO];
+
+/// Classify a failure to allocate a pty.
+///
+/// A full host is a capacity condition: the request is fine and will succeed
+/// once Runs drain, so the caller should back off rather than give up. Every
+/// other errno keeps [`ErrorCode::SpawnFailed`], which tells the caller the
+/// opposite — retrying this request unchanged is pointless.
+///
+/// The errno is recovered by downcast rather than by matching the rendered
+/// message. That is only possible because `portable-pty` is vendored: upstream
+/// formatted the errno into a string with `bail!`, leaving no typed value to
+/// inspect. See `third_party/portable-pty/src/unix.rs`.
+fn pty_open_error(error: &anyhow::Error) -> ProtocolError {
+    let errno = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error)
+        .map(rustix::io::Errno::from_raw_os_error);
+    if errno.is_some_and(|errno| PTY_EXHAUSTION_ERRNOS.contains(&errno)) {
+        return ProtocolError::new(
+            ErrorCode::RunCapacity,
+            format!("the host has no pty device available: {error:#}"),
+        );
+    }
+    spawn_error("open PTY", format!("{error:#}"))
 }
 
 fn control_not_applied(error: ProtocolError) -> ControlFailure {

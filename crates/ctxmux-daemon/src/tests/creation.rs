@@ -3507,3 +3507,65 @@ fn set_executable(path: &std::path::Path) {
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).expect("make fixture executable");
 }
+
+/// A host that has run out of pty devices is at capacity, not broken. The
+/// caller must be told to back off and retry, which `SpawnFailed` explicitly
+/// does not say.
+///
+/// The two errnos are not interchangeable trivia: Linux reports `ENOSPC` and
+/// macOS reports `ENXIO`, both measured directly (a `devpts` instance capped at
+/// 4, and the default `kern.tty.ptmx_max=511`). Only one of them is real on any
+/// given test host, so both are asserted here rather than in an integration
+/// test that could exercise at most one.
+#[test]
+fn pty_exhaustion_is_a_capacity_refusal_on_both_platforms() {
+    for errno in [rustix::io::Errno::NOSPC, rustix::io::Errno::NXIO] {
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+            .context("failed to openpty");
+        let classified = crate::pty_open_error(&error);
+        assert_eq!(
+            classified.code,
+            ErrorCode::RunCapacity,
+            "{errno:?} means the host is full, not that the request is bad"
+        );
+        // The operator still needs the underlying cause; a capacity code must
+        // not swallow the errno text that says which ceiling was hit.
+        assert!(
+            classified.message.contains("failed to openpty"),
+            "capacity message dropped its cause: {}",
+            classified.message
+        );
+    }
+}
+
+/// The control case. Without it, a classifier that returned `RunCapacity` for
+/// every openpty failure would pass the test above -- and would tell a caller
+/// to keep retrying a pty that will never open.
+#[test]
+fn other_pty_failures_remain_spawn_failures() {
+    for errno in [
+        rustix::io::Errno::IO,
+        rustix::io::Errno::PERM,
+        rustix::io::Errno::NOENT,
+        rustix::io::Errno::MFILE,
+    ] {
+        let error = anyhow::Error::new(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+            .context("failed to openpty");
+        let classified = crate::pty_open_error(&error);
+        assert_eq!(
+            classified.code,
+            ErrorCode::SpawnFailed,
+            "{errno:?} is not a capacity condition"
+        );
+    }
+}
+
+/// An openpty failure with no `io::Error` anywhere in its chain must not be
+/// guessed at. This is the path taken if the vendored crate ever stops
+/// attaching the errno as a source -- it degrades to `SpawnFailed` rather than
+/// silently classifying by accident.
+#[test]
+fn a_pty_failure_without_an_errno_is_not_treated_as_capacity() {
+    let error = anyhow::Error::msg("failed to openpty: something unstructured");
+    assert_eq!(crate::pty_open_error(&error).code, ErrorCode::SpawnFailed);
+}

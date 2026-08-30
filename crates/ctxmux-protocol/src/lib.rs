@@ -1568,7 +1568,15 @@ pub enum ErrorCode {
     InputCursorMismatch,
     /// Recoverable Input belongs to another daemon incarnation.
     DaemonInstanceMismatch,
-    /// The daemon cannot reserve a retained Run record before mutation.
+    /// The daemon cannot admit another Run. Either it cannot reserve a retained
+    /// Run record before mutation, or the host has no pty device left to hand
+    /// out. Both say the same thing to a caller — the fleet is full, back off
+    /// and retry once Runs drain — and are told apart only by the message.
+    ///
+    /// This is deliberately distinct from [`ErrorCode::SpawnFailed`], which says
+    /// the request itself cannot run and that retrying it unchanged is
+    /// pointless. A capacity refusal is about the host's current occupancy and
+    /// clears on its own.
     RunCapacity,
     /// The bounded live-control path has no capacity for this command.
     ControlBackpressure,
