@@ -7,7 +7,7 @@ use std::{
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -24,8 +24,8 @@ use rustix::{
 };
 
 use crate::{
-    NativeWaitFailure, PendingChild, Run, STOP_FORCED_TIMEOUT, STOP_GRACEFUL_TIMEOUT, exit_state,
-    mutex_lock,
+    CHILD_CONTROL_POLL, NativeWaitFailure, PendingChild, Run, STOP_FORCED_TIMEOUT,
+    STOP_GRACEFUL_TIMEOUT, exit_state, mutex_lock,
     native_control::{ChildCommand, HandoffInputState, NativeControlOwner, StopOwnerResult},
     native_session::NativeSession,
     qualification_stats::GaugeGuard,
@@ -148,6 +148,13 @@ pub(crate) struct NativeRunOwner {
 struct OwnerInner {
     state: Mutex<OwnerState>,
     wake: OwnerWake,
+    // Set once by `serve` when it attaches the process-wide SIGCHLD relay that
+    // wakes this owner on child exits. While false, the owner arms a timed
+    // backstop sweep so a natural exit is still detected; while true, the owner
+    // relies purely on the relay and blocks with no timer between exits. See
+    // `poll_deadline` for the full rationale — this is NOT a production safety
+    // net, it exists because unit tests construct owners without `serve`.
+    signal_driven: Arc<AtomicBool>,
     // Only read through the `#[cfg(test)]` accessor below; the live owner thread
     // captures its own clone (`owner_cleanup`) before this struct is built. Same
     // test-only retention as `diagnostics`.
@@ -316,6 +323,7 @@ impl Default for NativeRunOwner {
                             "failed to create daemon-wide native owner wake pipe: {error}"
                         ))),
                         wake: OwnerWake::unavailable(),
+                        signal_driven: Arc::new(AtomicBool::new(false)),
                         cleanup_admission: CleanupAdmission::new(
                             CLEANUP_MAX_ACTIVE,
                             OwnerWake::unavailable(),
@@ -327,9 +335,15 @@ impl Default for NativeRunOwner {
         };
         let cleanup_admission = CleanupAdmission::new(CLEANUP_MAX_ACTIVE, wake.clone());
         let diagnostics = Arc::new(OwnerDiagnostics::default());
+        // Default false: a freshly constructed owner arms the timed backstop so
+        // any construction site (all of which are unit tests today) detects a
+        // natural exit without a relay. `serve` flips it via `mark_signal_driven`
+        // once the SIGCHLD relay is attached.
+        let signal_driven = Arc::new(AtomicBool::new(false));
         let owner_wake = wake.clone();
         let owner_cleanup = cleanup_admission.clone();
         let owner_diagnostics = Arc::clone(&diagnostics);
+        let owner_signal_driven = Arc::clone(&signal_driven);
         let state = match thread::Builder::new()
             .name("ctxmux-native-owner".to_owned())
             .spawn(move || {
@@ -339,6 +353,7 @@ impl Default for NativeRunOwner {
                     &owner_wake,
                     &owner_cleanup,
                     &owner_diagnostics,
+                    &owner_signal_driven,
                 );
             }) {
             Ok(thread) => OwnerState::Running { commands, thread },
@@ -350,6 +365,7 @@ impl Default for NativeRunOwner {
             inner: Arc::new(OwnerInner {
                 state: Mutex::new(state),
                 wake,
+                signal_driven,
                 cleanup_admission,
                 diagnostics,
             }),
@@ -360,6 +376,16 @@ impl Default for NativeRunOwner {
 impl NativeRunOwner {
     pub(crate) fn owner_wake(&self) -> OwnerWake {
         self.inner.wake.clone()
+    }
+
+    /// Declare that a process-wide SIGCHLD relay now wakes this owner on child
+    /// exits, so it can stop arming the timed backstop sweep and block purely on
+    /// the relay between exits. Idempotent. `serve` calls this once, right after
+    /// registering the relay and before it services requests; a following
+    /// `owner_wake().wake()` (the exec-window catch-up) makes the owner observe
+    /// the flag and shed the deadline on its next cycle.
+    pub(crate) fn mark_signal_driven(&self) {
+        self.inner.signal_driven.store(true, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -690,6 +716,7 @@ fn owner_main(
     wake: &OwnerWake,
     cleanup_admission: &CleanupAdmission,
     diagnostics: &OwnerDiagnostics,
+    signal_driven: &AtomicBool,
 ) {
     let (completion_tx, completion_rx) = mpsc::channel();
     let mut entries = Vec::<NativeEntry>::new();
@@ -700,9 +727,11 @@ fn owner_main(
     // the thread's startup. Thereafter a pass runs only on a real edge: the wake
     // pipe fired (a command, a worker completion, a registration, or the
     // process-wide SIGCHLD relay in `serve`), or an armed poll deadline came due
-    // (a pending Stop's admission window). There is no free-running 20 ms tick —
-    // an idle watched Run costs no wakeups at all, which is the whole point of
-    // replacing the timed `waitid` sweep with SIGCHLD readiness.
+    // (a pending Stop's admission window, or — while no relay is attached — the
+    // timed backstop). Once `serve` marks the owner signal-driven there is no
+    // free-running 20 ms tick, so an idle watched Run costs no wakeups at all,
+    // which is the whole point of replacing the timed `waitid` sweep with SIGCHLD
+    // readiness.
     let mut owner_woken = true;
 
     loop {
@@ -753,7 +782,8 @@ fn owner_main(
                 )
                 || entry.terminal.is_some()
         });
-        owner_woken = poll_and_read_outputs(&mut entries, &mut wake_reader, diagnostics);
+        owner_woken =
+            poll_and_read_outputs(&mut entries, &mut wake_reader, signal_driven, diagnostics);
     }
 }
 
@@ -1285,19 +1315,30 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
 }
 
 /// The poll timeout for one owner cycle: the earliest of any pending-Stop
-/// admission deadline and any terminal output-drain deadline. `None` blocks
-/// until an fd or the wake pipe fires — the steady state for watched Runs, whose
-/// exits now arrive as the process-wide SIGCHLD relay rather than a 50 Hz timer.
+/// admission deadline, any terminal output-drain deadline, and — only while no
+/// SIGCHLD relay is attached — a timed backstop that re-peeks watched leaders.
+/// `None` blocks until an fd or the wake pipe fires.
 ///
-/// A plain `Watching` entry deliberately arms no deadline: its exit is signalled
-/// through the wake pipe, and a missed/coalesced signal degrades to "detected on
-/// the next wake" (see `owner_main`), never to a stranded Run. Only the two
-/// genuinely time-based obligations the signal cannot express are armed here —
-/// rejecting a Stop whose admission window elapsed while every cleanup slot
-/// stayed full, and force-finalizing a terminal Run whose output never reaches
-/// EOF within `OUTPUT_DRAIN_TIMEOUT`.
-fn poll_deadline(entries: &[NativeEntry]) -> Option<Instant> {
-    entries
+/// Once `serve` has marked the owner signal-driven, a plain `Watching` entry
+/// arms no deadline: its exit arrives as the process-wide SIGCHLD relay poking
+/// the wake pipe, and a missed/coalesced signal degrades to "detected on the
+/// next wake" (see `owner_main`), never to a stranded Run. That is the steady
+/// idle state this change creates — no 50 Hz timer, zero wakeups per idle Run.
+///
+/// THE BACKSTOP IS NOT A PRODUCTION SAFETY NET. Production correctness rests on
+/// two things, neither of which is this timer: (1) the kernel delivers SIGCHLD
+/// for every child transition of a child this process owns, and the relay's
+/// full-set peek turns one delivery into detection of every pending exit; (2)
+/// `serve` fires one catch-up wake after attaching the relay, closing the
+/// exec-in-place window in which an adopted child could have become a zombie
+/// before the new image registered its handler. The backstop exists solely
+/// because unit tests construct owners WITHOUT `serve` (so no relay ever fires):
+/// there it restores the pre-change timed detection so those owners still reap a
+/// natural exit. A future non-test construction site that forgets to attach a
+/// relay likewise stays correct rather than silently stranding Runs — which is
+/// why the default is backstop-armed and `serve` opts out, not the reverse.
+fn poll_deadline(entries: &[NativeEntry], signal_driven: &AtomicBool) -> Option<Instant> {
+    let obligation_deadline = entries
         .iter()
         .flat_map(|entry| {
             let stop_deadline = match &entry.lifecycle {
@@ -1310,12 +1351,26 @@ fn poll_deadline(entries: &[NativeEntry]) -> Option<Instant> {
             [stop_deadline, terminal_deadline]
         })
         .flatten()
-        .min()
+        .min();
+    // Backstop: while no relay is attached, arm the old 20 ms cadence for any
+    // watched Run so a natural exit is still peeked. Suppressed the moment the
+    // owner is signal-driven, restoring the `None` idle deadline in production.
+    let backstop = (!signal_driven.load(Ordering::Acquire)
+        && entries
+            .iter()
+            .any(|entry| matches!(entry.lifecycle, Lifecycle::Watching(_))))
+    .then(|| Instant::now() + CHILD_CONTROL_POLL);
+    match (obligation_deadline, backstop) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
 }
 
 fn poll_and_read_outputs(
     entries: &mut [NativeEntry],
     wake_reader: &mut UnixStream,
+    signal_driven: &AtomicBool,
     diagnostics: &OwnerDiagnostics,
 ) -> bool {
     let mut poll_fds = vec![PollFd::new(&*wake_reader, PollFlags::IN)];
@@ -1326,7 +1381,7 @@ fn poll_and_read_outputs(
             indices.push(index);
         }
     }
-    let deadline = poll_deadline(entries);
+    let deadline = poll_deadline(entries, signal_driven);
     let timeout = deadline.map(|deadline| {
         Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
             .expect("native poll duration fits Timespec")
@@ -1690,6 +1745,11 @@ mod tests {
         const RUNS: usize = 128;
 
         let owner = NativeRunOwner::default();
+        // Model the production configuration: `serve` marks the owner
+        // signal-driven, which sheds the timed backstop. Without this the owner
+        // would (correctly) keep the 20 ms backstop and this test would measure
+        // the fallback path, not the event path it means to pin.
+        owner.mark_signal_driven();
         let probes = Arc::new(AtomicUsize::new(0));
         let mut runs = Vec::with_capacity(RUNS);
         for _ in 0..RUNS {
@@ -1756,6 +1816,9 @@ mod tests {
         // after the leader turns terminal, the same peek-then-reap path publishes
         // the exit. `owner_wake()` stands in for the SIGCHLD relay `serve` pokes.
         let owner = NativeRunOwner::default();
+        // Production configuration: signal-driven, so the backstop is shed and a
+        // peek happens only on a wake — which is exactly what this test asserts.
+        owner.mark_signal_driven();
         let peeks = Arc::new(AtomicUsize::new(0));
         let live = Arc::new(AtomicUsize::new(1));
         let failure = NativeWaitFailure::default();
