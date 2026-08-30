@@ -94,6 +94,16 @@ const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a settled Stop waits for terminal state to become visible before
+/// answering with the state as it stands.
+///
+/// Publication happens on a worker that is already running by the time a Stop
+/// receipt exists: measured at 1-6 ms on a persistent daemon. This is a
+/// backstop for that window, deliberately far below every Stop budget, because
+/// publication can also sit behind a durable finalize — and a Stop must never
+/// be coupled to the persistence actor's queue depth. Exceeding it costs a
+/// stale `state` field in one receipt, never a failed Stop.
+const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_millis(100);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2706,6 +2716,12 @@ struct Run {
     qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
+    /// Woken once terminal state is visible, so a Stop can report the state its
+    /// own receipt implies rather than the one that predates publication.
+    ///
+    /// A `Notify` rather than a poll because the waiter is the request path:
+    /// the common case must cost one wakeup, not a sleep.
+    terminal_visible: Notify,
     events: LiveEventOwner,
     /// Daemon-wide retained-output budget this Run participates in. Held so the
     /// Run can register itself as an eviction victim and so `record_output` can
@@ -3186,6 +3202,7 @@ impl Run {
             qualification_stats: QualificationStats::default(),
             terminal_publications: terminal_publications.clone(),
             terminal_ordinal,
+            terminal_visible: Notify::new(),
             events: LiveEventOwner::new(LIVE_EVENT_CAPACITY),
             retention_budget,
         })
@@ -3499,6 +3516,7 @@ impl Run {
             qualification_stats: config.qualification_stats,
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
+            terminal_visible: Notify::new(),
             events: LiveEventOwner::new(config.live_event_capacity),
             retention_budget: config.retention_budget,
         });
@@ -3571,6 +3589,7 @@ impl Run {
             qualification_stats: config.qualification_stats.clone(),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
+            terminal_visible: Notify::new(),
             events: LiveEventOwner::new(config.live_event_capacity),
             retention_budget: config.retention_budget,
         });
@@ -3714,6 +3733,7 @@ impl Run {
             qualification_stats,
             terminal_publications,
             terminal_ordinal,
+            terminal_visible: Notify::new(),
             events: LiveEventOwner::new(live_event_capacity),
             retention_budget,
         });
@@ -3829,6 +3849,7 @@ impl Run {
             qualification_stats,
             terminal_publications,
             terminal_ordinal,
+            terminal_visible: Notify::new(),
             events: LiveEventOwner::new(live_event_capacity),
             retention_budget,
         });
@@ -4399,6 +4420,31 @@ impl Run {
     fn publish_terminal_state(&self, terminal: RunState) {
         self.terminal_publications
             .publish(&self.terminal_ordinal, &self.state, terminal);
+        // Ordered after publication so a woken waiter always observes the
+        // terminal state, never the write that is about to happen. The waiter's
+        // own `is_running` recheck also covers this, so no test goes red on the
+        // swap -- it is defence in depth, not a tested guarantee.
+        self.terminal_visible.notify_waiters();
+    }
+
+    /// Wait until terminal state is visible, or until the Run is already
+    /// terminal, or until `deadline`.
+    ///
+    /// The deadline is a backstop, not the expected path: publication happens on
+    /// a `ctxmux-native-blocking` worker that is already running by the time a
+    /// Stop receipt exists. A timeout here returns the state as it stands rather
+    /// than failing the Stop, because the Stop itself did succeed.
+    async fn await_terminal_visible(&self, deadline: Instant) {
+        loop {
+            let notified = self.terminal_visible.notified();
+            if !self.is_running() {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
+                return;
+            }
+        }
     }
 
     fn terminate_unpublished(self: &Arc<Self>) -> Result<(), String> {
@@ -5557,10 +5603,18 @@ async fn recoverable_stop_response(
     };
     let (run, result) = flight.resolve().await;
     Ok(match result {
-        Ok(receipt) => Response::ControlAccepted {
-            run: run.info(),
-            receipt,
-        },
+        Ok(receipt) => {
+            // The receipt is proof the child was reaped, but publication runs on
+            // a separate worker: without this the response could name a Run the
+            // daemon still reports as `Running`, which is what `remove` on the
+            // next line of a warm client saw.
+            run.await_terminal_visible(Instant::now() + TERMINAL_VISIBILITY_GRACE)
+                .await;
+            Response::ControlAccepted {
+                run: run.info(),
+                receipt,
+            }
+        }
         Err(failure) => Response::ControlRejected { failure },
     })
 }
@@ -6760,6 +6814,7 @@ mod tests {
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
+            terminal_visible: Notify::new(),
             events: super::LiveEventOwner::new(1),
             retention_budget: crate::retention::RetentionBudget::production(),
         });
@@ -8506,6 +8561,7 @@ mod tests {
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
+            terminal_visible: Notify::new(),
             events: super::LiveEventOwner::new(live_event_capacity),
             retention_budget: crate::retention::RetentionBudget::production(),
         })
