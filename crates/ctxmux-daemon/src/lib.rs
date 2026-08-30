@@ -7625,7 +7625,81 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_output_log_releases_its_bytes_from_the_total() {        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+    fn the_listing_walk_never_holds_run_state_while_taking_run_output() {
+        // REGRESSION GUARD for a daemon-wide wedge that actually happened.
+        //
+        // `summary()` once read its fields straight into the struct literal:
+        //
+        //     RunSummary {
+        //         state: mutex_lock(&self.state).clone(),
+        //         latest_output_bytes: mutex_lock(&self.output).latest_output_bytes(),
+        //     }
+        //
+        // Struct-literal fields evaluate in source order and their temporaries
+        // live to the end of the statement, so the `state` guard was still held
+        // when `output` was locked — a `state -> output` edge on the List path.
+        // Every other path takes them the other way (`record_output`,
+        // `publish_terminal`), so a List walking one Run while that Run's
+        // terminal publication ran deadlocked both threads, and with them the
+        // whole daemon: 5 threads in futex, none in epoll_wait, every new
+        // client hanging on connect.
+        //
+        // Asserting "no deadlock" would be useless here — the ABBA needs a
+        // precise interleaving and the buggy code passes such a test nearly
+        // always. So assert the ORDERING PROPERTY that makes the cycle
+        // impossible instead: while another thread holds `output`, a
+        // `summary()` in flight must not be holding `state`. If someone
+        // reintroduces the fused form, `summary()` grabs `state` first and then
+        // blocks on `output` — and this test deadlocks instead of passing,
+        // which is the loudest possible failure.
+        let id = RunId::new();
+        let native_runs = NativeRuntimeOwner::default();
+        let run = Run::new_native_for_owner_test_with_budget(
+            id,
+            NativeControlOwner::new_for_wait_test(id, native_runs.owner_wake()),
+            native_runs,
+            NativeWaitFailure::default(),
+            crate::retention::RetentionBudget::with_limit(u64::MAX),
+        );
+        run.record_output(vec![0_u8; 4096]);
+
+        let output_guard = mutex_lock(&run.output);
+
+        let summarising = Arc::clone(&run);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let walker = std::thread::spawn(move || {
+            entered_tx.send(()).expect("report the walk has started");
+            summarising.summary()
+        });
+        entered_rx.recv().expect("the walk starts");
+
+        // The walker is now inside `summary()` and must be blocked on `output`,
+        // which this thread holds. The load-bearing assertion: `state` is free.
+        // Under the fused form the walker would be holding it and this would
+        // fail (or, once we then block, the whole test would hang).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed_state_free = false;
+        while Instant::now() < deadline {
+            if run.state.try_lock().is_ok() {
+                observed_state_free = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            observed_state_free,
+            "a List walk blocked on `output` must not be holding `state`; \
+             that pairing is the state -> output edge that wedged the daemon"
+        );
+
+        drop(output_guard);
+        let summary = walker.join().expect("the walk completes once output frees");
+        assert_eq!(summary.latest_output_bytes, 4096);
+    }
+
+    #[test]
+    fn dropping_an_output_log_releases_its_bytes_from_the_total() {
+        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
         let mut output = OutputLog::new(budget.clone());
         output.push(vec![0_u8; 4096]);
         assert_eq!(budget.retained_total(), 4096);
