@@ -3439,11 +3439,8 @@ async fn a_failing_execve_is_reported_as_spawn_failed_rather_than_a_started_run(
     set_executable(&control);
 
     let doomed = temp.path().join("doomed.sh");
-    std::fs::write(
-        &doomed,
-        "#!/ctxmux/no/such/interpreter\nexit 0\n",
-    )
-    .expect("write bad-interpreter script");
+    std::fs::write(&doomed, "#!/ctxmux/no/such/interpreter\nexit 0\n")
+        .expect("write bad-interpreter script");
     set_executable(&doomed);
 
     // Both files are present and executable, so neither is rejected before the
