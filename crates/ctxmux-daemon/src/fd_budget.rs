@@ -99,6 +99,17 @@ const fn reserved_fds() -> usize {
 /// concurrency target, *not* from `MAX_RETAINED_RUNS`, so the record cap can
 /// change (or be replaced by a byte budget) without silently re-sizing the
 /// descriptor budget.
+///
+/// Deliberately and load-bearingly `const fn`: it is what keeps a future per-Run
+/// descriptor honest. `FDS_PER_RUN` is 3 on every platform because native exit
+/// detection is event-driven through the *process-wide* SIGCHLD self-pipe
+/// (`native_runtime`/`serve`) — reusing descriptors the daemon already holds, so
+/// a watched Run opens no per-Run watch fd. Any future scheme that instead spent
+/// a descriptor per Run gated on a runtime capability (a `pidfd_open` probe, a
+/// kernel-version check) could not be consulted from a `const fn`, forcing
+/// whoever adds it to drop `const` here — a visible, reviewable diff — rather
+/// than letting the real per-Run cost drift above the budgeted 3 the way an
+/// earlier per-Run pidfd once did, unnoticed until EMFILE at a few thousand Runs.
 pub(crate) const fn fd_budget() -> usize {
     FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()
 }
