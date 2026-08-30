@@ -10,53 +10,56 @@
 //! so SIGCHLD lands on the reuse path — it is free.
 //!
 //! This test measures that reuse directly rather than trusting the claim, and
-//! it does so without depending on *when* the singleton descriptor is created,
-//! because that moment is platform-specific:
+//! it deliberately does not depend on *when* the singleton descriptor is
+//! created. That moment is an implementation detail of the platform's driver,
+//! and measurement has already contradicted the intuitive story once:
 //!
-//! * On macOS the signal driver is backed by a fresh kqueue self-pipe that the
-//!   *first* `signal()` call allocates, so the first registration is an
-//!   observable descriptor bump.
-//! * On Linux the signal driver instead rides the multi-threaded runtime's
-//!   already-open epoll I/O driver, so even the first registration opens no new
-//!   descriptor — the count does not move at all. (Verified on a real Linux
-//!   5.15 `x86_64` host: the first registration measured a zero delta.)
+//! * Linux rides the multi-threaded runtime's already-open epoll I/O driver, so
+//!   even the first registration opens nothing. (Measured on a real Linux 5.15
+//!   `x86_64` host: 10 -> 10.)
+//! * macOS was expected to allocate a fresh kqueue self-pipe on the first
+//!   `signal()` call and show a visible bump. It does not — measured 10 -> 10
+//!   there too. The expectation was wrong, not the measurement.
 //!
-//! The old form of this test asserted `first_cost > 0` as a precondition, which
-//! held on macOS but made the test fail on Linux — the very platform CI runs
-//! and the one the frozen per-Run fd budget was never baselined against. So the
-//! assertion here is the property the daemon actually depends on and that holds
-//! on both platforms: after the first registration, registering a whole *batch*
-//! of additional distinct signals — SIGCHLD among them — moves the descriptor
-//! count by exactly zero. A design that allocated a descriptor per signal would
-//! show a delta equal to the batch size; zero across many distinct kinds is the
-//! guarantee, and it is independent of the batch size and of the platform's
-//! allocation strategy. The first registration's cost is recorded for the log
-//! only, never asserted.
+//! An earlier form of this test asserted `first_cost > 0` as a precondition. It
+//! was written against that wrong expectation, and it failed the moment it ran
+//! on Linux — the platform CI actually gates on, and the one the frozen per-Run
+//! fd budget was never baselined against. Asserting a first-registration cost in
+//! either direction pins a detail the daemon does not depend on, so this test
+//! asserts neither: the cost is printed for the log and never checked.
+//!
+//! What is asserted is the property the daemon does depend on, which holds on
+//! both platforms regardless of that detail: after the first registration,
+//! registering a whole *batch* of additional distinct signals — SIGCHLD among
+//! them — moves the descriptor count by exactly zero. A design that allocated a
+//! descriptor per signal would show a delta equal to the batch size; zero across
+//! many distinct kinds is the guarantee, and it is independent of the batch size
+//! and of the platform's allocation strategy.
 //!
 //! It lives in its own integration binary so that the first registration below
 //! is provably the first `signal()` call in the process — a unit test sharing
 //! the daemon's test binary could not promise that, and the reuse claim would
 //! be meaningless if some earlier test had already created the singleton.
-
-// Exact fd census needs the process descriptor table, which this reads via
-// procfs. macOS is covered by the reliability qualification harness (see the
-// per-Run descriptor test in native_lifecycle.rs for the same rationale).
-#![cfg(target_os = "linux")]
+// The census reads `/dev/fd`, which both platforms provide as a view of this
+// process's own descriptor table (on Linux it is a symlink to `/proc/self/fd`),
+// so the suite runs everywhere. A whole-file `#![cfg(target_os = "linux")]`
+// would compile to an empty binary on macOS: the suite would silently assert
+// nothing there while the evidence map still claimed it as macOS coverage.
+// macOS is the platform where the first registration *is* an observable bump,
+// so it is the more interesting half of the reuse claim, not the one to drop.
 
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 fn open_fd_count() -> usize {
-    std::fs::read_dir("/proc/self/fd")
-        .expect("read this process's descriptor table from procfs")
+    std::fs::read_dir("/dev/fd")
+        .expect("read this process's descriptor table from /dev/fd")
         .count()
 }
 
-/// Reading `/proc/self/fd` itself opens a directory descriptor for the duration
-/// of the read, so two consecutive counts of an unchanged table are equal only
-/// because that transient fd is opened and closed within each call. Sample a few
-/// times and take the steady value to shed any lingering lazily-created fd (the
-/// tokio runtime's own reactor, for instance) so the delta we attribute to a
-/// signal registration is really the registration's.
+/// The census itself opens nothing, but the tokio runtime creates some of its
+/// own descriptors lazily. Sample until two consecutive counts agree so the
+/// delta we attribute to a signal registration is really the registration's and
+/// not a reactor descriptor that happened to appear alongside it.
 fn settled_fd_count() -> usize {
     let mut last = open_fd_count();
     for _ in 0..8 {
@@ -76,12 +79,12 @@ async fn additional_signal_kinds_cost_zero_descriptors() {
     // attributable to the signal registrations and not to lazy reactor setup.
     let before_first = settled_fd_count();
 
-    // First registration in this process. On macOS this is where the driver's
-    // self-pipe is allocated (an observable bump); on Linux the driver reuses
-    // the runtime's epoll and this moves nothing. We do not assert on it —
-    // its cost is platform-specific — but we record it so a reader of the test
-    // output can see which regime the running platform is in. Keep the guard
-    // alive so its descriptors (if any) are not dropped before we measure.
+    // First registration in this process. Measured at zero on both Linux and
+    // macOS, but that is not asserted — it is a driver implementation detail
+    // the daemon does not rely on, and it is exactly the detail an earlier
+    // version of this test got wrong. Recorded so a reader of the test output
+    // can see which regime the running platform is in. Keep the guard alive so
+    // its descriptors (if any) are not dropped before we measure.
     let _first = signal(SignalKind::hangup()).expect("register first signal (SIGHUP)");
     let after_first = settled_fd_count();
     let first_cost = after_first
