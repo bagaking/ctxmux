@@ -25,7 +25,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params, pa
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{creation::MAX_RETAINED_RUNS, run_spec::validate_run_spec};
+use crate::{fd_budget::FD_BUDGET_LIVE_RUNS, run_spec::validate_run_spec};
 
 const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "state.sqlite3";
@@ -40,7 +40,48 @@ const STATE_FILES_MAX_BYTES: u64 = 404 * 1024 * 1024;
 const PER_RUN_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
 const GLOBAL_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const METADATA_BYTES: u64 = 64 * 1024 * 1024;
-const RUN_RECORDS: u64 = 4_096;
+// Two durable row ceilings, for two different durable concerns. Neither is the
+// in-memory live-Run cap: that count (`MAX_RETAINED_RUNS`) bounds live daemon
+// resources — descriptors, retained output bytes — and a serving daemon may
+// change or clamp it per host. Persistence must not inherit it. A daemon built
+// to run thousands of concurrent Runs that normalized its durable state down to
+// 128 on every restart would discard the terminal history of all but 128 Runs —
+// silent data loss dressed up as a resource bound.
+//
+// RETAINED_RUN_RECORDS is the serving ceiling startup normalization evicts down
+// to and new-Run admission enforces. It is anchored to the daemon's own
+// concurrency target: startup provisions descriptors for `FD_BUDGET_LIVE_RUNS`
+// concurrent live Runs (`fd_budget.rs`), so persistence retains at least that
+// many durable records — a full daemon that restarts recovers every Run it was
+// running, and terminal history is reclaimed by exact replacement exactly as
+// the live Registry reclaims a live slot, rather than by a restart-time purge.
+// This is a row bound, not a byte bound: the frozen file budgets (384 MiB main
+// database, 256 MiB durable replay, 64 MiB metadata) sit far above it — 64 MiB
+// of metadata alone funds well over 100k minimal rows — so what actually gates
+// the count is the O(rows) startup recovery scan, which this ceiling holds to
+// the same order as the live-Run population the daemon already walks.
+const RETAINED_RUN_RECORDS: u64 = FD_BUDGET_LIVE_RUNS as u64;
+// RUN_RECORD_FORMAT_ENVELOPE is the structural row count schema validation
+// accepts *before* startup normalization runs. It must exceed the serving
+// ceiling: normalization's whole job is to open a store that is over the
+// serving ceiling and trim it, so the validator that gates the open cannot
+// itself cap at the serving ceiling or no such store could ever be opened to be
+// trimmed. The excess a valid store legitimately carries is the turnover
+// overlap — ADR 013's eight-slot physical-overlap owner can leave up to eight
+// not-yet-published rows above the ceiling when a crash interrupts turnover
+// (the "N-plus-eight" bound). 4096 clears `RETAINED_RUN_RECORDS + 8` and is a
+// page-aligned power of two, so the envelope stays a clean structural limit
+// with headroom above the overlap rather than a number tuned to one workload.
+const RUN_RECORD_FORMAT_ENVELOPE: u64 = 4_096;
+// The envelope must clear the serving ceiling plus the eight-slot turnover
+// overlap, or a crash mid-turnover would leave a valid store the validator then
+// rejects as corrupt. Enforced at compile time so the two numbers cannot drift
+// into that contradiction, mirroring the floor guards in `retention.rs` and
+// `fd_budget.rs`.
+const _: () = assert!(
+    RUN_RECORD_FORMAT_ENVELOPE >= RETAINED_RUN_RECORDS + 8,
+    "the format envelope must accept the serving ceiling plus the turnover overlap"
+);
 const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
@@ -65,12 +106,12 @@ struct AdmissionLimits {
 impl AdmissionLimits {
     #[cfg(test)]
     const FORMAT: Self = Self {
-        run_records: RUN_RECORDS,
+        run_records: RUN_RECORD_FORMAT_ENVELOPE,
         metadata_bytes: METADATA_BYTES,
     };
 
     const OPERATIONAL: Self = Self {
-        run_records: MAX_RETAINED_RUNS as u64,
+        run_records: RETAINED_RUN_RECORDS,
         metadata_bytes: METADATA_BYTES,
     };
 }
@@ -3955,7 +3996,7 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
         metadata_total = metadata_total.saturating_add(stored_metadata);
         replay_total = replay_total.saturating_add(replay_bytes);
     }
-    if record_count > RUN_RECORDS
+    if record_count > RUN_RECORD_FORMAT_ENVELOPE
         || metadata_total > METADATA_BYTES
         || replay_total > GLOBAL_REPLAY_BYTES
     {
@@ -4613,14 +4654,34 @@ mod tests {
         AdmissionLimits, CommitProbe, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
         MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
-        PersistentCandidate, PersistentStartCompletion, RUN_RECORDS, SHM_MAX_BYTES,
-        STATE_FILES_MAX_BYTES, StartCommitCrashPhase, StartDisposition, StartReceipt,
-        StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES,
-        WAL_MAX_BYTES, append_replay, create_schema, metadata_size, mutex_lock,
-        prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
+        PersistentCandidate, PersistentStartCompletion, RETAINED_RUN_RECORDS,
+        RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
+        StartDisposition, StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES,
+        WAL_CHECKPOINT_MAX_RETRIES, WAL_MAX_BYTES, append_replay, create_schema, metadata_size,
+        mutex_lock, prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
         validate_existing_schema, wal_charge_for_cache,
     };
-    use crate::creation::MAX_RETAINED_RUNS;
+    use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
+
+    /// Explicit serving ceiling for the startup-normalization eviction fixtures.
+    ///
+    /// The production ceiling is [`RETAINED_RUN_RECORDS`] (4000, pinned by
+    /// `retained_run_ceiling_funds_the_live_run_target` below). Driving eviction
+    /// at that size would need a 4000-row fixture per test; the normalization
+    /// *behavior* under test — canonical oldest-first prefix removal, WAL-bounded
+    /// restartable batches, live-Run exclusion — is identical at any ceiling, so
+    /// these fixtures exercise it at a tractable size, exactly as `retention.rs`
+    /// tests its reclamation policy at `with_limit(1000)` rather than 1 GiB. It is
+    /// deliberately *not* `MAX_RETAINED_RUNS`: persistence no longer borrows the
+    /// live-Run cap, and this number is a test-fixture size, not that cap.
+    const EVICTION_TEST_CEILING: usize = 128;
+
+    /// The eviction fixtures' explicit serving admission limits: a small row
+    /// ceiling with the production metadata budget.
+    const EVICTION_TEST_LIMITS: AdmissionLimits = AdmissionLimits {
+        run_records: EVICTION_TEST_CEILING as u64,
+        metadata_bytes: METADATA_BYTES,
+    };
 
     const COMMIT_CRASH_STATE_DIR: &str = "CTXMUX_COMMIT_CRASH_STATE_DIR";
     const COMMIT_CRASH_PHASE: &str = "CTXMUX_COMMIT_CRASH_PHASE";
@@ -4678,7 +4739,7 @@ mod tests {
         assert_eq!(PER_RUN_REPLAY_BYTES, 4 * 1024 * 1024);
         assert_eq!(GLOBAL_REPLAY_BYTES, 256 * 1024 * 1024);
         assert_eq!(METADATA_BYTES, 64 * 1024 * 1024);
-        assert_eq!(RUN_RECORDS, 4_096);
+        assert_eq!(RUN_RECORD_FORMAT_ENVELOPE, 4_096);
         assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 1_024);
         assert_eq!(DATABASE_MAX_BYTES, 384 * 1024 * 1024);
         assert_eq!(WAL_MAX_BYTES, 16 * 1024 * 1024);
@@ -4691,6 +4752,29 @@ mod tests {
             u64::try_from(MAX_TRANSACTION_PAYLOAD_BYTES).expect("payload limit fits u64") * 4
                 + 1024 * 1024;
         assert!(worst_admitted_output <= WAL_CHECKPOINT_BYTES);
+    }
+
+    #[test]
+    fn retained_run_ceiling_funds_the_live_run_target_not_the_live_cap() {
+        // The serving row ceiling is a *read* figure, not a local literal: it
+        // must equal the descriptor concurrency target so a full daemon that
+        // restarts recovers every Run it was running, instead of purging all but
+        // a live-cap's worth of terminal history. Bind it to its single source of
+        // truth (`fd_budget`) so the two cannot drift, mirroring how
+        // `retention.rs` binds its floor to the frozen gate contract.
+        assert_eq!(RETAINED_RUN_RECORDS, FD_BUDGET_LIVE_RUNS as u64);
+        assert_eq!(RETAINED_RUN_RECORDS, 4000);
+        // The format envelope must accept the serving ceiling plus the eight-slot
+        // turnover overlap a crash mid-turnover can leave above it. The
+        // compile-time `const _` guard beside the constants enforces this; here we
+        // pin the concrete numbers a reader sees so the relationship is legible.
+        assert_eq!(RUN_RECORD_FORMAT_ENVELOPE, 4_096);
+        assert_eq!(RUN_RECORD_FORMAT_ENVELOPE - RETAINED_RUN_RECORDS, 96);
+        // 96 of headroom is well above the eight-slot overlap, and the ceiling is
+        // deliberately far above any in-memory live-Run cap the daemon configures
+        // (the qualified matrix tops out at 128 live Runs): persistence bounds a
+        // file and its recovery scan, not live descriptors, so it does not shrink
+        // when the live cap does. That decoupling is the whole point of the split.
     }
 
     #[test]
@@ -4945,12 +5029,9 @@ mod tests {
                     .force_startup_over_budget_once
                     .store(true, Ordering::Release);
             }
-            let Err(error) = StateStore::open(
-                &state_dir,
-                AdmissionLimits::OPERATIONAL,
-                None,
-                Arc::clone(&hooks),
-            ) else {
+            let Err(error) =
+                StateStore::open(&state_dir, EVICTION_TEST_LIMITS, None, Arc::clone(&hooks))
+            else {
                 panic!("injected startup {expected_phase} interruption unexpectedly opened");
             };
             assert!(error.to_string().contains("injected interruption"));
@@ -4965,10 +5046,14 @@ mod tests {
             }
         }
 
-        let (persistence, recovered) =
-            Persistence::open(&state_dir).expect("restart completes startup normalization");
-        assert_eq!(recovered.len(), MAX_RETAINED_RUNS);
-        let expected = &seeded[seeded.len() - MAX_RETAINED_RUNS..];
+        let (persistence, recovered) = Persistence::open_with_test_limits(
+            state_dir,
+            EVICTION_TEST_CEILING as u64,
+            METADATA_BYTES,
+        )
+        .expect("restart completes startup normalization");
+        assert_eq!(recovered.len(), EVICTION_TEST_CEILING);
+        let expected = &seeded[seeded.len() - EVICTION_TEST_CEILING..];
         assert_eq!(
             recovered
                 .iter()
@@ -5030,10 +5115,14 @@ mod tests {
         assert_eq!((records, running, interrupted), (131, 0, 1));
         drop(connection);
 
-        let (persistence, recovered) =
-            Persistence::open(&state_dir).expect("restart resumes startup normalization");
-        assert_eq!(recovered.len(), MAX_RETAINED_RUNS);
-        let expected = &seeded[seeded.len() - MAX_RETAINED_RUNS..];
+        let (persistence, recovered) = Persistence::open_with_test_limits(
+            state_dir,
+            EVICTION_TEST_CEILING as u64,
+            METADATA_BYTES,
+        )
+        .expect("restart resumes startup normalization");
+        assert_eq!(recovered.len(), EVICTION_TEST_CEILING);
+        let expected = &seeded[seeded.len() - EVICTION_TEST_CEILING..];
         assert_eq!(
             recovered
                 .iter()
@@ -6187,7 +6276,7 @@ mod tests {
         )
         .expect("open format-envelope persistence");
         assert!(recovered.is_empty());
-        let count = MAX_RETAINED_RUNS + 3;
+        let count = EVICTION_TEST_CEILING + 3;
         let mut seeded = Vec::with_capacity(count);
         for index in 0..count {
             let id = RunId::new();
@@ -6524,7 +6613,7 @@ mod tests {
         )
         .expect("open format-envelope persistence");
         assert!(recovered.is_empty());
-        let count = MAX_RETAINED_RUNS + 3;
+        let count = EVICTION_TEST_CEILING + 3;
         let mut seeded = Vec::with_capacity(count);
         let mut live_id = None;
         for index in 0..count {
@@ -6584,7 +6673,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            EVICTION_TEST_LIMITS,
             Some(super::HandoffHint {
                 epoch: epoch.clone(),
                 live_set: HashSet::from([live_id]),
@@ -6602,13 +6691,13 @@ mod tests {
             .expect("live handed-off Run recovered");
         assert_eq!(live_run.info.state, RunState::Running);
 
-        // Eviction actually ran: the DB is trimmed to the operational cap while
+        // Eviction actually ran: the DB is trimmed to the serving ceiling while
         // the live row is retained, proving the path was exercised, not skipped.
         let retained: i64 = store
             .connection
             .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
             .expect("count retained rows after over-budget handoff");
-        assert_eq!(retained, i64::try_from(MAX_RETAINED_RUNS).unwrap());
+        assert_eq!(retained, i64::try_from(EVICTION_TEST_CEILING).unwrap());
         assert_eq!(store.epoch, epoch);
     }
 
