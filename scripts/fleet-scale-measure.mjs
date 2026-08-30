@@ -62,6 +62,15 @@ const TIERS = [128, 512, 2048, 4000];
 /// The tier that overlaps the existing gate, singled out for the cross-check.
 const OVERLAP_TIER = 128;
 
+/// The daemon's own live-Run admission cap: `FD_BUDGET_LIVE_RUNS` in
+/// crates/ctxmux-daemon/src/fd_budget.rs.
+///
+/// This is the only tier at which a refusal can be observed — below it the
+/// daemon has no reason to refuse, above it the harness does not measure. It
+/// is deliberately separate from OVERLAP_TIER: conflating the two is what made
+/// the 512 and 2048 tiers fail for not exercising a ceiling they sit under.
+const DAEMON_ADMISSION_CAP = 4000;
+
 /// Observation rounds per tier before a threshold may be derived.
 ///
 /// Three is the contract's own rule (deriveObservedMaxima requires exactly
@@ -220,16 +229,38 @@ function observedMaximaForTier(rounds, tier, mode) {
   return deriveObservedMaxima(rounds);
 }
 
+/// Fields whose only correct value is zero, whatever the fleet was observed to
+/// leak.
+///
+/// deriveBudgetCeiling derives a ceiling from the observation, which is right
+/// for a cost that legitimately depends on the host (memory, CPU, descriptors)
+/// and wrong for a leak: a teardown that stranded N children would have its
+/// ceiling derived as N and ratify itself. That is not hypothetical — the
+/// 2026-09-06 farm run derived cleanup_live_children ceilings of 129/513/2049
+/// at the 128/512/2048 tiers, one per Run leaked, and passed every one. The
+/// darwin baseline records 0 here, which is what a working teardown produces.
+///
+/// These stay pinned to 0 so a leak fails the verdict instead of setting the
+/// standard for it.
+const ABSOLUTE_ZERO_FIELDS = Object.freeze([
+  "cleanup_live_children",
+  "cleanup_attachments",
+  "cleanup_threads_delta",
+]);
+
 /// Derive the full ceiling set for one tier/mode from its observed maxima.
 ///
-/// Each ceiling is deriveBudgetCeiling(field, observed) — the same rational
+/// Cost ceilings are deriveBudgetCeiling(field, observed) — the same rational
 /// rule the darwin budget is pinned to. No manual margin is applied; a
 /// hand-written ceiling is exactly the post-observation edit the contract
-/// forbids.
+/// forbids. Leak fields (ABSOLUTE_ZERO_FIELDS) are not derived at all: their
+/// ceiling is the constant 0, which no observation may raise.
 function ceilingsForTier(maxima) {
   const ceilings = {};
   for (const field of OBSERVED_FIELDS) {
-    ceilings[`max_${field}`] = deriveBudgetCeiling(field, maxima[field]);
+    ceilings[`max_${field}`] = ABSOLUTE_ZERO_FIELDS.includes(field)
+      ? 0
+      : deriveBudgetCeiling(field, maxima[field]);
   }
   return ceilings;
 }
@@ -463,6 +494,37 @@ function overlapCrossCheck(root, receipt, mode) {
   };
 }
 
+/// Name what actually failed across the tier verdicts.
+///
+/// A tier verdict is the conjunction of its ceiling checks, its List verdict
+/// and its admission verdict, so `!pass` alone does not say which. This used
+/// to report "exceeded a derived ceiling" unconditionally: the 2026-09-06 farm
+/// run refused with that sentence while every one of its ceiling checks
+/// passed, and the real cause was the admission predicate. A wrong reason is
+/// worse than no reason — it sends the reader looking for a regression that
+/// does not exist.
+function tierRefusalReasons(tierVerdicts) {
+  const reasons = [];
+  const breaches = tierVerdicts.flatMap((entry) =>
+    entry.checks
+      .filter((check) => !check.pass)
+      .map((check) => `${entry.tier} ${entry.mode} ${check.field}`),
+  );
+  if (breaches.length > 0) {
+    reasons.push(`a derived ceiling was exceeded: ${breaches.join(", ")}`);
+  }
+  for (const entry of tierVerdicts) {
+    for (const verdict of [entry.list_verdict, entry.admission_verdict]) {
+      if (verdict && !verdict.pass) {
+        reasons.push(
+          verdict.reason ?? `tier ${entry.tier} ${entry.mode}: verdict failed`,
+        );
+      }
+    }
+  }
+  return reasons;
+}
+
 /// Render the full acceptance verdict for a receipt against a thresholds file.
 ///
 /// Fails closed: any tier/mode that cannot be judged (missing cell, unreached
@@ -526,9 +588,7 @@ function renderVerdict({ thresholds, receipt, root }) {
       ? {}
       : {
           refusal_reasons: [
-            ...(tiersPass
-              ? []
-              : ["one or more tier/mode cells exceeded a derived ceiling"]),
+            ...tierRefusalReasons(tierVerdicts),
             ...(overlapAgrees
               ? []
               : [
@@ -547,6 +607,16 @@ function renderVerdict({ thresholds, receipt, root }) {
 function judgeListBehaviour(cell, tier, mode) {
   const success = cell.list_success;
   const latency = cell.list_latency_ms;
+  // A teardown that could not stop its Runs invalidates every cleanup reading
+  // in this cell, so it is reported here rather than left to be inferred from
+  // a leak counter that would otherwise look like a product defect.
+  const stopFailures = cell.cleanup_stop_failures;
+  if (Number.isFinite(stopFailures) && stopFailures > 0) {
+    return {
+      pass: false,
+      reason: `tier ${tier} ${mode}: teardown failed to stop ${stopFailures} Run(s), so the cleanup readings are not evidence`,
+    };
+  }
   if (success !== true) {
     return {
       pass: false,
@@ -573,7 +643,12 @@ function judgeAdmissionBehaviour(cell, tier, mode) {
   if (admission === null || admission === undefined) {
     // Only the tier at the daemon's own cap exercises refusal; below it there
     // is nothing to refuse, so absence is acceptable there and only there.
-    if (tier <= OVERLAP_TIER) {
+    //
+    // That cap is FD_BUDGET_LIVE_RUNS, not the overlap tier. This predicate
+    // used to read `tier <= OVERLAP_TIER` (128) — the deleted count cap — so
+    // the 512 and 2048 tiers, which sit below the real ceiling and cannot
+    // refuse anything, were failed for not refusing.
+    if (tier < DAEMON_ADMISSION_CAP) {
       return {
         pass: true,
         note: "no ceiling refusal exercised below the daemon cap",
@@ -818,6 +893,83 @@ function selfTest() {
     const verdict = judgeAdmissionBehaviour(goodCell(), 128, "idle");
     if (!verdict.pass) throw new Error("a clean refusal was not accepted");
     return `refused with ${verdict.refused_with}`;
+  });
+
+  // A tier below the daemon's cap cannot refuse anything, so an absent
+  // admission observation is correct there. This predicate once read
+  // `tier <= OVERLAP_TIER`, which failed 512 and 2048 for sitting under a
+  // ceiling they were never meant to reach.
+  expectSuccess("a tier below the daemon cap need not refuse", () => {
+    const results = [512, 2048].map((tier) =>
+      judgeAdmissionBehaviour(
+        goodCell({ admission_at_ceiling: null }),
+        tier,
+        "idle",
+      ),
+    );
+    if (!results.every((verdict) => verdict.pass)) {
+      throw new Error("a sub-cap tier was failed for not refusing");
+    }
+    return "512 and 2048 pass without a ceiling refusal";
+  });
+  expectFailure("the cap tier must still observe a refusal", () => {
+    const verdict = judgeAdmissionBehaviour(
+      goodCell({ admission_at_ceiling: null }),
+      4000,
+      "idle",
+    );
+    if (!verdict.pass) throw new Error(verdict.reason);
+  });
+
+  // The leak fields are pinned to 0 and no observation may raise them. Before
+  // this, deriveBudgetCeiling turned an observed leak into its own ceiling:
+  // the 2026-09-06 farm run derived 129/513/2049 stranded children at the
+  // 128/512/2048 tiers and passed all three.
+  expectSuccess("leak ceilings are zero, not derived from the leak", () => {
+    const leakyRound = goodCell({
+      cleanup_live_children: 4000,
+      cleanup_attachments: 17,
+    });
+    const leaked = ceilingsForTier(
+      observedMaximaForTier([leakyRound, leakyRound, leakyRound], 128, "idle"),
+    );
+    for (const field of ABSOLUTE_ZERO_FIELDS) {
+      if (leaked[`max_${field}`] !== 0) {
+        throw new Error(
+          `${field} ceiling was ${leaked[`max_${field}`]}, not 0 — the leak set its own standard`,
+        );
+      }
+    }
+    return "4000 stranded children still yield a ceiling of 0";
+  });
+  expectFailure("a nonzero leak fails the tier verdict", () => {
+    const ceilings = ceilingsForTier(
+      observedMaximaForTier([goodCell(), goodCell(), goodCell()], 128, "idle"),
+    );
+    const checks = judgeCell(
+      goodCell({ cleanup_live_children: 1 }),
+      ceilings,
+      128,
+      "idle",
+    );
+    const leak = checks.find(
+      (check) => check.field === "cleanup_live_children",
+    );
+    if (!leak) throw new Error("cleanup_live_children was not judged at all");
+    if (!leak.pass) {
+      throw new Error(
+        `cleanup_live_children 1 > ceiling ${leak.ceiling} correctly failed`,
+      );
+    }
+  });
+
+  expectFailure("a teardown that could not stop Runs fails the tier", () => {
+    const verdict = judgeListBehaviour(
+      goodCell({ cleanup_stop_failures: 3 }),
+      2048,
+      "idle",
+    );
+    if (!verdict.pass) throw new Error(verdict.reason);
   });
 
   if (failures.length > 0) {

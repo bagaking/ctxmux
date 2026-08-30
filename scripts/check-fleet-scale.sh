@@ -352,11 +352,31 @@ if [[ $admitted -ge 1 ]]; then
   retained_per_run=$(divide "$aggregate_bytes")
 fi
 
-# Stop every Run and sample cleanup.
+# Stop every Run, then sample what teardown actually released.
+#
+# `stop` is the command that terminates a Run; `remove` refuses one that is
+# still running ("still running; stop it before removing") and only discards an
+# already-terminal record. Calling remove here and discarding its error meant
+# every teardown failed silently and every child survived, which is why
+# cleanup_live_children read N+1 at every tier. Failures are counted rather
+# than swallowed: a teardown that cannot stop its Runs must be visible in the
+# cell, not inferred from a leak counter downstream.
+stop_failures=0
 while IFS=$'\t' read -r rid _; do
-  ctxmux --socket "$sock" remove "$rid" >/dev/null 2>&1 || true
+  if ! ctxmux --socket "$sock" stop "$rid" >>"$work/stop.err" 2>&1; then
+    stop_failures=$((stop_failures + 1))
+  fi
 done < <(ctxmux --socket "$sock" list 2>/dev/null)
-sleep 1
+
+# Children are reaped asynchronously after stop returns, so poll for the drain
+# instead of assuming a fixed sleep is long enough. A fleet that never drains
+# leaves the last observed count in place and fails the zero check downstream.
+for _ in $(seq 1 100); do
+  cleanup_children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l | tr -d ' ')
+  if [[ ${cleanup_children:-0} -eq 0 ]]; then break; fi
+  sleep 0.1
+done
+
 cleanup_raw=$(sample "$daemon_pid")
 cleanup_threads=$(printf '%s' "$cleanup_raw" | awk -F'|' '{print $3}')
 cleanup_attachments=$(printf '%s\n' "$(ctxmux --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
@@ -374,6 +394,7 @@ printf '"rss_kib_per_run":%s,' "$rss_per_run"
 printf '"threads_per_run":%s,' "$threads_per_run"
 printf '"fds_per_run":%s,' "$fds_per_run"
 printf '"cleanup_live_children":%s,' "$cleanup_children"
+printf '"cleanup_stop_failures":%s,' "$stop_failures"
 printf '"cleanup_attachments":%s,' "$cleanup_attachments"
 printf '"steady":{"rss_kib":%s},' "$steady_rss"
 printf '"baseline":{"threads":%s},' "$baseline_threads"
