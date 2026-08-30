@@ -5,6 +5,7 @@ import type { RunId } from "./RunId.js";
 import type { RunLineage } from "./RunLineage.js";
 import type { RunSpec } from "./RunSpec.js";
 import type { RunState } from "./RunState.js";
+import type { TerminalSize } from "./TerminalSize.js";
 
 /**
  * Current public metadata for one Run.
@@ -60,4 +61,34 @@ export type RunInfo = {
    * `None` when this Run has no current-incarnation native cursor authority.
    */
   applied_input_bytes: number | null;
+  /**
+   * Live PTY dimensions last confirmed by the owning terminal, or `None`
+   * when no owner can confirm them.
+   *
+   * Distinct from `spec.size`, which is only the size *requested* at launch
+   * and never changes afterwards. This field is the size the owning PTY
+   * itself reported: it is seeded from the owner's read-back at creation and
+   * replaced by the read-back of every applied resize, so a Run started at
+   * 80x24 and resized to 200x87 reports `spec.size` 80x24 beside a
+   * `current_size` of 200x87. A resize that fails, or whose read-back the
+   * owner cannot complete, leaves the previous confirmed value in place
+   * rather than recording a size no terminal ever acknowledged.
+   *
+   * `None` is a real answer, not a missing one, and it means exactly that no
+   * owner is in a position to confirm a size:
+   *
+   * - a tmux-backed Run, whose pane is owned and resized by tmux — ctxmux
+   *   observes that pane through public Control Mode and does not resize it
+   *   (`RunCapabilities::TMUX_READ_ONLY.resize` is false), so any size it
+   *   reported would be an import-time observation presented as live truth;
+   * - a historical Run recovered by a replacement daemon, which holds a
+   *   stored spec but no live PTY to ask.
+   *
+   * This is one dimension pair, not terminal contents. It does not record
+   * when a resize happened, does not retain the sizes a Run passed through,
+   * and does not let a caller reconstruct how a TUI was laid out at any
+   * earlier point in the Run. A client that needs historical geometry must
+   * observe [`RunEvent::Resized`] on a live attachment and retain it itself.
+   */
+  current_size: TerminalSize | null;
 };

@@ -90,8 +90,14 @@ ordered opaque workspace, artifact, or context references. An imported tmux
 Run has no launch spec because tmux already owns its pane and process.
 `RunInfo` exposes identity, immediate parent and actual fork fidelity when
 present, Backend identity and capabilities, PID when available, lifecycle
-state, retained-output cursors, optional committed `durable_output_bytes`, and
-attachment count. For an imported tmux Run, `RunInfo.pid` is the pane PID
+state, retained-output cursors, optional committed `durable_output_bytes`,
+optional owner-confirmed `current_size`, and attachment count. `current_size`
+is the live PTY geometry the owning terminal last confirmed, distinct from the
+launch spec's initial terminal size, which never changes. Only an owner that
+can confirm a size reports one: an imported tmux pane is sized by tmux and a
+recovered historical Run has no live PTY, so both report `null` rather than
+echoing a size ctxmux is not in a position to observe. For an imported tmux
+Run, `RunInfo.pid` is the pane PID
 observed at import and participates in the target fence; it is not daemon-owned
 process authority and ctxmux never signals it.
 
@@ -442,6 +448,10 @@ The important guarantees are behavioral, not implied by lock types.
   ordered `Gap`; an unrepresentable non-output loss fails the attachment
   closed instead of being mislabeled as replayable output loss.
 - `RunInfo` reads output and lifecycle under separate locks, so it is useful metadata rather than a transactional snapshot of every field.
+- A native resize confirms the PTY read-back and publishes its `Resized` event
+  under one owner lock, so concurrent resizes cannot be stored in one order and
+  observed in another. A failed resize or an unreadable read-back publishes
+  nothing and leaves the previously confirmed size in place.
 - In persistent mode `durable_output_bytes` advances only after the store actor
   commits a contiguous replay batch. Live `latest_output_bytes` may be ahead.
 - Persistence-capable activation, output recording, and native terminal

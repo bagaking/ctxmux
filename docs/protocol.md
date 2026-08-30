@@ -228,7 +228,8 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   expected applied-input cursor, or recover its retained exact applied range
   after reconnect within the same daemon incarnation.
 - `resize`: request new live PTY rows and columns and report the size read back
-  from the owning PTY.
+  from the owning PTY. Every applied resize also updates the Run's
+  `current_size` and publishes one `resized` event to existing attachments.
 - `signal { signal: interrupt }`: deliver `SIGINT` to the current foreground
   process group. On macOS the retained PTY master uses `TIOCSIG`, so the tty
   driver selects that group without a userspace numeric-PGID check/signal gap.
@@ -595,8 +596,8 @@ and receives:
 - retained bytes after that cursor, slicing the first range when it falls inside a retained chunk;
 - the first retained byte and total output bytes allocated;
 - a `truncated` flag when required output was already evicted;
-- future ordered output, Backend observation, raw-output gap, explicit
-  observation discontinuity, and exit events.
+- future ordered output, Backend observation, confirmed resize, raw-output gap,
+  explicit observation discontinuity, and exit events.
 
 The daemon subscribes an attachment before taking its replay snapshot and
 deduplicates live events already covered by that snapshot. Before publishing an
@@ -658,6 +659,46 @@ synthesized for a later attachment.
 This byte log does not reconstruct the current screen of a full-screen TUI.
 Interactive `ctxmux attach` reconstructs a client view from retained bytes and
 paints one still frame; the protocol and non-interactive attach remain raw.
+
+### Live terminal dimensions
+
+`RunInfo.current_size` reports the dimensions the owning PTY last confirmed, and
+is independent of `RunSpec.size`. The spec records the size a Run was _asked_ to
+start at and never changes; `current_size` is seeded from the owner's read-back
+at creation and replaced by the read-back of each applied resize. A Run started
+at 80x24 and resized to 200x87 therefore reports a `spec.size` of 80x24 beside a
+`current_size` of 200x87. Both `status` and the attachment snapshot carry it, so
+a client that attaches after a resize learns the current geometry without
+replaying any event.
+
+Each applied resize also publishes one `resized { size }` event to existing
+attachments, carrying the same read-back value the command's
+`resize { applied_size }` receipt returns. The daemon stores the confirmed size
+and publishes that event under one owner lock, so concurrent resizes are ordered
+and the last `resized` an attachment receives always agrees with the Run's
+`current_size`. A resize that is rejected, or whose read-back the owner cannot
+complete, publishes nothing and leaves the previously confirmed size standing:
+there is no event, and no reported size, for dimensions no terminal
+acknowledged. Like `input` and `signal`, an uncertain resize is not replayable.
+
+`current_size` is `null` when no owner can confirm a size, which is a definite
+answer rather than a missing one:
+
+- an imported tmux pane is owned and resized by tmux. ctxmux observes it through
+  public Control Mode and never resizes it (`resize` is refused with
+  `unsupported_capability`), so a reported size would be an import-time
+  observation dressed up as live truth. A tmux-backed Run never publishes
+  `resized`.
+- a historical Run recovered by a replacement daemon holds a stored spec but no
+  live PTY to ask, exactly as with `applied_input_bytes`.
+
+This is one dimension pair, not terminal contents, and it does not weaken the
+preceding paragraph. `current_size` does not record when a resize happened, does
+not retain the sizes a Run passed through, and does not let a caller reconstruct
+how a TUI was laid out at any earlier point in the Run. Reconstructing a past
+screen would require the contents at that moment as well as its geometry, and
+ctxmux retains no such thing. A client that needs historical geometry must
+observe `resized` on a live attachment and retain it itself.
 
 ## Lifetime and persistent mode
 

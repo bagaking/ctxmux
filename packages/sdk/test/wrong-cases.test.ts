@@ -1138,6 +1138,28 @@ test("SC-02 validates tmux-owned and interrupted Run wire contracts", () => {
       "$frame.response.run.spec",
     ],
     [
+      // A tmux pane is resized by tmux, so no ctxmux owner can confirm its
+      // dimensions; reporting a pair here would launder a guess into an answer.
+      {
+        type: "response",
+        response: {
+          type: "imported",
+          run: { ...tmux, current_size: { cols: 200, rows: 87 } },
+        },
+      },
+      "$frame.response.run.current_size",
+    ],
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: { ...native, current_size: { cols: 200, rows: 0 } },
+        },
+      },
+      "$frame.response.run.current_size.rows",
+    ],
+    [
       {
         type: "response",
         response: {
@@ -2629,6 +2651,39 @@ test("SDK-02 treats observation discontinuity EOF as a clean attachment end", as
   assert.equal(await attachment.nextEvent(), undefined);
 });
 
+test("SDK-02 surfaces a confirmed resize and keeps it out of the byte budget", async (context) => {
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    peer.send({
+      type: "event",
+      event: { type: "resized", size: { cols: 200, rows: 87 } },
+    });
+    peer.send({
+      type: "event",
+      event: { type: "resized", size: { cols: 0, rows: 87 } },
+    });
+  });
+
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  assert.deepEqual(await attachment.nextEvent(), {
+    type: "resized",
+    size: { cols: 200, rows: 87 },
+  });
+  // The owner never publishes a zero read-back, so a zero on the wire is a
+  // broken peer rather than a terminal that legitimately has no columns.
+  await assert.rejects(
+    attachment.nextEvent(),
+    (error: unknown) =>
+      error instanceof CtxmuxInvalidFrameError &&
+      error.path === "$frame.event.size.cols",
+  );
+});
+
 test("SDK-02 coalesces daemon output Gaps at the latest byte cursor", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
@@ -2808,6 +2863,10 @@ function runInfo() {
     first_available_byte: 1,
     attachments: 1,
     applied_input_bytes: 0,
+    // Deliberately not spec.size: the two are independent fields, and a
+    // fixture that echoed the spec would accept a client that read the wrong
+    // one.
+    current_size: { cols: 200, rows: 87 },
   };
 }
 
@@ -2866,6 +2925,7 @@ function tmuxRunInfo() {
     },
     pid: pane.pane_pid,
     applied_input_bytes: null,
+    current_size: null,
   };
 }
 

@@ -2112,7 +2112,7 @@ mod tests {
         // The first entry passed preflight before the second failed. It must
         // still own its PTY, proving validation did not relinquish a prefix.
         controls[0]
-            .resize(TerminalSize { rows: 25, cols: 81 })
+            .resize(TerminalSize { rows: 25, cols: 81 }, |_| {})
             .expect("earlier owner remains live after later preflight failure");
         for pid in &pids {
             assert!(

@@ -658,7 +658,9 @@ impl EventInbox {
                     return Err("daemon sent more than one terminal lifecycle event");
                 }
             }
-            event @ (RunEvent::Tmux { .. } | RunEvent::ObservationDiscontinuity) => {
+            event @ (RunEvent::Tmux { .. }
+            | RunEvent::ObservationDiscontinuity
+            | RunEvent::Resized { .. }) => {
                 if matches!(&event, RunEvent::ObservationDiscontinuity) {
                     state.saw_observation_discontinuity = true;
                 }
@@ -761,6 +763,7 @@ fn event_bytes(event: &RunEvent) -> usize {
         | RunEvent::Interrupted { .. }
         | RunEvent::Tmux { .. }
         | RunEvent::ObservationDiscontinuity
+        | RunEvent::Resized { .. }
         | RunEvent::Gap { .. } => 0,
     }
 }

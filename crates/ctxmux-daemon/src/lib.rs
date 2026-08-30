@@ -2495,6 +2495,10 @@ impl MaterializedCreation {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            // This record is built for the persistence actor before any PTY
+            // owner exists, and what persistence restores is a Run with no
+            // live terminal at all. Neither moment has a size to confirm.
+            current_size: None,
         }
     }
 }
@@ -2726,6 +2730,14 @@ struct LiveEventCursor {
     latest_output_discontinuity_byte: u64,
     observation_revision: u64,
     terminal_revision: u64,
+    /// Number of confirmed resizes published for this Run.
+    ///
+    /// Deliberately separate from `observation_revision`: a missed resize is
+    /// recoverable, because the current size is authoritative in `RunInfo`,
+    /// whereas a missed observation has no snapshot and closes a live
+    /// attachment. Counting them together would tear down an attachment that
+    /// merely fell behind on window sizes.
+    resize_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -2752,6 +2764,7 @@ impl LiveEventOwner {
                     latest_output_discontinuity_byte: 0,
                     observation_revision: 0,
                     terminal_revision: 0,
+                    resize_revision: 0,
                 },
             }),
         }
@@ -2787,6 +2800,13 @@ impl LiveEventOwner {
                     .observation_revision
                     .checked_add(1)
                     .expect("live observation revision remains representable");
+            }
+            RunEvent::Resized { .. } => {
+                state.cursor.resize_revision = state
+                    .cursor
+                    .resize_revision
+                    .checked_add(1)
+                    .expect("live resize revision remains representable");
             }
         }
         let envelope = LiveRunEvent {
@@ -3866,6 +3886,15 @@ impl Run {
             Some(RunControl::Native(control)) => Some(control.applied_input_bytes()),
             Some(RunControl::Tmux(_)) | None => None,
         };
+        // Same ownership rule as the input cursor above, for the same reason: a
+        // size is reported only by an owner that can confirm one. A tmux pane is
+        // resized by tmux, and a recovered historical Run has no live PTY to
+        // ask -- both report `None` rather than replaying `spec.size`, which is
+        // the requested size and was never confirmed by anything.
+        let current_size = match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control.confirmed_size(),
+            Some(RunControl::Tmux(_)) | None => None,
+        };
         let output = mutex_lock(&self.output);
         RunInfo {
             id: self.id,
@@ -3882,6 +3911,7 @@ impl Run {
             first_available_byte: output.first_available_byte(),
             attachments: self.attachments.load(Ordering::Acquire),
             applied_input_bytes,
+            current_size,
         }
     }
 
@@ -3975,7 +4005,14 @@ impl Run {
             return Err(control_not_applied(invalid_run_spec(error)));
         }
         match self.native_control() {
-            Ok(control) => control.resize(size),
+            // The owner publishes while holding its own state lock, so the
+            // confirmed size and the event announcing it cannot be reordered
+            // against a concurrent resize. `publish_event` takes only the
+            // live-event lock, which is never held while the native-control
+            // lock is acquired.
+            Ok(control) => control.resize(size, |applied| {
+                self.publish_event(RunEvent::Resized { size: applied });
+            }),
             Err(error) => Err(control_not_applied(error)),
         }
     }
@@ -5765,6 +5802,7 @@ mod tests {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
         }
     }
 
@@ -6054,7 +6092,7 @@ mod tests {
             .expect_err("failed waiter fences input");
         assert_eq!(input.error.code, ErrorCode::BackendUnavailable);
         let resize = control
-            .resize(TerminalSize { rows: 24, cols: 80 })
+            .resize(TerminalSize { rows: 24, cols: 80 }, |_| {})
             .expect_err("failed waiter fences resize");
         assert_eq!(resize.error.code, ErrorCode::BackendUnavailable);
         let started = Instant::now();
@@ -6163,6 +6201,9 @@ mod tests {
                 first_available_byte: DURABLE_HEAD,
                 attachments: 0,
                 applied_input_bytes: Some(0),
+                // A recovered row carries no confirmed size; re-adoption must
+                // take it from the PTY it inherits, not from this record.
+                current_size: None,
             },
             // Committed durable bytes with none retained in memory: the honest
             // replay of a Run whose output crossed the exec on disk only.
@@ -7759,6 +7800,7 @@ mod tests {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
         };
         let operation_key =
             CreateOperationKey::new("dropped-append").expect("valid dropped-append key");
@@ -7894,6 +7936,7 @@ mod tests {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
         };
         let operation_key =
             CreateOperationKey::new("steady-append").expect("valid steady-append key");
@@ -8028,6 +8071,7 @@ mod tests {
             first_available_byte: 0,
             attachments: 0,
             applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
         };
         let operation_key = CreateOperationKey::new("overloaded").expect("valid overloaded key");
         let durable = persistence
