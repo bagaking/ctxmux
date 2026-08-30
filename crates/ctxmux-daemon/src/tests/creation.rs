@@ -24,7 +24,7 @@ async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
         .expect("creation reaches the post-publication owner barrier")
         .expect("creation barrier remains connected");
     let original = manager
-        .list()
+        .list_all()
         .into_iter()
         .next()
         .expect("the active creation published one Run");
@@ -73,7 +73,7 @@ async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
         .await
         .expect_err("shutdown rejects the pre-fence unbound stripe waiter");
     assert_eq!(same_stripe_error.code, ErrorCode::BackendUnavailable);
-    assert_eq!(manager.list().len(), 1, "stripe waiter spawned no Run");
+    assert_eq!(manager.list_all().len(), 1, "stripe waiter spawned no Run");
     shutdown
         .await
         .expect("shutdown owner task remains live")
@@ -193,7 +193,7 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
     assert!(read_marker_pids(&rejected_marker).is_empty());
     assert_valid_fork_rejected_before_spawn(&manager, &creation_hook, first.id, &first_marker)
         .await;
-    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list_all().len(), 1);
 
     stop_run_and_wait(&manager, first.id).await;
     wait_for_run_workers(&manager).await;
@@ -224,8 +224,8 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
         .await
         .expect("replace the exact quiescent terminal Run");
     assert_ne!(replacement.id, first.id);
-    assert_eq!(manager.list().len(), 1);
-    assert_eq!(manager.list()[0].id, replacement.id);
+    assert_eq!(manager.list_all().len(), 1);
+    assert_eq!(manager.list_all()[0].id, replacement.id);
     assert_eq!(
         manager.info(first.id).unwrap_err().code,
         ErrorCode::RunNotFound
@@ -239,7 +239,7 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
         .await
         .expect("the removed exact key may elect one new Run");
     assert_ne!(recreated.id, first.id);
-    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list_all().len(), 1);
     assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
     stop_run_and_wait(&manager, recreated.id).await;
 }
@@ -293,7 +293,7 @@ async fn removing_a_terminal_run_frees_a_slot_that_a_capacity_rejected_start_the
         .remove(first.id)
         .await
         .expect("remove the quiescent terminal Run");
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
     assert_eq!(
         manager.info(first.id).unwrap_err().code,
         ErrorCode::RunNotFound
@@ -309,7 +309,7 @@ async fn removing_a_terminal_run_frees_a_slot_that_a_capacity_rejected_start_the
         .await
         .expect("the freed slot admits a fresh Start");
     assert_ne!(replacement.id, first.id);
-    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list_all().len(), 1);
     assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
     wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
     wait_for_run_workers(&manager).await;
@@ -336,7 +336,7 @@ async fn removing_a_terminal_run_frees_a_slot_that_a_capacity_rejected_start_the
         .remove(reused.id)
         .await
         .expect("remove the final terminal Run");
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -372,7 +372,7 @@ async fn removing_an_absent_or_already_removed_run_is_idempotent_run_not_found()
         ErrorCode::RunNotFound,
         "a second removal of the same id is idempotent, never a forced re-teardown"
     );
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -424,7 +424,7 @@ async fn removing_an_attached_terminal_run_is_refused_without_forced_teardown() 
         .remove(run.id)
         .await
         .expect("the detached terminal Run is removable");
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -458,7 +458,7 @@ async fn persistent_removal_deletes_the_exact_durable_unit_and_survives_restart(
         .remove(removed.id)
         .await
         .expect("remove the exact durable Run");
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
     assert_eq!(
         manager.info(removed.id).unwrap_err().code,
         ErrorCode::RunNotFound
@@ -498,7 +498,7 @@ async fn persistent_removal_deletes_the_exact_durable_unit_and_survives_restart(
     );
     assert_eq!(
         restarted
-            .list()
+            .list_all()
             .iter()
             .map(|run| run.id)
             .collect::<Vec<_>>(),
@@ -562,7 +562,7 @@ async fn projected_memory_record_blocks_a_second_physical_start_before_publicati
         .await
         .expect("first creation reaches post-spawn barrier")
         .expect("first creation barrier remains connected");
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
 
     let rejected = manager
         .create(
@@ -581,7 +581,7 @@ async fn projected_memory_record_blocks_a_second_physical_start_before_publicati
         .await
         .expect("first creation owner task remains live")
         .expect("first projected Run publishes");
-    assert_eq!(manager.list().len(), 1);
+    assert_eq!(manager.list_all().len(), 1);
     manager
         .get(first.id)
         .unwrap()
@@ -738,7 +738,7 @@ async fn multiple_terminal_candidates_replace_earliest_run_and_its_exact_key() {
     );
     assert_eq!(
         manager
-            .list()
+            .list_all()
             .into_iter()
             .map(|run| run.id)
             .collect::<HashSet<_>>(),
@@ -804,8 +804,8 @@ async fn concurrent_reservations_stay_bounded_under_reverse_publication() {
         )
         .await
         .expect("a self-funded reservation may publish before an older ticket");
-    assert_eq!(manager.list().len(), 1);
-    assert_eq!(manager.list()[0].id, replacement.id);
+    assert_eq!(manager.list_all().len(), 1);
+    assert_eq!(manager.list_all()[0].id, replacement.id);
     assert_eq!(
         manager.info(initial.id).unwrap_err().code,
         ErrorCode::RunNotFound
@@ -828,7 +828,7 @@ async fn concurrent_reservations_stay_bounded_under_reverse_publication() {
         .await
         .expect("delayed creation task remains live")
         .expect("the older reservation publishes after its self-funded successor");
-    let retained: HashSet<_> = manager.list().into_iter().map(|run| run.id).collect();
+    let retained: HashSet<_> = manager.list_all().into_iter().map(|run| run.id).collect();
     assert_eq!(retained, HashSet::from([delayed.id, replacement.id]));
 
     for id in [delayed.id, replacement.id] {
@@ -903,7 +903,11 @@ async fn failed_replacement_restores_candidate_and_tmux_admission_checks_capacit
         0,
         "capacity rejection cannot enter tmux discovery or Control startup"
     );
-    assert_eq!(manager.list().len(), 1, "rejected import publishes no Run");
+    assert_eq!(
+        manager.list_all().len(),
+        1,
+        "rejected import publishes no Run"
+    );
     manager
         .get(live.id)
         .unwrap()
@@ -951,8 +955,8 @@ async fn fresh_level_a_fork_materializes_then_releases_its_parent_before_reserva
         manager.info(parent.id).unwrap_err().code,
         ErrorCode::RunNotFound
     );
-    assert_eq!(manager.list().len(), 1);
-    assert_eq!(manager.list()[0].id, child.id);
+    assert_eq!(manager.list_all().len(), 1);
+    assert_eq!(manager.list_all()[0].id, child.id);
     assert_eq!(
         manager
             .create(child_key, child_request)
@@ -1445,7 +1449,7 @@ async fn committed_creation_survives_a_post_commit_failure_and_restart() {
         .expect_err("post-commit check remains visible to the first caller");
     assert_eq!(error.code, ErrorCode::Persistence);
     assert!(persistence.is_failed());
-    let published = manager.list();
+    let published = manager.list_all();
     assert_eq!(published.len(), 1);
     let original = published[0].clone();
     let original_pid = original.pid.expect("committed Run has one child PID");
@@ -1586,7 +1590,11 @@ async fn barrier_surfaces_a_poisoned_slot_so_the_upgrade_fail_stops() {
         .expect_err("post-commit failure is visible to the creating caller");
     assert_eq!(error.code, ErrorCode::Persistence);
     assert!(persistence.is_failed());
-    let original = manager.list().into_iter().next().expect("Run published");
+    let original = manager
+        .list_all()
+        .into_iter()
+        .next()
+        .expect("Run published");
 
     // The f04 guard: a barrier over a poisoned slot returns Err, which is what
     // makes `perform_exec_upgrade` fail-stop rather than exec into a replay gap.
@@ -1652,7 +1660,11 @@ async fn persistent_replacement_removes_exact_run_and_key_in_the_same_epoch() {
         ErrorCode::RunNotFound
     );
     assert_eq!(
-        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        manager
+            .list_all()
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
         vec![replacement.id]
     );
     assert_persistent_run_key_absent(&state_dir, first.id, &operation_key);
@@ -1684,7 +1696,11 @@ async fn persistent_replacement_removes_exact_run_and_key_in_the_same_epoch() {
         ErrorCode::RunNotFound
     );
     assert_eq!(
-        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        manager
+            .list_all()
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
         vec![recreated.id]
     );
     assert_persistent_run_key_absent(&state_dir, replacement.id, &replacement_key);
@@ -1732,7 +1748,7 @@ async fn assert_persistent_replacement_restart(
     assert_eq!(wait_for_marker_pids(marker, 2).await, pids);
     assert_eq!(
         restarted
-            .list()
+            .list_all()
             .iter()
             .map(|run| run.id)
             .collect::<Vec<_>>(),
@@ -1900,10 +1916,10 @@ async fn assert_turnover_boundary(
     recovered: bool,
 ) {
     assert_eq!(retained.len(), TURNOVER_RECORDS);
-    assert_eq!(manager.list().len(), TURNOVER_RECORDS);
+    assert_eq!(manager.list_all().len(), TURNOVER_RECORDS);
     assert_eq!(
         manager
-            .list()
+            .list_all()
             .into_iter()
             .map(|info| info.id)
             .collect::<HashSet<_>>(),
@@ -2644,7 +2660,7 @@ async fn creation_owner_panic_after_spawn_transfers_cleanup_and_preserves_key_sa
         .expect("request task observes the creation owner result")
         .expect_err("panicked creation owner cannot publish a Run");
     assert_eq!(error.code, ErrorCode::Internal);
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
     assert_eq!(manager.unpublished_cleanups.owned_count(), 1);
     let retry = manager
@@ -2814,7 +2830,7 @@ async fn assert_persistent_commit_unwind_converges(
     } = fixture;
     assert_eq!(
         manager
-            .list()
+            .list_all()
             .iter()
             .map(|info| info.id)
             .collect::<Vec<_>>(),
@@ -2911,7 +2927,7 @@ async fn persistent_capacity_rejects_before_spawn_without_consuming_key() {
     assert_eq!(error.code, ErrorCode::RunCapacity);
     assert!(error.message.contains("metadata"));
     assert!(read_marker_pids(&marker).is_empty());
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 0);
     assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
     assert!(!persistence.is_failed());
@@ -2989,7 +3005,11 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
         .expect_err("injected pre-COMMIT failure rejects the unpublished fork");
     assert_pending_rollback(&error);
     assert_eq!(
-        manager.list().iter().map(|run| run.id).collect::<Vec<_>>(),
+        manager
+            .list_all()
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
         vec![parent.id]
     );
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
@@ -3176,7 +3196,7 @@ async fn eight_pending_cleanup_owners_reject_a_ninth_key_before_spawn() {
         .expect_err("ninth key is rejected before physical launch");
     assert_eq!(error.code, ErrorCode::BackendUnavailable);
     assert!(read_marker_pids(&marker).is_empty());
-    assert!(manager.list().is_empty());
+    assert!(manager.list_all().is_empty());
 
     for run in &pending {
         run.stop()

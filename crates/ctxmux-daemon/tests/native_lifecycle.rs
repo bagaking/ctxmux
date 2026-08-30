@@ -713,7 +713,7 @@ async fn receive_server_frame(
         .unwrap_or_else(|error| panic!("invalid server frame while {context}: {error}"))
 }
 
-async fn wait_for_run_count(client: &Client, expected: usize) -> Vec<ctxmux_protocol::RunInfo> {
+async fn wait_for_run_count(client: &Client, expected: usize) -> Vec<ctxmux_protocol::RunSummary> {
     timeout(scaled(Duration::from_secs(5)), async {
         loop {
             let runs = client.list().await.expect("list response-loss Runs");
@@ -2981,7 +2981,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 15,
+        PROTOCOL_VERSION, 16,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
@@ -3139,6 +3139,120 @@ async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
             .chunks
             .windows(2)
             .all(|pair| pair[1].start_byte == pair[0].end_byte)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fleet_that_overflows_one_frame_stays_fully_enumerable_and_never_drops_the_socket() {
+    // This is the generation-15 defect, pinned end to end against the real
+    // daemon boundary. Before the fix, `List` answered with one `Response::Runs`
+    // carrying the ENTIRE fleet as fat `RunInfo` rows (each embedding an
+    // unbounded `RunSpec`). Past MAX_FRAME_BYTES that frame could not be encoded,
+    // the error propagated to the accept loop as a `ConnectionError`, and the
+    // socket was dropped with no frame — the client saw a bare EOF it could not
+    // tell apart from a daemon crash. The silence was worse than truncation.
+    //
+    // `List` now returns thin `RunSummary` rows over a cursor, so enumeration
+    // scales past a single frame. This test builds a fleet whose OLD fat-row
+    // enumeration would have overflowed the frame budget several times over, then
+    // proves the fleet still enumerates exactly once each, in order, with the
+    // connection intact. The complementary generic backstop — any response that
+    // still embeds unbounded data becoming a typed `ResponseTooLarge` rather than
+    // a silent drop — is pinned deterministically by the daemon-crate unit test
+    // `send_capped_converts_an_oversize_frame_into_a_typed_error`, because the
+    // daemon (correctly) refuses an oversize inbound request frame, so an oversize
+    // single `RunInfo` cannot be smuggled in through the public client at all.
+    let daemon = TestDaemon::start().await;
+
+    // Give every Run a chunky-but-framable declared input so a full-fidelity
+    // `RunInfo` enumeration of the fleet would need many frames, while any single
+    // Run's `RunInfo` still fits one frame on its own. 32 KiB per row across the
+    // fleet dwarfs the 1 MiB budget many times over; the thin summary of the same
+    // Run is a few dozen bytes, which is the entire point of the summary row.
+    let bulky_reference = "d".repeat(32 * 1024);
+    let fleet_size = 40usize;
+    assert!(
+        fleet_size * bulky_reference.len() > MAX_FRAME_BYTES,
+        "fixture must model a fleet whose fat-row enumeration overflows one frame"
+    );
+
+    let mut started = Vec::with_capacity(fleet_size);
+    for index in 0..fleet_size {
+        let run = daemon
+            .client
+            .start(RunSpec {
+                program: "/bin/sh".to_owned(),
+                // Exit immediately: this test is about metadata size, not output.
+                args: vec!["-c".to_owned(), "true".to_owned()],
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: vec![RunInputReference {
+                    kind: RunInputKind::Context,
+                    reference: format!("{bulky_reference}-{index}"),
+                }],
+            })
+            .await
+            .expect("start a Run carrying a bulky declared input");
+        started.push(run.id);
+    }
+
+    // The whole fleet enumerates through the transparent paging client. A single
+    // `list()` returns every Run exactly once; the connection survives because
+    // each thin-summary page is trivially framable.
+    let listed = daemon
+        .client
+        .list()
+        .await
+        .expect("enumerate an oversize fleet without losing the connection");
+    let listed_ids: BTreeSet<RunId> = listed.iter().map(|summary| summary.id).collect();
+    let started_ids: BTreeSet<RunId> = started.iter().copied().collect();
+    assert_eq!(
+        listed_ids, started_ids,
+        "every started Run must appear exactly once across the paged enumeration"
+    );
+    assert_eq!(
+        listed.len(),
+        fleet_size,
+        "paged enumeration must neither drop nor duplicate a Run"
+    );
+
+    // The same fleet also enumerates page by page with an explicit small limit,
+    // proving the cursor is exclusive, advances monotonically, and terminates.
+    let page_limit = 7u32;
+    let mut cursor: Option<RunId> = None;
+    let mut enumerated: Vec<RunId> = Vec::new();
+    let mut page_count = 0usize;
+    loop {
+        let page = daemon
+            .client
+            .list_page(cursor, Some(page_limit))
+            .await
+            .expect("a summary page is always framable");
+        assert!(
+            page.runs.len() <= page_limit as usize,
+            "the daemon must honor the requested page ceiling"
+        );
+        enumerated.extend(page.runs.iter().map(|summary| summary.id));
+        page_count += 1;
+        assert!(page_count <= fleet_size + 1, "paging must terminate");
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert!(
+        page_count >= 2,
+        "the fixture must force more than one page so cursor advancement is exercised"
+    );
+    assert!(
+        enumerated.windows(2).all(|pair| pair[0] < pair[1]),
+        "cursor paging must yield strictly increasing ids with no repeats"
+    );
+    assert_eq!(
+        enumerated.iter().copied().collect::<BTreeSet<_>>(),
+        started_ids,
+        "explicit cursor paging must cover the whole fleet"
     );
 }
 

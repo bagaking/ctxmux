@@ -41,15 +41,16 @@ pub use persistence::PersistenceError;
 use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
     CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
-    MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION, ProtocolError,
-    RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
-    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
-    RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
-    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER,
-    RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput, RecoverableStop, Request, Response,
-    RunBackend, RunCapabilities, RunEvent, RunId, RunInfo, RunLineage, RunSpec, RunState,
-    RuntimeBuildId, RuntimeId, RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalSize,
-    TmuxRunEvent, decode_frame, encode_frame,
+    LIST_MAX_PAGE_RUNS, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
+    ProtocolError, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+    RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
+    RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
+    RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
+    RecoverableStop, Request, Response, RunBackend, RunBackendKind, RunCapabilities, RunEvent,
+    RunId, RunInfo, RunLineage, RunSpec, RunState, RunSummary, RuntimeBuildId, RuntimeId,
+    RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalSize, TmuxRunEvent, decode_frame,
+    encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system};
@@ -2322,10 +2323,41 @@ impl RunManager {
         self.pin(id)
     }
 
-    fn list(&self) -> Vec<RunInfo> {
-        let mut runs = self.registry.list_infos();
-        runs.sort_by_key(|run| run.id.to_string());
-        runs
+    /// Return one ascending page of thin Run summaries and the cursor to
+    /// continue from, if any.
+    ///
+    /// `after` is the exclusive `RunId` cursor from the request and `limit` is
+    /// the caller's requested page size before clamping. The clamp lives here so
+    /// every entry point (the request handler, tests) shares one bound:
+    /// `None`/`0` and any value above [`LIST_MAX_PAGE_RUNS`] all resolve to the
+    /// ceiling, which — together with the thin per-row shape — is what keeps the
+    /// `Runs` frame inside [`MAX_FRAME_BYTES`]. The returned `next_cursor` is the
+    /// last row's id when more Runs remain, and `None` at the end of the fleet.
+    fn list(&self, after: Option<RunId>, limit: Option<u32>) -> (Vec<RunSummary>, Option<RunId>) {
+        let clamped = clamp_list_limit(limit);
+        let (runs, has_more) = self.registry.list_summaries_after(after, clamped);
+        let next_cursor = has_more.then(|| runs.last().map(|run| run.id)).flatten();
+        (runs, next_cursor)
+    }
+
+    /// Whole-fleet ascending listing used by daemon-internal tests.
+    ///
+    /// Tests assert over the complete retained set rather than one page, so this
+    /// walks the same paged primitive to exhaustion. It is not a public path:
+    /// clients page through [`RunManager::list`] (over the wire) precisely so no
+    /// caller depends on the whole fleet fitting one response.
+    #[cfg(test)]
+    fn list_all(&self) -> Vec<RunSummary> {
+        let mut runs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = self.list(cursor, None);
+            runs.extend(page);
+            match next {
+                Some(next) => cursor = Some(next),
+                None => return runs,
+            }
+        }
     }
 
     const fn persistence_mode(&self) -> PersistenceMode {
@@ -3703,6 +3735,25 @@ impl Run {
         }
     }
 
+    /// Cheap enumeration-safe projection of this Run's public metadata.
+    ///
+    /// Distinct from [`Run::info`] on purpose: it reads only the fields a
+    /// [`RunSummary`] carries, so it takes just the `output` and `state` locks
+    /// and never touches the persistence binding or native-control cursor. That
+    /// keeps a full-fleet `List` walk from contending on every Run's persistence
+    /// mutex, and it drops the unbounded `RunSpec` clone that made an unpaged
+    /// `RunInfo` fleet overflow the wire frame.
+    fn summary(&self) -> RunSummary {
+        RunSummary {
+            id: self.id,
+            backend: RunBackendKind::from(&self.backend),
+            pid: self.pid,
+            state: mutex_lock(&self.state).clone(),
+            latest_output_bytes: mutex_lock(&self.output).latest_output_bytes(),
+            attachments: self.attachments.load(Ordering::Acquire),
+        }
+    }
+
     #[cfg(test)]
     fn persistence_start_info(&self) -> RunInfo {
         let mut info = self.info();
@@ -4962,7 +5013,20 @@ async fn handle_connection(
         request => {
             let response = execute_request(&manager, request).await;
             match response {
-                Ok(response) => send(&mut wire, &ServerFrame::Response { response }).await?,
+                // A successful response is the only frame here whose size grows
+                // with fleet or user-controlled data, so it goes through the
+                // capped sender: if it somehow exceeds the frame maximum, the
+                // client receives a typed ResponseTooLarge error instead of the
+                // silent socket drop that an unsendable frame caused before. A
+                // ProtocolError frame is tiny and bounded, so it uses the plain
+                // sender.
+                Ok(response) => {
+                    // Ignore whether the real frame or the fallback error was
+                    // sent: this is a one-shot request connection, so either way
+                    // the client has a framed answer and the connection ends
+                    // cleanly below.
+                    send_capped(&mut wire, &ServerFrame::Response { response }).await?;
+                }
                 Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
             }
         }
@@ -5020,9 +5084,10 @@ async fn execute_request(
                 .create(operation_key, CreationRequest::Fork { parent, plan })
                 .await?,
         }),
-        Request::List => Ok(Response::Runs {
-            runs: manager.list(),
-        }),
+        Request::List { after, limit } => {
+            let (runs, next_cursor) = manager.list(after, limit);
+            Ok(Response::Runs { runs, next_cursor })
+        }
         Request::Status { id } => Ok(Response::Status {
             run: manager.info(id)?,
         }),
@@ -5165,12 +5230,80 @@ fn codec() -> LinesCodec {
     LinesCodec::new_with_max_length(MAX_FRAME_BYTES)
 }
 
+/// Resolve a caller's requested `List` page size to a concrete bound.
+///
+/// `None` (field absent) and `0` both mean "as many as allowed"; any request is
+/// capped at [`LIST_MAX_PAGE_RUNS`]. Centralized so the clamp cannot drift
+/// between the request handler and tests, and so a client can never enlarge a
+/// page past the size the thin-summary frame budget was proven against.
+fn clamp_list_limit(limit: Option<u32>) -> usize {
+    match limit {
+        None | Some(0) => LIST_MAX_PAGE_RUNS,
+        Some(requested) => usize::try_from(requested)
+            .unwrap_or(LIST_MAX_PAGE_RUNS)
+            .min(LIST_MAX_PAGE_RUNS),
+    }
+}
+
 async fn send(
     wire: &mut Framed<UnixStream, LinesCodec>,
     frame: &ServerFrame,
 ) -> Result<(), ConnectionError> {
     wire.send(encode_frame(frame)?).await?;
     Ok(())
+}
+
+/// Send a server frame, and if it cannot be framed because it exceeds
+/// [`MAX_FRAME_BYTES`], send a typed `ResponseTooLarge` error frame instead of
+/// letting the oversize frame drop the connection.
+///
+/// Returns `Ok(true)` when the requested frame was sent and `Ok(false)` when the
+/// fallback error was sent instead, so a caller with follow-on frames (an
+/// attachment about to stream replay) can stop after the error rather than
+/// speak past it.
+///
+/// This closes the generic half of the original defect. `List` is fixed
+/// structurally by paging thin summaries, but the accept loop's response path is
+/// generic: *any* frame that grew past the cap — historically an enormous
+/// `RunInfo` in a `List` or an `Attached` header, or any future fat response —
+/// would encode to `FrameError::TooLarge`, propagate as `ConnectionError`, and
+/// reach the spawn task's `eprintln!`-and-return, closing the socket with no
+/// frame. The client then saw a bare EOF it could not tell apart from a daemon
+/// crash. Here the daemon instead emits a small, always-framable error the caller
+/// can branch on (`ErrorCode::ResponseTooLarge`) and, for `List`, retry with a
+/// smaller page.
+///
+/// A transport failure while sending the fallback error is still returned as a
+/// `ConnectionError` — the connection is genuinely gone at that point, and there
+/// is nothing smaller to send. Only the *encode-too-large* case is converted;
+/// an encode failure for any other reason (which would be an internal bug, not a
+/// size problem) is propagated unchanged.
+async fn send_capped(
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    frame: &ServerFrame,
+) -> Result<bool, ConnectionError> {
+    match encode_frame(frame) {
+        Ok(encoded) => {
+            wire.send(encoded).await?;
+            Ok(true)
+        }
+        Err(ctxmux_protocol::FrameError::TooLarge { actual, maximum }) => {
+            send(
+                wire,
+                &ServerFrame::Error {
+                    error: ProtocolError::new(
+                        ErrorCode::ResponseTooLarge,
+                        format!(
+                            "response is {actual} bytes; the protocol frame maximum is {maximum}"
+                        ),
+                    ),
+                },
+            )
+            .await?;
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn receive(
@@ -5221,8 +5354,9 @@ mod tests {
     use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
     use ctxmux_protocol::{
         CommandDisposition, ControlReceipt, CreateOperationKey, ErrorCode, ForkPlan,
-        InterruptionReason, ProtocolError, RecoverableStop, RunBackend, RunCapabilities, RunEvent,
-        RunId, RunInfo, RunSpec, RunState, StopDisposition, TerminalSize, TmuxRunEvent,
+        InterruptionReason, ProtocolError, RecoverableStop, Response, RunBackend, RunCapabilities,
+        RunEvent, RunId, RunInfo, RunInputKind, RunInputReference, RunSpec, RunState,
+        StopDisposition, TerminalSize, TmuxRunEvent, decode_frame,
     };
     use portable_pty::{Child, ChildKiller, ExitStatus};
     use tokio::sync::{Barrier, Notify, broadcast, mpsc};
@@ -5232,13 +5366,14 @@ mod tests {
         CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep, LiveRunEvent,
         NativeRuntimeOwner, NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
         PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode, RecoveredRun,
-        Run, RunManager, ServerError, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
-        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
-        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
-        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
-        TmuxRunControl, TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission,
-        UpgradeRequestGate, mutex_lock, prepare_socket_path, prepare_socket_path_with_hook,
-        resolve_tmux_termination, serve_with_manager, serve_with_persistence_manager, spawn_error,
+        Run, RunManager, ServerError, ServerFrame, TMUX_DISCOVERY_TIMEOUT,
+        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
+        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
+        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
+        TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission, UpgradeRequestGate, codec,
+        mutex_lock, prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
+        send_capped, serve_with_manager, serve_with_persistence_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
 
@@ -5258,6 +5393,117 @@ mod tests {
     use crate::native_control::NativeControlOwner;
 
     mod creation;
+
+    /// Build a `RunInfo` whose echoed spec carries a declared input of exactly
+    /// `reference_bytes`, so the caller can dial the encoded frame size across the
+    /// `MAX_FRAME_BYTES` boundary. `declared_inputs` is metadata that never
+    /// reaches exec, which is why it is the honest lever for an oversize
+    /// `RunInfo`: the same field the public `List`/`Status` responses echo back.
+    fn run_info_with_declared_input_bytes(reference_bytes: usize) -> RunInfo {
+        RunInfo {
+            id: RunId::new(),
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: vec![RunInputReference {
+                    kind: RunInputKind::Context,
+                    reference: "r".repeat(reference_bytes),
+                }],
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(4242),
+            state: RunState::Running,
+            latest_output_bytes: 0,
+            durable_output_bytes: None,
+            first_available_byte: 0,
+            attachments: 0,
+            applied_input_bytes: Some(0),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_capped_converts_an_oversize_frame_into_a_typed_error() {
+        use ctxmux_protocol::MAX_FRAME_BYTES;
+        use futures_util::StreamExt;
+        use tokio_util::codec::Framed;
+
+        // This is the generic backstop half of the generation-15 fix, pinned
+        // deterministically. The public client cannot smuggle an oversize single
+        // `RunInfo` in — the daemon refuses an oversize inbound REQUEST frame at
+        // the codec before dispatch — so the response-side overflow is proven
+        // here at the exact seam that used to drop the socket in silence.
+        //
+        // Before the fix, an unsendable frame surfaced as `FrameError::TooLarge`,
+        // propagated to the accept loop as a `ConnectionError`, and closed the
+        // socket with nothing written; the client saw a bare EOF. `send_capped`
+        // instead writes a small, always-framable `ResponseTooLarge` error the
+        // client can branch on.
+
+        // A response whose RunInfo clears the frame budget passes through
+        // untouched and returns `Ok(true)`; the peer decodes exactly that frame.
+        let (server, client) = tokio::net::UnixStream::pair().expect("open a socket pair");
+        let mut peer = Framed::new(client, codec());
+        let small = ServerFrame::Response {
+            response: Response::Status {
+                run: run_info_with_declared_input_bytes(64),
+            },
+        };
+        let mut server_wire = Framed::new(server, codec());
+        let sent = send_capped(&mut server_wire, &small)
+            .await
+            .expect("a framable response sends cleanly");
+        assert!(
+            sent,
+            "a within-budget frame reports that the real frame was sent"
+        );
+        let line = peer
+            .next()
+            .await
+            .expect("peer receives the framable response")
+            .expect("read the framable frame");
+        assert_eq!(
+            decode_frame::<ServerFrame>(&line).expect("decode the framable frame"),
+            small,
+            "a within-budget response arrives byte-for-byte"
+        );
+
+        // A response whose RunInfo overflows the frame budget is NOT dropped: the
+        // caller gets `Ok(false)` and the peer decodes a typed ResponseTooLarge
+        // error instead of an EOF.
+        let (server, client) = tokio::net::UnixStream::pair().expect("open a socket pair");
+        let mut peer = Framed::new(client, codec());
+        let oversize = ServerFrame::Response {
+            response: Response::Status {
+                run: run_info_with_declared_input_bytes(MAX_FRAME_BYTES + 64 * 1024),
+            },
+        };
+        let mut server_wire = Framed::new(server, codec());
+        let sent = send_capped(&mut server_wire, &oversize)
+            .await
+            .expect("an oversize response still yields a framed fallback, not a transport error");
+        assert!(
+            !sent,
+            "an oversize frame reports that the fallback error was sent instead"
+        );
+        let line = peer
+            .next()
+            .await
+            .expect("peer receives the fallback frame rather than an EOF")
+            .expect("read the fallback frame");
+        match decode_frame::<ServerFrame>(&line).expect("decode the fallback frame") {
+            ServerFrame::Error { error } => assert_eq!(
+                error.code,
+                ErrorCode::ResponseTooLarge,
+                "the fallback is a typed ResponseTooLarge protocol error"
+            ),
+            other => panic!("oversize response must fall back to an error frame, got {other:?}"),
+        }
+    }
 
     #[test]
     fn tmux_import_stages_share_one_shutdown_bounded_budget() {
@@ -6414,7 +6660,10 @@ mod tests {
                 .expect_err("injected setup failure rejects start");
 
             assert_eq!(error.code, ErrorCode::SpawnFailed);
-            assert!(manager.list().is_empty(), "failed start published a Run");
+            assert!(
+                manager.list_all().is_empty(),
+                "failed start published a Run"
+            );
             if matches!(
                 failed_step,
                 LaunchSetupStep::RegisterOutputOwner | LaunchSetupStep::RegisterWaitOwner

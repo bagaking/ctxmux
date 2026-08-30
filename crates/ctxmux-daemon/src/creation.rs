@@ -11,7 +11,7 @@ use std::{
 
 use ctxmux_protocol::{
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, ErrorCode,
-    ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec, StopDisposition,
+    ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec, RunSummary, StopDisposition,
     StopOperationKey,
 };
 use serde::{Deserialize, Serialize};
@@ -2093,13 +2093,51 @@ impl RunRegistry {
             .map(|entry| entry.run.info())
     }
 
-    /// Copy the public list without pinning every retained Run.
-    pub(crate) fn list_infos(&self) -> Vec<RunInfo> {
-        read_lock(&self.state)
+    /// Copy one ascending page of thin Run summaries without pinning any Run.
+    ///
+    /// `after` is an exclusive `RunId` cursor and `limit` is the already-clamped
+    /// page size. Runs are ordered by ascending id — the same order a caller sees
+    /// sorting ids as strings (see [`RunId`]'s ordering docs) — so a caller pages
+    /// deterministically by feeding back the previous page's last id. The return
+    /// is `(summaries, has_more)`: `has_more` is true when at least one retained
+    /// Run sorts after the last row on this page, which the caller turns into a
+    /// `next_cursor`.
+    ///
+    /// The registry stores Runs in a `HashMap`, so this collects the ids that
+    /// pass the cursor under the read lock and partially sorts only enough of
+    /// them to fill the page plus one lookahead; it never materializes a fully
+    /// sorted clone of the whole fleet. Every residency is listed, matching the
+    /// prior whole-fleet behavior — a Run mid-collection or mid-removal is still
+    /// a Run the operator can see until it is gone.
+    pub(crate) fn list_summaries_after(
+        &self,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> (Vec<RunSummary>, bool) {
+        let state = read_lock(&self.state);
+        // Gather the ids strictly greater than the cursor, then select the
+        // smallest `limit + 1` of them. `select_nth_unstable` is linear and
+        // avoids sorting the entire keyspace when the fleet dwarfs one page; the
+        // extra element is the cheap lookahead that proves whether more remains.
+        let mut ids: Vec<RunId> = state
             .runs
-            .values()
-            .map(|entry| entry.run.info())
-            .collect()
+            .keys()
+            .copied()
+            .filter(|id| after.is_none_or(|cursor| *id > cursor))
+            .collect();
+        let lookahead = limit.saturating_add(1);
+        if ids.len() > lookahead {
+            ids.select_nth_unstable(limit);
+            ids.truncate(lookahead);
+        }
+        ids.sort_unstable();
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let summaries = ids
+            .into_iter()
+            .filter_map(|id| state.runs.get(&id).map(|entry| entry.run.summary()))
+            .collect();
+        (summaries, has_more)
     }
 
     /// Pin only tmux Runs that still belong to ordinary Registry shutdown.
