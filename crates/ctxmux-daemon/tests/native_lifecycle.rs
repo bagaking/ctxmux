@@ -4909,8 +4909,8 @@ async fn constrained_fd_limit_clamps_admission_and_explains_the_ceiling() {
         )
         .await;
     assert!(
-        clamp_line.contains("funds only 2 live Run(s)") && clamp_line.contains("configured 128"),
-        "clamp log must name the funded ceiling and the configured cap: {clamp_line}"
+        clamp_line.contains("funds only 2 live Run(s)") && clamp_line.contains("configured 4000"),
+        "clamp log must name the funded ceiling and the concurrency target: {clamp_line}"
     );
     assert!(
         clamp_line.contains("run_capacity"),

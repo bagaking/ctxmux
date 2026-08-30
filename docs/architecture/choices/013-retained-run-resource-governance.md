@@ -23,15 +23,16 @@ general Backend framework.
 
 ### One operational Run-record ceiling
 
-The production daemon admits at most 128 retained or projected publication
-records across native and tmux Runs. Persistent mode uses the same operational
-Registry ceiling and couples its exact durable replacement to the Registry
-ticket. A publication reservation counts before native spawn or tmux Control
-child startup. Its own exact candidate replacement can make that ticket's
-projected burden zero, but an uncommitted net release never becomes global
-slack. Concurrent reservations therefore cannot publish a 129th Run. This is a
-retained-record bound, not a claim that no transient owner can coexist with
-those records.
+The production daemon admits retained or projected publication records across
+native and tmux Runs up to its live-Run admission ceiling — the descriptor
+concurrency target (`FD_BUDGET_LIVE_RUNS`, 4000), clamped down at startup to what
+`RLIMIT_NOFILE` funds. Persistent mode uses the same operational Registry ceiling
+and couples its exact durable replacement to the Registry ticket. A publication
+reservation counts before native spawn or tmux Control child startup. Its own
+exact candidate replacement can make that ticket's projected burden zero, but an
+uncommitted net release never becomes global slack. Concurrent reservations
+therefore cannot publish one Run past the ceiling. This is a retained-record
+bound, not a claim that no transient owner can coexist with those records.
 
 The value 128 preserves the already qualified 1/32/128 live-Run matrix while
 avoiding the false safety of reusing SQLite's historical 4,096-row format
@@ -104,27 +105,26 @@ supervisor.
 
 ### Startup descriptor budget and the honest effective ceiling
 
-The 128-record ceiling is only reachable if the process has the descriptors to
+The admission ceiling is only reachable if the process has the descriptors to
 back it. Each live native Run retains one reader descriptor plus the PTY master
 and writer it aliases, so the descriptor cost scales with the live-Run count on
 top of a fixed baseline. The daemon inherits whatever `RLIMIT_NOFILE` its
 launcher gives it and does not otherwise manage it, so on a stock macOS soft
-limit of 256 it would exhaust descriptors near ~82 live Runs — before the 128
-ceiling ever refused a Run — and the operator would see an opaque PTY/spawn
-failure instead of the designed `run_capacity`.
+limit of 256 it would exhaust descriptors near ~82 live Runs and the operator
+would see an opaque PTY/spawn failure instead of the designed `run_capacity`.
 
 Startup therefore reads `RLIMIT_NOFILE` and raises the soft limit toward a
 budget sized for a **descriptor concurrency target** — `fd_budget_live_runs ×
 fds_per_run` plus a fixed baseline, the physical-overlap owner's descriptors,
-and client-attachment headroom — never toward the hard limit. The target is
-chosen independently of the 128-record cap: the daemon is built for an agent
-runtime with thousands of concurrent Runs, attachment and turnover fan-out are
-not record-count-bounded, and the record cap is itself slated to become a
-retained-byte budget — so the descriptor budget must stand on its own number,
-not on the record cap. At the configured target of 4000 live Runs the budget is
-`4000 × 3 + 104 = 12104` descriptors; a compile-time assertion pins only the
-_lower_ bound `fd_budget_live_runs ≥ MAX_RETAINED_RUNS`, so the budget can never
-fund fewer Runs than the record cap admits.
+and client-attachment headroom — never toward the hard limit. The target is the
+daemon's live-Run admission ceiling: the daemon is built for an agent runtime
+with thousands of concurrent Runs, attachment and turnover fan-out are not
+record-count-bounded, and the former 128-record count cap has been removed —
+retained memory is now bounded by the daemon-wide retained-byte budget and
+durable rows by the persistence ceiling, so descriptors, the resource that
+scales one-per-live-Run, are what bound live admission. At the configured target
+of 4000 live Runs the budget is `4000 × 3 + 104 = 12104` descriptors, and the
+Registry seeds its admission ceiling from that same target.
 
 An earlier design instead capped the budget _below_ `FD_SETSIZE` (1024) at
 compile time, reasoning that the raised soft limit is inherited by every managed
@@ -147,19 +147,19 @@ raises further.
 
 When the OS refuses the raise, or the hard limit is below the budget, the daemon
 does not fail. It re-reads `RLIMIT_NOFILE` after the `setrlimit` and clamps the
-effective retained-record ceiling to the live-Run count the _granted_ limit
-actually funds — never the value merely requested — then logs the clamp with
-both the funded ceiling and the configured 128, so admission refuses excess Runs
-with the same `run_capacity` at an honest, predictable ceiling instead of hitting
-EMFILE by surprise. The re-read matters on macOS, where a `setrlimit` can report
-success yet leave a soft limit that later cannot fund opens against
+effective admission ceiling to the live-Run count the _granted_ limit actually
+funds — never the value merely requested — then logs the clamp with both the
+funded ceiling and the configured concurrency target, so admission refuses excess
+Runs with the same `run_capacity` at an honest, predictable ceiling instead of
+hitting EMFILE by surprise. The re-read matters on macOS, where a `setrlimit` can
+report success yet leave a soft limit that later cannot fund opens against
 `kern.maxfilesperproc`; measurement on the dev host showed macOS reflects the
 requested soft limit faithfully through `getrlimit` even above that wall
 (enforcing it at `open()` time instead), so the re-read is a portable honesty
 guard rather than a workaround for a specific kernel. This makes the _effective_
-ceiling honest; it does not change the _configured_ `MAX_RETAINED_RUNS`, and it
-never raises the ceiling above it. The complementary EMFILE-survival of the
-accept loop is a separate concern.
+ceiling honest; it only ever clamps the target _down_ to what descriptors fund,
+never up. The complementary EMFILE-survival of the accept loop is a separate
+concern.
 
 ### Registry entry and lookup linearization
 

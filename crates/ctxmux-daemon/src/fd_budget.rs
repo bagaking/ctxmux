@@ -5,9 +5,9 @@
 //! one writer dup from `take_writer`, all aliasing the same master — see ADR
 //! 013) on top of a fixed process baseline. It never read, raised, or clamped
 //! its own `RLIMIT_NOFILE`, so on a stock macOS soft limit of 256 it hit EMFILE
-//! near 82 live Runs — before the 128-record admission cap ever refused a Run.
-//! The operator then saw an opaque PTY/spawn error instead of the designed
-//! `run_capacity`: the cap they were promised was not the cap they hit.
+//! near 82 live Runs. The operator then saw an opaque PTY/spawn error instead of
+//! the designed `run_capacity`: the limit they hit was not the ceiling they were
+//! told about.
 //!
 //! At startup this module reads the soft and hard limits, raises the soft limit
 //! toward [`fd_budget`] — descriptors for [`FD_BUDGET_LIVE_RUNS`] concurrent live
@@ -17,11 +17,12 @@
 //! `run_capacity` at the real descriptor ceiling instead of failing opaquely
 //! mid-spawn.
 //!
-//! The budget stands on its own concurrency target, not on the Run-*record* cap
-//! (`MAX_RETAINED_RUNS`): attachment and turnover fan-out are not
-//! record-count-bounded today, and a sibling change is replacing the record cap
-//! with a retained-byte budget, so the descriptor budget must not assume the
-//! record cap is the thing that bounds fds.
+//! [`FD_BUDGET_LIVE_RUNS`] *is* the daemon's live-Run admission ceiling now that
+//! the `MAX_RETAINED_RUNS = 128` record cap is gone: the Registry seeds its
+//! admission ceiling from this target and this module only clamps it *down* to
+//! what the OS funds. Descriptors are the resource that scales one-per-live-Run,
+//! so they are what bounds live admission; retained memory and durable rows are
+//! bounded by their own budgets (`retention.rs`, `persistence.rs`).
 //!
 //! Child / exec inheritance is deliberate and unbounded by design. `portable_pty`
 //! owns the child `pre_exec` and exposes no passthrough, and this crate is
@@ -44,33 +45,26 @@
 
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
-use crate::creation::{MAX_CREATION_OWNER_SLOTS, MAX_RETAINED_RUNS};
+use crate::creation::MAX_CREATION_OWNER_SLOTS;
 
 /// Descriptors one live native Run keeps open: PTY master + reader dup + writer
 /// dup, all referring to the same master. Held at 3 by ADR 013 and pinned as
 /// `fds_per_run` in the reliability contracts.
 pub(crate) const FDS_PER_RUN: usize = 3;
 
-/// Concurrent live Runs the startup budget provisions descriptors for. This is
-/// the daemon's descriptor *concurrency target*, chosen independently of the
-/// Run-*record* cap (`MAX_RETAINED_RUNS`): attachment and turnover fan-out are
-/// not record-count-bounded, and a sibling change is replacing the record cap
-/// with a retained-byte budget, so the descriptor budget must stand on its own
-/// number rather than assume the record cap is what bounds fds. Measured cost at
-/// this target on a 64-core Linux host: ~12k fds, ~14 MiB RSS, ~21% of one core
-/// — comparable to `tmux` at the same Run count, which imposes no count limit.
+/// Concurrent live Runs the startup budget provisions descriptors for, and the
+/// daemon's live-Run admission ceiling: `RegistryState::record_capacity`
+/// defaults to this and is only ever clamped *down* to what `RLIMIT_NOFILE`
+/// actually funds. It is a descriptor *concurrency target*, not the removed
+/// `MAX_RETAINED_RUNS = 128` record count — attachment and turnover fan-out are
+/// not record-count-bounded, retained memory is now bounded by the daemon-wide
+/// retained-byte budget (`retention.rs`), and durable rows by the persistence
+/// ceiling (`persistence.rs`, also anchored here). Descriptors are the one
+/// resource that scales one-per-live-Run, so they are what admission is bounded
+/// by. Measured cost at this target on a 64-core Linux host: ~12k fds, ~14 MiB
+/// RSS, ~21% of one core — comparable to `tmux` at the same Run count, which
+/// imposes no count limit.
 pub(crate) const FD_BUDGET_LIVE_RUNS: usize = 4000;
-
-/// The descriptor budget must fund at least as many Runs as the record cap
-/// admits; otherwise a daemon on an unbounded host would still clamp its own
-/// admission below the cap it advertises. Enforced at compile time so the two
-/// numbers cannot drift into that contradiction. (This is a lower bound on the
-/// budget, not the earlier upper bound that capped Run concurrency below
-/// `FD_SETSIZE` — see the module docs for why that upper bound was wrong.)
-const _: () = assert!(
-    FD_BUDGET_LIVE_RUNS >= MAX_RETAINED_RUNS,
-    "the descriptor budget must fund at least the retained-Run admission cap"
-);
 
 /// Fixed non-Run descriptors the daemon holds regardless of Run count: stdio,
 /// the accepted listener socket, tokio's kqueue/epoll, signal registrations, up
@@ -95,10 +89,7 @@ const fn reserved_fds() -> usize {
 
 /// Soft `RLIMIT_NOFILE` the daemon raises toward so [`FD_BUDGET_LIVE_RUNS`]
 /// concurrent live Runs are reachable without EMFILE:
-/// `FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()`. Derived from the
-/// concurrency target, *not* from `MAX_RETAINED_RUNS`, so the record cap can
-/// change (or be replaced by a byte budget) without silently re-sizing the
-/// descriptor budget.
+/// `FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()`.
 ///
 /// Deliberately and load-bearingly `const fn`: it is what keeps a future per-Run
 /// descriptor honest. `FDS_PER_RUN` is 3 on every platform because native exit
@@ -115,20 +106,22 @@ pub(crate) const fn fd_budget() -> usize {
 }
 
 /// Live-Run ceiling the effective soft limit actually funds. `None` means the
-/// soft limit is unlimited, which funds the full cap. Reserves the same fixed
-/// descriptors the budget accounts for, then divides the remainder among Runs
-/// at [`FDS_PER_RUN`] each; saturating so an absurdly small limit yields zero
-/// rather than underflowing. Never exceeds [`MAX_RETAINED_RUNS`] — this makes
-/// the *effective* ceiling honest, it does not change the *configured* cap.
+/// soft limit is unlimited, which funds the full concurrency target. Reserves
+/// the same fixed descriptors the budget accounts for, then divides the
+/// remainder among Runs at [`FDS_PER_RUN`] each; saturating so an absurdly small
+/// limit yields zero rather than underflowing. Never exceeds the daemon's own
+/// concurrency target [`FD_BUDGET_LIVE_RUNS`] — a soft limit funding more Runs
+/// than the daemon provisions for does not raise admission above the target it
+/// budgeted, sized, and measured against.
 pub(crate) fn run_ceiling_for_soft_limit(effective_soft: Option<u64>) -> usize {
     let Some(soft) = effective_soft else {
-        return MAX_RETAINED_RUNS;
+        return FD_BUDGET_LIVE_RUNS;
     };
     let reserved = reserved_fds() as u64;
     let per_run = FDS_PER_RUN as u64;
     let for_runs = soft.saturating_sub(reserved);
-    let admissible = (for_runs / per_run).min(MAX_RETAINED_RUNS as u64);
-    usize::try_from(admissible).expect("admissible count is bounded by MAX_RETAINED_RUNS")
+    let admissible = (for_runs / per_run).min(FD_BUDGET_LIVE_RUNS as u64);
+    usize::try_from(admissible).expect("admissible count is bounded by FD_BUDGET_LIVE_RUNS")
 }
 
 /// Outcome of applying the startup budget, for logging and clamping.
@@ -139,7 +132,8 @@ pub(crate) struct FdBudgetOutcome {
     pub(crate) run_ceiling: usize,
     /// The soft limit was successfully raised toward the budget.
     pub(crate) raised: bool,
-    /// The effective ceiling is below the configured `MAX_RETAINED_RUNS`.
+    /// The effective ceiling is below the daemon's concurrency target
+    /// [`FD_BUDGET_LIVE_RUNS`].
     pub(crate) clamped: bool,
     /// Soft limit observed before any raise; `None` means unlimited.
     pub(crate) original_soft: Option<u64>,
@@ -202,7 +196,7 @@ pub(crate) fn apply_fd_budget() -> FdBudgetOutcome {
         effective_soft,
         run_ceiling,
         raised,
-        clamped: run_ceiling < MAX_RETAINED_RUNS,
+        clamped: run_ceiling < FD_BUDGET_LIVE_RUNS,
         original_soft,
         hard,
     }
@@ -211,15 +205,14 @@ pub(crate) fn apply_fd_budget() -> FdBudgetOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        FD_BUDGET_LIVE_RUNS, FDS_PER_RUN, MAX_RETAINED_RUNS, fd_budget, reserved_fds,
-        run_ceiling_for_soft_limit,
+        FD_BUDGET_LIVE_RUNS, FDS_PER_RUN, fd_budget, reserved_fds, run_ceiling_for_soft_limit,
     };
 
     /// The budget is derived from the concurrency target, and its magnitude is
     /// pinned: 4000 live Runs at 3 fds each plus the 104-fd fixed reservation is
     /// 12104. This is the figure a thousands-concurrent-Run agent runtime needs;
-    /// a regression that silently re-sized it back toward the record cap would
-    /// fail here.
+    /// a regression that silently re-sized it back toward the old 128 record cap
+    /// would fail here.
     #[test]
     fn budget_funds_the_configured_concurrency_target() {
         assert_eq!(FD_BUDGET_LIVE_RUNS, 4000);
@@ -228,32 +221,34 @@ mod tests {
             FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()
         );
         assert_eq!(fd_budget(), 12104);
-        // The budget funds far more than the record cap (guaranteed at compile
-        // time by the FD_BUDGET_LIVE_RUNS >= MAX_RETAINED_RUNS assertion), so
-        // raising to it leaves admission bounded only by the record cap, never
-        // by descriptors.
+        // Raising the soft limit to exactly the budget funds exactly the
+        // concurrency target: admission is then bounded by that target, never by
+        // descriptors falling short of it.
         assert_eq!(
             run_ceiling_for_soft_limit(Some(fd_budget() as u64)),
-            MAX_RETAINED_RUNS
+            FD_BUDGET_LIVE_RUNS
         );
     }
 
-    /// The effective ceiling tracks descriptors at the record-cap boundary and is
-    /// not simply pinned at the cap: a limit funding exactly the record cap
-    /// admits it, one descriptor-set short admits one fewer.
+    /// The effective ceiling tracks descriptors at the concurrency-target
+    /// boundary and is not simply pinned at it: a limit funding exactly the
+    /// target admits it, one descriptor-set short admits one fewer.
     #[test]
-    fn ceiling_tracks_descriptors_at_the_cap_boundary() {
+    fn ceiling_tracks_descriptors_at_the_target_boundary() {
         let per_run = u64::try_from(FDS_PER_RUN).unwrap();
         let reserved = u64::try_from(reserved_fds()).unwrap();
-        let at_cap = reserved + u64::try_from(MAX_RETAINED_RUNS).unwrap() * per_run;
-        assert_eq!(run_ceiling_for_soft_limit(Some(at_cap)), MAX_RETAINED_RUNS);
+        let at_target = reserved + u64::try_from(FD_BUDGET_LIVE_RUNS).unwrap() * per_run;
         assert_eq!(
-            run_ceiling_for_soft_limit(Some(at_cap - per_run)),
-            MAX_RETAINED_RUNS - 1
+            run_ceiling_for_soft_limit(Some(at_target)),
+            FD_BUDGET_LIVE_RUNS
+        );
+        assert_eq!(
+            run_ceiling_for_soft_limit(Some(at_target - per_run)),
+            FD_BUDGET_LIVE_RUNS - 1
         );
     }
 
-    /// A constrained limit clamps below the configured cap by the exact
+    /// A constrained limit clamps below the concurrency target by the exact
     /// descriptor arithmetic, so the operator hits an honest ceiling.
     #[test]
     fn constrained_limit_clamps_to_the_funded_run_count() {
@@ -261,17 +256,32 @@ mod tests {
         let per_run = u64::try_from(FDS_PER_RUN).unwrap();
         for runs in [0_u64, 2, 17, 50] {
             let soft = reserved + runs * per_run;
-            let expected = usize::try_from(runs).unwrap().min(MAX_RETAINED_RUNS);
+            let expected = usize::try_from(runs).unwrap().min(FD_BUDGET_LIVE_RUNS);
             assert_eq!(run_ceiling_for_soft_limit(Some(soft)), expected);
             // A partial descriptor past a whole Run cannot fund another Run.
             assert_eq!(run_ceiling_for_soft_limit(Some(soft + 1)), expected);
         }
     }
 
-    /// An unlimited soft limit funds the full cap without clamping.
+    /// An unlimited soft limit funds the full concurrency target without
+    /// clamping.
     #[test]
-    fn unlimited_soft_funds_the_full_cap() {
-        assert_eq!(run_ceiling_for_soft_limit(None), MAX_RETAINED_RUNS);
+    fn unlimited_soft_funds_the_full_target() {
+        assert_eq!(run_ceiling_for_soft_limit(None), FD_BUDGET_LIVE_RUNS);
+    }
+
+    /// A soft limit funding more Runs than the daemon provisions for does not
+    /// raise admission above the concurrency target it budgeted and measured
+    /// against: the ceiling stays pinned at the target.
+    #[test]
+    fn generous_limit_does_not_raise_above_the_target() {
+        let per_run = u64::try_from(FDS_PER_RUN).unwrap();
+        let reserved = u64::try_from(reserved_fds()).unwrap();
+        let beyond_target = reserved + u64::try_from(FD_BUDGET_LIVE_RUNS + 1000).unwrap() * per_run;
+        assert_eq!(
+            run_ceiling_for_soft_limit(Some(beyond_target)),
+            FD_BUDGET_LIVE_RUNS
+        );
     }
 
     /// A limit below the fixed reservation saturates to zero rather than

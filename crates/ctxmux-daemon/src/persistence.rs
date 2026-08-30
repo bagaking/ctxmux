@@ -41,12 +41,13 @@ const PER_RUN_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
 const GLOBAL_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const METADATA_BYTES: u64 = 64 * 1024 * 1024;
 // Two durable row ceilings, for two different durable concerns. Neither is the
-// in-memory live-Run cap: that count (`MAX_RETAINED_RUNS`) bounds live daemon
-// resources — descriptors, retained output bytes — and a serving daemon may
-// change or clamp it per host. Persistence must not inherit it. A daemon built
-// to run thousands of concurrent Runs that normalized its durable state down to
-// 128 on every restart would discard the terminal history of all but 128 Runs —
-// silent data loss dressed up as a resource bound.
+// in-memory live-Run admission ceiling: that ceiling bounds live daemon
+// descriptors and a serving daemon clamps it down per host to what
+// `RLIMIT_NOFILE` funds. Persistence must not inherit a host-clamped live
+// resource ceiling as its durable row bound. A daemon built to run thousands of
+// concurrent Runs whose durable state normalized down to a scarce host's live
+// ceiling on every restart would discard the terminal history of the Runs above
+// it — silent data loss dressed up as a resource bound.
 //
 // RETAINED_RUN_RECORDS is the serving ceiling startup normalization evicts down
 // to and new-Run admission enforces. It is anchored to the daemon's own
@@ -55,6 +56,10 @@ pub(crate) const METADATA_BYTES: u64 = 64 * 1024 * 1024;
 // many durable records — a full daemon that restarts recovers every Run it was
 // running, and terminal history is reclaimed by exact replacement exactly as
 // the live Registry reclaims a live slot, rather than by a restart-time purge.
+// The live admission ceiling anchors to the same `FD_BUDGET_LIVE_RUNS`, so on an
+// un-clamped host the two ceilings hold the same value — but they remain
+// distinct concerns: the live one is clamped down per host, this durable one is
+// not, so recovery never depends on the host that happens to be replaying.
 // This is a row bound, not a byte bound: the frozen file budgets (384 MiB main
 // database, 256 MiB durable replay, 64 MiB metadata) sit far above it — 64 MiB
 // of metadata alone funds well over 100k minimal rows — so what actually gates
@@ -4672,8 +4677,9 @@ mod tests {
     /// restartable batches, live-Run exclusion — is identical at any ceiling, so
     /// these fixtures exercise it at a tractable size, exactly as `retention.rs`
     /// tests its reclamation policy at `with_limit(1000)` rather than 1 GiB. It is
-    /// deliberately *not* `MAX_RETAINED_RUNS`: persistence no longer borrows the
-    /// live-Run cap, and this number is a test-fixture size, not that cap.
+    /// deliberately *not* the live-Run admission ceiling: persistence no longer
+    /// borrows the live ceiling, and this number is a test-fixture size, not that
+    /// ceiling.
     const EVICTION_TEST_CEILING: usize = 128;
 
     /// The eviction fixtures' explicit serving admission limits: a small row

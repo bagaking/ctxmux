@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use super::{Run, RunControl, STOP_ACK_TIMEOUT, control_not_applied, read_lock, write_lock};
+use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 use crate::native_control::{ControlResult, DetachedNativeDescriptors, PendingStop};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
@@ -27,7 +28,6 @@ const CREATION_STRIPES: usize = 64;
 // startup fd budget reserves descriptors for this many overlapping unpublished
 // PTYs (see `fd_budget`), so it is shared rather than duplicated.
 pub(crate) const MAX_CREATION_OWNER_SLOTS: usize = 8;
-pub(crate) const MAX_RETAINED_RUNS: usize = 128;
 const CLEANUP_POLL: Duration = Duration::from_millis(20);
 
 /// Total order of terminal state publication within one daemon incarnation.
@@ -721,18 +721,23 @@ mod tests {
     use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunId, RunSpec, TerminalSize};
 
     use super::{
-        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, TerminalOrdinal,
-        TerminalPublicationOwner, UnpublishedCleanupOwner, compare_memory_collection_candidates,
+        CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, RegistryEntry,
+        RegistryResidency, RegistryState, Run, TerminalOrdinal, TerminalPublicationOwner,
+        UnpublishedCleanupOwner, compare_memory_collection_candidates,
+        select_publication_candidates,
     };
+    use crate::retention::RetentionBudget;
 
     #[test]
     fn clamp_record_capacity_only_lowers_the_ceiling() {
         let registry = super::RunRegistry::default();
-        assert_eq!(registry.record_capacity(), super::MAX_RETAINED_RUNS);
-        // A funded ceiling at or above the configured cap changes nothing: the
-        // configured cap stays authoritative.
-        registry.clamp_record_capacity(super::MAX_RETAINED_RUNS + 10);
-        assert_eq!(registry.record_capacity(), super::MAX_RETAINED_RUNS);
+        // The default admission ceiling is the descriptor concurrency target,
+        // not a hardcoded record count.
+        assert_eq!(registry.record_capacity(), super::FD_BUDGET_LIVE_RUNS);
+        // A funded ceiling at or above the default changes nothing: the fd
+        // budget funds at least its own target, so a generous host stays there.
+        registry.clamp_record_capacity(super::FD_BUDGET_LIVE_RUNS + 10);
+        assert_eq!(registry.record_capacity(), super::FD_BUDGET_LIVE_RUNS);
         // A scarce funded ceiling lowers the effective admission ceiling.
         registry.clamp_record_capacity(5);
         assert_eq!(registry.record_capacity(), 5);
@@ -740,6 +745,160 @@ mod tests {
         // clamp — clamping is monotonically downward within one incarnation.
         registry.clamp_record_capacity(50);
         assert_eq!(registry.record_capacity(), 5);
+    }
+
+    /// Build a `RegistryState` holding `count` terminal, collection-eligible
+    /// memory-only Runs — no PTYs, threads, or child processes, so thousands are
+    /// cheap to stand up. Every entry passes the candidate filter (retained,
+    /// `strong_count == 1`, `collection_ordinal().is_some()`), which is the worst
+    /// case for the scan: the old code walked and sorted all of them on every
+    /// create.
+    #[cfg(test)]
+    fn eligible_registry_state(count: usize) -> RegistryState {
+        let budget = RetentionBudget::production();
+        let publications = TerminalPublicationOwner::default();
+        let mut state = RegistryState::default();
+        for _ in 0..count {
+            let run = Run::terminal_eligible_for_bench(&publications, budget.clone());
+            state.runs.insert(
+                run.id,
+                RegistryEntry {
+                    run,
+                    operation_key: None,
+                    stop_operation: None,
+                    metadata_bytes: None,
+                    residency: RegistryResidency::Retained,
+                },
+            );
+        }
+        state
+    }
+
+    /// The no-pressure creation path — the common case, run under the Registry
+    /// write lock on *every* Run creation — must not scan the Registry.
+    ///
+    /// `select_publication_candidates` reports `evaluated`, the number of records
+    /// it walked to choose a candidate. Below the admission ceiling with no
+    /// metadata to fund, a new Run needs no eviction candidate, so the scan is
+    /// pure waste: the fix skips it and reports `evaluated == 0` no matter how
+    /// many Runs are retained. At the ceiling the scan is genuinely needed to
+    /// find an exact replacement, and every eligible record is still walked. This
+    /// pins both: O(1) off the ceiling, full scan on it.
+    #[test]
+    fn no_pressure_publication_scans_nothing_regardless_of_registry_size() {
+        for count in [0_usize, 1, 128, 1024, 4096] {
+            let mut state = eligible_registry_state(count);
+
+            // Below the ceiling: no new Run can trip eviction pressure, so the
+            // scan is skipped entirely. Set the ceiling above `count` explicitly
+            // so the largest case is genuinely below it rather than at the
+            // default fd concurrency target.
+            state.record_capacity = count + 1;
+            let below = select_publication_candidates(&state, None);
+            assert_eq!(
+                below.evaluated, 0,
+                "no-pressure publication at {count} retained Runs must scan nothing"
+            );
+            assert!(below.result.is_ok());
+
+            // At the ceiling: eviction pressure forces the scan, so every
+            // eligible record is walked to find the one exact replacement.
+            state.record_capacity = count.max(1);
+            let at_ceiling = select_publication_candidates(&state, None);
+            assert_eq!(
+                at_ceiling.evaluated, count,
+                "an at-ceiling publication must still walk every retained record"
+            );
+        }
+    }
+
+    /// Mean nanoseconds per `select_publication_candidates(state, None)` call
+    /// over `iterations`, after a warm-up to settle allocator/cache effects.
+    /// Uses `as_secs_f64` (not `as_nanos as f64`) to stay clear of the
+    /// precision-loss lint while keeping nanosecond resolution.
+    #[cfg(test)]
+    fn mean_selection_nanos(state: &RegistryState, iterations: u32) -> f64 {
+        for _ in 0..64 {
+            std::hint::black_box(select_publication_candidates(state, None));
+        }
+        let start = Instant::now();
+        for _ in 0..iterations {
+            std::hint::black_box(select_publication_candidates(state, None));
+        }
+        start.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
+    }
+
+    /// Creation-path cost curve: time the no-pressure candidate selection (the
+    /// path taken on every create under the write lock) across Run counts
+    /// spanning the old 128 wall up to thousands, and prove it does not grow
+    /// super-linearly.
+    ///
+    /// This is the wall-clock measurement behind the fix. The old code built and
+    /// sorted an ordering over all retained Runs unconditionally — O(N log N) per
+    /// create, i.e. quadratic across a fill of N Runs — which the removed 128 cap
+    /// hid. The at-ceiling control here still does that scan+sort and shows it
+    /// climbing with N; the no-pressure path skips it and stays flat.
+    ///
+    /// Gated behind `CTXMUX_BENCH_CREATION_PATH` rather than `#[ignore]`: the
+    /// reachability gate forbids an ignored test in a required Rust suite, and
+    /// wall-clock ratios are load-sensitive on a shared CI box, so the timing
+    /// sweep must neither run nor assert in the default gate. The *deterministic*
+    /// proof of the skip — `evaluated == 0` off-ceiling regardless of N — is
+    /// pinned separately and always-on in
+    /// `no_pressure_publication_scans_nothing_regardless_of_registry_size`.
+    /// Reproduce the curve with:
+    /// `CTXMUX_BENCH_CREATION_PATH=1 cargo test -p ctxmux-daemon --lib --release
+    /// -- --nocapture creation_path_cost`.
+    #[test]
+    fn creation_path_cost_is_not_superlinear_in_registry_size() {
+        if std::env::var_os("CTXMUX_BENCH_CREATION_PATH").is_none() {
+            // Default gate: the timing sweep is opt-in. The algorithmic proof it
+            // corroborates runs deterministically in the sibling test.
+            return;
+        }
+
+        // Time one no-pressure selection (the common create path) many times at
+        // each Run count, and — as a control — the at-ceiling path, which still
+        // does the scan+sort the old no-pressure path did unconditionally.
+        let counts = [128_usize, 256, 512, 1024, 2048];
+        let iterations = 2000;
+
+        let mut no_pressure = Vec::new();
+        for &count in &counts {
+            let mut state = eligible_registry_state(count);
+
+            // The fixed common path: below the ceiling, the scan is skipped.
+            state.record_capacity = count + 1;
+            let skipped = mean_selection_nanos(&state, iterations);
+            no_pressure.push((count, skipped));
+
+            // The control: at the ceiling, the scan+sort runs — this is the work
+            // the old code paid on *every* create, super-linear in N.
+            state.record_capacity = count.max(1);
+            let scanned = mean_selection_nanos(&state, iterations);
+
+            println!(
+                "N={count:>5}  no_pressure(skip)={skipped:>10.1} ns   at_ceiling(scan+sort)={scanned:>10.1} ns"
+            );
+        }
+
+        // A scan+sort would make the no-pressure per-call time rise with N. The
+        // skip makes it flat within measurement noise: a 16x Run-count increase
+        // (128 -> 2048) must not cost anything like 16x per call. Generous
+        // headroom keeps this from flaking under CI load while still catching a
+        // return to super-linear behavior (the at_ceiling control shows what that
+        // looks like: it climbs with N).
+        let (small_n, small) = no_pressure.first().copied().unwrap();
+        let (large_n, large) = no_pressure.last().copied().unwrap();
+        let ratio = large / small.max(1.0);
+        println!(
+            "no-pressure creation-path cost ratio N={small_n}->{large_n}: {ratio:.2}x (per-call {small:.1} -> {large:.1} ns)"
+        );
+        assert!(
+            ratio < 4.0,
+            "no-pressure creation cost grew {ratio:.2}x from N={small_n} to N={large_n} \
+             ({small:.1} -> {large:.1} ns/call); a super-linear scan has returned"
+        );
     }
 
     #[test]
@@ -1168,6 +1327,21 @@ struct RegistryState {
     stop_runs: HashMap<StopOperationKey, RunId>,
     reservations: HashMap<PublicationTicket, RegistryReservation>,
     next_ticket: u64,
+    /// The live-Run admission ceiling: the descriptor concurrency target the
+    /// daemon provisions for (`FD_BUDGET_LIVE_RUNS`), clamped down at startup to
+    /// what `RLIMIT_NOFILE` actually funds (`clamp_record_capacity`). This is the
+    /// point admission refuses a new Run with `run_capacity` unless it can evict
+    /// an eligible terminal one by exact replacement.
+    ///
+    /// It is a descriptor-derived ceiling, not the old `MAX_RETAINED_RUNS = 128`
+    /// count cap. That cap bounded *records* and, incidentally, was the only
+    /// thing bounding retained memory and durable rows; both are now bounded by
+    /// their own resource — the daemon-wide retained-byte budget (`retention.rs`)
+    /// and the durable row ceiling (`persistence.rs`). Anchoring the live ceiling
+    /// to the same `FD_BUDGET_LIVE_RUNS` those two already cite keeps one honest
+    /// number — descriptors — gating live admission, so an agent host that funds
+    /// thousands of descriptors admits thousands of Runs rather than refusing at
+    /// 128.
     record_capacity: usize,
 }
 
@@ -1179,7 +1353,7 @@ impl Default for RegistryState {
             stop_runs: HashMap::new(),
             reservations: HashMap::new(),
             next_ticket: 0,
-            record_capacity: MAX_RETAINED_RUNS,
+            record_capacity: FD_BUDGET_LIVE_RUNS,
         }
     }
 }
@@ -1222,6 +1396,19 @@ fn compare_memory_collection_candidates(
     left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1))
 }
 
+/// One candidate-selection pass over the Registry, and how many retained
+/// records it scanned to reach its verdict.
+///
+/// `evaluated` is the number of `state.runs` entries walked while choosing an
+/// eviction/metadata-funding candidate. Under the removed `MAX_RETAINED_RUNS`
+/// cap this was effectively "records present" (the scan always ran once the
+/// Registry held anything), and the reliability contract froze
+/// `candidate_evaluations_delta = replacements_per_window * run_ceiling` on that
+/// basis. It is now "records actually scanned for a candidate": a no-pressure
+/// publication that funds nothing scans nothing and reports 0, because the scan
+/// is skipped when no record needs evicting and no metadata needs funding. The
+/// count is unchanged whenever the scan does run — i.e. whenever the Registry is
+/// at its admission ceiling and a create must find an exact replacement.
 struct CandidateSelection {
     evaluated: usize,
     result: Result<Vec<RunId>, ProtocolError>,
@@ -1251,6 +1438,31 @@ fn select_publication_candidates(
                     .saturating_sub(super::persistence::METADATA_BYTES)
             });
     let needs_record = projected_records >= state.record_capacity;
+
+    // Fast path: with no record-eviction pressure and no metadata to fund, this
+    // publication needs no collection candidate — the scan-and-sort below would
+    // break on its first iteration and return an empty candidate set anyway. So
+    // skip building the ordering entirely.
+    //
+    // This is not a micro-optimization: `reserve_publication` calls this under
+    // the Registry write lock on *every* Run creation, and the scan is over all
+    // `state.runs` followed by a sort. The old `MAX_RETAINED_RUNS = 128` cap hid
+    // the cost — 128 entries sort for free. With admission now bounded by the fd
+    // budget (thousands of Runs), an unconditional scan+sort per create made
+    // total creation cost O(N log N) per Run, i.e. quadratic across a fill — the
+    // "refuses at 128" wall would have become "crawls at thousands", a worse
+    // failure because it looks like success. Only actual eviction pressure
+    // (`needs_record`) or persistent metadata that must be funded pays for the
+    // ordering. `evaluated` is 0 here because no record was scanned to fund this
+    // publication; see `CandidateSelection::evaluated` for what that metric now
+    // measures.
+    if !needs_record && metadata_to_fund == 0 {
+        return CandidateSelection {
+            evaluated: 0,
+            result: Ok(Vec::new()),
+        };
+    }
+
     let mut evaluated = 0;
     let mut ordered = state
         .runs
@@ -2205,14 +2417,15 @@ impl RunRegistry {
         );
     }
 
-    /// Lower the retained-record ceiling to what the process fd budget funds.
+    /// Lower the live-Run admission ceiling to what the process fd budget funds.
     ///
-    /// Only ever clamps downward: the configured `MAX_RETAINED_RUNS` is the
-    /// authoritative cap, and a funded ceiling at or above it changes nothing.
-    /// When descriptors are scarce this makes admission refuse with the
-    /// designed `run_capacity` at the honest ceiling instead of the daemon
-    /// hitting EMFILE mid-spawn. Startup-only, before the socket is published,
-    /// so no reservation or Collecting fence is in flight.
+    /// Only ever clamps downward: the default ceiling is the descriptor
+    /// concurrency target `FD_BUDGET_LIVE_RUNS`, and a funded ceiling at or above
+    /// it changes nothing. When descriptors are scarce this makes admission
+    /// refuse with the designed `run_capacity` at the honest, descriptor-derived
+    /// ceiling instead of the daemon hitting EMFILE mid-spawn. Startup-only,
+    /// before the socket is published, so no reservation or Collecting fence is
+    /// in flight.
     pub(crate) fn clamp_record_capacity(&self, funded_ceiling: usize) {
         let mut state = write_lock(&self.state);
         state.record_capacity = state.record_capacity.min(funded_ceiling);

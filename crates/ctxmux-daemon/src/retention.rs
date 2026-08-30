@@ -7,10 +7,11 @@
 //! crosses 4 MiB. That leaves two holes, both of which this module fills.
 //!
 //! 1. **No aggregate bound.** N Runs authorize N × 4 MiB with nothing watching
-//!    the sum. The record cap (`MAX_RETAINED_RUNS = 128`) only *incidentally*
-//!    bounded this at 128 × 4 MiB = 512 MiB, and a sibling change is removing
-//!    that cap because this is an agent runtime that runs thousands of
-//!    concurrent Runs. At 4000 Runs the un-bounded design authorizes 16 GiB.
+//!    the sum. The old record cap (`MAX_RETAINED_RUNS = 128`) only *incidentally*
+//!    bounded this at 128 × 4 MiB = 512 MiB, and that cap has since been removed
+//!    because this is an agent runtime that runs thousands of concurrent Runs
+//!    (live admission is now bounded by the descriptor budget, `fd_budget.rs`).
+//!    At 4000 Runs the un-bounded design authorizes 16 GiB.
 //! 2. **Quiet Runs pin memory forever.** Per-Run eviction fires *only on that
 //!    Run's own push*. A Run that fills 4 MiB and then goes silent never pushes
 //!    again, so nothing ever reclaims its 4 MiB — even under global pressure.
@@ -140,7 +141,7 @@ pub(crate) const RETENTION_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// `reliability-gc-contract.json` as `retained_plus_overlap_payload_bytes` and
 /// in ADR 013 as the 544 MiB retained-plus-overlap bound. Expressed as a literal
 /// (not `MAX_RETAINED_RUNS * OUTPUT_RETENTION_BYTES`) so it stays a valid floor
-/// after the sibling change removes the record cap.
+/// now that the record cap has been removed and no such constant exists.
 const GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES: u64 = 570_425_344;
 
 /// The budget must clear the frozen gate peak, or reclamation would truncate a
