@@ -212,10 +212,6 @@ sample() {
   fds=$(ls "$proc/$pid/fd" 2>/dev/null | wc -l | tr -d ' ')
   echo "$rss|$cpu|$threads|$fds"
 }
-cpu_seconds() {
-  # ps TIME is [[dd-]hh:]mm:ss; reduce to seconds.
-  awk -F: '{ s=0; for (i=1;i<=NF;i++){ s = s*60 + $i } print s }' <<<"$1"
-}
 
 "$ctxmuxd_bin" --socket "$sock" --state-dir "$statedir" >"$work/daemon.log" 2>&1 &
 daemon_pid=$!
@@ -334,10 +330,36 @@ rest=${rest#*|}
 steady_threads=${rest%%|*}
 steady_fds=${rest##*|}
 
-elapsed=1
-base_cpu_s=$(cpu_seconds "$baseline_cpu_raw")
-steady_cpu_s=$(cpu_seconds "$steady_cpu_raw")
-cpu_core_percent=$(awk "BEGIN{d=$steady_cpu_s-$base_cpu_s; if(d<0)d=0; printf \"%.3f\", d/$elapsed*100}")
+# Measure idle CPU over a dedicated window, after the fleet has settled.
+#
+# This used to subtract two `ps -o time=` readings taken across the whole fill
+# and divide by a hardcoded elapsed=1. Two things were wrong with that. ps TIME
+# has one-second granularity, so every result was a multiple of 100 — the
+# 2026-09-06 farm run reported 0/100/800/2900/4400 and nothing between. And the
+# window spanned Run creation, so it scored the cost of building the fleet, not
+# the cost of holding it. Idle CPU is the number that matters for a fleet that
+# sits there: it is what the tmux comparison turns on.
+#
+# The stat file's fields 14 and 15 are utime and stime in clock ticks, which
+# is finer than a second, and the window is timed rather than assumed.
+cpu_ticks() {
+  awk '{print $14 + $15}' "$proc/$1/stat" 2>/dev/null || echo 0
+}
+clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
+idle_window=5
+idle_start_ticks=$(cpu_ticks "$daemon_pid")
+idle_start=$(date +%s.%N)
+sleep "$idle_window"
+idle_end_ticks=$(cpu_ticks "$daemon_pid")
+idle_end=$(date +%s.%N)
+cpu_core_percent=$(awk "BEGIN{
+  d = $idle_end_ticks - $idle_start_ticks;
+  if (d < 0) d = 0;
+  secs = d / $clock_ticks;
+  wall = $idle_end - $idle_start;
+  if (wall <= 0) wall = $idle_window;
+  printf \"%.3f\", secs / wall * 100
+}")
 
 divide() { awk "BEGIN{v=$1; if(v<0)v=0; printf \"%.3f\", v/$admitted}"; }
 if [[ $admitted -lt 1 ]]; then admitted=0; fi
