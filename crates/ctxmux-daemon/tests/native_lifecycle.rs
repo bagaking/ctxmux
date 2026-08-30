@@ -27,7 +27,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::UnixStream,
+    net::{UnixListener, UnixStream},
     time::{sleep, timeout},
 };
 use tokio_util::codec::{Framed, LinesCodec};
@@ -5013,4 +5013,80 @@ async fn managed_child_inherits_the_raised_fd_ceiling() {
 
     drop(attachment);
     stop_run(&daemon.client, run.id).await;
+}
+
+/// One `stop` costs exactly one connection.
+///
+/// `prepare_stop` opens a whole connection solely to read `daemon_instance_id`
+/// out of the Hello, then drops the wire -- and the Stop that follows receives
+/// that same field on its own Hello. On a 64-core host the wasted trip was
+/// 15.6 ms of a 21.0 ms `stop`, while the daemon side of the work was 5.4 ms.
+///
+/// Connections accepted is the only honest observable here: a wall-clock
+/// assertion would pass a two-trip implementation on a fast enough host.
+#[tokio::test]
+async fn stop_once_reaches_the_daemon_in_a_single_connection() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start Run");
+
+    // Count connections by putting a proxy in front of the real socket. The
+    // client under test talks only to the proxy.
+    let proxy_dir = tempfile::tempdir().expect("create proxy temp directory");
+    let proxy_path = proxy_dir.path().join("proxy.sock");
+    let listener = UnixListener::bind(&proxy_path).expect("bind counting proxy");
+    let upstream = daemon.client.socket_path().to_path_buf();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&connections);
+    let pump = tokio::spawn(async move {
+        loop {
+            let Ok((mut inbound, _)) = listener.accept().await else {
+                return;
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = UnixStream::connect(&upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+
+    let proxied = Client::new(&proxy_path);
+    let accepted = proxied.stop_once(run.id).await.expect("stop in one trip");
+    assert_eq!(
+        accepted.run.id, run.id,
+        "Stop receipt names the stopped Run"
+    );
+
+    let trips = connections.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        trips, 1,
+        "stop_once opened {trips} connections; a preparatory round trip is back on the Stop path"
+    );
+
+    // The retained-key path is the one that may spend a second trip, and it
+    // must keep doing so -- the credential has to outlive a lost response.
+    let second = daemon
+        .client
+        .start(interactive_shell())
+        .await
+        .expect("start second Run");
+    connections.store(0, std::sync::atomic::Ordering::SeqCst);
+    let operation = proxied
+        .prepare_stop(second.id)
+        .await
+        .expect("prepare retained Stop");
+    proxied.stop(operation).await.expect("apply retained Stop");
+    assert_eq!(
+        connections.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the retained-key path still prepares separately"
+    );
+
+    pump.abort();
 }
