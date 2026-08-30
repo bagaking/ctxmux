@@ -502,6 +502,22 @@ async fn serve_with_manager(
         .map_err(|source| ServerError::io("<sigchld>", source))?;
     let native_owner_wake = manager.native_runs.owner_wake();
 
+    // The relay is live: tell the native owner it may now rely on SIGCHLD and
+    // shed its timed backstop sweep (block with no timer between exits). Then
+    // fire ONE catch-up wake, which forces the owner to peek its whole watched
+    // set once before it is allowed to block. This closes the exec-in-place
+    // adopt window: a child re-adopted by this image via `Run::readopt` (same pid
+    // across execve, still our child) could have exited DURING the exec — after
+    // the old image stopped watching, before this image registered the handler
+    // above — and SIGCHLD's default disposition is ignore, so that transition was
+    // never queued for anyone. Without this catch-up the adopted Run would sit
+    // undetected until some unrelated wake. Cold-recovered Runs (`Run::recover`)
+    // are children of the dead previous process, reparented to init, so they are
+    // not ours to reap and need no coverage here; the catch-up simply no-ops for
+    // them. The peek is non-reaping, so a spurious catch-up is harmless.
+    manager.native_runs.mark_signal_driven();
+    native_owner_wake.wake();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
