@@ -699,6 +699,59 @@ impl Client {
         )
     }
 
+    /// Stop one Run in a single round trip, without retaining the operation.
+    ///
+    /// The incarnation is read from the Hello on the very connection that
+    /// carries the Stop, so no preparatory round trip is needed. The key is
+    /// therefore not retained: on response loss the caller cannot distinguish
+    /// an applied Stop from a lost one. Use [`Client::prepare_stop`] with
+    /// [`Client::stop`] when the operation must survive that loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the Runtime lacks recoverable Stop, the
+    /// operation is rejected, or no unique result can be received.
+    pub async fn stop_once(&self, id: RunId) -> Result<ControlAccepted<StopReceipt>, ClientError> {
+        let (mut wire, runtime) = self
+            .connect_for_dispatch()
+            .await
+            .map_err(control_not_applied)?;
+        require_recoverable_stop(&runtime).map_err(control_not_applied)?;
+        let request = Request::Stop {
+            operation: RecoverableStop {
+                daemon_instance: runtime.daemon_instance_id,
+                operation_key: StopOperationKey::random(),
+                id,
+            },
+        };
+        let encoded = encode_frame(&ClientFrame::Request { request })
+            .map_err(ClientError::Frame)
+            .map_err(control_not_applied)?;
+        send_encoded_sink(&mut wire, encoded)
+            .await
+            .map_err(control_request_unknown)?;
+        let response = match receive(&mut wire).await.map_err(control_request_unknown)? {
+            ServerFrame::Response { response } => response,
+            ServerFrame::Error { error } => {
+                return Err(control_request_unknown(error.into()));
+            }
+            _ => {
+                return Err(control_request_unknown(ClientError::UnexpectedFrame(
+                    "expected correlated control response",
+                )));
+            }
+        };
+        let accepted = decode_short_control(response, decode_stop_receipt)?;
+        if accepted.run.id != id {
+            return Err(control_request_unknown(
+                ClientError::ProtocolContractViolation(
+                    "recoverable Stop response names another Run",
+                ),
+            ));
+        }
+        Ok(accepted)
+    }
+
     /// Apply or recover one caller-retained complete-session Stop operation.
     ///
     /// The operation retains its original daemon incarnation, exact Run, and
@@ -738,17 +791,7 @@ impl Client {
     /// Returns [`ClientError`] when the Runtime identity cannot be obtained.
     pub async fn prepare_stop(&self, id: RunId) -> Result<RecoverableStop, ClientError> {
         let runtime = self.runtime_info().await?;
-        let advertised_version = runtime
-            .capabilities
-            .get(RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP)
-            .copied();
-        if advertised_version.is_none_or(|version| version < 1) {
-            return Err(ClientError::UnsupportedCapability {
-                capability: RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(),
-                required_version: 1,
-                advertised_version,
-            });
-        }
+        require_recoverable_stop(&runtime)?;
         Ok(RecoverableStop {
             daemon_instance: runtime.daemon_instance_id,
             operation_key: StopOperationKey::random(),
@@ -1033,6 +1076,21 @@ fn decode_recoverable_stop_attachment_response(
             "expected recoverable Stop result after attached snapshot",
         ))),
     }
+}
+
+fn require_recoverable_stop(runtime: &RuntimeIdentity) -> Result<(), ClientError> {
+    let advertised_version = runtime
+        .capabilities
+        .get(RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP)
+        .copied();
+    if advertised_version.is_none_or(|version| version < 1) {
+        return Err(ClientError::UnsupportedCapability {
+            capability: RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(),
+            required_version: 1,
+            advertised_version,
+        });
+    }
+    Ok(())
 }
 
 fn control_request_unknown(source: ClientError) -> ClientError {
