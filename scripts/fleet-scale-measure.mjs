@@ -29,10 +29,13 @@
 //
 //   Name the lane.  Every number says which host produced it and at which tier.
 //   The 128 tier overlaps the existing darwin gate on purpose: if the farm's
-//   128 numbers disagree with the darwin baseline beyond a stated platform
-//   delta, the harness is measuring something different from the gate and its
-//   larger tiers cannot be trusted. That cross-check is emitted in the report,
-//   not buried in a comment.
+//   128 numbers disagree with the darwin baseline on a per-Run structural cost,
+//   the cross-check refuses and names the direction, because the two directions
+//   have opposite remedies. Above the baseline means the daemon regressed or the
+//   harnesses measure different things, and the larger tiers cannot be trusted.
+//   Below it means the daemon got cheaper than the frozen baseline records, so
+//   the baseline is stale and no longer cross-checks anything. Both refuse; only
+//   one is a defect. That cross-check is emitted in the report, not buried here.
 //
 // HOST IDENTITY IS ENFORCED, NOT MERELY RECORDED. The darwin baseline records
 // os: darwin and never checks it, which is exactly how a darwin-derived
@@ -103,12 +106,20 @@ const REQUIRED_HOST_CLASS = { platform: "linux", arch: "x64" };
 
 /// Fields whose farm/darwin agreement is asserted at the overlap tier.
 ///
-/// These are the platform-invariant structural costs: the daemon holds three
-/// descriptors per Run and two threads per Run by design on every platform
-/// (ADR 013 / the SIGCHLD reuse proof), so a farm that measures a different
-/// value at 128 is measuring something the gate is not. RSS and CPU are
-/// deliberately excluded here — they legitimately differ by platform and are
-/// bounded per-tier by the derived ceilings instead.
+/// These are the structural per-Run costs. They are platform-invariant by
+/// design — the daemon's descriptor and thread cost per Run comes from its own
+/// architecture (ADR 013 / the SIGCHLD reuse proof), not from the kernel it
+/// runs on — so a farm that measures a different value at 128 is measuring
+/// something the gate is not. RSS and CPU are deliberately excluded here: they
+/// legitimately differ by platform and are bounded per-tier by the derived
+/// ceilings instead.
+///
+/// Invariant across platforms is not invariant across versions. `threads_per_run`
+/// was 2 when the darwin baseline was frozen and is 0 now, because #52 replaced
+/// the per-Run wake source with one shared SIGCHLD handler. A frozen baseline is
+/// the point — it is what makes a regression visible — but it means this check
+/// also fires when the daemon improves, which is why the comparison reports
+/// which direction it moved rather than assuming the worse one.
 const OVERLAP_INVARIANT_FIELDS = ["fds_per_run", "threads_per_run"];
 
 /// What the darwin gate holds at 128, for the overlap cross-check.
@@ -481,40 +492,93 @@ function readingsForCell(cell) {
 /// The 128-tier cross-check against the darwin gate.
 ///
 /// The structural per-Run costs (descriptors, threads) are platform-invariant
-/// by design, so the farm and darwin must agree on them at 128 within a stated
-/// delta of zero. Disagreement means the harness is measuring something the
-/// gate is not, which forfeits any trust in the larger tiers. This returns the
-/// comparison so the report can state it in the output rather than hide it.
+/// by design, so the farm and darwin must agree on them at 128. Disagreement
+/// means one of two things, and the check is only useful if it says which.
+/// This returns the comparison so the report states it in the output rather
+/// than hiding it.
+///
+/// AGREEMENT IS TO WITHIN A FEW WHOLE UNITS ACROSS THE FLEET, NOT TO THE
+/// PRINTED DECIMAL. The census computes these as (steady - baseline) / admitted
+/// and prints three decimals, so two effects move the quotient without any
+/// per-Run cost changing: a fixed descriptor the daemon happens to hold at the
+/// steady sample but not at the baseline (a log file, an accepted control
+/// socket, an inherited pipe), and the rounding of the printed value itself.
+/// Exact float equality would call that a structural disagreement and forfeit
+/// the whole receipt over one descriptor that has nothing to do with per-Run
+/// cost.
+///
+/// The budget is set by the size of the gap it must sit in. At the 128 tier one
+/// stray fixed descriptor is 1 unit and print rounding adds at most 0.0005*128
+/// = 0.064 more; a genuine off-by-one in FDS_PER_RUN is 128 units, and the
+/// stale darwin thread baseline is 256. Four units admits the fixed overhead
+/// with room for the rounding while staying 32x below the smallest real defect,
+/// and that margin only widens at larger tiers. Fixed overhead is not waved
+/// through unexamined either — absolute descriptor and thread cost is still
+/// graded per tier by the derived ceilings. This check asks the narrower
+/// question those cannot: do the two harnesses disagree about what one Run
+/// costs?
+const OVERLAP_UNIT_TOLERANCE = 4;
+
+/// One field's farm/darwin comparison. Pure, so the self-test can exercise
+/// every branch without a budgets file on disk.
+function compareOverlapField(field, farmValue, darwinValue, fleet) {
+  const fleetDelta = Math.abs(farmValue - darwinValue) * fleet;
+  const agree = fleetDelta < OVERLAP_UNIT_TOLERANCE;
+  return {
+    field,
+    farm: farmValue,
+    darwin: darwinValue,
+    fleet_delta_units: Number(fleetDelta.toFixed(3)),
+    agree,
+    ...(agree
+      ? {}
+      : {
+          // Direction carries the diagnosis, and getting it wrong costs real
+          // time. Reading "the harnesses do not measure the same thing" sent
+          // me hunting for a measurement defect when the cause was the
+          // opposite: #52 replaced the per-Run thread with one shared SIGCHLD
+          // source, so the farm honestly measures 0 threads/Run while the
+          // frozen baseline still records the 2 the daemon used to cost. The
+          // cross-check failed *because the optimization worked*.
+          //
+          // Below the baseline cannot mean an unnoticed regression — the
+          // daemon is cheaper than the gate believes — so it is reported as
+          // what it is. It still refuses: a baseline that no longer describes
+          // the daemon has stopped cross-checking anything, and silently
+          // passing it would let the farm tiers run unanchored forever. The
+          // remedy is a reviewed re-baseline, not a looser predicate.
+          direction: farmValue > darwinValue ? "above" : "below",
+          reason:
+            farmValue > darwinValue
+              ? `farm ${field} ${farmValue} at ${OVERLAP_TIER} exceeds the darwin baseline ` +
+                `${darwinValue} by ${fleetDelta.toFixed(1)} units across the fleet; this per-Run ` +
+                "cost is platform-invariant by design, so the daemon either regressed or the " +
+                "two harnesses do not measure the same thing, and the larger farm tiers " +
+                "cannot be trusted until that is resolved"
+              : `farm ${field} ${farmValue} at ${OVERLAP_TIER} is BELOW the darwin baseline ` +
+                `${darwinValue} by ${fleetDelta.toFixed(1)} units across the fleet. The daemon ` +
+                "costs less than the gate records, so this is not a regression and not a " +
+                "measurement mismatch: the darwin baseline is older than the daemon and no " +
+                "longer cross-checks anything. Re-baseline darwin as its own reviewed step, " +
+                "preserving the freeze-then-optimize property",
+        }),
+  };
+}
+
 function overlapCrossCheck(root, receipt, mode) {
   const farmCell = receipt.modes?.[mode]?.[String(OVERLAP_TIER)];
   assertCompleteCell(farmCell, `overlap cross-check ${mode}`);
   const farm = readingsForCell(farmCell);
   const darwin = darwinOverlapMaxima(root, mode);
-  const comparisons = OVERLAP_INVARIANT_FIELDS.map((field) => {
-    const farmValue = farm[field];
-    const darwinValue = darwin[field];
-    const agree = farmValue === darwinValue;
-    return {
-      field,
-      farm: farmValue,
-      darwin: darwinValue,
-      agree,
-      ...(agree
-        ? {}
-        : {
-            reason:
-              `farm ${field} ${farmValue} at ${OVERLAP_TIER} disagrees with the darwin ` +
-              `baseline ${darwinValue}; these per-Run costs are platform-invariant by ` +
-              "design, so a mismatch means the two harnesses do not measure the same thing " +
-              "and the larger farm tiers cannot be trusted",
-          }),
-    };
-  });
+  const fleet = farmCell.admitted_runs;
+  const comparisons = OVERLAP_INVARIANT_FIELDS.map((field) =>
+    compareOverlapField(field, farm[field], darwin[field], fleet),
+  );
   return {
     tier: OVERLAP_TIER,
     mode,
     platform_invariant_fields: OVERLAP_INVARIANT_FIELDS,
-    delta_allowed: 0,
+    fleet_unit_tolerance: OVERLAP_UNIT_TOLERANCE,
     comparisons,
     agrees: comparisons.every((entry) => entry.agree),
   };
@@ -633,11 +697,19 @@ function renderVerdict({ thresholds, receipt, root }) {
       : {
           refusal_reasons: [
             ...tierRefusalReasons(tierVerdicts),
-            ...(overlapAgrees
-              ? []
-              : [
-                  "the 128 tier disagreed with the darwin gate on a platform-invariant per-Run cost",
-                ]),
+            // Carry the per-field reason up rather than restating a generic
+            // "disagreed" line. The two directions have opposite remedies —
+            // above the baseline means investigate the daemon, below it means
+            // re-baseline darwin — and a summary that erases the difference
+            // points the reader at the wrong one.
+            ...overlaps.flatMap((entry) =>
+              entry.comparisons
+                .filter((comparison) => !comparison.agree)
+                .map(
+                  (comparison) =>
+                    `${entry.mode} ${OVERLAP_TIER}: ${comparison.reason}`,
+                ),
+            ),
           ],
         }),
   };
@@ -918,6 +990,71 @@ function selfTest() {
         logical_cpus: 14,
       },
     );
+  });
+
+  // The overlap cross-check: agreement is per whole descriptor/thread across
+  // the fleet, and the two disagreement directions carry opposite remedies.
+  expectSuccess("a rounding-scale overlap delta still agrees", () => {
+    // One stray daemon descriptor at 128 Runs prints as 3.008/Run. Exact
+    // equality called that a structural disagreement and forfeited the receipt.
+    const entry = compareOverlapField("fds_per_run", 3.008, 3, 128);
+    if (!entry.agree) {
+      throw new Error(`one stray descriptor was treated as disagreement`);
+    }
+    return `${entry.fleet_delta_units} fleet units < ${OVERLAP_UNIT_TOLERANCE}`;
+  });
+  expectSuccess("a real per-Run off-by-one is still caught", () => {
+    // The case the tolerance must not swallow: FDS_PER_RUN actually 4.
+    const entry = compareOverlapField("fds_per_run", 4, 3, 128);
+    if (entry.agree) throw new Error("an extra fd per Run was not caught");
+    if (entry.direction !== "above") {
+      throw new Error(`expected direction above, got ${entry.direction}`);
+    }
+    return `${entry.fleet_delta_units} fleet units, direction ${entry.direction}`;
+  });
+  expectSuccess("the tolerance keeps its margin below a real defect", () => {
+    // The comment above justifies 4 units by the gap between fixed overhead
+    // (~1 unit) and the smallest real per-Run defect (128 units at this tier).
+    // Pin that reasoning: a tolerance raised toward the defect would start
+    // admitting off-by-ones silently, and nothing else in the file would fail.
+    const smallestRealDefect = compareOverlapField(
+      "fds_per_run",
+      4,
+      3,
+      OVERLAP_TIER,
+    ).fleet_delta_units;
+    if (OVERLAP_UNIT_TOLERANCE * 8 > smallestRealDefect) {
+      throw new Error(
+        `tolerance ${OVERLAP_UNIT_TOLERANCE} is within 8x of a real ` +
+          `${smallestRealDefect}-unit per-Run defect`,
+      );
+    }
+    return `${OVERLAP_UNIT_TOLERANCE} units vs ${smallestRealDefect}-unit defect`;
+  });
+  expectSuccess("below the baseline is reported as a stale baseline", () => {
+    // The live case: #52 removed the per-Run thread, so the farm measures 0
+    // where the frozen darwin baseline still records 2. The daemon got
+    // cheaper. Reporting that as "the harnesses disagree" points the reader
+    // at a measurement defect that does not exist.
+    const entry = compareOverlapField("threads_per_run", 0, 2, 128);
+    if (entry.agree) throw new Error("a 256-thread gap was not caught");
+    if (entry.direction !== "below") {
+      throw new Error(`expected direction below, got ${entry.direction}`);
+    }
+    if (!entry.reason.includes("older than the daemon")) {
+      throw new Error(`the reason does not name the stale baseline`);
+    }
+    if (entry.reason.includes("cannot be trusted")) {
+      throw new Error("a cheaper daemon was reported as untrustworthy tiers");
+    }
+    return `${entry.fleet_delta_units} fleet units, direction ${entry.direction}`;
+  });
+  expectSuccess("a stale baseline still refuses rather than passing", () => {
+    // Honest naming must not become an exemption: a baseline that no longer
+    // describes the daemon has stopped cross-checking anything.
+    const entry = compareOverlapField("threads_per_run", 0, 2, 128);
+    if (entry.agree) throw new Error("a stale baseline was silently accepted");
+    return "below-baseline disagreement still fails closed";
   });
 
   // Verdict wiring: a passing cell passes, a breaching cell fails.
