@@ -212,13 +212,19 @@ mod tests {
     #[test]
     fn budget_funds_the_configured_concurrency_target() {
         assert_eq!(FD_BUDGET_LIVE_RUNS, 4000);
-        assert_eq!(fd_budget(), FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds());
+        assert_eq!(
+            fd_budget(),
+            FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()
+        );
         assert_eq!(fd_budget(), 12104);
         // The budget funds far more than the record cap (guaranteed at compile
         // time by the FD_BUDGET_LIVE_RUNS >= MAX_RETAINED_RUNS assertion), so
         // raising to it leaves admission bounded only by the record cap, never
         // by descriptors.
-        assert_eq!(run_ceiling_for_soft_limit(Some(fd_budget() as u64)), MAX_RETAINED_RUNS);
+        assert_eq!(
+            run_ceiling_for_soft_limit(Some(fd_budget() as u64)),
+            MAX_RETAINED_RUNS
+        );
     }
 
     /// The effective ceiling tracks descriptors at the record-cap boundary and is

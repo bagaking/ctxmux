@@ -267,7 +267,10 @@ impl TestDaemon {
             .spawn()
             .expect("spawn fd-limited ctxmuxd");
 
-        let stderr = child.stderr.take().expect("fd-limited daemon exposes stderr");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("fd-limited daemon exposes stderr");
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let drain = Arc::clone(&stderr_lines);
         std::thread::spawn(move || {
@@ -4706,9 +4709,13 @@ async fn constrained_fd_limit_clamps_admission_and_explains_the_ceiling() {
     // Two live Runs fit under the funded ceiling.
     let mut live = Vec::new();
     for index in 0..2 {
-        let run = daemon.client.start(non_reading_shell()).await.unwrap_or_else(|error| {
-            panic!("Run {index} should fit under the funded ceiling: {error}")
-        });
+        let run = daemon
+            .client
+            .start(non_reading_shell())
+            .await
+            .unwrap_or_else(|error| {
+                panic!("Run {index} should fit under the funded ceiling: {error}")
+            });
         live.push(run.id);
     }
 
