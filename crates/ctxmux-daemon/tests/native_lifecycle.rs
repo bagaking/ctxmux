@@ -5265,3 +5265,44 @@ async fn next_resized_event(
     .await
     .expect("the applied resize reaches the open attachment")
 }
+
+/// A returned Stop receipt describes a Run that `remove` will accept.
+///
+/// agentmux stops a Run and removes it on the next line, over a long-lived
+/// connection. The remove came back `InvalidRunState` ("still running"):
+/// terminal publication runs on a `ctxmux-native-blocking` worker with no
+/// ordering against the Stop reply, so the reply could name a Run the daemon
+/// still considered live. A cold CLI never saw it -- ~12 ms of process spawn
+/// between the two commands hid the window that a warm client lands inside.
+///
+/// The assertion is on the state the receipt itself reports, not on a later
+/// poll: a receipt that says `Running` is the defect, whatever a retry finds.
+#[tokio::test]
+async fn a_returned_stop_leaves_the_run_immediately_removable() {
+    // Persistent, because that is what agentmux runs: publication there sits
+    // behind a durable finalize, which is the wider of the two windows.
+    let daemon = TestDaemon::start_persistent().await;
+    for attempt in 0..8 {
+        let run = daemon
+            .client
+            .start(interactive_shell())
+            .await
+            .expect("start Run");
+        let accepted = daemon
+            .client
+            .stop_once(run.id)
+            .await
+            .expect("stop in one trip");
+        assert!(
+            !matches!(accepted.run.state, RunState::Running),
+            "attempt {attempt}: Stop returned a receipt but reported state {:?}; \
+             the response describes a Run that the daemon still considers live",
+            accepted.run.state
+        );
+        daemon
+            .client
+            .remove(run.id)
+            .await
+            .unwrap_or_else(|error| panic!("attempt {attempt}: remove after Stop: {error}"));
+    }
+}
