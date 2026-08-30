@@ -1668,6 +1668,156 @@ mod tests {
         );
     }
 
+    // A leader probe that reports terminal only after `live` is cleared, and
+    // counts every peek. Models a child that exits when we say so, so a peek
+    // before the "exit" sees a live leader and a peek after sees a terminal one.
+    fn event_driven_session(peeks: Arc<AtomicUsize>, live: Arc<AtomicUsize>) -> NativeSession {
+        NativeSession::from_child_pid(42)
+            .unwrap()
+            .with_leader_probe_for_test(Arc::new(move || {
+                peeks.fetch_add(1, Ordering::AcqRel);
+                Ok(live.load(Ordering::Acquire) == 0)
+            }))
+    }
+
+    #[test]
+    fn idle_watched_runs_do_not_arm_the_timed_sweep() {
+        // The measured cost was one waitid peek per watched Run every 20 ms. With
+        // exit detection moved to the process-wide SIGCHLD relay (modelled here by
+        // the absence of any wake), an idle watched Run must arm neither a timed
+        // lifecycle pass nor a terminal peek, and the owner must sit blocked in
+        // poll rather than spin — the wakeup no longer scales with Run count.
+        const RUNS: usize = 128;
+
+        let owner = NativeRunOwner::default();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let mut runs = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let failure = NativeWaitFailure::default();
+            let id = RunId::new();
+            let (control, run) = test_run(&owner, id, failure.clone());
+            owner
+                .register_for_test(
+                    &run,
+                    Box::new(WatchingChild),
+                    watching_session(Arc::clone(&probes)),
+                    control,
+                    failure,
+                    || {},
+                )
+                .map_err(|error| error.into_parts().0)
+                .expect("register idle watched fixture");
+            runs.push(run);
+        }
+
+        // Let every registration drain and the owner settle into its blocking
+        // poll, then measure across a window many multiples of the old 20 ms
+        // sweep. `register_for_test` opens /dev/null as the reader, which reports
+        // EOF-readable once and is then dropped from the poll set, so a settled
+        // idle owner holds only watched entries with no armed deadline.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.diagnostic_snapshot().registrations < RUNS {
+            assert!(Instant::now() < deadline, "owner drained all registrations");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let baseline = owner.diagnostic_snapshot();
+        let baseline_probes = probes.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(400));
+        let after = owner.diagnostic_snapshot();
+
+        assert_eq!(
+            probes.load(Ordering::Acquire) - baseline_probes,
+            0,
+            "an idle watched Run ran a terminal peek without any exit readiness"
+        );
+        // 400 ms across 128 idle Runs would be ~2500 timed wakeups under the old
+        // sweep. The owner must be genuinely blocked in poll, not spinning: allow
+        // a small constant for registration settle races only.
+        assert!(
+            after.poll_returns - baseline.poll_returns <= 2,
+            "idle watched owner is not blocked in poll: {} extra poll returns",
+            after.poll_returns - baseline.poll_returns
+        );
+        assert!(
+            after.lifecycle_probes - baseline.lifecycle_probes <= 2,
+            "idle watched owner ran timed lifecycle passes: {} extra",
+            after.lifecycle_probes - baseline.lifecycle_probes
+        );
+
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .expect("shut down idle watched owner");
+    }
+
+    #[test]
+    fn a_wake_after_exit_detects_it_through_the_peek_then_reap_path() {
+        // Prove the event path is load-bearing: with no wake the owner never peeks
+        // (it would every 20 ms under the old sweep), and the moment a wake arrives
+        // after the leader turns terminal, the same peek-then-reap path publishes
+        // the exit. `owner_wake()` stands in for the SIGCHLD relay `serve` pokes.
+        let owner = NativeRunOwner::default();
+        let peeks = Arc::new(AtomicUsize::new(0));
+        let live = Arc::new(AtomicUsize::new(1));
+        let failure = NativeWaitFailure::default();
+        let id = RunId::new();
+        let (control, run) = test_run(&owner, id, failure.clone());
+        owner
+            .register_for_test(
+                &run,
+                Box::new(WatchingChild),
+                event_driven_session(Arc::clone(&peeks), Arc::clone(&live)),
+                control,
+                failure,
+                || {},
+            )
+            .map_err(|error| error.into_parts().0)
+            .expect("register event-driven exit fixture");
+
+        // Settle past registration, then confirm that without any further wake the
+        // owner performs no terminal peek across several old-sweep periods. One
+        // registration-edge peek is expected; nothing after it.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.diagnostic_snapshot().registrations < 1 {
+            assert!(Instant::now() < deadline, "owner drained the registration");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let settled_peeks = peeks.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            peeks.load(Ordering::Acquire),
+            settled_peeks,
+            "owner peeked terminality without a wake (timed sweep still armed)"
+        );
+        assert!(run.info().state.is_running(), "Run exited before its wake");
+
+        // Mark the leader terminal and wake the owner: the wake alone must drive
+        // detection through the WNOWAIT peek and the sequenced reap.
+        live.store(0, Ordering::Release);
+        owner.owner_wake().wake();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while run.info().state.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "a wake after exit did not drive terminal detection"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            matches!(run.info().state, ctxmux_protocol::RunState::Exited { .. }),
+            "Run reached a non-exit terminal state: {:?}",
+            run.info().state
+        );
+        assert!(
+            peeks.load(Ordering::Acquire) > settled_peeks,
+            "terminal publication bypassed the WNOWAIT peek"
+        );
+
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(1))
+            .expect("shut down owner after event-driven exit");
+    }
+
     #[test]
     fn extract_for_handoff_returns_live_descriptors_and_leaves_children_running() {
         use std::{collections::HashSet, process::Command};

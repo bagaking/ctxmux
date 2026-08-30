@@ -866,6 +866,26 @@
       ]
     },
     {
+      "id": "signal-driver-fd-cost",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/tests/signal_driver_fd_cost.rs",
+      "invariants": [
+        "registering signal kinds beyond the first, SIGCHLD among them, reuses the process-wide signal self-pipe and costs zero descriptors, so the daemon's SIGCHLD exit detection adds no per-process descriptor"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "persistence-recovery-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/tests/persistence_recovery.rs",

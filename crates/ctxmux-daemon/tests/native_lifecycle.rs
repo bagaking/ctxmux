@@ -4172,6 +4172,69 @@ async fn repeated_upgrades_have_zero_settled_fd_and_thread_delta() {
         .expect("stop resource-census Run");
 }
 
+/// Pin the *observable* per-Run descriptor cost, the way the reliability harness
+/// measures it — `(steady - baseline) / runs` on the daemon's real open-fd count
+/// — rather than asserting a constant against itself. This is the regression that
+/// actually bit once: a per-Run exit-watch descriptor (a pidfd) pushed the real
+/// cost to 4 while the budget still said 3, and nothing failed until EMFILE at a
+/// few thousand Runs on a platform CI never baselines. Event-driven exit
+/// detection now rides the process-wide SIGCHLD self-pipe the daemon already
+/// holds, so a watched Run must add exactly its PTY trio and no fourth
+/// descriptor. If a future change re-introduced a per-Run watch fd, this delta
+/// would jump to 4 and fail here — on Linux, where CI runs it for every PR.
+///
+/// Linux-gated because it needs an exact fd census. Linux reads it precisely from
+/// the process descriptor table via procfs; the macOS `lsof` census is noisier
+/// (it lists more than numbered fds), so pinning an exact per-Run delta there
+/// would be flaky. macOS's per-Run cost is instead covered by the reliability
+/// qualification harness, which baselines the darwin receipts the budget derives
+/// from. The design is identical on both platforms — no per-Run fd exists on
+/// either — so the Linux census is a sufficient guard against the regression.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_live_native_run_costs_exactly_its_pty_trio_and_no_watch_descriptor() {
+    // Held at 3 by ADR 013 and pinned as `FDS_PER_RUN` in fd_budget.rs: PTY
+    // master + reader dup + writer dup, all aliasing the same master. The point
+    // of this test is that event-driven exit detection adds nothing to it.
+    const FDS_PER_RUN: usize = 3;
+    const RUNS: usize = 8;
+
+    let daemon = TestDaemon::start().await;
+    let daemon_pid = daemon.child.id();
+
+    // Baseline with zero live Runs, after the daemon has fully settled (signal
+    // registrations, listener, tokio reactor, SQLite quartet — everything the
+    // budget's fixed reservation already accounts for is open before we measure).
+    let (baseline_fds, _baseline_threads) = stable_process_resources(daemon_pid).await;
+
+    let mut ids = Vec::with_capacity(RUNS);
+    for index in 0..RUNS {
+        let run = daemon
+            .client
+            .start(non_reading_shell())
+            .await
+            .unwrap_or_else(|error| panic!("start descriptor-census Run {index}: {error}"));
+        ids.push(run.id);
+    }
+    wait_for_run_count(&daemon.client, RUNS).await;
+
+    let (steady_fds, _steady_threads) = stable_process_resources(daemon_pid).await;
+    let added = steady_fds
+        .checked_sub(baseline_fds)
+        .expect("live Runs never reduce the daemon descriptor count");
+    assert_eq!(
+        added,
+        RUNS * FDS_PER_RUN,
+        "each live native Run must add exactly {FDS_PER_RUN} descriptors (PTY trio) and no \
+         per-Run exit-watch fd: {RUNS} Runs added {added} descriptors ({baseline_fds} -> \
+         {steady_fds})"
+    );
+
+    for id in ids {
+        stop_run(&daemon.client, id).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::too_many_lines,
