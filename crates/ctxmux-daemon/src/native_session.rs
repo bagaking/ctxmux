@@ -13,7 +13,21 @@ use rustix::{
     process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, getsid, kill_process, waitid},
 };
 
+/// Longest gap between quiescence checks. Reached by doubling from
+/// [`QUIESCENCE_FIRST_POLL`], so a long wait stays cheap in wakeups.
 const QUIESCENCE_POLL: Duration = Duration::from_millis(10);
+
+/// Gap before the FIRST re-check after signalling.
+///
+/// A signalled child without a handler dies in microseconds, but the check
+/// immediately after `signal_members` races the kernel and essentially always
+/// loses -- so the first sleep is what the caller actually waits out. At a flat
+/// 10 ms that made a whole `stop` cost 12.15 ms on the farm, against 0.27 ms
+/// for a Run whose child had already exited: the Stop machinery is nearly free
+/// and the sleep was the operation. Starting 50x finer and doubling keeps the
+/// common case at a fraction of a millisecond without turning a 500 ms
+/// graceful timeout into thousands of wakeups.
+const QUIESCENCE_FIRST_POLL: Duration = Duration::from_micros(200);
 
 /// One native Run's kernel-owned session identity.
 ///
@@ -139,13 +153,15 @@ impl NativeSession {
                 .map(|status| (status, ctxmux_protocol::StopDisposition::Graceful));
         }
         self.signal_members(Signal::KILL)?;
+        let mut backoff = QUIESCENCE_FIRST_POLL;
         while Instant::now() < deadline {
             if self.members(false)?.is_empty() {
                 return self
                     .reap_leader(child)
                     .map(|status| (status, ctxmux_protocol::StopDisposition::Forced));
             }
-            thread::sleep(QUIESCENCE_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+            backoff = (backoff * 2).min(QUIESCENCE_POLL);
         }
         Err(format!(
             "native session {} retained descendants after direct-child exit",
@@ -158,6 +174,7 @@ impl NativeSession {
         child: &mut (dyn Child + Send + Sync),
         deadline: Instant,
     ) -> Result<Option<ExitStatus>, String> {
+        let mut backoff = QUIESCENCE_FIRST_POLL;
         loop {
             if self.leader_is_terminal()? && self.members(false)?.is_empty() {
                 return self.reap_leader(child).map(Some);
@@ -165,7 +182,8 @@ impl NativeSession {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            thread::sleep(QUIESCENCE_POLL.min(deadline.saturating_duration_since(Instant::now())));
+            thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
+            backoff = (backoff * 2).min(QUIESCENCE_POLL);
         }
     }
 
@@ -755,5 +773,70 @@ mod tests {
 
         let _ = unrelated.kill();
         let _ = unrelated.wait();
+    }
+
+    /// Stopping a Run whose child dies instantly must not cost a poll interval.
+    ///
+    /// The check right after `signal_members` races the kernel and essentially
+    /// always loses, so the FIRST sleep is what the caller waits out. At a flat
+    /// 10 ms that sleep *was* the operation: a whole `stop` measured 12.15 ms
+    /// on a 64-core host against 0.27 ms for a Run whose child had already
+    /// exited, proving the Stop machinery itself is nearly free.
+    ///
+    /// The budget is the point of this test. 5 ms sits well above the ~0.2 ms
+    /// first backoff and well under the 10 ms flat poll it replaced, so a
+    /// revert to a flat `QUIESCENCE_POLL` first sleep fails here while a loaded
+    /// CI box does not.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stopping_an_instantly_dying_child_does_not_wait_out_a_poll_interval() {
+        // `setsid` makes the child a real session leader, which is the shape
+        // `NativeSession` owns -- portable-pty establishes the same thing
+        // before exec. A bare spawn shares our session, so `members()` cannot
+        // see it and the Stop fails its emptiness requirement instead of
+        // measuring anything. `setsid --wait` keeps the pid we adopt as the
+        // leader's, and `sleep` has no SIGTERM handler so it dies at once.
+        let child = Command::new("setsid")
+            .args(["--wait", "/bin/sleep", "600"])
+            .spawn()
+            .expect("spawn quiescence timing child");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        // Wait for the kernel to make the child its own session leader; until
+        // then the census cannot attribute it to this session.
+        let ready = Instant::now();
+        while Instant::now() - ready < Duration::from_secs(5) {
+            if super::getsid(Pid::from_raw(pid as i32))
+                .is_ok_and(|sid| sid.as_raw_pid() as u32 == pid)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut session = NativeSession::from_child_pid(pid).unwrap();
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+
+        let started = Instant::now();
+        let (disposition, _status) = session
+            .stop(
+                &mut adopted,
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+            )
+            .expect("stop the child");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            disposition,
+            ctxmux_protocol::StopDisposition::Graceful,
+            "an unhandled SIGTERM ends the child in the graceful phase"
+        );
+        assert!(
+            elapsed < Duration::from_millis(5),
+            "stop took {elapsed:?} for a child that dies on SIGTERM; the first \
+             quiescence sleep is back to a flat poll interval"
+        );
     }
 }
