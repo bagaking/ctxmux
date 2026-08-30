@@ -414,9 +414,10 @@ fn accept_error_is_fatal(source: &io::Error) -> bool {
 /// record capacity is lowered. On the exec-in-place re-exec path the incoming
 /// image inherits the prior raise, so the raise is idempotent (a no-op) and the
 /// clamp recomputes the same ceiling. When the OS will not fund the full
-/// budget, the clamp is logged with both the funded ceiling and the configured
-/// cap so the operator sees why fewer Runs are admitted than the cap promises,
-/// instead of the daemon reaching EMFILE by surprise mid-spawn.
+/// budget, the clamp is logged with both the funded ceiling and the daemon's
+/// concurrency target so the operator sees why fewer Runs are admitted than the
+/// target provisions for, instead of the daemon reaching EMFILE by surprise
+/// mid-spawn.
 fn apply_startup_fd_budget(manager: &RunManager) {
     let outcome = fd_budget::apply_fd_budget();
     let describe =
@@ -429,7 +430,7 @@ fn apply_startup_fd_budget(manager: &RunManager) {
             describe(outcome.effective_soft),
             describe(outcome.hard),
             outcome.run_ceiling,
-            creation::MAX_RETAINED_RUNS,
+            fd_budget::FD_BUDGET_LIVE_RUNS,
             fd_budget::fd_budget(),
         );
     } else if outcome.raised {
@@ -3129,6 +3130,47 @@ struct TmuxWaitOutcome {
 }
 
 impl Run {
+    /// A minimal terminal, collection-eligible memory-only Run for benchmarks —
+    /// no PTY, no descriptors, no threads, no child process, so a benchmark can
+    /// build thousands of them cheaply to exercise the creation-path candidate
+    /// scan at scale. Terminal (`Exited`), unattached, no live control, and its
+    /// terminal ordinal is set through `TerminalPublicationOwner::recover` so
+    /// `collection_ordinal` returns `Some` (it treats a control-less
+    /// `PersistentCapable` Run as quiescent). Held by the Registry alone, so
+    /// `strong_count == 1` makes it an eligible replacement candidate.
+    #[cfg(test)]
+    fn terminal_eligible_for_bench(
+        terminal_publications: &TerminalPublicationOwner,
+        retention_budget: RetentionBudget,
+    ) -> Arc<Self> {
+        let terminal_ordinal = OnceLock::new();
+        terminal_publications.recover(&terminal_ordinal);
+        Arc::new(Self {
+            id: RunId::new(),
+            spec: None,
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(1),
+            state: Mutex::new(RunState::Exited {
+                code: 0,
+                signal: None,
+            }),
+            output: Mutex::new(OutputLog::new(retention_budget.clone())),
+            incarnation_control: None,
+            native_runs: None,
+            persistence_mode: PersistenceMode::PersistentCapable,
+            persistence_transition: Mutex::new(()),
+            persistence: Mutex::new(PersistenceBinding::Disabled),
+            attachments: AtomicUsize::new(0),
+            qualification_stats: QualificationStats::default(),
+            terminal_publications: terminal_publications.clone(),
+            terminal_ordinal,
+            events: LiveEventOwner::new(LIVE_EVENT_CAPACITY),
+            retention_budget,
+        })
+    }
+
     #[cfg(test)]
     fn new_native_for_owner_test(
         id: RunId,

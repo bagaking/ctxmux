@@ -336,13 +336,15 @@ function assertSameHostClass(derivedHost, receiptHost) {
 
 /// The admission-cap precondition, checked before a tier's numbers are trusted.
 ///
-/// The shipped daemon admits at most MAX_RETAINED_RUNS (128) LIVE Runs: startup
-/// clamps record capacity to min(configured 128, fd-funded ceiling) and
-/// admission refuses beyond it with run_capacity. So a tier above 128 can only
-/// be reached by a daemon built or configured to raise that cap. The measuring
-/// side records how many Runs it actually admitted; if that is short of the
-/// tier, the tier is a BLOCKED PRECONDITION — reported loudly — not a fleet
-/// that quietly came up small and produced flattering per-Run numbers.
+/// The shipped daemon bounds live admission by its file-descriptor budget, not
+/// by a fixed record count: startup raises RLIMIT_NOFILE toward descriptors for
+/// FD_BUDGET_LIVE_RUNS (4000) concurrent live Runs and clamps the effective
+/// ceiling down to whatever the OS actually funds, refusing beyond it with
+/// run_capacity. So a tier is reachable only where the host funds that many
+/// descriptors; a tier the host cannot fund is a BLOCKED PRECONDITION. The
+/// measuring side records how many Runs it actually admitted; if that is short
+/// of the tier, it is reported loudly — not a fleet that quietly came up small
+/// and produced flattering per-Run numbers.
 function assertTierWasReached(cell, tier, mode) {
   const admitted = cell?.admitted_runs;
   if (!Number.isInteger(admitted) || admitted < 0) {
@@ -353,10 +355,11 @@ function assertTierWasReached(cell, tier, mode) {
   }
   if (admitted < tier) {
     throw new Error(
-      `tier ${tier} ${mode}: the daemon admitted only ${admitted} of ${tier} Runs. The shipped ` +
-        "daemon caps live Runs at 128 (MAX_RETAINED_RUNS); a tier above it needs a daemon whose " +
-        "record cap is raised, or this is a blocked precondition rather than a measurable tier. " +
-        "Refusing to score a fleet that never reached its target size.",
+      `tier ${tier} ${mode}: the daemon admitted only ${admitted} of ${tier} Runs. Live ` +
+        "admission is bounded by the descriptor budget (FD_BUDGET_LIVE_RUNS clamped to what " +
+        "RLIMIT_NOFILE funds); a tier this host cannot fund descriptors for is a blocked " +
+        "precondition rather than a measurable tier. Refusing to score a fleet that never " +
+        "reached its target size.",
     );
   }
 }
