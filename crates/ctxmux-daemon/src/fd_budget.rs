@@ -52,10 +52,16 @@ use crate::creation::MAX_CREATION_OWNER_SLOTS;
 /// `fds_per_run` in the reliability contracts.
 pub(crate) const FDS_PER_RUN: usize = 3;
 
-/// Concurrent live Runs the startup budget provisions descriptors for, and the
-/// daemon's live-Run admission ceiling: `RegistryState::record_capacity`
-/// defaults to this and is only ever clamped *down* to what `RLIMIT_NOFILE`
-/// actually funds. It is a descriptor *concurrency target*, not the removed
+/// Concurrent live Runs the startup budget provisions descriptors for.
+///
+/// This is what the daemon *provisions* for, not on its own what it will
+/// admit. The effective ceiling is the smallest of three things: this target,
+/// what `RLIMIT_NOFILE` funds (`RegistryState::record_capacity` defaults here
+/// and is only ever clamped *down*, see `run_ceiling_for_soft_limit`), and
+/// whatever ptys the kernel will still hand out. The third term is not
+/// budgeted, because it cannot be known in advance — see below.
+///
+/// It is a descriptor *concurrency target*, not the removed
 /// `MAX_RETAINED_RUNS = 128` record count — attachment and turnover fan-out are
 /// not record-count-bounded, retained memory is now bounded by the daemon-wide
 /// retained-byte budget (`retention.rs`), and durable rows by the persistence
@@ -64,6 +70,34 @@ pub(crate) const FDS_PER_RUN: usize = 3;
 /// by. Measured cost at this target on a 64-core Linux host: ~12k fds, ~14 MiB
 /// RSS, ~21% of one core — comparable to `tmux` at the same Run count, which
 /// imposes no count limit.
+///
+/// # The pty ceiling, and why it is not probed
+///
+/// Every live Run holds a pty, and the kernel caps those independently of
+/// descriptors. Measured:
+///
+/// * Linux exposes `/proc/sys/kernel/pty/{max,nr,reserve}` (a directory, not a
+///   `pty.max` file). The farm hosts read `max=65536`, so the kernel ceiling is
+///   an order of magnitude above this target and never binds there.
+/// * macOS exposes `kern.tty.ptmx_max`, 511 by default. With ~180 ptys already
+///   held by an ordinary desktop session, `openpty` began failing at 346 — so
+///   darwin's real headroom is roughly a tenth of this target, and the pty
+///   ceiling binds long before the descriptor budget does.
+///
+/// The daemon deliberately does not probe either at startup and clamp against
+/// it. macOS publishes the ceiling but no current-allocation counter, so a
+/// probe there cannot subtract what the rest of the system holds and would be
+/// wrong by a different amount every minute. Linux does publish `nr`, but it is
+/// live — it moved by tens of thousands during a single measurement run — so a
+/// startup snapshot is stale immediately. A probed ceiling would look
+/// authoritative and still be wrong.
+///
+/// The honest arrangement is this fixed budget plus a truthful refusal when the
+/// kernel declines: pty exhaustion surfaces as `ErrorCode::RunCapacity` (not
+/// `SpawnFailed`) on both platforms, keyed on the errnos each one reports. A
+/// darwin fleet is therefore expected to refuse cleanly somewhere near 350 Runs
+/// rather than reach this target, which is also why the darwin lane cannot
+/// exercise admission at this ceiling.
 pub(crate) const FD_BUDGET_LIVE_RUNS: usize = 4000;
 
 /// Fixed non-Run descriptors the daemon holds regardless of Run count: stdio,
