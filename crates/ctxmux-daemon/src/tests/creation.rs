@@ -244,6 +244,271 @@ async fn memory_capacity_rejects_before_spawn_then_replaces_one_quiescent_termin
     stop_run_and_wait(&manager, recreated.id).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_terminal_run_frees_a_slot_that_a_capacity_rejected_start_then_uses() {
+    let (manager, _hook) = capacity_test_manager(1);
+    let temp = tempfile::tempdir().expect("create removal capacity fixture");
+    let first_marker = temp.path().join("first.log");
+    let rejected_marker = temp.path().join("rejected.log");
+    let replacement_marker = temp.path().join("replacement.log");
+    let first_key = CreateOperationKey::new("removal-first").unwrap();
+    let first = manager
+        .create(
+            first_key.clone(),
+            CreationRequest::Start {
+                spec: marker_spec(&first_marker, true),
+            },
+        )
+        .await
+        .expect("fill the one-record Registry");
+    assert_eq!(wait_for_marker_pids(&first_marker, 1).await.len(), 1);
+
+    // A live retained Run cannot be removed and cannot fund a replacement, so
+    // the second Start is still refused before spawn.
+    assert_eq!(
+        manager.remove(first.id).await.unwrap_err().code,
+        ErrorCode::InvalidRunState
+    );
+    let rejected = manager
+        .create(
+            CreateOperationKey::new("removal-rejected").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&rejected_marker, false),
+            },
+        )
+        .await
+        .expect_err("a live retained Run leaves no free slot");
+    assert_eq!(rejected.code, ErrorCode::RunCapacity);
+    assert!(read_marker_pids(&rejected_marker).is_empty());
+
+    stop_run_and_wait(&manager, first.id).await;
+    wait_for_run_workers(&manager).await;
+
+    // Removal returns the slot to the budget: the retained count drops to zero,
+    // which is a net release that admission-triggered replacement can never
+    // produce (replacement is net-zero and only elects a candidate under
+    // pressure). A subsequent Start now admits a brand-new Run, not a replacement
+    // of the removed one.
+    manager
+        .remove(first.id)
+        .await
+        .expect("remove the quiescent terminal Run");
+    assert!(manager.list().is_empty());
+    assert_eq!(
+        manager.info(first.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+
+    let replacement = manager
+        .create(
+            CreateOperationKey::new("removal-replacement").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&replacement_marker, false),
+            },
+        )
+        .await
+        .expect("the freed slot admits a fresh Start");
+    assert_ne!(replacement.id, first.id);
+    assert_eq!(manager.list().len(), 1);
+    assert_eq!(wait_for_marker_pids(&replacement_marker, 1).await.len(), 1);
+    wait_for_run_terminal_async(&manager.get(replacement.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    // The removed key is unbound and elects an ordinary new Run on reuse.
+    manager
+        .remove(replacement.id)
+        .await
+        .expect("free the slot again before reusing the first key");
+    let reused = manager
+        .create(
+            first_key,
+            CreationRequest::Start {
+                spec: marker_spec(&first_marker, false),
+            },
+        )
+        .await
+        .expect("the removed exact key elects one ordinary new Run");
+    assert_ne!(reused.id, first.id);
+    assert_eq!(wait_for_marker_pids(&first_marker, 2).await.len(), 2);
+    wait_for_run_terminal_async(&manager.get(reused.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+    manager
+        .remove(reused.id)
+        .await
+        .expect("remove the final terminal Run");
+    assert!(manager.list().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_an_absent_or_already_removed_run_is_idempotent_run_not_found() {
+    let (manager, _hook) = capacity_test_manager(1);
+    let never_created = RunId::new();
+    assert_eq!(
+        manager.remove(never_created).await.unwrap_err().code,
+        ErrorCode::RunNotFound,
+        "removing an unknown id is a clean idempotent RunNotFound"
+    );
+
+    let temp = tempfile::tempdir().expect("create idempotent removal fixture");
+    let marker = temp.path().join("run.log");
+    let run = manager
+        .create(
+            CreateOperationKey::new("idempotent-removal").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, false),
+            },
+        )
+        .await
+        .expect("create the removal target");
+    wait_for_run_terminal_async(&manager.get(run.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    manager
+        .remove(run.id)
+        .await
+        .expect("first removal reclaims the terminal Run");
+    assert_eq!(
+        manager.remove(run.id).await.unwrap_err().code,
+        ErrorCode::RunNotFound,
+        "a second removal of the same id is idempotent, never a forced re-teardown"
+    );
+    assert!(manager.list().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_an_attached_terminal_run_is_refused_without_forced_teardown() {
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::default()
+    });
+    let temp = tempfile::tempdir().expect("create attached removal fixture");
+    let marker = temp.path().join("attached-removal.log");
+    let run = manager
+        .create(
+            CreateOperationKey::new("attached-removal").unwrap(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, false),
+            },
+        )
+        .await
+        .expect("start the attachment target");
+    wait_for_run_terminal_async(&manager.get(run.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+
+    // A live attachment guard holds an `Arc<Run>` and raises the attachment
+    // count, so the terminal Run is no longer collectable. Removal must refuse
+    // rather than force the guard off. (This is exactly what an in-flight public
+    // Attach or any other lookup pin does; the guard is the deterministic form.)
+    let pinned = manager.get(run.id).expect("pin the terminal Run");
+    let (attachment_guard, subscription) = pinned.subscribe();
+
+    let refused = manager
+        .remove(run.id)
+        .await
+        .expect_err("an attached Run cannot be removed");
+    assert_eq!(refused.code, ErrorCode::BackendUnavailable);
+    assert_eq!(
+        manager
+            .info(run.id)
+            .expect("attached Run stays retained")
+            .id,
+        run.id,
+        "a refused removal leaves the Run fully intact"
+    );
+
+    drop(subscription);
+    drop(attachment_guard);
+    drop(pinned);
+    wait_for_run_workers(&manager).await;
+    manager
+        .remove(run.id)
+        .await
+        .expect("the detached terminal Run is removable");
+    assert!(manager.list().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persistent_removal_deletes_the_exact_durable_unit_and_survives_restart() {
+    let temp = tempfile::tempdir().expect("create persistent removal fixture");
+    let state_dir = temp.path().join("state");
+    let marker = temp.path().join("starts.log");
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(state_dir.clone(), 1, 64 * 1024 * 1024)
+            .expect("open tiny persistence store");
+    assert!(recovered.is_empty());
+    let manager = Arc::new(RunManager {
+        registry: RunRegistry::with_record_capacity(1),
+        ..RunManager::persistent(persistence, recovered)
+    });
+    let removed_key = CreateOperationKey::new("persistent-removed").unwrap();
+    let removed = manager
+        .create(
+            removed_key.clone(),
+            CreationRequest::Start {
+                spec: marker_spec(&marker, false),
+            },
+        )
+        .await
+        .expect("create the removal target");
+    wait_for_run_terminal_async(&manager.get(removed.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+    assert_persistent_run_key_present(&state_dir, removed.id, &removed_key);
+
+    manager
+        .remove(removed.id)
+        .await
+        .expect("remove the exact durable Run");
+    assert!(manager.list().is_empty());
+    assert_eq!(
+        manager.info(removed.id).unwrap_err().code,
+        ErrorCode::RunNotFound
+    );
+    assert_persistent_run_key_absent(&state_dir, removed.id, &removed_key);
+
+    // The freed slot admits a fresh persistent Run that must itself survive
+    // restart, proving the removal did not corrupt the store.
+    let kept_key = CreateOperationKey::new("persistent-kept").unwrap();
+    let kept = manager
+        .create(
+            kept_key.clone(),
+            CreationRequest::Start {
+                spec: short_lived_spec(),
+            },
+        )
+        .await
+        .expect("the freed slot admits a fresh persistent Start");
+    assert_ne!(kept.id, removed.id);
+    wait_for_run_terminal_async(&manager.get(kept.id).unwrap()).await;
+    wait_for_run_workers(&manager).await;
+    assert_persistent_run_key_present(&state_dir, kept.id, &kept_key);
+    drop(manager);
+
+    // Restart recovers only the kept Run: the removed row is durably gone, so a
+    // restarted daemon holds one record, not two, and the removed key is free.
+    let (persistence, recovered) =
+        Persistence::open_with_test_limits(state_dir.clone(), 1, 64 * 1024 * 1024)
+            .expect("reopen tiny persistence store");
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].info.id, kept.id);
+    assert_eq!(&recovered[0].operation_key, &kept_key);
+    let restarted = Arc::new(RunManager::persistent(persistence, recovered));
+    assert!(
+        restarted.get(removed.id).is_err(),
+        "the removed Run does not return after restart"
+    );
+    assert_eq!(
+        restarted
+            .list()
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
+        vec![kept.id]
+    );
+    assert_persistent_run_key_absent(&state_dir, removed.id, &removed_key);
+    assert_persistent_run_key_present(&state_dir, kept.id, &kept_key);
+    drop(restarted);
+}
+
 async fn assert_valid_fork_rejected_before_spawn(
     manager: &Arc<RunManager>,
     creation_hook: &CreationTestHook,

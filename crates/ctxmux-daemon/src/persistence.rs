@@ -359,6 +359,22 @@ impl PersistentCandidate {
     }
 }
 
+/// Durable outcome of one exact terminal-Run removal.
+///
+/// Removal has no successor row, so a rolled-back or rejected removal simply
+/// leaves the exact candidate present and is safe to surface as a typed error.
+/// An unclassifiable rollback failure latches the persistence actor exactly as
+/// a start `CommitUnknown` does, so the daemon fail-stops rather than diverging
+/// durable and in-memory truth.
+pub(crate) enum RemovalDisposition {
+    /// The exact row and its cascading replay were deleted and committed.
+    Removed,
+    /// No durable mutation occurred; the exact candidate remains present.
+    NotRemoved(PersistenceError),
+    /// The rollback or classification could not be proven; restart is required.
+    Unknown(PersistenceError),
+}
+
 /// Monotonic durable disposition of one staged Run start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartDisposition {
@@ -788,6 +804,31 @@ impl Persistence {
         }
     }
 
+    /// Delete one exact terminal Run row and its cascading replay in a single
+    /// bounded transaction, reusing the same spill-disabled zero-WAL page-charge
+    /// admission the exact-replacement path proves. The actor is the sole store
+    /// owner, so this shares the FIFO ordering of every other durable mutation.
+    pub(crate) fn remove_terminal(&self, candidate: PersistentCandidate) -> RemovalDisposition {
+        if let Some(message) = mutex_lock(&self.inner.failure).clone() {
+            return RemovalDisposition::NotRemoved(PersistenceError::Mutation(message));
+        }
+        let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        if self
+            .inner
+            .sender
+            .send(Command::RemoveTerminal {
+                candidate,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return RemovalDisposition::NotRemoved(PersistenceError::ActorStopped);
+        }
+        reply_rx.recv().unwrap_or(RemovalDisposition::NotRemoved(
+            PersistenceError::ActorStopped,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_start(
         &self,
@@ -1072,6 +1113,10 @@ impl Drop for StagedPersistentStart {
 
 enum Command {
     StageStart(Box<StageRequest>),
+    RemoveTerminal {
+        candidate: PersistentCandidate,
+        reply: mpsc::SyncSender<RemovalDisposition>,
+    },
     Append {
         id: RunId,
         replay: OutputReplay,
@@ -1196,6 +1241,24 @@ fn actor_main(
                     return;
                 };
                 handle_staged_start_result(&request, result, failure);
+            }
+            Command::RemoveTerminal { candidate, reply } => {
+                // Fail closed before touching the store, mirroring StageStart: a
+                // latched fatal failure rejects the removal without database work.
+                let disposition = if let Some(message) = mutex_lock(failure).clone() {
+                    RemovalDisposition::NotRemoved(PersistenceError::Mutation(message))
+                } else {
+                    match store.remove_terminal_with_shutdown(&candidate, Some(shutdown)) {
+                        Some(disposition) => {
+                            if let RemovalDisposition::Unknown(error) = &disposition {
+                                remember_failure(failure, error);
+                            }
+                            disposition
+                        }
+                        None => return,
+                    }
+                };
+                let _ = reply.send(disposition);
             }
             Command::Append {
                 id,
@@ -2495,6 +2558,221 @@ impl StateStore {
                     .map_err(PersistenceError::database)
             },
             || file_len(&self.wal_path),
+        )
+    }
+
+    /// Remove one exact terminal candidate, retrying only transient checkpoint
+    /// pressure and reporting shutdown as `None` (the caller keeps the Registry
+    /// entry). Every other outcome is a definitive [`RemovalDisposition`].
+    fn remove_terminal_with_shutdown(
+        &mut self,
+        candidate: &PersistentCandidate,
+        shutdown: Option<&AtomicBool>,
+    ) -> Option<RemovalDisposition> {
+        loop {
+            if shutdown.is_some_and(|shutdown| shutdown.load(Ordering::Acquire)) {
+                return None;
+            }
+            match self.remove_terminal_once(candidate, shutdown) {
+                Ok(disposition) => return Some(disposition),
+                Err(error) if error.is_transient_storage() => {
+                    if wait_for_shutdown(shutdown?, STORAGE_RETRY_INTERVAL) {
+                        return None;
+                    }
+                }
+                Err(error) => return Some(RemovalDisposition::NotRemoved(error)),
+            }
+        }
+    }
+
+    fn remove_terminal_once(
+        &mut self,
+        candidate: &PersistentCandidate,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<RemovalDisposition, PersistenceError> {
+        self.truncate_wal_to_zero_with_shutdown(shutdown)?;
+        self.connection
+            .release_memory()
+            .map_err(PersistenceError::database)?;
+        let previous_cache_spill = self
+            .disable_cache_spill()
+            .map_err(|failure| failure.error)?;
+        let result = self.remove_terminal_spill_disabled(candidate);
+        match self.restore_cache_spill(previous_cache_spill) {
+            Ok(()) => Ok(result),
+            Err(restore_error) => match result {
+                // A committed delete whose only later failure is the spill
+                // restore is still durably gone; surface removal, not unknown.
+                RemovalDisposition::Removed => Ok(RemovalDisposition::Removed),
+                RemovalDisposition::NotRemoved(error) | RemovalDisposition::Unknown(error) => Ok(
+                    RemovalDisposition::Unknown(combine_errors(&error, &restore_error)),
+                ),
+            },
+        }
+    }
+
+    fn remove_terminal_spill_disabled(
+        &self,
+        candidate: &PersistentCandidate,
+    ) -> RemovalDisposition {
+        if let Err(error) = ctxmux_sqlite_status::reset_cache_io(&self.connection) {
+            return RemovalDisposition::NotRemoved(
+                admission_failure(format!(
+                    "persistent removal could not reset cache counters: {error}"
+                ))
+                .error,
+            );
+        }
+        if let Err(error) = self.connection.execute_batch("BEGIN IMMEDIATE") {
+            return RemovalDisposition::NotRemoved(PersistenceError::database(error));
+        }
+        match file_len(&self.wal_path) {
+            Ok(0) => {}
+            Ok(_) => {
+                return self.rollback_removal(
+                    PersistenceError::Mutation(
+                        "persistent WAL changed before exact removal".to_owned(),
+                    ),
+                    false,
+                );
+            }
+            Err(error) => return self.rollback_removal(error, false),
+        }
+        if let Err(error) = self.delete_exact_terminal(candidate) {
+            return self.rollback_removal(error, false);
+        }
+        let snapshot = match ctxmux_sqlite_status::cache_admission_snapshot(&self.connection) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self.rollback_removal(
+                    admission_failure(format!(
+                        "persistent removal could not observe cache status: {error}"
+                    ))
+                    .error,
+                    false,
+                );
+            }
+        };
+        let wal_bytes = match file_len(&self.wal_path) {
+            Ok(bytes) => bytes,
+            Err(error) => return self.rollback_removal(error, false),
+        };
+        let charge = wal_charge_for_cache(snapshot.used_bytes);
+        if wal_bytes != 0
+            || snapshot.writes != 0
+            || snapshot.spills != 0
+            || charge.is_none_or(|charge| charge > WAL_CHECKPOINT_BYTES)
+        {
+            return self.rollback_removal(
+                admission_failure(format!(
+                    "persistent removal exceeds or cannot prove its 8 MiB WAL charge: \
+                     cache={} bytes, writes={}, spills={}, wal={} bytes",
+                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes
+                ))
+                .error,
+                false,
+            );
+        }
+        match self.connection.execute_batch("COMMIT") {
+            Ok(()) => match self.validate_files() {
+                Ok(()) => RemovalDisposition::Removed,
+                // The row is durably gone even if a post-commit file check
+                // fails; latch that as a fatal removal, never as retained.
+                Err(error) => RemovalDisposition::Unknown(error),
+            },
+            Err(commit_error) => self.classify_failed_removal(candidate, commit_error),
+        }
+    }
+
+    /// Roll back a staged removal. `after_commit` is only ever false here (no SQL
+    /// runs after COMMIT), so a rollback failure is `Unknown`, matching the start
+    /// path's fail-closed classification.
+    fn rollback_removal(&self, error: PersistenceError, after_commit: bool) -> RemovalDisposition {
+        match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) if after_commit => RemovalDisposition::Unknown(error),
+            Ok(()) => RemovalDisposition::NotRemoved(error),
+            Err(rollback_error) => RemovalDisposition::Unknown(PersistenceError::Mutation(
+                format!("{error}; removal rollback failed: {rollback_error}"),
+            )),
+        }
+    }
+
+    fn classify_failed_removal(
+        &self,
+        candidate: &PersistentCandidate,
+        commit_error: rusqlite::Error,
+    ) -> RemovalDisposition {
+        if !self.connection.is_autocommit()
+            && let Err(rollback_error) = self.connection.execute_batch("ROLLBACK")
+        {
+            return RemovalDisposition::Unknown(PersistenceError::Mutation(format!(
+                "persistent removal COMMIT failed ({commit_error}) and rollback failed \
+                 ({rollback_error})"
+            )));
+        }
+        match self.exact_terminal_present(candidate) {
+            Ok(true) => RemovalDisposition::NotRemoved(PersistenceError::database(commit_error)),
+            Ok(false) => RemovalDisposition::Removed,
+            Err(probe_error) => RemovalDisposition::Unknown(PersistenceError::Mutation(format!(
+                "persistent removal COMMIT failed ({commit_error}) and exact probe failed: \
+                 {probe_error}"
+            ))),
+        }
+    }
+
+    fn delete_exact_terminal(
+        &self,
+        candidate: &PersistentCandidate,
+    ) -> Result<(), PersistenceError> {
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM runs WHERE id = ?1 AND creation_key = ?2 COLLATE BINARY
+                 AND metadata_bytes = ?3 AND state_kind != 'running'",
+                params![
+                    candidate.id.to_string(),
+                    candidate.operation_key.as_str(),
+                    i64::try_from(candidate.metadata_bytes).map_err(|_| {
+                        PersistenceError::Mutation(
+                            "candidate metadata does not fit SQLite".to_owned(),
+                        )
+                    })?
+                ],
+            )
+            .map_err(PersistenceError::database)?;
+        if deleted != 1 {
+            return Err(PersistenceError::Mutation(format!(
+                "persistent removal candidate {} does not match its exact terminal snapshot",
+                candidate.id
+            )));
+        }
+        Ok(())
+    }
+
+    fn exact_terminal_present(
+        &self,
+        candidate: &PersistentCandidate,
+    ) -> Result<bool, PersistenceError> {
+        let stored: Option<(String, i64, String, String)> = self
+            .connection
+            .query_row(
+                "SELECT creation_key, metadata_bytes, state_kind, state_json
+                 FROM runs WHERE id = ?1",
+                [candidate.id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some((key, metadata, state_kind, state_json)) = stored else {
+            return Ok(false);
+        };
+        let state: RunState =
+            serde_json::from_str(&state_json).map_err(PersistenceError::serialization)?;
+        Ok(
+            key.as_bytes() == candidate.operation_key.as_str().as_bytes()
+                && nonnegative_u64(metadata, "candidate metadata")? == candidate.metadata_bytes
+                && state_kind == state_kind_for(&state)
+                && !state.is_running(),
         )
     }
 

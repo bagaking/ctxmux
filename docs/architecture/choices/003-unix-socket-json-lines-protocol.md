@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 14
+# 003 — Unix socket and NDJSON protocol generation 15
 
-- Status: accepted for generation 14; pre-stable
+- Status: accepted for generation 15; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -72,12 +72,17 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 14 directly replaces generation 13. It separates
-cursor-free non-output `observation_discontinuity` from raw-output `gap`; there
-is no fallback encoding that falsely treats tmux observation loss as byte
-replay. Generation 13 used integer-array output bytes; generation 14 replaces
-that wire shape with strict padded base64. Generation 12 added one explicit
-`attach_recoverable_stop` composite so
+Protocol generation 15 directly replaces generation 14. It adds the `remove`
+request and its `removed { id }` response so a client can reclaim one
+already-terminal, unpinned Run's retained record slot; the verb refuses a
+running Run with `invalid_run_state` and an attached, pinned, collecting, or
+not-yet-quiescent Run with `backend_unavailable`, and reports an unknown or
+already-removed id as `run_not_found` so a retry is idempotent. Generation 14
+separated cursor-free non-output `observation_discontinuity` from raw-output
+`gap`; there is no fallback encoding that falsely treats tmux observation loss
+as byte replay. Generation 13 used integer-array output bytes; generation 14
+replaced that wire shape with strict padded base64. Generation 12 added one
+explicit `attach_recoverable_stop` composite so
 terminal attachment recovery intent is present before the ordinary
 terminal-event/EOF boundary. Generation 11
 requires one caller-retained recoverable native Stop operation and advertises
@@ -92,7 +97,7 @@ keys and receipts; generation 6 introduced the narrow `run_capacity` error;
 generation 5 introduced correlated attachment controls, typed owner receipts,
 failure dispositions, and applied PTY-size readback; generation 4 introduced
 bounded creation keys. An older peer fails the exact generation handshake
-before request dispatch; ctxmux does not provide a generation-13 fallback,
+before request dispatch; ctxmux does not provide a generation-14 fallback,
 migration, alias, version range, or dual encoding.
 Compatibility policy is not yet a release guarantee.
 

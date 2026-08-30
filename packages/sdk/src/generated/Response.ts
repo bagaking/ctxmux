@@ -2,6 +2,7 @@
 import type { AppliedInputRange } from "./AppliedInputRange.js";
 import type { ControlFailure } from "./ControlFailure.js";
 import type { ControlReceipt } from "./ControlReceipt.js";
+import type { RunId } from "./RunId.js";
 import type { RunInfo } from "./RunInfo.js";
 import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
 
@@ -15,6 +16,7 @@ export type Response =
   | { type: "forked"; run: RunInfo }
   | { type: "runs"; runs: Array<RunInfo> }
   | { type: "status"; run: RunInfo }
+  | { type: "removed"; id: RunId }
   | { type: "control_accepted"; run: RunInfo; receipt: ControlReceipt }
   | { type: "control_rejected"; failure: ControlFailure }
   | { type: "input_applied"; run: RunInfo; range: AppliedInputRange };

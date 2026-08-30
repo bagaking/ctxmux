@@ -76,8 +76,8 @@ use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegis
 use crate::native_session::{AdoptedChild, NativeSession};
 use crate::persistence::{
     CommittedStart, HandoffHint, Persistence, PersistentCandidate, PersistentRun,
-    PersistentStartCompletion, PersistentStartFailure, RecoveredRun, StagedPersistentStart,
-    StartDisposition,
+    PersistentStartCompletion, PersistentStartFailure, RecoveredRun, RemovalDisposition,
+    StagedPersistentStart, StartDisposition,
 };
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 use crate::tmux::{
@@ -2094,6 +2094,78 @@ impl RunManager {
         })
     }
 
+    /// Reclaim one already-terminal, unpinned Run so its retained slot returns.
+    ///
+    /// Memory-only removal is one Registry critical section. Persistent removal
+    /// fences the entry, deletes the exact durable row on the persistence actor
+    /// off the async runtime, then commits the in-memory removal; a durable
+    /// failure restores the fence and the Run stays intact. An unclassifiable
+    /// durable outcome fail-stops the incarnation, exactly like a start's
+    /// `CommitUnknown`, so durable and in-memory truth never diverge.
+    async fn remove(self: &Arc<Self>, id: RunId) -> Result<(), ProtocolError> {
+        let Some(_persistence) = &self.persistence else {
+            return self.registry.remove_memory(id);
+        };
+        let manager = Arc::clone(self);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        thread::Builder::new()
+            .name("ctxmux-remove".to_owned())
+            .spawn(move || {
+                let _ = result_tx.send(manager.remove_persistent(id));
+            })
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to start Run removal owner: {error}"),
+                )
+            })?;
+        result_rx.await.map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("Run removal owner ended without a result: {error}"),
+            )
+        })?
+    }
+
+    fn remove_persistent(&self, id: RunId) -> Result<(), ProtocolError> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .expect("persistent removal has a persistence owner");
+        let (candidate, removal) = self.registry.begin_persistent_removal(id)?;
+        match persistence.remove_terminal(PersistentCandidate::from(candidate)) {
+            RemovalDisposition::Removed => {
+                removal.commit();
+                Ok(())
+            }
+            RemovalDisposition::NotRemoved(error) => {
+                // The fence restores on drop; the Run stays intact and resolvable.
+                drop(removal);
+                Err(ProtocolError::new(
+                    ErrorCode::Persistence,
+                    format!("durable Run removal was rejected: {error}"),
+                ))
+            }
+            RemovalDisposition::Unknown(error) => {
+                let message = error.to_string();
+                // The durable outcome is unknown: never guess in memory. Keep
+                // the fence (leak the owner) and fail-stop the incarnation so
+                // restart's SQLite recovery is the only authority.
+                std::mem::forget(removal);
+                self.incarnation_failure.record(format!(
+                    "durable Run removal outcome is unknown; restart is required: {message}"
+                ));
+                self.creation_flights.fence();
+                Err(ProtocolError::new(
+                    ErrorCode::Persistence,
+                    format!(
+                        "durable Run removal outcome is unknown; restart is required: {message}"
+                    ),
+                ))
+            }
+        }
+    }
+
     fn validate_recoverable_stop(
         &self,
         operation: &RecoverableStop,
@@ -3778,6 +3850,10 @@ impl Run {
         control.wait_for_completion(timeout)
     }
 
+    fn is_running(&self) -> bool {
+        mutex_lock(&self.state).is_running()
+    }
+
     fn collection_ordinal(&self) -> Option<TerminalOrdinal> {
         if mutex_lock(&self.state).is_running() || self.attachments.load(Ordering::Acquire) != 0 {
             return None;
@@ -4852,6 +4928,10 @@ async fn execute_request(
         Request::Status { id } => Ok(Response::Status {
             run: manager.info(id)?,
         }),
+        Request::Remove { id } => {
+            manager.remove(id).await?;
+            Ok(Response::Removed { id })
+        }
         Request::Input { id, data } => {
             let run = match manager.pin(id) {
                 Ok(run) => run,

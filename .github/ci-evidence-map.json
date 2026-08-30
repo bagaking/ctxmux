@@ -716,7 +716,8 @@
       "path": "crates/ctxmux-daemon/src/creation.rs",
       "invariants": [
         "creation-key stripes and physical-launch admission remain independently bounded while shutdown fencing wakes queued waiters and drains active owners",
-        "one globally eight-slot-bounded cleanup owner fences exact keys until waiter reap without retaining unrelated stripes or launch permits"
+        "one globally eight-slot-bounded cleanup owner fences exact keys until waiter reap without retaining unrelated stripes or launch permits",
+        "client-requested removal reuses the collection eligibility, Removing fence, descriptor detach, and exact durable-delete machinery, refusing running, attached, pinned, and non-quiescent Runs and restoring the entry on any durable failure"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -737,7 +738,8 @@
       "path": "crates/ctxmux-daemon/src/tests/creation.rs",
       "invariants": [
         "creation stripes, committed publication, terminal persistence handoff, exact process identity, collection, and late-output durability boundaries remain deterministic",
-        "real pre-COMMIT Start and Fork rejection proves waiter reap plus dead child PIDs, pending same-key fencing, single-leader reuse, cross-key cleanup reclamation, hard cleanup capacity, shutdown reporting, persistence health, and unrelated sentinel survival"
+        "real pre-COMMIT Start and Fork rejection proves waiter reap plus dead child PIDs, pending same-key fencing, single-leader reuse, cross-key cleanup reclamation, hard cleanup capacity, shutdown reporting, persistence health, and unrelated sentinel survival",
+        "removing a terminal Run frees a slot a run_capacity-rejected Start then uses, running removal is refused invalid_run_state, attached removal is refused backend_unavailable and stays intact, double or unknown removal is idempotent run_not_found, and persistent removal deletes the exact durable row so restart recovers one fewer record with the key unbound"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",

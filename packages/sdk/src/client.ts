@@ -295,6 +295,23 @@ export class CtxmuxClient {
     return response.run;
   }
 
+  /**
+   * Reclaim one already-terminal, unpinned Run so its retained record slot
+   * returns to the daemon's budget. This never forces teardown: a running or
+   * attached Run is refused with a typed protocol error, and removing an
+   * unknown or already-removed id reports `run_not_found`, so a retry is
+   * idempotent.
+   */
+  public async remove(id: RunId): Promise<void> {
+    const response = await this.#request({ type: "remove", id });
+    if (response.type !== "removed") {
+      throw unexpected("removed response", response.type);
+    }
+    if (response.id !== id) {
+      throw unexpected(`removed response for ${id}`, response.id);
+    }
+  }
+
   public async input(
     id: RunId,
     data: ByteInput,

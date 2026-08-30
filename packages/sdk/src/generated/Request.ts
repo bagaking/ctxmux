@@ -23,6 +23,7 @@ export type Request =
     }
   | { type: "list" }
   | { type: "status"; id: RunId }
+  | { type: "remove"; id: RunId }
   | { type: "input"; id: RunId; data: Array<number> }
   | { type: "recoverable_input"; operation: RecoverableInput }
   | { type: "resize"; id: RunId; size: TerminalSize }
