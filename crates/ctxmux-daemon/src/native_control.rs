@@ -482,6 +482,40 @@ impl HandoffInputState {
         }
         validate_handoff_diagnostic_bytes(diagnostic_bytes)
     }
+
+    /// Recoverable-Input request bytes this Run carries across a handoff. The
+    /// per-Run cap is [`INPUT_RESULT_MAX_REQUEST_BYTES`] (1 MiB); the manifest
+    /// bounds the daemon-wide sum of these rather than multiplying the cap by the
+    /// Run count.
+    pub(crate) fn retained_request_bytes(&self) -> usize {
+        self.operations
+            .iter()
+            .fold(0, |sum, op| sum.saturating_add(op.request_len()))
+    }
+
+    /// Drop the oldest retained operation, returning the request bytes it freed
+    /// (0 when the ledger is empty). Completed idempotency results are ordered
+    /// ahead of the single Unknown record, so the pure result cache is shed
+    /// before the poisoned-lane diagnostic. Every suffix of the operation order
+    /// is still a valid ledger under [`HandoffInputState::validate`] — dropping
+    /// the front only lowers `completed_end` for the survivors and leaves the
+    /// Unknown's cursor fence intact — so front-shedding never corrupts state.
+    pub(crate) fn shed_oldest_operation(&mut self) -> usize {
+        if self.operations.is_empty() {
+            return 0;
+        }
+        self.operations.remove(0).request_len()
+    }
+}
+
+impl HandoffInputOperation {
+    /// Recoverable request payload length this operation carries in the manifest.
+    fn request_len(&self) -> usize {
+        match self {
+            HandoffInputOperation::Completed { data, .. }
+            | HandoffInputOperation::Unknown { data, .. } => data.len(),
+        }
+    }
 }
 
 fn validate_handoff_diagnostic_bytes(diagnostic_bytes: usize) -> Result<(), String> {

@@ -1067,6 +1067,15 @@ impl HandoffStopOperation {
         }
         Ok(())
     }
+
+    /// Diagnostic bytes this settled Stop result carries in the manifest. Only an
+    /// Unknown outcome retains one (bounded per item); an Accepted outcome is 0.
+    pub(crate) fn diagnostic_bytes(&self) -> usize {
+        match &self.outcome {
+            HandoffStopOutcome::Unknown { failure } => failure.error.message.len(),
+            HandoffStopOutcome::Accepted { .. } => 0,
+        }
+    }
 }
 
 impl HandoffStopOutcome {
