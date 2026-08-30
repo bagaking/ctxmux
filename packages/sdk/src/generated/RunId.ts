@@ -2,5 +2,13 @@
 
 /**
  * Stable identity of a Run for the lifetime of its owning daemon.
+ *
+ * The ordering is the total order of the underlying UUID's 16 big-endian
+ * bytes, which is byte-for-byte the lexicographic order of its canonical
+ * lowercase-hyphenated string form (fixed-position hyphens never change a
+ * relative comparison). List enumeration relies on this equivalence: it pages
+ * by ascending `RunId`, and that is the same order a caller sees when it sorts
+ * the returned ids as strings, so a cursor stays meaningful without the client
+ * having to know it is a UUID.
  */
 export type RunId = string;

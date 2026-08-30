@@ -22,4 +22,5 @@ export type ErrorCode =
   | "daemon_instance_mismatch"
   | "run_capacity"
   | "control_backpressure"
+  | "response_too_large"
   | "internal";

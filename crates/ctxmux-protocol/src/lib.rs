@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -68,6 +68,27 @@ pub const REMOTE_ENDPOINT_CONTRACT_VERSION: u32 = 1;
 
 /// Maximum size of one JSON-lines frame.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Largest number of Run summaries the daemon returns in one `List` page.
+///
+/// List enumeration is paged specifically so it can never depend on the whole
+/// fleet fitting in one [`MAX_FRAME_BYTES`] frame (the generation-15 defect this
+/// replaces: an unpaged `Runs` frame silently dropped the connection once the
+/// fleet's `RunInfo` rows crossed the cap). Two independent facts keep every
+/// page inside the frame budget:
+///
+/// - a [`RunSummary`] is a thin, fixed-shape row — identity, backend *kind*,
+///   pid, state, and three counters — with **no** `RunSpec`, so its encoded
+///   size has a small constant ceiling that does not grow with a caller's
+///   command line or environment; and
+/// - this cap bounds how many such rows a page may carry.
+///
+/// `512` thin rows encode well under a megabyte with wide headroom (a summary is
+/// on the order of a couple hundred bytes at most), so the page limit is a
+/// throughput/latency knob rather than a safety boundary — the per-row shape is
+/// what makes the frame safe. A caller learns more remains from the response's
+/// `next_cursor`; it does not learn or depend on this exact number.
+pub const LIST_MAX_PAGE_RUNS: usize = 512;
 
 /// Maximum UTF-8 byte length of one caller-owned Run creation operation key.
 pub const MAX_CREATE_OPERATION_KEY_BYTES: usize = 128;
@@ -594,7 +615,15 @@ pub struct AppliedInputRange {
 }
 
 /// Stable identity of a Run for the lifetime of its owning daemon.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+///
+/// The ordering is the total order of the underlying UUID's 16 big-endian
+/// bytes, which is byte-for-byte the lexicographic order of its canonical
+/// lowercase-hyphenated string form (fixed-position hyphens never change a
+/// relative comparison). List enumeration relies on this equivalence: it pages
+/// by ascending `RunId`, and that is the same order a caller sees when it sorts
+/// the returned ids as strings, so a cursor stays meaningful without the client
+/// having to know it is a UUID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
 #[serde(transparent)]
 #[ts(type = "string")]
 pub struct RunId(Uuid);
@@ -881,6 +910,74 @@ pub struct RunInfo {
     /// Bytes successfully applied by the current native Input owner, or
     /// `None` when this Run has no current-incarnation native cursor authority.
     pub applied_input_bytes: Option<u64>,
+}
+
+/// Backend owner of one Run, without any backend-specific identity payload.
+///
+/// This is the enumeration-safe projection of [`RunBackend`]: it names *which*
+/// backend owns a Run but carries none of the tmux server/session/pane strings
+/// that the full variant does. A [`RunSummary`] uses it so a listed row cannot
+/// grow with backend-specific identity data; a caller that needs the full
+/// backend identity reads it from the Run's [`RunInfo`] through `Status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RunBackendKind {
+    /// The ctxmux daemon owns the native PTY and direct child handle.
+    Native,
+    /// tmux owns the server, session, and pane; ctxmux observes one pane.
+    Tmux,
+}
+
+impl From<&RunBackend> for RunBackendKind {
+    fn from(backend: &RunBackend) -> Self {
+        match backend {
+            RunBackend::Native => Self::Native,
+            RunBackend::Tmux { .. } => Self::Tmux,
+        }
+    }
+}
+
+/// One thin, fixed-shape Run row returned by paged enumeration.
+///
+/// `List` returns these rather than full [`RunInfo`] values on purpose. A
+/// `RunInfo` embeds `spec: Option<RunSpec>`, whose `program`, `args`, `env`, and
+/// `declared_inputs` are caller-controlled and unbounded; a fleet of such rows
+/// in one frame is exactly what overflowed [`MAX_FRAME_BYTES`] and silently
+/// closed the connection before generation 16. A `RunSummary` deliberately omits
+/// `spec`, `lineage`, `capabilities`, the durable/first-available cursors, and
+/// the backend identity payload, keeping only the fields a fleet overview needs:
+/// identity, backend kind, liveness, pid, output progress, and attachment count.
+/// Its encoded size therefore has a small constant ceiling. A caller that wants
+/// the launch spec, lineage, capabilities, or full backend identity for a chosen
+/// Run reads its [`RunInfo`] through `Status` — most callers listing a fleet do
+/// not want any of that per row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct RunSummary {
+    /// Stable Run identity, and the paging cursor key.
+    pub id: RunId,
+    /// Backend owner without its identity payload.
+    pub backend: RunBackendKind,
+    /// Child process identifier when supplied by the platform.
+    pub pid: Option<u32>,
+    /// Current lifecycle state.
+    pub state: RunState,
+    /// Total output bytes allocated so far.
+    pub latest_output_bytes: u64,
+    /// Number of live attachment connections.
+    pub attachments: usize,
+}
+
+impl From<&RunInfo> for RunSummary {
+    fn from(info: &RunInfo) -> Self {
+        Self {
+            id: info.id,
+            backend: RunBackendKind::from(&info.backend),
+            pid: info.pid,
+            state: info.state.clone(),
+            latest_output_bytes: info.latest_output_bytes,
+            attachments: info.attachments,
+        }
+    }
 }
 
 /// Caller-retained request for one recoverable native Input operation.
@@ -1183,8 +1280,29 @@ pub enum Request {
         parent: RunId,
         plan: ForkPlan,
     },
-    /// List all Runs retained by this daemon.
-    List,
+    /// List one page of the Runs retained by this daemon, ordered by ascending
+    /// [`RunId`].
+    ///
+    /// Paging is mandatory, not optional: the whole fleet is never promised to
+    /// fit one frame (see [`LIST_MAX_PAGE_RUNS`] and [`RunSummary`]). `after` is
+    /// an exclusive cursor — the daemon returns Runs whose id is strictly
+    /// greater — so a caller walks the fleet by passing the previous page's
+    /// `next_cursor` back in. `None` starts at the first Run. `limit` requests at
+    /// most that many rows; the daemon clamps it to `LIST_MAX_PAGE_RUNS` and
+    /// treats `None` or `0` as the clamped maximum. Enumeration is best-effort
+    /// across pages: a Run present for the whole walk appears exactly once, but
+    /// Runs created or removed *between* pages may appear or vanish, and the
+    /// cursor stays valid even if the Run it names is removed before the next
+    /// page (ids strictly greater than a removed id are unaffected).
+    List {
+        /// Exclusive `RunId` cursor; `None` starts at the first Run.
+        #[serde(default)]
+        after: Option<RunId>,
+        /// Requested page size, clamped to [`LIST_MAX_PAGE_RUNS`]; `None` or `0`
+        /// means the clamped maximum.
+        #[serde(default)]
+        limit: Option<u32>,
+    },
     /// Read current metadata for one Run.
     Status { id: RunId },
     /// Reclaim one already-terminal, unpinned Run and its retained record.
@@ -1311,8 +1429,14 @@ pub enum Response {
     Imported { run: RunInfo },
     /// A forked child Run was created.
     Forked { run: RunInfo },
-    /// Current Runs retained by the daemon.
-    Runs { runs: Vec<RunInfo> },
+    /// One page of the Runs retained by the daemon, ordered by ascending
+    /// [`RunId`]. `next_cursor` is `Some(id)` when more Runs may follow — the
+    /// caller reissues `List { after: Some(id), .. }` to continue — and `None`
+    /// when this page reached the end of the fleet at the time it was built.
+    Runs {
+        runs: Vec<RunSummary>,
+        next_cursor: Option<RunId>,
+    },
     /// Current metadata for one Run.
     Status { run: RunInfo },
     /// One already-terminal Run and its retained record were reclaimed.
@@ -1424,6 +1548,14 @@ pub enum ErrorCode {
     RunCapacity,
     /// The bounded live-control path has no capacity for this command.
     ControlBackpressure,
+    /// A well-formed response would exceed [`MAX_FRAME_BYTES`] and cannot be
+    /// framed. This is a fail-closed observable error in place of the silent
+    /// connection drop that an unsendable frame caused before generation 16: the
+    /// caller learns the daemon had a real answer that did not fit, distinct from
+    /// a crash or transport loss, and can narrow its request (for `List`, a
+    /// smaller `limit`; for a single fat Run, this is not expected to occur under
+    /// the creation-time bounds but is reported honestly if it ever does).
+    ResponseTooLarge,
     /// An unexpected daemon failure occurred.
     Internal,
 }
@@ -1600,17 +1732,18 @@ mod tests {
     use super::{
         AppliedInputRange, AttachmentCommandId, ClientFrame, ClientHello, CommandDisposition,
         ControlFailure, ControlOutcome, ControlReceipt, CreateOperationKey, DaemonInstanceId,
-        ErrorCode, FrameError, InputOperationKey, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-        MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_CAPABILITY_VERSION,
-        MAX_STOP_OPERATION_KEY_BYTES, OutputChunk, PROTOCOL_VERSION, ProtocolError,
-        REMOTE_ENDPOINT_CONTRACT_VERSION, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+        ErrorCode, FrameError, InputOperationKey, LIST_MAX_PAGE_RUNS,
+        MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES, MAX_INPUT_OPERATION_KEY_BYTES,
+        MAX_RUNTIME_CAPABILITY_VERSION, MAX_STOP_OPERATION_KEY_BYTES, OutputChunk,
+        PROTOCOL_VERSION, ProtocolError, REMOTE_ENDPOINT_CONTRACT_VERSION,
+        RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
         RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
         RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
         RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
-        RecoverableStop, Request, Response, RunBackend, RunCapabilities, RunEvent, RunId, RunInfo,
-        RunSignal, RunSpec, RunState, RuntimeBuildId, RuntimeId, RuntimeIdPersistence,
-        RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey, TerminalSize,
-        decode_frame, encode_frame,
+        RecoverableStop, Request, Response, RunBackend, RunBackendKind, RunCapabilities, RunEvent,
+        RunId, RunInfo, RunSignal, RunSpec, RunState, RunSummary, RuntimeBuildId, RuntimeId,
+        RuntimeIdPersistence, RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey,
+        TerminalSize, decode_frame, encode_frame,
     };
 
     /// The endpoint contract version is a client-side fact with a stable value.
@@ -1713,7 +1846,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_15_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_16_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1731,7 +1864,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 15,
+                    "protocolGeneration": 16,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -1804,7 +1937,7 @@ mod tests {
     }
 
     #[test]
-    fn output_chunks_use_strict_padded_base64_on_the_generation_15_wire() {
+    fn output_chunks_use_strict_padded_base64_on_the_generation_16_wire() {
         let chunk = OutputChunk {
             start_byte: 7,
             end_byte: 9,
@@ -1845,7 +1978,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_stop_requests_have_exact_generation_15_wire_shapes() {
+    fn recoverable_stop_requests_have_exact_generation_16_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -2020,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_request_and_removed_response_have_exact_generation_15_wire_shapes() {
+    fn remove_request_and_removed_response_have_exact_generation_16_wire_shapes() {
         let id = RunId::new();
         let request = Request::Remove { id };
         let request_frame = ClientFrame::Request {
@@ -2052,6 +2185,196 @@ mod tests {
                 "type": "removed",
                 "id": id.to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn list_request_pages_by_optional_cursor_and_limit() {
+        let cursor = RunId::new();
+
+        // A first page omits both arguments; `#[serde(default)]` keeps the wire
+        // minimal so an unpaged caller sends no cursor noise.
+        let first = Request::List {
+            after: None,
+            limit: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::json!({"type": "list", "after": null, "limit": null})
+        );
+        assert_eq!(
+            decode_frame::<Request>(br#"{"type":"list"}"#).unwrap(),
+            first,
+            "omitted cursor and limit default to a first, maximum page"
+        );
+
+        // A continuation carries the previous page's exclusive cursor and an
+        // explicit page size.
+        let next = Request::List {
+            after: Some(cursor),
+            limit: Some(50),
+        };
+        assert_eq!(
+            serde_json::to_value(&next).unwrap(),
+            serde_json::json!({
+                "type": "list",
+                "after": cursor.to_string(),
+                "limit": 50,
+            })
+        );
+        let frame = ClientFrame::Request {
+            request: next.clone(),
+        };
+        assert_eq!(
+            decode_frame::<ClientFrame>(&encode_frame(&frame).unwrap()).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn runs_response_carries_thin_summaries_and_a_continuation_cursor() {
+        let info = sample_run_info();
+        let id = info.id;
+        let summary = RunSummary::from(&info);
+
+        // The summary is the enumeration-safe projection: it keeps identity,
+        // liveness, and counters but drops the unbounded RunSpec and backend
+        // identity payload that made an unpaged RunInfo fleet overflow a frame.
+        assert_eq!(summary.id, id);
+        assert_eq!(summary.backend, RunBackendKind::Native);
+        assert_eq!(summary.pid, info.pid);
+        assert_eq!(summary.latest_output_bytes, info.latest_output_bytes);
+        assert_eq!(summary.attachments, info.attachments);
+
+        let response = Response::Runs {
+            runs: vec![summary.clone()],
+            next_cursor: Some(id),
+        };
+        let response_frame = ServerFrame::Response {
+            response: response.clone(),
+        };
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encode_frame(&response_frame).unwrap()).unwrap(),
+            response_frame
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({
+                "type": "runs",
+                "runs": [{
+                    "id": id.to_string(),
+                    "backend": "native",
+                    "pid": info.pid,
+                    "state": {"type": "running"},
+                    "latest_output_bytes": 0,
+                    "attachments": 1,
+                }],
+                "next_cursor": id.to_string(),
+            })
+        );
+
+        // The final page signals the end of the fleet with a null cursor.
+        let last = Response::Runs {
+            runs: Vec::new(),
+            next_cursor: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            serde_json::json!({"type": "runs", "runs": [], "next_cursor": null})
+        );
+    }
+
+    #[test]
+    fn tmux_backend_projects_to_a_kind_without_its_identity_payload() {
+        let backend = RunBackend::Tmux {
+            socket_path: "/tmp/tmux-1000/default".to_owned(),
+            server_pid: 7,
+            server_started_at: 9,
+            session_id: "$1".to_owned(),
+            window_id: "@2".to_owned(),
+            pane_id: "%3".to_owned(),
+            tmux_version: "3.4".to_owned(),
+        };
+        assert_eq!(RunBackendKind::from(&backend), RunBackendKind::Tmux);
+        // The kind serializes to the same discriminant tags the full backend
+        // uses, so a summary reader and a status reader agree on the name.
+        assert_eq!(
+            serde_json::to_value(RunBackendKind::Native).unwrap(),
+            serde_json::json!("native")
+        );
+        assert_eq!(
+            serde_json::to_value(RunBackendKind::Tmux).unwrap(),
+            serde_json::json!("tmux")
+        );
+    }
+
+    #[test]
+    fn run_ids_order_matches_their_canonical_string_order() {
+        // List paging keys on RunId ordering and documents that it equals the
+        // caller-visible canonical-string order. Verify the equivalence over a
+        // batch so a future derive change that broke it would fail here.
+        let mut ids: Vec<RunId> = (0..256).map(|_| RunId::new()).collect();
+        ids.sort();
+        for pair in ids.windows(2) {
+            assert!(
+                pair[0].to_string() <= pair[1].to_string(),
+                "RunId Ord disagreed with canonical string order: {} then {}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+
+    #[test]
+    fn response_too_large_error_has_a_stable_wire_name() {
+        // The fail-closed replacement for the silent connection drop must have a
+        // stable machine-readable code a client can branch on.
+        assert_eq!(
+            serde_json::to_value(ErrorCode::ResponseTooLarge).unwrap(),
+            serde_json::json!("response_too_large")
+        );
+        let frame = ServerFrame::Error {
+            error: ProtocolError::new(
+                ErrorCode::ResponseTooLarge,
+                "response exceeds the protocol frame maximum",
+            ),
+        };
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encode_frame(&frame).unwrap()).unwrap(),
+            frame
+        );
+    }
+
+    #[test]
+    fn list_page_ceiling_stays_within_the_frame_budget() {
+        // The safety argument for paging: a full page of thin summaries encodes
+        // far below MAX_FRAME_BYTES. Build the largest wire-plausible summary —
+        // a signal-exited tmux Run with saturated counters — repeat it to the
+        // page ceiling, and assert the encoded Runs frame clears the cap with
+        // room to spare. This pins the per-row shape, not just the count.
+        let heavy = RunSummary {
+            id: RunId::new(),
+            backend: RunBackendKind::Tmux,
+            pid: Some(u32::MAX),
+            state: RunState::Exited {
+                code: u32::MAX,
+                signal: Some("SIGTERM".to_owned()),
+            },
+            latest_output_bytes: u64::MAX,
+            attachments: usize::MAX,
+        };
+        let runs = vec![heavy; LIST_MAX_PAGE_RUNS];
+        let frame = encode_frame(&ServerFrame::Response {
+            response: Response::Runs {
+                runs,
+                next_cursor: Some(RunId::new()),
+            },
+        })
+        .expect("a full page of thin summaries must always frame");
+        assert!(
+            frame.len() < MAX_FRAME_BYTES / 2,
+            "a full summary page must clear the frame cap with wide headroom, was {} bytes",
+            frame.len()
         );
     }
 

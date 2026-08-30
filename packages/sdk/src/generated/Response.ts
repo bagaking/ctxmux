@@ -4,6 +4,7 @@ import type { ControlFailure } from "./ControlFailure.js";
 import type { ControlReceipt } from "./ControlReceipt.js";
 import type { RunId } from "./RunId.js";
 import type { RunInfo } from "./RunInfo.js";
+import type { RunSummary } from "./RunSummary.js";
 import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
 
 /**
@@ -14,7 +15,7 @@ export type Response =
   | { type: "tmux_panes"; tmux_version: string; panes: Array<TmuxPaneInfo> }
   | { type: "imported"; run: RunInfo }
   | { type: "forked"; run: RunInfo }
-  | { type: "runs"; runs: Array<RunInfo> }
+  | { type: "runs"; runs: Array<RunSummary>; next_cursor: RunId | null }
   | { type: "status"; run: RunInfo }
   | { type: "removed"; id: RunId }
   | { type: "control_accepted"; run: RunInfo; receipt: ControlReceipt }
