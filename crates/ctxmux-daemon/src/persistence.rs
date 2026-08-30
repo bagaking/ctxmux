@@ -699,10 +699,11 @@ impl PersistentRun {
         // chose to render.
         #[cfg(test)]
         {
-            *mutex_lock(&self.persistence.inner.test_hooks.observed_append) = Some(ObservedAppend {
-                first_byte: replay.chunks.first().map(|chunk| chunk.start_byte),
-                payload_bytes: replay.chunks.iter().map(|chunk| chunk.data.len()).sum(),
-            });
+            *mutex_lock(&self.persistence.inner.test_hooks.observed_append) =
+                Some(ObservedAppend {
+                    first_byte: replay.chunks.first().map(|chunk| chunk.start_byte),
+                    payload_bytes: replay.chunks.iter().map(|chunk| chunk.data.len()).sum(),
+                });
         }
         if mutex_lock(&self.persistence.inner.failure).is_some() {
             // Persistence is already off; no future replay can help, so report
@@ -7036,7 +7037,9 @@ mod tests {
         // it, standing in for a slow fsync.
         let (reached, release) = persistence.pause_next_append();
         expect_queued(durable.append(info.id, replay(vec![chunk(0, b"first")])));
-        reached.recv().expect("the actor reaches the append barrier");
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
 
         // Fill the queue past its depth from another thread, so a send that
         // blocks fails this test on a deadline instead of hanging it. Every one
@@ -7058,9 +7061,7 @@ mod tests {
             })
             .expect("spawn the queue filler");
 
-        let overran = filled_rx
-            .recv_timeout(Duration::from_secs(30))
-            .is_err();
+        let overran = filled_rx.recv_timeout(Duration::from_secs(30)).is_err();
         assert!(
             !overran,
             "appends must never block on a stalled actor: this is the daemon-wide \

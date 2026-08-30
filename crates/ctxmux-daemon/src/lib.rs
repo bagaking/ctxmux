@@ -7791,7 +7791,9 @@ mod tests {
         // dropped rather than queued.
         let (reached, release) = persistence.pause_next_append();
         run.record_output(b"alpha".to_vec());
-        reached.recv().expect("the actor reaches the append barrier");
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
 
         // These pushes cannot be queued: their appends are dropped on the
         // floor. Before this fix they would have blocked the output reader.
@@ -7938,7 +7940,9 @@ mod tests {
         // above the recovered watermark), so spend that debt first. From here
         // on every append is accepted and nothing more is owed.
         run.record_output(b"prime".to_vec());
-        reached.recv().expect("the actor reaches the append barrier");
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
 
         // Build a log far larger than any single push. If the offer were the
         // catch-up, it would carry all of these bytes again.
@@ -8052,7 +8056,9 @@ mod tests {
         // Park the actor inside its first append, then fill the queue behind it.
         let (reached, _release) = persistence.pause_next_append();
         run.record_output(b"prime".to_vec());
-        reached.recv().expect("the actor reaches the append barrier");
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
         for _ in 0..(crate::persistence::PERSISTENCE_QUEUE_CAPACITY * 2) {
             run.record_output(b"flood".to_vec());
         }
