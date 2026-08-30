@@ -123,23 +123,23 @@ not record-count-bounded, and the record cap is itself slated to become a
 retained-byte budget — so the descriptor budget must stand on its own number,
 not on the record cap. At the configured target of 4000 live Runs the budget is
 `4000 × 3 + 104 = 12104` descriptors; a compile-time assertion pins only the
-*lower* bound `fd_budget_live_runs ≥ MAX_RETAINED_RUNS`, so the budget can never
+_lower_ bound `fd_budget_live_runs ≥ MAX_RETAINED_RUNS`, so the budget can never
 fund fewer Runs than the record cap admits.
 
-An earlier design instead capped the budget *below* `FD_SETSIZE` (1024) at
+An earlier design instead capped the budget _below_ `FD_SETSIZE` (1024) at
 compile time, reasoning that the raised soft limit is inherited by every managed
 child (`portable_pty` owns the child `pre_exec` and the crate is
 `unsafe_code = "forbid"`, so per-child restoration is unavailable) and a
 `select(2)`-using child must be kept under the fd-≥-1024 stack-corruption
 boundary. That was wrong, and it forfeited the host's entire concurrency ceiling
 (~306 live Runs) to guard a hazard the inheritance does not create. The soft
-limit is a *ceiling*, not a floor: fd numbers are kernel-assigned as the lowest
+limit is a _ceiling_, not a floor: fd numbers are kernel-assigned as the lowest
 available, so raising the ceiling never pushes a child's fds to higher numbers —
 it only lets a child that opens many fds open more. `FD_SETSIZE` corruption
 strikes only a child that itself opens 1024+ fds and then calls `select`, which
 is independently broken anywhere its own soft limit exceeds 1024 and is not
-something our raise causes. (This is the same reason systemd raises the *hard*
-limit while leaving the *soft* default at 1024 — protecting legacy `select`
+something our raise causes. (This is the same reason systemd raises the _hard_
+limit while leaving the _soft_ default at 1024 — protecting legacy `select`
 users without capping everyone's concurrency — rather than bounding process
 count.) The inheritance is therefore accepted as-is at any budget; the raise is
 idempotent, since the re-exec image inherits the prior raise and only ever
@@ -147,7 +147,7 @@ raises further.
 
 When the OS refuses the raise, or the hard limit is below the budget, the daemon
 does not fail. It re-reads `RLIMIT_NOFILE` after the `setrlimit` and clamps the
-effective retained-record ceiling to the live-Run count the *granted* limit
+effective retained-record ceiling to the live-Run count the _granted_ limit
 actually funds — never the value merely requested — then logs the clamp with
 both the funded ceiling and the configured 128, so admission refuses excess Runs
 with the same `run_capacity` at an honest, predictable ceiling instead of hitting
@@ -156,8 +156,8 @@ success yet leave a soft limit that later cannot fund opens against
 `kern.maxfilesperproc`; measurement on the dev host showed macOS reflects the
 requested soft limit faithfully through `getrlimit` even above that wall
 (enforcing it at `open()` time instead), so the re-read is a portable honesty
-guard rather than a workaround for a specific kernel. This makes the *effective*
-ceiling honest; it does not change the *configured* `MAX_RETAINED_RUNS`, and it
+guard rather than a workaround for a specific kernel. This makes the _effective_
+ceiling honest; it does not change the _configured_ `MAX_RETAINED_RUNS`, and it
 never raises the ceiling above it. The complementary EMFILE-survival of the
 accept loop is a separate concern.
 
