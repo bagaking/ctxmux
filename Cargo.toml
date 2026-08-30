@@ -46,3 +46,21 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "deny"
 pedantic = "deny"
+
+# Local fork of portable-pty 0.9.0, differing in one function.
+#
+# Upstream's `close_random_fds` runs in the child of every spawn and closes each
+# descriptor above stdio by enumerating /dev/fd. That is O(open fds) per launch,
+# so a process holding many descriptors gets quadratically slower at spawning —
+# the daemon keeps 3 per live Run, and at 32k Runs each spawn walked a 96k-entry
+# table (~290ms, measured). The fork uses close_range(2) on Linux: one syscall,
+# 3-7us at every table size measured. It also fixes a failing execve being
+# reported as a successful spawn (wezterm#7893). See third_party/portable-pty/
+# src/unix.rs for the full rationale.
+#
+# There is nothing to upgrade to: 0.9.0 is the newest published version and the
+# function is unchanged upstream since 2020. The patch also has to live outside
+# the workspace, because `unsafe_code = "forbid"` above applies to members and
+# the fix needs the `pre_exec` the dependency already owns.
+[patch.crates-io]
+portable-pty = { path = "third_party/portable-pty" }

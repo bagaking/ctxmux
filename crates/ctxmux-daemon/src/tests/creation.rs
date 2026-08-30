@@ -3409,3 +3409,101 @@ impl Drop for UnrelatedProcess {
         let _ = self.0.wait();
     }
 }
+
+/// A program that passes the pre-flight `access(X_OK)` check but whose `execve`
+/// fails must still be reported as `SpawnFailed`, not as a started Run.
+///
+/// This is a distinct path from a missing or non-executable program, which
+/// `CommandBuilder::search_path` rejects before ever forking — that case is
+/// covered by `failed_replacement_restores_candidate_and_tmux_admission_checks_
+/// capacity_first`, and it passed even while this one was broken. The gap was
+/// the *post*-fork failure: `portable-pty`'s `close_random_fds` used to close
+/// the descriptor std uses to carry the child's `execve` errno back to the
+/// parent, so a child that never ran was reported as a healthy Run and the
+/// caller only discovered otherwise by noticing the Run had already exited.
+///
+/// A script with an unresolvable interpreter is the smallest way to reach that
+/// state: the file itself is present and executable, so pre-flight passes, and
+/// the kernel then fails the exec because the `#!` interpreter does not exist.
+///
+/// The control case is not optional. It runs the same fixture shape with a
+/// working interpreter, so a fixture that could not spawn *anything* — a bad
+/// temp dir, a missing exec bit, a lost mount — fails loudly here instead of
+/// masquerading as proof that exec failures are detected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_execve_is_reported_as_spawn_failed_rather_than_a_started_run() {
+    let temp = tempfile::tempdir().expect("create exec-failure fixture");
+
+    let control = temp.path().join("control.sh");
+    std::fs::write(&control, "#!/bin/sh\nexit 0\n").expect("write control script");
+    set_executable(&control);
+
+    let doomed = temp.path().join("doomed.sh");
+    std::fs::write(
+        &doomed,
+        "#!/ctxmux/no/such/interpreter\nexit 0\n",
+    )
+    .expect("write bad-interpreter script");
+    set_executable(&doomed);
+
+    // Both files are present and executable, so neither is rejected before the
+    // fork. Assert that rather than trusting it: if the exec bit failed to
+    // stick, the "failure" below would prove nothing about execve.
+    for path in [&control, &doomed] {
+        let mode = std::os::unix::fs::MetadataExt::mode(
+            &std::fs::metadata(path).expect("fixture script is readable"),
+        );
+        assert_ne!(
+            mode & 0o111,
+            0,
+            "fixture {} must be executable for the pre-flight check to pass",
+            path.display()
+        );
+    }
+
+    let manager = Arc::new(RunManager::default());
+    let script_spec = |path: &std::path::Path| RunSpec {
+        program: path.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        cwd: None,
+        env: BTreeMap::new(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    };
+
+    let started = manager
+        .create(
+            CreateOperationKey::new("execfail-control").unwrap(),
+            CreationRequest::Start {
+                spec: script_spec(&control),
+            },
+        )
+        .await
+        .expect("a script with a working interpreter still spawns");
+    wait_for_run_terminal_async(&manager.get(started.id).unwrap()).await;
+
+    let failure = manager
+        .create(
+            CreateOperationKey::new("execfail-bad-interpreter").unwrap(),
+            CreationRequest::Start {
+                spec: script_spec(&doomed),
+            },
+        )
+        .await
+        .expect_err("a child whose execve fails is not a started Run");
+    assert_eq!(failure.code, ErrorCode::SpawnFailed);
+
+    // The failed creation must leave nothing behind: the control Run is the
+    // only Run the manager ever published.
+    let published: Vec<_> = manager.list_all().into_iter().map(|run| run.id).collect();
+    assert_eq!(published, vec![started.id]);
+}
+
+fn set_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .expect("read fixture permissions")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("make fixture executable");
+}
