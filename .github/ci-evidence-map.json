@@ -870,7 +870,7 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/tests/signal_driver_fd_cost.rs",
       "invariants": [
-        "registering signal kinds beyond the first, SIGCHLD among them, reuses the process-wide signal self-pipe and costs zero descriptors, so the daemon's SIGCHLD exit detection adds no per-process descriptor"
+        "registering signal kinds beyond the first, SIGCHLD among them, reuses the process-wide signal driver and costs zero descriptors on both platforms, so the daemon's SIGCHLD exit detection adds no per-process descriptor. The first registration's own cost is measured and logged but never asserted: it is a driver implementation detail the daemon does not depend on"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
