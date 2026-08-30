@@ -21,7 +21,18 @@ export type Request =
       parent: RunId;
       plan: ForkPlan;
     }
-  | { type: "list" }
+  | {
+      type: "list";
+      /**
+       * Exclusive `RunId` cursor; `None` starts at the first Run.
+       */
+      after: RunId | null;
+      /**
+       * Requested page size, clamped to [`LIST_MAX_PAGE_RUNS`]; `None` or `0`
+       * means the clamped maximum.
+       */
+      limit: number | null;
+    }
   | { type: "status"; id: RunId }
   | { type: "remove"; id: RunId }
   | { type: "input"; id: RunId; data: Array<number> }
