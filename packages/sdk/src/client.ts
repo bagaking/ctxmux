@@ -38,6 +38,7 @@ import type { Response } from "./generated/Response.js";
 import type { RunId } from "./generated/RunId.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
+import type { RunSummary } from "./generated/RunSummary.js";
 import type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
@@ -115,6 +116,16 @@ export interface RecoverableInputOperation {
 export interface RecoverableStopAttachment {
   readonly attachment: Attachment;
   readonly stop: ControlAccepted<StopReceipt>;
+}
+
+/**
+ * One page of retained Run summaries returned by {@link CtxmuxClient.listPage}.
+ * `nextCursor` is a non-null {@link RunId} when more Runs may follow (reissue
+ * with `after` set to it) and `null` at the end of the fleet.
+ */
+export interface RunPage {
+  readonly runs: readonly RunSummary[];
+  readonly nextCursor: RunId | null;
 }
 
 /** Validate or generate one caller-retained Run creation operation key. */
@@ -279,12 +290,54 @@ export class CtxmuxClient {
     return response.run;
   }
 
-  public async list(): Promise<readonly RunInfo[]> {
-    const response = await this.#request({ type: "list" });
+  /**
+   * Enumerate every retained Run as a whole-fleet snapshot.
+   *
+   * This preserves the "give me everything" contract callers had before
+   * enumeration was paged: it walks the cursor internally and concatenates the
+   * pages, so a caller that just wants the whole fleet keeps one call. The rows
+   * are thin {@link RunSummary} values (identity, backend kind, pid, state,
+   * output bytes, attachments); a caller that needs a Run's launch spec,
+   * lineage, or capabilities reads its full {@link RunInfo} with
+   * {@link CtxmuxClient.status}.
+   *
+   * Because the walk spans several requests, it is a best-effort snapshot, not
+   * an atomic one: a Run that exists for the whole walk appears exactly once,
+   * but Runs created or removed while paging may or may not appear.
+   */
+  public async list(): Promise<readonly RunSummary[]> {
+    const runs: RunSummary[] = [];
+    let after: RunId | null = null;
+    for (;;) {
+      const page = await this.listPage(after);
+      runs.push(...page.runs);
+      if (page.nextCursor === null) {
+        return runs;
+      }
+      after = page.nextCursor;
+    }
+  }
+
+  /**
+   * Fetch one page of retained Run summaries.
+   *
+   * `after` is an exclusive {@link RunId} cursor (`null` starts at the first
+   * Run) and `limit` requests a page size the daemon clamps to its maximum
+   * (`null` or `0` means the clamped maximum). The returned page carries the
+   * rows and a `nextCursor`: a non-null id means more Runs may follow — reissue
+   * with `after` set to it — and `null` means this page reached the end of the
+   * fleet. Prefer {@link CtxmuxClient.list} for a whole-fleet snapshot; reach
+   * for this when a caller wants to bound memory, show progress, or stop early.
+   */
+  public async listPage(
+    after: RunId | null = null,
+    limit: number | null = null,
+  ): Promise<RunPage> {
+    const response = await this.#request({ type: "list", after, limit });
     if (response.type !== "runs") {
       throw unexpected("runs response", response.type);
     }
-    return response.runs;
+    return { runs: response.runs, nextCursor: response.next_cursor };
   }
 
   public async status(id: RunId): Promise<RunInfo> {

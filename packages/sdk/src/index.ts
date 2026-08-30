@@ -19,6 +19,7 @@ export type {
   RecoverableInputOperation,
   RecoverableStopAttachment,
   ResizeReceipt,
+  RunPage,
   RuntimeCapabilityRequirements,
   SignalReceipt,
   StopReceipt,
@@ -115,6 +116,7 @@ export type { ReplayCapability } from "./generated/ReplayCapability.js";
 export type { Request } from "./generated/Request.js";
 export type { Response } from "./generated/Response.js";
 export type { RunBackend } from "./generated/RunBackend.js";
+export type { RunBackendKind } from "./generated/RunBackendKind.js";
 export type { RunCapabilities } from "./generated/RunCapabilities.js";
 export type { RunId } from "./generated/RunId.js";
 export type { RunInfo } from "./generated/RunInfo.js";
@@ -123,6 +125,7 @@ export type { RunInputReference } from "./generated/RunInputReference.js";
 export type { RunLineage } from "./generated/RunLineage.js";
 export type { RunSpec } from "./generated/RunSpec.js";
 export type { RunState } from "./generated/RunState.js";
+export type { RunSummary } from "./generated/RunSummary.js";
 export type { RuntimeBuildId } from "./generated/RuntimeBuildId.js";
 export type { RuntimeId } from "./generated/RuntimeId.js";
 export type { RuntimeIdPersistence } from "./generated/RuntimeIdPersistence.js";
