@@ -691,6 +691,26 @@
       ]
     },
     {
+      "id": "daemon-retention-budget-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/retention.rs",
+      "invariants": [
+        "the daemon-wide retained-output budget clears the frozen replay-pressure gate peak, holds a set of Runs at or below one shared total, reclaims a filled-then-quiet Run under another Run's pressure, evicts unattached before attached Runs, releases a dropped participant's bytes, and lets a single-flight reclamation loser return without blocking"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "persistence-store-contracts",
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/persistence.rs",
