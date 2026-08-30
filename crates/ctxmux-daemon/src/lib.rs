@@ -4310,9 +4310,7 @@ impl Run {
 
     fn publish_terminal_state(&self, terminal: RunState) {
         self.terminal_publications
-            .publish(&self.terminal_ordinal, || {
-                *mutex_lock(&self.state) = terminal;
-            });
+            .publish(&self.terminal_ordinal, &self.state, terminal);
     }
 
     fn terminate_unpublished(self: &Arc<Self>) -> Result<(), String> {
