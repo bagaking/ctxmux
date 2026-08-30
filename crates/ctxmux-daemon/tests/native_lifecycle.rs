@@ -4235,6 +4235,40 @@ async fn each_live_native_run_costs_exactly_its_pty_trio_and_no_watch_descriptor
     }
 }
 
+/// End-to-end proof that a silent native Run's *natural* exit is detected under
+/// the production configuration — the real `ctxmuxd` binary, where `serve` has
+/// attached the SIGCHLD relay and shed the timed backstop, so this exercises the
+/// pure event path and not the fallback. The child writes nothing and no client
+/// touches it, so nothing but the child's own exit can wake the owner: if the
+/// SIGCHLD relay were not wired, the daemon would never observe the exit and the
+/// wait below would time out. It exits after a short sleep so the daemon is
+/// provably blocked in poll (no pending output, no command) before the exit
+/// arrives, which is exactly the idle-then-exit case the relay must cover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_silent_natural_exit_is_detected_by_the_signal_relay() {
+    let daemon = TestDaemon::start().await;
+    let run = daemon
+        .client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            // No output at all, then a self-driven exit after the daemon has
+            // certainly settled into a blocking poll. Only SIGCHLD can end this.
+            args: vec!["-c".to_owned(), "sleep 0.2; exit 0".to_owned()],
+            cwd: None,
+            env: BTreeMap::new(),
+            size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .expect("start silent natural-exit fixture");
+
+    let terminal = wait_until_exited(&daemon.client, run.id).await;
+    assert!(
+        matches!(terminal, RunState::Exited { .. }),
+        "a silent natural exit must be detected via the SIGCHLD relay: {terminal:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::too_many_lines,
