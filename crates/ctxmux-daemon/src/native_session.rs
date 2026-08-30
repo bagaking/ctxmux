@@ -12,8 +12,6 @@ use rustix::{
     io::Errno,
     process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, getsid, kill_process, waitid},
 };
-#[cfg(not(target_os = "macos"))]
-use sysinfo::{ProcessesToUpdate, System};
 
 const QUIESCENCE_POLL: Duration = Duration::from_millis(10);
 
@@ -458,20 +456,59 @@ fn process_ids() -> Result<Vec<u32>, String> {
         .map_err(|error| format!("failed to enumerate native session members: {error}"))
 }
 
-// The `Result` is not redundant across the cfg pair: the macOS sibling calls a
-// fallible syscall wrapper and genuinely fails. `members()` calls whichever one
-// is compiled with the same `?`, so both must present the same signature. On
-// this arm `sysinfo` reports no error, which is why the lint fires here alone.
-#[allow(clippy::unnecessary_wraps)]
+/// Enumerate PIDs only, by reading `/proc`'s numeric entries directly.
+///
+/// `members()` needs exactly one thing from each process: its session ID, which
+/// it obtains with `getsid`. It never reads a name, a command line, or memory
+/// figures. Asking `sysinfo` for `ProcessesToUpdate::All` used to answer this
+/// question, and it harvested per-process `stat`, `statm`, `status` and
+/// `cmdline` for every process on the HOST -- then all of it was discarded
+/// except the key set.
+///
+/// That harvest is why `Stop` cost `63.6 ms + 0.0775 ms * host_process_count`
+/// (R^2 = 0.999, measured on a 64-core farm worker): `wait_quiescent` calls
+/// `members()` once per 10 ms poll and `signal_members` calls it again, so the
+/// scan ran several times per Stop. It also made the cost depend on the whole
+/// machine rather than on this daemon -- one Run alongside 3000 unrelated
+/// processes measured 352.7 ms, against 121 ms on an idle host.
+///
+/// Measured split of the two halves on the same host (694 processes):
+/// `readdir` 0.496 ms, 694 `getsid` calls 0.162 ms, total 0.657 ms. The
+/// enumeration was never the expensive part; the discarded harvest was.
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<u32>, String> {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    Ok(system.processes().keys().map(|pid| pid.as_u32()).collect())
+    let entries = std::fs::read_dir("/proc")
+        .map_err(|error| format!("failed to enumerate native session members: {error}"))?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("failed to read a /proc entry during census: {error}"))?;
+        // Only the numeric entries are processes; `/proc` also holds `self`,
+        // `net`, `sys` and friends. A PID that exits between readdir and the
+        // subsequent `getsid` is handled there as `Errno::SRCH`, so a stale
+        // entry here is harmless.
+        if let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        {
+            pids.push(pid);
+        }
+    }
+    if pids.is_empty() {
+        // The caller is itself a process, so an empty census means /proc did
+        // not answer rather than that the host is empty. Fail closed: an empty
+        // member list would otherwise read as "the session is quiescent" and
+        // let `stop()` report success over a Run that is still alive.
+        return Err("enumerating /proc yielded no processes".to_owned());
+    }
+    Ok(pids)
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(target_os = "macos"))]
+    use std::time::{Duration, Instant};
     use std::{process::Command, sync::Arc};
 
     use rustix::{io::Errno, process::Pid};
@@ -625,6 +662,47 @@ mod tests {
         );
         let _ = unrelated.kill();
         let _ = unrelated.wait();
+    }
+
+    /// The census must see a freshly spawned process, and must not be paying
+    /// for a per-process attribute harvest to do it.
+    ///
+    /// The budget is the point of the test, not decoration. `members()` runs
+    /// once per 10 ms quiescence poll and again in `signal_members`, so a
+    /// census that costs tens of milliseconds turns every `Stop` into a
+    /// host-wide scan -- which is exactly the regression this replaced
+    /// (`Stop` measured `63.6 ms + 0.0775 ms * host_process_count`). Direct
+    /// `/proc` enumeration plus one `getsid` per entry measured 0.657 ms at
+    /// 694 processes; 50 ms is ~75x that, so this fails on a reintroduced
+    /// harvest and not on a loaded CI box.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn process_census_sees_new_processes_without_a_per_process_harvest() {
+        let mut sentinel = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn census sentinel");
+        let sentinel_pid = sentinel.id();
+
+        let started = Instant::now();
+        let pids = super::process_ids().expect("enumerate processes");
+        let elapsed = started.elapsed();
+
+        assert!(
+            pids.contains(&sentinel_pid),
+            "census missed a live process it must be able to signal"
+        );
+        assert!(
+            pids.contains(&std::process::id()),
+            "census missed its own process"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "census took {elapsed:?}; a per-process attribute harvest is back on the Stop path"
+        );
+
+        let _ = sentinel.kill();
+        let _ = sentinel.wait();
     }
 
     #[test]
