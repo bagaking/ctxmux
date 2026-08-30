@@ -175,7 +175,31 @@ work=$6
 
 sock="$work/ctxmux.sock"
 statedir="$work/state"
+# The daemon requires the state directory to be exactly 0700 and refuses to
+# start otherwise. A plain mkdir -p inherits the login umask, which on a farm
+# node is commonly 0022 and yields 0755 — so the mode is set explicitly rather
+# than left to the environment.
 mkdir -p "$statedir"
+chmod 700 "$statedir"
+
+# Deny the client every route to substituting its own daemon.
+#
+# `ctxmux` connect-or-spawns: any command, ping included, starts its own
+# ctxmuxd when the socket does not answer, passing --socket alone and no
+# --state-dir. Our daemon takes tens of milliseconds to bind, so the very first
+# readiness ping lands in that window, spawns a rival, and the rival wins the
+# bind — our daemon then exits with "already listening" and the census measures
+# a process it never configured. It picks the daemon to spawn by looking for a
+# ctxmuxd sibling of the client binary and then on PATH, so the client is run
+# from a directory holding nothing else, with PATH emptied for those calls. The
+# spawn then cannot resolve a daemon at all, ping simply fails, and the loop
+# waits for OUR daemon instead of racing a replacement into existence.
+client_dir="$work/client"
+mkdir -p "$client_dir"
+cp "$ctxmux_bin" "$client_dir/ctxmux"
+chmod +x "$client_dir/ctxmux"
+ctxmux_bin="$client_dir/ctxmux"
+ctxmux() { PATH= "$ctxmux_bin" "$@"; }
 
 # Sample the daemon: rss (KiB) and cpu seconds from ps, threads and descriptors
 # from procfs. This mirrors the Linux census path in the repository's
@@ -195,17 +219,30 @@ cpu_seconds() {
 
 "$ctxmuxd_bin" --socket "$sock" --state-dir "$statedir" >"$work/daemon.log" 2>&1 &
 daemon_pid=$!
-cleanup_daemon() { kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; }
+# Kill whatever actually holds the socket, not merely the pid we launched, so
+# nothing outlives this census and taints the next round.
+cleanup_daemon() {
+  kill "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+  pkill -f "ctxmuxd --socket $sock" 2>/dev/null || true
+}
 trap cleanup_daemon EXIT
 
-# Wait for readiness.
+# Wait for readiness. A green ping alone is not proof that OUR daemon answered,
+# so the loop also requires our process to still be alive, and surfaces the
+# daemon log when it is not — an empty measurement that looks real is the worst
+# outcome available here.
 ready=false
 for _ in $(seq 1 100); do
-  if "$ctxmux_bin" --socket "$sock" ping >/dev/null 2>&1; then ready=true; break; fi
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    break
+  fi
+  if ctxmux --socket "$sock" ping >/dev/null 2>&1; then ready=true; break; fi
   sleep 0.1
 done
-if [[ $ready != true ]]; then
-  echo '{"error":"daemon never became ready"}'
+if [[ $ready != true ]] || ! kill -0 "$daemon_pid" 2>/dev/null; then
+  reason=$(tr -d '"\\' <"$work/daemon.log" 2>/dev/null | tr '\n' ' ' | cut -c1-400)
+  printf '{"error":"the census daemon never became ready","daemon_log":"%s"}\n' "$reason"
   exit 1
 fi
 
@@ -226,7 +263,7 @@ refused_clean=0
 emfile=0
 admission_error=""
 for _ in $(seq 1 "$target"); do
-  if out=$("$ctxmux_bin" --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
+  if out=$(ctxmux --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
     admitted=$((admitted + 1))
   else
     err=$(cat "$work/start.err")
@@ -246,7 +283,7 @@ done
 # If the fleet reached its target, probe one more admission to observe ceiling
 # behaviour explicitly rather than inferring it.
 if [[ $admitted -ge $target ]]; then
-  if out=$("$ctxmux_bin" --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
+  if out=$(ctxmux --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
     :
   else
     err=$(cat "$work/start.err")
@@ -259,15 +296,15 @@ fi
 # For active runs, drive input to each Run so retained output is non-trivial.
 if [[ $mode == active ]]; then
   while IFS=$'\t' read -r rid _; do
-    "$ctxmux_bin" --socket "$sock" input "$rid" "aaaa" >/dev/null 2>&1 || true
-  done < <("$ctxmux_bin" --socket "$sock" list 2>/dev/null)
+    ctxmux --socket "$sock" input "$rid" "aaaa" >/dev/null 2>&1 || true
+  done < <(ctxmux --socket "$sock" list 2>/dev/null)
 fi
 
 sleep 1
 
 # List across the whole fleet, timing it and confirming it enumerated every Run.
 list_start=$(date +%s.%N)
-listing=$("$ctxmux_bin" --socket "$sock" list 2>"$work/list.err") && list_ok=true || list_ok=false
+listing=$(ctxmux --socket "$sock" list 2>"$work/list.err") && list_ok=true || list_ok=false
 list_end=$(date +%s.%N)
 list_count=$(printf '%s\n' "$listing" | grep -c . || true)
 list_latency=$(awk "BEGIN{printf \"%.3f\", ($list_end - $list_start) * 1000}")
@@ -277,6 +314,17 @@ if [[ $list_ok == true && $list_count -ge $admitted ]]; then list_success=true; 
 # Aggregate retained output bytes, summed from the head byte counter each Run
 # reports in its listing row.
 aggregate_bytes=$(printf '%s\n' "$listing" | sed -n 's/.*head=\([0-9]*\).*/\1/p' | awk '{s += $1} END {print s + 0}')
+
+# The steady sample is the one every per-Run cost is derived from, so the
+# daemon that served the fleet must still be the daemon we launched. If ours
+# died partway, the client will have substituted its own and the numbers below
+# would describe a process we never configured — refuse instead of reporting
+# them.
+if ! kill -0 "$daemon_pid" 2>/dev/null; then
+  reason=$(tr -d '"\\' <"$work/daemon.log" 2>/dev/null | tr '\n' ' ' | cut -c1-400)
+  printf '{"error":"the census daemon died before the steady sample","daemon_log":"%s"}\n' "$reason"
+  exit 1
+fi
 
 steady_raw=$(sample "$daemon_pid")
 steady_rss=${steady_raw%%|*}
@@ -306,12 +354,12 @@ fi
 
 # Stop every Run and sample cleanup.
 while IFS=$'\t' read -r rid _; do
-  "$ctxmux_bin" --socket "$sock" remove "$rid" >/dev/null 2>&1 || true
-done < <("$ctxmux_bin" --socket "$sock" list 2>/dev/null)
+  ctxmux --socket "$sock" remove "$rid" >/dev/null 2>&1 || true
+done < <(ctxmux --socket "$sock" list 2>/dev/null)
 sleep 1
 cleanup_raw=$(sample "$daemon_pid")
 cleanup_threads=$(printf '%s' "$cleanup_raw" | awk -F'|' '{print $3}')
-cleanup_attachments=$(printf '%s\n' "$("$ctxmux_bin" --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
+cleanup_attachments=$(printf '%s\n' "$(ctxmux --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
 cleanup_children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l | tr -d ' ')
 
 peak_rss=$steady_rss
@@ -383,17 +431,45 @@ ctxmux_fleet_ship_verified() {
 
 # Run the census helper on one host over ssh (accept) or locally (smoke),
 # returning the JSON census cell on stdout.
+#
+# `| tail -1` would make the pipeline's status the tail's, so a census that
+# died would look like a success carrying an error object. Downstream
+# validation does refuse such a cell, but it would name a missing field rather
+# than the actual cause. PIPESTATUS is inspected instead so the helper's own
+# failure is reported where it happened, with the reason it emitted.
+ctxmux_fleet_census_status() {
+  local status=$1 cell=$2 where=$3
+  if [[ $status -ne 0 ]]
+  then
+    echo "error: the census helper failed on $where (exit $status)" >&2
+    echo "  it reported: ${cell:-<no output>}" >&2
+    return 1
+  fi
+  printf '%s' "$cell"
+}
 ctxmux_fleet_run_census_remote() {
   local dest=$1 mode=$2 target=$3 ctxmuxd_bin=$4 ctxmux_bin=$5 run_program=$6 remote_work=$7
-  ctxmux_fleet_census_helper \
-    | ssh "$dest" "bash -s -- '$mode' '$target' '$ctxmuxd_bin' '$ctxmux_bin' '$run_program' '$remote_work'" \
-    | tail -1
+  local cell status
+  cell=$(
+    ctxmux_fleet_census_helper \
+      | ssh "$dest" "bash -s -- '$mode' '$target' '$ctxmuxd_bin' '$ctxmux_bin' '$run_program' '$remote_work'" \
+      | tail -1
+    exit "${PIPESTATUS[1]}"
+  )
+  status=$?
+  ctxmux_fleet_census_status "$status" "$cell" "$dest ($mode/$target)"
 }
 ctxmux_fleet_run_census_local() {
   local mode=$1 target=$2 ctxmuxd_bin=$3 ctxmux_bin=$4 run_program=$5 local_work=$6
-  ctxmux_fleet_census_helper \
-    | bash -s -- "$mode" "$target" "$ctxmuxd_bin" "$ctxmux_bin" "$run_program" "$local_work" \
-    | tail -1
+  local cell status
+  cell=$(
+    ctxmux_fleet_census_helper \
+      | bash -s -- "$mode" "$target" "$ctxmuxd_bin" "$ctxmux_bin" "$run_program" "$local_work" \
+      | tail -1
+    exit "${PIPESTATUS[1]}"
+  )
+  status=$?
+  ctxmux_fleet_census_status "$status" "$cell" "this host ($mode/$target)"
 }
 
 if [[ $ctxmux_fleet_profile == smoke ]]
