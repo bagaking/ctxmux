@@ -113,6 +113,7 @@ fi
 
 scripts/check-protocol-types.sh
 scripts/check-remote-cost.sh --self-test
+scripts/check-fleet-scale.sh --self-test
 npm run format:check
 npm run typecheck
 npm run build

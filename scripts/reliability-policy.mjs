@@ -58,7 +58,7 @@ const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
 /// lines between `ctxmux_check_core() (` and the completion-token line, which is
 /// what `coreHash` below hashes — and say which step moved in the commit.
 const EXPECTED_CHECK_CORE_SHA256 =
-  "cda3a0c863328abec89548ecd8fdc23686bc7cfc8affe0c6788d371527c10e87";
+  "94558aefe994235bdff099d8fe7145b7848bd32f2fadf7f1163403fb0b451b26";
 const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
   "ea4b034e70736db01d40e61dc530d81efdc1752f455f56697c93c222b4e11f9b";
 const EXPECTED_QUALIFICATION_POLICY = {
