@@ -5218,6 +5218,21 @@ async fn current_size_tracks_confirmed_resizes_independently_of_the_spec() {
     drop(late);
     drop(attachment);
     stop_run(&daemon.client, run.id).await;
+
+    // current_size is the last size the owner confirmed, not a reading taken
+    // per request, so it survives the PTY it describes: a terminated Run
+    // reports the geometry its terminal last had rather than reverting to
+    // null, exactly as applied_input_bytes keeps its cursor.
+    assert_eq!(
+        daemon
+            .client
+            .status(run.id)
+            .await
+            .expect("read status after the Run terminates")
+            .current_size,
+        Some(resized),
+        "a terminated Run keeps the last size its terminal confirmed"
+    );
 }
 
 /// Read events until the next `Resized`, tolerating interleaved output.

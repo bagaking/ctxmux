@@ -671,6 +671,11 @@ at 80x24 and resized to 200x87 therefore reports a `spec.size` of 80x24 beside a
 a client that attaches after a resize learns the current geometry without
 replaying any event.
 
+It is the last size the owner confirmed, not a fresh reading taken per request,
+so a Run that has exited keeps reporting the size its terminal last had rather
+than reverting to `null`. That is a fact about the Run's history and stays true
+after the PTY is gone, exactly as `applied_input_bytes` does.
+
 Each applied resize also publishes one `resized { size }` event to existing
 attachments, carrying the same read-back value the command's
 `resize { applied_size }` receipt returns. The daemon stores the confirmed size
