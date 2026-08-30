@@ -2905,7 +2905,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 14,
+        PROTOCOL_VERSION, 15,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
