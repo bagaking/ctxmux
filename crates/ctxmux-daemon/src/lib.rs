@@ -33,6 +33,7 @@ mod native_session;
 mod native_spawn_env;
 mod persistence;
 mod qualification_stats;
+mod retention;
 mod run_spec;
 mod tmux;
 
@@ -82,6 +83,7 @@ use crate::persistence::{
     StagedPersistentStart, StartDisposition,
 };
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
+use crate::retention::{RetentionBudget, RetentionVictim};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
@@ -891,6 +893,7 @@ struct RunManager {
     native_input_drains: InputDrainGate,
     native_runs: NativeRuntimeOwner,
     qualification_stats: QualificationStats,
+    retention_budget: RetentionBudget,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
@@ -1456,6 +1459,7 @@ impl RunManager {
             native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
             native_runs: NativeRuntimeOwner::default(),
             qualification_stats,
+            retention_budget: RetentionBudget::production(),
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1519,6 +1523,7 @@ impl RunManager {
         qualification_stats: QualificationStats,
     ) -> Self {
         let terminal_publications = TerminalPublicationOwner::default();
+        let retention_budget = RetentionBudget::production();
         let runs = recovered
             .into_iter()
             .map(|recovered| {
@@ -1540,6 +1545,7 @@ impl RunManager {
                         LIVE_EVENT_CAPACITY,
                         terminal_publications.clone(),
                         qualification_stats.clone(),
+                        retention_budget.clone(),
                     ),
                     metadata_owner,
                 )
@@ -1556,6 +1562,7 @@ impl RunManager {
             native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
             native_runs: NativeRuntimeOwner::default(),
             qualification_stats,
+            retention_budget,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1594,6 +1601,7 @@ impl RunManager {
         let native_input_drains = InputDrainGate::with_stats(qualification_stats.clone());
         let creation_flights = CreationFlightOwner::with_stats(qualification_stats.clone());
         let incarnation_failure = IncarnationFailure::default();
+        let retention_budget = RetentionBudget::production();
         let mut runs = Vec::with_capacity(recovered.len());
         for recovered in recovered {
             let operation_key = recovered.operation_key.clone();
@@ -1622,6 +1630,7 @@ impl RunManager {
                         creation_flights: creation_flights.clone(),
                         incarnation_failure: incarnation_failure.clone(),
                     },
+                    retention_budget.clone(),
                 )?,
                 None => Run::recover(
                     recovered,
@@ -1629,6 +1638,7 @@ impl RunManager {
                     LIVE_EVENT_CAPACITY,
                     terminal_publications.clone(),
                     qualification_stats.clone(),
+                    retention_budget.clone(),
                 ),
             };
             runs.push((operation_key, run, metadata_owner));
@@ -1648,6 +1658,7 @@ impl RunManager {
             native_input_drains,
             native_runs,
             qualification_stats,
+            retention_budget,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1772,6 +1783,7 @@ impl RunManager {
                     incarnation_failure: self.incarnation_failure.clone(),
                 },
                 qualification_stats: self.qualification_stats.clone(),
+                retention_budget: self.retention_budget.clone(),
             },
             request,
             cleanup_reservation,
@@ -2052,6 +2064,7 @@ impl RunManager {
                     prepare_deadline: started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
                     total_deadline: started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
                     qualification_stats: self.qualification_stats.clone(),
+                    retention_budget: self.retention_budget.clone(),
                 },
                 cleanup_reservation,
             )?;
@@ -2396,6 +2409,7 @@ impl RunManager {
                 terminal_publications: self.terminal_publications.clone(),
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: self.qualification_stats.clone(),
+                retention_budget: self.retention_budget.clone(),
             },
             request,
             cleanup_reservation,
@@ -2456,6 +2470,7 @@ struct NativeSpawnConfig {
     terminal_publications: TerminalPublicationOwner,
     wait_failure: NativeWaitFailure,
     qualification_stats: QualificationStats,
+    retention_budget: RetentionBudget,
 }
 
 struct MaterializedCreation {
@@ -2501,6 +2516,7 @@ struct TmuxImportConfig {
     prepare_deadline: Instant,
     total_deadline: Instant,
     qualification_stats: QualificationStats,
+    retention_budget: RetentionBudget,
 }
 
 #[must_use = "a started tmux Control owner must be published or transferred for cleanup"]
@@ -2686,6 +2702,10 @@ struct Run {
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
     events: LiveEventOwner,
+    /// Daemon-wide retained-output budget this Run participates in. Held so the
+    /// Run can register itself as an eviction victim and so `record_output` can
+    /// drive cross-Run reclamation after admitting new bytes.
+    retention_budget: RetentionBudget,
 }
 
 struct LiveEventOwner {
@@ -2833,6 +2853,27 @@ impl NativeRunOwner for Arc<Run> {
 impl NativeRunOwner for PendingPublication {
     fn run(&self) -> &Arc<Run> {
         self.run()
+    }
+}
+
+impl RetentionVictim for Run {
+    fn run_id(&self) -> RunId {
+        self.id
+    }
+
+    fn retained_output_bytes(&self) -> usize {
+        mutex_lock(&self.output).retained_bytes()
+    }
+
+    fn is_attached(&self) -> bool {
+        self.attachments.load(Ordering::Acquire) != 0
+    }
+
+    fn reclaim_output(&self, drop_at_least: usize) -> usize {
+        // Takes only this Run's own `output` lock, matching the trait's
+        // one-lock-at-a-time contract so the daemon-wide reclaimer never holds
+        // two `output` locks or the participants lock while trimming.
+        mutex_lock(&self.output).trim_front(drop_at_least)
     }
 }
 
@@ -3095,6 +3136,23 @@ impl Run {
         native_runs: NativeRuntimeOwner,
         wait_failure: NativeWaitFailure,
     ) -> Arc<Self> {
+        Self::new_native_for_owner_test_with_budget(
+            id,
+            control,
+            native_runs,
+            wait_failure,
+            RetentionBudget::production(),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_native_for_owner_test_with_budget(
+        id: RunId,
+        control: NativeControlOwner,
+        native_runs: NativeRuntimeOwner,
+        wait_failure: NativeWaitFailure,
+        retention_budget: RetentionBudget,
+    ) -> Arc<Self> {
         Self::new_native(
             NativeSpawnConfig {
                 id,
@@ -3114,6 +3172,7 @@ impl Run {
                 terminal_publications: TerminalPublicationOwner::default(),
                 wait_failure,
                 qualification_stats: QualificationStats::default(),
+                retention_budget,
             },
             id,
             Some(42),
@@ -3141,6 +3200,7 @@ impl Run {
                 terminal_publications: TerminalPublicationOwner::default(),
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: QualificationStats::default(),
+                retention_budget: RetentionBudget::production(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -3212,6 +3272,7 @@ impl Run {
                 terminal_publications,
                 wait_failure: NativeWaitFailure::default(),
                 qualification_stats: QualificationStats::default(),
+                retention_budget: RetentionBudget::production(),
             },
             |run| run,
             |_, _| Ok(()),
@@ -3353,7 +3414,7 @@ impl Run {
         pid: Option<u32>,
         native_control: NativeControlOwner,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let run = Arc::new(Self {
             id,
             spec: Some(config.spec),
             lineage: config.lineage,
@@ -3361,7 +3422,7 @@ impl Run {
             capabilities: RunCapabilities::NATIVE,
             pid,
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::default()),
+            output: Mutex::new(OutputLog::new(config.retention_budget.clone())),
             incarnation_control: Some(RunControl::Native(native_control)),
             native_runs: Some(config.native_runs),
             persistence_mode: config.persistence_mode,
@@ -3377,7 +3438,20 @@ impl Run {
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
             events: LiveEventOwner::new(config.live_event_capacity),
-        })
+            retention_budget: config.retention_budget,
+        });
+        Self::register_retention(run)
+    }
+
+    /// Register a freshly built Run with its daemon-wide retention budget and
+    /// return it. Every constructor funnels through this so no Run can retain
+    /// output without being an eviction participant. Registration stores only a
+    /// `Weak` handle (see `retention`), so it never immortalizes the Run or
+    /// disturbs collection's `strong_count == 1` eligibility.
+    fn register_retention(run: Arc<Self>) -> Arc<Self> {
+        let victim: Arc<dyn RetentionVictim + Send + Sync> = run.clone();
+        run.retention_budget.register(&victim);
+        run
     }
 
     #[allow(
@@ -3419,7 +3493,9 @@ impl Run {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(target.pane_pid),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation()),
+            output: Mutex::new(OutputLog::with_initial_truncation(
+                config.retention_budget.clone(),
+            )),
             incarnation_control: Some(RunControl::Tmux(TmuxRunControl {
                 writer: Mutex::new(Some(TmuxCommandWriter::new(stdin))),
                 commands: commands_tx,
@@ -3434,7 +3510,9 @@ impl Run {
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
             events: LiveEventOwner::new(config.live_event_capacity),
+            retention_budget: config.retention_budget,
         });
+        let run = Self::register_retention(run);
         let pending_publication = PendingTmuxPublication::new(run, cleanup_reservation);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let (output_done_tx, output_done_rx) = mpsc::channel();
@@ -3549,10 +3627,11 @@ impl Run {
         live_event_capacity: usize,
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
+        retention_budget: RetentionBudget,
     ) -> Arc<Self> {
         let terminal_ordinal = OnceLock::new();
         terminal_publications.recover(&terminal_ordinal);
-        Arc::new(Self {
+        let run = Arc::new(Self {
             id: recovered.info.id,
             spec: recovered.info.spec,
             lineage: recovered.info.lineage,
@@ -3560,7 +3639,10 @@ impl Run {
             capabilities: recovered.info.capabilities,
             pid: recovered.info.pid,
             state: Mutex::new(recovered.info.state),
-            output: Mutex::new(OutputLog::from_replay(recovered.replay)),
+            output: Mutex::new(OutputLog::from_replay(
+                recovered.replay,
+                retention_budget.clone(),
+            )),
             incarnation_control: None,
             native_runs: None,
             persistence_mode: PersistenceMode::PersistentCapable,
@@ -3571,7 +3653,9 @@ impl Run {
             terminal_publications,
             terminal_ordinal,
             events: LiveEventOwner::new(live_event_capacity),
-        })
+            retention_budget,
+        });
+        Self::register_retention(run)
     }
 
     /// Re-bind live native control onto a freshly recovered Run whose child and
@@ -3600,6 +3684,7 @@ impl Run {
         qualification_stats: QualificationStats,
         input_drains: InputDrainGate,
         wait_failure: NativeWaitFailure,
+        retention_budget: RetentionBudget,
     ) -> Result<Arc<Self>, ProtocolError> {
         let id = recovered.info.id;
 
@@ -3669,7 +3754,10 @@ impl Run {
             capabilities: recovered.info.capabilities,
             pid: Some(child_pid),
             state: Mutex::new(recovered.info.state),
-            output: Mutex::new(OutputLog::from_replay(recovered.replay)),
+            output: Mutex::new(OutputLog::from_replay(
+                recovered.replay,
+                retention_budget.clone(),
+            )),
             incarnation_control: Some(RunControl::Native(native_control)),
             native_runs: Some(native_runs),
             persistence_mode: PersistenceMode::PersistentCapable,
@@ -3680,7 +3768,9 @@ impl Run {
             terminal_publications,
             terminal_ordinal,
             events: LiveEventOwner::new(live_event_capacity),
+            retention_budget,
         });
+        let run = Self::register_retention(run);
 
         let registration_control = run
             .native_control()
@@ -3854,6 +3944,15 @@ impl Run {
                 chunk
             }
         };
+        // This push admitted new bytes into the daemon-wide total. Drive
+        // cross-Run reclamation now — the same event that admits bytes reclaims
+        // them, so no periodic sweep is needed and a quiet Run's pinned memory
+        // is freed by *this* Run's pressure. The `output` lock above is already
+        // released, so reclamation (which locks victims' `output` one at a time)
+        // cannot deadlock against it; `except = self.id` keeps a newcomer's own
+        // bytes as the last resort rather than the first casualty. The fast path
+        // is a single atomic load when under budget.
+        self.retention_budget.reclaim_excess(self.id);
         self.publish_event(RunEvent::Output { chunk });
     }
 
@@ -4721,28 +4820,57 @@ impl Drop for AttachmentGuard {
     }
 }
 
-#[derive(Default)]
+/// Per-Run retained-output ring, with its bytes welded to the daemon-wide
+/// [`RetentionBudget`].
+///
+/// The log holds a budget handle and reports every retained-byte change through
+/// it: `push` adds, each trim (per-Run *and* global) subtracts, and `Drop`
+/// subtracts the remainder. Because the log drops exactly when its `Run` drops,
+/// every reclamation path — ordinary drop, Registry collection/replacement, and
+/// the explicit `remove` verb — decrements the total for free, with no separate
+/// accounting hook to keep in sync.
 struct OutputLog {
     chunks: VecDeque<OutputChunk>,
     retained_bytes: usize,
     latest_output_bytes: u64,
     source_gap_after_byte: Option<u64>,
+    /// Daemon-wide budget this log's bytes count against. A cheap `Arc`-backed
+    /// handle; every log shares the one `RunManager` budget.
+    budget: RetentionBudget,
 }
 
 impl OutputLog {
-    fn with_initial_truncation() -> Self {
+    fn new(budget: RetentionBudget) -> Self {
         Self {
-            source_gap_after_byte: Some(0),
-            ..Self::default()
+            chunks: VecDeque::new(),
+            retained_bytes: 0,
+            latest_output_bytes: 0,
+            source_gap_after_byte: None,
+            budget,
         }
     }
 
-    fn from_replay(replay: OutputReplay) -> Self {
+    fn with_initial_truncation(budget: RetentionBudget) -> Self {
         Self {
-            retained_bytes: replay.chunks.iter().map(|chunk| chunk.data.len()).sum(),
+            chunks: VecDeque::new(),
+            retained_bytes: 0,
+            latest_output_bytes: 0,
+            source_gap_after_byte: Some(0),
+            budget,
+        }
+    }
+
+    fn from_replay(replay: OutputReplay, budget: RetentionBudget) -> Self {
+        let retained_bytes = replay.chunks.iter().map(|chunk| chunk.data.len()).sum();
+        // Recovered bytes are live retained payload the moment they load, so
+        // they count against the budget exactly as freshly pushed bytes do.
+        budget.add(retained_bytes);
+        Self {
+            retained_bytes,
             chunks: replay.chunks.into(),
             latest_output_bytes: replay.latest_output_bytes,
             source_gap_after_byte: None,
+            budget,
         }
     }
 
@@ -4767,13 +4895,50 @@ impl OutputLog {
         };
         self.latest_output_bytes = end_byte;
         self.retained_bytes = self.retained_bytes.saturating_add(chunk.data.len());
+        self.budget.add(chunk.data.len());
         self.chunks.push_back(chunk.clone());
+        // Per-Run cap: an individual Run never retains more than 4 MiB of its
+        // own scrollback. This is the first, cheapest line of defense and the
+        // one the frozen reliability contract measures; the daemon-wide budget
+        // sits above it and only reclaims across Runs under aggregate pressure.
         while self.retained_bytes > OUTPUT_RETENTION_BYTES && self.chunks.len() > 1 {
             if let Some(evicted) = self.chunks.pop_front() {
                 self.retained_bytes = self.retained_bytes.saturating_sub(evicted.data.len());
+                self.budget.sub(evicted.data.len());
             }
         }
         chunk
+    }
+
+    /// Trim oldest chunks until at least `drop_at_least` bytes are shed or only
+    /// one chunk remains, decrementing the shared budget as it goes. Returns the
+    /// bytes actually reclaimed.
+    ///
+    /// This is the *same* front-pop mechanic `push` uses for the per-Run 4 MiB
+    /// cap — only the trigger differs (aggregate pressure, not this Run's own
+    /// overrun). It therefore inherits that mechanic's safety: it removes only
+    /// already-recorded history (for a persistent Run every chunk was durably
+    /// enqueued at push time, so trimming memory never loses durability), it
+    /// only advances `first_available_byte` forward (never rewinding a cursor),
+    /// and it never empties the log below its final chunk, so
+    /// `latest_output_bytes` and the replay cursor stay monotonic. A client
+    /// observes the ordinary `truncated = true` replay signal, identical to a
+    /// per-Run overrun.
+    fn trim_front(&mut self, drop_at_least: usize) -> usize {
+        let mut freed = 0;
+        while freed < drop_at_least && self.chunks.len() > 1 {
+            if let Some(evicted) = self.chunks.pop_front() {
+                let bytes = evicted.data.len();
+                self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
+                self.budget.sub(bytes);
+                freed += bytes;
+            }
+        }
+        freed
+    }
+
+    const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     const fn latest_output_bytes(&self) -> u64 {
@@ -4799,6 +4964,18 @@ impl OutputLog {
                 .is_some_and(|gap_byte| after_byte <= gap_byte)
                 || after_byte < first_available_byte,
         }
+    }
+}
+
+impl Drop for OutputLog {
+    /// Release this Run's still-retained bytes from the daemon-wide total. This
+    /// is the single accounting hook that makes every reclamation path correct
+    /// for free: an ordinary drop, a Registry collection or exact replacement,
+    /// and the explicit `remove` verb all drop the `Run` (and thus this log),
+    /// so none of them needs its own budget bookkeeping. Trims already
+    /// decremented what they shed; only the live remainder is left to release.
+    fn drop(&mut self) {
+        self.budget.sub(self.retained_bytes);
     }
 }
 
@@ -5880,6 +6057,7 @@ mod tests {
             crate::qualification_stats::QualificationStats::default(),
             input_drains,
             wait_failure,
+            crate::retention::RetentionBudget::production(),
         )
         .expect("readopt rebinds live control onto the recovered Run");
 
@@ -6360,7 +6538,9 @@ mod tests {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(1),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation()),
+            output: Mutex::new(OutputLog::with_initial_truncation(
+                crate::retention::RetentionBudget::production(),
+            )),
             incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
                 writer: Mutex::new(None),
                 commands,
@@ -6375,6 +6555,7 @@ mod tests {
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
             events: super::LiveEventOwner::new(1),
+            retention_budget: crate::retention::RetentionBudget::production(),
         });
         (run, command_rx)
     }
@@ -7274,7 +7455,7 @@ mod tests {
 
     #[test]
     fn replay_marks_a_cursor_older_than_retained_output_as_truncated() {
-        let mut output = OutputLog::default();
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         for _ in 0..600 {
             output.push(vec![0; 8192]);
         }
@@ -7285,9 +7466,98 @@ mod tests {
     }
 
     #[test]
+    fn output_log_reports_its_bytes_to_the_shared_budget() {
+        // Each OutputLog's live bytes count against the daemon-wide total, and
+        // the per-Run cap keeps one log's contribution at or below 4 MiB.
+        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let mut output = OutputLog::new(budget.clone());
+        for _ in 0..8 {
+            output.push(vec![0_u8; 1024 * 1024]); // 1 MiB each, 8 MiB pushed
+        }
+        // Per-Run eviction held the log itself at or below the 4 MiB cap...
+        assert!(output.retained_bytes() <= OUTPUT_RETENTION_BYTES);
+        // ...and the shared total exactly mirrors that surviving payload.
+        assert_eq!(budget.retained_total(), output.retained_bytes() as u64);
+    }
+
+    #[test]
+    fn dropping_an_output_log_releases_its_bytes_from_the_total() {
+        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let mut output = OutputLog::new(budget.clone());
+        output.push(vec![0_u8; 4096]);
+        assert_eq!(budget.retained_total(), 4096);
+        drop(output);
+        assert_eq!(
+            budget.retained_total(),
+            0,
+            "an OutputLog must return its bytes to the total when it drops"
+        );
+    }
+
+    #[test]
+    fn a_quiet_output_log_is_trimmed_by_aggregate_pressure() {
+        // The bug a per-Run-only design misses. `quiet` fills to its 4 MiB cap
+        // and then never pushes again; `busy` pushes until the shared total
+        // exceeds the limit, and `busy`'s own record_output — the production
+        // trigger, no manual call — reclaims from the idle `quiet` Run.
+        //
+        // Limit 5 MiB: one Run's 4 MiB cap fits, but the two together (8 MiB)
+        // bust it, so pressure must cross Run boundaries to recover.
+        let budget = crate::retention::RetentionBudget::with_limit(5 * 1024 * 1024);
+        assert_eq!(budget.limit(), 5 * 1024 * 1024);
+
+        let quiet_id = RunId::new();
+        let quiet_native_runs = NativeRuntimeOwner::default();
+        let quiet_run = Run::new_native_for_owner_test_with_budget(
+            quiet_id,
+            NativeControlOwner::new_for_wait_test(quiet_id, quiet_native_runs.owner_wake()),
+            quiet_native_runs,
+            NativeWaitFailure::default(),
+            budget.clone(),
+        );
+        // Fill the quiet Run to its 4 MiB cap in fine chunks. Alone it stays
+        // under the 5 MiB budget, so it does not trim itself.
+        for _ in 0..64 {
+            quiet_run.record_output(vec![0_u8; 64 * 1024]);
+        }
+        let filled = mutex_lock(&quiet_run.output).retained_bytes();
+        assert!(
+            filled >= 3 * 1024 * 1024,
+            "quiet Run should be near its cap"
+        );
+
+        // A second Run sharing the budget goes busy. Its record_output pushes
+        // drive cross-Run reclamation with no manual trigger.
+        let busy_id = RunId::new();
+        let busy_native_runs = NativeRuntimeOwner::default();
+        let busy_run = Run::new_native_for_owner_test_with_budget(
+            busy_id,
+            NativeControlOwner::new_for_wait_test(busy_id, busy_native_runs.owner_wake()),
+            busy_native_runs,
+            NativeWaitFailure::default(),
+            budget.clone(),
+        );
+        for _ in 0..64 {
+            busy_run.record_output(vec![0_u8; 64 * 1024]);
+        }
+
+        let after = mutex_lock(&quiet_run.output).retained_bytes();
+        assert!(
+            after < filled,
+            "the quiet Run pinned {after} bytes; aggregate pressure must trim it (was {filled})"
+        );
+        assert!(
+            budget.retained_total() <= budget.limit(),
+            "aggregate reclamation left {} bytes above the {} limit",
+            budget.retained_total(),
+            budget.limit()
+        );
+    }
+
+    #[test]
     fn replay_cursor_and_retention_boundaries_are_exact() {
         // OR-002: retained ranges and truncation are caller-cursor relative.
-        let mut output = OutputLog::default();
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         let first_size = OUTPUT_RETENTION_BYTES / 2;
         let second_size = OUTPUT_RETENTION_BYTES - first_size;
         output.push(vec![b'a'; first_size]);
@@ -7362,7 +7632,8 @@ mod tests {
 
     #[test]
     fn replay_keeps_a_tmux_source_gap_visible_to_late_attachments() {
-        let mut output = OutputLog::with_initial_truncation();
+        let mut output =
+            OutputLog::with_initial_truncation(crate::retention::RetentionBudget::production());
         assert!(output.replay(0).truncated);
         assert_eq!(output.mark_source_gap(), 0);
 
@@ -7392,7 +7663,7 @@ mod tests {
 
     #[test]
     fn one_oversized_output_chunk_is_retained_as_an_honest_replay_unit() {
-        let mut output = OutputLog::default();
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         let oversized = vec![0xa5; OUTPUT_RETENTION_BYTES + 1];
         output.push(oversized.clone());
 
@@ -7418,7 +7689,7 @@ mod tests {
         // LC-001 / OR-002: a live-ring lag does not replace the caller's
         // durable replay cursor with the daemon head.
         let (events, mut receiver) = broadcast::channel(2);
-        let mut output = OutputLog::default();
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         for byte in b"abcd" {
             let chunk = output.push(vec![*byte]);
             events.send(chunk).expect("keep receiver live");
@@ -7501,7 +7772,9 @@ mod tests {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(pane_pid),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation()),
+            output: Mutex::new(OutputLog::with_initial_truncation(
+                crate::retention::RetentionBudget::production(),
+            )),
             incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
                 writer: Mutex::new(None),
                 commands,
@@ -7516,6 +7789,7 @@ mod tests {
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
             events: super::LiveEventOwner::new(live_event_capacity),
+            retention_budget: crate::retention::RetentionBudget::production(),
         })
     }
 

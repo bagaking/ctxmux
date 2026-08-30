@@ -83,6 +83,7 @@
         "crates/ctxmux-daemon/src/native_spawn_env.rs",
         "crates/ctxmux-daemon/src/handoff.rs",
         "crates/ctxmux-daemon/src/fd_budget.rs",
+        "crates/ctxmux-daemon/src/retention.rs",
         "crates/ctxmux-daemon/src/qualification_stats.rs",
         "crates/ctxmux-daemon/src/main.rs",
         "crates/ctxmux-inherited-fd/src/lib.rs",
