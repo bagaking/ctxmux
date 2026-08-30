@@ -392,15 +392,29 @@ if [[ $list_ok == true && $list_count -ge $admitted ]]; then list_success=true; 
 # bounds is OutputLog::retained_bytes — what the daemon is still holding right
 # now, capped per-Run at 4 MiB and fleet-wide at 1 GiB. A Run that streamed a
 # gigabyte and had it trimmed reports a gigabyte here while retaining almost
-# nothing. The two numbers diverge without limit as a fleet ages.
-#
-# The darwin gate measures the real quantity (it sums replay lengths per Run),
-# so the same field name previously described two different measurements in two
-# harnesses, with only this one being the wrong one. Naming it for what it is
-# keeps it from being graded against a retention ceiling it cannot satisfy the
-# meaning of. Proving the fleet-wide retention cap from here needs
-# retained_bytes on the wire, which the protocol does not carry today.
+# nothing. The two numbers diverge without limit as a fleet ages, so this one
+# is reported for context and is never graded against a retention ceiling.
 aggregate_bytes=$(printf '%s\n' "$listing" | sed -n 's/.*head=\([0-9]*\).*/\1/p' | awk '{s += $1} END {print s + 0}')
+
+# Bytes the fleet is holding RIGHT NOW, summed from the retained counter the
+# listing row carries alongside `head=`. This is the quantity the daemon's
+# fleet-wide RETENTION_BUDGET_BYTES cap actually bounds, so summing it here
+# gives an external check on that cap that does not depend on the daemon's own
+# accounting: the daemon maintains its total incrementally as an AtomicU64,
+# while this re-derives it from the per-Run rows. A drift between the two would
+# mean the budget's bookkeeping had desynchronized from what the logs hold.
+#
+# Guard against silently summing nothing. `sed -n 's/...//p'` prints only lines
+# that match, so a renamed or dropped field yields an empty stream, awk prints
+# 0, and a fleet holding gigabytes would grade as a comfortable pass against
+# the 1 GiB ceiling. An absent field is a broken harness, not a healthy fleet.
+retained_rows=$(printf '%s\n' "$listing" | grep -c 'retained=' || true)
+if [ "$list_count" -gt 0 ] && [ "$retained_rows" -ne "$list_count" ]; then
+  printf '{"error":"the listing carried retained= on %s of %s rows; the retention total cannot be summed from a partial listing"}\n' \
+    "$retained_rows" "$list_count"
+  exit 1
+fi
+aggregate_retained_bytes=$(printf '%s\n' "$listing" | sed -n 's/.*retained=\([0-9]*\).*/\1/p' | awk '{s += $1} END {print s + 0}')
 
 # The steady sample is the one every per-Run cost is derived from, so the
 # daemon that served the fleet must still be the daemon we launched. If ours
@@ -542,6 +556,7 @@ printf '"cleanup":{"threads":%s},' "$cleanup_threads"
 printf '"list_latency_ms":%s,' "$list_latency"
 printf '"list_success":%s,' "$list_success"
 printf '"aggregate_output_bytes_lifetime":%s,' "$aggregate_bytes"
+printf '"aggregate_retained_bytes":%s,' "$aggregate_retained_bytes"
 if [[ $refused_clean -ge 1 || $emfile -eq 1 ]]; then
   refused_bool=false
   if [[ $refused_clean -ge 1 ]]; then refused_bool=true; fi

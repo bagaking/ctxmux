@@ -318,6 +318,10 @@ function runSummary(value: unknown, path: string): void {
   }
   runState(run.state, `${path}.state`);
   validateCursorValue(run.latest_output_bytes, `${path}.latest_output_bytes`);
+  validateCursorValue(
+    run.retained_output_bytes,
+    `${path}.retained_output_bytes`,
+  );
   safeUnsignedInteger(run.attachments, `${path}.attachments`);
 }
 

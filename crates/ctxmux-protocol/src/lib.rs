@@ -961,8 +961,23 @@ pub struct RunSummary {
     pub pid: Option<u32>,
     /// Current lifecycle state.
     pub state: RunState,
-    /// Total output bytes allocated so far.
+    /// Total output bytes allocated so far. Monotonic over the Run's lifetime:
+    /// it counts bytes that have *passed through*, and never decreases when the
+    /// scrollback is trimmed. Do not read it as memory currently held — the
+    /// `retained_output_bytes` field below is that quantity.
     pub latest_output_bytes: u64,
+    /// Output bytes this Run is holding in memory *right now*.
+    ///
+    /// The distinction from `latest_output_bytes` is the whole reason this field
+    /// exists. That one is a lifetime total and only ever grows; this one rises
+    /// and falls as the scrollback is trimmed, and is the quantity the daemon's
+    /// two retention caps actually bound — per-Run, and summed fleet-wide.
+    /// Confusing the two fails in both directions: a long-lived fleet reports a
+    /// lifetime total far above the fleet cap while holding almost nothing, and
+    /// a fleet sitting exactly at the cap can report a lifetime total well under
+    /// it. An external harness summing this field across a `List` gets the same
+    /// quantity the daemon caps, so the cap becomes checkable from outside.
+    pub retained_output_bytes: u64,
     /// Number of live attachment connections.
     pub attachments: usize,
 }
@@ -975,6 +990,15 @@ impl From<&RunInfo> for RunSummary {
             pid: info.pid,
             state: info.state.clone(),
             latest_output_bytes: info.latest_output_bytes,
+            // A `RunInfo` does not carry retained bytes, and inferring one from
+            // `latest_output_bytes` would be worse than admitting the gap: for
+            // any trimmed Run the lifetime total overstates what is held, so a
+            // harness summing the projection would read a fleet as over its cap
+            // while the daemon sits comfortably under it. Zero is the honest
+            // floor. This projection is not on the production List path (which
+            // builds summaries straight from the live `OutputLog`); it exists
+            // for callers converting a Status record they already hold.
+            retained_output_bytes: 0,
             attachments: info.attachments,
         }
     }
@@ -2244,6 +2268,11 @@ mod tests {
         assert_eq!(summary.backend, RunBackendKind::Native);
         assert_eq!(summary.pid, info.pid);
         assert_eq!(summary.latest_output_bytes, info.latest_output_bytes);
+        // A RunInfo carries no retained count, so the projection floors it at
+        // zero rather than reusing the lifetime total. Pinned so a later "fix"
+        // that copies latest_output_bytes across cannot land quietly: that
+        // would make any trimmed Run report memory it is not holding.
+        assert_eq!(summary.retained_output_bytes, 0);
         assert_eq!(summary.attachments, info.attachments);
 
         let response = Response::Runs {
@@ -2267,6 +2296,7 @@ mod tests {
                     "pid": info.pid,
                     "state": {"type": "running"},
                     "latest_output_bytes": 0,
+                    "retained_output_bytes": 0,
                     "attachments": 1,
                 }],
                 "next_cursor": id.to_string(),
@@ -2361,6 +2391,7 @@ mod tests {
                 signal: Some("SIGTERM".to_owned()),
             },
             latest_output_bytes: u64::MAX,
+            retained_output_bytes: u64::MAX,
             attachments: usize::MAX,
         };
         let runs = vec![heavy; LIST_MAX_PAGE_RUNS];

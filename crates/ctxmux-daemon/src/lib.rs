@@ -3876,12 +3876,21 @@ impl Run {
     /// mutex, and it drops the unbounded `RunSpec` clone that made an unpaged
     /// `RunInfo` fleet overflow the wire frame.
     fn summary(&self) -> RunSummary {
+        // One guard for both output fields. `output` is a plain non-reentrant
+        // mutex, so reading the retained count through the `RetentionVictim`
+        // impl (`Run::retained_output_bytes`) would take it a second time and
+        // deadlock the List walk. Bind it once and read both.
+        let output = mutex_lock(&self.output);
+        let latest_output_bytes = output.latest_output_bytes();
+        let retained_output_bytes = output.retained_bytes() as u64;
+        drop(output);
         RunSummary {
             id: self.id,
             backend: RunBackendKind::from(&self.backend),
             pid: self.pid,
             state: mutex_lock(&self.state).clone(),
-            latest_output_bytes: mutex_lock(&self.output).latest_output_bytes(),
+            latest_output_bytes,
+            retained_output_bytes,
             attachments: self.attachments.load(Ordering::Acquire),
         }
     }
@@ -7523,8 +7532,82 @@ mod tests {
     }
 
     #[test]
-    fn dropping_an_output_log_releases_its_bytes_from_the_total() {
+    fn the_two_wire_byte_counters_diverge_once_trimming_starts() {
+        // The reason `retained_output_bytes` exists as a separate wire field.
+        // Both counters agree while nothing has been evicted, and an external
+        // harness that mixed them up would look correct on a fresh fleet — the
+        // bug only appears once the daemon starts trimming, which is exactly
+        // when a retention cap is worth checking.
         let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let mut output = OutputLog::new(budget);
+        output.push(vec![0_u8; 1024]);
+        assert_eq!(output.latest_output_bytes(), 1024);
+        assert_eq!(output.retained_bytes() as u64, output.latest_output_bytes());
+
+        // Push well past the 4 MiB per-Run cap so eviction has to run.
+        for _ in 0..8 {
+            output.push(vec![0_u8; 1024 * 1024]);
+        }
+
+        // The lifetime counter keeps every byte that ever passed through...
+        assert_eq!(output.latest_output_bytes(), 1024 + 8 * 1024 * 1024);
+        // ...while the retained count fell back under the per-Run cap.
+        assert!(output.retained_bytes() <= OUTPUT_RETENTION_BYTES);
+        // The gap is the whole point: reading the lifetime total as "memory
+        // held" would report this Run at 8 MiB against a 4 MiB cap and fail a
+        // healthy daemon.
+        assert!(
+            (output.retained_bytes() as u64) < output.latest_output_bytes(),
+            "a trimmed log must retain strictly less than it has ever emitted"
+        );
+    }
+
+    #[test]
+    fn the_listing_row_reports_bytes_held_not_bytes_ever_emitted() {
+        // The wire contract, asserted on a real Run through the same `summary()`
+        // the List walk calls. The OutputLog-level test above proves the two
+        // counters diverge; this proves the LISTING carries the right one.
+        // Without it, wiring `latest_output_bytes()` into the retained field
+        // passes every other test in the suite — an external harness would then
+        // sum lifetime totals, read a healthy fleet as far over its retention
+        // cap, and the defect would only surface as a false gate failure.
+        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let id = RunId::new();
+        let native_runs = NativeRuntimeOwner::default();
+        let run = Run::new_native_for_owner_test_with_budget(
+            id,
+            NativeControlOwner::new_for_wait_test(id, native_runs.owner_wake()),
+            native_runs,
+            NativeWaitFailure::default(),
+            budget,
+        );
+
+        // Push well past the 4 MiB per-Run cap so the log has to evict.
+        for _ in 0..128 {
+            run.record_output(vec![0_u8; 64 * 1024]); // 8 MiB total
+        }
+
+        let summary = run.summary();
+        let held = mutex_lock(&run.output).retained_bytes() as u64;
+
+        assert_eq!(
+            summary.retained_output_bytes, held,
+            "the listing row must carry the log's live retained count"
+        );
+        assert_eq!(summary.latest_output_bytes, 128 * 64 * 1024);
+        assert!(
+            summary.retained_output_bytes <= OUTPUT_RETENTION_BYTES as u64,
+            "a listed Run must never report holding more than the per-Run cap"
+        );
+        assert!(
+            summary.retained_output_bytes < summary.latest_output_bytes,
+            "after eviction the two wire counters must not be equal; if they \
+             are, the retained field is wired to the lifetime total"
+        );
+    }
+
+    #[test]
+    fn dropping_an_output_log_releases_its_bytes_from_the_total() {        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
         let mut output = OutputLog::new(budget.clone());
         output.push(vec![0_u8; 4096]);
         assert_eq!(budget.retained_total(), 4096);

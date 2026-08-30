@@ -37,9 +37,26 @@ export type RunSummary = {
    */
   state: RunState;
   /**
-   * Total output bytes allocated so far.
+   * Total output bytes allocated so far. Monotonic over the Run's lifetime:
+   * it counts bytes that have *passed through*, and never decreases when the
+   * scrollback is trimmed. Do not read it as memory currently held — the
+   * `retained_output_bytes` field below is that quantity.
    */
   latest_output_bytes: number;
+  /**
+   * Output bytes this Run is holding in memory *right now*.
+   *
+   * The distinction from `latest_output_bytes` is the whole reason this field
+   * exists. That one is a lifetime total and only ever grows; this one rises
+   * and falls as the scrollback is trimmed, and is the quantity the daemon's
+   * two retention caps actually bound — per-Run, and summed fleet-wide.
+   * Confusing the two fails in both directions: a long-lived fleet reports a
+   * lifetime total far above the fleet cap while holding almost nothing, and
+   * a fleet sitting exactly at the cap can report a lifetime total well under
+   * it. An external harness summing this field across a `List` gets the same
+   * quantity the daemon caps, so the cap becomes checkable from outside.
+   */
+  retained_output_bytes: number;
   /**
    * Number of live attachment connections.
    */

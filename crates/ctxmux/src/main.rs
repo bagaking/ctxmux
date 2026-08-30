@@ -714,7 +714,7 @@ fn print_summary(run: &RunSummary) {
         RunBackendKind::Tmux => "tmux",
     };
     println!(
-        "{}\t{}\tpid={}\tbackend={}\tattachments={}\thead={}",
+        "{}\t{}\tpid={}\tbackend={}\tattachments={}\thead={}\tretained={}",
         run.id,
         format_run_state(&run.state),
         run.pid
@@ -722,6 +722,11 @@ fn print_summary(run: &RunSummary) {
         backend,
         run.attachments,
         run.latest_output_bytes,
+        // Distinct from `head=` on purpose. `head=` is a lifetime total that
+        // only grows; `retained=` is what this Run holds right now, and summing
+        // it across a listing is how an external harness checks the daemon's
+        // fleet-wide retention cap without needing the daemon's own counter.
+        run.retained_output_bytes,
     );
 }
 
