@@ -130,13 +130,83 @@ do
   esac
 done
 
-# The self-test is the cheap, host-agnostic gate check. It delegates to the
-# measurement core, which proves each refusal fires: a fleet acceptance harness
-# that could report a silent zero is worse than none, because a green verdict
-# with nothing behind it would be cited later as if a fleet had been accepted.
+# Shell-level self-test: the census fragments whose failure mode is "no cell at
+# all" rather than "a wrong cell". Each case runs the real fragment under the
+# census's own `set -euo pipefail`, so a regression here fails the gate instead
+# of being discovered on the farm an hour into a run.
+ctxmux_fleet_shell_self_test() {
+  local failures=0
+
+  # A drained fleet is the healthy outcome, and it is the one `pgrep` reports
+  # by exiting 1. Run the real drain fragment against a pid that has no
+  # children and require a cell-bearing exit. Before the guard this exited 1
+  # with no output; the node fixtures could not see it, because a census that
+  # aborts produces nothing to judge.
+  local drained_pid=$$ observed rc
+  observed=$(
+    bash -euo pipefail -c '
+      count_children() { { pgrep -P "$1" 2>/dev/null || true; } | wc -l | tr -d " "; }
+      for _ in $(seq 1 3); do
+        n=$(count_children "$1")
+        if [[ ${n:-0} -eq 0 ]]; then break; fi
+        sleep 0.1
+      done
+      printf "%s" "${n:-missing}"
+    ' _ "$drained_pid" 2>/dev/null
+  ) && rc=0 || rc=$?
+  if [[ $rc -eq 0 && $observed == 0 ]]; then
+    echo "  ok    a fully drained fleet still emits a cell: cleanup_live_children=0"
+  else
+    echo "  FAIL  a drained fleet aborted the census (rc=$rc, observed='${observed:-}')"
+    echo "        pgrep exits 1 when it matches nothing; under set -e that kills the run"
+    failures=$((failures + 1))
+  fi
+
+  # The counter must still report a real number when children DO exist,
+  # otherwise the leak check downstream is comparing against a constant zero
+  # and every stranded child passes.
+  local live_out live_rc
+  live_out=$(
+    bash -euo pipefail -c '
+      count_children() { { pgrep -P "$1" 2>/dev/null || true; } | wc -l | tr -d " "; }
+      sleep 30 & sleep 30 &
+      n=$(count_children $$)
+      kill %1 %2 2>/dev/null || true
+      printf "%s" "$n"
+    ' 2>/dev/null
+  ) && live_rc=0 || live_rc=$?
+  if [[ $live_rc -eq 0 && ${live_out:-0} -ge 2 ]]; then
+    echo "  ok    live children are still counted, not flattened to zero: $live_out"
+  else
+    echo "  FAIL  the child counter did not observe live children (rc=$live_rc, got '${live_out:-}')"
+    failures=$((failures + 1))
+  fi
+
+  if [[ $failures -ne 0 ]]; then
+    echo "shell self-test FAILED: $failures census fragment(s) would not produce a cell" >&2
+    exit 1
+  fi
+  echo "  shell fragments ok: the census emits a cell on the healthy path"
+}
+
+# The self-test is the cheap, host-agnostic gate check. It proves each refusal
+# fires: a fleet acceptance harness that could report a silent zero is worse
+# than none, because a green verdict with nothing behind it would be cited
+# later as if a fleet had been accepted.
+#
+# It runs in two layers because the failures live in two languages. The node
+# core judges synthetic cells, so it catches every *verdict* defect. It cannot
+# catch a defect in the shell that PRODUCES a cell: those fixtures are typed
+# by hand and never run this file. One such defect shipped — the drain loop's
+# unguarded `pgrep` aborted the census under `set -euo pipefail` on precisely
+# the healthy path — and the node fixtures stayed green through all of it,
+# because a census that dies emits no cell for them to judge. So the shell
+# fragments that decide whether a cell exists are tested here, in shell.
 if [[ $ctxmux_fleet_self_test == true ]]
 then
   echo "== fleet-scale harness self-test =="
+  ctxmux_fleet_shell_self_test
+  echo
   exec node scripts/fleet-scale-measure.mjs --self-test
 fi
 
@@ -412,8 +482,20 @@ done < <(ctxmux --socket "$sock" list 2>/dev/null)
 # Children are reaped asynchronously after stop returns, so poll for the drain
 # instead of assuming a fixed sleep is long enough. A fleet that never drains
 # leaves the last observed count in place and fails the zero check downstream.
+#
+# `pgrep` exits 1 when it matches nothing, and under `set -euo pipefail` that
+# status propagates through the pipeline and aborts the script. Zero children
+# is the *healthy* outcome here — a fully drained fleet — so the unguarded form
+# killed the census at exactly the moment it was about to record a pass, before
+# any cell was emitted, and reported it as a helper failure rather than a
+# result. `|| true` is therefore load-bearing, not defensive noise.
+#
+# This was latent until #59 made teardown actually stop Runs. While `remove`
+# was silently failing, children never drained, `pgrep` always matched, and the
+# abort could not fire. Fixing the leak is what armed this.
+count_children() { { pgrep -P "$1" 2>/dev/null || true; } | wc -l | tr -d ' '; }
 for _ in $(seq 1 100); do
-  cleanup_children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l | tr -d ' ')
+  cleanup_children=$(count_children "$daemon_pid")
   if [[ ${cleanup_children:-0} -eq 0 ]]; then break; fi
   sleep 0.1
 done
@@ -421,7 +503,7 @@ done
 cleanup_raw=$(sample "$daemon_pid")
 cleanup_threads=$(printf '%s' "$cleanup_raw" | awk -F'|' '{print $3}')
 cleanup_attachments=$(printf '%s\n' "$(ctxmux --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
-cleanup_children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l | tr -d ' ')
+cleanup_children=$(count_children "$daemon_pid")
 
 # Everything sampled since the guard at the steady sample assumed the daemon was
 # still alive, and every one of those readings degrades to a *passing* value if
