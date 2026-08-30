@@ -71,6 +71,19 @@ const OVERLAP_TIER = 128;
 /// the 512 and 2048 tiers fail for not exercising a ceiling they sit under.
 const DAEMON_ADMISSION_CAP = 4000;
 
+/// Wall-clock ceiling for enumerating the whole fleet, in milliseconds.
+///
+/// Fixed in advance rather than derived. Every other cost ceiling in this file
+/// is derived from observation because RSS and CPU legitimately depend on the
+/// host, but latency is the one dimension where deriving the bar would defeat
+/// the check: the regression this harness exists to catch (#49, List degrading
+/// past ~1000 Runs) shows up as a *rising* latency, and a ceiling derived from
+/// that rise ratifies it. Set two orders of magnitude above anything measured —
+/// the farm curve runs 8.2 ms at 128 to 26.5 ms at 4000, and tmux lists 300
+/// sessions in 8.1 ms — so it never fires on host noise, only on a stall a
+/// caller would feel.
+const LIST_LATENCY_CEILING_MS = 1000;
+
 /// Observation rounds per tier before a threshold may be derived.
 ///
 /// Three is the contract's own rule (deriveObservedMaxima requires exactly
@@ -434,12 +447,25 @@ function judgeCell(cell, ceilings, tier, mode) {
 }
 
 /// Flatten a census cell into the OBSERVED_FIELDS the ceilings are keyed by.
+///
+/// The `retained_output_bytes_per_run` key is the frozen contract's name and
+/// cannot change here: OBSERVED_FIELDS is hashed into every committed darwin
+/// baseline, so renaming it would rehash the measurement contract and invalidate
+/// budgets this harness deliberately never writes. The census-side field it
+/// reads is named for what it actually holds — total output produced over each
+/// Run's lifetime, from the monotonic `head=` counter — which is NOT the
+/// currently-retained bytes the 4 MiB per-Run and 1 GiB fleet-wide retention
+/// caps bound. The darwin gate measures the real quantity by summing replay
+/// lengths; this one cannot, because retained_bytes is not on the protocol wire.
+/// So the mapping is deliberate and lossy in a known direction: it grades a
+/// lifetime total against a ceiling derived from lifetime totals on the same
+/// host, which is a coherent cost check, and it is NOT evidence about retention.
 function readingsForCell(cell) {
   return {
     cpu_core_percent: cell.cpu_core_percent,
     peak_rss_kib: cell.peak_rss_kib,
     steady_rss_kib: cell.steady.rss_kib,
-    retained_output_bytes_per_run: cell.retained_output_bytes_per_run,
+    retained_output_bytes_per_run: cell.output_bytes_lifetime_per_run,
     rss_kib_per_run: cell.rss_kib_per_run,
     threads_per_run: cell.threads_per_run,
     fds_per_run: cell.fds_per_run,
@@ -563,7 +589,8 @@ function renderVerdict({ thresholds, receipt, root }) {
         list_latency_ms: cell.list_latency_ms ?? null,
         list_success: cell.list_success ?? null,
         admission_at_ceiling: cell.admission_at_ceiling ?? null,
-        aggregate_retained_bytes: cell.aggregate_retained_bytes ?? null,
+        aggregate_output_bytes_lifetime:
+          cell.aggregate_output_bytes_lifetime ?? null,
         pass:
           checks.every((entry) => entry.pass) &&
           judgeListBehaviour(cell, tier, mode).pass &&
@@ -607,6 +634,22 @@ function renderVerdict({ thresholds, receipt, root }) {
 function judgeListBehaviour(cell, tier, mode) {
   const success = cell.list_success;
   const latency = cell.list_latency_ms;
+  // A census whose daemon died partway reports zeros that all read as passing:
+  // no children to leak, no stat file so idle CPU computes as 0.000, and a
+  // failed List so the teardown loop stops nothing and counts no failures. That
+  // cell is not merely green, it outscores a healthy one. The census records
+  // liveness explicitly for exactly this reason, so a cell that does not carry
+  // the field is a cell whose zeros were never corroborated — absent fails the
+  // same as false, or an older receipt would slip through unexamined.
+  if (cell.daemon_alive_after_census !== true) {
+    return {
+      pass: false,
+      reason:
+        cell.daemon_alive_after_census === undefined
+          ? `tier ${tier} ${mode}: census did not record daemon liveness, so its zero readings are not evidence`
+          : `tier ${tier} ${mode}: the census daemon was dead after the census, so every reading in this cell describes a dead process`,
+    };
+  }
   // A teardown that could not stop its Runs invalidates every cleanup reading
   // in this cell, so it is reported here rather than left to be inferred from
   // a leak counter that would otherwise look like a product defect.
@@ -627,6 +670,20 @@ function judgeListBehaviour(cell, tier, mode) {
     return {
       pass: false,
       reason: `tier ${tier} ${mode}: List latency is not a finite non-negative number (${latency})`,
+    };
+  }
+  // Grading latency only for finiteness let the one regression this harness was
+  // built to catch pass: #49 was List degrading past ~1000 Runs, and a decay to
+  // whole seconds satisfies "is a number". A *derived* ceiling is wrong here for
+  // the reason leak ceilings were wrong — it would ratify whatever we measured.
+  // The bound is therefore fixed in advance and set where no healthy host lands:
+  // the farm's own curve runs 8.2 ms at 128 to 26.5 ms at 4000, and tmux at 300
+  // sessions lists in 8.1 ms, so a whole second is two orders of magnitude past
+  // anything observed while still being unambiguously a caller-visible stall.
+  if (latency > LIST_LATENCY_CEILING_MS) {
+    return {
+      pass: false,
+      reason: `tier ${tier} ${mode}: List took ${round(latency)} ms, past the ${LIST_LATENCY_CEILING_MS} ms ceiling — enumerating the fleet is a caller-visible stall`,
     };
   }
   return { pass: true, latency_ms: round(latency) };
@@ -710,19 +767,21 @@ function selfTest() {
   const goodCell = (overrides = {}) => ({
     cpu_core_percent: 1,
     peak_rss_kib: 10000,
+    output_bytes_lifetime_per_run: 0,
     retained_output_bytes_per_run: 0,
     rss_kib_per_run: 100,
     threads_per_run: 2,
     fds_per_run: 3,
     cleanup_live_children: 0,
     cleanup_attachments: 0,
+    daemon_alive_after_census: true,
     steady: { rss_kib: 9000 },
     baseline: { threads: 8 },
     cleanup: { threads: 8 },
     admitted_runs: 128,
     list_success: true,
     list_latency_ms: 5,
-    aggregate_retained_bytes: 0,
+    aggregate_output_bytes_lifetime: 0,
     admission_at_ceiling: {
       refused_cleanly: true,
       emfile: false,
@@ -970,6 +1029,51 @@ function selfTest() {
       "idle",
     );
     if (!verdict.pass) throw new Error(verdict.reason);
+  });
+
+  // The census daemon dying mid-run is indistinguishable from a perfect run by
+  // every other field: no children to leak, no stat file so idle CPU reads
+  // 0.000, and a failed List so nothing is stopped and no failure is counted.
+  // These two cases are what stop that cell from being the best-looking one in
+  // the receipt.
+  expectFailure("a census whose daemon died fails the tier", () => {
+    const verdict = judgeListBehaviour(
+      goodCell({ daemon_alive_after_census: false }),
+      2048,
+      "idle",
+    );
+    if (!verdict.pass) throw new Error(verdict.reason);
+  });
+
+  expectFailure("a cell that never recorded daemon liveness fails", () => {
+    const cell = goodCell();
+    delete cell.daemon_alive_after_census;
+    const verdict = judgeListBehaviour(cell, 2048, "idle");
+    if (!verdict.pass) throw new Error(verdict.reason);
+  });
+
+  // #49 was List degrading past ~1000 Runs. Grading latency for finiteness only
+  // meant a decay to whole seconds still passed, so the harness could not catch
+  // the regression it was built for.
+  expectFailure("a List that stalls for seconds fails the tier", () => {
+    const verdict = judgeListBehaviour(
+      goodCell({ list_latency_ms: 5000 }),
+      4000,
+      "idle",
+    );
+    if (!verdict.pass) throw new Error(verdict.reason);
+  });
+
+  // The ceiling must not be so tight that real farm readings trip it: the
+  // measured curve tops out at 26.5 ms at 4000 Runs.
+  expectSuccess("a realistic farm List latency still passes", () => {
+    const verdict = judgeListBehaviour(
+      goodCell({ list_latency_ms: 26.5 }),
+      4000,
+      "idle",
+    );
+    if (!verdict.pass) throw new Error(verdict.reason);
+    return `26.5 ms accepted under the ${LIST_LATENCY_CEILING_MS} ms ceiling`;
   });
 
   if (failures.length > 0) {

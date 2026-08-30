@@ -14,10 +14,15 @@
 # met.
 #
 # What it measures, per tier and for both idle and active Runs: fds_per_run,
-# idle cpu_core_percent, steady_rss_kib and rss_kib_per_run,
-# retained_output_bytes_per_run and the aggregate retained bytes, List latency
-# and success, and admission behaviour at the descriptor ceiling (which must
-# refuse cleanly with run_capacity and never hit EMFILE).
+# idle cpu_core_percent, steady_rss_kib and rss_kib_per_run, per-Run and
+# aggregate lifetime output bytes, List latency and success, whether the census
+# daemon was still alive at the end, and admission behaviour at the descriptor
+# ceiling (which must refuse cleanly with run_capacity and never hit EMFILE).
+#
+# It does NOT measure retention. The retention budget bounds bytes the daemon is
+# still holding; the only per-Run byte counter on the wire is monotonic lifetime
+# output, so the fleet-wide 1 GiB cap has no proof here until retained_bytes is
+# exposed by the protocol.
 #
 # Tiers: 128, 512, 2048, 4000. The 128 tier is load-bearing. It overlaps the
 # existing darwin gate, so the harness cross-checks the farm's 128 numbers
@@ -307,8 +312,22 @@ list_latency=$(awk "BEGIN{printf \"%.3f\", ($list_end - $list_start) * 1000}")
 list_success=false
 if [[ $list_ok == true && $list_count -ge $admitted ]]; then list_success=true; fi
 
-# Aggregate retained output bytes, summed from the head byte counter each Run
-# reports in its listing row.
+# Total output each Run has produced over its lifetime, summed from the head
+# byte counter in its listing row.
+#
+# This is deliberately NOT named "retained": `head=` is latest_output_bytes, a
+# cumulative counter that only ever climbs, whereas what the retention budget
+# bounds is OutputLog::retained_bytes — what the daemon is still holding right
+# now, capped per-Run at 4 MiB and fleet-wide at 1 GiB. A Run that streamed a
+# gigabyte and had it trimmed reports a gigabyte here while retaining almost
+# nothing. The two numbers diverge without limit as a fleet ages.
+#
+# The darwin gate measures the real quantity (it sums replay lengths per Run),
+# so the same field name previously described two different measurements in two
+# harnesses, with only this one being the wrong one. Naming it for what it is
+# keeps it from being graded against a retention ceiling it cannot satisfy the
+# meaning of. Proving the fleet-wide retention cap from here needs
+# retained_bytes on the wire, which the protocol does not carry today.
 aggregate_bytes=$(printf '%s\n' "$listing" | sed -n 's/.*head=\([0-9]*\).*/\1/p' | awk '{s += $1} END {print s + 0}')
 
 # The steady sample is the one every per-Run cost is derived from, so the
@@ -404,14 +423,29 @@ cleanup_threads=$(printf '%s' "$cleanup_raw" | awk -F'|' '{print $3}')
 cleanup_attachments=$(printf '%s\n' "$(ctxmux --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
 cleanup_children=$(pgrep -P "$daemon_pid" 2>/dev/null | wc -l | tr -d ' ')
 
+# Everything sampled since the guard at the steady sample assumed the daemon was
+# still alive, and every one of those readings degrades to a *passing* value if
+# it was not. A dead pid has no children, so `pgrep -P` reports zero leaked
+# children; its stat file is gone, so `cpu_ticks` falls back to 0 and idle CPU
+# computes as a perfect 0.000; `list` fails, so the teardown loop iterates zero
+# times and records zero stop failures. A daemon that died mid-census therefore
+# produces a cell that is not merely green but *better* than a healthy one.
+#
+# So liveness is recorded as a measurement in its own right rather than trusted.
+# The verdict must fail closed when it is false or absent — an older receipt
+# that predates this field is a receipt whose zeros were never corroborated.
+daemon_alive_after_census=true
+kill -0 "$daemon_pid" 2>/dev/null || daemon_alive_after_census=false
+
 peak_rss=$steady_rss
 if [[ $baseline_rss -gt $peak_rss ]]; then peak_rss=$baseline_rss; fi
 
 printf '{'
 printf '"admitted_runs":%s,' "$admitted"
+printf '"daemon_alive_after_census":%s,' "$daemon_alive_after_census"
 printf '"cpu_core_percent":%s,' "$cpu_core_percent"
 printf '"peak_rss_kib":%s,' "$peak_rss"
-printf '"retained_output_bytes_per_run":%s,' "$retained_per_run"
+printf '"output_bytes_lifetime_per_run":%s,' "$retained_per_run"
 printf '"rss_kib_per_run":%s,' "$rss_per_run"
 printf '"threads_per_run":%s,' "$threads_per_run"
 printf '"fds_per_run":%s,' "$fds_per_run"
@@ -423,7 +457,7 @@ printf '"baseline":{"threads":%s},' "$baseline_threads"
 printf '"cleanup":{"threads":%s},' "$cleanup_threads"
 printf '"list_latency_ms":%s,' "$list_latency"
 printf '"list_success":%s,' "$list_success"
-printf '"aggregate_retained_bytes":%s,' "$aggregate_bytes"
+printf '"aggregate_output_bytes_lifetime":%s,' "$aggregate_bytes"
 if [[ $refused_clean -ge 1 || $emfile -eq 1 ]]; then
   refused_bool=false
   if [[ $refused_clean -ge 1 ]]; then refused_bool=true; fi
