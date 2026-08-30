@@ -589,6 +589,23 @@ function renderVerdict({ thresholds, receipt, root }) {
         list_latency_ms: cell.list_latency_ms ?? null,
         list_success: cell.list_success ?? null,
         admission_at_ceiling: cell.admission_at_ceiling ?? null,
+        // Reported, deliberately NOT judged, and the distinction matters.
+        //
+        // This is the sum of `head=` across the fleet: each Run's cumulative
+        // lifetime output counter. It is not retention. `OutputLog` evicts
+        // chunks past OUTPUT_RETENTION_BYTES and the fleet-wide budget trims
+        // further, so retained bytes can fall while this only ever rises.
+        // Grading it against the 1 GiB cap of #47 would fail a healthy daemon
+        // as soon as its Runs had *emitted* a gigabyte, whenever emitted.
+        //
+        // So #47's daemon-wide cap has no proof at farm scale, and this field
+        // is not it. The number that would prove it — OutputLog::retained_bytes
+        // — is computed in the daemon but absent from the protocol, so the
+        // census cannot read it (the darwin gate reaches it only by replaying
+        // every Run, which does not survive thousands of Runs). Closing the
+        // gap needs the wire change first; until then this stays a reported
+        // observation, because a check that grades the wrong quantity is worse
+        // than a documented hole.
         aggregate_output_bytes_lifetime:
           cell.aggregate_output_bytes_lifetime ?? null,
         pass:
