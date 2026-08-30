@@ -13,8 +13,8 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_si
 use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, ForkFidelity, ForkPlan, PROTOCOL_VERSION,
-    RecoverableStop, RunEvent, RunId, RunInfo, RunSpec, RunState, StopDisposition,
-    StopOperationKey, TerminalSize,
+    RecoverableStop, RunBackendKind, RunEvent, RunId, RunInfo, RunSpec, RunState, RunSummary,
+    StopDisposition, StopOperationKey, TerminalSize,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
@@ -119,8 +119,10 @@ async fn run() -> Result<(), String> {
         "fork" => fork(&client, args).await?,
         "list" => {
             ensure_empty(&args)?;
+            // The client pages internally, so the CLI keeps its whole-fleet
+            // listing without knowing about cursors.
             for run in client.list().await.map_err(|error| error.to_string())? {
-                print_run(&run);
+                print_summary(&run);
             }
         }
         "status" => {
@@ -688,15 +690,43 @@ fn ensure_empty(args: &[OsString]) -> Result<(), String> {
     }
 }
 
-fn print_run(run: &RunInfo) {
-    let state = match &run.state {
+/// Render a Run's lifecycle state as one operator-facing token.
+fn format_run_state(state: &RunState) -> String {
+    match state {
         RunState::Running => "running".to_owned(),
         RunState::Exited { code, signal } => match signal {
             Some(signal) => format!("exited({code}, {signal})"),
             None => format!("exited({code})"),
         },
         RunState::Interrupted { reason } => format!("interrupted({reason:?})"),
+    }
+}
+
+/// Print one thin `list` row.
+///
+/// A `list` page carries [`RunSummary`] values, not full `RunInfo`, so this
+/// deliberately omits lineage and the durable head that `status` still shows —
+/// those live on the fat per-Run record. It keeps the run id first so scripts
+/// and the CLI smoke test can still find a Run by grepping the listing.
+fn print_summary(run: &RunSummary) {
+    let backend = match run.backend {
+        RunBackendKind::Native => "native",
+        RunBackendKind::Tmux => "tmux",
     };
+    println!(
+        "{}\t{}\tpid={}\tbackend={}\tattachments={}\thead={}",
+        run.id,
+        format_run_state(&run.state),
+        run.pid
+            .map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+        backend,
+        run.attachments,
+        run.latest_output_bytes,
+    );
+}
+
+fn print_run(run: &RunInfo) {
+    let state = format_run_state(&run.state);
     let lineage = run.lineage.as_ref().map_or_else(
         || "root".to_owned(),
         |lineage| {

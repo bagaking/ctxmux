@@ -18,9 +18,9 @@ use ctxmux_protocol::{
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, DaemonInstanceId,
     ForkPlan, FrameError, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
     ProtocolError, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RecoverableInput, RecoverableStop,
-    Request, Response, RunEvent, RunId, RunInfo, RunSignal, RunSpec, RuntimeCapabilityVersionError,
-    RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey, TerminalSize, TmuxPaneInfo,
-    decode_frame, encode_frame, validate_runtime_capability_version,
+    Request, Response, RunEvent, RunId, RunInfo, RunSignal, RunSpec, RunSummary,
+    RuntimeCapabilityVersionError, RuntimeIdentity, ServerFrame, StopDisposition, StopOperationKey,
+    TerminalSize, TmuxPaneInfo, decode_frame, encode_frame, validate_runtime_capability_version,
 };
 use futures_util::{SinkExt, StreamExt};
 use thiserror::Error;
@@ -31,6 +31,16 @@ type Wire = Framed<UnixStream, LinesCodec>;
 
 /// Exact Runtime capability versions required before business dispatch.
 pub type RuntimeCapabilityRequirements = BTreeMap<String, u64>;
+
+/// One page of retained Run summaries returned by [`Client::list_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPage {
+    /// Thin Run rows for this page, ordered by ascending [`RunId`].
+    pub runs: Vec<RunSummary>,
+    /// Cursor to continue from: `Some(id)` when more Runs may follow, `None` at
+    /// the end of the fleet.
+    pub next_cursor: Option<RunId>,
+}
 
 /// Failure observed at the public Rust client boundary.
 #[derive(Debug, Error)]
@@ -486,15 +496,58 @@ impl Client {
         }
     }
 
-    /// List Runs retained by the daemon.
+    /// Enumerate every Run retained by the daemon, transparently paging.
+    ///
+    /// This preserves the "give me everything" contract callers had before
+    /// enumeration was paged: it walks the cursor internally and concatenates the
+    /// pages, so a caller that just wants the whole fleet keeps one call. The
+    /// rows are thin [`RunSummary`] values (identity, backend kind, pid, state,
+    /// output bytes, attachments); a caller that needs a Run's launch spec,
+    /// lineage, or capabilities reads its full [`RunInfo`] with [`Client::status`].
+    ///
+    /// Because the walk spans several requests, it is a best-effort snapshot, not
+    /// an atomic one: a Run that exists for the whole walk appears exactly once,
+    /// but Runs created or removed while paging may or may not appear. Each page
+    /// crosses its own short-lived connection.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError`] when the daemon cannot be reached or returns an
     /// invalid response.
-    pub async fn list(&self) -> Result<Vec<RunInfo>, ClientError> {
-        match self.request(Request::List).await? {
-            Response::Runs { runs } => Ok(runs),
+    pub async fn list(&self) -> Result<Vec<RunSummary>, ClientError> {
+        let mut runs = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = self.list_page(cursor, None).await?;
+            runs.extend(page.runs);
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(runs),
+            }
+        }
+    }
+
+    /// Fetch one page of retained Run summaries.
+    ///
+    /// `after` is an exclusive [`RunId`] cursor (`None` starts at the first Run)
+    /// and `limit` requests a page size the daemon clamps to its maximum (`None`
+    /// or `0` means the clamped maximum). The returned [`RunPage`] carries the
+    /// rows and a `next_cursor`: `Some(id)` means more Runs may follow — reissue
+    /// with `after: Some(id)` — and `None` means this page reached the end of the
+    /// fleet. Prefer [`Client::list`] for a whole-fleet snapshot; reach for this
+    /// when a caller wants to bound memory, show progress, or stop early.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the daemon cannot be reached or returns an
+    /// invalid response.
+    pub async fn list_page(
+        &self,
+        after: Option<RunId>,
+        limit: Option<u32>,
+    ) -> Result<RunPage, ClientError> {
+        match self.request(Request::List { after, limit }).await? {
+            Response::Runs { runs, next_cursor } => Ok(RunPage { runs, next_cursor }),
             _ => Err(ClientError::UnexpectedFrame("expected runs response")),
         }
     }

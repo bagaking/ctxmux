@@ -15,7 +15,8 @@ use tokio_util::codec::{Framed, LinesCodec};
 use super::AttachmentHookPoint;
 use super::{
     ConnectionError, ControlResult, LiveEventCursor, Run, RunManager, UpgradeRequestAdmission,
-    UpgradeRequestPermit, control_not_applied, invalid_request, receive, send, upgrade_retry_error,
+    UpgradeRequestPermit, control_not_applied, invalid_request, receive, send, send_capped,
+    upgrade_retry_error,
 };
 
 const MAX_PENDING_STOP_RESULTS: usize = 64;
@@ -59,7 +60,14 @@ pub(super) async fn handle_pinned(
     let snapshot = run.attachment_snapshot(after_byte);
     let (header, replay_chunks, terminal_state) = split_snapshot(snapshot);
     let mut sent_through_byte = header.replay.latest_output_bytes;
-    send(&mut wire, &ServerFrame::Attached { snapshot: header }).await?;
+    // The attachment header embeds a full RunInfo, whose RunSpec is
+    // caller-controlled and unbounded. If it cannot be framed, the client gets a
+    // typed ResponseTooLarge error rather than a silently dropped socket, and we
+    // stop before streaming replay onto a connection whose header never landed.
+    if !send_capped(&mut wire, &ServerFrame::Attached { snapshot: header }).await? {
+        drop(request_permit);
+        return Ok(());
+    }
     send_replay(&mut wire, replay_chunks).await?;
     if let Some(response) = initial_response {
         send(&mut wire, &ServerFrame::Response { response }).await?;
