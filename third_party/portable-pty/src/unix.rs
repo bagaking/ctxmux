@@ -52,22 +52,12 @@ fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
         return Err(Error::new(io::Error::last_os_error()).context("failed to openpty"));
     }
 
-    // LOCAL FORK. Upstream resolves the tty name here, on every openpty, with
-    // `ttyname_r` on the slave. That call walks /dev looking for a device that
-    // matches the fd's rdev, so it costs more than the openpty it follows
-    // (0.9ms vs 0.4ms, measured) and grows with the number of open ptys
-    // (1.0ms at 50, 2.1ms at 400) -- the same shape as the `close_random_fds`
-    // walk this fork already fixes. The daemon never asks for the name, so it
-    // paid the largest single item on its Run-creation path for a string it
-    // discards. Resolved lazily in `tty_name()` instead, from the master with
-    // `ptsname`, which is a pointer read out of the kernel's own pty table:
-    // 0.01ms, flat, and byte-identical to the eager answer in 300/300 pairs.
-    // `ptsname` also keeps working after the slave fd is closed, which is what
-    // every spawn does, so the deferral does not narrow the window in which the
-    // name is available.
+    let tty_name = tty_name(slave);
+
     let master = UnixMasterPty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(master) }),
         took_writer: RefCell::new(false),
+        tty_name,
     };
     let slave = UnixSlavePty {
         fd: PtyFd(unsafe { FileDescriptor::from_raw_fd(slave) }),
@@ -121,20 +111,31 @@ impl Read for PtyFd {
     }
 }
 
-/// Name of the slave device behind an open pty master.
-///
-/// LOCAL FORK: replaces upstream's `ttyname_r(slave)`. See the comment in
-/// `openpty` for why, and for the equivalence measurement.
-fn tty_name(master_fd: RawFd) -> Option<PathBuf> {
-    // Safety: `ptsname` returns a pointer to a static buffer owned by libc,
-    // valid until the next call on this thread. It is copied out before
-    // returning, and no other `ptsname` call can interleave on this thread.
-    let name = unsafe { libc::ptsname(master_fd) };
-    if name.is_null() {
-        return None;
+fn tty_name(fd: RawFd) -> Option<PathBuf> {
+    let mut buf = vec![0 as std::ffi::c_char; 128];
+
+    loop {
+        let res = unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) };
+
+        if res == libc::ERANGE {
+            if buf.len() > 64 * 1024 {
+                // on macOS, if the buf is "too big", ttyname_r can
+                // return ERANGE, even though that is supposed to
+                // indicate buf is "too small".
+                return None;
+            }
+            buf.resize(buf.len() * 2, 0 as std::ffi::c_char);
+            continue;
+        }
+
+        return if res == 0 {
+            let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+            let osstr = OsStr::from_bytes(cstr.to_bytes());
+            Some(PathBuf::from(osstr))
+        } else {
+            None
+        };
     }
-    let cstr = unsafe { std::ffi::CStr::from_ptr(name) };
-    Some(PathBuf::from(OsStr::from_bytes(cstr.to_bytes())))
 }
 
 /// On Big Sur, Cocoa leaks various file descriptors to child processes,
@@ -363,6 +364,7 @@ impl PtyFd {
 struct UnixMasterPty {
     fd: PtyFd,
     took_writer: RefCell<bool>,
+    tty_name: Option<PathBuf>,
 }
 
 /// Represents the slave end of a pty.
@@ -427,7 +429,7 @@ impl MasterPty for UnixMasterPty {
     }
 
     fn tty_name(&self) -> Option<PathBuf> {
-        tty_name(self.fd.0.as_raw_fd())
+        self.tty_name.clone()
     }
 
     fn process_group_leader(&self) -> Option<libc::pid_t> {
