@@ -7,7 +7,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -99,7 +99,7 @@ const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 /// Every other command (start, finalize, shutdown) still blocks here. Those are
 /// per-Run lifecycle transitions on their own callers, not the daemon-wide
 /// output reader, so blocking them cannot stall the fleet.
-const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
+pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
@@ -327,6 +327,20 @@ pub(crate) struct Persistence {
 
 struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
+    /// Appends handed to `sender` that the actor has not yet dequeued.
+    ///
+    /// The channel itself cannot be asked how full it is, and finding out by
+    /// sending is exactly the wrong order: rendering the replay is the expensive
+    /// half, so a caller that discovers fullness from a failed `try_send` has
+    /// already paid for a message it then throws away. Under sustained overload
+    /// that is *every* push, which is why fixing the catch-up render alone left
+    /// the fleet wedged (512 x 40/s went from 199 to 325 admitted, not to 512).
+    ///
+    /// So the depth is tracked explicitly: incremented before a send, decremented
+    /// by the actor as it dequeues. It is advisory — it can be stale in either
+    /// direction, and `try_send` remains the real admission decision — but it is
+    /// enough to skip the render when the queue is visibly saturated.
+    queue_depth: Arc<AtomicUsize>,
     failure: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
@@ -350,6 +364,12 @@ struct PersistenceTestHooks {
     /// Stalls the actor inside an append so a test can hold it there while the
     /// queue fills, standing in for a slow fsync.
     append_barrier: Mutex<Option<FinalizeTestBarrier>>,
+    /// Records the SHAPE of the next offered append — where it starts and how
+    /// many bytes it carries. A test that re-derives the expected replay proves
+    /// nothing (it recomputes the very expression under test); observing what
+    /// the caller actually handed over is what catches a whole-log recopy.
+    #[cfg(test)]
+    observed_append: Mutex<Option<ObservedAppend>>,
     startup_batch_wal_bytes: Mutex<Vec<u64>>,
     startup_fail_after_commits: AtomicU64,
     startup_over_budget_attempts: AtomicU64,
@@ -536,6 +556,30 @@ struct FinalizeTestBarrier {
     release: mpsc::Receiver<()>,
 }
 
+/// What one offered append actually carried, captured at the moment the caller
+/// handed it over.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ObservedAppend {
+    /// Start byte of the first chunk, or `None` for an empty replay.
+    pub(crate) first_byte: Option<u64>,
+    /// Total chunk bytes — the copy this offer cost.
+    pub(crate) payload_bytes: usize,
+}
+
+/// Reads back the append offer recorded since this observer was created.
+#[cfg(test)]
+pub(crate) struct AppendObserver {
+    persistence: Persistence,
+}
+
+#[cfg(test)]
+impl AppendObserver {
+    pub(crate) fn take(&self) -> Option<ObservedAppend> {
+        mutex_lock(&self.persistence.inner.test_hooks.observed_append).take()
+    }
+}
+
 impl Drop for PersistenceInner {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -551,6 +595,12 @@ pub(crate) struct PersistentRun {
     persistence: Persistence,
     durable_head: Arc<AtomicU64>,
     metadata_bytes: Arc<AtomicU64>,
+    /// Set when an `append` was refused, cleared once a catch-up has been
+    /// rendered to replace it. Lives here rather than on `Run` because it is
+    /// meaningless without the `durable_head` it pairs with: both are cloned
+    /// into every handle for one Run's binding and both die with it, so a
+    /// rebind cannot leave a stale "owed a catch-up" flag behind.
+    catch_up_owed: Arc<AtomicBool>,
 }
 
 pub(crate) struct CommittedStart {
@@ -571,18 +621,58 @@ impl PersistentRun {
         self.durable_head.load(Ordering::Acquire)
     }
 
+    /// The byte offset the next replay must start at.
+    ///
+    /// Normally this is `head`, the caller's own end-of-log: the previous append
+    /// was accepted, so only the newest bytes are outstanding and the render is
+    /// one chunk. After a refusal it is [`Self::durable_head`] instead, so the
+    /// replay carries every byte the dropped append would have — which is the
+    /// only thing that keeps a drop from becoming a forward gap.
+    ///
+    /// Consuming the flag here (rather than after a successful send) is
+    /// deliberate: the returned offset is a promise about the replay the caller
+    /// is ABOUT to render. If that send is then refused, `append` re-arms the
+    /// flag, so the debt is never dropped and never double-counted.
+    pub(crate) fn next_replay_start(&self, head: u64) -> u64 {
+        if self.catch_up_owed.swap(false, Ordering::AcqRel) {
+            self.durable_head()
+        } else {
+            head
+        }
+    }
+
     pub(crate) fn metadata_bytes_owner(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.metadata_bytes)
     }
 
     /// Enqueue durable output for one Run, dropping the request rather than
-    /// waiting when the actor is behind.
+    /// waiting when the actor is behind. Returns whether the request was
+    /// accepted, so the caller knows which replay to render NEXT time.
     ///
-    /// `replay` MUST be rendered from [`Self::durable_head`], not from the bytes
-    /// of the push that triggered it. That is what makes dropping safe: the
-    /// watermark only advances after a commit, so a dropped append leaves it
-    /// where it was and the next push re-renders a catch-up that still starts
-    /// exactly at `durable_head`. Nothing is lost and no gap is ever observable.
+    /// `replay` must cover every byte from the last ACCEPTED append onward. The
+    /// cheap case is the delta for this push alone, and it is what the caller
+    /// sends while this method keeps returning `true`: the actor stitches a
+    /// chain of queued deltas together against `expected_heads`, a pending
+    /// watermark that advances per queued append rather than per commit, so
+    /// contiguity holds even when the queue is deep and nothing has been
+    /// committed yet.
+    ///
+    /// The moment this returns `false` that chain is broken, and the caller
+    /// MUST render the next replay from [`Self::durable_head`] instead. That
+    /// catch-up is what makes dropping safe: the watermark only advances after a
+    /// commit, so a dropped append leaves it where it was and the catch-up still
+    /// starts exactly at `durable_head`. Nothing is lost and no gap is ever
+    /// observable.
+    ///
+    /// Rendering the catch-up UNCONDITIONALLY is not a safe conservative choice
+    /// — it is a fleet-scale wedge. `OutputLog::replay` copies every retained
+    /// chunk above the watermark (`retained_after` ends in `to_vec`), so once
+    /// the actor lags at all, every subsequent push copies `retained - durable`
+    /// bytes, bounded only by `OUTPUT_RETENTION_BYTES`. That cost lands inline on
+    /// the one thread described below, which makes the lag worse, which makes
+    /// the next copy bigger. Measured on 512 Runs x 40 chunks/s: admission
+    /// stalled at 211 Runs with the owner thread at 97.4% USER time, against
+    /// 512/512 admitted for the same load with persistence off.
     ///
     /// A blocking send here would stall the whole fleet. Every native Run's
     /// output is read by ONE daemon-wide thread (`native_runtime::owner_main`),
@@ -597,22 +687,79 @@ impl PersistentRun {
     /// commits more bytes per fsync. Pressure degrades into fewer, larger
     /// writes rather than into a stalled fleet.
     ///
-    /// Sending a delta instead would be worse than lossy. `append_replay`
+    /// Sending a delta after a DROP would be worse than lossy. `append_replay`
     /// rejects a forward gap outright, and that error latches persistence off
     /// daemon-wide via `remember_failure` — so a drop would poison durability
-    /// for every Run at exactly the moment the disk is under pressure.
-    pub(crate) fn append(&self, id: RunId, replay: OutputReplay) {
-        if mutex_lock(&self.persistence.inner.failure).is_some() {
-            return;
+    /// for every Run at exactly the moment the disk is under pressure. That is
+    /// why the return value must be honoured rather than ignored.
+    #[must_use = "a refused append means the next replay must be a catch-up from durable_head"]
+    pub(crate) fn append(&self, id: RunId, replay: OutputReplay) -> bool {
+        // Record the offer's shape BEFORE anything can consume it, and before
+        // the failure short-circuit, so a test sees exactly what the caller
+        // chose to render.
+        #[cfg(test)]
+        {
+            *mutex_lock(&self.persistence.inner.test_hooks.observed_append) = Some(ObservedAppend {
+                first_byte: replay.chunks.first().map(|chunk| chunk.start_byte),
+                payload_bytes: replay.chunks.iter().map(|chunk| chunk.data.len()).sum(),
+            });
         }
-        // `try_send` rather than `send`: see above. Both error arms are correct
-        // to swallow — `Full` is absorbed by the next catch-up, and
-        // `Disconnected` means the actor is gone, which `failure` already owns.
-        let _ = self.persistence.inner.sender.try_send(Command::Append {
-            id,
-            replay,
-            durable_head: Arc::clone(&self.durable_head),
-        });
+        if mutex_lock(&self.persistence.inner.failure).is_some() {
+            // Persistence is already off; no future replay can help, so report
+            // acceptance rather than making the caller render catch-ups forever.
+            return true;
+        }
+        // `try_send` rather than `send`: see above. `Full` is absorbed by the
+        // next catch-up, which re-arming `catch_up_owed` is what schedules.
+        // `Disconnected` means the actor is gone, which `failure` already owns —
+        // it arms the flag too, which is merely a wasted render on a dead path,
+        // never a correctness problem.
+        let accepted = self
+            .persistence
+            .inner
+            .sender
+            .try_send(Command::Append {
+                id,
+                replay,
+                durable_head: Arc::clone(&self.durable_head),
+            })
+            .is_ok();
+        if accepted {
+            self.persistence
+                .inner
+                .queue_depth
+                .fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.catch_up_owed.store(true, Ordering::Release);
+        }
+        accepted
+    }
+
+    /// Whether the queue has visible room, checked BEFORE rendering a replay.
+    ///
+    /// Rendering is the expensive half of an append, so learning that the queue
+    /// is full from a failed `try_send` is learning it one full render too late.
+    /// Under sustained overload every push fails that way, and the reactor
+    /// thread spends all its time building messages it immediately discards:
+    /// that is why bounding the render size alone moved 512 x 40/s from 199 to
+    /// only 325 admitted instead of curing it.
+    ///
+    /// This is advisory, not an admission decision. The counter can lag the
+    /// actor in either direction, so `try_send` still decides — a false "has
+    /// room" merely costs the render we would have paid anyway, and a false
+    /// "full" skips one append that the next push's catch-up re-sends. Neither
+    /// can lose bytes, because skipping arms `catch_up_owed` exactly as a
+    /// refusal does.
+    pub(crate) fn queue_has_room(&self) -> bool {
+        self.persistence.inner.queue_depth.load(Ordering::Acquire) < PERSISTENCE_QUEUE_CAPACITY
+    }
+
+    /// Give up on this push without rendering, arming the next catch-up.
+    ///
+    /// The counterpart to `queue_has_room` returning false: the bytes are still
+    /// owed, so the debt is recorded exactly as a refused `append` records it.
+    pub(crate) fn defer_append(&self) {
+        self.catch_up_owed.store(true, Ordering::Release);
     }
 
     pub(crate) fn finalize(
@@ -734,6 +881,8 @@ impl Persistence {
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
         let (init_tx, init_rx) = mpsc::sync_channel(0);
+        let queue_depth = Arc::new(AtomicUsize::new(0));
+        let actor_queue_depth = Arc::clone(&queue_depth);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -748,6 +897,7 @@ impl Persistence {
                     admission_limits,
                     handoff,
                     &command_rx,
+                    &actor_queue_depth,
                     &init_tx,
                     &actor_failure,
                     &actor_shutdown,
@@ -770,6 +920,7 @@ impl Persistence {
         let persistence = Self {
             inner: Arc::new(PersistenceInner {
                 sender: command_tx,
+                queue_depth,
                 failure,
                 shutdown,
                 join: Mutex::new(Some(join)),
@@ -874,6 +1025,10 @@ impl Persistence {
                     persistence: self.clone(),
                     durable_head: Arc::new(AtomicU64::new(0)),
                     metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
+                    // A fresh Run starts at byte 0 with an empty log, so its
+                    // first delta already begins at the watermark and no
+                    // catch-up is owed.
+                    catch_up_owed: Arc::new(AtomicBool::new(false)),
                 }),
                 decision: Some(decision_tx),
                 completion: completion_rx,
@@ -995,6 +1150,15 @@ impl Persistence {
         (reached_rx, release_tx)
     }
 
+    /// Clear any recorded offer and return a handle that reads the next one.
+    #[cfg(test)]
+    pub(crate) fn capture_next_append_payload(&self) -> AppendObserver {
+        *mutex_lock(&self.inner.test_hooks.observed_append) = None;
+        AppendObserver {
+            persistence: self.clone(),
+        }
+    }
+
     #[cfg(test)]
     fn fail_next_append_as_disk_full(&self) {
         assert!(
@@ -1095,6 +1259,12 @@ impl Persistence {
             persistence: self.clone(),
             durable_head: Arc::new(AtomicU64::new(durable_head)),
             metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
+            // A recovered Run starts OWING a catch-up. Its in-memory log may
+            // already hold bytes above the recovered watermark (a rebind after
+            // the actor was replaced, say), and a delta would declare those
+            // bytes durable when they are not. Paying one catch-up on the first
+            // push is cheap; guessing wrong here is a permanent gap.
+            catch_up_owed: Arc::new(AtomicBool::new(true)),
         }
     }
 }
@@ -1275,6 +1445,7 @@ fn actor_main(
     admission_limits: AdmissionLimits,
     handoff: Option<HandoffHint>,
     receiver: &mpsc::Receiver<Command>,
+    queue_depth: &AtomicUsize,
     init: &mpsc::SyncSender<ActorInit>,
     failure: &Mutex<Option<String>>,
     shutdown: &AtomicBool,
@@ -1369,6 +1540,10 @@ fn actor_main(
             } => {
                 #[cfg(test)]
                 pause_before_append(test_hooks);
+                // One `Append` has left the channel. Decrement here rather than
+                // at the two dequeue sites above so the counter tracks appends
+                // only — a `StageStart` or `RemoveTerminal` never incremented it.
+                queue_depth.fetch_sub(1, Ordering::AcqRel);
                 let mut batch = vec![(id, replay, durable_head)];
                 let mut payload = replay_payload(&batch[0].1);
                 while payload < MAX_TRANSACTION_PAYLOAD_BYTES {
@@ -1380,6 +1555,7 @@ fn actor_main(
                         }) if payload.saturating_add(replay_payload(&replay))
                             <= MAX_TRANSACTION_PAYLOAD_BYTES =>
                         {
+                            queue_depth.fetch_sub(1, Ordering::AcqRel);
                             payload = payload.saturating_add(replay_payload(&replay));
                             batch.push((id, replay, durable_head));
                         }
@@ -4749,6 +4925,23 @@ mod tests {
     /// ceiling.
     const EVICTION_TEST_CEILING: usize = 128;
 
+    /// Assert an `append` was queued.
+    ///
+    /// Every fixture append below runs against an otherwise idle actor, so a
+    /// refusal there is a broken fixture, not the behavior under test — and a
+    /// silently dropped fixture append would leave the *next* assertion reading
+    /// a log that was never written, which reads as a product bug. The one
+    /// place a refusal is expected is the queue-saturation loop, which ignores
+    /// the result explicitly.
+    #[track_caller]
+    fn expect_queued(accepted: bool) {
+        assert!(
+            accepted,
+            "the persistence queue refused a fixture append; the fixture, not \
+             the code under test, is at fault"
+        );
+    }
+
     /// The eviction fixtures' explicit serving admission limits: a small row
     /// ceiling with the production metadata budget.
     const EVICTION_TEST_LIMITS: AdmissionLimits = AdmissionLimits {
@@ -5417,7 +5610,7 @@ mod tests {
             .expect("insert append DiskFull fixture");
         let first_replay = replay(vec![chunk(0, b"survives DiskFull")]);
         persistence.fail_next_append_as_disk_full();
-        durable.append(first.id, first_replay.clone());
+        expect_queued(durable.append(first.id, first_replay.clone()));
         durable.finalize(first.id, 42, first_replay.clone(), exited_state());
 
         assert!(!persistence.is_failed());
@@ -5488,7 +5681,7 @@ mod tests {
             .expect("insert SQLite I/O error fixture Run");
         let output = replay(vec![chunk(0, b"must not be acknowledged")]);
         persistence.fail_next_append_as_io_error();
-        durable.append(first.id, output);
+        expect_queued(durable.append(first.id, output));
 
         let error = persistence
             .barrier()
@@ -5747,7 +5940,7 @@ mod tests {
                     .insert_start(&test_operation_key(info.id), &info)
                     .expect("insert corruption fixture Run");
                 let payload = replay(vec![chunk(0, &[0x5a_u8; 2048])]);
-                durable.append(info.id, payload.clone());
+                expect_queued(durable.append(info.id, payload.clone()));
                 durable.finalize(info.id, 7, payload, exited_state());
             }
             persistence.assert_exclusive_owner();
@@ -5911,7 +6104,7 @@ mod tests {
         // Step 1: one write-side I/O failure, the shape ENOSPC takes when the
         // failing write lands on the WAL rather than on the database file.
         persistence.fail_next_append_as_io_failure(rusqlite::ffi::SQLITE_IOERR_WRITE);
-        durable.append(first.id, first_replay.clone());
+        expect_queued(durable.append(first.id, first_replay.clone()));
         durable.finalize(first.id, 42, first_replay.clone(), exited_state());
 
         // Step 2: the actor is not latched, and the retried append committed.
@@ -5976,7 +6169,7 @@ mod tests {
             .insert_start(&test_operation_key(info.id), &info)
             .expect("insert replay-idempotence fixture");
         let committed = replay(vec![chunk(0, b"committed once")]);
-        durable.append(info.id, committed.clone());
+        expect_queued(durable.append(info.id, committed.clone()));
         persistence.barrier().expect("first append commits");
         assert!(!persistence.is_failed());
         let head_after_first = durable.durable_head();
@@ -5984,7 +6177,7 @@ mod tests {
 
         // Re-submit the identical append, exactly as a retry after an uncertain
         // commit would. It must be accepted as an already-durable no-op.
-        durable.append(info.id, committed.clone());
+        expect_queued(durable.append(info.id, committed.clone()));
         persistence
             .barrier()
             .expect("a replayed append is a verified no-op, not a commit failure");
@@ -6042,7 +6235,7 @@ mod tests {
         assert!(rejection.is_capacity());
 
         let first_replay = replay(vec![chunk(0, b"first")]);
-        first_durable.append(first.id, first_replay.clone());
+        expect_queued(first_durable.append(first.id, first_replay.clone()));
         first_durable.finalize(first.id, 42, first_replay, exited_state());
         assert_eq!(first_durable.durable_head(), 5);
 
@@ -6101,7 +6294,7 @@ mod tests {
             .insert_start(&first_key, &first)
             .expect("insert candidate");
         let first_replay = replay(vec![chunk(0, b"retained")]);
-        first_durable.append(first.id, first_replay.clone());
+        expect_queued(first_durable.append(first.id, first_replay.clone()));
         first_durable.finalize(first.id, 77, first_replay, exited_state());
 
         let replacement = running_info(RunId::new());
@@ -6149,8 +6342,8 @@ mod tests {
         let durable = persistence
             .insert_start(&test_operation_key(first.id), &first)
             .expect("insert fatal fixture record");
-        durable.append(first.id, replay(vec![chunk(0, b"committed")]));
-        durable.append(first.id, replay(vec![chunk(0, b"conflict")]));
+        expect_queued(durable.append(first.id, replay(vec![chunk(0, b"committed")])));
+        expect_queued(durable.append(first.id, replay(vec![chunk(0, b"conflict")])));
 
         let later = running_info(RunId::new());
         let Err(error) = persistence.insert_start(&test_operation_key(later.id), &later) else {
@@ -6372,7 +6565,7 @@ mod tests {
                 } else {
                     replay(Vec::new())
                 };
-                durable.append(id, retained.clone());
+                expect_queued(durable.append(id, retained.clone()));
                 durable.finalize(id, 42, retained, exited_state());
             }
             drop(durable);
@@ -6700,7 +6893,7 @@ mod tests {
                 // becomes the live handed-off Run once we reopen with a hint.
                 live_id = Some(id);
             } else {
-                durable.append(id, replay(Vec::new()));
+                expect_queued(durable.append(id, replay(Vec::new())));
                 durable.finalize(id, 42, replay(Vec::new()), exited_state());
             }
             drop(durable);
@@ -6842,7 +7035,7 @@ mod tests {
         // Hold the actor inside its first append so the queue backs up behind
         // it, standing in for a slow fsync.
         let (reached, release) = persistence.pause_next_append();
-        durable.append(info.id, replay(vec![chunk(0, b"first")]));
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"first")])));
         reached.recv().expect("the actor reaches the append barrier");
 
         // Fill the queue past its depth from another thread, so a send that
@@ -6858,7 +7051,8 @@ mod tests {
             .spawn(move || {
                 let stalled = replay(vec![chunk(0, b"first")]);
                 for _ in 0..(PERSISTENCE_QUEUE_CAPACITY * 2) {
-                    filler.append(filler_id, stalled.clone());
+                    // A refusal is the POINT here: this loop exists to saturate the queue.
+                    let _ = filler.append(filler_id, stalled.clone());
                 }
                 let _ = filled_tx.send(());
             })
@@ -6922,7 +7116,7 @@ mod tests {
             .expect("insert catch-up fixture");
 
         let first = replay(vec![chunk(0, b"alpha")]);
-        durable.append(info.id, first.clone());
+        expect_queued(durable.append(info.id, first.clone()));
         durable.finalize(info.id, 42, first.clone(), exited_state());
         assert_eq!(durable.durable_head(), first.latest_output_bytes);
 
