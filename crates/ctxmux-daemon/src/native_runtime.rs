@@ -1342,9 +1342,10 @@ fn poll_deadline(entries: &[NativeEntry], signal_driven: &AtomicBool) -> Option<
         .iter()
         .flat_map(|entry| {
             let stop_deadline = match &entry.lifecycle {
-                Lifecycle::Watching(watching) => {
-                    watching.pending_stop.as_ref().map(|pending| pending.deadline)
-                }
+                Lifecycle::Watching(watching) => watching
+                    .pending_stop
+                    .as_ref()
+                    .map(|pending| pending.deadline),
                 _ => None,
             };
             let terminal_deadline = entry.terminal.as_ref().map(|terminal| terminal.deadline);

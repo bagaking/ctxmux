@@ -441,6 +441,50 @@ fn apply_startup_fd_budget(manager: &RunManager) {
     manager.registry.clamp_record_capacity(outcome.run_ceiling);
 }
 
+/// Register the process-wide SIGCHLD relay that drives native Run exit
+/// detection, mark the owner signal-driven, and fire the exec-window catch-up.
+///
+/// SIGCHLD readiness replaces the owner's old 50 Hz `waitid` sweep as the exit
+/// trigger: one child exit wakes the native owner thread, which peeks its whole
+/// watched set once (a coalesced burst is one wake, which is correct — see
+/// `native_runtime::owner_main`). This costs ZERO extra descriptors per Run:
+/// tokio's signal driver funnels every registration through one process-wide
+/// self-pipe singleton, and the daemon already created that pipe with the SIGHUP
+/// registration in `serve_with_manager`. tokio's handler only records an event
+/// id and writes one self-pipe byte — it neither reaps nor blocks the signal —
+/// so it coexists with the owner's non-reaping peek-then-reap discipline and with
+/// the tmux backend's own SIGCHLD-based pane reaping. (tokio's own child reaper is
+/// not compiled in: the workspace enables tokio's `signal` feature, not
+/// `process`.)
+///
+/// ORDERING INVARIANT — do not reorder without re-reading this: SIGCHLD must be
+/// registered alongside the existing SIGHUP registration at startup, before any
+/// Run is published, and must NOT become the first signal the process ever
+/// registers. The reliability harness samples its descriptor baseline after
+/// startup; if the driver's self-pipe were created inside that window (SIGCHLD
+/// moved earlier, or SIGHUP moved later), the harness would attribute two extra
+/// descriptors it did not expect to the fleet. Keeping both registrations here
+/// keeps the pipe out of the measured window.
+///
+/// The catch-up wake after `mark_signal_driven` forces the owner to peek its
+/// whole watched set once before it is allowed to block, closing the
+/// exec-in-place adopt window: a child re-adopted by this image via
+/// `Run::readopt` (same pid across execve, still our child) can exit DURING the
+/// exec — after the old image stopped watching, before this image registered the
+/// handler — and SIGCHLD's default-ignore disposition drops that transition, so
+/// it is queued for no one. Without the catch-up that adopted Run would sit
+/// undetected until some unrelated wake. Cold-recovered Runs (`Run::recover`) are
+/// children of the dead previous process, reparented to init, so they are not
+/// ours to reap and need no coverage; the peek is non-reaping, so a spurious
+/// catch-up is harmless.
+fn arm_native_exit_relay(manager: &RunManager) -> Result<tokio::signal::unix::Signal, ServerError> {
+    let sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|source| ServerError::io("<sigchld>", source))?;
+    manager.native_runs.mark_signal_driven();
+    manager.native_runs.owner_wake().wake();
+    Ok(sigchld)
+}
+
 async fn serve_with_manager(
     socket_path: PathBuf,
     listener: UnixListener,
@@ -476,47 +520,7 @@ async fn serve_with_manager(
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .map_err(|source| ServerError::io("<sighup>", source))?;
 
-    // Process-wide SIGCHLD readiness is what replaces the owner's old 50 Hz
-    // `waitid` sweep as the exit trigger: one child exit wakes the native owner
-    // thread, which then peeks its whole watched set once (a coalesced burst is
-    // one wake, which is correct — see `native_runtime::owner_main`). This costs
-    // ZERO extra descriptors per Run because tokio's signal driver funnels every
-    // registration through one process-wide self-pipe singleton, and the daemon
-    // already created that pipe with the SIGHUP registration above.
-    //
-    // ORDERING INVARIANT — do not reorder without re-reading this: SIGCHLD must
-    // be registered here, alongside the existing SIGHUP registration and before
-    // any Run is published into the owner, and it must NOT become the first
-    // signal the process ever registers. The reliability harness samples its
-    // descriptor baseline after startup; if the driver's self-pipe were created
-    // inside that window (because SIGCHLD moved earlier, or SIGHUP moved later),
-    // the harness would attribute two extra descriptors it did not expect to the
-    // fleet. Keeping both registrations here, at startup, keeps the pipe out of
-    // the measured window. tokio's SIGCHLD handler only records an event id and
-    // writes one self-pipe byte — it neither reaps nor blocks the signal — so it
-    // is compatible with the owner's non-reaping peek-then-reap discipline and
-    // with the tmux backend's own SIGCHLD-based pane reaping. (tokio's own child
-    // reaper is not compiled in: the workspace enables tokio's `signal` feature
-    // but not `process`.)
-    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
-        .map_err(|source| ServerError::io("<sigchld>", source))?;
-    let native_owner_wake = manager.native_runs.owner_wake();
-
-    // The relay is live: tell the native owner it may now rely on SIGCHLD and
-    // shed its timed backstop sweep (block with no timer between exits). Then
-    // fire ONE catch-up wake, which forces the owner to peek its whole watched
-    // set once before it is allowed to block. This closes the exec-in-place
-    // adopt window: a child re-adopted by this image via `Run::readopt` (same pid
-    // across execve, still our child) could have exited DURING the exec — after
-    // the old image stopped watching, before this image registered the handler
-    // above — and SIGCHLD's default disposition is ignore, so that transition was
-    // never queued for anyone. Without this catch-up the adopted Run would sit
-    // undetected until some unrelated wake. Cold-recovered Runs (`Run::recover`)
-    // are children of the dead previous process, reparented to init, so they are
-    // not ours to reap and need no coverage here; the catch-up simply no-ops for
-    // them. The peek is non-reaping, so a spurious catch-up is harmless.
-    manager.native_runs.mark_signal_driven();
-    native_owner_wake.wake();
+    let mut sigchld = arm_native_exit_relay(&manager)?;
 
     loop {
         tokio::select! {
@@ -560,7 +564,7 @@ async fn serve_with_manager(
                 // every one, which is why coalescing is correct rather than lossy.
                 // We consult no siginfo/pid here: the wake is a pure hint, and the
                 // owner's peek remains the authoritative observation.
-                native_owner_wake.wake();
+                manager.native_runs.owner_wake().wake();
             }
             _ = sighup.recv() => {
                 if manager.persistence.is_none() {
