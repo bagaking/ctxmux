@@ -2154,6 +2154,10 @@ mod tests {
     struct FakePty {
         size: Mutex<PtySize>,
         readback_row_delta: u16,
+        /// Report a zero-column read-back, the way a driver can when the far
+        /// side of the pty is gone: the resize "succeeded" but the size it
+        /// hands back is not one any terminal is actually using.
+        zero_readback: bool,
     }
 
     impl FakePty {
@@ -2161,6 +2165,14 @@ mod tests {
             Self {
                 size: Mutex::new(PtySize::default()),
                 readback_row_delta,
+                zero_readback: false,
+            }
+        }
+
+        fn with_zero_readback() -> Self {
+            Self {
+                zero_readback: true,
+                ..Self::new(0)
             }
         }
     }
@@ -2173,6 +2185,12 @@ mod tests {
         }
 
         fn get_size(&self) -> io::Result<PtySize> {
+            if self.zero_readback {
+                return Ok(PtySize {
+                    cols: 0,
+                    ..*mutex_lock(&self.size)
+                });
+            }
             Ok(*mutex_lock(&self.size))
         }
 
@@ -2520,6 +2538,43 @@ mod tests {
             owner.master_raw_fd(),
             expected,
             "the master fd number is stable across a resize on the live descriptor"
+        );
+    }
+
+    #[test]
+    fn an_unusable_zero_read_back_publishes_nothing_and_keeps_the_last_confirmed_size() {
+        // The master reports zero columns after a resize whose ioctl succeeded.
+        // The mutation did cross the boundary, so the caller must be told
+        // `unknown` -- but zero columns is not a geometry any terminal is
+        // using, so it must never be stored or published as confirmed truth.
+        let (zeroed, _child) = owner(
+            Box::new(io::sink()),
+            Box::new(FakePty::with_zero_readback()),
+            InputDrainGate::default(),
+        );
+        let seeded = zeroed.confirmed_size();
+
+        let mut published = Vec::new();
+        let failure = zeroed
+            .resize(TerminalSize { rows: 24, cols: 80 }, |size| {
+                published.push(size);
+            })
+            .expect_err("a zero read-back cannot be confirmed");
+
+        assert_eq!(failure.error.code, ErrorCode::Io);
+        assert_eq!(
+            failure.disposition,
+            CommandDisposition::Unknown,
+            "the ioctl already crossed the boundary, so the outcome is unknown"
+        );
+        assert!(
+            published.is_empty(),
+            "no observer may be told a size no terminal acknowledged"
+        );
+        assert_eq!(
+            zeroed.confirmed_size(),
+            seeded,
+            "the previously confirmed size stands rather than being replaced"
         );
     }
 
