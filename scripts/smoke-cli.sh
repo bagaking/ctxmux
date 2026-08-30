@@ -84,12 +84,24 @@ ctxmux_cli_runtime_again=$("$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" runti
 [[ "$ctxmux_cli_runtime_again" == "$ctxmux_cli_runtime" ]] ||
   fail "Runtime identity changed within one daemon lifetime"
 
+# The generation the CLI compiled against, read from its own --version banner.
+# Pinning a literal here made this smoke assert 14 for the whole life of
+# generations 15 and 16: the daemon moved, the pin did not, and the lane simply
+# failed instead of reporting a mismatch anyone acted on. Deriving it keeps the
+# real invariant -- that the running daemon serves the generation this CLI was
+# built for -- while removing the copy that goes stale on its own.
+ctxmux_cli_version_banner=$("$ctxmux_cli_bin" --version)
+[[ "$ctxmux_cli_version_banner" =~ \(protocol\ ([0-9]+)\)$ ]] ||
+  fail "cannot read the protocol generation from: $ctxmux_cli_version_banner"
+ctxmux_cli_expected_generation="${BASH_REMATCH[1]}"
+
 ctxmux_cli_run=$(
   "$ctxmux_cli_bin" --socket "$ctxmux_cli_socket" start -- /bin/sh -c \
     "read line; printf 'OUT:%s\\n' \"\$line\""
 )
 [[ "$ctxmux_cli_run" =~ ^[0-9a-f-]{36}$ ]] || fail "start returned an invalid Run id: $ctxmux_cli_run"
 CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run" \
+  CTXMUX_SMOKE_GENERATION="$ctxmux_cli_expected_generation" \
   node --input-type=module -e '
     import assert from "node:assert/strict";
     const runtime = JSON.parse(process.env.CTXMUX_SMOKE_RUNTIME);
@@ -112,7 +124,10 @@ CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run"
     assert.notEqual(runtime.runtimeId, runId);
     assert.notEqual(runtime.daemonInstanceId, runId);
     assert.match(runtime.buildId, /^ctxmuxd\/[^/]+$/u);
-    assert.equal(runtime.protocolGeneration, 14);
+    assert.equal(
+      runtime.protocolGeneration,
+      Number(process.env.CTXMUX_SMOKE_GENERATION),
+    );
     assert.notEqual(runtime.platform, "");
     assert.notEqual(runtime.arch, "");
     assert.deepEqual(runtime.capabilities, {
@@ -191,8 +206,12 @@ done
 ctxmux_cli_list=$(CTXMUX_SOCKET="$ctxmux_cli_socket" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_run"
 expect_contains "$ctxmux_cli_list" "$ctxmux_cli_child"
-expect_contains "$("$ctxmux_cli_bin" --version)" "protocol 14"
-expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol 14"
+# The CLI and the daemon must claim the same generation as each other. Anchor
+# both to the banner read above rather than repeating the literal: two copies of
+# the same constant is how this file came to assert 14 against a generation-16
+# daemon in three separate places.
+expect_contains "$("$ctxmux_cli_bin" --version)" "protocol $ctxmux_cli_expected_generation"
+expect_contains "$("$ctxmux_daemon_bin" --version)" "protocol $ctxmux_cli_expected_generation"
 
 ctxmux_cli_default_list=$(env -u CTXMUX_SOCKET XDG_RUNTIME_DIR="$ctxmux_cli_tmp" "$ctxmux_cli_bin" list)
 expect_contains "$ctxmux_cli_default_list" "$ctxmux_cli_run"
