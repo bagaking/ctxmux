@@ -11,8 +11,8 @@ use std::{
 
 use ctxmux_protocol::{
     CommandDisposition, ControlFailure, ControlReceipt, CreateOperationKey, ErrorCode,
-    ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec, RunSummary, StopDisposition,
-    StopOperationKey,
+    ForkFidelity, ForkPlan, ProtocolError, RunId, RunInfo, RunSpec, RunState, RunSummary,
+    StopDisposition, StopOperationKey,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
@@ -60,10 +60,24 @@ impl TerminalPublicationOwner {
             .expect("one recovered Run receives one terminal ordinal");
     }
 
+    /// Assign the ordinal and make the terminal state visible under one lock.
+    ///
+    /// The state write must stay inside the `next` critical section: that is
+    /// the whole point of this owner, and dropping the guard first would let a
+    /// later ordinal become visible before an earlier one.
+    ///
+    /// Taking the `Mutex<RunState>` rather than a closure is deliberate. A
+    /// closure lets a caller run anything at all while a daemon-wide lock is
+    /// held, including acquiring further locks, which is how a cross-thread
+    /// cycle gets built by accident. The only work this owner ever needs to
+    /// cover is one state write, so it takes exactly that and the escape hatch
+    /// closes: `next -> state` is now the complete set of edges this function
+    /// can produce, and it is checkable by reading the signature.
     pub(crate) fn publish(
         &self,
         ordinal: &OnceLock<TerminalOrdinal>,
-        publish_state: impl FnOnce(),
+        state: &Mutex<RunState>,
+        terminal: RunState,
     ) {
         let mut next = self
             .next
@@ -75,7 +89,9 @@ impl TerminalPublicationOwner {
         ordinal
             .set(TerminalOrdinal(*next))
             .expect("one Run publishes terminal state once");
-        publish_state();
+        *state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = terminal;
     }
 }
 
@@ -713,12 +729,12 @@ impl Drop for PendingPublication {
 mod tests {
     use std::{
         collections::BTreeMap,
-        sync::{Arc, Mutex, OnceLock, TryLockError, mpsc},
+        sync::{Arc, Mutex, OnceLock, TryLockError},
         thread,
         time::{Duration, Instant},
     };
 
-    use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunId, RunSpec, TerminalSize};
+    use ctxmux_protocol::{CreateOperationKey, ErrorCode, RunId, RunSpec, RunState, TerminalSize};
 
     use super::{
         CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, RegistryEntry,
@@ -926,39 +942,85 @@ mod tests {
 
     #[test]
     fn terminal_ordinal_matches_visible_publication_order() {
+        // The contract: the ordinal and the visible state move together, so a
+        // higher ordinal can never be seen beside an older state. Proving it
+        // means catching `publish` mid-flight and showing `next` is still held
+        // while the state write is outstanding.
+        //
+        // `publish` takes the state mutex rather than a closure, so the way to
+        // stall it mid-flight is to hold that mutex. This is a stronger probe
+        // than the closure version it replaced: back then the test supplied the
+        // blocking code itself, so it only demonstrated that a closure could
+        // block. Here the stall comes from the real lock on the real write, and
+        // the state we read back afterwards is the state `publish` wrote.
         let owner = TerminalPublicationOwner::default();
         let first_ordinal = Arc::new(OnceLock::new());
-        let second_ordinal = Arc::new(OnceLock::new());
-        let visible = Arc::new(Mutex::new(Vec::new()));
-        let (first_entered_tx, first_entered_rx) = mpsc::sync_channel(0);
-        let (release_first_tx, release_first_rx) = mpsc::sync_channel(0);
+        let second_ordinal = OnceLock::new();
+        let first_state = Arc::new(Mutex::new(RunState::Running));
+        let second_state = Mutex::new(RunState::Running);
+
+        let first_state_guard = first_state.lock().expect("hold the first state");
 
         let first_owner = owner.clone();
         let first_cell = Arc::clone(&first_ordinal);
-        let first_visible = Arc::clone(&visible);
+        let first_state_handle = Arc::clone(&first_state);
         let first = thread::spawn(move || {
-            first_owner.publish(&first_cell, || {
-                first_entered_tx.send(()).expect("report first claimant");
-                release_first_rx.recv().expect("release first claimant");
-                first_visible.lock().unwrap().push("first");
-            });
+            first_owner.publish(
+                &first_cell,
+                &first_state_handle,
+                RunState::Exited {
+                    code: 1,
+                    signal: None,
+                },
+            );
         });
-        first_entered_rx.recv().expect("first claimant owns order");
 
-        let publication_is_locked = matches!(owner.next.try_lock(), Err(TryLockError::WouldBlock));
+        // The publisher has claimed its ordinal and is now blocked on the state
+        // write this thread is holding. `next` must still be held: releasing it
+        // here would let a later publisher take a higher ordinal and make its
+        // state visible first, which is the exact inversion this owner exists
+        // to prevent.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut publication_is_locked = false;
+        while Instant::now() < deadline {
+            if first_ordinal.get().is_some()
+                && matches!(owner.next.try_lock(), Err(TryLockError::WouldBlock))
+            {
+                publication_is_locked = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             publication_is_locked,
             "the terminal owner remains locked through visible state publication"
         );
 
-        release_first_tx
-            .send(())
-            .expect("release first publication");
+        drop(first_state_guard);
         first.join().expect("first publisher remains live");
-        owner.publish(&second_ordinal, || {
-            visible.lock().unwrap().push("second");
-        });
-        assert_eq!(*visible.lock().unwrap(), ["first", "second"]);
+        assert!(
+            matches!(
+                *first_state.lock().expect("read the published state"),
+                RunState::Exited { code: 1, .. }
+            ),
+            "publish writes the terminal state it was given"
+        );
+
+        owner.publish(
+            &second_ordinal,
+            &second_state,
+            RunState::Exited {
+                code: 2,
+                signal: None,
+            },
+        );
+        assert!(
+            matches!(
+                *second_state.lock().expect("read the second state"),
+                RunState::Exited { code: 2, .. }
+            ),
+            "the second publication is visible once it completes"
+        );
         assert!(first_ordinal.get() < second_ordinal.get());
     }
 
@@ -990,7 +1052,7 @@ mod tests {
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            owner.publish(&cell, || {});
+            owner.publish(&cell, &Mutex::new(RunState::Running), RunState::Running);
         }));
         std::panic::set_hook(previous_hook);
 
