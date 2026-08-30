@@ -4002,9 +4002,29 @@ impl Run {
                 let (chunk, replay, running, persistence) = {
                     let mut output = mutex_lock(&self.output);
                     let chunk = output.push(data);
-                    let replay = output.replay(chunk.start_byte);
                     let running = mutex_lock(&self.state).is_running();
                     let persistence = mutex_lock(&self.persistence).active().cloned();
+                    // Render the catch-up from the DURABLE watermark, not from
+                    // this push's start byte. `append` is allowed to drop when
+                    // the actor is behind, and that is only sound because this
+                    // replay is idempotent: the watermark advances only after a
+                    // commit, so a dropped append leaves it put and the next
+                    // push re-renders a replay that still begins exactly at
+                    // `durable_head`, carrying the skipped bytes with it.
+                    //
+                    // Sending `chunk.start_byte` instead would make a drop a
+                    // forward gap, which `append_replay` rejects and
+                    // `remember_failure` then latches daemon-wide.
+                    //
+                    // Re-sent durable bytes are not duplicated: `append_replay`
+                    // verifies any chunk at or below the watermark against the
+                    // stored bytes and moves on. Retention bounds the size —
+                    // the log can only render what it still retains.
+                    let replay = persistence
+                        .as_ref()
+                        .map_or_else(|| output.replay(chunk.start_byte), |durable| {
+                            output.replay(durable.durable_head())
+                        });
                     (chunk, replay, running, persistence)
                 };
                 if running && let Some(persistence) = persistence {
@@ -7667,6 +7687,136 @@ mod tests {
             "after eviction the two wire counters must not be equal; if they \
              are, the retained field is wired to the lifetime total"
         );
+    }
+
+    #[test]
+    fn record_output_survives_a_dropped_append_without_losing_bytes() {
+        // `Run::record_output` is allowed to DROP an append when the persistence
+        // actor is behind — that is what stops one slow fsync from stalling the
+        // single daemon-wide output reader and, through it, every Run's pty.
+        //
+        // Dropping is only sound if what it sends is a catch-up from the
+        // durable watermark rather than a delta of the current push. This test
+        // makes a real append get dropped (the actor is held at a barrier while
+        // the queue overflows) and then asserts the DURABLE bytes are still
+        // whole. Send a delta instead and the dropped bytes never arrive:
+        // `append_replay` sees a forward gap, rejects it, and `remember_failure`
+        // latches durability off daemon-wide — exactly when the disk is slow.
+        let directory = tempfile::tempdir().expect("create dropped-append run directory");
+        let (persistence, _recovered) = Persistence::open(directory.path().join("state"))
+            .expect("open dropped-append persistence");
+
+        let run_id = RunId::new();
+        let info = RunInfo {
+            id: run_id,
+            // A persistent native Run must carry its launch specification.
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
+            attachments: 0,
+            applied_input_bytes: Some(0),
+        };
+        let operation_key =
+            CreateOperationKey::new("dropped-append").expect("valid dropped-append key");
+        let durable = persistence
+            .insert_start(&operation_key, &info)
+            .expect("seed the dropped-append row")
+            .durable;
+
+        let recovered = RecoveredRun {
+            operation_key,
+            info,
+            replay: OutputReplay {
+                chunks: Vec::new(),
+                first_available_byte: 0,
+                latest_output_bytes: 0,
+                truncated: false,
+            },
+            metadata_bytes: 0,
+        };
+        let run = Run::recover(
+            recovered,
+            durable,
+            16,
+            TerminalPublicationOwner::default(),
+            crate::qualification_stats::QualificationStats::default(),
+            crate::retention::RetentionBudget::with_limit(u64::MAX),
+        );
+
+        // Hold the actor inside its first append so everything behind it is
+        // dropped rather than queued.
+        let (reached, release) = persistence.pause_next_append();
+        run.record_output(b"alpha".to_vec());
+        reached.recv().expect("the actor reaches the append barrier");
+
+        // These pushes cannot be queued: their appends are dropped on the
+        // floor. Before this fix they would have blocked the output reader.
+        for _ in 0..(2 * 1024) {
+            run.record_output(b"x".to_vec());
+        }
+        run.record_output(b"omega".to_vec());
+
+        release.send(()).expect("release the append barrier");
+
+        // One more push after the actor drains. Its catch-up still starts at
+        // the durable head, so it carries every byte whose own append was
+        // dropped.
+        run.record_output(b"tail".to_vec());
+        // Flush through the durable handle rather than `publish_terminal`:
+        // `Run::recover` already claimed this Run's terminal ordinal, and the
+        // point under test is the durable byte stream, not terminal publication.
+        let (expected, catch_up) = {
+            let output = mutex_lock(&run.output);
+            (output.latest_output_bytes(), output.replay(0))
+        };
+        mutex_lock(&run.persistence)
+            .active()
+            .expect("a recovered Run has active persistence")
+            .finalize(
+                run_id,
+                42,
+                catch_up,
+                RunState::Exited {
+                    code: 0,
+                    signal: None,
+                },
+            );
+
+        assert!(
+            !persistence.is_failed(),
+            "a dropped append must never latch persistence: a forward gap here \
+             would kill durability for every Run in the fleet"
+        );
+
+        drop(run);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) =
+            Persistence::open(directory.path().join("state")).expect("reopen durable state");
+        let row = recovered
+            .iter()
+            .find(|run| run.info.id == run_id)
+            .expect("the Run is durable");
+        assert_eq!(
+            row.replay.latest_output_bytes, expected,
+            "every byte must reach the disk despite thousands of dropped \
+             appends; a short count means the offer was a delta, not a catch-up"
+        );
+        drop(reopened);
     }
 
     #[test]

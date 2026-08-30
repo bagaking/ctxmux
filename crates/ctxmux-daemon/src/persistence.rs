@@ -88,6 +88,17 @@ const _: () = assert!(
     "the format envelope must accept the serving ceiling plus the turnover overlap"
 );
 const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Depth of the actor's command queue.
+///
+/// Output appends do **not** block on this queue being full — see
+/// [`PersistentRun::append`], which drops instead and lets the next push carry
+/// the skipped bytes. The depth therefore buys burst absorption, not
+/// backpressure: it is how far the fleet can run ahead of one fsync before
+/// appends start coalescing into larger transactions.
+///
+/// Every other command (start, finalize, shutdown) still blocks here. Those are
+/// per-Run lifecycle transitions on their own callers, not the daemon-wide
+/// output reader, so blocking them cannot stall the fleet.
 const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
@@ -336,6 +347,9 @@ struct PersistenceTestHooks {
     fail_next_insert_after_commit: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
+    /// Stalls the actor inside an append so a test can hold it there while the
+    /// queue fills, standing in for a slow fsync.
+    append_barrier: Mutex<Option<FinalizeTestBarrier>>,
     startup_batch_wal_bytes: Mutex<Vec<u64>>,
     startup_fail_after_commits: AtomicU64,
     startup_over_budget_attempts: AtomicU64,
@@ -561,11 +575,40 @@ impl PersistentRun {
         Arc::clone(&self.metadata_bytes)
     }
 
+    /// Enqueue durable output for one Run, dropping the request rather than
+    /// waiting when the actor is behind.
+    ///
+    /// `replay` MUST be rendered from [`Self::durable_head`], not from the bytes
+    /// of the push that triggered it. That is what makes dropping safe: the
+    /// watermark only advances after a commit, so a dropped append leaves it
+    /// where it was and the next push re-renders a catch-up that still starts
+    /// exactly at `durable_head`. Nothing is lost and no gap is ever observable.
+    ///
+    /// A blocking send here would stall the whole fleet. Every native Run's
+    /// output is read by ONE daemon-wide thread (`native_runtime::owner_main`),
+    /// which calls `Run::record_output` inline, which calls this. One slow fsync
+    /// would therefore stop that thread from draining ANY pty — including
+    /// memory-only Runs, which never reach this code but share the reader — so
+    /// every child in the fleet would block writing into a full pty buffer.
+    ///
+    /// Dropping is deliberately *not* the same as losing durability: the actor
+    /// already coalesces queued appends into one transaction up to
+    /// `MAX_TRANSACTION_PAYLOAD_BYTES`, so a full queue means the next append
+    /// commits more bytes per fsync. Pressure degrades into fewer, larger
+    /// writes rather than into a stalled fleet.
+    ///
+    /// Sending a delta instead would be worse than lossy. `append_replay`
+    /// rejects a forward gap outright, and that error latches persistence off
+    /// daemon-wide via `remember_failure` — so a drop would poison durability
+    /// for every Run at exactly the moment the disk is under pressure.
     pub(crate) fn append(&self, id: RunId, replay: OutputReplay) {
         if mutex_lock(&self.persistence.inner.failure).is_some() {
             return;
         }
-        let _ = self.persistence.inner.sender.send(Command::Append {
+        // `try_send` rather than `send`: see above. Both error arms are correct
+        // to swallow — `Full` is absorbed by the next catch-up, and
+        // `Disconnected` means the actor is gone, which `failure` already owns.
+        let _ = self.persistence.inner.sender.try_send(Command::Append {
             id,
             replay,
             durable_head: Arc::clone(&self.durable_head),
@@ -936,6 +979,19 @@ impl Persistence {
                 release: release_rx,
             });
         assert!(previous.is_none(), "only one finalize barrier may be armed");
+        (reached_rx, release_tx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_append(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (reached_tx, reached_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let previous =
+            mutex_lock(&self.inner.test_hooks.append_barrier).replace(FinalizeTestBarrier {
+                reached: reached_tx,
+                release: release_rx,
+            });
+        assert!(previous.is_none(), "only one append barrier may be armed");
         (reached_rx, release_tx)
     }
 
@@ -1311,6 +1367,8 @@ fn actor_main(
                 replay,
                 durable_head,
             } => {
+                #[cfg(test)]
+                pause_before_append(test_hooks);
                 let mut batch = vec![(id, replay, durable_head)];
                 let mut payload = replay_payload(&batch[0].1);
                 while payload < MAX_TRANSACTION_PAYLOAD_BYTES {
@@ -1546,6 +1604,15 @@ fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
 #[cfg(test)]
 fn pause_before_finalize(test_hooks: &PersistenceTestHooks) {
     let barrier = mutex_lock(&test_hooks.finalize_barrier).take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached.send(());
+        let _ = barrier.release.recv();
+    }
+}
+
+#[cfg(test)]
+fn pause_before_append(test_hooks: &PersistenceTestHooks) {
+    let barrier = mutex_lock(&test_hooks.append_barrier).take();
     if let Some(barrier) = barrier {
         let _ = barrier.reached.send(());
         let _ = barrier.release.recv();
@@ -6751,5 +6818,127 @@ mod tests {
         assert_eq!(persistence.daemon_instance().to_string(), epoch);
         drop(persistence);
         drop(held);
+    }
+
+    /// A dropped append must not stall the caller, and must not lose bytes.
+    ///
+    /// This is the whole justification for `append`'s non-blocking send. The
+    /// caller is the daemon-wide output reader thread, so blocking it would
+    /// stop every Run's pty from being drained. Dropping is only sound because
+    /// the replay is rendered from `durable_head`, which a dropped append
+    /// leaves unmoved — so the next append re-offers the same bytes.
+    #[test]
+    fn a_dropped_append_is_recovered_by_the_next_one() {
+        let temp = TempDir::new().expect("create dropped-append fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert dropped-append fixture");
+
+        // Hold the actor inside its first append so the queue backs up behind
+        // it, standing in for a slow fsync.
+        let (reached, release) = persistence.pause_next_append();
+        durable.append(info.id, replay(vec![chunk(0, b"first")]));
+        reached.recv().expect("the actor reaches the append barrier");
+
+        // Fill the queue past its depth from another thread, so a send that
+        // blocks fails this test on a deadline instead of hanging it. Every one
+        // of these would have blocked the output reader before this fix; here
+        // they are dropped instead. The watermark has not moved, so each
+        // carries the same bytes from 0.
+        let filler = durable.clone();
+        let filler_id = info.id;
+        let (filled_tx, filled_rx) = super::mpsc::sync_channel(0);
+        let fill = thread::Builder::new()
+            .name("dropped-append-filler".to_owned())
+            .spawn(move || {
+                let stalled = replay(vec![chunk(0, b"first")]);
+                for _ in 0..(PERSISTENCE_QUEUE_CAPACITY * 2) {
+                    filler.append(filler_id, stalled.clone());
+                }
+                let _ = filled_tx.send(());
+            })
+            .expect("spawn the queue filler");
+
+        let overran = filled_rx
+            .recv_timeout(Duration::from_secs(30))
+            .is_err();
+        assert!(
+            !overran,
+            "appends must never block on a stalled actor: this is the daemon-wide \
+             output reader, so a blocking send stops every Run's pty from draining"
+        );
+        assert_eq!(
+            durable.durable_head(),
+            0,
+            "nothing can be durable while the actor is held at the barrier"
+        );
+
+        release.send(()).expect("release the append barrier");
+        fill.join().expect("the queue filler finishes");
+
+        // The bytes that were dropped are carried by the next catch-up, which
+        // still starts at the unmoved watermark and now extends past it.
+        let whole = replay(vec![chunk(0, b"first"), chunk(5, b"-second")]);
+        durable.finalize(info.id, 42, whole.clone(), exited_state());
+        assert!(
+            !persistence.is_failed(),
+            "a dropped append must not latch persistence"
+        );
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen recovered state");
+        let run = recovered
+            .iter()
+            .find(|run| run.info.id == info.id)
+            .expect("the Run survives the dropped appends");
+        assert_eq!(
+            run.replay, whole,
+            "every byte must be durable despite the dropped appends"
+        );
+        drop(reopened);
+    }
+
+    /// The catch-up re-sends bytes that are already durable. That must be a
+    /// verified no-op, not a duplicate — otherwise the fix would corrupt the
+    /// replay on every push after the first.
+    #[test]
+    fn re_sending_durable_bytes_does_not_duplicate_them() {
+        let temp = TempDir::new().expect("create catch-up fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert catch-up fixture");
+
+        let first = replay(vec![chunk(0, b"alpha")]);
+        durable.append(info.id, first.clone());
+        durable.finalize(info.id, 42, first.clone(), exited_state());
+        assert_eq!(durable.durable_head(), first.latest_output_bytes);
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen recovered state");
+        let run = recovered
+            .iter()
+            .find(|run| run.info.id == info.id)
+            .expect("the Run is durable");
+        assert_eq!(
+            run.replay, first,
+            "re-offered durable bytes are verified, never appended twice"
+        );
+        drop(reopened);
     }
 }
