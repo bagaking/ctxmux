@@ -12,9 +12,15 @@ fallbacks or migrations.
   a known command needs the daemon and nothing is listening. The SDK does not.
 - Socket permissions are set to owner read/write only.
 - Each frame is one UTF-8 JSON value followed by a newline.
-- A frame may not exceed 1 MiB.
+- A frame may not exceed 1 MiB. An inbound frame over the cap fails decoding and
+  closes the connection. An outbound response the daemon cannot fit in the cap
+  does not silently drop the socket: the daemon sends a `response_too_large`
+  error frame the client can branch on. `list` avoids this case by construction
+  through paged thin `RunSummary` rows; the fallback is the generic backstop for
+  any response embedding caller-controlled data (for example a `RunInfo` whose
+  `RunSpec` is large).
 - Raw PTY bytes are represented as strict padded standard-base64 strings in
-  generation 15. SDK clients decode them once to `Uint8Array` values before
+  generation 16. SDK clients decode them once to `Uint8Array` values before
   exposing events or applying byte-based queue limits.
 
 If a requested socket path is an ordinary file or symlink rather than a socket,
@@ -30,7 +36,7 @@ Every connection begins with `ClientFrame::Hello`. The daemon either returns a
 matching `ServerFrame::Hello` or an explicit `version_mismatch` error and closes
 the connection.
 
-The generation fence covers the wire contract only. A successful generation-15
+The generation fence covers the wire contract only. A successful generation-16
 Hello carries exactly one Provider-neutral `RuntimeIdentity`:
 
 ```ts
@@ -192,7 +198,19 @@ Closing a client socket only removes that attachment. It does not stop the Run.
 - `fork`: create a child through one required creation operation key and an
   explicit Level A or Level B plan, then return metadata containing its
   immediate parent and actual fidelity.
-- `list`: return all Runs retained by this daemon.
+- `list { after, limit }`: return one page of retained Runs as thin
+  `RunSummary` rows (identity, backend kind, pid, state, output bytes,
+  attachments — never the unbounded `RunSpec`), ordered by ascending `RunId`,
+  plus a `next_cursor`. `after` is an exclusive `RunId` cursor (`null` starts at
+  the first Run) and `limit` requests a page size the daemon clamps to
+  `LIST_MAX_PAGE_RUNS` (512); `null` or `0` means that clamped maximum. A
+  non-null `next_cursor` means more Runs may follow — reissue with `after` set
+  to it — and `null` marks the end of the fleet. Paging over a fixed-shape row
+  keeps a full-fleet enumeration inside the 1 MiB frame no matter how many Runs
+  or how large their specs; the pre-generation-16 `list` returned every full
+  `RunInfo` in one frame, which silently dropped the connection once the fleet
+  exceeded the cap. A caller that needs a Run's spec, lineage, or capabilities
+  reads its full `RunInfo` with `status`.
 - `status`: return current metadata for one Run.
 - `remove`: reclaim one already-terminal, unpinned Run so its retained record
   slot returns to the 128-record budget, replying `removed { id }`. This never
@@ -248,7 +266,7 @@ process authority.
 
 Tmux discovery remains available in persistent mode, but tmux import returns
 `unsupported_capability`: ctxmux does not persist or recover Control Mode
-ownership in generation 15.
+ownership in generation 16.
 
 Unknown Runs, invalid dimensions, incompatible protocol versions, failed
 process spawns, durable mutation failures, and operations against a terminal
@@ -264,7 +282,7 @@ metadata capacity within the admitted SQLite page charge. Candidate Runs,
 their replay and byte-exact keys, and the successor Run/key change in one
 transaction; Backend or persistence failures remain their own error classes.
 
-Every generation-15 `RunSpec` includes `declared_inputs`, an ordered list of
+Every generation-16 `RunSpec` includes `declared_inputs`, an ordered list of
 opaque workspace, artifact, or context references. The daemon records these
 references without dereferencing, copying, normalizing, or inferring ownership
 from them. Ordinary `start` returns `lineage: null`.
@@ -287,7 +305,7 @@ bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
 the key in an error. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
-The daemon compares canonical typed requests after generation-15 decoding and
+The daemon compares canonical typed requests after generation-16 decoding and
 default application, not raw JSON member order. A canonical Start is its exact
 `RunSpec`. A canonical Fork is its parent `RunId` plus exact `ForkPlan`; Level A
 therefore compares the parent and `level_a`, while Level B also compares its
@@ -606,7 +624,7 @@ reassemble several MiB of bounded history.
 The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplayHeader` with no `chunks` field. `AttachedSnapshot` and
 `OutputReplay` are client API types produced only after ordered reassembly; a
-generation-15 peer that puts `chunks` back into the header is invalid.
+generation-16 peer that puts `chunks` back into the header is invalid.
 
 `Gap { latest_output_bytes }` reports raw-output delivery discontinuity only.
 It is not a recovery cursor: the caller must reattach using its own last
@@ -654,7 +672,7 @@ guard is armed, writes exactly one NDJSON record:
 ```
 
 The parent accepts bootstrap only when that instance equals the
-`runtime.daemonInstanceId` in the ordinary generation-15 public Hello from the selected
+`runtime.daemonInstanceId` in the ordinary generation-16 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
 receipt write failure fails bootstrap; a requested write failure also removes
 the unpublished socket. The inherited channel proves which spawned child
@@ -682,7 +700,7 @@ write, while later attachment commands receive an explicit retryable
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
 fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 15 gains no upgrade wire
+strictly bounded, unique, and validated; generation 16 gains no upgrade wire
 operation.
 
 An output append or terminal finalize that receives SQLite's typed `DiskFull`,
@@ -730,6 +748,6 @@ from those Rust types with `ts-rs`; they are not maintained as a second schema.
 `scripts/check-protocol-types.sh` generates into a temporary directory and
 fails on any checked-in drift. The TypeScript client implements the same hello,
 request, attachment, event, and error frames as the Rust client. It also
-validates the complete nested generation-15 frame at runtime, rejects duplicate
+validates the complete nested generation-16 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.

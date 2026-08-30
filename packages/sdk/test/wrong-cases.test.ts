@@ -742,9 +742,12 @@ test("SC-02 validates and snapshots client capability requirements", async (cont
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "list" },
+      request: { type: "list", after: null, limit: null },
     });
-    peer.send({ type: "response", response: { type: "runs", runs: [] } });
+    peer.send({
+      type: "response",
+      response: { type: "runs", runs: [], next_cursor: null },
+    });
   });
   const client = new CtxmuxClient({
     socketPath: daemon.socketPath,
@@ -895,7 +898,10 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
         },
       },
     },
-    { type: "response", response: { type: "runs", runs: [runInfo()] } },
+    {
+      type: "response",
+      response: { type: "runs", runs: [runSummary()], next_cursor: null },
+    },
     { type: "response", response: { type: "status", run: runInfo() } },
     {
       type: "response",
@@ -1071,10 +1077,11 @@ test("SC-02 validates tmux-owned and interrupted Run wire contracts", () => {
       response: {
         type: "runs",
         runs: interruptionReasons.map((reason) => ({
-          ...runInfo(),
+          ...runSummary(),
           pid: null,
           state: { type: "interrupted" as const, reason },
         })),
+        next_cursor: null,
       },
     },
     {
@@ -2801,6 +2808,17 @@ function runInfo() {
     first_available_byte: 1,
     attachments: 1,
     applied_input_bytes: 0,
+  };
+}
+
+function runSummary() {
+  return {
+    id: RUN_ID,
+    backend: "native" as const,
+    pid: 42,
+    state: { type: "running" as const },
+    latest_output_bytes: 1,
+    attachments: 1,
   };
 }
 

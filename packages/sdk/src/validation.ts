@@ -26,6 +26,7 @@ const ERROR_CODES: ReadonlySet<ErrorCode> = new Set([
   "daemon_instance_mismatch",
   "run_capacity",
   "control_backpressure",
+  "response_too_large",
   "internal",
 ]);
 
@@ -258,8 +259,11 @@ function response(value: unknown, path: string): void {
       return;
     case "runs":
       array(valueRecord.runs, `${path}.runs`).forEach((run, index) =>
-        runInfo(run, `${path}.runs[${index}]`),
+        runSummary(run, `${path}.runs[${index}]`),
       );
+      if (valueRecord.next_cursor !== null) {
+        runId(valueRecord.next_cursor, `${path}.next_cursor`);
+      }
       return;
     case "removed":
       runId(valueRecord.id, `${path}.id`);
@@ -303,6 +307,25 @@ function runEvent(value: unknown, path: string): void {
     default:
       throw invalid(`${path}.type`, "a known Run-event discriminant");
   }
+}
+
+function runSummary(value: unknown, path: string): void {
+  const run = record(value, path);
+  runId(run.id, `${path}.id`);
+  runBackendKind(run.backend, `${path}.backend`);
+  if (run.pid !== null) {
+    unsignedInteger(run.pid, `${path}.pid`, 0xffff_ffff);
+  }
+  runState(run.state, `${path}.state`);
+  validateCursorValue(run.latest_output_bytes, `${path}.latest_output_bytes`);
+  safeUnsignedInteger(run.attachments, `${path}.attachments`);
+}
+
+function runBackendKind(value: unknown, path: string): "native" | "tmux" {
+  if (value === "native" || value === "tmux") {
+    return value;
+  }
+  throw invalid(path, "a known Run backend kind");
 }
 
 function runInfo(value: unknown, path: string): void {
