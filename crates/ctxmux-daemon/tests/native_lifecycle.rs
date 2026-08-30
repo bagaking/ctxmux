@@ -73,6 +73,58 @@ impl TestDaemon {
         Self::from_spawned(child, directory, socket).await
     }
 
+    /// Spawn a memory-only daemon under a lowered soft+hard `RLIMIT_NOFILE`.
+    ///
+    /// `/bin/sh -c 'ulimit -n N; exec ctxmuxd …'` clamps the descriptor limit
+    /// the daemon inherits, exactly as a constrained launcher would; the daemon
+    /// then computes a clamped, explained ceiling instead of hitting EMFILE
+    /// mid-spawn. stderr is piped so the clamp log line can be scanned.
+    async fn start_memory_only_with_nofile_limit(limit: u32) -> Self {
+        let _permit = daemon_spawn_permit().await;
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
+        let socket = directory.path().join("ctxmux.sock");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n \"$1\"; shift; exec \"$@\"")
+            .arg("ctxmux-nofile-limit-fixture")
+            .arg(limit.to_string())
+            .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ctxmuxd under a lowered RLIMIT_NOFILE");
+        let stderr_lines = Self::drain_stderr(&mut child);
+        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+    }
+
+    /// Spawn a memory-only daemon under a lowered *soft-only* `RLIMIT_NOFILE`,
+    /// leaving the hard limit untouched. `ulimit -S -n N` lets the daemon raise
+    /// its soft limit back toward the budget, which is what a managed child then
+    /// inherits.
+    async fn start_memory_only_with_soft_nofile_limit(soft_limit: u32) -> Self {
+        let _permit = daemon_spawn_permit().await;
+        let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
+        let socket = directory.path().join("ctxmux.sock");
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -S -n \"$1\"; shift; exec \"$@\"")
+            .arg("ctxmux-soft-nofile-limit-fixture")
+            .arg(soft_limit.to_string())
+            .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
+            .arg("--socket")
+            .arg(&socket)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ctxmuxd under a lowered soft RLIMIT_NOFILE");
+        let stderr_lines = Self::drain_stderr(&mut child);
+        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+    }
+
     async fn start_with_inherited_fd(sentinel: &Path) -> Self {
         let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
@@ -162,10 +214,18 @@ impl TestDaemon {
             .spawn()
             .expect("spawn persistent ctxmuxd");
 
-        let stderr = child
-            .stderr
-            .take()
-            .expect("persistent daemon exposes stderr");
+        let stderr_lines = Self::drain_stderr(&mut child);
+
+        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+    }
+
+    /// Take the child's piped stderr and drain it line-by-line into a shared
+    /// buffer on a dedicated thread, mirroring each line so `--nocapture` runs
+    /// stay observable. The thread ends when the daemon dies and closes the
+    /// pipe (see `Drop`). Requires the child to have been spawned with
+    /// `Stdio::piped()` stderr.
+    fn drain_stderr(child: &mut Child) -> Arc<Mutex<Vec<String>>> {
+        let stderr = child.stderr.take().expect("piped daemon exposes stderr");
         let stderr_lines = Arc::new(Mutex::new(Vec::new()));
         let drain = Arc::clone(&stderr_lines);
         std::thread::spawn(move || {
@@ -173,8 +233,6 @@ impl TestDaemon {
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
-                        // Mirror the daemon's stderr so `--nocapture` runs stay
-                        // observable while iterating.
                         eprintln!("[ctxmuxd stderr] {line}");
                         drain.lock().expect("stderr buffer lock").push(line);
                     }
@@ -182,8 +240,7 @@ impl TestDaemon {
                 }
             }
         });
-
-        Self::from_spawned_with_stderr(child, directory, socket, Some(stderr_lines)).await
+        stderr_lines
     }
 
     /// Start a memory-only daemon whose `RLIMIT_NOFILE` soft limit is clamped to
@@ -427,6 +484,22 @@ fn non_reading_shell() -> RunSpec {
         args: vec![
             "-c".to_owned(),
             "stty raw -echo; printf 'READY\\n'; exec /bin/sleep 30".to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::default(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+/// A shell that prints its own soft `RLIMIT_NOFILE` and then idles. Used to
+/// observe what fd ceiling a managed child inherits from the daemon.
+fn report_nofile_shell() -> RunSpec {
+    RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            "printf 'NOFILE:%s\\n' \"$(ulimit -Sn)\"; exec /bin/sleep 30".to_owned(),
         ],
         cwd: None,
         env: BTreeMap::default(),
@@ -4597,4 +4670,129 @@ async fn daemon_survives_transient_accept_failure_and_keeps_serving() {
     })
     .await
     .expect("daemon serves again once descriptors free");
+}
+
+/// Under a constrained `RLIMIT_NOFILE`, the daemon must refuse excess Runs with
+/// the designed `run_capacity` at an honest, descriptor-derived ceiling — never
+/// hit EMFILE mid-spawn — and must log the clamp with both the funded ceiling
+/// and the configured cap so the operator can see why they get fewer Runs.
+///
+/// The limit funds exactly two live Runs (reserved fds + 2*3), so two starts
+/// succeed and the third is rejected before any physical spawn. This asserts
+/// the user-visible contract, not the syscall.
+#[tokio::test]
+async fn constrained_fd_limit_clamps_admission_and_explains_the_ceiling() {
+    // reserved_fds = FD_BASELINE(16) + FD_ATTACHMENT_HEADROOM(64)
+    //   + MAX_CREATION_OWNER_SLOTS(8) * FDS_PER_RUN(3) = 104; + 2 Runs * 3 = 110.
+    let daemon = TestDaemon::start_memory_only_with_nofile_limit(110).await;
+
+    // The clamp is announced with both numbers before the socket is served.
+    let clamp_line = daemon
+        .wait_stderr_line(
+            "effective Run ceiling clamped",
+            5,
+            "the daemon should log the fd clamp with both numbers",
+        )
+        .await;
+    assert!(
+        clamp_line.contains("funds only 2 live Run(s)") && clamp_line.contains("configured 128"),
+        "clamp log must name the funded ceiling and the configured cap: {clamp_line}"
+    );
+    assert!(
+        clamp_line.contains("run_capacity"),
+        "clamp log must tell the operator excess Runs are refused with run_capacity: {clamp_line}"
+    );
+
+    // Two live Runs fit under the funded ceiling.
+    let mut live = Vec::new();
+    for index in 0..2 {
+        let run = daemon.client.start(non_reading_shell()).await.unwrap_or_else(|error| {
+            panic!("Run {index} should fit under the funded ceiling: {error}")
+        });
+        live.push(run.id);
+    }
+
+    // The third is refused cleanly with run_capacity — the honest ceiling — not
+    // an opaque PTY/spawn error from EMFILE.
+    let rejected = daemon
+        .client
+        .start(non_reading_shell())
+        .await
+        .expect_err("a Run past the funded ceiling must be refused, not spawned");
+    assert_protocol_error(rejected, ErrorCode::RunCapacity);
+
+    // The two admitted Runs are genuinely live, proving the ceiling did not
+    // simply reject everything.
+    assert_eq!(daemon.client.list().await.expect("list Runs").len(), 2);
+
+    for id in live {
+        stop_run(&daemon.client, id).await;
+    }
+}
+
+/// The daemon raises its own soft limit toward the fd budget, and — because
+/// `portable_pty` owns the child `pre_exec` and this crate forbids unsafe — that
+/// raised limit is deliberately inherited by every managed child. This pins the
+/// inheritance decision: a child sees the daemon's raised ceiling, not the
+/// constrained limit the launcher imposed. The expected value is read from the
+/// daemon's own raise log rather than hardcoded, so the test tracks the budget
+/// (which funds thousands of Runs) without pinning a literal that a constrained
+/// host's hard limit might not reach.
+#[tokio::test]
+async fn managed_child_inherits_the_raised_fd_ceiling() {
+    // Soft-only lower to 200 (below the budget) while the hard limit stays high,
+    // so the daemon can and does raise soft toward the budget. The child then
+    // reports the inherited soft limit.
+    let daemon = TestDaemon::start_memory_only_with_soft_nofile_limit(200).await;
+
+    let raise_line = daemon
+        .wait_stderr_line(
+            "raised RLIMIT_NOFILE",
+            5,
+            "the daemon should log that it raised its soft limit toward the budget",
+        )
+        .await;
+    // Parse the target the daemon raised to: "... soft 200 -> <target> (hard ...)".
+    let raised_to: u64 = raise_line
+        .split("-> ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("raise log must name the raised soft target: {raise_line}"));
+    assert!(
+        raised_to > 200,
+        "the daemon must raise above the launcher's constrained 200: {raise_line}"
+    );
+
+    let run = daemon
+        .client
+        .start(report_nofile_shell())
+        .await
+        .expect("start the fd-reporting child");
+    let (mut attachment, snapshot) = daemon
+        .client
+        .attach(run.id, 0)
+        .await
+        .expect("attach to the fd-reporting child");
+    let mut observed = replay_bytes(&snapshot.replay.chunks);
+    let mut last_seq = snapshot.replay.latest_output_bytes;
+    wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"NOFILE:").await;
+
+    let text = String::from_utf8_lossy(&observed);
+    let reported = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("NOFILE:"))
+        .map(|value| value.trim().to_owned())
+        .expect("child reports its inherited soft RLIMIT_NOFILE");
+    let reported: u64 = reported
+        .parse()
+        .unwrap_or_else(|_| panic!("child soft limit should be numeric, got {reported:?}"));
+    // The child inherits the daemon's raised ceiling, not the launcher's 200.
+    assert_eq!(
+        reported, raised_to,
+        "the managed child inherits the daemon's raised fd budget ({raised_to})"
+    );
+
+    drop(attachment);
+    stop_run(&daemon.client, run.id).await;
 }

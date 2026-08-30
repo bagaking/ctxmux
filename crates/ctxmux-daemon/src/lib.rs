@@ -25,6 +25,7 @@ use std::{
 mod adopted_pty;
 mod attachment;
 mod creation;
+mod fd_budget;
 mod handoff;
 mod native_control;
 mod native_runtime;
@@ -402,6 +403,44 @@ fn accept_error_is_fatal(source: &io::Error) -> bool {
     )
 }
 
+/// Read and raise `RLIMIT_NOFILE` toward the computed fd budget, then clamp the
+/// effective live-Run ceiling to what descriptors actually allow.
+///
+/// Runs once per incarnation on the single startup funnel, before the socket is
+/// published — so no reservation or Collecting fence is in flight when the
+/// record capacity is lowered. On the exec-in-place re-exec path the incoming
+/// image inherits the prior raise, so the raise is idempotent (a no-op) and the
+/// clamp recomputes the same ceiling. When the OS will not fund the full
+/// budget, the clamp is logged with both the funded ceiling and the configured
+/// cap so the operator sees why fewer Runs are admitted than the cap promises,
+/// instead of the daemon reaching EMFILE by surprise mid-spawn.
+fn apply_startup_fd_budget(manager: &RunManager) {
+    let outcome = fd_budget::apply_fd_budget();
+    let describe =
+        |limit: Option<u64>| limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
+    if outcome.clamped {
+        eprintln!(
+            "ctxmuxd: RLIMIT_NOFILE soft {} hard {} funds only {} live Run(s); \
+             effective Run ceiling clamped below the configured {} \
+             (fd budget {} unavailable); excess Runs are refused with run_capacity",
+            describe(outcome.effective_soft),
+            describe(outcome.hard),
+            outcome.run_ceiling,
+            creation::MAX_RETAINED_RUNS,
+            fd_budget::fd_budget(),
+        );
+    } else if outcome.raised {
+        eprintln!(
+            "ctxmuxd: raised RLIMIT_NOFILE soft {} -> {} (hard {}); funds {} live Run(s)",
+            describe(outcome.original_soft),
+            describe(outcome.effective_soft),
+            describe(outcome.hard),
+            outcome.run_ceiling,
+        );
+    }
+    manager.registry.clamp_record_capacity(outcome.run_ceiling);
+}
+
 async fn serve_with_manager(
     socket_path: PathBuf,
     listener: UnixListener,
@@ -411,6 +450,7 @@ async fn serve_with_manager(
     state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
+    apply_startup_fd_budget(&manager);
     if let Some(handoff) = &handoff {
         // A12 wires manifest.state_lock_fd into the incoming-image startup path.
         eprintln!(

@@ -23,8 +23,10 @@ use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats
 
 const CREATION_STRIPES: usize = 64;
 // Matches the pre-registered resource start concurrency while bounding only
-// transient physical launch owners; this is not a public Run quota.
-const MAX_CREATION_OWNER_SLOTS: usize = 8;
+// transient physical launch owners; this is not a public Run quota. The
+// startup fd budget reserves descriptors for this many overlapping unpublished
+// PTYs (see `fd_budget`), so it is shared rather than duplicated.
+pub(crate) const MAX_CREATION_OWNER_SLOTS: usize = 8;
 pub(crate) const MAX_RETAINED_RUNS: usize = 128;
 const CLEANUP_POLL: Duration = Duration::from_millis(20);
 
@@ -722,6 +724,23 @@ mod tests {
         CreationFlightOwner, CreationRequest, MAX_CREATION_OWNER_SLOTS, TerminalOrdinal,
         TerminalPublicationOwner, UnpublishedCleanupOwner, compare_memory_collection_candidates,
     };
+
+    #[test]
+    fn clamp_record_capacity_only_lowers_the_ceiling() {
+        let registry = super::RunRegistry::default();
+        assert_eq!(registry.record_capacity(), super::MAX_RETAINED_RUNS);
+        // A funded ceiling at or above the configured cap changes nothing: the
+        // configured cap stays authoritative.
+        registry.clamp_record_capacity(super::MAX_RETAINED_RUNS + 10);
+        assert_eq!(registry.record_capacity(), super::MAX_RETAINED_RUNS);
+        // A scarce funded ceiling lowers the effective admission ceiling.
+        registry.clamp_record_capacity(5);
+        assert_eq!(registry.record_capacity(), 5);
+        // A later, larger funded ceiling never raises it back above the last
+        // clamp — clamping is monotonically downward within one incarnation.
+        registry.clamp_record_capacity(50);
+        assert_eq!(registry.record_capacity(), 5);
+    }
 
     #[test]
     fn memory_collection_order_prefers_ordinal_then_run_id() {
@@ -2137,6 +2156,24 @@ impl RunRegistry {
                 residency: RegistryResidency::Retained,
             },
         );
+    }
+
+    /// Lower the retained-record ceiling to what the process fd budget funds.
+    ///
+    /// Only ever clamps downward: the configured `MAX_RETAINED_RUNS` is the
+    /// authoritative cap, and a funded ceiling at or above it changes nothing.
+    /// When descriptors are scarce this makes admission refuse with the
+    /// designed `run_capacity` at the honest ceiling instead of the daemon
+    /// hitting EMFILE mid-spawn. Startup-only, before the socket is published,
+    /// so no reservation or Collecting fence is in flight.
+    pub(crate) fn clamp_record_capacity(&self, funded_ceiling: usize) {
+        let mut state = write_lock(&self.state);
+        state.record_capacity = state.record_capacity.min(funded_ceiling);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_capacity(&self) -> usize {
+        read_lock(&self.state).record_capacity
     }
 
     #[cfg(test)]

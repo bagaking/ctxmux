@@ -102,6 +102,65 @@ missing receipt may conservatively retain that slot until daemon exit; bounded
 fail-stop is preferred to inventing cleanup success or adding a worker
 supervisor.
 
+### Startup descriptor budget and the honest effective ceiling
+
+The 128-record ceiling is only reachable if the process has the descriptors to
+back it. Each live native Run retains one reader descriptor plus the PTY master
+and writer it aliases, so the descriptor cost scales with the live-Run count on
+top of a fixed baseline. The daemon inherits whatever `RLIMIT_NOFILE` its
+launcher gives it and does not otherwise manage it, so on a stock macOS soft
+limit of 256 it would exhaust descriptors near ~82 live Runs — before the 128
+ceiling ever refused a Run — and the operator would see an opaque PTY/spawn
+failure instead of the designed `run_capacity`.
+
+Startup therefore reads `RLIMIT_NOFILE` and raises the soft limit toward a
+budget sized for a **descriptor concurrency target** — `fd_budget_live_runs ×
+fds_per_run` plus a fixed baseline, the physical-overlap owner's descriptors,
+and client-attachment headroom — never toward the hard limit. The target is
+chosen independently of the 128-record cap: the daemon is built for an agent
+runtime with thousands of concurrent Runs, attachment and turnover fan-out are
+not record-count-bounded, and the record cap is itself slated to become a
+retained-byte budget — so the descriptor budget must stand on its own number,
+not on the record cap. At the configured target of 4000 live Runs the budget is
+`4000 × 3 + 104 = 12104` descriptors; a compile-time assertion pins only the
+*lower* bound `fd_budget_live_runs ≥ MAX_RETAINED_RUNS`, so the budget can never
+fund fewer Runs than the record cap admits.
+
+An earlier design instead capped the budget *below* `FD_SETSIZE` (1024) at
+compile time, reasoning that the raised soft limit is inherited by every managed
+child (`portable_pty` owns the child `pre_exec` and the crate is
+`unsafe_code = "forbid"`, so per-child restoration is unavailable) and a
+`select(2)`-using child must be kept under the fd-≥-1024 stack-corruption
+boundary. That was wrong, and it forfeited the host's entire concurrency ceiling
+(~306 live Runs) to guard a hazard the inheritance does not create. The soft
+limit is a *ceiling*, not a floor: fd numbers are kernel-assigned as the lowest
+available, so raising the ceiling never pushes a child's fds to higher numbers —
+it only lets a child that opens many fds open more. `FD_SETSIZE` corruption
+strikes only a child that itself opens 1024+ fds and then calls `select`, which
+is independently broken anywhere its own soft limit exceeds 1024 and is not
+something our raise causes. (This is the same reason systemd raises the *hard*
+limit while leaving the *soft* default at 1024 — protecting legacy `select`
+users without capping everyone's concurrency — rather than bounding process
+count.) The inheritance is therefore accepted as-is at any budget; the raise is
+idempotent, since the re-exec image inherits the prior raise and only ever
+raises further.
+
+When the OS refuses the raise, or the hard limit is below the budget, the daemon
+does not fail. It re-reads `RLIMIT_NOFILE` after the `setrlimit` and clamps the
+effective retained-record ceiling to the live-Run count the *granted* limit
+actually funds — never the value merely requested — then logs the clamp with
+both the funded ceiling and the configured 128, so admission refuses excess Runs
+with the same `run_capacity` at an honest, predictable ceiling instead of hitting
+EMFILE by surprise. The re-read matters on macOS, where a `setrlimit` can report
+success yet leave a soft limit that later cannot fund opens against
+`kern.maxfilesperproc`; measurement on the dev host showed macOS reflects the
+requested soft limit faithfully through `getrlimit` even above that wall
+(enforcing it at `open()` time instead), so the re-read is a portable honesty
+guard rather than a workaround for a specific kernel. This makes the *effective*
+ceiling honest; it does not change the *configured* `MAX_RETAINED_RUNS`, and it
+never raises the ceiling above it. The complementary EMFILE-survival of the
+accept loop is a separate concern.
+
 ### Registry entry and lookup linearization
 
 The Registry remains the single residency owner. Each entry contains the
@@ -776,6 +835,8 @@ or deterministic-owner fixtures.
 
 - `crates/ctxmux-daemon/src/creation.rs`: Registry, creation keys, publication,
   and T-026 private cleanup owner
+- `crates/ctxmux-daemon/src/fd_budget.rs`: startup `RLIMIT_NOFILE` budget and
+  the honest effective-ceiling clamp
 - `crates/ctxmux-daemon/src/lib.rs`: Start, Fork, import, Run lifecycle, and
   attachment lookup paths
 - `crates/ctxmux-daemon/src/native_control.rs`: native child, reap, PTY, and
