@@ -476,6 +476,32 @@ async fn serve_with_manager(
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .map_err(|source| ServerError::io("<sighup>", source))?;
 
+    // Process-wide SIGCHLD readiness is what replaces the owner's old 50 Hz
+    // `waitid` sweep as the exit trigger: one child exit wakes the native owner
+    // thread, which then peeks its whole watched set once (a coalesced burst is
+    // one wake, which is correct — see `native_runtime::owner_main`). This costs
+    // ZERO extra descriptors per Run because tokio's signal driver funnels every
+    // registration through one process-wide self-pipe singleton, and the daemon
+    // already created that pipe with the SIGHUP registration above.
+    //
+    // ORDERING INVARIANT — do not reorder without re-reading this: SIGCHLD must
+    // be registered here, alongside the existing SIGHUP registration and before
+    // any Run is published into the owner, and it must NOT become the first
+    // signal the process ever registers. The reliability harness samples its
+    // descriptor baseline after startup; if the driver's self-pipe were created
+    // inside that window (because SIGCHLD moved earlier, or SIGHUP moved later),
+    // the harness would attribute two extra descriptors it did not expect to the
+    // fleet. Keeping both registrations here, at startup, keeps the pipe out of
+    // the measured window. tokio's SIGCHLD handler only records an event id and
+    // writes one self-pipe byte — it neither reaps nor blocks the signal — so it
+    // is compatible with the owner's non-reaping peek-then-reap discipline and
+    // with the tmux backend's own SIGCHLD-based pane reaping. (tokio's own child
+    // reaper is not compiled in: the workspace enables tokio's `signal` feature
+    // but not `process`.)
+    let mut sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
+        .map_err(|source| ServerError::io("<sigchld>", source))?;
+    let native_owner_wake = manager.native_runs.owner_wake();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -507,6 +533,18 @@ async fn serve_with_manager(
                 manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
                 manager.qualification_stats.finish();
                 return Ok(());
+            }
+            _ = sigchld.recv() => {
+                // A child (any child) reached a waitable terminal state. Poke the
+                // native owner thread; it re-peeks its whole watched set once and
+                // routes any terminal leader through the same non-reaping
+                // peek-then-`reap_leader` path the timed sweep used. `recv`
+                // coalesces pending SIGCHLDs into a single readiness, so a burst of
+                // exits collapses to one wake — the owner's single sweep still sees
+                // every one, which is why coalescing is correct rather than lossy.
+                // We consult no siginfo/pid here: the wake is a pure hint, and the
+                // owner's peek remains the authoritative observation.
+                native_owner_wake.wake();
             }
             _ = sighup.recv() => {
                 if manager.persistence.is_none() {

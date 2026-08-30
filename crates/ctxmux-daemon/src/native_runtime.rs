@@ -24,8 +24,8 @@ use rustix::{
 };
 
 use crate::{
-    CHILD_CONTROL_POLL, NativeWaitFailure, PendingChild, Run, STOP_FORCED_TIMEOUT,
-    STOP_GRACEFUL_TIMEOUT, exit_state, mutex_lock,
+    NativeWaitFailure, PendingChild, Run, STOP_FORCED_TIMEOUT, STOP_GRACEFUL_TIMEOUT, exit_state,
+    mutex_lock,
     native_control::{ChildCommand, HandoffInputState, NativeControlOwner, StopOwnerResult},
     native_session::NativeSession,
     qualification_stats::GaugeGuard,
@@ -696,25 +696,35 @@ fn owner_main(
     let mut queued = VecDeque::<WorkerJob>::new();
     let mut active = HashMap::<u64, thread::JoinHandle<()>>::new();
     let mut next_job_id = 0_u64;
-    let mut next_lifecycle_probe = Instant::now();
+    // Start "woken" so the first iteration drains the registrations that raced
+    // the thread's startup. Thereafter a pass runs only on a real edge: the wake
+    // pipe fired (a command, a worker completion, a registration, or the
+    // process-wide SIGCHLD relay in `serve`), or an armed poll deadline came due
+    // (a pending Stop's admission window). There is no free-running 20 ms tick —
+    // an idle watched Run costs no wakeups at all, which is the whole point of
+    // replacing the timed `waitid` sweep with SIGCHLD readiness.
     let mut owner_woken = true;
 
     loop {
-        if owner_woken && drain_commands(commands, &mut entries, diagnostics) {
-            detach_active_workers(&mut active);
-            drain_completions(&completion_rx, &mut entries, &mut active);
-            preserve_shutdown_authority(&mut entries, &mut queued);
-            return;
-        }
         if owner_woken {
+            if drain_commands(commands, &mut entries, diagnostics) {
+                detach_active_workers(&mut active);
+                drain_completions(&completion_rx, &mut entries, &mut active);
+                preserve_shutdown_authority(&mut entries, &mut queued);
+                return;
+            }
             drain_completions(&completion_rx, &mut entries, &mut active);
-            drive_lifecycle(&mut entries, &mut queued, cleanup_admission, false);
-        }
-        let now = Instant::now();
-        if now >= next_lifecycle_probe {
+            // Peek every watched leader on each edge. SIGCHLD is process-wide and
+            // carries no pid we consult, so an exit signal means only "some
+            // watched child may now be terminal" — hence the whole set is
+            // re-peeked. Coalescing a burst of exits into one edge is therefore
+            // correct, not a bug: the single sweep observes every leader that
+            // turned terminal. The peek is a non-reaping `waitid(WNOWAIT)` (see
+            // `leader_is_terminal`), so running it on a command or completion edge
+            // too is idempotent and never consumes an exit status ahead of the
+            // sequenced `reap_leader`.
             diagnostics.lifecycle_probes.fetch_add(1, Ordering::AcqRel);
-            drive_lifecycle(&mut entries, &mut queued, cleanup_admission, true);
-            next_lifecycle_probe = now + CHILD_CONTROL_POLL;
+            drive_lifecycle(&mut entries, &mut queued, cleanup_admission);
         }
         start_worker_jobs(
             &mut queued,
@@ -743,12 +753,7 @@ fn owner_main(
                 )
                 || entry.terminal.is_some()
         });
-        owner_woken = poll_and_read_outputs(
-            &mut entries,
-            &mut wake_reader,
-            next_lifecycle_probe,
-            diagnostics,
-        );
+        owner_woken = poll_and_read_outputs(&mut entries, &mut wake_reader, diagnostics);
     }
 }
 
@@ -850,7 +855,6 @@ fn drive_lifecycle(
     entries: &mut [NativeEntry],
     queued: &mut VecDeque<WorkerJob>,
     cleanup_admission: &CleanupAdmission,
-    probe_lifecycle: bool,
 ) {
     'entries: for entry in entries {
         let lifecycle = std::mem::replace(&mut entry.lifecycle, Lifecycle::Queued);
@@ -964,11 +968,10 @@ fn drive_lifecycle(
             }
         }
 
-        if !probe_lifecycle {
-            entry.lifecycle = Lifecycle::Watching(watching);
-            continue;
-        }
-
+        // Peek the leader's terminal state without reaping. Reached on every
+        // owner edge now that the timed sweep is gone; a SIGCHLD edge is what
+        // makes this observe a fresh exit, but a command/completion edge peeks
+        // just as safely (idempotent WNOWAIT).
         match watching.session.leader_is_terminal() {
             Ok(false) => entry.lifecycle = Lifecycle::Watching(watching),
             Ok(true) => {
@@ -1281,10 +1284,38 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
     }
 }
 
+/// The poll timeout for one owner cycle: the earliest of any pending-Stop
+/// admission deadline and any terminal output-drain deadline. `None` blocks
+/// until an fd or the wake pipe fires — the steady state for watched Runs, whose
+/// exits now arrive as the process-wide SIGCHLD relay rather than a 50 Hz timer.
+///
+/// A plain `Watching` entry deliberately arms no deadline: its exit is signalled
+/// through the wake pipe, and a missed/coalesced signal degrades to "detected on
+/// the next wake" (see `owner_main`), never to a stranded Run. Only the two
+/// genuinely time-based obligations the signal cannot express are armed here —
+/// rejecting a Stop whose admission window elapsed while every cleanup slot
+/// stayed full, and force-finalizing a terminal Run whose output never reaches
+/// EOF within `OUTPUT_DRAIN_TIMEOUT`.
+fn poll_deadline(entries: &[NativeEntry]) -> Option<Instant> {
+    entries
+        .iter()
+        .flat_map(|entry| {
+            let stop_deadline = match &entry.lifecycle {
+                Lifecycle::Watching(watching) => {
+                    watching.pending_stop.as_ref().map(|pending| pending.deadline)
+                }
+                _ => None,
+            };
+            let terminal_deadline = entry.terminal.as_ref().map(|terminal| terminal.deadline);
+            [stop_deadline, terminal_deadline]
+        })
+        .flatten()
+        .min()
+}
+
 fn poll_and_read_outputs(
     entries: &mut [NativeEntry],
     wake_reader: &mut UnixStream,
-    next_lifecycle_probe: Instant,
     diagnostics: &OwnerDiagnostics,
 ) -> bool {
     let mut poll_fds = vec![PollFd::new(&*wake_reader, PollFlags::IN)];
@@ -1295,19 +1326,7 @@ fn poll_and_read_outputs(
             indices.push(index);
         }
     }
-    let lifecycle_deadline = entries
-        .iter()
-        .any(|entry| matches!(entry.lifecycle, Lifecycle::Watching(_)))
-        .then_some(next_lifecycle_probe);
-    let terminal_deadline = entries
-        .iter()
-        .filter_map(|entry| entry.terminal.as_ref().map(|terminal| terminal.deadline))
-        .min();
-    let deadline = match (lifecycle_deadline, terminal_deadline) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
-    };
+    let deadline = poll_deadline(entries);
     let timeout = deadline.map(|deadline| {
         Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
             .expect("native poll duration fits Timespec")
@@ -1315,11 +1334,18 @@ fn poll_and_read_outputs(
     let poll_result = poll(&mut poll_fds, timeout.as_ref());
     diagnostics.poll_returns.fetch_add(1, Ordering::AcqRel);
     let mut owner_woken = false;
+    // `poll` returns the count of ready descriptors; `Ok(0)` is a timeout, which
+    // only happens when a deadline was armed. Treat it as an owner wake so the
+    // next loop pass runs `drive_lifecycle`/`queue_ready_terminals` to service
+    // the elapsed deadline — the timed obligation the SIGCHLD relay cannot
+    // express. With no deadline armed the timeout is `None` and `poll` blocks, so
+    // a spurious `Ok(0)` cannot arise.
     let ready = match poll_result {
-        Ok(_) => {
-            owner_woken = poll_fds[0]
-                .revents()
-                .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL);
+        Ok(ready_count) => {
+            owner_woken = ready_count == 0
+                || poll_fds[0]
+                    .revents()
+                    .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL);
             poll_fds
                 .iter()
                 .skip(1)
