@@ -105,6 +105,27 @@
       ]
     },
     {
+      "id": "daemon-fd-budget",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/fd_budget.rs",
+      "invariants": [
+        "the startup soft-limit budget is derived from the concurrency target rather than the retained-Run record cap, so replacing the record cap cannot silently re-size the descriptor budget",
+        "the advertised live-Run ceiling follows exact descriptor arithmetic against the limit the OS actually granted, so a constrained host refuses at an honest ceiling instead of failing mid-spawn with EMFILE"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
       "id": "daemon-handoff-manifest",
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/handoff.rs",

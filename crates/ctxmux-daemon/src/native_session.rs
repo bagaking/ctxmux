@@ -458,6 +458,11 @@ fn process_ids() -> Result<Vec<u32>, String> {
         .map_err(|error| format!("failed to enumerate native session members: {error}"))
 }
 
+// The `Result` is not redundant across the cfg pair: the macOS sibling calls a
+// fallible syscall wrapper and genuinely fails. `members()` calls whichever one
+// is compiled with the same `?`, so both must present the same signature. On
+// this arm `sysinfo` reports no error, which is why the lint fires here alone.
+#[allow(clippy::unnecessary_wraps)]
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<u32>, String> {
     let mut system = System::new();
