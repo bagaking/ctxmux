@@ -386,6 +386,63 @@ replacement. Decision 009 remains authoritative for schema-4 validation up to
 the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
 limits, file ceilings, recovery class, and SQLite durability assumptions.
 
+### Client-requested removal
+
+Admission-triggered replacement reclaims a slot only under capacity pressure and
+only for a net-zero exchange, so a client with pinned or simply unwanted terminal
+history has no way to return a record to the 128 budget and no age or wall-clock
+expiration is promised. The `remove { id }` request closes that gap with client
+agency, not a new policy engine. It reuses the exact eligibility, fence, detach,
+and durable-delete machinery that replacement already proves; it adds no
+scheduler, lease, TTL, or background actor.
+
+Removal refuses; it never forces. Eligibility is identical to a collection
+candidate's: the id must name a Registry entry that is `Retained` (not already
+`Collecting` or `Removing`), not running, owned only by the Registry
+(`Arc::strong_count == 1`, so no attachment guard, control pin, or in-flight
+lookup holds it), and past `collection_ordinal` — a proven terminal ordinal with
+a quiescent Backend. A running Run returns `invalid_run_state`, mirroring how a
+recovered Run rejects a live state change; an attached, pinned, still-collecting,
+`Removing`, or not-yet-quiescent Run returns `backend_unavailable`; an absent id
+returns `run_not_found`, so removing an already-removed id — or racing a
+concurrent removal or replacement that already took it — is idempotent rather
+than an error. No path forces teardown of a live or attached Run.
+
+Memory-only removal is one Registry write: validate, detach the closed PTY and
+writer descriptors through the same owner-fence quiescence proof replacement
+uses (closing each exactly once outside the lock), remove the entry and its
+creation-key and stop-key mappings, and drop the owned `Arc<Run>` and descriptors
+outside the lock. Unlike replacement this is a net release: the retained count
+drops by one and the freed slot admits a brand-new Run rather than electing the
+removed one, which is the observable behavior no admission-triggered path can
+produce.
+
+Persistent removal adds a new residency state to the entry machine so the exact
+durable delete is crash-safe and race-safe:
+
+```text
+Retained
+  └─ Registry write lock ─> Removing
+                              ├─ durable delete rejected or restore -> Retained
+                              └─ durable COMMIT proven              -> Removed
+```
+
+`Removing` fences the entry exactly as `Collecting(ticket)` does — it blocks
+pins, candidate selection, and matching-key resolution — while the persistence
+actor deletes the byte-exact `(id, BINARY creation key, metadata_bytes,
+state_kind != 'running')` row and its cascading replay. That delete reuses the
+same scoped `cache_spill=OFF`, zero-length-WAL, page-charge admission proven for
+exact replacement; a delete-only transaction is strictly less work than the
+proven delete-plus-insert, so the frozen 8 MiB per-transaction and 16 MiB total
+WAL ceilings still bound it, and the fence is released by the exact in-memory
+removal only after the durable COMMIT. A rejected or rolled-back delete leaves
+the exact row present and restores the entry to `Retained` through an RAII owner,
+so durable and in-memory truth never diverge; an unclassifiable durable
+outcome is `CommitUnknown`, which keeps the fence, stops current-incarnation
+admission, and never resumes the actor, exactly as a start's unknown COMMIT does,
+leaving restart's SQLite recovery as the only authority. A crash before COMMIT
+recovers the Run; a crash after COMMIT recovers a store without it.
+
 ### Public error and protocol generation
 
 Global Registry admission with no eligible projected slot uses the narrow
@@ -394,10 +451,16 @@ existing T-026 exact-key cleanup fence, a candidate already fenced by another
 reservation, daemon shutdown, a failed worker boundary, or an unavailable
 external Backend; those cases have an owner but cannot currently serve the
 request. `control_backpressure` remains limited to a live control queue. Adding
-`run_capacity` is an incompatible schema change, so the implementation advances
-the protocol to generation 6 and updates Rust schema/codegen, TypeScript
+`run_capacity` is an incompatible schema change, so its implementation advanced
+the protocol to generation 6 and updated Rust schema/codegen, TypeScript
 runtime validation, first-party clients, wrong-case tests, and protocol
-documentation together.
+documentation together. Adding the `remove` request and its `removed { id }`
+response is likewise incompatible: it advances the protocol to generation 15 and
+updates the same Rust schema/codegen, TypeScript runtime validation, first-party
+Rust and TypeScript clients and CLI, wire-shape tests, and protocol
+documentation together. Removal introduces no new error code; it reuses
+`invalid_run_state`, `backend_unavailable`, and `run_not_found` exactly as the
+matrix below records.
 
 The exact error matrix is:
 
@@ -413,6 +476,10 @@ The exact error matrix is:
 | T-026 exact-key fence or daemon shutdown                               | `backend_unavailable`                            |
 | committed/removed Run through List                                     | omitted                                          |
 | committed/removed Run through Status/Attach/control/fresh Fork         | `run_not_found`                                  |
+| `remove` of a terminal, unpinned Run                                   | `removed { id }`; slot freed, key unbound        |
+| `remove` of a running Run                                              | `invalid_run_state` before any mutation          |
+| `remove` of an attached, pinned, collecting, or non-quiescent Run      | `backend_unavailable` before any mutation        |
+| `remove` of an unknown or already-removed id                           | `run_not_found`; idempotent                      |
 | old operation key after its prior Run is fully absent                  | unbound; ordinary creation election              |
 
 Copy-only List and Status linearize before exact removal and may be followed by
@@ -572,11 +639,18 @@ live only in the separately source-bound GC contract.
 - COMMIT is the only durable point of no return and cannot be reclassified by a
   later check.
 - Running, pinned, attached, incompletely finalized, or locally controlled Runs
-  are never collected.
+  are never collected, and are never removed by the `remove` request either: it
+  refuses with a typed error rather than forcing teardown.
+- `remove` reclaims through the same eligibility, fence, descriptor detach, and
+  durable-delete machinery as replacement; it is a net release of one slot, not
+  a net-zero exchange, and reuses only existing error codes.
 - Output stays on the existing per-Run hot path; no second live byte quota or
   byte-accounting lock is added.
-- The policy adds no Agent/session metadata, scheduler, public delete API,
-  Backend hierarchy, TTL compatibility layer, or process-tree promise.
+- The policy adds no Agent/session metadata, scheduler, Backend hierarchy, TTL
+  compatibility layer, background collector, durable lease, or process-tree
+  promise. Client-requested `remove` is a narrow, admission-symmetric,
+  refuse-don't-force reclamation verb, not a general delete, GC, or history-
+  management service.
 
 ## Alternatives
 
@@ -589,16 +663,33 @@ live only in the separately source-bound GC contract.
   Registry lookup and attachment-guard construction.
 - Letting SQLite choose eviction independently can delete a row whose live Run
   is pinned or leave Registry and durable key truth divergent.
-- A background TTL/LRU actor, public delete API, durable lease, or generic
-  Backend collector adds policy and state not required by admission-triggered
-  exact replacement.
+- A background TTL/LRU actor, durable lease, or generic Backend collector adds
+  standing policy and state not required by admission-triggered exact
+  replacement, and none of them can reclaim a pinned or simply unwanted terminal
+  Run on the client's behalf. The accepted `remove` request supplies that client
+  agency without any of that machinery: it is synchronous, caller-driven, holds
+  no timer or standing state, and reuses the existing eligibility and durable
+  paths. An earlier form of this decision rejected any "public delete API"
+  outright; that blanket rejection is narrowed here to the broad automatic and
+  lease-based forms, because the concrete gap — no way to return a slot to the
+  budget without capacity pressure electing it — is real and is closed most
+  simply by a narrow refuse-don't-force verb.
+- Automatic reclamation of every terminal Run (eager on terminal transition, or
+  a periodic sweep) was rejected as the fork for closing that gap: it would
+  delete history the client may still want to read, still cannot touch a pinned
+  Run, and reintroduces exactly the standing-policy surface (when to sweep, what
+  to keep) this decision avoids. Explicit `remove` leaves retention the client's
+  choice and deletes only what the client names.
 - Rejecting metadata only after spawn is made rollback-safe by T-026 but fails
   the stronger pre-mutation resource admission goal.
 
 ## Known constraints
 
 Collection is admission-triggered; history below 128 is retained and no age or
-wall-clock expiration is promised. The 128 ceiling bounds Registry records and
+wall-clock expiration is promised. Client `remove` is the only way to return a
+retained slot without capacity pressure electing it; it is caller-driven, not a
+timer or quota, so it changes no automatic-retention promise. The 128 ceiling
+bounds Registry records and
 their 512 MiB replay payload; the shared eight-slot overlap owner produces the
 separate 544 MiB retained-plus-overlap payload bound above. Neither value bounds
 descendant processes from legacy direct-child Stop semantics. Generation 9
@@ -608,7 +699,7 @@ The payload ceiling is not a universal daemon RSS claim: extreme short reads
 can amplify chunk/Vec metadata, and public attachments clone replay without a
 global attachment quota. The canonical pressure workload measures and caps its
 declared chunking and eight-wide replay surface only. General attachment
-admission, chunk-cardinality policy, manual history deletion, secure erasure,
+admission, chunk-cardinality policy, automatic history deletion, secure erasure,
 and arbitrary Backend event replay remain separate decisions.
 
 ## Wrong-case corpus
@@ -633,6 +724,12 @@ mapping without masquerading as additional normalized corpus cases.
   ceiling under an adverse publication order.
 - Terminal state can precede output-reader, input-drain, tmux Control, or
   persistence-owner quiescence; dropping the Run then hides a live owner.
+- A client `remove` racing a concurrent removal, an admission-triggered
+  replacement that already took the same candidate, or the Run's own terminal
+  finalize must not double-free or diverge: the `Removing` fence and the
+  idempotent `run_not_found` on an absent id make the loser a clean no-op, and a
+  durable delete that cannot be classified keeps the fence and fail-stops rather
+  than guessing in memory.
 
 These obligations become active only with the implementation and mapped public
 or deterministic-owner fixtures.
@@ -666,6 +763,14 @@ or deterministic-owner fixtures.
 - T-005: the source-bound canonical nightly fills and turns over 128 records in
   each mode, restarts persistent state, verifies maximum replay pressure and
   the ordinary soak, and fails closed on telemetry or frozen-identity drift.
+- Client `remove`: focused fixtures in
+  `crates/ctxmux-daemon/src/tests/creation.rs` prove that removing a terminal
+  Run frees a slot a `run_capacity`-rejected Start then uses (a net release, not
+  replacement), that removing a running Run is refused `invalid_run_state`, that
+  an attached Run is refused `backend_unavailable` and stays intact, that a
+  double or unknown removal is idempotent `run_not_found`, and that persistent
+  removal deletes the byte-exact durable row so a restarted daemon recovers one
+  fewer record with the removed key unbound.
 
 ## Repository evidence
 

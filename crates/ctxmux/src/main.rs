@@ -37,6 +37,7 @@ usage:
   ctxmux [--socket <path>] fork [--operation-key <key>] <run-id>
   ctxmux [--socket <path>] list
   ctxmux [--socket <path>] status <run-id>
+  ctxmux [--socket <path>] remove <run-id>
   ctxmux [--socket <path>] input <run-id> <text>
   ctxmux [--socket <path>] input <run-id> --stdin
   ctxmux [--socket <path>] resize <run-id> <cols> <rows>
@@ -83,6 +84,7 @@ async fn run() -> Result<(), String> {
             | "fork"
             | "list"
             | "status"
+            | "remove"
             | "input"
             | "resize"
             | "interrupt"
@@ -126,6 +128,12 @@ async fn run() -> Result<(), String> {
             ensure_empty(&args)?;
             let run = client.status(id).await.map_err(|error| error.to_string())?;
             print_run(&run);
+        }
+        "remove" => {
+            let id = take_run_id(&mut args)?;
+            ensure_empty(&args)?;
+            client.remove(id).await.map_err(|error| error.to_string())?;
+            println!("{id}\tremoved");
         }
         "input" => input(&client, args).await?,
         "resize" => resize(&client, args).await?,

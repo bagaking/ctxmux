@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
 use super::{Run, RunControl, STOP_ACK_TIMEOUT, control_not_applied, read_lock, write_lock};
-use crate::native_control::{ControlResult, PendingStop};
+use crate::native_control::{ControlResult, DetachedNativeDescriptors, PendingStop};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
 const CREATION_STRIPES: usize = 64;
@@ -1169,6 +1169,11 @@ struct RegistryEntry {
 enum RegistryResidency {
     Retained,
     Collecting(PublicationTicket),
+    /// Fenced for an in-flight explicit removal while its durable row is
+    /// deleted. Like `Collecting`, it blocks pins, candidate selection, and
+    /// creation-key resolution; unlike it, it has no publication ticket and is
+    /// released by restoring `Retained` or by exact removal.
+    Removing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1571,10 +1576,13 @@ impl RunRegistry {
         }
         match entry.residency {
             RegistryResidency::Retained => Ok(Some(entry.run.info())),
-            RegistryResidency::Collecting(_) => Err(ProtocolError::new(
-                ErrorCode::BackendUnavailable,
-                "Run creation is temporarily unavailable while its retained owner is being replaced",
-            )),
+            RegistryResidency::Collecting(_) | RegistryResidency::Removing => {
+                Err(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "Run creation is temporarily unavailable while its retained owner is being \
+                     replaced or removed",
+                ))
+            }
         }
     }
 
@@ -1964,13 +1972,98 @@ impl RunRegistry {
         };
         match entry.residency {
             RegistryResidency::Retained => Ok(Some(Arc::clone(&entry.run))),
-            RegistryResidency::Collecting(_) => Err(ProtocolError::new(
-                ErrorCode::BackendUnavailable,
-                format!(
-                    "Run {id} is temporarily unavailable while its retained owner is being replaced"
-                ),
-            )),
+            RegistryResidency::Collecting(_) | RegistryResidency::Removing => {
+                Err(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    format!(
+                        "Run {id} is temporarily unavailable while its retained owner is being \
+                         replaced or removed"
+                    ),
+                ))
+            }
         }
+    }
+
+    /// Reclaim one already-terminal, unpinned, quiescent Run entirely in memory.
+    ///
+    /// This shares the exact eligibility notion `collection_ordinal` encodes for
+    /// exact replacement: a running, attached, pinned, still-controlled, or
+    /// not-yet-quiescent Run is refused, and the same irreversible descriptor
+    /// detach closes the native PTY owners exactly once before the entry leaves
+    /// the Registry. Removal never spawns and never funds a successor, so it
+    /// needs no publication ticket, overlap permit, or capacity admission.
+    pub(crate) fn remove_memory(&self, id: RunId) -> Result<(), ProtocolError> {
+        let mut state = write_lock(&self.state);
+        let removed = take_removable_entry(&mut state, id)?;
+        sync_registry_stats(&self.qualification_stats, &state);
+        drop(state);
+        // Drop the detached descriptors and the Run outside the Registry lock.
+        drop(removed);
+        Ok(())
+    }
+
+    /// Fence one eligible terminal Run for an in-flight durable removal.
+    ///
+    /// The exact candidate identity is returned so the persistence actor can
+    /// delete the same row; the Registry entry stays `Removing` (blocking pins,
+    /// candidate selection, and key resolution) until the returned owner either
+    /// commits the exact in-memory removal or is dropped, which restores it.
+    pub(crate) fn begin_persistent_removal(
+        &self,
+        id: RunId,
+    ) -> Result<(PersistentCollectionCandidate, PersistentRemoval), ProtocolError> {
+        let mut state = write_lock(&self.state);
+        let entry = validate_removable_entry(&state, id)?;
+        let candidate = PersistentCollectionCandidate {
+            id,
+            operation_key: entry.operation_key.clone().ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("persistent Run {id} has no exact creation key to remove"),
+                )
+            })?,
+            metadata_bytes: entry
+                .metadata_bytes
+                .as_ref()
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCode::Internal,
+                        format!("persistent Run {id} has no durable metadata accounting"),
+                    )
+                })?
+                .load(Ordering::Acquire),
+        };
+        // Detach and drop descriptors before durable work, proving Backend-local
+        // quiescence exactly as exact replacement does; the entry is otherwise
+        // fully restorable if the durable delete fails.
+        let detached = state
+            .runs
+            .get(&id)
+            .expect("validated removal candidate remains Registry-owned")
+            .run
+            .detach_collection_descriptors()
+            .map_err(|error| {
+                ProtocolError::new(
+                    ErrorCode::Internal,
+                    format!("failed to fence Run {id} for removal: {error}"),
+                )
+            })?;
+        state
+            .runs
+            .get_mut(&id)
+            .expect("validated removal candidate remains Registry-owned")
+            .residency = RegistryResidency::Removing;
+        sync_registry_stats(&self.qualification_stats, &state);
+        drop(state);
+        drop(detached);
+        Ok((
+            candidate,
+            PersistentRemoval {
+                state: Arc::clone(&self.state),
+                qualification_stats: self.qualification_stats.clone(),
+                id: Some(id),
+            },
+        ))
     }
 
     /// Copy current public state without creating a long-lived Run owner.
@@ -2113,6 +2206,144 @@ impl Drop for PublicationReservation {
     }
 }
 
+/// Validate that `id` names a Run eligible for reclamation, returning a typed
+/// error otherwise. This is the single source of the removal eligibility rules
+/// and must agree with `Run::collection_ordinal`: not running (`InvalidRunState`
+/// mirrors how recovered Runs reject state changes), not fenced, and owned only
+/// by the Registry with a proven terminal ordinal and quiescent Backend
+/// (`BackendUnavailable`), else absent (`RunNotFound`, so removal is idempotent).
+fn validate_removable_entry(
+    state: &RegistryState,
+    id: RunId,
+) -> Result<&RegistryEntry, ProtocolError> {
+    let Some(entry) = state.runs.get(&id) else {
+        return Err(ProtocolError::new(
+            ErrorCode::RunNotFound,
+            format!("Run {id} does not exist"),
+        ));
+    };
+    if entry.residency != RegistryResidency::Retained {
+        return Err(ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            format!("Run {id} is already being replaced or removed"),
+        ));
+    }
+    if entry.run.is_running() {
+        return Err(ProtocolError::new(
+            ErrorCode::InvalidRunState,
+            format!("Run {id} is still running; stop it before removing"),
+        ));
+    }
+    if Arc::strong_count(&entry.run) != 1 {
+        return Err(ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            format!("Run {id} is attached or in use and cannot be removed"),
+        ));
+    }
+    if entry.run.collection_ordinal().is_none() {
+        return Err(ProtocolError::new(
+            ErrorCode::BackendUnavailable,
+            format!("Run {id} has not reached collectable quiescence"),
+        ));
+    }
+    Ok(entry)
+}
+
+/// Remove one exact Registry entry and its key mappings, returning the owned
+/// entry so its `Arc<Run>` and detached descriptors drop outside the lock. The
+/// caller must have validated eligibility while holding the same write lock.
+fn remove_registry_entry(state: &mut RegistryState, id: RunId) -> RegistryEntry {
+    let removed = state
+        .runs
+        .remove(&id)
+        .expect("validated removal candidate remains Registry-owned");
+    if let Some(operation_key) = &removed.operation_key {
+        let mapped = state.creation_runs.remove(operation_key);
+        debug_assert_eq!(mapped, Some(id));
+    }
+    if let Some(stop_operation) = &removed.stop_operation {
+        let mapped = state.stop_runs.remove(&stop_operation.key);
+        debug_assert_eq!(mapped, Some(id));
+    }
+    removed
+}
+
+/// Validate, detach descriptors, and remove one eligible entry under one lock.
+fn take_removable_entry(
+    state: &mut RegistryState,
+    id: RunId,
+) -> Result<RemovedEntry, ProtocolError> {
+    validate_removable_entry(state, id)?;
+    let detached = state
+        .runs
+        .get(&id)
+        .expect("validated removal candidate remains Registry-owned")
+        .run
+        .detach_collection_descriptors()
+        .map_err(|error| {
+            ProtocolError::new(
+                ErrorCode::Internal,
+                format!("failed to detach Run {id} descriptors for removal: {error}"),
+            )
+        })?;
+    Ok(RemovedEntry {
+        _entry: remove_registry_entry(state, id),
+        _detached: detached,
+    })
+}
+
+/// Owned Registry entry plus any detached native descriptors, dropped together
+/// outside the Registry lock so each descriptor closes exactly once. The fields
+/// are never read: the type exists only to carry both owners past the lock and
+/// drop them there.
+struct RemovedEntry {
+    _entry: RegistryEntry,
+    _detached: Option<DetachedNativeDescriptors>,
+}
+
+/// RAII owner of one in-flight durable removal fence.
+///
+/// While held, the fenced entry stays `Removing`. `commit` performs the exact
+/// in-memory removal after the durable delete succeeds; `Drop` without a commit
+/// restores `Retained`, so a failed or unclassified durable delete leaves the
+/// Run fully intact and re-resolvable.
+#[must_use = "a durable removal fence must be committed or restored"]
+pub(crate) struct PersistentRemoval {
+    state: Arc<RwLock<RegistryState>>,
+    qualification_stats: QualificationStats,
+    id: Option<RunId>,
+}
+
+impl PersistentRemoval {
+    /// Remove the fenced entry and its key mappings after a durable COMMIT.
+    pub(crate) fn commit(mut self) {
+        let id = self.id.take().expect("removal fence commits exactly once");
+        let mut state = write_lock(&self.state);
+        debug_assert_eq!(
+            state.runs.get(&id).map(|entry| entry.residency),
+            Some(RegistryResidency::Removing)
+        );
+        let removed = remove_registry_entry(&mut state, id);
+        sync_registry_stats(&self.qualification_stats, &state);
+        drop(state);
+        drop(removed);
+    }
+}
+
+impl Drop for PersistentRemoval {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else {
+            return;
+        };
+        let mut state = write_lock(&self.state);
+        if let Some(entry) = state.runs.get_mut(&id) {
+            debug_assert_eq!(entry.residency, RegistryResidency::Removing);
+            entry.residency = RegistryResidency::Retained;
+        }
+        sync_registry_stats(&self.qualification_stats, &state);
+    }
+}
+
 fn restore_reservation(state: &mut RegistryState, ticket: PublicationTicket) {
     let Some(reservation) = state.reservations.remove(&ticket) else {
         debug_assert!(false, "active publication ticket remains registered");
@@ -2133,7 +2364,7 @@ fn sync_registry_stats(telemetry: &QualificationStats, registry_state: &Registry
         .runs
         .values()
         .filter_map(|entry| match entry.residency {
-            RegistryResidency::Retained => None,
+            RegistryResidency::Retained | RegistryResidency::Removing => None,
             RegistryResidency::Collecting(ticket) => Some(ticket),
         })
         .collect::<std::collections::HashSet<_>>()

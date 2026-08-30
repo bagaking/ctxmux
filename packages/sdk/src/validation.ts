@@ -261,6 +261,9 @@ function response(value: unknown, path: string): void {
         runInfo(run, `${path}.runs[${index}]`),
       );
       return;
+    case "removed":
+      runId(valueRecord.id, `${path}.id`);
+      return;
     default:
       throw invalid(`${path}.type`, "a known response discriminant");
   }

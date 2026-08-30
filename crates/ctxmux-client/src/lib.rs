@@ -512,6 +512,28 @@ impl Client {
         }
     }
 
+    /// Reclaim one already-terminal, unpinned Run so its retained record slot
+    /// returns to the daemon's budget.
+    ///
+    /// This never forces teardown: a running or attached Run is refused with a
+    /// typed [`ClientError`], and removing an unknown or already-removed id is
+    /// reported as [`ctxmux_protocol::ErrorCode::RunNotFound`], so a retry is
+    /// idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the Run cannot be removed in its current
+    /// state or the request cannot complete.
+    pub async fn remove(&self, id: RunId) -> Result<(), ClientError> {
+        match self.request(Request::Remove { id }).await? {
+            Response::Removed { id: removed } if removed == id => Ok(()),
+            Response::Removed { .. } => Err(ClientError::UnexpectedFrame(
+                "remove response named a different Run",
+            )),
+            _ => Err(ClientError::UnexpectedFrame("expected removed response")),
+        }
+    }
+
     /// Write bytes to one live Run.
     ///
     /// # Errors

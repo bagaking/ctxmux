@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -1187,6 +1187,13 @@ pub enum Request {
     List,
     /// Read current metadata for one Run.
     Status { id: RunId },
+    /// Reclaim one already-terminal, unpinned Run and its retained record.
+    ///
+    /// This releases a retained-but-terminal Run so its capacity slot returns
+    /// immediately, without waiting for a later `Start` to elect it as an exact
+    /// replacement candidate. It never forces a live Run down: a running,
+    /// attached, or otherwise still-owned Run is refused with a typed error.
+    Remove { id: RunId },
     /// Write bytes to a live Run's PTY.
     Input { id: RunId, data: Vec<u8> },
     /// Write one caller-keyed native Input whose result survives reconnect.
@@ -1308,6 +1315,8 @@ pub enum Response {
     Runs { runs: Vec<RunInfo> },
     /// Current metadata for one Run.
     Status { run: RunInfo },
+    /// One already-terminal Run and its retained record were reclaimed.
+    Removed { id: RunId },
     /// A control request reached its documented owner boundary.
     ControlAccepted {
         run: RunInfo,
@@ -1704,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_14_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_15_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1722,7 +1731,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 14,
+                    "protocolGeneration": 15,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -1795,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn output_chunks_use_strict_padded_base64_on_the_generation_14_wire() {
+    fn output_chunks_use_strict_padded_base64_on_the_generation_15_wire() {
         let chunk = OutputChunk {
             start_byte: 7,
             end_byte: 9,
@@ -1836,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_stop_requests_have_exact_generation_14_wire_shapes() {
+    fn recoverable_stop_requests_have_exact_generation_15_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -2006,6 +2015,42 @@ mod tests {
                     "code": "run_capacity",
                     "message": "retained Run capacity is unavailable"
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn remove_request_and_removed_response_have_exact_generation_15_wire_shapes() {
+        let id = RunId::new();
+        let request = Request::Remove { id };
+        let request_frame = ClientFrame::Request {
+            request: request.clone(),
+        };
+        assert_eq!(
+            decode_frame::<ClientFrame>(&encode_frame(&request_frame).unwrap()).unwrap(),
+            request_frame
+        );
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            serde_json::json!({
+                "type": "remove",
+                "id": id.to_string(),
+            })
+        );
+
+        let response = Response::Removed { id };
+        let response_frame = ServerFrame::Response {
+            response: response.clone(),
+        };
+        assert_eq!(
+            decode_frame::<ServerFrame>(&encode_frame(&response_frame).unwrap()).unwrap(),
+            response_frame
+        );
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            serde_json::json!({
+                "type": "removed",
+                "id": id.to_string(),
             })
         );
     }
