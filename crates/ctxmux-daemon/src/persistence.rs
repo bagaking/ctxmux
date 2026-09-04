@@ -3670,17 +3670,26 @@ impl StateStore {
         for (id, replay, durable_head) in batch {
             let groups = split_chunks(&replay.chunks)?;
             if groups.is_empty() {
-                if !transaction_batch.is_empty() {
-                    self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
-                    transaction_batch.clear();
-                    transaction_payload = 0;
-                    expected_heads.clear();
-                }
-                self.append_transaction_with_shutdown(
-                    &[(*id, replay.clone(), Arc::clone(durable_head))],
-                    None,
-                    shutdown,
-                )?;
+                // A chunkless replay still has an UPDATE to make -- its
+                // `truncated` flag and `first_available_byte` -- but it offers
+                // no bytes, so it is contiguous with everything and belongs in
+                // whatever transaction is already open.
+                //
+                // Giving it one of its own used to cost TWO fsyncs, not one:
+                // the arm flushed the pending batch to get out of the way, so
+                // an empty replay arriving mid-drain split the appends around
+                // it into separate transactions. The empty COMMIT is genuinely
+                // cheap (0.043 ms, measured); the flush it forced was not --
+                // that one carries real output, ~1.5-2.9 ms at
+                // `synchronous=FULL`. Every create ends in
+                // `activate_persistence_after_publication` appending
+                // `replay(0)`, so under a chatty fleet the split landed on the
+                // start path once per Run.
+                //
+                // No watermark moves here: `expected_heads` stays put, because
+                // a replay with no chunks advances nothing that the next group
+                // must be contiguous against.
+                transaction_batch.push((*id, replay.clone(), Arc::clone(durable_head)));
                 continue;
             }
             for (index, chunks) in groups.iter().enumerate() {
@@ -6208,27 +6217,29 @@ mod tests {
         );
     }
 
-    /// An empty replay reaches a real COMMIT -- and that COMMIT is cheap.
+    /// An empty replay rides along in the open transaction instead of splitting it.
     ///
     /// Every create ends in `activate_persistence_after_publication`, which
     /// appends `replay(0)` unconditionally. On a Run that has produced nothing
     /// -- the common case, since activation happens microseconds after spawn --
-    /// that replay is empty, and `append_batch` does not skip it: the
-    /// `groups.is_empty()` arm issues its own `append_transaction`.
+    /// that replay is empty.
     ///
-    /// Counting stops there, so this test only pins the count. It is NOT a
-    /// standing invitation to remove the append: the commit was measured at
-    /// 0.043 ms median against 0.303 ms for the same path carrying three bytes.
-    /// A COMMIT with no dirty page to flush is ~7x cheaper than one with, so
-    /// the create path would reclaim ~0.6% by skipping it. Guarding the call
-    /// site was investigated and rejected on that measurement.
+    /// The empty COMMIT itself is cheap and was measured so: 0.043 ms against
+    /// 0.303 ms for the same path carrying three bytes. That measurement is
+    /// what rejected guarding the CALL SITE, and it still holds. What it did
+    /// not price is the arm that used to handle the empty replay HERE: it
+    /// flushed whatever was already collected before opening its own
+    /// transaction, so an empty replay arriving mid-drain split the surrounding
+    /// appends into separate fsyncs. Those carry real output -- 1.5-2.9 ms each
+    /// at `synchronous=FULL` on the farm -- so the cost was never the empty
+    /// commit, it was the split.
     ///
-    /// Kept because the count is a real fact worth pinning: if a future change
-    /// makes this empty append expensive (a dirty page, a schema bump, an
-    /// autocheckpoint), the cost moves but this assertion will not notice --
-    /// re-measure rather than trusting the count alone.
+    /// Both halves are asserted: the empty replay alone still reaches exactly
+    /// one commit (it is not skipped -- its `truncated` and
+    /// `first_available_byte` still have to land), and an empty replay BETWEEN
+    /// two appends no longer multiplies the commit count.
     #[test]
-    fn an_empty_replay_still_costs_one_commit() {
+    fn an_empty_replay_joins_the_open_transaction() {
         let temp = TempDir::new().expect("create empty-append fixture");
         let state_dir = temp.path().join("state");
         let hooks = Arc::new(PersistenceTestHooks::default());
@@ -6263,6 +6274,47 @@ mod tests {
              vs 0.303 ms carrying bytes)"
         );
         assert_eq!(head.load(Ordering::Acquire), 0, "no bytes became durable");
+
+        // The regression this guards: the same empty replay sandwiched between
+        // two contiguous appends. All three are one contiguous run of bytes for
+        // one Run, so they belong in ONE transaction -- the empty one in the
+        // middle must not split them into three.
+        let bystander = RunId::new();
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start bystander fixture transaction");
+        insert_test_run(&transaction, bystander, "running", 1);
+        transaction.commit().expect("commit bystander fixture Run");
+
+        hooks.append_transaction_commits.store(0, Ordering::Release);
+        let bystander_head = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        store
+            .append_batch(&[
+                (
+                    bystander,
+                    replay(vec![chunk(0, b"aaa")]),
+                    Arc::clone(&bystander_head),
+                ),
+                (id, replay(Vec::new()), Arc::clone(&head)),
+                (
+                    bystander,
+                    replay(vec![chunk(3, b"bbb")]),
+                    Arc::clone(&bystander_head),
+                ),
+            ])
+            .expect("append around an empty replay");
+
+        assert_eq!(
+            hooks.append_transaction_commits.load(Ordering::Acquire),
+            1,
+            "an empty replay must not split the transaction it landed in"
+        );
+        assert_eq!(
+            bystander_head.load(Ordering::Acquire),
+            6,
+            "both real appends still became durable"
+        );
     }
 
     #[test]
