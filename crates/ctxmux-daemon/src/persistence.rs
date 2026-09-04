@@ -148,6 +148,13 @@ const COALESCE_ROW_BYTES: usize = 64 * 1024;
 /// drain — that is simply not the regime this constant is being priced for.
 /// See `docs/architecture/r24-the-create-was-never-doing-the-work.md`.
 pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 16;
+/// Depth of the lifecycle command queue.
+///
+/// Shallow on purpose — see [`PersistenceInner::lifecycle`]. Lifecycle verbs
+/// are rare and every caller blocks on its own reply, so this needs to hold
+/// only the handful that can be in flight across concurrent connections, not a
+/// burst.
+const LIFECYCLE_QUEUE_CAPACITY: usize = 8;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
@@ -375,6 +382,30 @@ pub(crate) struct Persistence {
 
 struct PersistenceInner {
     sender: mpsc::SyncSender<Command>,
+    /// Lifecycle commands, kept off `sender` so they do not queue behind the
+    /// append backlog.
+    ///
+    /// Measured on cn3 before this existed: at eight chatty Runs a `finalize`
+    /// spent 93.0 ms of its 94.9 ms waiting to be *dequeued*, against 1.8 ms of
+    /// actual work and **one microsecond** blocked at admission. The wait was
+    /// pure FIFO position — the command was already in the queue, just behind
+    /// up to a full depth of appends — and it scaled 5472x from a quiet fleet
+    /// to a loud one while the admission time did not move at all.
+    ///
+    /// That measurement is what picks a second channel over the alternatives.
+    /// A second `SQLite` connection cannot help: WAL permits one writer, enforced
+    /// by an exclusive lock held while frames are appended, so the lifecycle
+    /// transaction would block on that lock for the same interval and we would
+    /// additionally own `SQLITE_BUSY` retries. A second database file would
+    /// give isolation but costs cross-file atomicity, which WAL does not
+    /// provide for attached databases. Neither is needed for a command that is
+    /// merely standing in the wrong line.
+    ///
+    /// Depth is 8 and deliberately shallow. This is not a buffer: lifecycle
+    /// commands are rare and each caller blocks on its own reply, so the queue
+    /// exists to avoid a send-side stall, not to absorb a burst. Kafka's
+    /// KIP-291 sized its controller queue at 20 on the same reasoning.
+    lifecycle: mpsc::SyncSender<Command>,
     /// Appends handed to `sender` that the actor has not yet dequeued.
     ///
     /// The channel itself cannot be asked how full it is, and finding out by
@@ -636,6 +667,27 @@ impl AppendObserver {
     }
 }
 
+impl PersistenceInner {
+    /// Send one lifecycle command, then nudge the actor in case it is parked.
+    /// Returns whether the command was accepted; a refusal means the actor is
+    /// gone, which every caller turns into its own `ActorStopped` disposition.
+    ///
+    /// The nudge is `try_send`, never `send`. A blocking wake would put the
+    /// lifecycle caller right back behind the append backlog this channel
+    /// exists to escape — the bug, reintroduced through the fix. A refused
+    /// nudge is also provably harmless: `try_send` only fails when the append
+    /// channel is full, and a full append channel means the actor is not parked
+    /// in `recv()`, so it reaches the top of the loop on its own and finds the
+    /// command there.
+    fn send_lifecycle(&self, command: Command) -> bool {
+        if self.lifecycle.send(command).is_err() {
+            return false;
+        }
+        let _ = self.sender.try_send(Command::LifecycleWake);
+        true
+    }
+}
+
 impl Drop for PersistenceInner {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -860,11 +912,10 @@ impl PersistentRun {
             return;
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        if self
+        if !self
             .persistence
             .inner
-            .sender
-            .send(Command::Finalize {
+            .send_lifecycle(Command::Finalize {
                 id,
                 actual_pid,
                 replay,
@@ -873,7 +924,6 @@ impl PersistentRun {
                 metadata_bytes: Arc::clone(&self.metadata_bytes),
                 reply: reply_tx,
             })
-            .is_err()
         {
             return;
         }
@@ -908,6 +958,13 @@ impl Persistence {
     /// so the caller can fail-stop instead of exec-ing into a replay gap.
     pub(crate) fn barrier(&self) -> Result<(), PersistenceError> {
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
+        // Deliberately NOT on the lifecycle lane. A barrier's entire meaning is
+        // its FIFO position: it returns when every append enqueued before it has
+        // committed. Overtaking those appends would make it return early and
+        // tell `exec`-in-place that a replay is durable when it is not — the
+        // replay gap this call exists to prevent. The lifecycle lane is for
+        // commands that carry their own bytes; a barrier carries none and is
+        // pure ordering.
         if self
             .inner
             .sender
@@ -967,6 +1024,7 @@ impl Persistence {
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(LIFECYCLE_QUEUE_CAPACITY);
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let actor_queue_depth = Arc::clone(&queue_depth);
@@ -984,6 +1042,7 @@ impl Persistence {
                     admission_limits,
                     handoff,
                     &command_rx,
+                    &lifecycle_rx,
                     &actor_queue_depth,
                     &init_tx,
                     &actor_failure,
@@ -1007,6 +1066,7 @@ impl Persistence {
         let persistence = Self {
             inner: Arc::new(PersistenceInner {
                 sender: command_tx,
+                lifecycle: lifecycle_tx,
                 queue_depth,
                 failure,
                 shutdown,
@@ -1089,9 +1149,9 @@ impl Persistence {
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let (decision_tx, decision_rx) = mpsc::sync_channel(0);
         let (completion_tx, completion_rx) = mpsc::sync_channel(0);
-        self.inner
-            .sender
-            .send(Command::StageStart(Box::new(StageRequest {
+        if !self
+            .inner
+            .send_lifecycle(Command::StageStart(Box::new(StageRequest {
                 prepared: Box::new(prepared),
                 candidates,
                 receipt: receipt.clone(),
@@ -1099,13 +1159,13 @@ impl Persistence {
                 decision: decision_rx,
                 completion: completion_tx,
             })))
-            .map_err(|_| {
-                let _ = receipt.decide(StartDisposition::NotCommitted);
-                PersistentStartFailure::new(
-                    StartDisposition::NotCommitted,
-                    PersistenceError::ActorStopped,
-                )
-            })?;
+        {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return Err(PersistentStartFailure::new(
+                StartDisposition::NotCommitted,
+                PersistenceError::ActorStopped,
+            ));
+        }
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(StagedPersistentStart {
                 durable: Some(PersistentRun {
@@ -1144,14 +1204,12 @@ impl Persistence {
             return RemovalDisposition::NotRemoved(PersistenceError::Mutation(message));
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        if self
+        if !self
             .inner
-            .sender
-            .send(Command::RemoveTerminal {
+            .send_lifecycle(Command::RemoveTerminal {
                 candidate,
                 reply: reply_tx,
             })
-            .is_err()
         {
             return RemovalDisposition::NotRemoved(PersistenceError::ActorStopped);
         }
@@ -1494,6 +1552,10 @@ enum Command {
     Barrier {
         reply: mpsc::SyncSender<()>,
     },
+    /// Sent on the append channel purely to break the actor out of a blocking
+    /// `recv()` when a lifecycle command arrives on the other channel. Carries
+    /// nothing; the loop re-checks the lifecycle channel on its next turn.
+    LifecycleWake,
     Shutdown,
 }
 
@@ -1560,6 +1622,7 @@ fn actor_main(
     admission_limits: AdmissionLimits,
     handoff: Option<HandoffHint>,
     receiver: &mpsc::Receiver<Command>,
+    lifecycle_rx: &mpsc::Receiver<Command>,
     queue_depth: &AtomicUsize,
     init: &mpsc::SyncSender<ActorInit>,
     failure: &Mutex<Option<String>>,
@@ -1593,40 +1656,69 @@ fn actor_main(
 
     let mut pending = VecDeque::new();
     loop {
-        let command = match pending.pop_front() {
-            Some(command) => command,
-            None => match receiver.try_recv() {
-                Ok(command) => command,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-                Err(mpsc::TryRecvError::Empty) => {
-                    // Nothing is queued, so nothing is waiting on this thread.
-                    // Fold the WAL now, while the cost is nobody's latency, so
-                    // a later lifecycle verb inherits a small baseline rather
-                    // than an 8 MiB one. Measured on cn3 (Linux,
-                    // synchronous=FULL): folding costs ~1.6 ms/MiB, linear to
-                    // the 8 MiB admission ceiling (12.6 ms there), against
-                    // 0.016 ms for the same call on an already-zero WAL.
-                    //
-                    // This is an optimization only, and a weak one under load:
-                    // a chatty fleet's queue never empties, so this never fires
-                    // exactly when the WAL is largest. `fold_wal_below_ceiling`
-                    // is what actually bounds the baseline on the paths that
-                    // must prove a charge.
-                    //
-                    // Errors are deliberately dropped rather than latched: an
-                    // idle fold has no receipt to fail and no caller to inform,
-                    // and every path that depends on a bounded WAL still folds
-                    // and still proves its charge. A failure here costs only
-                    // the optimization.
-                    idle_fold_wal(&store, shutdown);
-                    match receiver.recv() {
+        // Lifecycle first, at every dequeue. This is the whole of R25: the
+        // command was never short of a slot (measured: 1 us blocked at
+        // admission), it was standing behind up to a full depth of appends
+        // (measured: 93.0 ms of a 94.9 ms `finalize` at eight chatty Runs).
+        //
+        // Checking here rather than reordering inside a batch is what keeps the
+        // R21 latch intact: lifecycle commands stay FIFO among themselves, so
+        // the lifecycle-vs-lifecycle edge that a `StageStart` must not cross —
+        // it may not overtake the `Finalize` of a candidate it evicts — is
+        // preserved by the single channel's own ordering.
+        let command = match lifecycle_rx.try_recv() {
+            Ok(command) => command,
+            Err(mpsc::TryRecvError::Disconnected | mpsc::TryRecvError::Empty) => {
+                match pending.pop_front() {
+                    Some(command) => command,
+                    None => match receiver.try_recv() {
                         Ok(command) => command,
-                        Err(_) => return,
-                    }
+                        Err(mpsc::TryRecvError::Disconnected) => return,
+                        Err(mpsc::TryRecvError::Empty) => {
+                            // Nothing is queued, so nothing is waiting on this thread.
+                            // Fold the WAL now, while the cost is nobody's latency, so
+                            // a later lifecycle verb inherits a small baseline rather
+                            // than an 8 MiB one. Measured on cn3 (Linux,
+                            // synchronous=FULL): folding costs ~1.6 ms/MiB, linear to
+                            // the 8 MiB admission ceiling (12.6 ms there), against
+                            // 0.016 ms for the same call on an already-zero WAL.
+                            //
+                            // This is an optimization only, and a weak one under load:
+                            // a chatty fleet's queue never empties, so this never fires
+                            // exactly when the WAL is largest. `fold_wal_below_ceiling`
+                            // is what actually bounds the baseline on the paths that
+                            // must prove a charge.
+                            //
+                            // Errors are deliberately dropped rather than latched: an
+                            // idle fold has no receipt to fail and no caller to inform,
+                            // and every path that depends on a bounded WAL still folds
+                            // and still proves its charge. A failure here costs only
+                            // the optimization.
+                            idle_fold_wal(&store, shutdown);
+                            // Block on the append channel alone. A lifecycle
+                            // sender that arrives while this thread is parked
+                            // pushes a `LifecycleWake` here to break it out —
+                            // and if that push is refused because the append
+                            // channel is full, the thread is not parked, so the
+                            // loop's own next turn finds the command. Polling
+                            // both channels instead would cost idle wakeups,
+                            // which this daemon spent a round driving to zero.
+                            match receiver.recv() {
+                                Ok(command) => command,
+                                Err(_) => return,
+                            }
+                        }
+                    },
                 }
-            },
+            }
         };
         match command {
+            // The wake token carries nothing and needs no handling: its only
+            // job was to break the actor out of a blocking `recv()`, and by the
+            // time this arm runs the lifecycle check at the top of the loop has
+            // already had its turn. Falling through to the next iteration is
+            // the whole behaviour.
+            Command::LifecycleWake => {}
             Command::StageStart(request) => {
                 // Fail closed before touching the store: a latched fatal
                 // failure must reject the mutation without driving any
@@ -7418,6 +7510,126 @@ mod tests {
             "packing may change row boundaries, never the bytes"
         );
         assert_eq!(recovered[0].replay.latest_output_bytes, head + 4);
+        drop(reopened);
+    }
+
+    /// A finalize that overtakes its own Run's queued appends must not latch
+    /// persistence, and must not lose their bytes.
+    ///
+    /// This is the hazard the lifecycle lane introduces, and it is the reverse
+    /// of the one that is easy to think of. The obvious worry is that the
+    /// overtaken appends are LOST; they are not, because `finalize` carries the
+    /// Run's full replay and `missing_chunks` commits whatever is not yet
+    /// durable. The real hazard is that they are REJECTED: `append_replay`
+    /// fails an append whose chunks pass `durable_head` once the Run is no
+    /// longer `running`, and that error goes through `remember_failure`, which
+    /// latches persistence off for every Run in the daemon.
+    ///
+    /// Before the lifecycle lane a finalize sat behind its Run's appends, so
+    /// they always landed while the Run was still running and the guard could
+    /// not fire. Now it overtakes them, so this fixture wedges the actor inside
+    /// one append, queues two more appends and the finalize behind it, and
+    /// releases — which is the exact interleaving production now produces.
+    #[test]
+    fn a_finalize_that_overtakes_its_runs_appends_does_not_latch() {
+        let temp = TempDir::new().expect("create overtake fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert overtake fixture");
+
+        // Wedge the actor inside the first append so everything after it queues.
+        // The pause fires BEFORE the batching loop, so on release the actor
+        // would otherwise swallow every queued append into that one batch and
+        // no overtake would occur — which is what an earlier version of this
+        // fixture measured while passing. The finalize is therefore sent while
+        // the actor is still wedged, so it is sitting on the lifecycle lane
+        // when the actor next picks, and the appends that arrive after it are
+        // the ones it overtakes.
+        let (reached, release) = persistence.pause_next_append();
+        let first = [b'a'; 64];
+        assert!(durable.append(info.id, replay(vec![chunk(0, &first)])));
+        reached.recv().expect("the actor reaches the append barrier");
+
+        let second = [b'b'; 64];
+        let third = [b'c'; 64];
+        let mut whole = Vec::new();
+        whole.extend_from_slice(&first);
+        whole.extend_from_slice(&second);
+        whole.extend_from_slice(&third);
+
+        // The finalize carries the Run's whole replay, as the real publication
+        // path does.
+        let finalize_replay = replay(vec![
+            chunk(0, &first),
+            chunk(64, &second),
+            chunk(128, &third),
+        ]);
+        let durable_for_thread = durable.clone();
+        let id = info.id;
+        let finalizer = std::thread::spawn(move || {
+            durable_for_thread.finalize(id, 42, finalize_replay, exited_state());
+        });
+        // Give the finalize time to land on the lifecycle lane, then queue the
+        // appends it must overtake.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let late_second = durable.append(info.id, replay(vec![chunk(64, &second)]));
+        let late_third = durable.append(info.id, replay(vec![chunk(128, &third)]));
+        assert!(
+            late_second && late_third,
+            "the append channel must still accept; a refusal would mean this \
+             fixture never created the overtake it exists to test"
+        );
+
+        release.send(()).expect("release the append barrier");
+        finalizer.join().expect("the finalize completes");
+
+        // The overtake must have actually happened, or this fixture is
+        // asserting nothing. When `finalize` takes the lifecycle lane it is
+        // dequeued BEFORE the two late appends, so by the time it returns the
+        // Run is already terminal and its durable head already covers all
+        // three chunks. Routed on the append lane instead, the finalize is
+        // dequeued last and this is still true at the end — so the head alone
+        // cannot distinguish them. What can: on the lifecycle lane the late
+        // appends are dequeued against a Run that is ALREADY terminal, which
+        // is precisely the state `append_replay` refuses to advance. A latch
+        // here is the failure this fixture exists to catch.
+        assert_eq!(
+            durable.durable_head(),
+            192,
+            "the finalize must have committed all three chunks"
+        );
+        // Let the overtaken appends be dequeued against the now-terminal Run.
+        persistence.barrier().expect("drain the overtaken appends");
+
+        // The overtaken appends are dequeued after the Run is terminal. Their
+        // bytes are already durable via the finalize, so they must be skipped
+        // rather than rejected.
+        assert!(
+            !persistence.is_failed(),
+            "a finalize overtaking its own Run's queued appends latched persistence"
+        );
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen overtaken state");
+        assert_eq!(recovered.len(), 1);
+        let recovered_bytes: Vec<u8> = recovered[0]
+            .replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(
+            recovered_bytes, whole,
+            "overtaking may reorder the commits, never drop the bytes"
+        );
         drop(reopened);
     }
 
