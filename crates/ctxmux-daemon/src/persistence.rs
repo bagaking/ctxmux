@@ -384,6 +384,14 @@ struct PersistenceTestHooks {
     /// write lands on the WAL rather than on the database file.
     fail_next_append_as_io_failure: AtomicI32,
     checkpoint_attempts: AtomicU64,
+    /// Idle folds are counted apart from `checkpoint_attempts`: they are a
+    /// different event (nobody is waiting on one), and folding them into the
+    /// same counter would let an idle fold satisfy a test that means to observe
+    /// the create path retrying a busy checkpoint.
+    idle_folds: AtomicU64,
+    /// Set by fixtures whose subject is the WAL state itself -- an idle fold
+    /// arriving first would zero the WAL out from under them.
+    suppress_idle_fold: AtomicBool,
 }
 
 #[cfg(test)]
@@ -1436,6 +1444,33 @@ enum StageCompletion {
 /// the reconciled recovered Runs.
 type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
 
+/// Fold the WAL while the actor's queue is empty, so the zero baseline the next
+/// `StageStart` requires is already there.
+///
+/// Returns whether a checkpoint actually ran, which is what the idle-fold tests
+/// assert on: an idle daemon must fold at most once and then stay quiet, or the
+/// 0.000% idle CPU this project already won would regress.
+fn idle_fold_wal(store: &StateStore, shutdown: &AtomicBool) -> bool {
+    if shutdown.load(Ordering::Acquire) {
+        return false;
+    }
+    #[cfg(test)]
+    if store
+        .test_hooks
+        .suppress_idle_fold
+        .load(Ordering::Acquire)
+    {
+        return false;
+    }
+    // The common case by far: the WAL is already zero because the last fold
+    // left it that way, and a daemon that is merely idle must not do disk work
+    // on every pass. One `stat` (~8 us on cn3) buys that.
+    if !matches!(file_len(&store.wal_path), Ok(bytes) if bytes > 0) {
+        return false;
+    }
+    store.try_fold_wal_once()
+}
+
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
@@ -1481,9 +1516,35 @@ fn actor_main(
     loop {
         let command = match pending.pop_front() {
             Some(command) => command,
-            None => match receiver.recv() {
+            None => match receiver.try_recv() {
                 Ok(command) => command,
-                Err(_) => return,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Nothing is queued, so nothing is waiting on this thread.
+                    // Fold the WAL now, while the cost is nobody's latency, so
+                    // the next `StageStart` finds the zero baseline its
+                    // admission proof already requires instead of paying to
+                    // create one. Neither the checkpoint at :2606 nor the
+                    // `wal_bytes == 0` assertion at :2703 changes -- this only
+                    // decides *when* the bytes get folded. Measured on cn3
+                    // (Linux, synchronous=FULL): folding costs ~1.6 ms/MiB,
+                    // linear to the 8 MiB admission ceiling (12.6 ms there),
+                    // against 0.016 ms for the same call on an already-zero
+                    // WAL. That gap is what a create stops paying, and it is
+                    // why a chatty fleet's creates cost 11-15 ms where the
+                    // quiet benchmark sees 7 ms.
+                    //
+                    // Errors are deliberately dropped rather than latched: an
+                    // idle fold has no receipt to fail and no caller to inform,
+                    // and every path that actually depends on a zero WAL still
+                    // checkpoints and still proves it. A failure here costs
+                    // only the optimization.
+                    idle_fold_wal(&store, shutdown);
+                    match receiver.recv() {
+                        Ok(command) => command,
+                        Err(_) => return,
+                    }
+                }
             },
         };
         match command {
@@ -2828,6 +2889,25 @@ impl StateStore {
 
     fn truncate_wal_to_zero(&self) -> Result<(), PersistenceError> {
         self.truncate_wal_to_zero_with_shutdown(None)
+    }
+
+    /// One `wal_checkpoint(TRUNCATE)` attempt, with no retry and no sleeping.
+    ///
+    /// The idle fold runs on the actor thread with nothing queued behind it,
+    /// but a command can arrive at any moment. `retry_wal_checkpoint` would
+    /// sleep up to 550 ms across its 8 attempts waiting out a reader, and that
+    /// wait would be charged to whatever arrives next. A busy WAL simply means
+    /// the fold does not happen this time; the create path still folds and
+    /// still proves its zero baseline.
+    fn try_fold_wal_once(&self) -> bool {
+        #[cfg(test)]
+        self.test_hooks.idle_folds.fetch_add(1, Ordering::AcqRel);
+        let checkpointed = self
+            .connection
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            });
+        matches!(checkpointed, Ok(busy) if busy == 0)
     }
 
     fn truncate_wal_to_zero_with_shutdown(
@@ -4911,9 +4991,9 @@ mod tests {
         PersistentCandidate, PersistentStartCompletion, RETAINED_RUN_RECORDS,
         RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
         StartDisposition, StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES,
-        WAL_CHECKPOINT_MAX_RETRIES, WAL_MAX_BYTES, append_replay, create_schema, metadata_size,
-        mutex_lock, prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
-        validate_existing_schema, wal_charge_for_cache,
+        WAL_CHECKPOINT_MAX_RETRIES, WAL_MAX_BYTES, append_replay, create_schema, file_len,
+        idle_fold_wal, metadata_size, mutex_lock, prune_global_replay_to, retry_transient_storage,
+        retry_wal_checkpoint, validate_existing_schema, wal_charge_for_cache,
     };
     use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 
@@ -5911,11 +5991,17 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
         assert!(recovered.is_empty());
+        let hooks = Arc::clone(&persistence.inner.test_hooks);
+        // This fixture's subject is a reader pinning WAL frames, so it needs
+        // those frames to still be there when the reader snapshots. The actor's
+        // idle fold would zero them first, leaving nothing to pin and no busy
+        // checkpoint to observe. Suppress before writing the row that creates
+        // them, not after: the actor can drain and fold in between.
+        hooks.suppress_idle_fold.store(true, Ordering::Release);
         let info = running_info(RunId::new());
         let _durable = persistence
             .insert_start(&test_operation_key(info.id), &info)
             .expect("insert reader fixture Run");
-        let hooks = Arc::clone(&persistence.inner.test_hooks);
         hooks.checkpoint_attempts.store(0, Ordering::Release);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
@@ -5962,6 +6048,202 @@ mod tests {
         assert!(
             persistence.checkpoint_attempts() >= 2,
             "the owner must have observed and retried the busy checkpoint"
+        );
+    }
+
+    /// The actor folds the WAL when its queue drains, so a later `StageStart`
+    /// finds the zero baseline its admission proof requires instead of paying
+    /// ~1.6 ms/MiB to create one (cn3, synchronous=FULL, linear to the 8 MiB
+    /// ceiling). This pins the fold actually happening off the client's path.
+    #[test]
+    fn a_drained_queue_folds_the_wal_before_the_next_start_needs_it() {
+        let temp = TempDir::new().expect("create idle fold fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, _recovered) = Persistence::open(&state_dir).expect("open persistence");
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert idle fold fixture Run");
+
+        // Dirty the WAL the way a producing Run does, then let the queue drain.
+        let payload = vec![b'x'; 64 * 1024];
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, &payload)])));
+        persistence.barrier().expect("drain the append");
+
+        let wal = state_dir.join(format!("{DATABASE_FILE}-wal"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if file_len(&wal).unwrap_or(0) == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            file_len(&wal).unwrap_or(u64::MAX),
+            0,
+            "a drained queue must leave the WAL folded, so the next start does not pay for it"
+        );
+        assert!(!persistence.is_failed());
+    }
+
+    /// The guard for the metric this project already won: idle CPU is 0.000%,
+    /// and a fold that fires on every pass through the dequeue loop -- rather
+    /// than only when the WAL is actually dirty -- would quietly undo that.
+    ///
+    /// Drives `idle_fold_wal` directly rather than racing the actor: the
+    /// property is "a zero WAL costs no checkpoint", which is a property of the
+    /// function, and asserting it here needs no sleeping.
+    #[test]
+    fn an_idle_fold_skips_a_wal_that_is_already_zero() {
+        let temp = TempDir::new().expect("create idle quiet fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (store, _recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open idle quiet fixture store");
+        let shutdown = AtomicBool::new(false);
+
+        store
+            .truncate_wal_to_zero()
+            .expect("reach the zero baseline the fold is supposed to notice");
+        let baseline = hooks.idle_folds.load(Ordering::Acquire);
+
+        for _ in 0..64 {
+            assert!(
+                !idle_fold_wal(&store, &shutdown),
+                "an already-zero WAL must not be folded again"
+            );
+        }
+
+        assert_eq!(
+            hooks.idle_folds.load(Ordering::Acquire),
+            baseline,
+            "64 idle passes issued checkpoints against a zero WAL; the skip is \
+             not holding and idle CPU will regress"
+        );
+    }
+
+    /// The other half: a dirty WAL must actually get folded, or the create path
+    /// keeps paying ~1.6 ms/MiB to reach its own zero baseline.
+    #[test]
+    fn an_idle_fold_zeroes_a_dirty_wal_exactly_once() {
+        let temp = TempDir::new().expect("create idle dirty fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open idle dirty fixture store");
+        let shutdown = AtomicBool::new(false);
+        store.truncate_wal_to_zero().expect("start from zero");
+
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start idle dirty fixture transaction");
+        insert_test_run(&transaction, RunId::new(), "running", 1);
+        transaction.commit().expect("dirty the WAL with a real row");
+        assert!(
+            file_len(&store.wal_path).expect("read WAL length") > 0,
+            "the fixture must leave WAL bytes for the fold to find"
+        );
+
+        assert!(idle_fold_wal(&store, &shutdown), "a dirty WAL must fold");
+        assert_eq!(
+            file_len(&store.wal_path).expect("read WAL length"),
+            0,
+            "the fold must leave the zero baseline a later start requires"
+        );
+        let after = hooks.idle_folds.load(Ordering::Acquire);
+        assert!(
+            !idle_fold_wal(&store, &shutdown),
+            "the WAL is zero now; a second fold must be skipped"
+        );
+        assert_eq!(
+            hooks.idle_folds.load(Ordering::Acquire),
+            after,
+            "the skip must cost no checkpoint"
+        );
+    }
+
+    /// The wiring guard. The three fixtures above test `idle_fold_wal` itself,
+    /// so deleting its call site leaves every one of them green -- this one
+    /// goes through the real actor and fails if the fold is never reached.
+    #[test]
+    fn the_actor_folds_the_wal_once_its_queue_drains() {
+        let temp = TempDir::new().expect("create actor idle fold fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert actor idle fold fixture Run");
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, &[b'x'; 64 * 1024])])));
+        persistence.barrier().expect("drain the queued append");
+
+        // The barrier returns once the append has committed; the fold happens
+        // on the actor's next trip through an empty queue, so poll rather than
+        // sleep a fixed amount.
+        let wal = state_dir.join(format!("{DATABASE_FILE}-wal"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut folded = false;
+        while Instant::now() < deadline {
+            if file_len(&wal).unwrap_or(u64::MAX) == 0 {
+                folded = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(
+            folded,
+            "a drained actor queue left {} WAL bytes; the next start will pay \
+             ~1.6 ms/MiB to fold them itself",
+            file_len(&wal).unwrap_or(u64::MAX)
+        );
+        assert!(!persistence.is_failed());
+    }
+
+
+    #[test]
+    fn an_idle_fold_does_nothing_once_shutdown_is_set() {
+        let temp = TempDir::new().expect("create idle shutdown fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open idle shutdown fixture store");
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start idle shutdown fixture transaction");
+        insert_test_run(&transaction, RunId::new(), "running", 1);
+        transaction.commit().expect("dirty the WAL");
+        assert!(
+            file_len(&store.wal_path).expect("read WAL length") > 0,
+            "the fixture must leave a dirty WAL"
+        );
+
+        let shutdown = AtomicBool::new(true);
+        let before = hooks.idle_folds.load(Ordering::Acquire);
+        assert!(!idle_fold_wal(&store, &shutdown));
+        assert_eq!(
+            hooks.idle_folds.load(Ordering::Acquire),
+            before,
+            "a shutting-down actor must not checkpoint"
         );
     }
 
