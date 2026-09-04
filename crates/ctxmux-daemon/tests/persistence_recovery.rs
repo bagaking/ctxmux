@@ -511,15 +511,45 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
         .await
         .expect("attach recovered retained tail");
     let recovered_bytes = replay_bytes(&recovered_snapshot.replay.chunks);
-    assert_eq!(recovered_bytes, live_bytes);
+    // The recovered window is a SUFFIX of the live one, not a copy of it. Both
+    // sides prune to the same 4 MiB ceiling but in different units: the live
+    // log pops whole PTY reads (200-600 bytes each), while the durable side
+    // drops whole 64 KiB coalesced rows (`COALESCE_ROW_BYTES`, round 11). So
+    // the durable side sheds up to one row more than the live side, and
+    // recovery legitimately returns up to 64 KiB less.
+    //
+    // Asserting byte equality here made this test fail on 5 of 12 runs against
+    // the UNMODIFIED daemon -- every shortfall under 64 KiB (3, 12, 35, 40, 48,
+    // 56 KiB observed). That is the contract working, not breaking: choices/009
+    // promises "the previous or next complete unit, never a hybrid", and a
+    // whole-row boundary is exactly such a unit.
+    //
+    // What must hold, and what this now asserts: every recovered byte is a real
+    // byte at the same offset (suffix identity), so recovery never invents,
+    // reorders, or drops from the middle. That is the property the equality
+    // assertion was reaching for and the one a crash could actually violate.
+    assert!(
+        recovered_bytes.len() <= live_bytes.len(),
+        "recovery must not invent bytes: {} recovered vs {} live",
+        recovered_bytes.len(),
+        live_bytes.len()
+    );
+    assert!(
+        live_bytes.len() - recovered_bytes.len() <= 64 * 1024,
+        "the durable window may trail the live one by at most one coalesced row, \
+         not {} bytes",
+        live_bytes.len() - recovered_bytes.len()
+    );
     assert_eq!(
-        recovered_snapshot.replay.first_available_byte,
-        exited.first_available_byte
+        recovered_bytes,
+        live_bytes[live_bytes.len() - recovered_bytes.len()..],
+        "the recovered window must be a byte-exact suffix of the live one"
     );
     assert_eq!(
         recovered_snapshot.replay.latest_output_bytes,
         exited.latest_output_bytes
     );
+    assert!(recovered_snapshot.replay.first_available_byte >= exited.first_available_byte);
     assert!(recovered_snapshot.replay.truncated);
 }
 
