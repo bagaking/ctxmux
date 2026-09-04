@@ -124,12 +124,16 @@ mod tests {
     const TOTAL_CEILING: u64 = 16 * 1024 * 1024;
 
     /// One staged spill-disabled transaction on a WAL that already carries
-    /// `baseline_target` bytes of unrelated frames.
+    /// `baseline_target` bytes of frames.
+    ///
+    /// With `overlap`, the baseline also holds pages the measured transaction
+    /// dirties again; without it, the baseline is entirely disjoint and a
+    /// `baseline_target` of 0 reaches the commit on a genuinely empty WAL.
     ///
     /// Returns `(baseline, bound, actual)`: the WAL length admission would
     /// have recorded, the charge derived from the pre-COMMIT cache footprint,
     /// and the WAL length after COMMIT.
-    fn staged_transaction_on_baseline(baseline_target: u64) -> (u64, u64, u64) {
+    fn staged_transaction_on_baseline(baseline_target: u64, overlap: bool) -> (u64, u64, u64) {
         let directory = tempdir().unwrap();
         let database = directory.path().join("proof.sqlite3");
         let wal = directory.path().join("proof.sqlite3-wal");
@@ -151,8 +155,43 @@ mod tests {
         assert_eq!(page_size, i64::try_from(PAGE_BYTES).unwrap());
 
         // Grow the WAL with writes that are *not* the measured transaction, so
-        // the measured one genuinely appends after existing frames.
-        let wal_len = || fs::metadata(&wal).map_or(0, |metadata| metadata.len());
+        // the measured one genuinely appends after existing frames. A missing
+        // WAL is a broken fixture, not an empty one: reporting it as zero would
+        // let every later assertion pass against a file that is not there.
+        let wal_len = || {
+            fs::metadata(&wal)
+                .expect("the WAL exists once journal_mode=WAL is set")
+                .len()
+        };
+
+        // Seed `facts` itself so the baseline holds pages the measured
+        // transaction dirties again -- its root and interior pages. A disjoint
+        // baseline only proves that residency of *unrelated* pages is free;
+        // production's lifecycle transaction overlaps pages the chatty output
+        // path already wrote, so the proof has to cover that too.
+        //
+        // The row count is fixed rather than scaled to the target: more rows in
+        // `facts` means a deeper B-tree, and the measured insert would touch
+        // extra interior pages for reasons that have nothing to do with WAL
+        // residency. Measured against the pinned amalgamation, seeding this way
+        // holds at 1342 frames from a 440 KiB baseline to an 8.4 MiB one, while
+        // growing the baseline with rows in `facts` instead moves it 1339->1343
+        // -- that variant would fail this test for B-tree shape, not residency.
+        if overlap {
+            for id in 0..64i64 {
+                connection
+                    .execute(
+                        "INSERT INTO facts(id, value) VALUES (?1, randomblob(1024));",
+                        [1_000_000 + id],
+                    )
+                    .unwrap();
+            }
+            assert!(
+                wal_len() > 0,
+                "the seed must leave `facts` pages resident in the WAL"
+            );
+        }
+
         while wal_len() < baseline_target {
             connection
                 .execute_batch("INSERT INTO ballast(value) VALUES (zeroblob(65536));")
@@ -197,54 +236,65 @@ mod tests {
     /// reproduces the absolute form this test used to assert, so a failure
     /// there means the harness broke rather than the hypothesis.
     ///
+    /// Both sweeps run: a disjoint baseline (only unrelated frames) and an
+    /// overlapping one (the baseline also holds `facts` pages the measured
+    /// transaction dirties again, which is the shape production presents). The
+    /// invariant is checked *within* each sweep — the two modes write slightly
+    /// different frame counts because seeding changes the B-tree, and comparing
+    /// across them would test shape rather than residency.
+    ///
     /// 8 MiB is the largest baseline the daemon can present, because
     /// `fold_wal_below_ceiling` checkpoints anything above it.
     #[test]
     fn cache_bound_covers_spill_disabled_wal_growth_from_any_baseline() {
-        let mut previous_delta = None;
-        for baseline_target in [0, 64 * 1024, 2 * 1024 * 1024, CHECKPOINT_CEILING] {
-            let (baseline, bound, actual) = staged_transaction_on_baseline(baseline_target);
-            assert!(
-                baseline >= baseline_target,
-                "baseline {baseline} never reached target {baseline_target}"
-            );
-            assert!(bound <= CHECKPOINT_CEILING, "charge {bound} exceeds 8 MiB");
-            assert!(
-                baseline.saturating_add(bound) <= TOTAL_CEILING,
-                "baseline {baseline} plus charge {bound} exceeds the 16 MiB total"
-            );
-
-            let delta = actual
-                .checked_sub(baseline)
-                .expect("the WAL grows monotonically across a commit");
-            // An empty WAL has no header yet, so the first commit onto one pays
-            // for it; every later commit appends frames only.
-            let frames_written = if baseline == 0 {
-                delta
-                    .checked_sub(WAL_HEADER_BYTES)
-                    .expect("a commit onto an empty WAL writes its 32-byte header")
-            } else {
-                delta
-            };
-            assert_eq!(
-                frames_written % FRAME_BYTES,
-                0,
-                "growth is a whole number of frames"
-            );
-            assert!(
-                delta <= bound,
-                "WAL grew {delta} from baseline {baseline}, exceeding bound {bound}"
-            );
-            // The frames written must also not depend on the baseline, or the
-            // charge would have to grow with WAL residency to stay sound.
-            if let Some(previous) = previous_delta {
-                assert_eq!(
-                    frames_written, previous,
-                    "the same transaction wrote {frames_written} frame bytes off baseline \
-                     {baseline} but {previous} off a smaller one"
+        for overlap in [false, true] {
+            let mut previous_delta = None;
+            for baseline_target in [0, 64 * 1024, 2 * 1024 * 1024, CHECKPOINT_CEILING] {
+                let (baseline, bound, actual) =
+                    staged_transaction_on_baseline(baseline_target, overlap);
+                assert!(
+                    baseline >= baseline_target,
+                    "baseline {baseline} never reached target {baseline_target}"
                 );
+                assert!(bound <= CHECKPOINT_CEILING, "charge {bound} exceeds 8 MiB");
+                assert!(
+                    baseline.saturating_add(bound) <= TOTAL_CEILING,
+                    "baseline {baseline} plus charge {bound} exceeds the 16 MiB total"
+                );
+
+                let delta = actual
+                    .checked_sub(baseline)
+                    .expect("the WAL grows monotonically across a commit");
+                // An empty WAL has no header yet, so the first commit onto one
+                // pays for it; every later commit appends frames only.
+                let frames_written = if baseline == 0 {
+                    delta
+                        .checked_sub(WAL_HEADER_BYTES)
+                        .expect("a commit onto an empty WAL writes its 32-byte header")
+                } else {
+                    delta
+                };
+                assert_eq!(
+                    frames_written % FRAME_BYTES,
+                    0,
+                    "growth is a whole number of frames"
+                );
+                assert!(
+                    delta <= bound,
+                    "WAL grew {delta} from baseline {baseline}, exceeding bound {bound}"
+                );
+                // The frames written must also not depend on the baseline, or
+                // the charge would have to grow with WAL residency to stay
+                // sound.
+                if let Some(previous) = previous_delta {
+                    assert_eq!(
+                        frames_written, previous,
+                        "the same transaction wrote {frames_written} frame bytes off baseline \
+                         {baseline} but {previous} off a smaller one (overlap={overlap})"
+                    );
+                }
+                previous_delta = Some(frames_written);
             }
-            previous_delta = Some(frames_written);
         }
     }
 }
