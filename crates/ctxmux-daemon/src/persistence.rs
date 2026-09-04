@@ -128,13 +128,26 @@ const COALESCE_ROW_BYTES: usize = 64 * 1024;
 /// finalize for any other Run: this queue can stall the fleet, and the depth is
 /// what bounds for how long.
 ///
-/// That is why this is 64 and not the 1024 it buffered at before. A loud fleet
-/// refills every slot the actor frees, so at 1024 the queue sits pinned full and
-/// the wait *grows* with each consecutive stop: measured 1.2 s climbing to 3.5 s
-/// over ten stops. At 64 the same wait is flat at 0.24-0.49 s. Depth sets the
-/// escalation, not the level; `TERMINAL_VISIBILITY_GRACE` covers the level. See
-/// `docs/architecture/r22-the-stop-that-stops-lying.md`.
-pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 64;
+/// That is why this is 16 and not the 64 it buffered at before, nor the 1024
+/// before that. A loud fleet refills every slot the actor frees, so the queue
+/// sits pinned full and a lifecycle verb waits for the whole depth to drain.
+/// The drain rate is a hardware constant — measured 186 MB/s on the farm host,
+/// identical at both depths — so the wait is simply depth ÷ rate, and quartering
+/// the depth quarters the wait: c8 `start` 221 → 93 ms, `stop` 384 → 89 ms,
+/// `remove` 456 → 99 ms, with commit size unchanged to the byte (2696 B/write
+/// in both arms) and fleet throughput unchanged (0.995×).
+///
+/// 16 is where that trade is still free, and "free" is measured rather than
+/// assumed. Depth is often said to buy the output path larger transactions;
+/// between 64 and 16 it does not. Steady-state rows sit pinned at the
+/// `COALESCE_ROW_BYTES` ceiling either way (64082 B/row at 16 vs 64059 B at 64),
+/// bytes per write are identical, and write throughput is 0.995×: eight reactor
+/// threads keep the actor's `try_recv` non-empty, so a batch fills to
+/// `MAX_TRANSACTION_PAYLOAD_BYTES` long before the depth is what bounds it.
+/// Depth still buys burst absorption for a fleet quiet enough to let the queue
+/// drain — that is simply not the regime this constant is being priced for.
+/// See `docs/architecture/r24-the-create-was-never-doing-the-work.md`.
+pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 16;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
@@ -5600,7 +5613,7 @@ mod tests {
         assert_eq!(GLOBAL_REPLAY_BYTES, 256 * 1024 * 1024);
         assert_eq!(METADATA_BYTES, 64 * 1024 * 1024);
         assert_eq!(RUN_RECORD_FORMAT_ENVELOPE, 4_096);
-        assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 64);
+        assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 16);
         assert_eq!(DATABASE_MAX_BYTES, 384 * 1024 * 1024);
         assert_eq!(WAL_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(SHM_MAX_BYTES, 4 * 1024 * 1024);
@@ -7334,6 +7347,20 @@ mod tests {
     /// and the recovered bytes are identical to what was appended. Asserting
     /// "the coalescer coalesced" by re-deriving its own arithmetic would pass
     /// even if the rows were wrong.
+    ///
+    /// The 400 reads arrive as ONE `OutputReplay` because that is the shape
+    /// `coalesce_batch` hands the writer: a batch of appends for one Run is
+    /// merged into a single replay carrying every chunk. Offering them one at a
+    /// time through `append` instead would make this fixture a function of
+    /// `PERSISTENCE_QUEUE_CAPACITY` — `append_replay` flushes its pending buffer
+    /// unconditionally at the end (crash consistency: the buffer does not
+    /// survive the transaction), so one batch is one row boundary and the batch
+    /// is bounded by what `try_recv` can pull. Measured: 4 rows at capacity 64,
+    /// 20 at capacity 16, which is a performance knob moving a correctness
+    /// assertion. Production never sees that coupling — eight reactor threads
+    /// keep `try_recv` non-empty, so a real batch fills to
+    /// `MAX_TRANSACTION_PAYLOAD_BYTES` and rows sit at the 64 KiB ceiling
+    /// regardless of depth (measured 64082 B/row at 16 vs 64059 B at 64).
     #[test]
     fn many_small_appends_become_few_large_rows() {
         let temp = TempDir::new().expect("create coalescing fixture");
@@ -7346,18 +7373,22 @@ mod tests {
             .insert_start(&test_operation_key(info.id), &info)
             .expect("insert coalescing fixture");
 
-        // 400 appends of 512 B: the shape the reactor actually produces, and
+        // 400 reads of 512 B: the shape the reactor actually produces, and
         // 200 KiB in total, so a correct packing needs 4 rows at 64 KiB where
-        // one-row-per-append needed 400.
+        // one-row-per-read needed 400.
         let payload = [b'x'; 512];
         let mut head = 0_u64;
         let mut written = Vec::new();
+        let mut chunks = Vec::new();
         for _ in 0..400 {
-            let one = replay(vec![chunk(head, &payload)]);
-            expect_queued(durable.append(info.id, one));
+            chunks.push(chunk(head, &payload));
             written.extend_from_slice(&payload);
             head += payload.len() as u64;
         }
+        assert!(
+            durable.append(info.id, replay(chunks)),
+            "an empty queue must accept the first append"
+        );
         persistence.barrier().expect("the appends commit");
         assert!(!persistence.is_failed());
         assert_eq!(durable.durable_head(), head);
@@ -7373,7 +7404,7 @@ mod tests {
         let rows = recovered[0].replay.chunks.len();
         assert!(
             rows <= 16,
-            "400 appends of 512 B must pack into a handful of rows, got {rows}"
+            "400 reads of 512 B must pack into a handful of rows, got {rows}"
         );
         written.extend_from_slice(b"tail");
         let recovered_bytes: Vec<u8> = recovered[0]
