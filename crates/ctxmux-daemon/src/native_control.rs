@@ -3549,4 +3549,44 @@ mod tests {
             "the retained size equals the last size published"
         );
     }
+
+    /// The vendored portable-pty fork resolves a master's tty name lazily, from
+    /// the master, instead of eagerly from the slave at `openpty` time -- the
+    /// eager call cost more than the `openpty` it followed and grew with the
+    /// number of open ptys. Every spawn closes the slave, so the property that
+    /// makes the deferral safe is that the answer outlives that close.
+    ///
+    /// Lives here, not in the fork, because the fork is patched in via
+    /// `[patch.crates-io]` and its own tests never run.
+    #[test]
+    fn a_master_still_names_its_slave_after_the_slave_is_closed() {
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+
+        let while_open = pair
+            .master
+            .tty_name()
+            .expect("name the slave while it is open");
+        drop(pair.slave);
+        let after_close = pair
+            .master
+            .tty_name()
+            .expect("name the slave after it is closed");
+
+        assert_eq!(
+            while_open, after_close,
+            "one master named two different slaves across the slave's close"
+        );
+        assert!(
+            after_close.exists(),
+            "named a device that does not exist: {}",
+            after_close.display()
+        );
+    }
 }
