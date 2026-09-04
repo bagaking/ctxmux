@@ -3020,8 +3020,8 @@ impl StateStore {
     /// but a command can arrive at any moment. `retry_wal_checkpoint` would
     /// sleep up to 550 ms across its 8 attempts waiting out a reader, and that
     /// wait would be charged to whatever arrives next. A busy WAL simply means
-    /// the fold does not happen this time; the create path still folds and
-    /// still proves its zero baseline.
+    /// the fold does not happen this time; every path that must bound the WAL
+    /// folds on its own and proves its own charge.
     fn try_fold_wal_once(&self) -> bool {
         #[cfg(test)]
         self.test_hooks.idle_folds.fetch_add(1, Ordering::AcqRel);
