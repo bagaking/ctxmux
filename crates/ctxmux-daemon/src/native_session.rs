@@ -7,10 +7,13 @@ use std::{
 
 use portable_pty::{Child, ChildKiller, ExitStatus};
 #[cfg(not(target_os = "macos"))]
-use rustix::process::{getpgid, kill_process_group};
+use rustix::process::getpgid;
 use rustix::{
     io::Errno,
-    process::{Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, getsid, kill_process, waitid},
+    process::{
+        Pid, Signal, WaitId, WaitIdOptions, WaitIdStatus, getsid, kill_process, kill_process_group,
+        waitid,
+    },
 };
 
 /// Longest gap between quiescence checks. Reached by doubling from
@@ -119,12 +122,12 @@ impl NativeSession {
         forced: Duration,
     ) -> Result<(ctxmux_protocol::StopDisposition, ExitStatus), String> {
         self.signal_members(Signal::TERM)?;
-        if let Some(status) = self.wait_quiescent(child, Instant::now() + graceful)? {
+        if let Some(status) = self.wait_quiescent(child, Signal::TERM, Instant::now() + graceful)? {
             return Ok((ctxmux_protocol::StopDisposition::Graceful, status));
         }
 
         self.signal_members(Signal::KILL)?;
-        self.wait_quiescent(child, Instant::now() + forced)?
+        self.wait_quiescent(child, Signal::KILL, Instant::now() + forced)?
             .map(|status| (ctxmux_protocol::StopDisposition::Forced, status))
             .ok_or_else(|| {
                 format!(
@@ -155,11 +158,15 @@ impl NativeSession {
         self.signal_members(Signal::KILL)?;
         let mut backoff = QUIESCENCE_FIRST_POLL;
         while Instant::now() < deadline {
-            if self.members(false)?.is_empty() {
+            let members = self.members(false)?;
+            if members.is_empty() {
                 return self
                     .reap_leader(child)
                     .map(|status| (status, ctxmux_protocol::StopDisposition::Forced));
             }
+            // Survivors of a group-wide KILL left the group; sweep them off the
+            // census this loop already took.
+            let _ = self.signal_stragglers(&members, Signal::KILL);
             thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
             backoff = (backoff * 2).min(QUIESCENCE_POLL);
         }
@@ -169,15 +176,35 @@ impl NativeSession {
         ))
     }
 
+    /// Wait for the owned session to drain, sweeping any process the group-wide
+    /// signal could not reach.
+    ///
+    /// The census here is the proof of session-emptiness and is not optional:
+    /// it is what makes a returned Stop mean "nothing of this Run is left". Its
+    /// member list doubles as the straggler list, so the sweep is free.
     fn wait_quiescent(
         &mut self,
         child: &mut (dyn Child + Send + Sync),
+        signal: Signal,
         deadline: Instant,
     ) -> Result<Option<ExitStatus>, String> {
         let mut backoff = QUIESCENCE_FIRST_POLL;
         loop {
-            if self.leader_is_terminal()? && self.members(false)?.is_empty() {
-                return self.reap_leader(child).map(Some);
+            // The `&&` short-circuit is load-bearing: while the leader is still
+            // alive there is nothing to prove and no census is taken. Making
+            // this unconditional costs a full host walk per poll.
+            if self.leader_is_terminal()? {
+                let members = self.members(false)?;
+                if members.is_empty() {
+                    return self.reap_leader(child).map(Some);
+                }
+                // These outlived a signal to the whole group, so they left the
+                // group while staying in the session: signal them directly, off
+                // the census this loop already took. Failures are not fatal --
+                // the census is the authority on emptiness, and a straggler we
+                // cannot signal just keeps the loop going until the caller
+                // escalates or gives up.
+                let _ = self.signal_stragglers(&members, signal);
             }
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -187,11 +214,44 @@ impl NativeSession {
         }
     }
 
+    /// Signal every owned process, without walking the host to find them.
+    ///
+    /// `portable-pty` makes the child a session leader before exec, so the
+    /// leader's PID is also the initial process-group ID: `kill(-leader)`
+    /// reaches the whole group in one syscall. The walk this replaces cost
+    /// 1.009 ms of a 3.046 ms Stop on a 868-process farm host -- it existed
+    /// only to build the list of PIDs to signal, and in the common case that
+    /// list is just the leader.
+    ///
+    /// Reuse is safe without a fresh check: the leader is observed with
+    /// `NOWAIT` and reaped only at the end, so it stays a zombie in its own
+    /// group for this whole window, and a process-group ID cannot be recycled
+    /// while any member -- zombie included -- remains.
+    ///
+    /// The group is not the session. A descendant that called `setpgid` but not
+    /// `setsid` leaves the group while staying owned, so it survives this and is
+    /// swept by `signal_stragglers` off the census that `wait_quiescent` takes
+    /// anyway. (One that called `setsid` left the session and was never owned by
+    /// either path.)
     fn signal_members(&self, signal: Signal) -> Result<(), String> {
+        self.require_waitable_anchor()?;
+        match kill_process_group(self.id, signal) {
+            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Err(error) => Err(format!(
+                "failed to signal native session {} process group: {error}",
+                self.id.as_raw_pid()
+            )),
+        }
+    }
+
+    /// Signal owned processes the group-wide signal could not reach.
+    ///
+    /// Takes the members the caller already enumerated, so this adds no walk of
+    /// its own.
+    fn signal_stragglers(&self, stragglers: &[Pid], signal: Signal) -> Result<(), String> {
         let mut failures = Vec::new();
-        let leader_terminal = self.leader_is_terminal()?;
-        for pid in self.members(!leader_terminal)? {
-            if let Err(error) = self.signal_member(pid, signal) {
+        for pid in stragglers {
+            if let Err(error) = self.signal_member(*pid, signal) {
                 failures.push(error);
             }
         }
@@ -837,6 +897,91 @@ mod tests {
             elapsed < Duration::from_millis(5),
             "stop took {elapsed:?} for a child that dies on SIGTERM; the first \
              quiescence sleep is back to a flat poll interval"
+        );
+    }
+
+    /// A descendant that left the process group must still be stopped.
+    ///
+    /// `signal_members` signals the process GROUP in one syscall rather than
+    /// walking `/proc` to enumerate the session, which is what makes a Stop
+    /// cost one census instead of two. The group is not the session: a
+    /// descendant that called `setpgid` leaves the group while remaining
+    /// session-owned, so `kill(-leader)` cannot reach it and only the straggler
+    /// sweep in `wait_quiescent` does.
+    ///
+    /// This is the falsifier for that sweep. Deleting it leaves the escapee
+    /// alive, `members()` never empties, and the Stop fails its emptiness
+    /// requirement -- so the test goes red rather than silently weakening the
+    /// whole-session guarantee to tmux's leader-only one.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn stopping_reaches_a_descendant_that_left_the_process_group() {
+        // The escapee has to call `setpgid` itself: a shell only moves a
+        // background job into its own group when job control is on, and a
+        // session with no controlling terminal turns it off ("can't access
+        // tty"), so `set -m` yields no escapee here. `setsid --wait` makes the
+        // outer shell the session leader we adopt, as portable-pty does before
+        // exec.
+        let child = Command::new("setsid")
+            .args([
+                "--wait",
+                "/bin/sh",
+                "-c",
+                "python3 -c 'import os,time; os.setpgid(0,0); time.sleep(600)' & \
+                 /bin/sleep 600",
+            ])
+            .spawn()
+            .expect("spawn a leader that puts a child in its own group");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        let ready = Instant::now();
+        while Instant::now() - ready < Duration::from_secs(5) {
+            if super::getsid(Pid::from_raw(pid as i32))
+                .is_ok_and(|sid| sid.as_raw_pid() as u32 == pid)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut session = NativeSession::from_child_pid(pid).unwrap();
+
+        // Find the escapee: session-owned, but in a different process group.
+        let mut escapee = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let members = session.members(false).unwrap_or_default();
+            escapee = members.into_iter().find(|member| {
+                rustix::process::getpgid(Some(*member))
+                    .is_ok_and(|group| group.as_raw_pid() as u32 != pid)
+            });
+            if escapee.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let escapee = escapee.expect(
+            "the fixture must produce a session member outside the leader's \
+             process group, or it is not exercising the gap this test covers",
+        );
+
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+        session
+            .stop(
+                &mut adopted,
+                Duration::from_millis(500),
+                Duration::from_millis(2_000),
+            )
+            .expect("stop must drain the whole session, group escapees included");
+
+        // A successful Stop asserts the session is empty; prove the escapee is
+        // actually gone rather than trusting the disposition.
+        assert!(
+            super::getsid(Some(escapee)).is_err(),
+            "process {} left the leader's process group and survived the Stop; \
+             the straggler sweep in wait_quiescent is gone",
+            escapee.as_raw_pid()
         );
     }
 }
