@@ -112,16 +112,31 @@ was measured on the same host with the same ballast:
 Slope **0.041 us/MiB** against 17.95. Flat, as predicted — 21x at 128 MiB. Both
 halves go, not one.
 
-## The honest shortfall
+## The honest shortfall, and a denominator error worth recording
 
-The spawn law does not explain the whole gap, and claiming it does would be the
-fit-the-arithmetic error this project keeps making.
+My first reading of this was that spawn explains "about a third" of the gap.
+That was wrong, and the way it was wrong is instructive: it divided a
+*chatty-growth delta* (0.85 ms, the 47.5 MiB of resident growth from c0 to c8 at
+17.95 us/MiB) by a *per-operation total* (2.05-2.76 ms). Two different
+denominators, and the ratio between them means nothing.
 
-The daemon's resident growth from c0 to c8 is 47.5 MiB. At 17.95 us/MiB that is
-**0.85 ms** against a 2.05-2.76 ms per-op gap. Spawn is roughly **a third**. The
-remainder is a different mechanism and must not be attributed here until it is
-measured on its own. Recording the miss explicitly because a partial explanation
-that reads as complete is how the previous four misattributions happened.
+Priced properly — absolute spawn cost at each shape's actual resident size,
+against that shape's measured `start`:
+
+| shape | resident | `fork`+`exec` | `posix_spawn` | saving | `start` after | vs tmux |
+|---|---|---|---|---|---|---|
+| c1 | ~15 MB | 0.54 ms | 0.12 ms | 0.42 ms | 9.28 -> 8.86 | 2.13x -> **2.03x** |
+| c2 | ~22 MB | 0.67 ms | 0.12 ms | 0.55 ms | 11.07 -> 10.52 | 2.25x -> **2.14x** |
+| c8 | ~55 MB | 1.26 ms | 0.12 ms | 1.14 ms | 23.73 -> 22.59 | 2.10x -> **2.00x** |
+
+So the whole spawn path — both halves, copy and teardown — is **4.6-5.0% of
+`start`**. Removing all of it moves the tmux ratio from 2.10x to 2.00x.
+
+That is the real number, and it reframes the round. `start` is 9-24 ms and spawn
+is under 1.3 ms of it; **95% of `start` is somewhere else and is currently
+unattributed.** Sixteen rounds of internal tuning never surfaced this because
+they compared against our own previous numbers, where a 5% slice looks like a
+respectable win.
 
 ## The blocker, and why it is gone
 
@@ -153,27 +168,34 @@ fail and did fail where it should, so it is not vacuous.
 `POSIX_SPAWN_SETSID` + `addopen` of the slave replaces `TIOCSCTTY`. The one
 blocker is gone.
 
-## What this costs to build
+## Why this is not being built yet
 
-Not free, and worth stating before committing. `SlavePty::spawn_command` returns
-`Box<dyn Child + Send + Sync>`, so a raw-pid implementation is structurally
-possible — but `Child` requires `try_wait`, `wait`, `process_id`, `kill` and
-`clone_killer`, which means hand-rolling reap-state and the already-reaped race
-that `std::process::Child` currently handles.
+`SlavePty::spawn_command` returns `Box<dyn Child + Send + Sync>`, so a raw-pid
+implementation is structurally possible. But `Child` requires `try_wait`, `wait`,
+`process_id`, `kill` and `clone_killer`, which means hand-rolling reap state and
+the already-reaped race that `std::process::Child` handles today — in a vendored
+dependency, on the path that every Run's lifetime depends on.
 
-That is real surface area for ~0.85 ms of a 2.05-2.76 ms gap. It is still the
-right next move, because it is the only *identified* mechanism, it is worth
-2.1x on the verb where tmux beats us 2.1-2.25x, and its benefit grows with
-resident memory — which grows with fleet size, the direction this project cares
-about. But it should be built knowing it closes a third of the gap, not all of
-it.
+At 4.6-5.0% of `start`, that is the wrong trade *right now*. Not because the
+change is bad — it is well understood, the blocker is cleared, and its benefit
+grows with resident memory, which grows with fleet size. But spending it now
+would mean writing the riskiest code in the round to collect the smallest
+identified win, while 95% of the verb sits unexplained.
+
+The ordering is: find where the other 95% goes, then decide whether spawn is
+worth its complexity as a follow-up. If the remaining cost turns out to also
+scale with fleet size, the two may be worth doing together; if `start` is
+dominated by something fixable in our own code, this may never be worth it.
+
+Keeping the evidence rather than the patch, because the evidence is what was
+expensive: three harnesses (`.tmp-r17-teardown.c`, `.tmp-r17-pspawn.c`,
+`.tmp-r17-ctty.c`) and the finding that `TIOCSCTTY` has a working replacement.
 
 ## Next
 
-1. Implement `posix_spawn` in `third_party/portable-pty/src/unix.rs` behind the
-   attribute set above, keeping the `fork`+`exec` path for any configuration the
-   attributes cannot express.
-2. Re-run this exact batch. The tmux arm is the acceptance criterion now, not our
-   own previous number.
-3. Attribute the remaining two thirds of `start`, which is still unexplained and
-   should not be assumed to be more of the same.
+1. **Attribute the other 95% of `start`.** Segment the verb the way round 13 did
+   rather than guessing at lines — guessing was wrong five times out of six, and
+   segmenting hit it in one.
+2. Re-run this batch against tmux after any change. The tmux arm is the
+   acceptance criterion now, not our own previous number.
+3. Revisit `posix_spawn` once the dominant term is known.
