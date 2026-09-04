@@ -96,6 +96,38 @@ operation may cross the snapshot. Timeout or preflight failure drops the fence
 and restores full service. Extraction is the point of no return; later barrier,
 serialization, CLOEXEC, or `execve` failure is fail-stop.
 
+### The schema is a shape, and it is checked before the exec
+
+`HANDOFF_SCHEMA` gates whether the incoming image will adopt the manifest, and
+it is compared for exact equality *after* `execve`. That placement makes it the
+one constant in the daemon whose value can kill every live Run: a mismatch is
+discovered when the old process image no longer exists, so nothing can refuse,
+retry, or roll back, and the incoming image's exit closes the inherited pty
+masters — SIGHUP to every live child at once.
+
+Two consequences follow, and both are now enforced rather than documented.
+
+**The bump means one thing.** The schema names the manifest's serialized
+*shape*, not the code around it. History had been conflating two different
+changes under one string: v1→v2 and v2→v3 each added a required field, which
+genuinely breaks a reader; v3→v4 changed only byte budgets and shedding policy
+and moved no field at all, spending a fatal bump on an upgrade whose bytes were
+compatible. A unit test pins the schema string to the serialized field set, so
+the first kind of change fails the build and the second passes untouched.
+Budgets, policies and limits are free to move; fields are not.
+
+**The target is asked first.** `ctxmuxd --version` declares the schema it
+accepts, and the outgoing image probes the exec target before the point of no
+return. A skew is then a log line and a daemon that keeps serving, instead of a
+fleet-wide kill. A target that declares no schema is refused for the same
+reason: an image that cannot say what it accepts cannot be verified, and the
+handoff is not where optimism belongs. Only the handoff schema gates the
+upgrade — a protocol-generation skew costs clients a `VersionMismatch` and a
+reconnect, which is designed and recoverable, so it is deliberately not checked
+here. The post-exec equality check stays as the fail-closed backstop against a
+corrupt or substituted manifest; the probe is what keeps reaching it from being
+the normal way a version skew is discovered.
+
 Startup reconciliation, which today turns every `running` row into
 `interrupted { daemon_restart }`, gains one exclusion: rows whose `RunId` is in
 the inherited live set stay `running` and are re-adopted from their inherited

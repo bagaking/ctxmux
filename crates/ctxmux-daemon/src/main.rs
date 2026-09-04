@@ -93,16 +93,28 @@ async fn serve(
     }
 }
 
+/// Print what this binary is and what it can adopt.
+///
+/// The handoff schema is printed, not merely held, because a daemon about to
+/// exec-in-place has no other way to ask its upgrade target what it accepts.
+/// Reading it here — before the exec — turns a fatal cross-version upgrade into
+/// a logged, reversible refusal. `ctxmux_daemon::handoff_version_token` is the
+/// single source for the text so the printer cannot drift from the parser.
+fn print_version() {
+    println!(
+        "ctxmuxd {} (protocol {}, {})",
+        env!("CARGO_PKG_VERSION"),
+        PROTOCOL_VERSION,
+        ctxmux_daemon::handoff_version_token()
+    );
+}
+
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|value| value == "--version") {
         args.next();
         if args.next().is_none() {
-            println!(
-                "ctxmuxd {} (protocol {})",
-                env!("CARGO_PKG_VERSION"),
-                PROTOCOL_VERSION
-            );
+            print_version();
             return ExitCode::SUCCESS;
         }
         eprintln!("{}", usage());
