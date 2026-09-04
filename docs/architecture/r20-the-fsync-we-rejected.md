@@ -98,11 +98,23 @@ is the signature this project keeps meeting: **收益和劣化是同一个机制
 
 ## Root cause: cheaper commits deepen the queue, and `stop` is what waits on it
 
-The mechanism that fits all four shapes:
+First, what is *not* true, because I wrote it down before checking: it is not
+that `stop` alone is coupled to the fleet's output. On the unmodified BASE arm
+all three verbs slow down as output rises, by similar amounts:
+
+| verb | p50 c0→c8 | p90 c0→c8 | p90/p50 at c8 |
+|---|---|---|---|
+| start | 4.48 → 9.12 | 5.69 → 16.01 | 1.75 |
+| stop | 6.73 → 11.26 | 8.21 → 27.01 | 2.40 |
+| remove | 3.52 → 6.61 | 4.26 → 14.69 | 2.22 |
+
+That shared cost is the known persistence cliff, not this round's finding.
+
+What *is* specific to `stop` is the **derivative**: when persistence gets
+cheaper, `start` and `remove` get faster and only `stop` gets slower.
 
 - `start` and `remove` block on **their own** commit. NORMAL removes an fsync
-  from that commit, so both get faster — medians *and* tails, everywhere,
-  including shapes where nothing else moves.
+  from that commit, so both improve — medians *and* tails, at every shape.
 - `stop` blocks on a full reactor sweep whose bottom half scans output
   ([[ctxmux-stop-measures-reactor-sweep-not-poll-intervals]]). Cheaper commits
   let the persistence actor accept work faster, so more output is resident per
@@ -144,10 +156,12 @@ cannot be built as stated: `synchronous` is connection-scoped in SQLite and both
 paths share the connection, so "NORMAL for some statements" is not a thing the
 pragma expresses. Not attempted, and not worth a round.
 
-The real target this round exposes is not the pragma at all: **`stop` pays for a
-sweep whose length is set by other Runs' output.** Four shapes now agree that
-`stop` is the only verb whose latency is coupled to its neighbours' volume. That
-is a scheduling problem, and it is the best-evidenced open item on the board.
+The real target this round exposes is not the pragma at all: **`stop` is the one
+verb that gets worse when persistence gets cheaper.** Four shapes agree on the
+sign of that derivative. The lever is the per-sweep bound on output scanning,
+not the cost of a commit — and the round's own failure is the evidence that
+lowering commit cost without bounding the sweep moves latency from one verb to
+another rather than removing it.
 
 ## Durability, verified anyway
 
