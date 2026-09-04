@@ -145,8 +145,9 @@ child publication.
 The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main
 database). One transaction may append at most 8 MiB of WAL frames. Output is
 split into smaller ordered batches. Decision 013 supersedes the old logical
-payload estimate for retained-Run replacement: the actor now requires a
-zero-length WAL and proves the exact spill-disabled transaction from its
+payload estimate for retained-Run replacement: the actor now folds the WAL below
+the 8 MiB checkpoint ceiling, records that length as its admission baseline, and
+proves the exact spill-disabled transaction's WAL *growth* from its
 cache-resident page upper bound before physical launch. It therefore preserves
 both the 8 MiB transaction and 16 MiB total WAL ceilings without assuming that
 a 4 MiB replay payload maps to 4 MiB of modified pages. The shared-memory file

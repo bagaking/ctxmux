@@ -324,23 +324,34 @@ cache-resident page set, not from a payload estimate.
 The single persistence connection uses a scoped `cache_spill=OFF` guard only
 while staging this transaction and restores the prior setting on every commit,
 rollback, and error path. Immediately before an exact replacement it releases
-unpinned clean cache memory, requires
-a successful `TRUNCATE` checkpoint and a zero-length WAL, resets the connection
-cache-write and cache-spill counters, and begins one write transaction. It
-validates and deletes the Registry-selected exact candidates, including
-cascading replay, and inserts the new `Running` row with `pid = NULL`. The
-transaction remains uncommitted and the actor remains its sole owner. No child
-exists yet.
+unpinned clean cache memory, folds the WAL below the 8 MiB checkpoint ceiling
+and records the resulting length as its **admission baseline**, resets the
+connection cache-write and cache-spill counters, and begins one write
+transaction. It validates and deletes the Registry-selected exact candidates,
+including cascading replay, and inserts the new `Running` row with
+`pid = NULL`. The transaction remains uncommitted and the actor remains its sole
+owner. No child exists yet.
+
+The baseline replaces an earlier rule that checkpointed the WAL to *zero* here.
+That rule was never a correctness requirement: it was an economy, letting a
+single comparison of the WAL's absolute length prove both ceilings at once. It
+was also expensive. Under a chatty fleet the output path deliberately lets the
+WAL ride up to its 8 MiB trigger, so it sits near that value essentially always
+(sampled every 10 ms, it was at zero for 3.7% of samples at chatty=2), and every
+lifecycle verb folded that whole file at ~1.6 ms/MiB — about 13 ms, measured as
+85-99% of the gap between these verbs and tmux. The fold is now conditional on
+exceeding the checkpoint ceiling, which is the same shape the far hotter output
+path has always used.
 
 With spill disabled, SQLite cannot write a dirty page in the middle of that
 transaction. After every statement and cursor is finalized, the actor requires
 all of the following before it grants physical-launch admission:
 
-- the WAL file remains zero length;
+- the WAL file is still exactly its admission baseline length;
 - `SQLITE_DBSTATUS_CACHE_WRITE` and `SQLITE_DBSTATUS_CACHE_SPILL` remain zero;
 - `SQLITE_DBSTATUS_CACHE_USED` succeeds on the non-shared single connection;
-  and
-- the conservative charge below fits the 8 MiB transaction ceiling.
+- the conservative charge below fits the 8 MiB transaction ceiling; and
+- the baseline plus that charge fits the 16 MiB total ceiling.
 
 For SQLite page size `P = 4096`, WAL frame header `H = 24`, WAL file header
 `W = 32`, and reported cache bytes `M`, the charge is:
@@ -357,9 +368,19 @@ cached pages. Every dirty page is one of those cached pages. With spill off and
 no SQL after admission, COMMIT appends at most one frame for each dirty page;
 the commit marker is carried by the final page frame. Clean/schema pages and
 allocator overhead only make the charge more conservative. At 4 KiB pages the
-8 MiB ceiling admits the WAL header plus at most 2,036 frames. Because
-every staged replacement starts from a zero-length WAL, the separate 16 MiB
-total ceiling is also preserved.
+8 MiB ceiling admits the WAL header plus at most 2,036 frames.
+
+The charge bounds the transaction's WAL *growth*, which is what makes it sound
+off a non-zero baseline: a commit appends frames after the existing ones, and
+the frames it writes do not depend on how many were already there. This is
+proven against the pinned SQLite for baselines from zero to the checkpoint
+ceiling in `ctxmux-sqlite-status`, which also pins the growth to be
+baseline-independent — if it were not, the charge would have to grow with WAL
+residency to stay sound. The 16 MiB total ceiling is preserved by arithmetic
+rather than by an empty file: the baseline is at most 8 MiB because anything
+larger is folded, and no transaction may charge more than 8 MiB, so the
+post-COMMIT WAL cannot exceed 16 MiB. Admission checks that sum explicitly
+rather than relying on the two ceilings being equal.
 
 A changed WAL, an unsupported status counter, a nonzero write or spill count,
 an over-budget charge, or another pre-COMMIT condition returns `run_capacity`
@@ -376,7 +397,10 @@ or, after native spawn succeeds, requests COMMIT without issuing further SQL.
 The actor is intentionally serialized for this short spawn boundary; ordinary
 append/finalize commands remain in the existing bounded queue. This avoids a
 parallel WAL-charge ledger, a durable reservation, and a general transaction
-API.
+API. The admission baseline is not such a ledger: it is one `stat` of the WAL
+taken inside the same serialized staging window and discarded when that window
+closes, with no state carried between transactions and nothing for a second
+writer to disagree with.
 
 The durable `Running` row intentionally stores no PID. The live PID remains a
 fact of the current child-handle owner. A successful terminal finalize writes
@@ -490,7 +514,7 @@ Retained
 pins, candidate selection, and matching-key resolution — while the persistence
 actor deletes the byte-exact `(id, BINARY creation key, metadata_bytes,
 state_kind != 'running')` row and its cascading replay. That delete reuses the
-same scoped `cache_spill=OFF`, zero-length-WAL, page-charge admission proven for
+same scoped `cache_spill=OFF`, baseline-rebased page-charge admission proven for
 exact replacement; a delete-only transaction is strictly less work than the
 proven delete-plus-insert, so the frozen 8 MiB per-transaction and 16 MiB total
 WAL ceilings still bound it, and the fence is released by the exact in-memory
