@@ -603,12 +603,22 @@ pub(crate) struct PersistentRun {
     persistence: Persistence,
     durable_head: Arc<AtomicU64>,
     metadata_bytes: Arc<AtomicU64>,
-    /// Set when an `append` was refused, cleared once a catch-up has been
-    /// rendered to replace it. Lives here rather than on `Run` because it is
-    /// meaningless without the `durable_head` it pairs with: both are cloned
-    /// into every handle for one Run's binding and both die with it, so a
-    /// rebind cannot leave a stale "owed a catch-up" flag behind.
-    catch_up_owed: Arc<AtomicBool>,
+    /// The highest byte this Run has successfully handed to the actor — the
+    /// exclusive end of the newest ACCEPTED append, which is where the next
+    /// replay must start.
+    ///
+    /// This is deliberately NOT `durable_head`. Every accepted append either
+    /// commits or latches persistence off daemon-wide (`remember_failure`);
+    /// there is no third outcome in which a queued append is silently dropped.
+    /// So "offered" already implies "will be durable, or nothing is", and
+    /// re-sending bytes that are merely still IN FLIGHT buys no safety while
+    /// costing the whole difference between the two watermarks — which under
+    /// load is an entire queue depth of output.
+    ///
+    /// Lives here rather than on `Run` for the same reason `durable_head` does:
+    /// both are cloned into every handle for one Run's binding and die with it,
+    /// so a rebind cannot inherit a stale watermark.
+    offered_head: Arc<AtomicU64>,
 }
 
 pub(crate) struct CommittedStart {
@@ -631,22 +641,19 @@ impl PersistentRun {
 
     /// The byte offset the next replay must start at.
     ///
-    /// Normally this is `head`, the caller's own end-of-log: the previous append
-    /// was accepted, so only the newest bytes are outstanding and the render is
-    /// one chunk. After a refusal it is [`Self::durable_head`] instead, so the
-    /// replay carries every byte the dropped append would have — which is the
-    /// only thing that keeps a drop from becoming a forward gap.
+    /// Normally this is the caller's own end-of-log: the previous append was
+    /// accepted, so only the newest bytes are outstanding and the render is one
+    /// chunk. After a refusal or a skip it stays where the last ACCEPTED append
+    /// ended, so the replay carries the bytes the dropped append would have —
+    /// which is the only thing that keeps a drop from becoming a forward gap.
     ///
-    /// Consuming the flag here (rather than after a successful send) is
-    /// deliberate: the returned offset is a promise about the replay the caller
-    /// is ABOUT to render. If that send is then refused, `append` re-arms the
-    /// flag, so the debt is never dropped and never double-counted.
-    pub(crate) fn next_replay_start(&self, head: u64) -> u64 {
-        if self.catch_up_owed.swap(false, Ordering::AcqRel) {
-            self.durable_head()
-        } else {
-            head
-        }
+    /// Unlike the `durable_head`-based catch-up this replaced, rendering has no
+    /// side effect: the watermark advances only when `append` actually hands the
+    /// bytes over. A render that is then refused, or discarded because the Run
+    /// left `running`, simply never moved it, so there is no debt to re-arm and
+    /// no way to consume one twice.
+    pub(crate) fn next_replay_start(&self) -> u64 {
+        self.offered_head.load(Ordering::Acquire)
     }
 
     pub(crate) fn metadata_bytes_owner(&self) -> Arc<AtomicU64> {
@@ -665,22 +672,41 @@ impl PersistentRun {
     /// contiguity holds even when the queue is deep and nothing has been
     /// committed yet.
     ///
-    /// The moment this returns `false` that chain is broken, and the caller
-    /// MUST render the next replay from [`Self::durable_head`] instead. That
-    /// catch-up is what makes dropping safe: the watermark only advances after a
-    /// commit, so a dropped append leaves it where it was and the catch-up still
-    /// starts exactly at `durable_head`. Nothing is lost and no gap is ever
-    /// observable.
+    /// The moment this returns `false` that chain is broken, and the caller MUST
+    /// render the next replay from [`Self::next_replay_start`] instead. That
+    /// catch-up is what makes dropping safe: the offered watermark advances only
+    /// on acceptance, so a dropped append leaves it exactly where the last
+    /// accepted one ended. Nothing is lost and no gap is ever observable.
     ///
-    /// Rendering the catch-up UNCONDITIONALLY is not a safe conservative choice
-    /// — it is a fleet-scale wedge. `OutputLog::replay` copies every retained
-    /// chunk above the watermark (`retained_after` ends in `to_vec`), so once
-    /// the actor lags at all, every subsequent push copies `retained - durable`
-    /// bytes, bounded only by `OUTPUT_RETENTION_BYTES`. That cost lands inline on
-    /// the one thread described below, which makes the lag worse, which makes
-    /// the next copy bigger. Measured on 512 Runs x 40 chunks/s: admission
-    /// stalled at 211 Runs with the owner thread at 97.4% USER time, against
-    /// 512/512 admitted for the same load with persistence off.
+    /// Catching up from `durable_head` instead — the COMMITTED watermark — is
+    /// not a safe conservative choice, it is a fleet-scale wedge, and it was one
+    /// in two compounding ways.
+    ///
+    /// The first is the render. `OutputLog::replay` copies every retained chunk
+    /// above the start byte, so a catch-up from the committed watermark copies
+    /// `retained - durable` bytes, bounded only by `OUTPUT_RETENTION_BYTES`,
+    /// inline on the one thread described below. Measured on 512 Runs x 40
+    /// chunks/s: admission stalled at 211 Runs with the owner thread at 97.4%
+    /// USER time, against 512/512 admitted for the same load with persistence
+    /// off.
+    ///
+    /// The second is what the oversized replay then did to the ACTOR, and it is
+    /// the half that made the wedge a latch. Bytes between the committed and the
+    /// offered watermark are already queued, so re-sending them produced a
+    /// replay that OVERLAPPED the appends still in flight ahead of it. That
+    /// overlap is fatal to throughput twice over: `append_batch_with_shutdown`
+    /// re-splits by contiguity, so an overlapping replay is never
+    /// `is_fresh_contiguous` and gets a transaction (and an fsync) entirely to
+    /// itself instead of coalescing to `MAX_TRANSACTION_PAYLOAD_BYTES`; and
+    /// every chunk of it that has since committed takes the verify-against-
+    /// stored branch in `append_replay`, one `SELECT data` plus a full compare
+    /// per chunk. Slower commits deepen the queue, a deeper queue widens the
+    /// gap between the two watermarks, and a wider gap makes the next catch-up
+    /// bigger — a loop with no exit, which is why a chatty Run cost seconds per
+    /// lifecycle verb rather than a bounded penalty.
+    ///
+    /// Both halves have the same cure and it is this watermark: never re-send a
+    /// byte the actor already holds.
     ///
     /// A blocking send here would stall the whole fleet. Every native Run's
     /// output is read by ONE daemon-wide thread (`native_runtime::owner_main`),
@@ -700,7 +726,7 @@ impl PersistentRun {
     /// daemon-wide via `remember_failure` — so a drop would poison durability
     /// for every Run at exactly the moment the disk is under pressure. That is
     /// why the return value must be honoured rather than ignored.
-    #[must_use = "a refused append means the next replay must be a catch-up from durable_head"]
+    #[must_use = "a refused append leaves the offered watermark behind, which the next replay must start from"]
     pub(crate) fn append(&self, id: RunId, replay: OutputReplay) -> bool {
         // Record the offer's shape BEFORE anything can consume it, and before
         // the failure short-circuit, so a test sees exactly what the caller
@@ -718,10 +744,17 @@ impl PersistentRun {
             // acceptance rather than making the caller render catch-ups forever.
             return true;
         }
+        // The offset the actor will expect the NEXT append to start at, read
+        // before the replay is moved into the message. This mirrors the actor's
+        // own pending watermark exactly: `append_batch_with_shutdown` records
+        // `expected_heads` from the last group's `latest_output_bytes`, so any
+        // other choice here would re-introduce the overlap this watermark exists
+        // to prevent.
+        let offered_through = replay.latest_output_bytes;
         // `try_send` rather than `send`: see above. `Full` is absorbed by the
-        // next catch-up, which re-arming `catch_up_owed` is what schedules.
+        // next replay, which starts from the still-unmoved offered watermark.
         // `Disconnected` means the actor is gone, which `failure` already owns —
-        // it arms the flag too, which is merely a wasted render on a dead path,
+        // leaving the watermark put is merely a wasted render on a dead path,
         // never a correctness problem.
         let accepted = self
             .persistence
@@ -734,12 +767,18 @@ impl PersistentRun {
             })
             .is_ok();
         if accepted {
+            // Only acceptance moves the watermark. `fetch_max` rather than
+            // `store` keeps it monotone on its own terms: every caller today
+            // renders under `Run::persistence_transition` and so arrives in
+            // order, but a watermark that could move BACKWARDS would turn the
+            // next delta into a forward gap and latch persistence off
+            // daemon-wide, which is too sharp an edge to leave resting on a
+            // lock held in another module.
+            self.offered_head.fetch_max(offered_through, Ordering::AcqRel);
             self.persistence
                 .inner
                 .queue_depth
                 .fetch_add(1, Ordering::AcqRel);
-        } else {
-            self.catch_up_owed.store(true, Ordering::Release);
         }
         accepted
     }
@@ -756,19 +795,10 @@ impl PersistentRun {
     /// This is advisory, not an admission decision. The counter can lag the
     /// actor in either direction, so `try_send` still decides — a false "has
     /// room" merely costs the render we would have paid anyway, and a false
-    /// "full" skips one append that the next push's catch-up re-sends. Neither
-    /// can lose bytes, because skipping arms `catch_up_owed` exactly as a
-    /// refusal does.
+    /// "full" skips one append whose bytes the next render still carries,
+    /// because only acceptance moves the offered watermark.
     pub(crate) fn queue_has_room(&self) -> bool {
         self.persistence.inner.queue_depth.load(Ordering::Acquire) < PERSISTENCE_QUEUE_CAPACITY
-    }
-
-    /// Give up on this push without rendering, arming the next catch-up.
-    ///
-    /// The counterpart to `queue_has_room` returning false: the bytes are still
-    /// owed, so the debt is recorded exactly as a refused `append` records it.
-    pub(crate) fn defer_append(&self) {
-        self.catch_up_owed.store(true, Ordering::Release);
     }
 
     pub(crate) fn finalize(
@@ -1035,9 +1065,9 @@ impl Persistence {
                     durable_head: Arc::new(AtomicU64::new(0)),
                     metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
                     // A fresh Run starts at byte 0 with an empty log, so its
-                    // first delta already begins at the watermark and no
-                    // catch-up is owed.
-                    catch_up_owed: Arc::new(AtomicBool::new(false)),
+                    // first delta already begins at the watermark and nothing
+                    // is outstanding.
+                    offered_head: Arc::new(AtomicU64::new(0)),
                 }),
                 decision: Some(decision_tx),
                 completion: completion_rx,
@@ -1268,12 +1298,13 @@ impl Persistence {
             persistence: self.clone(),
             durable_head: Arc::new(AtomicU64::new(durable_head)),
             metadata_bytes: Arc::new(AtomicU64::new(metadata_bytes)),
-            // A recovered Run starts OWING a catch-up. Its in-memory log may
-            // already hold bytes above the recovered watermark (a rebind after
-            // the actor was replaced, say), and a delta would declare those
-            // bytes durable when they are not. Paying one catch-up on the first
-            // push is cheap; guessing wrong here is a permanent gap.
-            catch_up_owed: Arc::new(AtomicBool::new(true)),
+            // A recovered Run has offered the actor nothing, so its watermark
+            // starts at the recovered commit point. Its in-memory log may
+            // already hold bytes above that (a rebind after the actor was
+            // replaced, say), and those bytes ARE still outstanding — starting
+            // here is what makes the first push carry them instead of declaring
+            // them durable when they are not.
+            offered_head: Arc::new(AtomicU64::new(durable_head)),
         }
     }
 }

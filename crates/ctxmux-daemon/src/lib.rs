@@ -4070,59 +4070,47 @@ impl Run {
                     // throws every one of them away. Asking first costs one atomic
                     // load and turns the overloaded path into no work at all.
                     //
-                    // Nothing is lost by skipping: `defer_append` arms the same
-                    // debt a refusal arms, so the next push that does get through
-                    // carries these bytes in its catch-up.
+                    // Nothing is lost by skipping: only an accepted append moves
+                    // the offered watermark, so the next push that does get
+                    // through renders from here and carries these bytes.
                     let replay = match persistence.as_ref() {
                         None => Some(output.replay(chunk.start_byte)),
                         Some(durable) if durable.queue_has_room() => {
-                            // Render only what is actually outstanding. Normally
-                            // that is this push alone, because the previous append
-                            // was accepted and the actor stitches queued deltas
-                            // together against its own pending watermark — the
-                            // queue does not have to have committed anything for
-                            // the chain to be contiguous.
+                            // Render only what is actually outstanding: every
+                            // byte past the newest ACCEPTED append. Normally
+                            // that is this push alone, because the previous
+                            // append was accepted and the actor stitches queued
+                            // deltas together against its own pending watermark
+                            // — the queue does not have to have committed
+                            // anything for the chain to be contiguous.
                             //
-                            // After a refusal or a skip, `next_replay_start` hands
-                            // back `durable_head` instead, so the replay carries
-                            // the dropped bytes too. That is what keeps a drop from
-                            // becoming a forward gap, which `append_replay` rejects
-                            // and `remember_failure` then latches daemon-wide.
+                            // After a refusal or a skip the watermark has not
+                            // moved, so the replay carries the dropped bytes
+                            // too. That is what keeps a drop from becoming a
+                            // forward gap, which `append_replay` rejects and
+                            // `remember_failure` then latches daemon-wide.
                             //
-                            // Re-sent durable bytes are not duplicated:
-                            // `append_replay` verifies any chunk at or below the
-                            // watermark against the stored bytes and moves on.
-                            //
-                            // Rendering the catch-up unconditionally is what wedged
-                            // the fleet: `replay` copies every retained chunk above
-                            // the start byte, so once the actor lagged, each push
-                            // copied up to `OUTPUT_RETENTION_BYTES` inline on the
-                            // single reactor thread and the lag fed itself.
-                            Some(output.replay(durable.next_replay_start(chunk.start_byte)))
+                            // Catching up from the COMMITTED watermark instead
+                            // is what wedged the fleet: it re-sends bytes the
+                            // actor already holds, which both copies up to
+                            // `OUTPUT_RETENTION_BYTES` inline on this single
+                            // thread and overlaps the queued appends, defeating
+                            // the actor's coalescing so each one pays its own
+                            // fsync. Both effects deepen the queue that caused
+                            // them.
+                            Some(output.replay(durable.next_replay_start()))
                         }
-                        Some(durable) => {
-                            durable.defer_append();
-                            None
-                        }
+                        Some(_) => None,
                     };
                     (chunk, replay, running, persistence)
                 };
-                match (running, persistence, replay) {
-                    (true, Some(persistence), Some(replay)) => {
-                        // The refusal is recorded inside `append`, which re-arms the
-                        // catch-up for the next push.
-                        let _accepted = persistence.append(self.id, replay);
-                    }
-                    // Rendered, then dropped without being offered: the Run left
-                    // `running` between the render above and this check. The
-                    // render already consumed the catch-up debt via
-                    // `next_replay_start`, and nothing here re-arms it the way a
-                    // refusal or a skip does, so give it back. Otherwise the next
-                    // push starts at its own offset and `append_replay` sees a
-                    // forward gap it must reject -- which latches persistence
-                    // daemon-wide for every Run, not just this one.
-                    (false, Some(persistence), Some(_)) => persistence.defer_append(),
-                    _ => {}
+                // A render that is discarded here (the Run left `running`
+                // between the render and this check) needs no repair: it never
+                // reached `append`, so the offered watermark never moved.
+                if let (true, Some(persistence), Some(replay)) = (running, persistence, replay) {
+                    // A refusal simply leaves the offered watermark where it
+                    // was, so the next push renders these bytes again.
+                    let _accepted = persistence.append(self.id, replay);
                 }
                 chunk
             }
@@ -4378,9 +4366,9 @@ impl Run {
             self.publish_event(RunEvent::Exited { state: terminal });
         } else {
             // This is the whole log from byte 0, the one append that is
-            // deliberately not a delta. If the actor refuses it, `append` arms
-            // the catch-up so the next push re-sends from `durable_head` (still
-            // 0 here) rather than a delta that would strand these bytes.
+            // deliberately not a delta. If the actor refuses it, the offered
+            // watermark stays at 0, so the next push re-sends from there rather
+            // than a delta that would strand these bytes.
             let _accepted = persistence.append(self.id, replay);
         }
     }
@@ -8101,10 +8089,10 @@ mod tests {
         // rejects it comes AFTER. So under sustained overload — every send
         // refused — the reactor thread renders a replay for every push and
         // throws every one away. Bounding the render's size does not help here,
-        // because a refusal arms `catch_up_owed`, so the very next push renders
-        // the unbounded catch-up again. Measured at 512 Runs x 40 chunks/s,
-        // bounding alone moved admission from 199/512 to 325/512 and still
-        // stalled with the owner thread at 96.8% USER time.
+        // because a refusal leaves the offered watermark behind, so the very
+        // next push renders everything outstanding again. Measured at 512 Runs
+        // x 40 chunks/s, bounding alone moved admission from 199/512 to 325/512
+        // and still stalled with the owner thread at 96.8% USER time.
         //
         // The invariant: when the queue is visibly full, do NO per-chunk work
         // proportional to the log. This asserts the observable effect — that
@@ -8196,21 +8184,22 @@ mod tests {
         // reproduced end-to-end on a farm host with a chatty 32-Run fleet.
         //
         // `record_output` renders the replay under the `output` lock and only
-        // then checks `running`. The render calls `next_replay_start`, which
-        // CONSUMES the catch-up debt -- it is a promise about the replay the
-        // caller is about to offer. If the Run leaves `running` in between, the
-        // old code dropped that replay on the floor with the debt already
-        // cleared: a refusal re-arms the flag and a skip re-arms the flag, but
-        // render-then-discard re-armed nothing.
-        //
-        // The next push then offered a delta starting at its OWN offset while
-        // the actor's watermark still sat where the discarded replay began, so
+        // then checks `running`. The original defect was that rendering had a
+        // SIDE EFFECT: it consumed a `catch_up_owed` flag as a promise about the
+        // replay the caller was about to offer. A refusal re-armed the flag and
+        // a skip re-armed the flag, but render-then-discard re-armed nothing, so
+        // the next push offered a delta starting at its OWN offset while the
+        // actor's watermark still sat where the discarded replay began.
         // `append_replay` saw a forward gap, rejected it, and `remember_failure`
         // latched persistence off for EVERY Run in the daemon.
         //
-        // Asserts the observable consequence -- the next offer starts back at
-        // the durable head -- rather than reading the flag, which would just
-        // re-derive the predicate under test.
+        // The whole class is now structurally impossible: the watermark advances
+        // only inside `append`, on acceptance, so a render that never reaches
+        // the actor cannot move it and there is no debt to consume, drop, or
+        // double-count. This still asserts the observable consequence -- that a
+        // discarded render leaves the next offer covering the same bytes --
+        // because the guarantee is what matters, not the mechanism that provides
+        // it.
         let directory = tempfile::tempdir().expect("create mid-push run directory");
         let (persistence, _recovered) =
             Persistence::open(directory.path().join("state")).expect("open mid-push state");
