@@ -4107,13 +4107,22 @@ impl Run {
                     };
                     (chunk, replay, running, persistence)
                 };
-                if running
-                    && let Some(persistence) = persistence
-                    && let Some(replay) = replay
-                {
-                    // The refusal is recorded inside `append`, which re-arms the
-                    // catch-up for the next push.
-                    let _accepted = persistence.append(self.id, replay);
+                match (running, persistence, replay) {
+                    (true, Some(persistence), Some(replay)) => {
+                        // The refusal is recorded inside `append`, which re-arms the
+                        // catch-up for the next push.
+                        let _accepted = persistence.append(self.id, replay);
+                    }
+                    // Rendered, then dropped without being offered: the Run left
+                    // `running` between the render above and this check. The
+                    // render already consumed the catch-up debt via
+                    // `next_replay_start`, and nothing here re-arms it the way a
+                    // refusal or a skip does, so give it back. Otherwise the next
+                    // push starts at its own offset and `append_replay` sees a
+                    // forward gap it must reject -- which latches persistence
+                    // daemon-wide for every Run, not just this one.
+                    (false, Some(persistence), Some(_)) => persistence.defer_append(),
+                    _ => {}
                 }
                 chunk
             }
@@ -8177,6 +8186,114 @@ mod tests {
         assert!(
             mutex_lock(&run.output).latest_output_bytes() > 0,
             "the skip must not drop the Run's own retained bytes"
+        );
+    }
+
+    #[test]
+    fn a_run_that_leaves_running_mid_push_keeps_owing_its_catch_up() {
+        // REGRESSION GUARD for a daemon-wide persistence latch that actually
+        // happened: `durable replay gap: got 18451664, expected 17087786`,
+        // reproduced end-to-end on a farm host with a chatty 32-Run fleet.
+        //
+        // `record_output` renders the replay under the `output` lock and only
+        // then checks `running`. The render calls `next_replay_start`, which
+        // CONSUMES the catch-up debt -- it is a promise about the replay the
+        // caller is about to offer. If the Run leaves `running` in between, the
+        // old code dropped that replay on the floor with the debt already
+        // cleared: a refusal re-arms the flag and a skip re-arms the flag, but
+        // render-then-discard re-armed nothing.
+        //
+        // The next push then offered a delta starting at its OWN offset while
+        // the actor's watermark still sat where the discarded replay began, so
+        // `append_replay` saw a forward gap, rejected it, and `remember_failure`
+        // latched persistence off for EVERY Run in the daemon.
+        //
+        // Asserts the observable consequence -- the next offer starts back at
+        // the durable head -- rather than reading the flag, which would just
+        // re-derive the predicate under test.
+        let directory = tempfile::tempdir().expect("create mid-push run directory");
+        let (persistence, _recovered) =
+            Persistence::open(directory.path().join("state")).expect("open mid-push state");
+
+        let run_id = RunId::new();
+        let info = RunInfo {
+            id: run_id,
+            spec: Some(RunSpec {
+                program: "/bin/true".to_owned(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            }),
+            lineage: None,
+            backend: RunBackend::Native,
+            capabilities: RunCapabilities::NATIVE,
+            pid: Some(42),
+            state: RunState::Running,
+            latest_output_bytes: 0,
+            durable_output_bytes: Some(0),
+            first_available_byte: 0,
+            attachments: 0,
+            applied_input_bytes: Some(0),
+            current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+        };
+        let operation_key = CreateOperationKey::new("mid-push").expect("valid mid-push key");
+        let durable = persistence
+            .insert_start(&operation_key, &info)
+            .expect("seed the mid-push row")
+            .durable;
+        let run = Run::recover(
+            RecoveredRun {
+                operation_key,
+                info,
+                replay: OutputReplay {
+                    chunks: Vec::new(),
+                    first_available_byte: 0,
+                    latest_output_bytes: 0,
+                    truncated: false,
+                },
+                metadata_bytes: 0,
+            },
+            durable,
+            16,
+            TerminalPublicationOwner::default(),
+            crate::qualification_stats::QualificationStats::default(),
+            crate::retention::RetentionBudget::with_limit(u64::MAX),
+        );
+
+        // One accepted push, so the Run is in steady state and owes nothing.
+        run.record_output(b"first".to_vec());
+        persistence.barrier().expect("the first append commits");
+
+        // The Run exits. Its next push renders (the queue has room) and is then
+        // discarded by the `running` check -- this is the moment the debt was
+        // being lost.
+        *mutex_lock(&run.state) = RunState::Exited {
+            code: 0,
+            signal: None,
+        };
+        run.record_output(b"written while leaving".to_vec());
+
+        // Back to running, as a rebind would leave it, and push again. That
+        // offer must carry the discarded bytes, which means starting at the
+        // durable head rather than at this chunk's own offset.
+        *mutex_lock(&run.state) = RunState::Running;
+        let durable_head = mutex_lock(&run.persistence)
+            .active()
+            .expect("the Run is still persistent")
+            .durable_head();
+        let observed = persistence.capture_next_append_payload();
+        run.record_output(b"after".to_vec());
+        let offered = observed.take().expect("the next push offers a replay");
+
+        assert_eq!(
+            offered.first_byte,
+            Some(durable_head),
+            "a push that was rendered and then discarded must leave the catch-up \
+             owed; offering only the newest delta declares the discarded bytes \
+             durable and `append_replay` rejects the gap, latching persistence \
+             off for the whole daemon"
         );
     }
 
