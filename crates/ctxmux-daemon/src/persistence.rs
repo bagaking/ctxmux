@@ -912,19 +912,15 @@ impl PersistentRun {
             return;
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        if !self
-            .persistence
-            .inner
-            .send_lifecycle(Command::Finalize {
-                id,
-                actual_pid,
-                replay,
-                state,
-                durable_head: Arc::clone(&self.durable_head),
-                metadata_bytes: Arc::clone(&self.metadata_bytes),
-                reply: reply_tx,
-            })
-        {
+        if !self.persistence.inner.send_lifecycle(Command::Finalize {
+            id,
+            actual_pid,
+            replay,
+            state,
+            durable_head: Arc::clone(&self.durable_head),
+            metadata_bytes: Arc::clone(&self.metadata_bytes),
+            reply: reply_tx,
+        }) {
             return;
         }
         let _ = reply_rx.recv();
@@ -1204,13 +1200,10 @@ impl Persistence {
             return RemovalDisposition::NotRemoved(PersistenceError::Mutation(message));
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
-        if !self
-            .inner
-            .send_lifecycle(Command::RemoveTerminal {
-                candidate,
-                reply: reply_tx,
-            })
-        {
+        if !self.inner.send_lifecycle(Command::RemoveTerminal {
+            candidate,
+            reply: reply_tx,
+        }) {
             return RemovalDisposition::NotRemoved(PersistenceError::ActorStopped);
         }
         reply_rx.recv().unwrap_or(RemovalDisposition::NotRemoved(
@@ -7553,7 +7546,9 @@ mod tests {
         let (reached, release) = persistence.pause_next_append();
         let first = [b'a'; 64];
         assert!(durable.append(info.id, replay(vec![chunk(0, &first)])));
-        reached.recv().expect("the actor reaches the append barrier");
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
 
         let second = [b'b'; 64];
         let third = [b'c'; 64];

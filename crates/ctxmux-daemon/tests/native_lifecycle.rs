@@ -481,7 +481,8 @@ fn chatty_shell() -> RunSpec {
     }
 }
 
-fn raw_capture_shell(expected_bytes: usize) -> RunSpec {    RunSpec {
+fn raw_capture_shell(expected_bytes: usize) -> RunSpec {
+    RunSpec {
         program: "/bin/sh".to_owned(),
         args: vec![
             "-c".to_owned(),
