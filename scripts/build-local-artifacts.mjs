@@ -216,11 +216,19 @@ function artifactDescriptor(root, relativePath, maximumBytes, executable) {
   };
 }
 
-function parseBinaryVersion(name, output) {
-  const match = new RegExp(
-    `^${name} ([0-9]+\\.[0-9]+\\.[0-9]+) \\(protocol ([0-9]+)\\)$`,
+// The parenthesis holds an open-ended list of identity facts, not just the
+// protocol. `ctxmuxd` names its handoff schema there too, and only `ctxmuxd`
+// does, so this parser must read the protocol without asserting what follows it.
+// Pinning `)` to the protocol digits is what broke the vendor build when the
+// schema was added: the binaries were correct and this regex was not.
+const BINARY_VERSION = (name) =>
+  new RegExp(
+    `^${name} ([0-9]+\\.[0-9]+\\.[0-9]+) \\(protocol ([0-9]+)[,)]`,
     "u",
-  ).exec(output.trim());
+  );
+
+export function parseBinaryVersion(name, output) {
+  const match = BINARY_VERSION(name).exec(output.trim());
   if (match === null) {
     throw new Error(`${name} returned a malformed version identity`);
   }

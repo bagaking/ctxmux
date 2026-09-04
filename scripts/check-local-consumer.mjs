@@ -327,8 +327,25 @@ assert.equal(PROTOCOL_VERSION, expectedProtocol);
 
 const cliVersion = (await execFile(cliBinary, ["--version"])).stdout.trim();
 const daemonVersion = (await execFile(daemonBinary, ["--version"])).stdout.trim();
+// The CLI states product and protocol and stops there. The daemon states one
+// fact more — the handoff schema it can adopt across an exec-in-place upgrade —
+// because an upgrade target that cannot declare that is refused before the exec
+// rather than discovered after it. So the two are asserted on what they share,
+// then the daemon on the extra fact only it owns. Asserting a single exact
+// string for both is what broke when the schema was added.
 assert.equal(cliVersion, "ctxmux " + expectedVersion + " (protocol " + expectedProtocol + ")");
-assert.equal(daemonVersion, "ctxmuxd " + expectedVersion + " (protocol " + expectedProtocol + ")");
+assert.equal(
+  daemonVersion.startsWith(
+    "ctxmuxd " + expectedVersion + " (protocol " + expectedProtocol + ",",
+  ),
+  true,
+  "ctxmuxd --version must lead with its product and protocol identity: " + daemonVersion,
+);
+assert.match(
+  daemonVersion,
+  /\(protocol [0-9]+, handoff ctxmux\.daemon-handoff\.v[0-9]+\)$/u,
+  "ctxmuxd --version must declare the handoff schema it accepts: " + daemonVersion,
+);
 
 const daemon = spawn(daemonBinary, ["--socket", socketPath, "--readiness-fd", "3"], {
   stdio: ["ignore", "ignore", "pipe", "pipe"],
