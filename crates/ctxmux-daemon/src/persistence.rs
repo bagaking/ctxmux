@@ -4688,13 +4688,30 @@ fn append_replay(
                 )));
             }
             // `replay_truncated` is already derived from `replay.truncated`
-            // below, which this branch requires, so the gap is recorded without
-            // any extra bookkeeping here.
-            if durable_oldest == durable_head {
-                // Nothing durable yet; the surviving front becomes the oldest
-                // byte this Run can ever offer.
-                durable_oldest = start_byte;
-            }
+            // below, which this branch requires, so the flag needs no extra
+            // bookkeeping here. The WINDOW does: the durable log is a single
+            // contiguous `[durable_first_available_byte, durable_output_bytes)`
+            // range, and `validate_replay_window` re-walks it on every open with
+            // no fallback for `Corrupt` -- an interior hole is not a degraded
+            // read, it is a daemon that will not start. So move the floor the
+            // way every retention path here already does: drop the prefix that
+            // the gap has made unreachable and start the window at the
+            // surviving front.
+            transaction
+                .execute(
+                    "DELETE FROM replay_chunks WHERE run_id = ?1 AND start_byte < ?2",
+                    params![&id_text, start_byte],
+                )
+                .map_err(PersistenceError::database)?;
+            let surviving: i64 = transaction
+                .query_row(
+                    "SELECT coalesce(sum(length(data)), 0) FROM replay_chunks WHERE run_id = ?1",
+                    [&id_text],
+                    |row| row.get(0),
+                )
+                .map_err(PersistenceError::database)?;
+            replay_bytes = surviving;
+            durable_oldest = start_byte;
             durable_head = start_byte;
         }
         if durable_head == 0 {
@@ -5022,8 +5039,9 @@ mod tests {
         RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
         StartDisposition, StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES,
         WAL_CHECKPOINT_MAX_RETRIES, WAL_MAX_BYTES, append_replay, create_schema, file_len,
-        idle_fold_wal, metadata_size, mutex_lock, prune_global_replay_to, retry_transient_storage,
-        retry_wal_checkpoint, validate_existing_schema, wal_charge_for_cache,
+        idle_fold_wal, metadata_size, mutex_lock, nonnegative_u64, prune_global_replay_to,
+        retry_transient_storage, retry_wal_checkpoint, validate_existing_schema,
+        validate_replay_window, wal_charge_for_cache,
     };
     use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 
@@ -5698,8 +5716,37 @@ mod tests {
             "an admitted gap MUST be recorded -- a reader that cannot tell this \
              from continuous output is worse than the refusal this replaced"
         );
-        assert_eq!(oldest, 0, "bytes already durable stay readable");
+        assert_eq!(
+            oldest, 9,
+            "admitting the gap must move the floor to the surviving front: the \
+             bytes below it are unreachable, and leaving them behind puts an \
+             interior hole in a window the recovery validator requires to be \
+             contiguous"
+        );
+
+        // The half that the immediate row state cannot show: a daemon restart
+        // must still accept this state. `validate_replay_window` walks the
+        // chunks demanding strict contiguity from `oldest`, and `open()` has no
+        // fallback for `Corrupt` -- an interior hole here is not a degraded
+        // read, it is a daemon that will not start.
+        let (oldest, head, replay_bytes, truncated): (i64, i64, i64, i64) = transaction
+            .query_row(
+                "SELECT durable_first_available_byte, durable_output_bytes, replay_bytes,
+                        replay_truncated FROM runs WHERE id = ?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("re-read accounting for the recovery check");
         transaction.commit().expect("commit the admitted gap");
+        validate_replay_window(
+            &connection,
+            id,
+            nonnegative_u64(oldest, "oldest").expect("oldest fits"),
+            nonnegative_u64(head, "head").expect("head fits"),
+            nonnegative_u64(replay_bytes, "replay bytes").expect("bytes fit"),
+            truncated != 0,
+        )
+        .expect("an admitted gap must survive a restart's replay validation");
     }
 
     #[test]
