@@ -98,12 +98,23 @@ const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 /// answering with the state as it stands.
 ///
 /// Publication happens on a worker that is already running by the time a Stop
-/// receipt exists: measured at 1-6 ms on a persistent daemon. This is a
-/// backstop for that window, deliberately far below every Stop budget, because
-/// publication can also sit behind a durable finalize — and a Stop must never
-/// be coupled to the persistence actor's queue depth. Exceeding it costs a
-/// stale `state` field in one receipt, never a failed Stop.
-const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_millis(100);
+/// receipt exists: measured at 1-6 ms on a persistent daemon. But publication
+/// can also sit behind a durable finalize, and under a loud fleet that finalize
+/// is queued behind the appends it must be ordered after: measured 0.3-3.6 s.
+///
+/// Expiring here is therefore **not** a harmless stale field. `remove` reads the
+/// very same `state` (`creation.rs`, `validate_removable_entry`), so a Stop that
+/// gives up answers `Running` and the caller's next `remove` is refused with
+/// `InvalidRunState`. The timer converts *slow* into *wrong*.
+///
+/// So this is a backstop against a hung publication, not a latency budget: it is
+/// sized past the measured worst case rather than under it. On the farm host,
+/// 100 ms gave 0/120 successful removes at the plateau and this bound gives
+/// 120/120, while the quiet shapes — where there is nothing to wait for — are
+/// unchanged within the noise floor. Waiting is bounded in turn by
+/// `PERSISTENCE_QUEUE_CAPACITY`, which is what stops the wait escalating across
+/// consecutive stops; see `docs/architecture/r22-the-stop-that-stops-lying.md`.
+const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_secs(10);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);

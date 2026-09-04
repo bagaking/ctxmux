@@ -457,8 +457,31 @@ fn interactive_shell() -> RunSpec {
     }
 }
 
-fn raw_capture_shell(expected_bytes: usize) -> RunSpec {
+/// A Run that keeps the reactor and the persistence actor busy.
+///
+/// 64-byte lines in a tight loop: the farm plateau is a `read()`-rate shape, so
+/// what matters is the number of messages the persistence queue has to carry,
+/// not raw byte volume.
+fn chatty_shell() -> RunSpec {
     RunSpec {
+        program: "/bin/sh".to_owned(),
+        args: vec![
+            "-c".to_owned(),
+            concat!(
+                "while :; do printf '%s\\n' ",
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; ",
+                "done"
+            )
+            .to_owned(),
+        ],
+        cwd: None,
+        env: BTreeMap::default(),
+        size: TerminalSize::default(),
+        declared_inputs: Vec::new(),
+    }
+}
+
+fn raw_capture_shell(expected_bytes: usize) -> RunSpec {    RunSpec {
         program: "/bin/sh".to_owned(),
         args: vec![
             "-c".to_owned(),
@@ -5264,6 +5287,76 @@ async fn next_resized_event(
     })
     .await
     .expect("the applied resize reaches the open attachment")
+}
+
+/// The same invariant, but with the persistence actor actually busy.
+///
+/// The quiet version above passes on unmodified main: on an idle daemon the
+/// finalize that gates publication is served in 1-6 ms, far inside the Stop's
+/// bounded wait, so the receipt is honest and the `remove` succeeds. That made
+/// it a test which could not fail on the shape where the defect lives.
+///
+/// Under a fleet that keeps the persistence queue full, the same finalize is
+/// queued behind the appends it must be ordered after -- measured 0.6-3.6 s on
+/// the farm host. The Stop's wait expires, the receipt reports `Running`, and
+/// `remove` refuses with `InvalidRunState`: 0/40 on the farm.
+///
+/// So this asserts the invariant where it is actually load-bearing. The fleet
+/// is started first and left running for the whole loop; each stopped Run is a
+/// quiet one, exactly as in the farm harness.
+#[tokio::test]
+async fn a_returned_stop_is_removable_while_the_fleet_is_loud() {
+    let daemon = TestDaemon::start_persistent().await;
+
+    // Eight, not four: at four the daemon reached only 98k reads/s on the farm
+    // host and every Stop settled in 10-28 ms with the receipt already terminal
+    // -- the bound was never reached, so the test could not fail on the defect.
+    // Eight is where the measured rate crosses into the plateau.
+    let mut fleet = Vec::new();
+    for _ in 0..8 {
+        let run = daemon
+            .client
+            .start(chatty_shell())
+            .await
+            .expect("start chatty fleet Run");
+        fleet.push(run.id);
+    }
+
+    // Let the fleet fill the persistence queue before the first Stop is timed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut refused = Vec::new();
+    for attempt in 0..8 {
+        let run = daemon
+            .client
+            .start(interactive_shell())
+            .await
+            .expect("start Run");
+        let accepted = daemon
+            .client
+            .stop_once(run.id)
+            .await
+            .expect("stop in one trip");
+        if matches!(accepted.run.state, RunState::Running) {
+            refused.push(format!("attempt {attempt}: receipt still reported Running"));
+            continue;
+        }
+        if let Err(error) = daemon.client.remove(run.id).await {
+            refused.push(format!("attempt {attempt}: remove after Stop: {error}"));
+        }
+    }
+
+    for id in fleet {
+        let _ = daemon.client.stop_once(id).await;
+    }
+
+    assert!(
+        refused.is_empty(),
+        "a Stop receipt must describe a Run that `remove` accepts, under load too; \
+         {} of 8 attempts were refused:\n  {}",
+        refused.len(),
+        refused.join("\n  "),
+    );
 }
 
 /// A returned Stop receipt describes a Run that `remove` will accept.
