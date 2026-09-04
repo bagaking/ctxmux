@@ -7644,12 +7644,95 @@ mod tests {
         drop(reopened);
     }
 
+    /// A catch-up must never re-send a byte the actor is already holding.
+    ///
+    /// This is the performance half of the offered-watermark contract, and the
+    /// half wall-clock alone cannot confirm. Catching up from the COMMITTED
+    /// watermark re-sent every byte queued but not yet committed, which
+    /// overlapped the appends ahead of it. `append_batch_with_shutdown`
+    /// re-splits by contiguity, so an overlapping replay is never
+    /// `is_fresh_contiguous`: it gets a transaction, and an fsync, entirely to
+    /// itself, and each already-committed chunk in the overlap additionally
+    /// takes the verify-against-stored branch (a `SELECT data` plus a full
+    /// compare). A queue N deep cost N transactions instead of one, and every
+    /// lifecycle verb waits behind all of them in the same FIFO — which is why
+    /// ONE chatty Run cost seconds per create rather than a bounded penalty.
+    ///
+    /// The overlap is the defect, so the overlap is what this measures: the
+    /// distance between what the next replay would re-send and what the actor
+    /// has already been given. Asserting on transaction counts instead needs the
+    /// actor to be slow-but-draining at exactly the right rate, which makes the
+    /// fixture time-dependent; this states the same invariant with no race.
+    #[test]
+    fn a_catch_up_after_a_refusal_does_not_re_send_queued_bytes() {
+        const CHUNK: &[u8] = b"bbbb";
+
+        let temp = TempDir::new().expect("create catch-up overlap fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert catch-up overlap fixture");
+
+        // Hold the actor so appends pile up ACCEPTED but UNCOMMITTED. This is
+        // the state the whole contract is about: `durable_head` stays at 0 while
+        // the actor's pending watermark runs far ahead of it.
+        let (reached, release) = persistence.pause_next_append();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, CHUNK)])));
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
+
+        let mut offered_through = CHUNK.len() as u64;
+        let mut refusals = 0_usize;
+        for index in 1..=(PERSISTENCE_QUEUE_CAPACITY + 64) {
+            let offset = (index as u64) * CHUNK.len() as u64;
+            if durable.append(info.id, replay(vec![chunk(offset, CHUNK)])) {
+                offered_through = offset + CHUNK.len() as u64;
+            } else {
+                refusals += 1;
+            }
+        }
+        assert!(
+            refusals > 0,
+            "the fixture must actually overflow the queue; without a refusal \
+             there is no catch-up and the test proves nothing"
+        );
+        assert_eq!(
+            durable.durable_head(),
+            0,
+            "nothing can be durable while the actor is held at the barrier"
+        );
+
+        // The catch-up the next push would render. Every byte below the offered
+        // watermark is already in the actor's hands.
+        let committed = durable.durable_head();
+        assert_eq!(
+            durable.next_replay_start(),
+            offered_through,
+            "a catch-up must resume where the last ACCEPTED append ended. \
+             Starting at the committed watermark ({committed}) instead would \
+             re-send {} queued bytes, and that overlap is what fragments the \
+             actor's batching into one fsync per append.",
+            offered_through - committed,
+        );
+
+        release.send(()).expect("release the append barrier");
+        persistence.barrier().expect("drain the queued appends");
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+    }
+
     /// The catch-up re-sends bytes that are already durable. That must be a
     /// verified no-op, not a duplicate — otherwise the fix would corrupt the
     /// replay on every push after the first.
     #[test]
-    fn re_sending_durable_bytes_does_not_duplicate_them() {
-        let temp = TempDir::new().expect("create catch-up fixture");
+    fn re_sending_durable_bytes_does_not_duplicate_them() {        let temp = TempDir::new().expect("create catch-up fixture");
         let state_dir = temp.path().join("state");
         let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
         assert!(recovered.is_empty());
