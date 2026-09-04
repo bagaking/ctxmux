@@ -4663,9 +4663,39 @@ fn append_replay(
             continue;
         }
         if start_byte != durable_head {
-            return Err(PersistenceError::Mutation(format!(
-                "Run {id} durable replay gap: got {start_byte}, expected {durable_head}"
-            )));
+            // A forward jump is normally corruption. There is exactly one way
+            // it is honest: the producer's bounded log no longer HOLDS the
+            // missing bytes, because the daemon-wide reclaimer evicted them to
+            // stay inside the frozen per-Run retention ceiling. The offer says
+            // so itself -- it starts exactly at the log's surviving front and
+            // carries `truncated` -- and no future replay can ever produce
+            // those bytes, so refusing only latches persistence off for every
+            // Run in the daemon while losing the same bytes anyway.
+            //
+            // This is deliberately NOT "accept gaps": a chunk starting ABOVE
+            // `first_available_byte` is a real contiguity bug (the producer
+            // still holds the bytes and failed to send them), and it still
+            // fails here. Only the case the producer can PROVE is unrecoverable
+            // is admitted, and it is recorded rather than papered over --
+            // `replay_truncated` is the same flag the durable pruner sets when
+            // it evicts, so a reader cannot mistake the gap for continuous
+            // output.
+            let evicted_beyond_recovery =
+                replay.truncated && chunk.start_byte == replay.first_available_byte;
+            if !evicted_beyond_recovery {
+                return Err(PersistenceError::Mutation(format!(
+                    "Run {id} durable replay gap: got {start_byte}, expected {durable_head}"
+                )));
+            }
+            // `replay_truncated` is already derived from `replay.truncated`
+            // below, which this branch requires, so the gap is recorded without
+            // any extra bookkeeping here.
+            if durable_oldest == durable_head {
+                // Nothing durable yet; the surviving front becomes the oldest
+                // byte this Run can ever offer.
+                durable_oldest = start_byte;
+            }
+            durable_head = start_byte;
         }
         if durable_head == 0 {
             durable_oldest = start_byte;
@@ -5614,6 +5644,96 @@ mod tests {
             assert_eq!((oldest, head, bytes, truncated), (3, 6, 3, 1));
         }
         transaction.commit().expect("commit replay pruning");
+    }
+
+    #[test]
+    fn a_gap_the_producer_proves_unrecoverable_is_recorded_rather_than_refused() {
+        // REGRESSION GUARD for a daemon-wide persistence latch reproduced on a
+        // farm host: `durable replay gap: got 18451664, expected 17087786`,
+        // hit by EVERY create once a chatty 32-Run fleet was running.
+        //
+        // Root cause: `OutputLog::trim_front` sheds a Run's oldest chunks to
+        // hold the frozen per-Run retention ceiling, and the daemon-wide
+        // reclaimer aims it at OTHER Runs under memory pressure. If it evicts
+        // bytes a Run still owes as a catch-up, no replay can ever reproduce
+        // them -- so refusing the offer loses exactly the same bytes AND
+        // latches persistence off for every Run in the daemon.
+        //
+        // Holding the bytes instead (a floor on eviction) was rejected: the
+        // per-Run retention ceiling is a frozen reliability contract, and a
+        // lagging actor would push retention straight through it.
+        let mut connection = test_connection();
+        let id = RunId::new();
+        let transaction = connection.transaction().expect("start replay transaction");
+        insert_test_run(&transaction, id, "running", 1);
+        append_replay(&transaction, id, &replay(vec![chunk(0, b"aaa")]))
+            .expect("seed the durable head");
+
+        // The reclaimer ate [3, 9) while it was still owed. What survives
+        // starts at 9, and the producer says so: the offer begins exactly at
+        // its log's surviving front, and it is marked truncated.
+        let evicted = OutputReplay {
+            chunks: vec![chunk(9, b"ddd")],
+            first_available_byte: 9,
+            latest_output_bytes: 12,
+            truncated: true,
+        };
+        append_replay(&transaction, id, &evicted).expect("an unrecoverable gap must be admitted");
+
+        let (oldest, head, truncated): (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT durable_first_available_byte, durable_output_bytes, replay_truncated
+                 FROM runs WHERE id = ?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read accounting after the admitted gap");
+        assert_eq!(
+            head, 12,
+            "the head must follow the surviving bytes; leaving it behind makes \
+             every later offer look like a gap too"
+        );
+        assert_eq!(
+            truncated, 1,
+            "an admitted gap MUST be recorded -- a reader that cannot tell this \
+             from continuous output is worse than the refusal this replaced"
+        );
+        assert_eq!(oldest, 0, "bytes already durable stay readable");
+        transaction.commit().expect("commit the admitted gap");
+    }
+
+    #[test]
+    fn a_gap_the_producer_could_still_close_is_refused() {
+        // The other half of the rule above, and the one that keeps it honest.
+        //
+        // Admitting a gap is safe ONLY because the producer proves the bytes
+        // are gone: the offer starts exactly at its log's surviving front. A
+        // chunk starting ABOVE `first_available_byte` means the producer STILL
+        // HOLDS the missing bytes and simply failed to send them -- a real
+        // contiguity bug. That must keep failing loudly, or the fix above
+        // degrades into "accept any gap" and silently masks data loss.
+        let mut connection = test_connection();
+        let id = RunId::new();
+        let transaction = connection.transaction().expect("start replay transaction");
+        insert_test_run(&transaction, id, "running", 1);
+        append_replay(&transaction, id, &replay(vec![chunk(0, b"aaa")]))
+            .expect("seed the durable head");
+
+        let still_holds_them = OutputReplay {
+            chunks: vec![chunk(9, b"ddd")],
+            // The log still retains from byte 3 -- [3, 9) is recoverable.
+            first_available_byte: 3,
+            latest_output_bytes: 12,
+            truncated: true,
+        };
+        let Err(error) = append_replay(&transaction, id, &still_holds_them) else {
+            panic!("a recoverable gap must still be refused");
+        };
+        assert!(
+            matches!(error, PersistenceError::Mutation(message)
+                if message.contains("durable replay gap")),
+            "the refusal must stay the contiguity error, not a new one"
+        );
     }
 
     /// An empty replay reaches a real COMMIT -- and that COMMIT is cheap.
