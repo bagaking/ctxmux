@@ -8052,8 +8052,29 @@ mod tests {
 
         // Build a log far larger than any single push. If the offer were the
         // catch-up, it would carry all of these bytes again.
-        let filler = vec![b'f'; 4096];
-        for _ in 0..64 {
+        //
+        // The log has to get big while the QUEUE stays short, and those pull in
+        // opposite directions: a push is only rendered when `queue_has_room()`
+        // (see `record_output`), so once the wedged actor's queue fills, every
+        // later push — including the one this test observes — is correctly
+        // skipped and offers nothing. Sizing this loop in units of
+        // `PERSISTENCE_QUEUE_CAPACITY` rather than in a bare count is what keeps
+        // that from happening silently: an earlier version pushed a hardcoded 64
+        // chunks, which fit when the capacity was 1024 and stopped fitting when
+        // R22 took it to 64. The test went red three rounds before anyone looked
+        // at it, and read as a defect in the code rather than in its own
+        // arithmetic.
+        //
+        // So: use half the queue, and make each chunk big enough that half a
+        // queue still clears the quarter-megabyte the assertion below needs.
+        let pushes = crate::persistence::PERSISTENCE_QUEUE_CAPACITY / 2;
+        assert!(
+            pushes >= 4,
+            "the queue must hold at least a few appends for this fixture to \
+             build a log without tripping the admission skip"
+        );
+        let filler = vec![b'f'; 512 * 1024 / pushes];
+        for _ in 0..pushes {
             run.record_output(filler.clone());
         }
 
