@@ -22,7 +22,7 @@ pub(crate) fn validate_run_spec(spec: &RunSpec) -> Result<(), RunSpecValidationE
     {
         return Err(RunSpecValidationError::EmptyInputReference);
     }
-    validate_terminal_size(spec.size)
+    validate_terminal_size(spec.initial_size)
 }
 
 pub(crate) const fn validate_terminal_size(

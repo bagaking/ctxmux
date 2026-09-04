@@ -153,7 +153,7 @@ fn shell_spec(script: &str) -> RunSpec {
         args: vec!["-c".to_owned(), script.to_owned()],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -719,9 +719,9 @@ async fn semantically_invalid_native_specs_fail_before_socket_or_sibling_publica
     let mut empty_program = original.clone();
     empty_program["program"] = json!("");
     let mut zero_columns = original.clone();
-    zero_columns["size"]["cols"] = json!(0);
+    zero_columns["initial_size"]["cols"] = json!(0);
     let mut zero_rows = original.clone();
-    zero_rows["size"]["rows"] = json!(0);
+    zero_rows["initial_size"]["rows"] = json!(0);
     let mut empty_reference = original.clone();
     empty_reference["declared_inputs"] = json!([{ "kind": "workspace", "reference": "" }]);
 

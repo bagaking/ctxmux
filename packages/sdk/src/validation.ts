@@ -417,7 +417,7 @@ function runSpec(value: unknown, path: string): void {
   for (const [name, environmentValue] of Object.entries(environment)) {
     string(environmentValue, `${path}.env.${name}`);
   }
-  terminalSize(spec.size, `${path}.size`, true);
+  terminalSize(spec.initial_size, `${path}.initial_size`, true);
   array(spec.declared_inputs, `${path}.declared_inputs`).forEach(
     (input, index) =>
       runInputReference(input, `${path}.declared_inputs[${index}]`),

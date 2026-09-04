@@ -2012,7 +2012,7 @@ fn turnover_spec(marker: &std::path::Path, payload: &[u8]) -> RunSpec {
                 String::from_utf8(payload.to_vec()).expect("turnover payload is ASCII"),
             ),
         ]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -2023,7 +2023,7 @@ fn short_lived_spec() -> RunSpec {
         args: vec!["-c".to_owned(), "exit 0".to_owned()],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -3223,7 +3223,7 @@ fn marker_spec(marker: &std::path::Path, keep_running: bool) -> RunSpec {
             "CTXMUX_CREATION_MARKER".to_owned(),
             marker.to_string_lossy().into_owned(),
         )]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -3241,7 +3241,7 @@ fn hup_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
             "CTXMUX_CREATION_MARKER".to_owned(),
             marker.to_string_lossy().into_owned(),
         )]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -3259,7 +3259,7 @@ fn term_ignoring_marker_spec(marker: &std::path::Path) -> RunSpec {
             "CTXMUX_CREATION_MARKER".to_owned(),
             marker.to_string_lossy().into_owned(),
         )]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -3464,7 +3464,7 @@ async fn a_failing_execve_is_reported_as_spawn_failed_rather_than_a_started_run(
         args: Vec::new(),
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     };
 

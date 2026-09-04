@@ -63,7 +63,7 @@ async fn controlling_pty_attach_restores_terminal_and_leaves_the_run_alive() {
             ],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize { cols: 80, rows: 24 },
+            initial_size: TerminalSize { cols: 80, rows: 24 },
             declared_inputs: Vec::new(),
         })
         .await
@@ -266,7 +266,7 @@ async fn controlling_pty_attach_paints_current_screen_not_csi_history() {
             ],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize { cols: 80, rows: 24 },
+            initial_size: TerminalSize { cols: 80, rows: 24 },
             declared_inputs: Vec::new(),
         })
         .await

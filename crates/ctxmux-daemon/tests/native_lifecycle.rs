@@ -452,7 +452,7 @@ fn interactive_shell() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -476,7 +476,7 @@ fn chatty_shell() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -500,7 +500,7 @@ fn raw_capture_shell(expected_bytes: usize) -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -514,7 +514,7 @@ fn non_reading_shell() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -530,7 +530,7 @@ fn report_nofile_shell() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -566,7 +566,7 @@ fn externally_released_reader_shell(
                 release.to_string_lossy().into_owned(),
             ),
         ]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -601,7 +601,7 @@ fn marker_shell(marker: &Path) -> RunSpec {
             "CTXMUX_CREATION_MARKER".to_owned(),
             marker.to_string_lossy().into_owned(),
         )]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -625,7 +625,7 @@ fn recoverable_stop_marker_shell(marker: &Path, exit_on_term: bool) -> RunSpec {
             "CTXMUX_STOP_MARKER".to_owned(),
             marker.to_string_lossy().into_owned(),
         )]),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -1186,7 +1186,7 @@ async fn capability_requirements_reject_before_a_real_memory_only_run_is_created
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             })
             .await
@@ -2179,7 +2179,7 @@ async fn recoverable_stop_composite_rejects_wrong_identity_before_attachment() {
             args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -2473,7 +2473,7 @@ async fn recoverable_stop_not_applied_does_not_retain_an_operation() {
             args: vec!["-c".to_owned(), "exit 0".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -2977,7 +2977,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
             args: vec!["-c".to_owned(), "exit 0".to_owned()],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3015,7 +3015,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 16,
+        PROTOCOL_VERSION, 17,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
@@ -3034,7 +3034,7 @@ async fn daemon_rejects_generation_12_before_request_dispatch() {
                 args: vec!["-c".to_owned(), "printf must-not-run".to_owned()],
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             },
         },
@@ -3136,7 +3136,7 @@ async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3220,7 +3220,7 @@ async fn a_fleet_that_overflows_one_frame_stays_fully_enumerable_and_never_drops
                 args: vec!["-c".to_owned(), "true".to_owned()],
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: vec![RunInputReference {
                     kind: RunInputKind::Context,
                     reference: format!("{bulky_reference}-{index}"),
@@ -3310,7 +3310,7 @@ async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3388,7 +3388,7 @@ async fn native_pty_child_does_not_inherit_an_ambient_daemon_descriptor() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3417,7 +3417,7 @@ async fn native_pty_child_does_not_inherit_the_private_qualification_descriptor(
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3467,7 +3467,7 @@ async fn inherited_readiness_receipt_matches_the_public_daemon_instance() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3575,7 +3575,7 @@ async fn recoverable_stop_replays_settled_forced_result() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3639,7 +3639,7 @@ async fn interrupt_reaches_the_foreground_group_without_stopping_the_run() {
             ],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3693,7 +3693,7 @@ async fn cleanup_saturation_rejects_the_ninth_stop_before_mutation() {
         ],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     };
     let mut runs = Vec::new();
@@ -3793,7 +3793,7 @@ async fn stop_forces_stubborn_descendants_and_preserves_unrelated_processes() {
                 "CTXMUX_DESCENDANTS".to_owned(),
                 marker.to_string_lossy().into_owned(),
             )]),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3831,7 +3831,7 @@ async fn concurrent_interrupt_and_stop_have_only_owner_declared_outcomes() {
             args: vec!["-c".to_owned(), "while :; do sleep 1; done".to_owned()],
             cwd: None,
             env: BTreeMap::default(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -3891,7 +3891,7 @@ async fn concurrent_interrupt_stop_and_natural_exit_leave_no_signal_or_process_s
                         .into_owned(),
                 ),
             ]),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -4084,7 +4084,7 @@ async fn adopted_child_preserves_public_signal_exit_identity() {
             args: vec!["30".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -4404,7 +4404,7 @@ async fn a_silent_natural_exit_is_detected_by_the_signal_relay() {
             args: vec!["-c".to_owned(), "sleep 0.2; exit 0".to_owned()],
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await
@@ -5143,7 +5143,7 @@ async fn current_size_tracks_confirmed_resizes_independently_of_the_spec() {
     let daemon = TestDaemon::start().await;
     let spec_size = TerminalSize { cols: 80, rows: 24 };
     let mut spec = interactive_shell();
-    spec.size = spec_size;
+    spec.initial_size = spec_size;
     let run = daemon.client.start(spec).await.expect("start sized Run");
 
     // At rest the two agree, but only because nothing has resized yet -- and
@@ -5191,7 +5191,7 @@ async fn current_size_tracks_confirmed_resizes_independently_of_the_spec() {
             .spec
             .as_ref()
             .expect("native Run retains its spec")
-            .size,
+            .initial_size,
         spec_size,
         "the launch spec is immutable and must not follow the live size"
     );

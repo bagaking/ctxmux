@@ -2850,7 +2850,7 @@ function runInfo() {
       args: ["-c", "printf ok"],
       cwd: null,
       env: { FIXTURE: "1" },
-      size: { cols: 80, rows: 24 },
+      initial_size: { cols: 80, rows: 24 },
       declared_inputs: [],
     },
     lineage: null,

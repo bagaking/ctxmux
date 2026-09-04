@@ -72,7 +72,7 @@ fn env_probe_spec(env: BTreeMap<String, String>) -> RunSpec {
         ],
         cwd: None,
         env,
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }

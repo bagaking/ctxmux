@@ -663,13 +663,23 @@ paints one still frame; the protocol and non-interactive attach remain raw.
 ### Live terminal dimensions
 
 `RunInfo.current_size` reports the dimensions the owning PTY last confirmed, and
-is independent of `RunSpec.size`. The spec records the size a Run was _asked_ to
-start at and never changes; `current_size` is seeded from the owner's read-back
-at creation and replaced by the read-back of each applied resize. A Run started
-at 80x24 and resized to 200x87 therefore reports a `spec.size` of 80x24 beside a
+is independent of `RunSpec.initial_size`. The spec records the size a Run was
+_asked_ to start at and never changes; `current_size` is seeded from the owner's
+read-back at creation and replaced by the read-back of each applied resize. A Run
+started at 80x24 and resized to 200x87 therefore reports a `spec.initial_size` of
+80x24 beside a
 `current_size` of 200x87. Both `status` and the attachment snapshot carry it, so
 a client that attaches after a resize learns the current geometry without
 replaying any event.
+
+Generation 17 renamed this field from `size` to `initial_size` and made it
+required. The old name read as the Run's size and invited exactly the confusion
+this section exists to correct: a consumer reaching for `spec.size` after a
+resize gets launch geometry and reconstructs retained output at the wrong width.
+Dropping the field's `default` is the other half — a peer that omits it is a peer
+that never decided the geometry, and answering 80x24 on its behalf turns that
+silence into a size no one chose. Both halves fail at the type level rather than
+at runtime, so a consumer upgrading to 17 is told where to look.
 
 It is the last size the owner confirmed, not a fresh reading taken per request,
 so a Run that has exited keeps reporting the size its terminal last had rather

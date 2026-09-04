@@ -943,7 +943,7 @@ fn portable_spec() -> RunSpec {
         args: vec!["-c".to_owned(), "exit 0".to_owned()],
         cwd: None,
         env: BTreeMap::default(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }

@@ -159,7 +159,7 @@ async fn stop_replays_a_caller_retained_operation_and_prints_its_disposition() {
             ],
             cwd: Some(directory.path().to_string_lossy().into_owned()),
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         })
         .await

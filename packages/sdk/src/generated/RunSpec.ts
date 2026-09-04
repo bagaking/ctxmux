@@ -23,9 +23,19 @@ export type RunSpec = {
    */
   env: { [key in string]: string };
   /**
-   * Initial PTY dimensions.
+   * PTY dimensions requested at launch, and never changed afterwards.
+   *
+   * This is the size the Run was *asked* to start at. It is not the size the
+   * terminal currently has: read [`RunInfo::current_size`] for that. The two
+   * diverge the moment anyone resizes the Run, and reconstructing retained
+   * output against this field after a resize parses it at the wrong width.
+   *
+   * Deliberately required rather than `#[serde(default)]`. A frame that omits
+   * it is a frame whose sender did not decide the geometry, and defaulting
+   * silently to 80x24 hands that sender a size no one chose — the same
+   * wrong-geometry failure this field's name now refuses to invite.
    */
-  size: TerminalSize;
+  initial_size: TerminalSize;
   /**
    * Explicit workspace, artifact, and context references used by this Run.
    */

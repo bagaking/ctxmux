@@ -1077,7 +1077,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             },
         };

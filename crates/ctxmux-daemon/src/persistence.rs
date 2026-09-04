@@ -8159,7 +8159,7 @@ mod tests {
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         };
         let spec_json = serde_json::to_string(&spec).expect("encode test spec");
@@ -8212,7 +8212,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,

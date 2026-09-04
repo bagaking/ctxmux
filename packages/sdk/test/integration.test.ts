@@ -85,7 +85,7 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
         args: [config.message],
         cwd: null,
         env: {},
-        size: { cols: 80, rows: 24 },
+        initial_size: { cols: 80, rows: 24 },
         declared_inputs: [],
       };
     },
@@ -114,7 +114,7 @@ test("registerIntegration binds explicit tool semantics to the raw client", asyn
     args: ["hello"],
     cwd: null,
     env: {},
-    size: { cols: 80, rows: 24 },
+    initial_size: { cols: 80, rows: 24 },
     declared_inputs: [],
   });
   assert.notEqual(registered.createObserver(), registered.createObserver());
@@ -331,7 +331,7 @@ function rootRun(): RunInfo {
       args: ["-i"],
       cwd: "/workspace",
       env: {},
-      size: { cols: 80, rows: 24 },
+      initial_size: { cols: 80, rows: 24 },
       declared_inputs: [],
     },
     lineage: null,
