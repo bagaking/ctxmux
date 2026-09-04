@@ -39,6 +39,16 @@ mod tmux;
 
 pub use persistence::PersistenceError;
 
+/// How this binary declares its handoff schema in `--version` output.
+///
+/// Re-exported for `ctxmuxd --version`, which is the one place the string has to
+/// leave the crate: an upgrade target that cannot state what it accepts cannot
+/// be verified before the exec that would kill every live Run.
+#[must_use]
+pub fn handoff_version_token() -> String {
+    handoff::version_token()
+}
+
 use ctxmux_protocol::{
     AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
     CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
@@ -670,24 +680,25 @@ fn snapshot_stop_operations_for_upgrade(
 /// the handoff manifest, clear CLOEXEC on exactly the descriptors that must
 /// survive, and execve this binary. On success this replaces the process image
 /// and never returns. `manager.persistence` MUST be `Some` (the caller checks).
-fn perform_exec_upgrade(
-    socket_path: &std::path::Path,
-    state_dir: &std::path::Path,
-    listener: &UnixListener,
-    manager: &RunManager,
-) -> Result<(), UpgradeAbort> {
-    use std::io::{Seek as _, Write as _};
-    use std::os::fd::AsRawFd as _;
+/// The reversible half of an exec-in-place upgrade: everything that can still be
+/// abandoned with every live Run intact.
+///
+/// Split out because the boundary matters more than the line count. Each step
+/// here fails as [`UpgradeAbort::BeforeExtract`], which costs a log line and
+/// leaves the daemon serving. Once the caller passes the point of no return,
+/// none of that is true any more — so a step that *can* live in here belongs in
+/// here, and this signature is where to add one.
+///
+/// Returns the unlinked manifest file and the verified exec target.
+fn prepare_exec_upgrade(state_dir: &std::path::Path) -> Result<(std::fs::File, PathBuf), UpgradeAbort>
+{
     use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::process::CommandExt as _;
-
-    // --- Reversible phase (before the point of no return) ---
 
     // A regular, immediately unlinked state-dir file avoids the pipe-capacity
     // deadlock that a complete bounded Input ledger could trigger before exec:
     // no incoming reader exists until the image has already been replaced.
     let handoff_path = state_dir.join(format!(".ctxmux-handoff-{}", uuid::Uuid::new_v4()));
-    let mut handoff_file = std::fs::OpenOptions::new()
+    let handoff_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
@@ -704,6 +715,34 @@ fn perform_exec_upgrade(
     })?;
     let exe = std::env::current_exe()
         .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io("<current_exe>", source)))?;
+
+    // Ask the target what it accepts, while refusing is still free. This is the
+    // last moment it is: the schema is checked again on the far side of the exec
+    // (`handoff::read_manifest`), but by then the old image no longer exists to
+    // refuse anything, and the incoming image's exit closes the inherited pty
+    // masters — killing every live Run at once. Here the same mismatch is a log
+    // line and a daemon that keeps serving.
+    crate::handoff::verify_exec_target(&exe).map_err(|reason| {
+        UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: format!("exec target rejected before any live Run was risked: {reason}"),
+        })
+    })?;
+    Ok((handoff_file, exe))
+}
+
+fn perform_exec_upgrade(
+    socket_path: &std::path::Path,
+    state_dir: &std::path::Path,
+    listener: &UnixListener,
+    manager: &RunManager,
+) -> Result<(), UpgradeAbort> {
+    use std::io::{Seek as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+
+    // --- Reversible phase (before the point of no return) ---
+
+    let (mut handoff_file, exe) = prepare_exec_upgrade(state_dir)?;
 
     // Fence new request mutations and wait until every already-admitted request
     // has written its response. The fence is RAII-reversible until extraction,

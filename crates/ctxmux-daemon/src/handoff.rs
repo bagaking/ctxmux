@@ -20,6 +20,10 @@
 use std::{
     collections::HashSet,
     os::fd::{AsRawFd, OwnedFd, RawFd},
+    path::Path,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +32,119 @@ use ctxmux_protocol::{DaemonInstanceId, RunId};
 
 use crate::{creation::HandoffStopOperation, native_control::HandoffInputState};
 
+/// The manifest's **structural** contract, and nothing else.
+///
+/// Bump this when — and only when — a serialized field is added, removed,
+/// renamed, or retyped, so that a manifest written by the running daemon can no
+/// longer be read by the incoming image. Do **not** bump it for a byte budget, a
+/// shedding policy, or any other behaviour that leaves the JSON shape alone.
+///
+/// The distinction is load-bearing because [`read_manifest`] compares this for
+/// exact equality on the far side of an `execve` that cannot be undone. A bump
+/// is therefore not a label: it is a declaration that the next hot upgrade must
+/// kill every live Run. History shows the two kinds of change were being
+/// conflated — v1→v2 and v2→v3 each added a required field (real breaks), while
+/// v3→v4 changed only byte budgets and moved no field at all, spending a fatal
+/// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
+/// is the lock: it moves with the shape, so it fails on the first kind of change
+/// and stays quiet through the second.
 pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v4";
+
+/// How this binary declares its handoff schema in `--version` output.
+///
+/// Printed by `ctxmuxd --version` and parsed back by
+/// [`schema_of_version_output`], so the outgoing image can ask an upgrade target
+/// what it will accept *before* committing to the exec. Both sides go through
+/// this one function precisely so the printer and the parser cannot drift apart.
+pub fn version_token() -> String {
+    format!("handoff {HANDOFF_SCHEMA}")
+}
+
+/// Recover the handoff schema from a `ctxmuxd --version` line, if it declares one.
+///
+/// `None` means the binary named no schema — an older image that predates
+/// [`version_token`]. That is deliberately indistinguishable from "incompatible"
+/// to the caller: a binary that cannot state what it accepts cannot be verified,
+/// and the only safe reading of an unverifiable exec target is to refuse it.
+pub fn schema_of_version_output(text: &str) -> Option<&str> {
+    let rest = text.split_once("handoff ")?.1;
+    let end = rest.find([')', '\n'])?;
+    Some(rest[..end].trim())
+}
+
+/// How long the upgrade target gets to answer `--version` before we give up.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const VERSION_PROBE_POLL: Duration = Duration::from_millis(10);
+
+/// Run a command to completion under [`VERSION_PROBE_TIMEOUT`], killing it if it
+/// overruns. Separated from [`verify_exec_target`] so the bounded-wait mechanics
+/// stay out of the way of the compatibility decision the caller is making.
+fn run_bounded(exe: &Path, mut child: Child) -> Result<Vec<u8>, String> {
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    loop {
+        let overrun = match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(VERSION_PROBE_POLL);
+                continue;
+            }
+            Ok(None) => format!(
+                "{} --version did not answer within {VERSION_PROBE_TIMEOUT:?}",
+                exe.display()
+            ),
+            Err(error) => format!("cannot await {} --version: {error}", exe.display()),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(overrun);
+    }
+    child
+        .wait_with_output()
+        .map(|output| output.stdout)
+        .map_err(|error| format!("cannot read {} --version: {error}", exe.display()))
+}
+
+/// Ask an upgrade target whether it can read the manifest we are about to write.
+///
+/// This runs *before* the point of no return, so its `Err` is a reversible
+/// abort: the daemon logs it and keeps serving every live Run. That is the whole
+/// value of the check. The same mismatch discovered on the far side of the exec
+/// is unrecoverable — by then the old process image is gone, there is no code
+/// left to roll back to, and the incoming image's exit closes the inherited pty
+/// masters, which SIGHUPs every live child at once.
+///
+/// Note what is deliberately *not* checked: the target's protocol generation. A
+/// protocol skew costs connected clients a `VersionMismatch` and a reconnect,
+/// which is a designed, recoverable outcome. Only the handoff schema can turn an
+/// upgrade into a fleet-wide kill, so only the handoff schema gates it.
+///
+/// # Errors
+///
+/// Returns a human-readable reason when the target cannot be run, does not
+/// answer within [`VERSION_PROBE_TIMEOUT`], declares no schema, or declares one
+/// this image would reject.
+pub fn verify_exec_target(exe: &Path) -> Result<(), String> {
+    let child = Command::new(exe)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("cannot run {} --version: {error}", exe.display()))?;
+    let stdout = run_bounded(exe, child)?;
+    let text = String::from_utf8_lossy(&stdout);
+    match schema_of_version_output(&text) {
+        Some(HANDOFF_SCHEMA) => Ok(()),
+        Some(other) => Err(format!(
+            "{} accepts handoff schema {other}, this image writes {HANDOFF_SCHEMA}",
+            exe.display()
+        )),
+        None => Err(format!(
+            "{} declares no handoff schema, so it cannot be verified to accept {HANDOFF_SCHEMA}",
+            exe.display()
+        )),
+    }
+}
 // The only Run-count-multiplied payload in this manifest is recoverable Input:
 // each Run may retain up to INPUT_RESULT_MAX_REQUEST_BYTES (1 MiB) of request
 // bytes. Multiplying that by the Run count is exactly the bound that fails at
@@ -452,6 +568,165 @@ mod tests {
             manifest.validate(99).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+    }
+
+    /// Every `path:type` pair a value serializes to, array indices collapsed to
+    /// `[]` so a fixture holding two Runs reads as the same shape as one holding
+    /// one. This is the manifest's wire shape reduced to something comparable.
+    fn shape(value: &serde_json::Value, into: &mut Vec<String>, path: &str) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    into.push(format!("{child_path}:{}", type_of(child)));
+                    shape(child, into, &child_path);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    shape(item, into, &format!("{path}[]"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn type_of(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    #[test]
+    fn the_schema_string_is_pinned_to_the_manifest_shape() {
+        // The lock that makes HANDOFF_SCHEMA mean "structure", not "version".
+        //
+        // This fixture is every field name the manifest serializes. Adding,
+        // removing, renaming, or retyping one moves the shape, so the manifest
+        // this image writes stops being readable by an image built before the
+        // change — and reaching that discovery costs every live Run, because it
+        // is only reachable past an execve that cannot be undone. The test fails
+        // on exactly that kind of change and stays silent through budget or
+        // policy edits, which is the distinction v3→v4 spent a fatal bump on.
+        //
+        // If this fails: bump HANDOFF_SCHEMA and update the fixture together.
+        let manifest = HandoffManifest::new_with_stop_operations(
+            DaemonInstanceId::new().to_string(),
+            100,
+            101,
+            vec![HandoffRun {
+                run_id: RunId::new(),
+                child_pid: 4321,
+                master_fd: 102,
+                input_state: HandoffInputState {
+                    applied_input_bytes: 3,
+                    input_failure: None,
+                    operations: vec![HandoffInputOperation::Completed {
+                        key: InputOperationKey::new("shape-lock").unwrap(),
+                        expected_byte: 0,
+                        data: vec![0, 255, 1],
+                        range: AppliedInputRange {
+                            start_byte: 0,
+                            end_byte: 3,
+                        },
+                    }],
+                },
+            }],
+            vec![HandoffStopOperation {
+                run_id: RunId::new(),
+                operation_key: StopOperationKey::new("shape-lock-stop").unwrap(),
+                outcome: HandoffStopOutcome::Accepted {
+                    disposition: StopDisposition::Forced,
+                },
+            }],
+        );
+
+        let mut observed = Vec::new();
+        shape(&serde_json::to_value(&manifest).unwrap(), &mut observed, "");
+        observed.sort();
+        observed.dedup();
+
+        let expected = [
+            ".schema:string",
+            ".epoch:string",
+            ".listener_fd:number",
+            ".state_lock_fd:number",
+            ".runs:array",
+            ".runs[].run_id:string",
+            ".runs[].child_pid:number",
+            ".runs[].master_fd:number",
+            ".runs[].input_state:object",
+            ".runs[].input_state.applied_input_bytes:number",
+            ".runs[].input_state.input_failure:null",
+            ".runs[].input_state.operations:array",
+            ".runs[].input_state.operations[].outcome:string",
+            ".runs[].input_state.operations[].key:string",
+            ".runs[].input_state.operations[].expected_byte:number",
+            ".runs[].input_state.operations[].data:string",
+            ".runs[].input_state.operations[].range:object",
+            ".runs[].input_state.operations[].range.start_byte:number",
+            ".runs[].input_state.operations[].range.end_byte:number",
+            ".stop_operations:array",
+            ".stop_operations[].run_id:string",
+            ".stop_operations[].operation_key:string",
+            // The Stop outcome is an internally tagged enum, so its tag and
+            // payload nest under `outcome` rather than flattening beside it.
+            ".stop_operations[].outcome:object",
+            ".stop_operations[].outcome.outcome:string",
+            ".stop_operations[].outcome.disposition:string",
+        ];
+        // Sorted rather than compared in fixture order: the entries above read
+        // top-down like the struct, and nothing about this check should depend on
+        // a reader knowing that '.' sorts before ':'.
+        let mut expected: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
+        expected.sort();
+        assert_eq!(
+            observed,
+            expected,
+            "the handoff manifest's serialized shape moved. A reader built before \
+             this change cannot parse what this image now writes, and it finds out \
+             only after an execve it cannot undo — every live Run dies. Bump \
+             HANDOFF_SCHEMA (currently {HANDOFF_SCHEMA}) and this fixture together."
+        );
+    }
+
+    #[test]
+    fn a_version_line_round_trips_through_its_own_parser() {
+        // Printer and parser must not drift: if --version stops declaring what
+        // schema_of_version_output looks for, every upgrade target reads as
+        // unverifiable and no upgrade can ever proceed.
+        let line = format!("ctxmuxd 0.1.0 (protocol 17, {})", version_token());
+        assert_eq!(schema_of_version_output(&line), Some(HANDOFF_SCHEMA));
+        assert_eq!(
+            schema_of_version_output(&format!("{line}\n")),
+            Some(HANDOFF_SCHEMA)
+        );
+        // A binary predating the token declares nothing — which must not read as
+        // a match, or the probe would wave through exactly the image it exists
+        // to catch.
+        assert_eq!(
+            schema_of_version_output("ctxmuxd 0.1.0 (protocol 16)"),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_exec_target_is_refused() {
+        // /bin/echo answers --version with something that names no schema. The
+        // probe must refuse it: an image that cannot say what it accepts cannot
+        // be trusted with every live Run.
+        let error = verify_exec_target(Path::new("/bin/echo")).unwrap_err();
+        assert!(
+            error.contains("declares no handoff schema"),
+            "unexpected refusal: {error}"
+        );
+        // A target that cannot even be run is likewise a refusal, not a panic.
+        assert!(verify_exec_target(Path::new("/nonexistent/ctxmuxd")).is_err());
     }
 
     #[test]
