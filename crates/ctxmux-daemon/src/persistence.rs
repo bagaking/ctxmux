@@ -88,6 +88,29 @@ const _: () = assert!(
     "the format envelope must accept the serving ceiling plus the turnover overlap"
 );
 const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Target size of one `replay_chunks` row.
+///
+/// A row costs the same fixed overhead whether it carries 200 bytes or 200 KiB:
+/// a record header, a 36-byte `run_id`, three integers, and an entry in the
+/// `UNIQUE(run_id, start_byte)` index. A PTY read averages 200-600 bytes on the
+/// farm host, so storing one row per read spends most of the WAL on that
+/// overhead — measured at 2.0-2.8 WAL bytes per byte of real output, which
+/// divides the ~57 MB/s fold ceiling down to a ~24 MB/s output ceiling and is
+/// exactly where the chatty cliff sits.
+///
+/// Bytes inside one transaction are already proven contiguous per Run (see
+/// `is_fresh_contiguous`), so they can share a row without changing what is
+/// stored — only how it is packed. Replicated against the real schema, packing
+/// to this size cuts amplification from 2.27x to 1.07x (53%), which is 95% of
+/// what an unbounded row would save.
+///
+/// The size is a ceiling on a row built in memory, never a row grown in place:
+/// appending to a stored row would rewrite all of its pages per push, which is
+/// worse than the fragmentation it would fix. It also bounds the two places a
+/// row is handled whole — retention eviction drops a row at a time (1.6% of the
+/// 4 MiB per-Run cap) and attachment sends one per frame (well under
+/// `MAX_FRAME_BYTES`).
+const COALESCE_ROW_BYTES: usize = 64 * 1024;
 /// Depth of the actor's command queue.
 ///
 /// Output appends do **not** block on this queue being full — see
@@ -3815,10 +3838,10 @@ impl StateStore {
             .transaction()
             .map_err(PersistenceError::database)?;
         let mut cursor_updates = HashMap::new();
-        for (id, replay, _) in batch {
-            let _ = append_replay(&transaction, *id, replay)?;
-            let head = read_run_head(&transaction, *id)?;
-            cursor_updates.insert(*id, head);
+        for (id, replay, _) in coalesce_batch(batch) {
+            let _ = append_replay(&transaction, id, &replay)?;
+            let head = read_run_head(&transaction, id)?;
+            cursor_updates.insert(id, head);
         }
         let _ = prune_global_replay(&transaction)?;
         let mut terminal_metadata = None;
@@ -4625,13 +4648,287 @@ fn decode_native_spec(id: RunId, spec_json: &str) -> Result<RunSpec, Persistence
     clippy::too_many_lines,
     reason = "one transaction-local range validation, append, pruning, and cursor update is easier to audit as one invariant"
 )]
+/// Merge a transaction's per-Run appends into one replay each, preserving order.
+///
+/// One transaction usually carries many appends for the same Run — that is what
+/// the actor's batching loop builds — and each one arrives as its own
+/// [`OutputReplay`]. Handing them to `append_replay` separately means each call
+/// starts with an empty row buffer, so its packing never spans the appends that
+/// actually share the transaction, which is where the fragmentation is.
+///
+/// Merging is metadata-only: the chunks are concatenated, and it is
+/// `append_replay` that still decides what becomes a row. `first_available_byte`
+/// and `truncated` come from the LAST append for the Run because they describe
+/// the producer's log at the newest render, and `latest_output_bytes` likewise.
+/// Order within a Run and the relative order of distinct Runs are both kept, so
+/// contiguity checks see exactly the sequence they would have seen.
+fn coalesce_batch(
+    batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
+) -> Vec<(RunId, OutputReplay, Arc<AtomicU64>)> {
+    let mut merged: Vec<(RunId, OutputReplay, Arc<AtomicU64>)> = Vec::new();
+    let mut index_of: HashMap<RunId, usize> = HashMap::new();
+    for (id, replay, durable_head) in batch {
+        if let Some(&index) = index_of.get(id) {
+            let existing: &mut OutputReplay = &mut merged[index].1;
+            existing.chunks.extend(replay.chunks.iter().cloned());
+            existing.first_available_byte = replay.first_available_byte;
+            existing.latest_output_bytes = replay.latest_output_bytes;
+            existing.truncated = replay.truncated;
+        } else {
+            index_of.insert(*id, merged.len());
+            merged.push((*id, replay.clone(), Arc::clone(durable_head)));
+        }
+    }
+    merged
+}
+
+/// Drop everything below `new_floor` and report the surviving byte count.
+///
+/// The durable log is a single contiguous
+/// `[durable_first_available_byte, durable_output_bytes)` range, and
+/// `validate_replay_window` re-walks it on every open with no fallback for
+/// `Corrupt` — an interior hole is not a degraded read, it is a daemon that
+/// will not start. So when a gap the producer proves unrecoverable moves the
+/// floor, the prefix the gap made unreachable goes with it, exactly as every
+/// other retention path here does.
+///
+/// The count is re-read from the table rather than adjusted arithmetically, so
+/// it cannot drift from what was actually deleted.
+fn reset_window_to(
+    transaction: &Transaction<'_>,
+    id_text: &str,
+    new_floor: i64,
+) -> Result<i64, PersistenceError> {
+    transaction
+        .execute(
+            "DELETE FROM replay_chunks WHERE run_id = ?1 AND start_byte < ?2",
+            params![id_text, new_floor],
+        )
+        .map_err(PersistenceError::database)?;
+    transaction
+        .query_row(
+            "SELECT coalesce(sum(length(data)), 0) FROM replay_chunks WHERE run_id = ?1",
+            [id_text],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)
+}
+
+/// Whether `[start_byte, end_byte)` is already stored with exactly these bytes.
+///
+/// A row now spans many appends, so a re-sent range is normally a SLICE of one
+/// rather than a row keyed at its own start byte: the lookup finds the row that
+/// CONTAINS the range and compares the overlapping bytes. Looking up by exact
+/// `start_byte` instead finds nothing for any interior range, which reports
+/// honest durable bytes as lost and latches persistence off daemon-wide.
+///
+/// The caller must have flushed any buffered bytes first — they are durable by
+/// `durable_head` but not yet a row, and this only sees rows.
+fn stored_range_matches(
+    transaction: &Transaction<'_>,
+    id_text: &str,
+    start_byte: i64,
+    end_byte: i64,
+    expected: &[u8],
+) -> Result<bool, PersistenceError> {
+    let stored: Option<(i64, i64, Vec<u8>)> = transaction
+        .prepare_cached(
+            "SELECT start_byte, end_byte, data FROM replay_chunks
+                 WHERE run_id = ?1 AND start_byte <= ?2
+                 ORDER BY start_byte DESC LIMIT 1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_row(params![id_text, start_byte], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .optional()
+        })
+        .map_err(PersistenceError::database)?;
+    Ok(stored.is_some_and(|(row_start, row_end, data)| {
+        if start_byte < row_start || end_byte > row_end {
+            return false;
+        }
+        let from = usize::try_from(start_byte - row_start).unwrap_or(usize::MAX);
+        let to = usize::try_from(end_byte - row_start).unwrap_or(usize::MAX);
+        data.get(from..to) == Some(expected)
+    }))
+}
+
+/// Write the buffered contiguous bytes as one `replay_chunks` row.
+///
+/// Called whenever the buffer reaches [`COALESCE_ROW_BYTES`] and — critically —
+/// before anything else reads the table, so no caller can observe a range that
+/// is logically durable but still sitting in memory. `append_replay` advances
+/// `durable_head` as bytes are buffered, which is what makes those two facts
+/// diverge in between.
+fn flush_pending_row(
+    transaction: &Transaction<'_>,
+    id_text: &str,
+    pending_start: i64,
+    pending: &mut Vec<u8>,
+) -> Result<(), PersistenceError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let len = i64::try_from(pending.len())
+        .map_err(|_| PersistenceError::Mutation("coalesced row is too large".to_owned()))?;
+    let end_byte = pending_start.checked_add(len).ok_or_else(|| {
+        PersistenceError::Mutation("coalesced row end byte exceeds SQLite".to_owned())
+    })?;
+    transaction
+        .prepare_cached(
+            "INSERT INTO replay_chunks(run_id, start_byte, end_byte, data)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![id_text, pending_start, end_byte, &*pending])
+        })
+        .map_err(PersistenceError::database)?;
+    pending.clear();
+    Ok(())
+}
+
+/// A Run's durable replay cursors plus the row currently being packed.
+///
+/// The window cursors and the pending row have to move together: buffering a
+/// chunk advances `durable_head` before the bytes are a row, so anything that
+/// reads the table mid-loop must flush first. Keeping them in one value is what
+/// makes that coupling visible rather than a rule to remember.
+struct ReplayCursors {
+    durable_oldest: i64,
+    durable_head: i64,
+    replay_bytes: i64,
+    pending: Vec<u8>,
+    pending_start: i64,
+}
+
+/// Commit one chunk against the durable window: verify it, jump the floor for
+/// a proven-unrecoverable gap, or buffer it into the row being packed.
+fn apply_replay_chunk(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    id_text: &str,
+    replay: &OutputReplay,
+    chunk: &OutputChunk,
+    cursors: &mut ReplayCursors,
+) -> Result<(), PersistenceError> {
+    let data_len = u64::try_from(chunk.data.len())
+        .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?;
+    if chunk.end_byte <= chunk.start_byte || chunk.end_byte - chunk.start_byte != data_len {
+        return Err(PersistenceError::Mutation(format!(
+            "Run {id} replay range [{}, {}) does not match its bytes",
+            chunk.start_byte, chunk.end_byte
+        )));
+    }
+    let start_byte = i64::try_from(chunk.start_byte)
+        .map_err(|_| PersistenceError::Mutation("output start byte exceeds SQLite".to_owned()))?;
+    let end_byte = i64::try_from(chunk.end_byte)
+        .map_err(|_| PersistenceError::Mutation("output end byte exceeds SQLite".to_owned()))?;
+
+    if end_byte <= cursors.durable_head {
+        if start_byte < cursors.durable_oldest {
+            return Err(PersistenceError::Mutation(format!(
+                "Run {id} cannot verify evicted replay range [{}, {})",
+                chunk.start_byte, chunk.end_byte
+            )));
+        }
+        // This range is already durable, so it is compared against storage
+        // rather than written. Any buffered bytes must land first: they are
+        // durable by `durable_head` but not yet a row, and the lookup would
+        // otherwise miss them and report honest bytes as lost.
+        flush_pending_row(
+            transaction,
+            id_text,
+            cursors.pending_start,
+            &mut cursors.pending,
+        )?;
+        if !stored_range_matches(transaction, id_text, start_byte, end_byte, &chunk.data)? {
+            return Err(PersistenceError::Mutation(format!(
+                "Run {id} replay range [{}, {}) is missing or changed bytes",
+                chunk.start_byte, chunk.end_byte
+            )));
+        }
+        return Ok(());
+    }
+
+    if start_byte != cursors.durable_head {
+        // A forward jump is normally corruption. There is exactly one way it is
+        // honest: the producer's bounded log no longer HOLDS the missing bytes,
+        // because the daemon-wide reclaimer evicted them to stay inside the
+        // frozen per-Run retention ceiling. The offer says so itself -- it
+        // starts exactly at the log's surviving front and carries `truncated` --
+        // and no future replay can ever produce those bytes, so refusing only
+        // latches persistence off for every Run in the daemon while losing the
+        // same bytes anyway.
+        //
+        // This is deliberately NOT "accept gaps": a chunk starting ABOVE
+        // `first_available_byte` is a real contiguity bug (the producer still
+        // holds the bytes and failed to send them), and it still fails here.
+        // Only the case the producer can PROVE is unrecoverable is admitted, and
+        // it is recorded rather than papered over -- `replay_truncated` is the
+        // same flag the durable pruner sets when it evicts, so a reader cannot
+        // mistake the gap for continuous output.
+        let evicted_beyond_recovery =
+            replay.truncated && chunk.start_byte == replay.first_available_byte;
+        if !evicted_beyond_recovery {
+            return Err(PersistenceError::Mutation(format!(
+                "Run {id} durable replay gap: got {start_byte}, expected {}",
+                cursors.durable_head
+            )));
+        }
+        // `replay_truncated` is derived from `replay.truncated`, which this
+        // branch requires, so the flag needs no extra bookkeeping here. The
+        // WINDOW does, and `reset_window_to` moves it.
+        //
+        // Buffered bytes must become rows before that call: they are below the
+        // new floor's predecessor and belong either in the prefix being dropped
+        // or in the surviving sum, and the re-`SELECT` only sees rows.
+        flush_pending_row(
+            transaction,
+            id_text,
+            cursors.pending_start,
+            &mut cursors.pending,
+        )?;
+        cursors.replay_bytes = reset_window_to(transaction, id_text, start_byte)?;
+        cursors.durable_oldest = start_byte;
+        cursors.durable_head = start_byte;
+    }
+    if cursors.durable_head == 0 {
+        cursors.durable_oldest = start_byte;
+    }
+
+    // Buffer instead of inserting. Every byte that reaches here is the immediate
+    // successor of the previous one (`start_byte == durable_head` is the only
+    // surviving path), so the buffer is always one contiguous range starting at
+    // `pending_start` -- exactly the shape of one row.
+    if cursors.pending.is_empty() {
+        cursors.pending_start = start_byte;
+    }
+    cursors.pending.extend_from_slice(&chunk.data);
+    if cursors.pending.len() >= COALESCE_ROW_BYTES {
+        flush_pending_row(
+            transaction,
+            id_text,
+            cursors.pending_start,
+            &mut cursors.pending,
+        )?;
+    }
+    cursors.durable_head = end_byte;
+    cursors.replay_bytes = cursors.replay_bytes.saturating_add(
+        i64::try_from(chunk.data.len())
+            .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?,
+    );
+    Ok(())
+}
+
 fn append_replay(
     transaction: &Transaction<'_>,
     id: RunId,
     replay: &OutputReplay,
 ) -> Result<bool, PersistenceError> {
     let id_text = id.to_string();
-    let (mut durable_oldest, mut durable_head, mut replay_bytes, state_kind): (
+    let (durable_oldest, durable_head, replay_bytes, state_kind): (
         i64,
         i64,
         i64,
@@ -4658,118 +4955,30 @@ fn append_replay(
             "cannot advance replay for terminal Run {id}"
         )));
     }
+    // `durable_head` advances as bytes are buffered, so between a buffered byte
+    // and its flush the table is BEHIND the cursors. Every branch inside
+    // `apply_replay_chunk` that reads the table flushes first, and the loop's
+    // exit below flushes unconditionally.
+    let mut cursors = ReplayCursors {
+        durable_oldest,
+        durable_head,
+        replay_bytes,
+        pending: Vec::new(),
+        pending_start: 0,
+    };
     for chunk in &replay.chunks {
-        let data_len = u64::try_from(chunk.data.len())
-            .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?;
-        if chunk.end_byte <= chunk.start_byte || chunk.end_byte - chunk.start_byte != data_len {
-            return Err(PersistenceError::Mutation(format!(
-                "Run {id} replay range [{}, {}) does not match its bytes",
-                chunk.start_byte, chunk.end_byte
-            )));
-        }
-        let start_byte = i64::try_from(chunk.start_byte).map_err(|_| {
-            PersistenceError::Mutation("output start byte exceeds SQLite".to_owned())
-        })?;
-        let end_byte = i64::try_from(chunk.end_byte)
-            .map_err(|_| PersistenceError::Mutation("output end byte exceeds SQLite".to_owned()))?;
-        if end_byte <= durable_head {
-            if start_byte < durable_oldest {
-                return Err(PersistenceError::Mutation(format!(
-                    "Run {id} cannot verify evicted replay range [{}, {})",
-                    chunk.start_byte, chunk.end_byte
-                )));
-            }
-            let stored: Option<(i64, Vec<u8>)> = transaction
-                .prepare_cached(
-                    "SELECT end_byte, data FROM replay_chunks
-                         WHERE run_id = ?1 AND start_byte = ?2",
-                )
-                .and_then(|mut statement| {
-                    statement
-                        .query_row(params![&id_text, start_byte], |row| {
-                            Ok((row.get(0)?, row.get(1)?))
-                        })
-                        .optional()
-                })
-                .map_err(PersistenceError::database)?;
-            if stored.as_ref() != Some(&(end_byte, chunk.data.clone())) {
-                return Err(PersistenceError::Mutation(format!(
-                    "Run {id} replay range [{}, {}) is missing or changed bytes",
-                    chunk.start_byte, chunk.end_byte
-                )));
-            }
-            continue;
-        }
-        if start_byte != durable_head {
-            // A forward jump is normally corruption. There is exactly one way
-            // it is honest: the producer's bounded log no longer HOLDS the
-            // missing bytes, because the daemon-wide reclaimer evicted them to
-            // stay inside the frozen per-Run retention ceiling. The offer says
-            // so itself -- it starts exactly at the log's surviving front and
-            // carries `truncated` -- and no future replay can ever produce
-            // those bytes, so refusing only latches persistence off for every
-            // Run in the daemon while losing the same bytes anyway.
-            //
-            // This is deliberately NOT "accept gaps": a chunk starting ABOVE
-            // `first_available_byte` is a real contiguity bug (the producer
-            // still holds the bytes and failed to send them), and it still
-            // fails here. Only the case the producer can PROVE is unrecoverable
-            // is admitted, and it is recorded rather than papered over --
-            // `replay_truncated` is the same flag the durable pruner sets when
-            // it evicts, so a reader cannot mistake the gap for continuous
-            // output.
-            let evicted_beyond_recovery =
-                replay.truncated && chunk.start_byte == replay.first_available_byte;
-            if !evicted_beyond_recovery {
-                return Err(PersistenceError::Mutation(format!(
-                    "Run {id} durable replay gap: got {start_byte}, expected {durable_head}"
-                )));
-            }
-            // `replay_truncated` is already derived from `replay.truncated`
-            // below, which this branch requires, so the flag needs no extra
-            // bookkeeping here. The WINDOW does: the durable log is a single
-            // contiguous `[durable_first_available_byte, durable_output_bytes)`
-            // range, and `validate_replay_window` re-walks it on every open with
-            // no fallback for `Corrupt` -- an interior hole is not a degraded
-            // read, it is a daemon that will not start. So move the floor the
-            // way every retention path here already does: drop the prefix that
-            // the gap has made unreachable and start the window at the
-            // surviving front.
-            transaction
-                .execute(
-                    "DELETE FROM replay_chunks WHERE run_id = ?1 AND start_byte < ?2",
-                    params![&id_text, start_byte],
-                )
-                .map_err(PersistenceError::database)?;
-            let surviving: i64 = transaction
-                .query_row(
-                    "SELECT coalesce(sum(length(data)), 0) FROM replay_chunks WHERE run_id = ?1",
-                    [&id_text],
-                    |row| row.get(0),
-                )
-                .map_err(PersistenceError::database)?;
-            replay_bytes = surviving;
-            durable_oldest = start_byte;
-            durable_head = start_byte;
-        }
-        if durable_head == 0 {
-            durable_oldest = start_byte;
-        }
-        transaction
-            .prepare_cached(
-                "INSERT INTO replay_chunks(run_id, start_byte, end_byte, data)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .and_then(|mut statement| {
-                statement.execute(params![&id_text, start_byte, end_byte, &chunk.data])
-            })
-            .map_err(PersistenceError::database)?;
-        durable_head = end_byte;
-        replay_bytes = replay_bytes.saturating_add(
-            i64::try_from(chunk.data.len())
-                .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?,
-        );
+        apply_replay_chunk(transaction, id, &id_text, replay, chunk, &mut cursors)?;
     }
+    let ReplayCursors {
+        mut durable_oldest,
+        durable_head,
+        mut replay_bytes,
+        mut pending,
+        pending_start,
+    } = cursors;
+    // Every reader below -- the pruner's index walk, and `validate_replay_window`
+    // on the next open -- sees rows, not the buffer, so it must land first.
+    flush_pending_row(transaction, &id_text, pending_start, &mut pending)?;
     let evicted = prune_run_replay(
         transaction,
         id,
@@ -4882,6 +5091,20 @@ fn prune_global_replay(transaction: &Transaction<'_>) -> Result<bool, Persistenc
     prune_global_replay_to(transaction, GLOBAL_REPLAY_BYTES)
 }
 
+/// Shed bytes across Runs until the daemon-wide replay total fits.
+///
+/// Eviction is by row in ordinal order — oldest bytes daemon-wide first — and a
+/// Run's LAST row is never dropped, so no Run is emptied to serve another's
+/// pressure.
+///
+/// Coalescing made that "never drop the last row" rule load-bearing in a way it
+/// was not before. A Run used to hold hundreds of small rows, so there was
+/// almost always one to drop; now a Run commonly holds a single 64 KiB row, and
+/// if every Run holds one, no candidate exists at all and the ceiling cannot be
+/// enforced. So the last row is not skipped, it is TRIMMED: its front is cut
+/// back in place, which sheds exactly the bytes needed and keeps the Run's
+/// window contiguous. A row is only ever shortened from the front, never
+/// emptied, which is what preserves the invariant the skip was there to protect.
 fn prune_global_replay_to(
     transaction: &Transaction<'_>,
     replay_limit: u64,
@@ -4908,9 +5131,10 @@ fn prune_global_replay_to(
             .optional()
             .map_err(PersistenceError::database)?;
         let Some((ordinal, run_id, _start_byte, bytes)) = candidate else {
-            return Err(PersistenceError::Corrupt(
-                "global replay accounting has no chunks".to_owned(),
-            ));
+            // Every Run is down to one row. Trim the globally-oldest row's
+            // front in place instead of dropping it: the ceiling still has to
+            // be met, and shortening a row sheds bytes without emptying a Run.
+            return trim_oldest_row(transaction, replay_limit, evicted);
         };
         transaction
             .execute("DELETE FROM replay_chunks WHERE ordinal = ?1", [ordinal])
@@ -4923,6 +5147,89 @@ fn prune_global_replay_to(
                    (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
                  ) WHERE id = ?1",
                 params![run_id, bytes],
+            )
+            .map_err(PersistenceError::database)?;
+    }
+}
+
+/// Cut the front off the largest Run's row until the daemon-wide total fits.
+///
+/// The last resort for [`prune_global_replay_to`], reached when every Run holds
+/// exactly one row and dropping any of them would empty a Run. Trimming in
+/// place sheds the same bytes without that cost: the row keeps its tail, the
+/// Run's window stays a single contiguous range, and `replay_truncated` records
+/// the loss the same way every other eviction path does.
+///
+/// This orders by SIZE where the whole-row path orders by `ordinal`, and the
+/// difference is forced rather than chosen. `ordinal` is an insertion counter,
+/// so it ranks rows by age only as long as rows are whole; an in-place trim
+/// leaves the ordinal untouched, so the row just trimmed still sorts oldest and
+/// the next pass trims it again. Following age here therefore does not shed the
+/// oldest bytes daemon-wide — it empties one Run's scrollback while every other
+/// Run keeps all of its own.
+///
+/// Shedding the largest Run down to an equal share of the limit is the
+/// max-min-fair alternative, and it terminates for the same reason it is fair:
+/// the share is rounded DOWN, so whenever the total is over the limit the
+/// largest Run is strictly above the share and every pass sheds at least one
+/// byte. A row is never trimmed to nothing.
+fn trim_oldest_row(
+    transaction: &Transaction<'_>,
+    replay_limit: u64,
+    mut evicted: bool,
+) -> Result<bool, PersistenceError> {
+    loop {
+        let (total, runs): (i64, i64) = transaction
+            .prepare_cached(
+                "SELECT coalesce(sum(replay_bytes), 0), count(*) FROM runs WHERE replay_bytes > 0",
+            )
+            .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+            .map_err(PersistenceError::database)?;
+        if nonnegative_u64(total, "global replay bytes")? <= replay_limit || runs == 0 {
+            return Ok(evicted);
+        }
+        let largest: Option<(i64, String, i64, i64)> = transaction
+            .query_row(
+                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, length(chunk.data)
+                 FROM replay_chunks AS chunk
+                 JOIN runs ON runs.id = chunk.run_id
+                 ORDER BY runs.replay_bytes DESC, chunk.ordinal LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(PersistenceError::database)?;
+        let Some((ordinal, run_id, start_byte, bytes)) = largest else {
+            return Err(PersistenceError::Corrupt(
+                "global replay accounting has no chunks".to_owned(),
+            ));
+        };
+        // An equal share of the limit, floored, and at least one byte so a
+        // limit smaller than the Run count still leaves every Run a window.
+        let share = i64::try_from(replay_limit / nonnegative_u64(runs, "run count")?)
+            .unwrap_or(i64::MAX)
+            .max(1);
+        let shed = (bytes - share).min(bytes - 1);
+        if shed <= 0 {
+            // Every Run is already at or below its share and still cannot be
+            // trimmed further without emptying one. Stop rather than spin.
+            return Ok(evicted);
+        }
+        transaction
+            .execute(
+                "UPDATE replay_chunks SET start_byte = ?2, data = substr(data, ?3)
+                 WHERE ordinal = ?1",
+                params![ordinal, start_byte + shed, shed + 1],
+            )
+            .map_err(PersistenceError::database)?;
+        evicted = true;
+        transaction
+            .execute(
+                "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
+                 durable_first_available_byte = coalesce(
+                   (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
+                 ) WHERE id = ?1",
+                params![run_id, shed],
             )
             .map_err(PersistenceError::database)?;
     }
@@ -5719,6 +6026,67 @@ mod tests {
             assert_eq!((oldest, head, bytes, truncated), (3, 6, 3, 1));
         }
         transaction.commit().expect("commit replay pruning");
+    }
+
+    /// The daemon-wide ceiling must still be enforceable when every Run holds
+    /// exactly one row, and must not be paid by a single Run.
+    ///
+    /// Coalescing made this the ordinary case. The whole-row evictor skips a
+    /// Run's last row so no Run is emptied for another's pressure — with one
+    /// row per Run that leaves no candidate at all, and the ceiling silently
+    /// stops being enforced (it returned `Corrupt`).
+    ///
+    /// Two assertions, and the second is the one that bites: the total must
+    /// come under the limit, AND no Run may be gutted to get there. Trimming
+    /// the globally-oldest row looks right and fails the second — `ordinal` is
+    /// an insertion counter that an in-place trim does not change, so the same
+    /// row stays "oldest" and is trimmed again and again down to one byte while
+    /// its neighbour keeps everything.
+    #[test]
+    fn the_global_ceiling_is_met_without_gutting_one_run() {
+        let mut connection = test_connection();
+        let first = RunId::new();
+        let second = RunId::new();
+        let transaction = connection.transaction().expect("start replay transaction");
+        insert_test_run(&transaction, first, "running", 1);
+        insert_test_run(&transaction, second, "running", 1);
+        // One row each: 600 B, well inside COALESCE_ROW_BYTES.
+        let payload = [b'z'; 600];
+        for id in [first, second] {
+            append_replay(&transaction, id, &replay(vec![chunk(0, &payload)]))
+                .expect("append single coalesced row");
+        }
+        let rows: i64 = transaction
+            .query_row("SELECT count(*) FROM replay_chunks", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(rows, 2, "the fixture must be one row per Run");
+
+        assert!(prune_global_replay_to(&transaction, 800).expect("prune under the ceiling"));
+
+        let total: i64 = transaction
+            .query_row("SELECT coalesce(sum(replay_bytes), 0) FROM runs", [], |row| {
+                row.get(0)
+            })
+            .expect("read global total");
+        assert!(total <= 800, "the ceiling must be met, got {total}");
+        for id in [first, second] {
+            let (oldest, head, bytes, truncated): (i64, i64, i64, i64) = transaction
+                .query_row(
+                    "SELECT durable_first_available_byte, durable_output_bytes, replay_bytes,
+                            replay_truncated FROM runs WHERE id = ?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read trimmed accounting");
+            assert!(
+                bytes >= 300,
+                "shedding must be shared, but one Run was cut to {bytes} B"
+            );
+            assert_eq!(head, 600, "trimming the front must not move the head");
+            assert_eq!(oldest, 600 - bytes, "the window floor must follow the trim");
+            assert_eq!(truncated, 1, "a trimmed Run must be marked truncated");
+        }
+        transaction.commit().expect("commit the trim");
     }
 
     #[test]
@@ -6714,6 +7082,130 @@ mod tests {
         );
         assert!(recovered.iter().any(|run| run.info.id == later.id));
         drop(reopened);
+    }
+
+    /// Many small appends must become few large rows, without changing a byte
+    /// of what is stored.
+    ///
+    /// A `replay_chunks` row costs the same fixed overhead — record header,
+    /// 36-byte `run_id`, three integers, an index entry — whether it carries
+    /// 200 bytes or 64 KiB. PTY reads average 200-600 B on the farm host, so a
+    /// row per read spent 2.0-2.8 WAL bytes per byte of real output, and the
+    /// ~57 MB/s fold ceiling divided by that is the chatty cliff.
+    ///
+    /// This asserts the CONSEQUENCE, not the mechanism: row count collapses,
+    /// and the recovered bytes are identical to what was appended. Asserting
+    /// "the coalescer coalesced" by re-deriving its own arithmetic would pass
+    /// even if the rows were wrong.
+    #[test]
+    fn many_small_appends_become_few_large_rows() {
+        let temp = TempDir::new().expect("create coalescing fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert coalescing fixture");
+
+        // 400 appends of 512 B: the shape the reactor actually produces, and
+        // 200 KiB in total, so a correct packing needs 4 rows at 64 KiB where
+        // one-row-per-append needed 400.
+        let payload = [b'x'; 512];
+        let mut head = 0_u64;
+        let mut written = Vec::new();
+        for _ in 0..400 {
+            let one = replay(vec![chunk(head, &payload)]);
+            expect_queued(durable.append(info.id, one));
+            written.extend_from_slice(&payload);
+            head += payload.len() as u64;
+        }
+        persistence.barrier().expect("the appends commit");
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), head);
+
+        let final_replay = replay(vec![chunk(head, b"tail")]);
+        durable.finalize(info.id, 42, final_replay, exited_state());
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen coalesced state");
+        assert_eq!(recovered.len(), 1);
+        let rows = recovered[0].replay.chunks.len();
+        assert!(
+            rows <= 16,
+            "400 appends of 512 B must pack into a handful of rows, got {rows}"
+        );
+        written.extend_from_slice(b"tail");
+        let recovered_bytes: Vec<u8> = recovered[0]
+            .replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(
+            recovered_bytes, written,
+            "packing may change row boundaries, never the bytes"
+        );
+        assert_eq!(recovered[0].replay.latest_output_bytes, head + 4);
+        drop(reopened);
+    }
+
+    /// A re-sent append must still verify when its range is a SLICE of a
+    /// coalesced row rather than a row of its own.
+    ///
+    /// This is the edge coalescing introduces. Before, a re-sent range was
+    /// looked up by exact `start_byte` and compared whole. Now the bytes it
+    /// covers usually sit in the middle of a much larger row, so a lookup keyed
+    /// on its own start byte finds nothing and reports honest, durable bytes as
+    /// lost — which `remember_failure` then latches daemon-wide.
+    #[test]
+    fn a_resent_append_verifies_against_a_slice_of_its_row() {
+        let temp = TempDir::new().expect("create slice-verify fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert slice-verify fixture");
+
+        // Three appends, then re-send the MIDDLE one: its start byte is not the
+        // start byte of the row that now holds it.
+        let first = replay(vec![chunk(0, b"first-")]);
+        let middle = replay(vec![chunk(6, b"middle-")]);
+        let last = replay(vec![chunk(13, b"last")]);
+        for one in [&first, &middle, &last] {
+            expect_queued(durable.append(info.id, one.clone()));
+        }
+        persistence.barrier().expect("the appends commit");
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), 17);
+
+        expect_queued(durable.append(info.id, middle.clone()));
+        persistence
+            .barrier()
+            .expect("a re-sent interior range is a verified no-op");
+        assert!(
+            !persistence.is_failed(),
+            "re-sending bytes that sit inside a coalesced row must verify, not latch"
+        );
+        assert_eq!(durable.durable_head(), 17, "verification advances nothing");
+
+        // Same range, different bytes. Without this the test would also pass on
+        // a lookup that accepts anything it finds.
+        let forged = replay(vec![chunk(6, b"MIDDLE-")]);
+        expect_queued(durable.append(info.id, forged));
+        let _ = persistence.barrier();
+        assert!(
+            persistence.is_failed(),
+            "changed bytes at a durable range must fail, or verification proves nothing"
+        );
+        drop(durable);
+        drop(persistence);
     }
 
     /// Retrying a mutation whose commit result is unknown must not double-commit.
