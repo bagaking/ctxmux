@@ -1,6 +1,7 @@
-# Round 16: what synchronous=FULL is buying, and why it did not land
+# Round 16: what synchronous=FULL is buying, and why it was rejected
 
-- Status: measured, adjudicated, NOT merged — blocked on evidence, not on doubt
+- Status: measured, adjudicated, **REJECTED** — a second batch turned the
+  suspected blemish into a confirmed regression
 - Host: cn3 (`n36-001-230`), 64-core Linux, ext4, glibc 2.36
 - Baseline: `e55e6cb`; test fix landed as `baf8bdd`
 - Table conventions: [benchmark comparison conventions](../benchmark-comparison-conventions.md)
@@ -69,33 +70,71 @@ cell is unresolved.
 
 ## Why this did not merge
 
-Two gates, both unmet, neither about the numbers above:
+Both blocking gates were later cleared, and clearing the second one is what
+killed the change.
 
-1. **The durability witness could not be run.** `persistence_recovery.rs` is the
-   evidence that the *promised* property survives, and it only runs on macOS
-   here (cn3 has no Rust toolchain). That machine had `syspolicyd` pinned at
-   99% CPU for four hours, stalling every freshly-linked binary at
-   `_dyld_start`. Compilation succeeded in 11.8 s; execution never started. Not
-   a flake to retry — an unusable host.
-2. **No same-batch tmux comparison exists.** The published table
-   (`chatty-shape-vs-tmux.md`) measured ctxmux at `3ed1a1b`, before R11 and R14,
-   both of which moved `start` materially. Citing "no regression" against it
-   would compare two moments rather than two systems (conventions §4.1). The
-   rerun was written and ready; cn3's root filesystem is **100% full, 0 bytes
-   free**, and a SQLite benchmark with no space to write a WAL measures
-   disk-full error paths, not performance. Deleting 186 MB of my own stale probe
-   binaries reclaimed 135 MB, which other tenants consumed within seconds.
+The tmux rerun blocked on cn3's root filesystem being 100% full. That turned out
+to be the wrong reading of the host: `/` was full, but `/data00` had 4.2 TB free
+and is writable. Only `/tmp` was ever the problem. The rerun was one `mktemp -d
+-p` away from being runnable the whole time, which is worth recording as its own
+lesson — "the host is unusable" was a conclusion drawn from one directory.
 
-The measurement is strong and the contract argument is sound. Neither is
-sufficient: a durability change needs proof that durability held, and a
-"no regression" claim needs a baseline from the same batch.
+The rerun then produced both a tmux baseline and, in the same batch, a second
+independent FULL-vs-NORMAL comparison. See
+[round 17](r17-the-spawn-path-is-where-tmux-beats-us.md) for the tmux side.
+
+### The regression, confirmed
+
+The paired candidate arms from that batch (6 rounds per shape, the two modes
+adjacent inside each round):
+
+| shape | verb | FULL | NORMAL | Δ | sign | p |
+|---|---|---|---|---|---|---|
+| c1 | start | 9.280 | 7.355 | **−1.925** | 6/6 | 0.031 |
+| c1 | stop+remove | 12.903 | 7.922 | −4.981 | 6/6 | 0.031 |
+| c2 | start | 11.072 | 11.158 | **+0.086** | 2/6 | 0.69 |
+| c2 | stop+remove | 14.023 | 9.066 | −4.957 | 6/6 | 0.031 |
+| c8 | start | 23.728 | 26.408 | **+2.680** | 2/6 | 0.69 |
+| c8 | stop+remove | 22.247 | 15.233 | −7.014 | 6/6 | 0.031 |
+
+`stop+remove` is a large, clean win at every shape. `start` moves the wrong way
+at c2 and c8, and at c8 it is +2.68 ms — 11% worse.
+
+The first batch called that cell "no effect" at p=0.15, which was the correct
+call *for one batch*: 8/24 fails the test. But 16 of 24 pairs leaning wrong is
+not the same as 12, and this batch independently reproduced the direction at
+both c2 and c8. Two batches agreeing on a direction that one batch could not
+resolve is evidence the first batch was underpowered, not evidence of noise.
+
+By the ratchet rule — any metric degrading means rollback — R16 is **rejected**.
+Not deferred pending better measurement: the measurement happened, and it went
+against the change.
+
+### Why start was always the cell to watch
+
+This is the outcome the relocation check was designed to catch, arriving one
+level deeper than that check could see. WAL high-water did not grow, so the
+bytes are not accumulating. But `start` truncates the whole WAL, and a WAL whose
+pages were never flushed by a per-commit fsync leaves more dirty pages for that
+truncate to force out. The work is not deferred into a bigger file; it is
+deferred into a *dirtier* one. Same total bytes, worse placement — and `start`
+pays for it.
+
+That is the fifth time in this project that a gain and a loss have turned out to
+be the same mechanism. The pattern is now specific enough to state as a rule:
+when removing a flush helps the verbs that wait on flushes, check the verb that
+forces a flush of its own.
 
 ## What carries forward
 
-- The A/B data stands and does not need re-running; it is 12 and 24 pairs with
-  a matched A/A control on a quiesced host.
-- The unresolved c8 `start` lean needs a *working* instrument. The syscall count
-  is the right idea; `strace -c` on a multi-threaded daemon was the wrong tool.
+- **The contract argument survives the rejection.** FULL really is paying, on
+  every commit, for power-loss safety that `choices/009` explicitly disclaims.
+  That remains true and remains worth revisiting — but the way to collect it is
+  not a blanket downgrade, because the `start` path depends on someone having
+  flushed those pages already. A future attempt should target the flush that
+  `start` forces rather than the flushes it depends on.
+- The A/B data stands: 12 and 24 pairs with a matched A/A control, plus 6 more
+  pairs per shape from the tmux batch, all on a quiesced host.
 - `baf8bdd` landed independently: the durability witness asserted byte equality
   between the live and recovered windows, which failed 5 of 12 runs against the
   **unmodified** daemon. Root cause is granularity, not durability — the live
@@ -103,3 +142,7 @@ sufficient: a durability change needs proof that durability held, and a
   64 KiB coalesced rows, so recovery legitimately trails by up to one row. It
   now asserts suffix identity plus a one-row bound, which is what a crash could
   actually violate.
+- The durability witness was never run against NORMAL, and now does not need to
+  be. Worth stating plainly so nobody reads this doc as "the durability question
+  was answered": it was not. The change was rejected on latency before the
+  durability evidence was needed.
