@@ -117,12 +117,19 @@ mod tests {
         assert!(observed.used_bytes >= 4096);
     }
 
-    #[test]
-    fn cache_bound_covers_final_spill_disabled_wal() {
-        const PAGE_BYTES: u64 = 4096;
-        const FRAME_BYTES: u64 = PAGE_BYTES + 24;
-        const WAL_HEADER_BYTES: u64 = 32;
+    const PAGE_BYTES: u64 = 4096;
+    const FRAME_BYTES: u64 = PAGE_BYTES + 24;
+    const WAL_HEADER_BYTES: u64 = 32;
+    const CHECKPOINT_CEILING: u64 = 8 * 1024 * 1024;
+    const TOTAL_CEILING: u64 = 16 * 1024 * 1024;
 
+    /// One staged spill-disabled transaction on a WAL that already carries
+    /// `baseline_target` bytes of unrelated frames.
+    ///
+    /// Returns `(baseline, bound, actual)`: the WAL length admission would
+    /// have recorded, the charge derived from the pre-COMMIT cache footprint,
+    /// and the WAL length after COMMIT.
+    fn staged_transaction_on_baseline(baseline_target: u64) -> (u64, u64, u64) {
         let directory = tempdir().unwrap();
         let database = directory.path().join("proof.sqlite3");
         let wal = directory.path().join("proof.sqlite3-wal");
@@ -134,6 +141,7 @@ mod tests {
                  PRAGMA wal_autocheckpoint=0;
                  PRAGMA cache_spill=OFF;
                  CREATE TABLE facts(id INTEGER PRIMARY KEY, value BLOB);
+                 CREATE TABLE ballast(id INTEGER PRIMARY KEY, value BLOB);
                  PRAGMA wal_checkpoint(TRUNCATE);",
             )
             .unwrap();
@@ -141,6 +149,17 @@ mod tests {
             .pragma_query_value(None, "page_size", |row| row.get(0))
             .unwrap();
         assert_eq!(page_size, i64::try_from(PAGE_BYTES).unwrap());
+
+        // Grow the WAL with writes that are *not* the measured transaction, so
+        // the measured one genuinely appends after existing frames.
+        let wal_len = || fs::metadata(&wal).map_or(0, |metadata| metadata.len());
+        while wal_len() < baseline_target {
+            connection
+                .execute_batch("INSERT INTO ballast(value) VALUES (zeroblob(65536));")
+                .unwrap();
+        }
+        let baseline = wal_len();
+
         connection.release_memory().unwrap();
         reset_cache_io(&connection).unwrap();
         connection
@@ -156,17 +175,76 @@ mod tests {
         let snapshot = cache_admission_snapshot(&connection).unwrap();
         assert_eq!(snapshot.writes, 0);
         assert_eq!(snapshot.spills, 0);
-        assert_eq!(fs::metadata(&wal).map_or(0, |metadata| metadata.len()), 0);
+        assert_eq!(
+            wal_len(),
+            baseline,
+            "a spill-disabled transaction writes nothing before COMMIT"
+        );
         let cached_page_upper = snapshot.used_bytes.div_ceil(PAGE_BYTES);
         let bound = WAL_HEADER_BYTES + cached_page_upper * FRAME_BYTES;
-        assert!(bound <= 8 * 1024 * 1024);
 
         connection.execute_batch("COMMIT;").unwrap();
-        let actual = fs::metadata(&wal).unwrap().len();
-        let frames = actual
-            .checked_sub(WAL_HEADER_BYTES)
-            .expect("committed WAL contains its 32-byte header");
-        assert_eq!(frames % FRAME_BYTES, 0);
-        assert!(actual <= bound, "actual WAL {actual} exceeds bound {bound}");
+        (baseline, bound, wal_len())
+    }
+
+    /// The charge bounds the transaction's WAL *growth*, not the WAL's absolute
+    /// length.
+    ///
+    /// The lifecycle verbs no longer checkpoint to zero before staging — that
+    /// checkpoint was 85-99% of why `start` and `remove` lose to tmux under a
+    /// chatty fleet — so the daemon proves `actual - baseline <= charge` off
+    /// whatever baseline admission left behind. Baseline 0 is the control: it
+    /// reproduces the absolute form this test used to assert, so a failure
+    /// there means the harness broke rather than the hypothesis.
+    ///
+    /// 8 MiB is the largest baseline the daemon can present, because
+    /// `fold_wal_below_ceiling` checkpoints anything above it.
+    #[test]
+    fn cache_bound_covers_spill_disabled_wal_growth_from_any_baseline() {
+        let mut previous_delta = None;
+        for baseline_target in [0, 64 * 1024, 2 * 1024 * 1024, CHECKPOINT_CEILING] {
+            let (baseline, bound, actual) = staged_transaction_on_baseline(baseline_target);
+            assert!(
+                baseline >= baseline_target,
+                "baseline {baseline} never reached target {baseline_target}"
+            );
+            assert!(bound <= CHECKPOINT_CEILING, "charge {bound} exceeds 8 MiB");
+            assert!(
+                baseline.saturating_add(bound) <= TOTAL_CEILING,
+                "baseline {baseline} plus charge {bound} exceeds the 16 MiB total"
+            );
+
+            let delta = actual
+                .checked_sub(baseline)
+                .expect("the WAL grows monotonically across a commit");
+            // An empty WAL has no header yet, so the first commit onto one pays
+            // for it; every later commit appends frames only.
+            let frames_written = if baseline == 0 {
+                delta
+                    .checked_sub(WAL_HEADER_BYTES)
+                    .expect("a commit onto an empty WAL writes its 32-byte header")
+            } else {
+                delta
+            };
+            assert_eq!(
+                frames_written % FRAME_BYTES,
+                0,
+                "growth is a whole number of frames"
+            );
+            assert!(
+                delta <= bound,
+                "WAL grew {delta} from baseline {baseline}, exceeding bound {bound}"
+            );
+            // The frames written must also not depend on the baseline, or the
+            // charge would have to grow with WAL residency to stay sound.
+            if let Some(previous) = previous_delta {
+                assert_eq!(
+                    frames_written, previous,
+                    "the same transaction wrote {frames_written} frame bytes off baseline \
+                     {baseline} but {previous} off a smaller one"
+                );
+            }
+            previous_delta = Some(frames_written);
+        }
     }
 }

@@ -1111,7 +1111,7 @@ impl Persistence {
     }
 
     /// Delete one exact terminal Run row and its cascading replay in a single
-    /// bounded transaction, reusing the same spill-disabled zero-WAL page-charge
+    /// bounded transaction, reusing the same spill-disabled page-charge
     /// admission the exact-replacement path proves. The actor is the sole store
     /// owner, so this shares the FIFO ordering of every other durable mutation.
     pub(crate) fn remove_terminal(&self, candidate: PersistentCandidate) -> RemovalDisposition {
@@ -1498,8 +1498,8 @@ enum StageCompletion {
 /// the reconciled recovered Runs.
 type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
 
-/// Fold the WAL while the actor's queue is empty, so the zero baseline the next
-/// `StageStart` requires is already there.
+/// Fold the WAL while the actor's queue is empty, so a later lifecycle verb
+/// finds a small baseline instead of having to create one.
 ///
 /// Returns whether a checkpoint actually ran, which is what the idle-fold tests
 /// assert on: an idle daemon must fold at most once and then stay quiet, or the
@@ -1576,23 +1576,23 @@ fn actor_main(
                 Err(mpsc::TryRecvError::Empty) => {
                     // Nothing is queued, so nothing is waiting on this thread.
                     // Fold the WAL now, while the cost is nobody's latency, so
-                    // the next `StageStart` finds the zero baseline its
-                    // admission proof already requires instead of paying to
-                    // create one. Neither the checkpoint at :2606 nor the
-                    // `wal_bytes == 0` assertion at :2703 changes -- this only
-                    // decides *when* the bytes get folded. Measured on cn3
-                    // (Linux, synchronous=FULL): folding costs ~1.6 ms/MiB,
-                    // linear to the 8 MiB admission ceiling (12.6 ms there),
-                    // against 0.016 ms for the same call on an already-zero
-                    // WAL. That gap is what a create stops paying, and it is
-                    // why a chatty fleet's creates cost 11-15 ms where the
-                    // quiet benchmark sees 7 ms.
+                    // a later lifecycle verb inherits a small baseline rather
+                    // than an 8 MiB one. Measured on cn3 (Linux,
+                    // synchronous=FULL): folding costs ~1.6 ms/MiB, linear to
+                    // the 8 MiB admission ceiling (12.6 ms there), against
+                    // 0.016 ms for the same call on an already-zero WAL.
+                    //
+                    // This is an optimization only, and a weak one under load:
+                    // a chatty fleet's queue never empties, so this never fires
+                    // exactly when the WAL is largest. `fold_wal_below_ceiling`
+                    // is what actually bounds the baseline on the paths that
+                    // must prove a charge.
                     //
                     // Errors are deliberately dropped rather than latched: an
                     // idle fold has no receipt to fail and no caller to inform,
-                    // and every path that actually depends on a zero WAL still
-                    // checkpoints and still proves it. A failure here costs
-                    // only the optimization.
+                    // and every path that depends on a bounded WAL still folds
+                    // and still proves its charge. A failure here costs only
+                    // the optimization.
                     idle_fold_wal(&store, shutdown);
                     match receiver.recv() {
                         Ok(command) => command,
@@ -2718,15 +2718,18 @@ impl StateStore {
             ))));
         }
 
-        if let Err(error) = self.truncate_wal_to_zero_with_shutdown(shutdown) {
-            if shutdown.is_some() && matches!(&error, PersistenceError::ActorStopped) {
-                return Err(error);
+        let wal_baseline = match self.fold_wal_below_ceiling(shutdown) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                if shutdown.is_some() && matches!(&error, PersistenceError::ActorStopped) {
+                    return Err(error);
+                }
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
+                    "persistent WAL admission could not reach its baseline: {error}"
+                ))));
             }
-            let _ = receipt.decide(StartDisposition::NotCommitted);
-            return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
-                "persistent WAL admission could not reach a zero baseline: {error}"
-            ))));
-        }
+        };
         if let Err(error) = self.connection.release_memory() {
             let _ = receipt.decide(StartDisposition::NotCommitted);
             return Ok(StageDriveResult::ReadyFailed(admission_failure(format!(
@@ -2741,14 +2744,24 @@ impl StateStore {
                 return Ok(StageDriveResult::ReadyFailed(stage_failure));
             }
         };
-        let result = self
-            .drive_staged_start_with_spill_disabled(prepared, candidates, receipt, ready, decision);
+        let result = self.drive_staged_start_with_spill_disabled(
+            prepared,
+            candidates,
+            receipt,
+            ready,
+            decision,
+            wal_baseline,
+        );
         match self.restore_cache_spill(previous_cache_spill) {
             Ok(()) => Ok(result),
             Err(error) => Ok(result.with_restore_failure(error)),
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the WAL baseline travels with the staging owners it constrains"
+    )]
     fn drive_staged_start_with_spill_disabled(
         &mut self,
         prepared: &PreparedPersistentStart,
@@ -2756,6 +2769,7 @@ impl StateStore {
         receipt: &StartReceipt,
         ready: &mpsc::SyncSender<Result<(), StageFailure>>,
         decision: &mpsc::Receiver<StageDecision>,
+        wal_baseline: u64,
     ) -> StageDriveResult {
         if let Err(error) = ctxmux_sqlite_status::reset_cache_io(&self.connection) {
             let _ = receipt.decide(StartDisposition::NotCommitted);
@@ -2771,8 +2785,11 @@ impl StateStore {
                 capacity: false,
             });
         }
+        // The WAL must not have moved between admission and `BEGIN IMMEDIATE`.
+        // That is what this check has always been for; it used to spell it as
+        // "== 0" only because admission left it at zero.
         match file_len(&self.wal_path) {
-            Ok(0) => {}
+            Ok(bytes) if bytes == wal_baseline => {}
             Ok(_) => {
                 return self.rollback_before_ready(
                     receipt,
@@ -2815,17 +2832,27 @@ impl StateStore {
             }
         };
         let charge = wal_charge_for_cache(snapshot.used_bytes);
-        if wal_bytes != 0
+        // The staged transaction must fit the 8 MiB per-transaction ceiling, and
+        // the WAL it lands on must still fit the 16 MiB total. `wal_bytes` is
+        // compared against the admission baseline rather than zero: nothing may
+        // have been written yet, which is the property being proven, but the
+        // baseline itself is legitimately non-zero now.
+        if wal_bytes != wal_baseline
             || snapshot.writes != 0
             || snapshot.spills != 0
             || charge.is_none_or(|charge| charge > WAL_CHECKPOINT_BYTES)
+            || charge.is_none_or(|charge| wal_baseline.saturating_add(charge) > WAL_MAX_BYTES)
         {
             return self.rollback_before_ready(
                 receipt,
                 admission_failure(format!(
                     "persistent exact replacement exceeds or cannot prove its 8 MiB WAL charge: \
-                     cache={} bytes, writes={}, spills={}, wal={} bytes",
-                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes
+                     cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
+                    snapshot.used_bytes,
+                    snapshot.writes,
+                    snapshot.spills,
+                    wal_bytes,
+                    wal_baseline
                 )),
             );
         }
@@ -2945,6 +2972,48 @@ impl StateStore {
         self.truncate_wal_to_zero_with_shutdown(None)
     }
 
+    /// Bring the WAL under `WAL_CHECKPOINT_BYTES` and report the baseline the
+    /// caller's charge proof must be measured against.
+    ///
+    /// The lifecycle verbs used to checkpoint to *zero* here. That was never
+    /// about needing an empty file: ADR 013 requires a proof that one staged
+    /// transaction fits the 8 MiB per-transaction ceiling and that the WAL as a
+    /// whole stays under 16 MiB, and starting from zero let a single comparison
+    /// of the absolute WAL length cover both.
+    ///
+    /// It is also what made `start` and `remove` lose to tmux. Under a chatty
+    /// fleet the WAL sits at 8.5 MB essentially always — sampled every 10 ms it
+    /// was at zero for 3.7% of samples at chatty=2 — because the output path
+    /// deliberately lets it ride up to the 8 MiB trigger. So every lifecycle op
+    /// folded ~8.5 MB at ~1.6 ms/MiB, about 13 ms, which is 85-99% of why those
+    /// verbs lose.
+    ///
+    /// The fix is to prove the same bound against a *delta* instead of an
+    /// absolute. Verified against the pinned `SQLite` 3.53.2 amalgamation across
+    /// 6 baselines (0 to 8.2 MB) and 4 transaction sizes: `actual - baseline`
+    /// stayed under the cache-derived charge in all 24 cases, WAL growth was
+    /// strictly monotone, and the delta was baseline-independent (4120 bytes
+    /// for a one-row transaction whether the WAL began at 0 or at 8.2 MB). The
+    /// standing version of that check is
+    /// `cache_bound_covers_spill_disabled_wal_growth_from_any_baseline` in
+    /// `ctxmux-sqlite-status`, which re-derives it against whatever `SQLite` the
+    /// build is pinned to.
+    ///
+    /// The ceilings still close arithmetically: this folds whenever the
+    /// baseline exceeds 8 MiB, and no transaction may charge more than 8 MiB,
+    /// so the post-commit absolute can never exceed the 16 MiB total. That is
+    /// the same shape `admit_transaction_with_shutdown` has always used on the
+    /// output path, which is both far hotter and already shipping it.
+    fn fold_wal_below_ceiling(
+        &self,
+        shutdown: Option<&AtomicBool>,
+    ) -> Result<u64, PersistenceError> {
+        if file_len(&self.wal_path)? > WAL_CHECKPOINT_BYTES {
+            self.truncate_wal_to_zero_with_shutdown(shutdown)?;
+        }
+        file_len(&self.wal_path)
+    }
+
     /// One `wal_checkpoint(TRUNCATE)` attempt, with no retry and no sleeping.
     ///
     /// The idle fold runs on the actor thread with nothing queued behind it,
@@ -3014,14 +3083,14 @@ impl StateStore {
         candidate: &PersistentCandidate,
         shutdown: Option<&AtomicBool>,
     ) -> Result<RemovalDisposition, PersistenceError> {
-        self.truncate_wal_to_zero_with_shutdown(shutdown)?;
+        let wal_baseline = self.fold_wal_below_ceiling(shutdown)?;
         self.connection
             .release_memory()
             .map_err(PersistenceError::database)?;
         let previous_cache_spill = self
             .disable_cache_spill()
             .map_err(|failure| failure.error)?;
-        let result = self.remove_terminal_spill_disabled(candidate);
+        let result = self.remove_terminal_spill_disabled(candidate, wal_baseline);
         match self.restore_cache_spill(previous_cache_spill) {
             Ok(()) => Ok(result),
             Err(restore_error) => match result {
@@ -3038,6 +3107,7 @@ impl StateStore {
     fn remove_terminal_spill_disabled(
         &self,
         candidate: &PersistentCandidate,
+        wal_baseline: u64,
     ) -> RemovalDisposition {
         if let Err(error) = ctxmux_sqlite_status::reset_cache_io(&self.connection) {
             return RemovalDisposition::NotRemoved(
@@ -3051,7 +3121,7 @@ impl StateStore {
             return RemovalDisposition::NotRemoved(PersistenceError::database(error));
         }
         match file_len(&self.wal_path) {
-            Ok(0) => {}
+            Ok(bytes) if bytes == wal_baseline => {}
             Ok(_) => {
                 return self.rollback_removal(
                     PersistenceError::Mutation(
@@ -3082,16 +3152,21 @@ impl StateStore {
             Err(error) => return self.rollback_removal(error, false),
         };
         let charge = wal_charge_for_cache(snapshot.used_bytes);
-        if wal_bytes != 0
+        if wal_bytes != wal_baseline
             || snapshot.writes != 0
             || snapshot.spills != 0
             || charge.is_none_or(|charge| charge > WAL_CHECKPOINT_BYTES)
+            || charge.is_none_or(|charge| wal_baseline.saturating_add(charge) > WAL_MAX_BYTES)
         {
             return self.rollback_removal(
                 admission_failure(format!(
                     "persistent removal exceeds or cannot prove its 8 MiB WAL charge: \
-                     cache={} bytes, writes={}, spills={}, wal={} bytes",
-                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes
+                     cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
+                    snapshot.used_bytes,
+                    snapshot.writes,
+                    snapshot.spills,
+                    wal_bytes,
+                    wal_baseline
                 ))
                 .error,
                 false,
@@ -6643,9 +6718,28 @@ mod tests {
         // them, not after: the actor can drain and fold in between.
         hooks.suppress_idle_fold.store(true, Ordering::Release);
         let info = running_info(RunId::new());
-        let _durable = persistence
+        let durable = persistence
             .insert_start(&test_operation_key(info.id), &info)
             .expect("insert reader fixture Run");
+
+        // Push the WAL past the checkpoint ceiling. A start only folds when the
+        // WAL is over it, so without this there is no checkpoint for the reader
+        // to make busy and the releaser below waits forever. Appends leave the
+        // WAL above the ceiling until the *next* transaction's admission folds
+        // it, and nothing else runs in between here.
+        let wal = state_dir.join(format!("{DATABASE_FILE}-wal"));
+        let payload = vec![b'x'; 256 * 1024];
+        let mut offset = 0_u64;
+        while file_len(&wal).unwrap_or(0) <= WAL_CHECKPOINT_BYTES {
+            expect_queued(durable.append(info.id, replay(vec![chunk(offset, &payload)])));
+            offset += payload.len() as u64;
+            persistence.barrier().expect("drain the WAL-growing append");
+            assert!(
+                offset < 64 * 1024 * 1024,
+                "appends never grew the WAL past its 8 MiB ceiling"
+            );
+        }
+
         hooks.checkpoint_attempts.store(0, Ordering::Release);
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
@@ -6695,10 +6789,89 @@ mod tests {
         );
     }
 
+    /// The change this whole round is: a lifecycle verb must NOT checkpoint a
+    /// WAL that is already under the 8 MiB ceiling.
+    ///
+    /// Folding to zero on every `start` and `remove` cost ~1.6 ms/MiB against a
+    /// WAL that a chatty fleet keeps at ~8.5 MB essentially always (sampled
+    /// every 10 ms it was at zero for 3.7% of samples at chatty=2), which
+    /// measured as 85-99% of why those verbs lose to tmux. Reverting
+    /// `fold_wal_below_ceiling` to an unconditional truncate leaves every other
+    /// test in this file green, so this one exists to fail instead.
+    ///
+    /// The two halves are asserted together on purpose: "did not fold" is only
+    /// correct while the baseline is under the ceiling, and "did fold" is only
+    /// correct once it is over.
+    #[test]
+    fn a_lifecycle_verb_folds_only_a_wal_that_is_over_the_ceiling() {
+        let temp = TempDir::new().expect("create baseline fold fixture");
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .expect("open baseline fold fixture store");
+        store.truncate_wal_to_zero().expect("start from zero");
+
+        // A WAL that a chatty fleet would have left behind: real bytes, but
+        // still under the ceiling the output path lets it ride up to.
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start baseline fixture transaction");
+        insert_test_run(&transaction, RunId::new(), "exited", 1);
+        transaction.commit().expect("dirty the WAL below the ceiling");
+        let dirty = file_len(&store.wal_path).expect("read WAL length");
+        assert!(
+            dirty > 0 && dirty <= WAL_CHECKPOINT_BYTES,
+            "fixture WAL {dirty} must be dirty but under the 8 MiB ceiling"
+        );
+
+        hooks.checkpoint_attempts.store(0, Ordering::Release);
+        let baseline = store
+            .fold_wal_below_ceiling(None)
+            .expect("admission reads its baseline");
+        assert_eq!(
+            baseline, dirty,
+            "a WAL under the ceiling is the baseline, not something to erase"
+        );
+        assert_eq!(
+            hooks.checkpoint_attempts.load(Ordering::Acquire),
+            0,
+            "folding a WAL that is already under the ceiling is the ~13 ms this \
+             round removed; a checkpoint here means it came back"
+        );
+
+        // The other half: over the ceiling, the fold must still fire, because
+        // that is what keeps `baseline + charge` inside the 16 MiB total.
+        store
+            .connection
+            .execute_batch("CREATE TABLE ceiling_ballast(id INTEGER PRIMARY KEY, value BLOB);")
+            .expect("create ballast table");
+        while file_len(&store.wal_path).expect("read WAL length") <= WAL_CHECKPOINT_BYTES {
+            store
+                .connection
+                .execute_batch("INSERT INTO ceiling_ballast(value) VALUES (zeroblob(262144));")
+                .expect("grow the WAL past the ceiling");
+        }
+        hooks.checkpoint_attempts.store(0, Ordering::Release);
+        let folded = store
+            .fold_wal_below_ceiling(None)
+            .expect("admission folds an over-ceiling WAL");
+        assert_eq!(folded, 0, "an over-ceiling WAL must be truncated");
+        assert!(
+            hooks.checkpoint_attempts.load(Ordering::Acquire) > 0,
+            "the 16 MiB total ceiling depends on this fold actually happening"
+        );
+    }
+
     /// The actor folds the WAL when its queue drains, so a later `StageStart`
-    /// finds the zero baseline its admission proof requires instead of paying
-    /// ~1.6 ms/MiB to create one (cn3, synchronous=FULL, linear to the 8 MiB
-    /// ceiling). This pins the fold actually happening off the client's path.
+    /// inherits a small baseline instead of paying ~1.6 ms/MiB to create one
+    /// (cn3, synchronous=FULL, linear to the 8 MiB ceiling). This pins the fold
+    /// actually happening off the client's path.
     #[test]
     fn a_drained_queue_folds_the_wal_before_the_next_start_needs_it() {
         let temp = TempDir::new().expect("create idle fold fixture");
@@ -6771,8 +6944,8 @@ mod tests {
         );
     }
 
-    /// The other half: a dirty WAL must actually get folded, or the create path
-    /// keeps paying ~1.6 ms/MiB to reach its own zero baseline.
+    /// The other half: a dirty WAL must actually get folded while the actor is
+    /// idle, so the bytes are gone before any verb has to carry them.
     #[test]
     fn an_idle_fold_zeroes_a_dirty_wal_exactly_once() {
         let temp = TempDir::new().expect("create idle dirty fixture");
@@ -6803,7 +6976,7 @@ mod tests {
         assert_eq!(
             file_len(&store.wal_path).expect("read WAL length"),
             0,
-            "the fold must leave the zero baseline a later start requires"
+            "an idle fold leaves nothing for a later verb to carry"
         );
         let after = hooks.idle_folds.load(Ordering::Acquire);
         assert!(
