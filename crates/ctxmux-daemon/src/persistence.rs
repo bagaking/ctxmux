@@ -119,10 +119,22 @@ const COALESCE_ROW_BYTES: usize = 64 * 1024;
 /// backpressure: it is how far the fleet can run ahead of one fsync before
 /// appends start coalescing into larger transactions.
 ///
-/// Every other command (start, finalize, shutdown) still blocks here. Those are
-/// per-Run lifecycle transitions on their own callers, not the daemon-wide
-/// output reader, so blocking them cannot stall the fleet.
-pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 1_024;
+/// Every other command (start, finalize, shutdown) still blocks here. For start
+/// and shutdown that blocking is contained: they run on their own per-connection
+/// task. `finalize` is not — it is called from `publish_terminal` on one of the
+/// eight shared `ctxmux-native-blocking` workers (`CLEANUP_MAX_ACTIVE`), so a
+/// finalize blocked on this queue holds a pool permit the whole time. Eight of
+/// them blocked together stop `start_worker_jobs` dispatching cleanup *or*
+/// finalize for any other Run: this queue can stall the fleet, and the depth is
+/// what bounds for how long.
+///
+/// That is why this is 64 and not the 1024 it buffered at before. A loud fleet
+/// refills every slot the actor frees, so at 1024 the queue sits pinned full and
+/// the wait *grows* with each consecutive stop: measured 1.2 s climbing to 3.5 s
+/// over ten stops. At 64 the same wait is flat at 0.24-0.49 s. Depth sets the
+/// escalation, not the level; `TERMINAL_VISIBILITY_GRACE` covers the level. See
+/// `docs/architecture/r22-the-stop-that-stops-lying.md`.
+pub(crate) const PERSISTENCE_QUEUE_CAPACITY: usize = 64;
 const LIFECYCLE_METADATA_RESERVE_BYTES: usize = 128;
 const WAL_HEADER_BYTES: u64 = 32;
 const WAL_FRAME_BYTES: u64 = 24 + PAGE_SIZE_BYTES;
@@ -5588,7 +5600,7 @@ mod tests {
         assert_eq!(GLOBAL_REPLAY_BYTES, 256 * 1024 * 1024);
         assert_eq!(METADATA_BYTES, 64 * 1024 * 1024);
         assert_eq!(RUN_RECORD_FORMAT_ENVELOPE, 4_096);
-        assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 1_024);
+        assert_eq!(PERSISTENCE_QUEUE_CAPACITY, 64);
         assert_eq!(DATABASE_MAX_BYTES, 384 * 1024 * 1024);
         assert_eq!(WAL_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(SHM_MAX_BYTES, 4 * 1024 * 1024);
