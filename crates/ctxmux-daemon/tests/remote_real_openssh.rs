@@ -36,7 +36,7 @@ fn sleeper() -> RunSpec {
         args: vec!["-c".to_owned(), "printf ready; sleep 300".to_owned()],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -52,7 +52,7 @@ fn delayed_stop() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -69,7 +69,7 @@ fn outage_output() -> RunSpec {
         ],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }

@@ -30,7 +30,7 @@ test("defineRun fills only portable protocol defaults", () => {
     args: [],
     cwd: null,
     env: {},
-    size: { cols: 80, rows: 24 },
+    initial_size: { cols: 80, rows: 24 },
     declared_inputs: [],
   });
 });

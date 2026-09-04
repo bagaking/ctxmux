@@ -3251,7 +3251,7 @@ impl Run {
                     args: Vec::new(),
                     cwd: None,
                     env: std::collections::BTreeMap::new(),
-                    size: TerminalSize::default(),
+                    initial_size: TerminalSize::default(),
                     declared_inputs: Vec::new(),
                 },
                 lineage: None,
@@ -3402,7 +3402,7 @@ impl Run {
         validate_run_spec(&config.spec).map_err(invalid_run_spec)?;
         let qualification_stats = config.qualification_stats.clone();
         let pair = native_pty_system()
-            .openpty(to_pty_size(config.spec.size))
+            .openpty(to_pty_size(config.spec.initial_size))
             .map_err(|error| pty_open_error(&error))?;
         // Prepare every fallible PTY view before physical launch. Once a child
         // exists, native control and PendingPublication can be built without a
@@ -5848,7 +5848,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: std::collections::BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: vec![RunInputReference {
                     kind: RunInputKind::Context,
                     reference: "r".repeat(reference_bytes),
@@ -7227,7 +7227,7 @@ mod tests {
                 args: vec!["-c".to_owned(), "exit 0".to_owned()],
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             },
             PersistenceMode::MemoryOnly,
@@ -7521,7 +7521,7 @@ mod tests {
                     args: vec!["-c".to_owned(), "exit 0".to_owned()],
                     cwd: None,
                     env: BTreeMap::new(),
-                    size: TerminalSize::default(),
+                    initial_size: TerminalSize::default(),
                     declared_inputs: Vec::new(),
                 },
                 move || {
@@ -7706,7 +7706,7 @@ mod tests {
             args: Vec::new(),
             cwd: None,
             env: BTreeMap::new(),
-            size: TerminalSize::default(),
+            initial_size: TerminalSize::default(),
             declared_inputs: Vec::new(),
         }
     }
@@ -7850,7 +7850,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,
@@ -7986,7 +7986,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,
@@ -8142,7 +8142,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,
@@ -8244,7 +8244,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,
@@ -9103,7 +9103,7 @@ mod tests {
                 ],
                 cwd: None,
                 env,
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             })
             .await

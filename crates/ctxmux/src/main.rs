@@ -216,7 +216,7 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
                 args: command_args,
                 cwd: Some(cwd),
                 env: BTreeMap::default(),
-                size,
+                initial_size: size,
                 declared_inputs: Vec::new(),
             },
             operation_key.unwrap_or_else(CreateOperationKey::random),
@@ -427,7 +427,7 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         .run
         .spec
         .as_ref()
-        .map_or_else(TerminalSize::default, |spec| spec.size);
+        .map_or_else(TerminalSize::default, |spec| spec.initial_size);
     let _raw_mode = RawModeGuard::enable()?;
     stdout
         .write_all(&screen::reconstruct(&replay, size))
@@ -502,7 +502,7 @@ async fn apply_initial_terminal_size(
     let requested = current_terminal_size(
         run.spec
             .as_ref()
-            .map_or(TerminalSize::default(), |spec| spec.size),
+            .map_or(TerminalSize::default(), |spec| spec.initial_size),
     )?;
     let accepted = attachment
         .resize(requested)
@@ -766,7 +766,7 @@ fn print_run(run: &RunInfo) {
         run.latest_output_bytes,
         run.durable_output_bytes
             .map_or_else(|| "memory-only".to_owned(), |seq| seq.to_string()),
-        // The owner-confirmed size, not `spec.size`: a Run started at 80x24 and
+        // The owner-confirmed size, not `spec.initial_size`: a Run started at 80x24 and
         // resized to 200x87 reports 200x87 here. "unknown" is a real answer --
         // no owner can confirm a tmux pane or a recovered Run -- so it is not
         // filled in from the spec.

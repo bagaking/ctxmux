@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -708,9 +708,18 @@ pub struct RunSpec {
     /// Environment entries added to the inherited daemon environment.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Initial PTY dimensions.
-    #[serde(default)]
-    pub size: TerminalSize,
+    /// PTY dimensions requested at launch, and never changed afterwards.
+    ///
+    /// This is the size the Run was *asked* to start at. It is not the size the
+    /// terminal currently has: read [`RunInfo::current_size`] for that. The two
+    /// diverge the moment anyone resizes the Run, and reconstructing retained
+    /// output against this field after a resize parses it at the wrong width.
+    ///
+    /// Deliberately required rather than `#[serde(default)]`. A frame that omits
+    /// it is a frame whose sender did not decide the geometry, and defaulting
+    /// silently to 80x24 hands that sender a size no one chose — the same
+    /// wrong-geometry failure this field's name now refuses to invite.
+    pub initial_size: TerminalSize,
     /// Explicit workspace, artifact, and context references used by this Run.
     pub declared_inputs: Vec<RunInputReference>,
 }
@@ -1838,7 +1847,7 @@ mod tests {
                 args: Vec::new(),
                 cwd: None,
                 env: std::collections::BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             }),
             lineage: None,
@@ -1945,7 +1954,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 16,
+                    "protocolGeneration": 17,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {

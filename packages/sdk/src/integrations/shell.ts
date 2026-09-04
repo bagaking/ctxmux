@@ -15,7 +15,8 @@ export interface ShellRunConfig {
   readonly args?: readonly string[];
   readonly cwd?: string;
   readonly env?: Readonly<Record<string, string>>;
-  readonly size?: TerminalSize;
+  /** Launch geometry. Omitting it here is an explicit choice of 80x24. */
+  readonly initialSize?: TerminalSize;
 }
 
 /** Explicit generic-shell Integration with no semantic observer capability. */
@@ -52,7 +53,7 @@ export const shellIntegration: Integration<ShellRunConfig, undefined, never> = {
       args: [...(config.args ?? ["-i"])],
       cwd: config.cwd ?? null,
       env: { ...(config.env ?? {}) },
-      size: config.size ?? { cols: 80, rows: 24 },
+      initial_size: config.initialSize ?? { cols: 80, rows: 24 },
       declared_inputs: [],
     };
   },

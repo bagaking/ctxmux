@@ -159,14 +159,15 @@ export function versionInfo(product: string): VersionInfo {
   return { product, protocol: PROTOCOL_VERSION };
 }
 
-/** Fill the portable defaults required by protocol generation 14. */
+/** Fill the portable defaults required by the current protocol generation. */
 export function defineRun(
   program: string,
   options: {
     readonly args?: readonly string[];
     readonly cwd?: string | null;
     readonly env?: Readonly<Record<string, string>>;
-    readonly size?: TerminalSize;
+    /** Launch geometry. Omitting it here is an explicit choice of 80x24. */
+    readonly initialSize?: TerminalSize;
     readonly declaredInputs?: readonly RunInputReference[];
   } = {},
 ): RunSpec {
@@ -178,7 +179,7 @@ export function defineRun(
     args: [...(options.args ?? [])],
     cwd: options.cwd ?? null,
     env: { ...(options.env ?? {}) },
-    size: options.size ?? { cols: 80, rows: 24 },
+    initial_size: options.initialSize ?? { cols: 80, rows: 24 },
     declared_inputs: [...(options.declaredInputs ?? [])],
   };
 }

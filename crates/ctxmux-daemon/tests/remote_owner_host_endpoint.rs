@@ -150,7 +150,7 @@ fn sleeper() -> RunSpec {
         args: vec!["-c".to_owned(), "printf ready; sleep 300".to_owned()],
         cwd: None,
         env: BTreeMap::new(),
-        size: TerminalSize::default(),
+        initial_size: TerminalSize::default(),
         declared_inputs: Vec::new(),
     }
 }
@@ -300,7 +300,7 @@ async fn output_written_while_disconnected_replays_from_the_caller_cursor() {
                 ],
                 cwd: None,
                 env: BTreeMap::new(),
-                size: TerminalSize::default(),
+                initial_size: TerminalSize::default(),
                 declared_inputs: Vec::new(),
             },
             CreateOperationKey::new("remote-replay-run").expect("key"),
