@@ -815,8 +815,10 @@ bounded, restartable startup transactions reconcile prior running rows, evict
 the canonical terminal prefix to the operational 128-record ceiling, remove
 orphan replay generations, truncate uncommitted tails, and finish
 serving-epoch publication before the socket becomes visible. Replay payloads
-come from the validated generation file, never an inline SQLite fallback. A
-missing or shortened referenced segment is a typed startup failure. Unknown
+come from the validated generation file, never an inline SQLite fallback; the
+writer syncs both payload bytes and generation directory entries before
+publishing a new generation name. A missing, shortened, overlapping, or
+otherwise unprovable referenced segment is a typed startup failure. Unknown
 versions, corrupt state, or an individually unprovable normalization unit fail
 startup; there is no migration, reset, salvage, or partial exposure.
 

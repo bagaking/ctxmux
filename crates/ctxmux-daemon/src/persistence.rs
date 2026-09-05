@@ -520,6 +520,9 @@ struct PersistenceTestHooks {
 static NEXT_OPEN_TEST_HOOKS: Mutex<Option<Arc<PersistenceTestHooks>>> = Mutex::new(None);
 
 #[cfg(test)]
+const REPLAY_COMPACTION_CRASH_PHASE: &str = "CTXMUX_REPLAY_COMPACTION_CRASH_PHASE";
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 enum StartCommitCrashPhase {
@@ -2417,13 +2420,19 @@ impl StateStore {
         };
         validate_replay_file_name(&replay_file)?;
         let replay_path = replay_dir.join(&replay_file);
-        if !replay_path.exists() {
+        let replay_file_created = if replay_path.exists() {
+            false
+        } else {
             OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
                 .open(&replay_path)
                 .map_err(|source| PersistenceError::io(&replay_path, source))?;
+            true
+        };
+        if replay_file_created {
+            sync_directory(&replay_dir)?;
         }
         validate_state_file(&replay_path)?;
         connection
@@ -2446,7 +2455,7 @@ impl StateStore {
             }
         }
         validate_quick_check(&connection)?;
-        validate_application_state(&connection, &replay_dir)?;
+        validate_application_state(&connection, &replay_dir, &replay_file)?;
 
         let mut store = Self {
             state_dir: state_dir.to_path_buf(),
@@ -2474,7 +2483,7 @@ impl StateStore {
             &store.shm_path,
         )?;
         store.normalize_startup()?;
-        validate_application_state(&store.connection, &store.replay_dir)?;
+        validate_application_state(&store.connection, &store.replay_dir, &store.replay_file)?;
         store.validate_operational_state()?;
         let recovered = load_recovered(&store.connection, &store.replay_dir)?;
         store.validate_files()?;
@@ -4379,6 +4388,13 @@ impl StateStore {
         output
             .sync_all()
             .map_err(|source| PersistenceError::io(&new_path, source))?;
+        // The SQLite switch below is the authority for the new generation.
+        // Persist its directory entry before publishing that name, otherwise a
+        // power loss can leave committed metadata pointing at a file whose
+        // create is still only in the directory cache.
+        sync_directory(&self.replay_dir)?;
+        #[cfg(test)]
+        crash_replay_compaction_if_armed("before_commit");
 
         let transaction = self
             .connection
@@ -4407,10 +4423,29 @@ impl StateStore {
                 [&new_file],
             )
             .map_err(PersistenceError::database)?;
-        transaction.commit().map_err(PersistenceError::database)?;
+        // A COMMIT error can be ambiguous: SQLite may have made the metadata
+        // durable before reporting an I/O failure. Keep the new generation in
+        // that case so startup can resolve the pair from `runtime_meta`:
+        // committed metadata keeps the new file, while a rolled-back
+        // transaction keeps the old file and removes this orphan. Deleting it
+        // here would turn an otherwise recoverable ambiguous commit into a
+        // missing referenced segment.
+        if let Err(error) = transaction.commit() {
+            generation.commit();
+            return Err(PersistenceError::database(error));
+        }
+        #[cfg(test)]
+        crash_replay_compaction_if_armed("after_commit");
         generation.commit();
         self.replay_file = new_file;
-        fs::remove_file(old_path).ok();
+        fs::remove_file(&old_path).map_err(|source| PersistenceError::io(&old_path, source))?;
+        // Losing this directory fsync is recoverable: the committed metadata
+        // already names the new generation, and startup removes any old entry
+        // that reappears after a crash. Do not turn that cleanup window into a
+        // data-loss claim or leave the actor latched after a successful switch.
+        if let Err(error) = sync_directory(&self.replay_dir) {
+            eprintln!("ctxmux replay directory cleanup sync deferred: {error}");
+        }
         debug_assert_eq!(offset, next_offset);
         Ok(())
     }
@@ -4823,6 +4858,7 @@ fn validate_quick_check(connection: &Connection) -> Result<(), PersistenceError>
 fn validate_application_state(
     connection: &Connection,
     replay_dir: &Path,
+    active_replay_file: &str,
 ) -> Result<(), PersistenceError> {
     let mut statement = connection
         .prepare(
@@ -4929,6 +4965,67 @@ fn validate_application_state(
         return Err(PersistenceError::Corrupt(
             "stored logical quota accounting exceeds the format limits".to_owned(),
         ));
+    }
+    validate_replay_extents(connection, replay_dir, active_replay_file)?;
+    Ok(())
+}
+
+/// Every durable extent is produced by the single append-only writer. A
+/// repeated or cross-generation range therefore means the `SQLite` index and
+/// payload file no longer describe one store, even when each individual Run's
+/// cursor still looks contiguous. Reject that corruption before serving any
+/// recovered replay.
+fn validate_replay_extents(
+    connection: &Connection,
+    replay_dir: &Path,
+    active_replay_file: &str,
+) -> Result<(), PersistenceError> {
+    let active_path = replay_dir.join(active_replay_file);
+    let file_size = file_len(&active_path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT data_file, data_offset, data_bytes
+             FROM replay_chunks ORDER BY data_file, data_offset, ordinal",
+        )
+        .map_err(PersistenceError::database)?;
+    let mut rows = statement.query([]).map_err(PersistenceError::database)?;
+    let mut previous_end = 0_u64;
+    let mut has_previous = false;
+    while let Some(row) = rows.next().map_err(PersistenceError::database)? {
+        let data_file: String = row.get(0).map_err(PersistenceError::database)?;
+        if data_file != active_replay_file {
+            return Err(PersistenceError::Corrupt(format!(
+                "replay extent references inactive generation {data_file:?}"
+            )));
+        }
+        let offset = nonnegative_u64(
+            row.get(1).map_err(PersistenceError::database)?,
+            "replay file offset",
+        )?;
+        let length = nonnegative_u64(
+            row.get(2).map_err(PersistenceError::database)?,
+            "replay segment length",
+        )?;
+        if length > PER_RUN_REPLAY_BYTES {
+            return Err(PersistenceError::Corrupt(
+                "replay segment exceeds the 4 MiB per-Run bound".to_owned(),
+            ));
+        }
+        let end = offset.checked_add(length).ok_or_else(|| {
+            PersistenceError::Corrupt("replay extent range overflows the file offset".to_owned())
+        })?;
+        if end > file_size {
+            return Err(PersistenceError::Corrupt(
+                "replay extent exceeds its active generation file".to_owned(),
+            ));
+        }
+        if has_previous && offset < previous_end {
+            return Err(PersistenceError::Corrupt(
+                "replay extents overlap in the active generation".to_owned(),
+            ));
+        }
+        previous_end = end;
+        has_previous = true;
     }
     Ok(())
 }
@@ -5055,6 +5152,20 @@ fn read_replay_segment(
     validate_replay_file_name(file_name)?;
     let path = replay_dir.join(file_name);
     validate_state_file(&path)?;
+    if length > PER_RUN_REPLAY_BYTES {
+        return Err(PersistenceError::Corrupt(format!(
+            "replay segment length {length} exceeds the 4 MiB per-Run bound"
+        )));
+    }
+    let file_size = file_len(&path)?;
+    let end = offset.checked_add(length).ok_or_else(|| {
+        PersistenceError::Corrupt("replay segment range overflows the file offset".to_owned())
+    })?;
+    if end > file_size {
+        return Err(PersistenceError::Corrupt(format!(
+            "replay segment [{offset}, {end}) exceeds file length {file_size}"
+        )));
+    }
     let mut file = File::open(&path).map_err(|source| PersistenceError::io(&path, source))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|source| PersistenceError::io(&path, source))?;
@@ -5445,6 +5556,13 @@ struct ReplayFileWriter {
 struct ReplayGenerationGuard {
     path: PathBuf,
     committed: bool,
+}
+
+#[cfg(test)]
+fn crash_replay_compaction_if_armed(phase: &str) {
+    if std::env::var(REPLAY_COMPACTION_CRASH_PHASE).as_deref() == Ok(phase) {
+        std::process::abort();
+    }
 }
 
 impl ReplayGenerationGuard {
@@ -6106,6 +6224,16 @@ fn file_len(path: &Path) -> Result<u64, PersistenceError> {
     }
 }
 
+/// Persist directory entries that are part of the replay generation protocol.
+/// File `sync_all` makes payload bytes durable; the directory sync makes the
+/// generation name durable before `SQLite` is allowed to publish it.
+fn sync_directory(path: &Path) -> Result<(), PersistenceError> {
+    File::open(path)
+        .map_err(|source| PersistenceError::io(path, source))?
+        .sync_all()
+        .map_err(|source| PersistenceError::io(path, source))
+}
+
 fn validate_physical_limits(
     state_dir: &Path,
     replay_dir: &Path,
@@ -6189,7 +6317,10 @@ mod tests {
         env,
         fs::{self, OpenOptions},
         io,
-        os::unix::{fs::MetadataExt, process::ExitStatusExt},
+        os::unix::{
+            fs::{MetadataExt, OpenOptionsExt},
+            process::ExitStatusExt,
+        },
         path::{Path, PathBuf},
         process::{
             Child as ProcessChild, Command as ProcessCommand, Output as ProcessOutput, Stdio,
@@ -6213,15 +6344,14 @@ mod tests {
         AdmissionLimits, CommitProbe, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
         MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
-        PersistentCandidate, PersistentStartCompletion, REPLAY_DIR, RETAINED_RUN_RECORDS,
-        RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
-        StartDisposition, StartReceipt, StateLockGuard, StateStore,
-        TEST_REPLAY_COMPACTION_TRIGGER_BYTES, WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES,
-        WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES, append_replay, append_replay_external,
-        create_schema, directory_file_len, file_len, idle_fold_wal, load_recovered, metadata_size,
-        mutex_lock, nonnegative_u64, prune_global_replay_to, retry_transient_storage,
-        retry_wal_checkpoint, validate_existing_schema, validate_replay_window,
-        wal_charge_for_cache,
+        PersistentCandidate, PersistentStartCompletion, REPLAY_COMPACTION_CRASH_PHASE, REPLAY_DIR,
+        RETAINED_RUN_RECORDS, RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES,
+        StartCommitCrashPhase, StartDisposition, StartReceipt, StateLockGuard, StateStore,
+        WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES, WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES,
+        append_replay, append_replay_external, create_schema, directory_file_len, file_len,
+        idle_fold_wal, load_recovered, metadata_size, mutex_lock, nonnegative_u64,
+        prune_global_replay_to, read_replay_segment, retry_transient_storage, retry_wal_checkpoint,
+        validate_existing_schema, validate_replay_window, wal_charge_for_cache,
     };
     use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 
@@ -6278,6 +6408,7 @@ mod tests {
     const COMMIT_CRASH_NEW_ID: &str = "CTXMUX_COMMIT_CRASH_NEW_ID";
     const COMMIT_CRASH_NEW_KEY: &str = "CTXMUX_COMMIT_CRASH_NEW_KEY";
     const COMMIT_CRASH_ROLE: &str = "CTXMUX_COMMIT_CRASH_ROLE";
+    const REPLAY_COMPACTION_CRASH_STATE_DIR: &str = "CTXMUX_REPLAY_COMPACTION_CRASH_STATE_DIR";
     const STARTUP_SOCKET_STATE_DIR: &str = "CTXMUX_STARTUP_SOCKET_STATE_DIR";
     const STARTUP_SOCKET_PATH: &str = "CTXMUX_STARTUP_SOCKET_PATH";
     const STARTUP_SOCKET_ROLE: &str = "CTXMUX_STARTUP_SOCKET_ROLE";
@@ -7471,7 +7602,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_replay_generation_compacts_without_changing_the_window() {
+    fn oversized_replay_generation_past_database_ceiling_compacts_without_changing_the_window() {
         let temp = TempDir::new().expect("create replay compaction fixture");
         let state_dir = temp.path().join("state");
         let (mut store, recovered) = StateStore::open(
@@ -7505,8 +7636,11 @@ mod tests {
             .write(true)
             .open(&old_file)
             .expect("open current replay generation");
-        file.set_len(TEST_REPLAY_COMPACTION_TRIGGER_BYTES + 1)
-            .expect("inflate replay generation");
+        // Use a sparse file so this exercises a generation larger than the
+        // frozen SQLite main database without spending hundreds of MiB in the
+        // test process. The compactor must copy only referenced segments.
+        file.set_len(DATABASE_MAX_BYTES + PAGE_SIZE_BYTES)
+            .expect("inflate replay generation past the database ceiling");
         drop(file);
         assert!(file_len(&old_file).expect("measure inflated generation") > old_len);
 
@@ -7529,6 +7663,182 @@ mod tests {
                 .expect("measure compacted generation")
                 < old_len + 128,
             "compaction must discard the sparse stale tail"
+        );
+    }
+
+    #[test]
+    fn replay_compaction_crash_selects_one_generation_on_reopen() {
+        for phase in ["before_commit", "after_commit"] {
+            let temp = TempDir::new().expect("create replay compaction crash fixture");
+            let state_dir = temp.path().join(phase);
+            let (mut store, recovered) = StateStore::open(
+                &state_dir,
+                AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::new(PersistenceTestHooks::default()),
+            )
+            .expect("open replay compaction crash store");
+            assert!(recovered.is_empty());
+
+            let id = RunId::new();
+            let transaction = store
+                .connection
+                .transaction()
+                .expect("start replay compaction crash setup");
+            let actual_metadata = insert_test_run(&transaction, id, "running", 1);
+            transaction
+                .execute(
+                    "UPDATE runs SET metadata_bytes = ?2 WHERE id = ?1",
+                    params![id.to_string(), actual_metadata],
+                )
+                .expect("make replay compaction crash metadata valid");
+            transaction
+                .commit()
+                .expect("commit replay compaction crash setup");
+
+            let transaction = store
+                .connection
+                .transaction()
+                .expect("start replay compaction crash payload transaction");
+            let payload = vec![b'c'; 2048];
+            let expected_replay = replay(vec![chunk(0, &payload)]);
+            append_replay_external(
+                &transaction,
+                id,
+                &expected_replay,
+                &store.replay_dir,
+                &store.replay_file,
+            )
+            .expect("write replay compaction crash payload");
+            transaction
+                .commit()
+                .expect("commit replay compaction crash payload");
+
+            drop(store);
+
+            let output = run_replay_compaction_crash_subprocess(&state_dir, phase);
+            assert_eq!(output.status.code(), None);
+            assert_eq!(
+                output.status.signal(),
+                Some(rustix::process::Signal::ABORT.as_raw()),
+                "replay compaction crash helper did not abort: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            let (reopened, recovered) = StateStore::open(
+                &state_dir,
+                AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::new(PersistenceTestHooks::default()),
+            )
+            .expect("reopen after replay compaction crash");
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].replay, expected_replay);
+            let generation_files = fs::read_dir(&reopened.replay_dir)
+                .expect("read replay generations after crash recovery")
+                .map(|entry| entry.expect("read replay generation entry").path())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                generation_files.len(),
+                1,
+                "startup must remove the losing generation"
+            );
+            assert_eq!(
+                generation_files[0]
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some(reopened.replay_file.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn replay_compaction_crash_subprocess() {
+        let Some(state_dir) = env::var_os(REPLAY_COMPACTION_CRASH_STATE_DIR) else {
+            return;
+        };
+        let phase = env::var(REPLAY_COMPACTION_CRASH_PHASE)
+            .expect("replay compaction crash helper receives a phase");
+        let state_dir = PathBuf::from(state_dir);
+        let (_store, _recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .expect("open replay compaction crash helper store");
+        panic!("replay compaction crash hook did not terminate at {phase}");
+    }
+
+    #[test]
+    fn rolled_back_replay_transaction_tail_is_truncated_on_reopen() {
+        let temp = TempDir::new().expect("create replay rollback fixture");
+        let state_dir = temp.path().join("state");
+        let (mut store, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .expect("open replay rollback store");
+        assert!(recovered.is_empty());
+
+        let id = RunId::new();
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start replay rollback setup transaction");
+        let actual_metadata = insert_test_run(&transaction, id, "running", 1);
+        transaction
+            .execute(
+                "UPDATE runs SET metadata_bytes = ?2 WHERE id = ?1",
+                params![id.to_string(), actual_metadata],
+            )
+            .expect("make replay rollback fixture metadata valid");
+        transaction.commit().expect("commit replay rollback setup");
+
+        let replay_path = store.replay_dir.join(&store.replay_file);
+        let base_len = file_len(&replay_path).expect("measure empty replay generation");
+        {
+            let transaction = store
+                .connection
+                .transaction()
+                .expect("start replay rollback transaction");
+            append_replay_external(
+                &transaction,
+                id,
+                &replay(vec![chunk(0, b"tail must not become durable")]),
+                &store.replay_dir,
+                &store.replay_file,
+            )
+            .expect("write replay before forced rollback");
+            assert!(
+                file_len(&replay_path).expect("measure uncommitted replay tail") > base_len,
+                "the fixture must leave a physical tail behind the rolled-back transaction"
+            );
+            transaction
+                .execute("INSERT INTO missing_table VALUES (1)", [])
+                .expect_err("force the transaction to roll back");
+        }
+        assert!(
+            file_len(&replay_path).expect("measure rolled-back replay tail") > base_len,
+            "a failed SQLite transaction may leave the synced append tail behind"
+        );
+        drop(store);
+
+        let (reopened, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .expect("reopen after replay transaction rollback");
+        assert!(recovered.iter().all(|run| run.replay.chunks.is_empty()));
+        let current_path = reopened.replay_dir.join(&reopened.replay_file);
+        assert_eq!(
+            file_len(&current_path).expect("measure normalized replay generation"),
+            base_len,
+            "startup must truncate bytes that never acquired a durable index row"
         );
     }
 
@@ -7567,7 +7877,23 @@ mod tests {
         let Err(error) = Persistence::open(&state_dir) else {
             panic!("truncated replay must be rejected");
         };
-        assert!(matches!(error, PersistenceError::Io { .. }));
+        assert!(matches!(error, PersistenceError::Corrupt(_)));
+    }
+
+    #[test]
+    fn oversized_replay_segment_length_fails_before_allocation() {
+        let temp = TempDir::new().expect("create replay length fixture");
+        let path = temp.path().join("replay-test.bin");
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("create replay length fixture file");
+        let error =
+            read_replay_segment(temp.path(), "replay-test.bin", 0, PER_RUN_REPLAY_BYTES + 1)
+                .expect_err("an oversized corrupt extent must be rejected before allocation");
+        assert!(matches!(error, PersistenceError::Corrupt(message) if message.contains("4 MiB")));
     }
 
     /// The change this whole round is: a lifecycle verb must NOT checkpoint a
@@ -8739,6 +9065,21 @@ mod tests {
         wait_for_test_subprocess(child, &format!("{phase}-COMMIT"))
     }
 
+    fn run_replay_compaction_crash_subprocess(state_dir: &Path, phase: &str) -> ProcessOutput {
+        let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
+            .arg("--exact")
+            .arg("persistence::tests::replay_compaction_crash_subprocess")
+            .arg("--nocapture")
+            .env(REPLAY_COMPACTION_CRASH_STATE_DIR, state_dir)
+            .env(REPLAY_COMPACTION_CRASH_PHASE, phase)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn isolated replay compaction crash fixture");
+        wait_for_test_subprocess(child, &format!("{phase}-replay-compaction"))
+    }
+
     fn run_startup_socket_subprocess(state_dir: &Path, socket: &Path, role: &str) -> ProcessOutput {
         let child = ProcessCommand::new(env::current_exe().expect("resolve unit test binary"))
             .arg("--exact")
@@ -8889,7 +9230,7 @@ mod tests {
         id: RunId,
         state_kind: &str,
         metadata_bytes: i64,
-    ) {
+    ) -> i64 {
         let spec = RunSpec {
             program: "/bin/true".to_owned(),
             args: Vec::new(),
@@ -8910,7 +9251,7 @@ mod tests {
         let state_json = serde_json::to_string(&state).expect("encode test state");
         let epoch = uuid::Uuid::new_v4().to_string();
         let operation_key = test_operation_key(id);
-        let _actual_metadata = metadata_size(
+        let actual_metadata = metadata_size(
             &id.to_string(),
             operation_key.as_str(),
             &spec_json,
@@ -8938,6 +9279,7 @@ mod tests {
                 ],
             )
             .expect("insert test Run row");
+        i64::try_from(actual_metadata).expect("test metadata fits SQLite")
     }
 
     fn running_info(id: RunId) -> RunInfo {

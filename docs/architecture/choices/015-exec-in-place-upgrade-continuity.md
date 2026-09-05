@@ -6,7 +6,8 @@
 - Supersedes: the two-process transactional direction of Feature **f-228**
   (`.bagakit/.../f-228cz55vj`), after the Herdr comparison
   (`f-226.../artifacts/herdr-transfer-review.md`) showed ctxmux's
-  SQLite-backed replay does not need Herdr's process-coexistence fd transfer.
+  SQLite replay metadata plus external generation files do not need Herdr's
+  process-coexistence fd transfer.
   See Alternatives for the accepted cost (no mid-transaction rollback).
 
 ## Context
@@ -217,9 +218,10 @@ re-exec changes no frame.
   two processes because its pty actor holds heavy in-process terminal state
   (`src/pty/actor/unix.rs`: grids, terminal responses, render state) that cannot
   be rebuilt from a store, so its fds must cross a process boundary while both
-  live. ctxmux keeps replay in SQLite, not in heavy in-process terminal state,
-  so `execve` is cheap and removes the process-coexistence window that is the
-  entire reason `SCM_RIGHTS` exists.
+  live. ctxmux keeps replay coordinates in SQLite and payloads in external
+  generation files, not in heavy in-process terminal state, so `execve` is
+  cheap and removes the process-coexistence window that is the entire reason
+  `SCM_RIGHTS` exists.
   - **Accepted cost.** f-228's acceptance boundary required "failure before
     commit restores the old owner" — a rollback to a still-live quiesced
     predecessor. Exec-in-place **cannot offer that**, and does not try to: once

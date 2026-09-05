@@ -600,10 +600,12 @@ this cleanup does not imply Run GC.
 
 Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread
-commits starts, contiguous output batches, pruning/accounting, and terminal
-transitions; a bounded actor queue backpressures the PTY reader instead of
-accumulating an unbounded durable-output backlog. If SQLite reports typed
-`DiskFull` while appending output or finalizing a Run, that actor keeps the
+commits starts, replay coordinates, pruning/accounting, and terminal
+transitions; replay payloads are synced to the active external generation
+before their coordinates commit. A bounded actor queue backpressures the PTY
+reader instead of accumulating an unbounded durable-output backlog. If SQLite
+reports typed `DiskFull`, write-side I/O pressure, or the external file reports
+`StorageFull` while appending output or finalizing a Run, that actor keeps the
 exact command at the head of the queue and retries after a short delay; later
 durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
 other storage, replay, budget, integrity, and owner-invariant failure remains
