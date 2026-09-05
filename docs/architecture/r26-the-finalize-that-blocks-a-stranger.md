@@ -1,9 +1,15 @@
 # One Run's durable finalize blocks another Run's Stop receipt
 
-**Status: product defect, found while clearing red tests before round 26. Not
-yet fixed.** Filed here because the round that fixes it needs the evidence, and
-because the fixture that catches it has been red for three rounds while I
-called those rounds green.
+**Status: FIXED in
+[`r29-the-stop-that-did-not-need-the-actor`](r29-the-stop-that-did-not-need-the-actor.md).**
+Found while clearing red tests before round 26, and filed here because the round
+that fixes it needs the evidence, and because the fixture that catches it had
+been red for three rounds while I called those rounds green.
+
+The fix did **not** take the publish-before-finalize direction this doc flagged
+below as needing its own round. That direction remains untaken and still needs
+one. The Stop path simply did not need terminal visibility at all: the wait was
+R22's, added for `remove`, and it now lives on `remove`.
 
 ## The symptom
 
@@ -123,8 +129,17 @@ was chosen deliberately, and `publish_terminal_state`'s own comment says the
 ordering is defence in depth. Reversing it needs its own round and its own
 crash-consistency argument, not a patch appended to this one.
 
+**R29 update:** that direction was never needed. The Stop path did not require
+terminal visibility — the wait it performed was R22's, added for `remove`'s
+benefit, and `docs/protocol.md` explicitly permits the receipt to precede
+publication. Moving the wait to `remove` closed the defect with the
+finalize/publish ordering untouched. Publishing before finalize is still
+unexplored and still needs its own crash-consistency round.
+
 ## Where the honest baseline now sits
 
 `cargo test -p ctxmux-daemon --lib` on `17111bb`: **244 passed, 1 failed**. That
 one failure is this defect. Any future claim that the suite is green must say
 so explicitly.
+
+**R29 update:** now **250 passed, 0 failed**. The asterisk is retired.

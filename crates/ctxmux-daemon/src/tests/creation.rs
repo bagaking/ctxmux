@@ -1313,6 +1313,52 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     drop(reopened);
 }
 
+/// `remove` waits out the terminal publication a reaped Run is owed.
+///
+/// The load-based siblings in `tests/native_lifecycle.rs` assert the same
+/// property by making the persistence actor busy, which only reaches the window
+/// when the host cooperates. This parks the actor exactly, so the wait is either
+/// there or the test is red -- deleting `await_reaped_publication` from `remove`
+/// makes this fail with `InvalidRunState` rather than time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_waits_for_the_publication_a_reaped_run_is_owed() {
+    let temp = tempfile::tempdir().expect("create parked-publication fixture");
+    let (persistence, recovered) =
+        Persistence::open(temp.path().join("state")).expect("open parked-publication persistence");
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let server = InProcessServer::start(Arc::clone(&manager));
+    let run = server
+        .client
+        .start(long_running_spec())
+        .await
+        .expect("start the Run whose publication is parked");
+    let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
+
+    let stop_operation = fresh_stop(&server.client, run.id).await;
+    server
+        .client
+        .stop(stop_operation)
+        .await
+        .expect("the Stop receipt does not wait on the parked publication");
+    finalize_reached
+        .recv_timeout(Duration::from_secs(5))
+        .expect("persistence actor reaches the finalize barrier");
+
+    let mut removal = Box::pin(server.client.remove(run.id));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut removal)
+            .await
+            .is_err(),
+        "remove waits for the parked publication instead of refusing the Run"
+    );
+
+    drop(finalize_release);
+    tokio::time::timeout(Duration::from_secs(5), removal)
+        .await
+        .expect("remove completes once publication lands")
+        .expect("remove accepts the published Run");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
     let temp = tempfile::tempdir().expect("create finalize shutdown fixture");

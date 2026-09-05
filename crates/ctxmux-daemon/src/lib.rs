@@ -104,18 +104,18 @@ const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long a settled Stop waits for terminal state to become visible before
-/// answering with the state as it stands.
+/// How long `remove` waits for a reaped Run's terminal state to become visible
+/// before reading the state as it stands.
 ///
 /// Publication happens on a worker that is already running by the time a Stop
 /// receipt exists: measured at 1-6 ms on a persistent daemon. But publication
 /// can also sit behind a durable finalize, and under a loud fleet that finalize
 /// is queued behind the appends it must be ordered after: measured 0.3-3.6 s.
 ///
-/// Expiring here is therefore **not** a harmless stale field. `remove` reads the
-/// very same `state` (`creation.rs`, `validate_removable_entry`), so a Stop that
-/// gives up answers `Running` and the caller's next `remove` is refused with
-/// `InvalidRunState`. The timer converts *slow* into *wrong*.
+/// Expiring here is therefore **not** harmless. `remove` reads the very `state`
+/// publication writes (`creation.rs`, `validate_removable_entry`), so a wait
+/// that gives up refuses the caller with `InvalidRunState`. The timer converts
+/// *slow* into *wrong*.
 ///
 /// So this is a backstop against a hung publication, not a latency budget: it is
 /// sized past the measured worst case rather than under it. On the farm host,
@@ -124,6 +124,10 @@ const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 /// unchanged within the noise floor. Waiting is bounded in turn by
 /// `PERSISTENCE_QUEUE_CAPACITY`, which is what stops the wait escalating across
 /// consecutive stops; see `docs/architecture/r22-the-stop-that-stops-lying.md`.
+///
+/// It is deliberately **not** on the Stop response path: that made every Stop
+/// wait out an unrelated Run's finalize on the one persistence actor. See
+/// `docs/architecture/r29-the-stop-that-did-not-need-the-actor.md`.
 const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_secs(10);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -2256,6 +2260,15 @@ impl RunManager {
         let Some(_persistence) = &self.persistence else {
             return self.registry.remove_memory(id);
         };
+        // A Stop receipt proves the child was reaped, not that publication has
+        // landed, and the caller's next line is usually this `remove`. Wait out
+        // the publication it is owed before reading the state it writes -- the
+        // drop releases the pin `validate_removable_entry` requires be unique.
+        if let Ok(run) = self.pin(id) {
+            run.await_reaped_publication(Instant::now() + TERMINAL_VISIBILITY_GRACE)
+                .await;
+            drop(run);
+        }
         let manager = Arc::clone(self);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         thread::Builder::new()
@@ -4451,23 +4464,44 @@ impl Run {
         self.terminal_visible.notify_waiters();
     }
 
-    /// Wait until terminal state is visible, or until the Run is already
-    /// terminal, or until `deadline`.
+    /// Wait until a reaped Run's terminal state is visible, or until `deadline`.
     ///
-    /// The deadline is a backstop, not the expected path: publication happens on
-    /// a `ctxmux-native-blocking` worker that is already running by the time a
-    /// Stop receipt exists. A timeout here returns the state as it stands rather
-    /// than failing the Stop, because the Stop itself did succeed.
-    async fn await_terminal_visible(&self, deadline: Instant) {
+    /// Publication runs on a `ctxmux-native-blocking` worker, and for a
+    /// persistent Run it sits behind a durable finalize ordered after the
+    /// appends already queued: measured 1-6 ms quiet, 0.3-3.6 s under a loud
+    /// fleet. `remove` reads the very `state` publication writes
+    /// (`validate_removable_entry`), so without this wait the `remove` on the
+    /// line after a Stop is refused `InvalidRunState` — the deadline would turn
+    /// *slow* into *wrong*, which is why it is sized past the measured worst
+    /// case rather than under it.
+    ///
+    /// A Run whose child is not yet reaped is genuinely live: no publication is
+    /// coming, so it gets no wait and `remove` refuses it promptly.
+    async fn await_reaped_publication(&self, deadline: Instant) {
         loop {
             let notified = self.terminal_visible.notified();
-            if !self.is_running() {
+            if !self.is_running() || !self.child_reaped() {
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || tokio::time::timeout(remaining, notified).await.is_err() {
                 return;
             }
+        }
+    }
+
+    /// Whether this Run's child is reaped, so a terminal publication is owed.
+    ///
+    /// Ordered before the Stop receipt (`mark_reaped` precedes the owner reply),
+    /// unlike closed quiescence, which is marked after it.
+    fn child_reaped(&self) -> bool {
+        match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control.reap_result().is_ok(),
+            Some(RunControl::Tmux(control)) => matches!(
+                control.observe_completion(),
+                TmuxCompletionObservation::Complete(_)
+            ),
+            None => false,
         }
     }
 
@@ -5618,18 +5652,15 @@ async fn recoverable_stop_response(
     };
     let (run, result) = flight.resolve().await;
     Ok(match result {
-        Ok(receipt) => {
-            // The receipt is proof the child was reaped, but publication runs on
-            // a separate worker: without this the response could name a Run the
-            // daemon still reports as `Running`, which is what `remove` on the
-            // next line of a warm client saw.
-            run.await_terminal_visible(Instant::now() + TERMINAL_VISIBILITY_GRACE)
-                .await;
-            Response::ControlAccepted {
-                run: run.info(),
-                receipt,
-            }
-        }
+        // The receipt proves this Run's child was reaped, and reaping never
+        // touches the persistence actor. Publication does, so waiting for it
+        // here made every Stop queue behind *another* Run's durable finalize;
+        // `remove` owns that wait now, which is the only caller that needed it.
+        // `docs/protocol.md` already promises this receipt may say `running`.
+        Ok(receipt) => Response::ControlAccepted {
+            run: run.info(),
+            receipt,
+        },
         Err(failure) => Response::ControlRejected { failure },
     })
 }
