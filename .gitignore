@@ -15,5 +15,6 @@ coverage
 
 .worktrees
 .tmp
+.tmp-*
 .bagakit
 .playwright-cli
