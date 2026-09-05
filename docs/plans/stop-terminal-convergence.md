@@ -1,5 +1,9 @@
 # Stop terminal convergence
 
+The [case study](../architecture/case-study-replay-stop-convergence.md) records
+the failure chain, superseded assumption, and validation limits. This document
+retains the bounded implementation scope.
+
 The user scoped this work to the replay/Stop regressions: “我说的就是刚才发现的
 问题, ctxmux 这边的全部解决一下” and “先做一个稳定而收敛的版本”. Other roadmap
 milestones and downstream product changes are outside this change.

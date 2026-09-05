@@ -1,5 +1,11 @@
 # R36 — the Stop was waiting for something only `remove` wanted
 
+Scope correction: this round records the contract under which it was measured.
+The assumption that only Remove needs terminal visibility was disproved by
+Stop followed by List. Public Stop success now joins terminal publication at
+the shared Stop flight. See the [combined case study](case-study-replay-stop-convergence.md)
+for the revised boundary; the measurements below remain historical evidence.
+
 **Fixed.** The defect filed in
 [`r26-the-finalize-that-blocks-a-stranger.md`](r26-the-finalize-that-blocks-a-stranger.md)
 is closed, and closed without touching the finalize/publish ordering that doc

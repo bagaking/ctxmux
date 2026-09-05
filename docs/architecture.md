@@ -668,4 +668,8 @@ The formal docs deliberately do not depend on the local research corpus that see
 
 The same discipline covers this repo's own measured performance/correctness rounds: the [`rNN-*` writeups](architecture/measured-rounds.md) are indexed with each round's one-line conclusion, disposition, whether its lesson has an executable guard, and — for rolled-back or refuted paths — a "do not retry" marker.
 
+The [replay capacity and Stop completion case study](architecture/case-study-replay-stop-convergence.md)
+connects the storage, worker-admission, and public-completion failures, including
+the R36 assumption invalidated by the Stop-then-List reproduction.
+
 The governing rule is compact: terminals are views, Runs are durable, and every stronger claim needs public-behavior evidence.
