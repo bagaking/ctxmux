@@ -874,7 +874,8 @@ impl PersistentRun {
             // next delta into a forward gap and latch persistence off
             // daemon-wide, which is too sharp an edge to leave resting on a
             // lock held in another module.
-            self.offered_head.fetch_max(offered_through, Ordering::AcqRel);
+            self.offered_head
+                .fetch_max(offered_through, Ordering::AcqRel);
             self.persistence
                 .inner
                 .queue_depth
@@ -1589,11 +1590,7 @@ fn idle_fold_wal(store: &StateStore, shutdown: &AtomicBool) -> bool {
         return false;
     }
     #[cfg(test)]
-    if store
-        .test_hooks
-        .suppress_idle_fold
-        .load(Ordering::Acquire)
-    {
+    if store.test_hooks.suppress_idle_fold.load(Ordering::Acquire) {
         return false;
     }
     // The common case by far: the WAL is already zero because the last fold
@@ -1795,27 +1792,8 @@ fn actor_main(
                 if mutex_lock(failure).is_none() {
                     let result = retry_transient_storage(shutdown, || {
                         #[cfg(test)]
-                        if test_hooks
-                            .fail_next_append_as_disk_full
-                            .swap(false, Ordering::AcqRel)
-                        {
-                            return Err(PersistenceError::injected_disk_full());
-                        }
-                        #[cfg(test)]
-                        if test_hooks
-                            .fail_next_append_as_io_error
-                            .swap(false, Ordering::AcqRel)
-                        {
-                            return Err(PersistenceError::injected_io_error());
-                        }
-                        #[cfg(test)]
-                        {
-                            let injected = test_hooks
-                                .fail_next_append_as_io_failure
-                                .swap(0, Ordering::AcqRel);
-                            if injected != 0 {
-                                return Err(PersistenceError::injected_io_failure(injected));
-                            }
+                        if let Some(error) = injected_append_failure(test_hooks) {
+                            return Err(error);
                         }
                         store.append_batch_with_shutdown(&batch, Some(shutdown))
                     });
@@ -2019,6 +1997,30 @@ fn pause_before_append(test_hooks: &PersistenceTestHooks) {
         let _ = barrier.reached.send(());
         let _ = barrier.release.recv();
     }
+}
+
+/// Consume whichever append-failure hook is armed and return the error to inject
+/// once, in the same precedence the actor's hot path checked inline: disk-full,
+/// then a generic I/O error, then an extended-code I/O failure. Each `swap`
+/// disarms the hook, so at most one fires per offered append.
+#[cfg(test)]
+fn injected_append_failure(test_hooks: &PersistenceTestHooks) -> Option<PersistenceError> {
+    if test_hooks
+        .fail_next_append_as_disk_full
+        .swap(false, Ordering::AcqRel)
+    {
+        return Some(PersistenceError::injected_disk_full());
+    }
+    if test_hooks
+        .fail_next_append_as_io_error
+        .swap(false, Ordering::AcqRel)
+    {
+        return Some(PersistenceError::injected_io_error());
+    }
+    let injected = test_hooks
+        .fail_next_append_as_io_failure
+        .swap(0, Ordering::AcqRel);
+    (injected != 0).then(|| PersistenceError::injected_io_failure(injected))
 }
 
 fn handle_staged_start_result(
@@ -2958,11 +2960,7 @@ impl StateStore {
                 admission_failure(format!(
                     "persistent exact replacement exceeds or cannot prove its 8 MiB WAL charge: \
                      cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
-                    snapshot.used_bytes,
-                    snapshot.writes,
-                    snapshot.spills,
-                    wal_bytes,
-                    wal_baseline
+                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes, wal_baseline
                 )),
             );
         }
@@ -3135,11 +3133,11 @@ impl StateStore {
     fn try_fold_wal_once(&self) -> bool {
         #[cfg(test)]
         self.test_hooks.idle_folds.fetch_add(1, Ordering::AcqRel);
-        let checkpointed = self
-            .connection
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-                row.get::<_, i64>(0)
-            });
+        let checkpointed =
+            self.connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                });
         matches!(checkpointed, Ok(busy) if busy == 0)
     }
 
@@ -3272,11 +3270,7 @@ impl StateStore {
                 admission_failure(format!(
                     "persistent removal exceeds or cannot prove its 8 MiB WAL charge: \
                      cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
-                    snapshot.used_bytes,
-                    snapshot.writes,
-                    snapshot.spills,
-                    wal_bytes,
-                    wal_baseline
+                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes, wal_baseline
                 ))
                 .error,
                 false,
@@ -3614,31 +3608,8 @@ impl StateStore {
         receipt: &StartReceipt,
     ) -> StageDriveResult {
         #[cfg(test)]
-        if self
-            .test_hooks
-            .fail_next_start_before_commit
-            .swap(false, Ordering::AcqRel)
-        {
-            return match self.connection.execute_batch("ROLLBACK") {
-                Ok(()) => {
-                    let _ = receipt.decide(StartDisposition::NotCommitted);
-                    StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
-                        error: PersistenceError::Mutation(
-                            "injected failure before durable Run creation COMMIT".to_owned(),
-                        ),
-                        fatal: false,
-                        capacity: false,
-                    }))
-                }
-                Err(rollback_error) => {
-                    let error = PersistenceError::Mutation(format!(
-                        "injected failure before durable Run creation COMMIT and rollback failed: \
-                         {rollback_error}"
-                    ));
-                    let _ = receipt.decide(StartDisposition::CommitUnknown);
-                    StageDriveResult::Completed(StageCompletion::CommitUnknown(error))
-                }
-            };
+        if let Some(result) = self.abort_start_before_commit_if_armed(receipt) {
+            return result;
         }
         #[cfg(test)]
         self.crash_start_commit_if_armed(StartCommitCrashPhase::Before);
@@ -3674,6 +3645,44 @@ impl StateStore {
                 self.classify_failed_commit(prepared, candidates, receipt, commit_error)
             }
         }
+    }
+
+    /// Consume the `fail_next_start_before_commit` hook and, if it was armed,
+    /// roll back the staged transaction to stand in for a crash between staging
+    /// and COMMIT. Returns the completed disposition to short-circuit with, or
+    /// `None` when the hook was not armed and the real commit should proceed.
+    #[cfg(test)]
+    fn abort_start_before_commit_if_armed(
+        &self,
+        receipt: &StartReceipt,
+    ) -> Option<StageDriveResult> {
+        if !self
+            .test_hooks
+            .fail_next_start_before_commit
+            .swap(false, Ordering::AcqRel)
+        {
+            return None;
+        }
+        Some(match self.connection.execute_batch("ROLLBACK") {
+            Ok(()) => {
+                let _ = receipt.decide(StartDisposition::NotCommitted);
+                StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
+                    error: PersistenceError::Mutation(
+                        "injected failure before durable Run creation COMMIT".to_owned(),
+                    ),
+                    fatal: false,
+                    capacity: false,
+                }))
+            }
+            Err(rollback_error) => {
+                let error = PersistenceError::Mutation(format!(
+                    "injected failure before durable Run creation COMMIT and rollback failed: \
+                     {rollback_error}"
+                ));
+                let _ = receipt.decide(StartDisposition::CommitUnknown);
+                StageDriveResult::Completed(StageCompletion::CommitUnknown(error))
+            }
+        })
     }
 
     #[cfg(test)]
@@ -5247,7 +5256,9 @@ fn prune_run_replay_to(
              WHERE run_id = ?1 ORDER BY start_byte",
         )
         .map_err(PersistenceError::database)?;
-    let mut rows = statement.query([id_text]).map_err(PersistenceError::database)?;
+    let mut rows = statement
+        .query([id_text])
+        .map_err(PersistenceError::database)?;
 
     // The first chunk that SURVIVES: walk from the front shedding bytes until
     // the remainder fits. Tracked as the surviving front rather than the last
@@ -5334,15 +5345,7 @@ fn prune_global_replay_to(
             .execute("DELETE FROM replay_chunks WHERE ordinal = ?1", [ordinal])
             .map_err(PersistenceError::database)?;
         evicted = true;
-        transaction
-            .execute(
-                "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
-                 durable_first_available_byte = coalesce(
-                   (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
-                 ) WHERE id = ?1",
-                params![run_id, bytes],
-            )
-            .map_err(PersistenceError::database)?;
+        shed_run_bytes(transaction, &run_id, bytes)?;
     }
 }
 
@@ -5417,16 +5420,33 @@ fn trim_oldest_row(
             )
             .map_err(PersistenceError::database)?;
         evicted = true;
-        transaction
-            .execute(
-                "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
-                 durable_first_available_byte = coalesce(
-                   (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
-                 ) WHERE id = ?1",
-                params![run_id, shed],
-            )
-            .map_err(PersistenceError::database)?;
+        shed_run_bytes(transaction, &run_id, shed)?;
     }
+}
+
+/// Shed `shed` bytes from a Run's replay accounting after its stored bytes were
+/// trimmed, and slide `durable_first_available_byte` up to the new oldest chunk.
+///
+/// This single statement is what keeps the durable window one contiguous range:
+/// both eviction paths (whole-row drop in [`prune_global_replay_to`] and
+/// in-place front trim in [`trim_oldest_row`]) must apply it identically, so it
+/// lives here rather than being copied. `coalesce(..., 0)` handles the Run that
+/// just lost its last chunk.
+fn shed_run_bytes(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    shed: i64,
+) -> Result<(), PersistenceError> {
+    transaction
+        .execute(
+            "UPDATE runs SET replay_bytes = replay_bytes - ?2, replay_truncated = 1,
+             durable_first_available_byte = coalesce(
+               (SELECT min(start_byte) FROM replay_chunks WHERE run_id = ?1), 0
+             ) WHERE id = ?1",
+            params![run_id, shed],
+        )
+        .map_err(PersistenceError::database)?;
+    Ok(())
 }
 
 fn read_run_head(transaction: &Transaction<'_>, id: RunId) -> Result<u64, PersistenceError> {
@@ -6258,9 +6278,11 @@ mod tests {
         assert!(prune_global_replay_to(&transaction, 800).expect("prune under the ceiling"));
 
         let total: i64 = transaction
-            .query_row("SELECT coalesce(sum(replay_bytes), 0) FROM runs", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT coalesce(sum(replay_bytes), 0) FROM runs",
+                [],
+                |row| row.get(0),
+            )
             .expect("read global total");
         assert!(total <= 800, "the ceiling must be met, got {total}");
         for id in [first, second] {
@@ -6933,7 +6955,9 @@ mod tests {
             .transaction()
             .expect("start baseline fixture transaction");
         insert_test_run(&transaction, RunId::new(), "exited", 1);
-        transaction.commit().expect("dirty the WAL below the ceiling");
+        transaction
+            .commit()
+            .expect("dirty the WAL below the ceiling");
         let dirty = file_len(&store.wal_path).expect("read WAL length");
         assert!(
             dirty > 0 && dirty <= WAL_CHECKPOINT_BYTES,
@@ -7139,7 +7163,6 @@ mod tests {
         );
         assert!(!persistence.is_failed());
     }
-
 
     #[test]
     fn an_idle_fold_does_nothing_once_shutdown_is_set() {
@@ -8725,7 +8748,8 @@ mod tests {
     /// verified no-op, not a duplicate — otherwise the fix would corrupt the
     /// replay on every push after the first.
     #[test]
-    fn re_sending_durable_bytes_does_not_duplicate_them() {        let temp = TempDir::new().expect("create catch-up fixture");
+    fn re_sending_durable_bytes_does_not_duplicate_them() {
+        let temp = TempDir::new().expect("create catch-up fixture");
         let state_dir = temp.path().join("state");
         let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
         assert!(recovered.is_empty());
