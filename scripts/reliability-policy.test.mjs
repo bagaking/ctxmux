@@ -1928,6 +1928,52 @@ test("rejects changed or misreported source-bound v2 evidence", () => {
   assert.ok(errors.some((error) => error.includes("raw maximum")));
 });
 
+test("a leaking re-baseline cannot derive its own nonzero leak ceiling", () => {
+  // The self-ratification this guard exists to stop. Leak-class ceilings are
+  // deriveBudgetCeiling(field, observed), and for cleanup_live_children /
+  // cleanup_attachments that rule returns the observation itself. So a baseline
+  // refreshed on a host that stranded one child per teardown would record the
+  // leak everywhere and pass its own budget === deriveBudgetCeiling assertion —
+  // the gate ratifying the leak. A farm run once scored ~4000 stranded children
+  // as a pass exactly this way. Simulate that consistent leaky re-baseline: every
+  // round reports it, and the recorded maxima + budgets are what a naive
+  // re-derivation would produce. The ceiling for a leak field must be 0.
+  for (const leakField of ["cleanup_live_children", "cleanup_attachments"]) {
+    const leakInputs = v2Inputs();
+    for (const receipt of leakInputs.baselineReceipts) {
+      const cells = receipt.value.stages.find(
+        ({ id }) => id === "resource-census",
+      ).result;
+      for (const cell of cells) {
+        if (leakField === "cleanup_live_children") {
+          cell.cleanup.descendants = [{ pid: 1 }];
+        }
+        cell[leakField] = 1;
+      }
+    }
+    for (const mode of ["idle", "active"]) {
+      for (const count of ["1", "32", "128"]) {
+        leakInputs.budgets.observation_baseline.observed_maxima[mode][count][
+          leakField
+        ] = 1;
+        // What deriveBudgetCeiling(leakField, 1) yields — the pre-guard ceiling.
+        leakInputs.budgets.budgets[mode][count][`max_${leakField}`] =
+          deriveBudgetCeiling(leakField, 1);
+      }
+    }
+    const errors = validateReliabilityPolicy(leakInputs);
+    assert.ok(
+      errors.some((error) =>
+        error.includes(`max_${leakField} must equal deterministic ceiling 0`),
+      ),
+      `a leaked ${leakField} ceiling was accepted; errors: ${JSON.stringify(errors)}`,
+    );
+    // The observation genuinely buys headroom under the frozen rule: it is the
+    // policy, not the byte-frozen contract, that pins the leak ceiling to 0.
+    assert.equal(deriveBudgetCeiling(leakField, 1), 1);
+  }
+});
+
 test("rejects unreachable smoke, release, and qualification profile policy", () => {
   const inputs = actualInputs();
   inputs.checkScript = inputs.checkScript.replace(

@@ -86,6 +86,33 @@ const RESOURCE_NUMERIC_FIELDS =
     " ",
   );
 
+/// Leak-class observed fields whose budget ceiling must be a hardcoded 0, never
+/// derived from the observation.
+///
+/// deriveBudgetCeiling(field, observed) returns the observation itself for these
+/// (multiplier 1, additive 0, minimum 0), so a baseline refreshed on a host that
+/// stranded N children or attachments per teardown would derive a ceiling of N
+/// and then pass its own `budget === deriveBudgetCeiling(...)` assertion below --
+/// the gate ratifying the very leak it exists to catch. That is not hypothetical:
+/// a farm run once scored ~4000 stranded children as a pass because the ceiling
+/// was taken from the leak count. A working teardown leaks zero, so the ceiling
+/// is the constant 0 that no observation may raise.
+///
+/// cleanup_threads_delta is deliberately NOT here. Its rule (rule(1,1,1,1,1,1,1,1))
+/// carries a legitimate floor of 1 -- a teardown may transiently hold one extra
+/// thread -- so the frozen budget records max_cleanup_threads_delta: 1, and
+/// forcing it to 0 would reject the current baseline.
+///
+/// This mirrors ABSOLUTE_ZERO_FIELDS in scripts/fleet-scale-measure.mjs, which
+/// closed the same hole on the fleet-scale verdict. The set lives here, not in
+/// reliability-budget-contract.mjs, because that module is byte-frozen: its
+/// sha256 is pinned in reliability-budgets.json and re-verified against the
+/// baseline commit, so adding an export there would invalidate every v2 baseline.
+const ABSOLUTE_ZERO_LEAK_FIELDS = new Set([
+  "cleanup_live_children",
+  "cleanup_attachments",
+]);
+
 export function sameMembers(left, right) {
   return (
     left.length === right.length &&
@@ -292,7 +319,9 @@ function validateMaximaAndCeilings(rounds, budgets, errors) {
           `recorded ${mode}/${count} ${field}=${recorded[field]} does not match raw maximum ${maxima[field]}`,
         );
         const budgetField = `max_${field}`;
-        const expected = deriveBudgetCeiling(field, maxima[field]);
+        const expected = ABSOLUTE_ZERO_LEAK_FIELDS.has(field)
+          ? 0
+          : deriveBudgetCeiling(field, maxima[field]);
         expect(
           errors,
           budgets.budgets?.[mode]?.[count]?.[budgetField] === expected,
