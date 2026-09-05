@@ -366,6 +366,14 @@ arithmetic and this pre-observation table:
 | Cleanup thread delta                  |          1 |        1 |       1 |       1 |
 | Cleanup live children and attachments |          1 |        0 |       0 |       1 |
 
+These budgets are leak probes and regression bounds, not the daemon's operating
+system capacity. Exceeding one is a qualification failure; it does not by
+itself mean the next Run will crash. Resource census waits for five consecutive
+identical descriptor/thread readings, and attachment cleanup requires three
+consecutive status snapshots at the expected count. A transient sample is
+therefore not treated as a leak, while a persistent extra descriptor or
+attachment remains visible to the gate.
+
 The generation-1 transition ended when the first complete source-bound baseline
 was frozen. Current policy accepts only generation 2; an all-generation-1 set,
 mixed generations, or an unknown generation fails closed. All three

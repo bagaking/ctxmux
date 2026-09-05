@@ -3030,12 +3030,21 @@ async function waitForAttachmentCounts(
   runs: readonly RunInfo[],
   expected: number,
 ) {
+  // One matching list snapshot can land while an attachment is still
+  // finishing its close path. Require a short consecutive stable window so a
+  // cleanup reading is evidence of quiescence rather than a lucky sample.
+  let stableObservations = 0;
   await withDeadline(
     poll(async () => {
       const statuses = await mapLimit(runs, 16, async (run) =>
         client.status(run.id),
       );
-      return statuses.every((run) => run.attachments === expected);
+      if (!statuses.every((run) => run.attachments === expected)) {
+        stableObservations = 0;
+        return false;
+      }
+      stableObservations += 1;
+      return stableObservations >= 3;
     }),
     10_000,
     `attachment count ${expected}`,
