@@ -5293,14 +5293,14 @@ async fn next_resized_event(
 /// The same invariant, but with the persistence actor actually busy.
 ///
 /// The quiet version above passes on unmodified main: on an idle daemon the
-/// finalize that gates publication is served in 1-6 ms, far inside the Stop's
-/// bounded wait, so the receipt is honest and the `remove` succeeds. That made
-/// it a test which could not fail on the shape where the defect lives.
+/// finalize that gates publication is served in 1-6 ms, so `remove` finds the
+/// Run already terminal and has nothing to wait for. That made it a test which
+/// could not fail on the shape where the defect lives.
 ///
 /// Under a fleet that keeps the persistence queue full, the same finalize is
 /// queued behind the appends it must be ordered after -- measured 0.6-3.6 s on
-/// the farm host. The Stop's wait expires, the receipt reports `Running`, and
-/// `remove` refuses with `InvalidRunState`: 0/40 on the farm.
+/// the farm host. Without `remove`'s wait for the publication a reaped Run is
+/// owed, `remove` refuses with `InvalidRunState`: 0/40 on the farm.
 ///
 /// So this asserts the invariant where it is actually load-bearing. The fleet
 /// is started first and left running for the whole loop; each stopped Run is a
@@ -5333,15 +5333,11 @@ async fn a_returned_stop_is_removable_while_the_fleet_is_loud() {
             .start(interactive_shell())
             .await
             .expect("start Run");
-        let accepted = daemon
+        daemon
             .client
             .stop_once(run.id)
             .await
             .expect("stop in one trip");
-        if matches!(accepted.run.state, RunState::Running) {
-            refused.push(format!("attempt {attempt}: receipt still reported Running"));
-            continue;
-        }
         if let Err(error) = daemon.client.remove(run.id).await {
             refused.push(format!("attempt {attempt}: remove after Stop: {error}"));
         }
@@ -5353,24 +5349,27 @@ async fn a_returned_stop_is_removable_while_the_fleet_is_loud() {
 
     assert!(
         refused.is_empty(),
-        "a Stop receipt must describe a Run that `remove` accepts, under load too; \
+        "a returned Stop must leave a Run that `remove` accepts, under load too; \
          {} of 8 attempts were refused:\n  {}",
         refused.len(),
         refused.join("\n  "),
     );
 }
 
-/// A returned Stop receipt describes a Run that `remove` will accept.
+/// A returned Stop leaves a Run that `remove` will accept.
 ///
 /// agentmux stops a Run and removes it on the next line, over a long-lived
 /// connection. The remove came back `InvalidRunState` ("still running"):
 /// terminal publication runs on a `ctxmux-native-blocking` worker with no
-/// ordering against the Stop reply, so the reply could name a Run the daemon
+/// ordering against the Stop reply, so `remove` could read a Run the daemon
 /// still considered live. A cold CLI never saw it -- ~12 ms of process spawn
 /// between the two commands hid the window that a warm client lands inside.
 ///
-/// The assertion is on the state the receipt itself reports, not on a later
-/// poll: a receipt that says `Running` is the defect, whatever a retry finds.
+/// The assertion is on `remove` itself, not on the receipt's `state` field:
+/// `docs/protocol.md` says that field may still read `running` while no owned
+/// process remains, so asserting on it would pin behaviour the wire does not
+/// promise. `remove` is what the caller actually needs to succeed, and it is
+/// what waits for the publication a reaped Run is owed.
 #[tokio::test]
 async fn a_returned_stop_leaves_the_run_immediately_removable() {
     // Persistent, because that is what agentmux runs: publication there sits
@@ -5382,17 +5381,11 @@ async fn a_returned_stop_leaves_the_run_immediately_removable() {
             .start(interactive_shell())
             .await
             .expect("start Run");
-        let accepted = daemon
+        daemon
             .client
             .stop_once(run.id)
             .await
             .expect("stop in one trip");
-        assert!(
-            !matches!(accepted.run.state, RunState::Running),
-            "attempt {attempt}: Stop returned a receipt but reported state {:?}; \
-             the response describes a Run that the daemon still considers live",
-            accepted.run.state
-        );
         daemon
             .client
             .remove(run.id)
