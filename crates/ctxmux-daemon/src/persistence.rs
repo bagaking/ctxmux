@@ -34,6 +34,28 @@ const PAGE_SIZE_BYTES: u64 = 4 * 1024;
 const DATABASE_MAX_BYTES: u64 = 384 * 1024 * 1024;
 const DATABASE_MAX_PAGES: u64 = DATABASE_MAX_BYTES / PAGE_SIZE_BYTES;
 const WAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+/// Smallest WAL the idle fold will volunteer to truncate.
+///
+/// Folding is not free to the *next* writer. `wal_checkpoint(TRUNCATE)` leaves
+/// the file at zero length, so the next commit must extend it again -- which
+/// degrades `fdatasync` into a full `fsync`, because a size change has to reach
+/// the inode -- and must write and separately sync a fresh 32-byte WAL header.
+/// On cn3 (ext4, `synchronous=FULL`) that costs the next commit +0.995 ms:
+/// 1.912 ms landing on a just-truncated WAL against 0.917 ms landing on one
+/// already a few hundred KiB long.
+///
+/// So an idle fold is a trade, not a free tidy-up: it spends its own cost now,
+/// plus that penalty on whoever commits next, to avoid a larger fold later. On
+/// a quiet fleet the later fold it avoids is the *cheapest* one -- a few KiB,
+/// which the same measurement prices at ~1.25 ms -- so folding there pays twice
+/// to dodge something smaller than either payment. Under load the trade is the
+/// good one the call site describes, because the WAL is megabytes by then.
+///
+/// 256 KiB is the smallest measured size whose fold (1.436 ms) exceeds the
+/// reset penalty with margin, and it is ~32x below `WAL_CHECKPOINT_BYTES`, so
+/// every bound that folds above that ceiling is untouched. This floor changes
+/// only when we *volunteer* to fold; it is not part of any proof.
+const WAL_IDLE_FOLD_FLOOR_BYTES: u64 = 256 * 1024;
 const WAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SHM_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const STATE_FILES_MAX_BYTES: u64 = 404 * 1024 * 1024;
@@ -1593,10 +1615,10 @@ fn idle_fold_wal(store: &StateStore, shutdown: &AtomicBool) -> bool {
     if store.test_hooks.suppress_idle_fold.load(Ordering::Acquire) {
         return false;
     }
-    // The common case by far: the WAL is already zero because the last fold
-    // left it that way, and a daemon that is merely idle must not do disk work
-    // on every pass. One `stat` (~8 us on cn3) buys that.
-    if !matches!(file_len(&store.wal_path), Ok(bytes) if bytes > 0) {
+    // Folding is only worth doing once the WAL is big enough to be worth the
+    // reset it causes. Below the floor, leaving the bytes alone is cheaper for
+    // everyone: see `WAL_IDLE_FOLD_FLOOR_BYTES`.
+    if !matches!(file_len(&store.wal_path), Ok(bytes) if bytes >= WAL_IDLE_FOLD_FLOOR_BYTES) {
         return false;
     }
     store.try_fold_wal_once()
@@ -5616,10 +5638,10 @@ mod tests {
         PersistentCandidate, PersistentStartCompletion, RETAINED_RUN_RECORDS,
         RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
         StartDisposition, StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES,
-        WAL_CHECKPOINT_MAX_RETRIES, WAL_MAX_BYTES, append_replay, create_schema, file_len,
-        idle_fold_wal, metadata_size, mutex_lock, nonnegative_u64, prune_global_replay_to,
-        retry_transient_storage, retry_wal_checkpoint, validate_existing_schema,
-        validate_replay_window, wal_charge_for_cache,
+        WAL_CHECKPOINT_MAX_RETRIES, WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES, append_replay,
+        create_schema, file_len, idle_fold_wal, metadata_size, mutex_lock, nonnegative_u64,
+        prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
+        validate_existing_schema, validate_replay_window, wal_charge_for_cache,
     };
     use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 
@@ -5645,6 +5667,16 @@ mod tests {
     /// a log that was never written, which reads as a product bug. The one
     /// place a refusal is expected is the queue-saturation loop, which ignores
     /// the result explicitly.
+    /// The fold floor as a payload length, for fixtures that must carry the WAL
+    /// past it. Written out rather than cast from [`WAL_IDLE_FOLD_FLOOR_BYTES`]
+    /// so no fixture needs a lossy conversion; the assertion below is what keeps
+    /// the two from drifting apart.
+    const FOLD_FLOOR_PAYLOAD: usize = 256 * 1024;
+    const _: () = assert!(
+        FOLD_FLOOR_PAYLOAD as u64 == WAL_IDLE_FOLD_FLOOR_BYTES,
+        "the fixture payload floor drifted from the fold floor it is meant to clear"
+    );
+
     #[track_caller]
     fn expect_queued(accepted: bool) {
         assert!(
@@ -7006,6 +7038,10 @@ mod tests {
     /// inherits a small baseline instead of paying ~1.6 ms/MiB to create one
     /// (cn3, synchronous=FULL, linear to the 8 MiB ceiling). This pins the fold
     /// actually happening off the client's path.
+    ///
+    /// The payload has to clear `WAL_IDLE_FOLD_FLOOR_BYTES`: below the floor the
+    /// fold deliberately declines, because truncating a small WAL costs the next
+    /// commit more than it saves.
     #[test]
     fn a_drained_queue_folds_the_wal_before_the_next_start_needs_it() {
         let temp = TempDir::new().expect("create idle fold fixture");
@@ -7017,7 +7053,7 @@ mod tests {
             .expect("insert idle fold fixture Run");
 
         // Dirty the WAL the way a producing Run does, then let the queue drain.
-        let payload = vec![b'x'; 64 * 1024];
+        let payload = vec![b'x'; 4 * FOLD_FLOOR_PAYLOAD];
         expect_queued(durable.append(info.id, replay(vec![chunk(0, &payload)])));
         persistence.barrier().expect("drain the append");
 
@@ -7039,17 +7075,18 @@ mod tests {
 
     /// The guard for the metric this project already won: idle CPU is 0.000%,
     /// and a fold that fires on every pass through the dequeue loop -- rather
-    /// than only when the WAL is actually dirty -- would quietly undo that.
+    /// than only when the WAL is actually worth folding -- would quietly undo
+    /// that.
     ///
     /// Drives `idle_fold_wal` directly rather than racing the actor: the
-    /// property is "a zero WAL costs no checkpoint", which is a property of the
-    /// function, and asserting it here needs no sleeping.
+    /// property is "a WAL below the floor costs no checkpoint", which is a
+    /// property of the function, and asserting it here needs no sleeping.
     #[test]
-    fn an_idle_fold_skips_a_wal_that_is_already_zero() {
+    fn an_idle_fold_skips_a_wal_below_the_floor() {
         let temp = TempDir::new().expect("create idle quiet fixture");
         let state_dir = temp.path().join("state");
         let hooks = Arc::new(PersistenceTestHooks::default());
-        let (store, _recovered) = StateStore::open(
+        let (mut store, _recovered) = StateStore::open(
             &state_dir,
             AdmissionLimits::OPERATIONAL,
             None,
@@ -7070,10 +7107,35 @@ mod tests {
             );
         }
 
+        // A WAL that is dirty but still under the floor is the case the floor
+        // exists for, and the one a zero-only check would get wrong: folding it
+        // would charge the next commit ~1 ms to save less than that.
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start below-floor fixture transaction");
+        insert_test_run(&transaction, RunId::new(), "running", 1);
+        transaction.commit().expect("dirty the WAL with a real row");
+        let dirty = file_len(&store.wal_path).expect("read WAL length");
+        assert!(
+            dirty > 0 && dirty < WAL_IDLE_FOLD_FLOOR_BYTES,
+            "the fixture must leave the WAL dirty but under the {WAL_IDLE_FOLD_FLOOR_BYTES} \
+             byte floor; it is {dirty} bytes"
+        );
+        assert!(
+            !idle_fold_wal(&store, &shutdown),
+            "a WAL under the floor must be left alone, not truncated"
+        );
+        assert_eq!(
+            file_len(&store.wal_path).expect("read WAL length"),
+            dirty,
+            "declining to fold must leave the bytes exactly where they were"
+        );
+
         assert_eq!(
             hooks.idle_folds.load(Ordering::Acquire),
             baseline,
-            "64 idle passes issued checkpoints against a zero WAL; the skip is \
+            "idle passes issued checkpoints against a WAL below the floor; the skip is \
              not holding and idle CPU will regress"
         );
     }
@@ -7099,14 +7161,27 @@ mod tests {
             .connection
             .transaction()
             .expect("start idle dirty fixture transaction");
-        insert_test_run(&transaction, RunId::new(), "running", 1);
-        transaction.commit().expect("dirty the WAL with a real row");
+        // Enough rows to carry the WAL past the fold floor: one row is dirty
+        // but deliberately not worth folding, which the floor fixture covers.
+        let mut rows = 0;
+        while file_len(&store.wal_path).expect("read WAL length") < WAL_IDLE_FOLD_FLOOR_BYTES {
+            insert_test_run(&transaction, RunId::new(), "running", 1);
+            rows += 1;
+            assert!(
+                rows < 100_000,
+                "the fixture could not carry the WAL past its floor"
+            );
+        }
+        transaction.commit().expect("dirty the WAL with real rows");
         assert!(
-            file_len(&store.wal_path).expect("read WAL length") > 0,
-            "the fixture must leave WAL bytes for the fold to find"
+            file_len(&store.wal_path).expect("read WAL length") >= WAL_IDLE_FOLD_FLOOR_BYTES,
+            "the fixture must leave enough WAL bytes to be worth folding"
         );
 
-        assert!(idle_fold_wal(&store, &shutdown), "a dirty WAL must fold");
+        assert!(
+            idle_fold_wal(&store, &shutdown),
+            "a WAL above the floor must fold"
+        );
         assert_eq!(
             file_len(&store.wal_path).expect("read WAL length"),
             0,
@@ -7138,7 +7213,10 @@ mod tests {
         let durable = persistence
             .insert_start(&test_operation_key(info.id), &info)
             .expect("insert actor idle fold fixture Run");
-        expect_queued(durable.append(info.id, replay(vec![chunk(0, &[b'x'; 64 * 1024])])));
+        expect_queued(durable.append(
+            info.id,
+            replay(vec![chunk(0, &vec![b'x'; 4 * FOLD_FLOOR_PAYLOAD])]),
+        ));
         persistence.barrier().expect("drain the queued append");
 
         // The barrier returns once the append has committed; the fold happens
@@ -7180,11 +7258,22 @@ mod tests {
             .connection
             .transaction()
             .expect("start idle shutdown fixture transaction");
-        insert_test_run(&transaction, RunId::new(), "running", 1);
+        // Past the fold floor, so the only thing that can decline this fold is
+        // the shutdown flag. A below-floor WAL would return false either way and
+        // leave the assertion unable to fail.
+        let mut rows = 0;
+        while file_len(&store.wal_path).expect("read WAL length") < WAL_IDLE_FOLD_FLOOR_BYTES {
+            insert_test_run(&transaction, RunId::new(), "running", 1);
+            rows += 1;
+            assert!(
+                rows < 100_000,
+                "the fixture could not carry the WAL past its floor"
+            );
+        }
         transaction.commit().expect("dirty the WAL");
         assert!(
-            file_len(&store.wal_path).expect("read WAL length") > 0,
-            "the fixture must leave a dirty WAL"
+            file_len(&store.wal_path).expect("read WAL length") >= WAL_IDLE_FOLD_FLOOR_BYTES,
+            "the fixture must leave a WAL that would otherwise be folded"
         );
 
         let shutdown = AtomicBool::new(true);
