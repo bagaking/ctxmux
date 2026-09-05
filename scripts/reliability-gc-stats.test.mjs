@@ -100,6 +100,31 @@ test("persisted stats artifacts use the same final and sequence oracle", () => {
   }
 });
 
+test("collector rejects gauge and counter label order divergence", async () => {
+  for (const mutate of [
+    (value) => {
+      [value.gauges[10], value.gauges[11]] = [
+        value.gauges[11],
+        value.gauges[10],
+      ];
+    },
+    (value) => {
+      [value.counters[0], value.counters[1]] = [
+        value.counters[1],
+        value.counters[0],
+      ];
+    },
+  ]) {
+    const value = JSON.parse(frame(1, { final: true }));
+    mutate(value);
+    const stream = new PassThrough();
+    const collector = new QualificationStatsCollector(stream);
+    collector.markClosing();
+    stream.end(`${JSON.stringify(value)}\n`);
+    await assert.rejects(() => collector.finish(), /label/u);
+  }
+});
+
 function frame(seq, overrides = {}) {
   return `${JSON.stringify({
     schema: "ctxmux.qualification-stats.v1",
@@ -108,6 +133,8 @@ function frame(seq, overrides = {}) {
     seq,
     final: false,
     dropped_total: 0,
+    gauges: [...GC_STAT_GAUGES],
+    counters: [...GC_STAT_COUNTERS],
     current: Array(GC_STAT_GAUGES.length).fill(0),
     high_water: Array(GC_STAT_GAUGES.length).fill(0),
     cumulative: Array(GC_STAT_COUNTERS.length).fill(0),
