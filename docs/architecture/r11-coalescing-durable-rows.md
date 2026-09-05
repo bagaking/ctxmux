@@ -178,12 +178,13 @@ Every row abuts the next, the concatenated length equals the window width, and
 fixture and compared two empty databases — it passed, and proved nothing. A
 check that cannot distinguish "correct" from "no data" is not a check.
 
-## Still open
+## Historical follow-up (resolved in schema 5)
 
 The schema creates `replay_chunks_run_start_byte` on `(run_id, start_byte)`
 while `UNIQUE(run_id, start_byte)` has already built an autoindex on exactly
 those columns. `EXPLAIN QUERY PLAN` shows the planner picking one or the other
 per query and no query needing both, yet every insert writes both b-trees.
-Ablation puts it at 12.6% of WAL bytes before coalescing. Not taken this round:
-it changes the schema, and one durable-format change at a time is the ratchet's
-whole point.
+Ablation puts it at 12.6% of WAL bytes before coalescing. Schema 5 removes the
+duplicate index while moving payloads out of SQLite. The pre-stable schema has
+no migration path, so older stores are rejected rather than carrying both index
+shapes.

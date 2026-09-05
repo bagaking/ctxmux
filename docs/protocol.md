@@ -774,7 +774,23 @@ fail-stop. The version-2 handoff manifest and every carried descriptor are
 strictly bounded, unique, and validated; generation 16 gains no upgrade wire
 operation.
 
-An output append or terminal finalize that receives SQLite's typed `DiskFull`,
+A valid store at its fixed main-database page ceiling reclaims bounded oldest
+replay prefixes before allocating mutations or startup reconciliation. This
+physical-pressure retention preserves Run/key/metadata and the durable head,
+while advancing the replay floor and truncation fact in the same transaction.
+It never raises the file ceiling or presents evicted bytes as contiguous replay.
+See ADR 009 for the independent physical and logical retention bounds.
+
+Replay payloads are append-only files under the state directory. SQLite stores
+only the contiguous window index and the active generation name. The writer
+syncs payload bytes before committing their index row; startup truncates an
+unreferenced tail and removes generations that lost the atomic generation
+switch. Once a generation exceeds twice the global replay budget, retained
+segments are copied to a new generation and the index is switched in one
+transaction. Compaction is transparent to protocol cursors and does not widen
+the main-database ceiling.
+
+An output append or terminal finalize that receives external storage `DiskFull`,
 or whose WAL admission is temporarily blocked by a reader during
 `wal_checkpoint(TRUNCATE)`, does not permanently poison the serving daemon. The
 persistence actor retries that same ordered unit after a short delay and admits
@@ -789,17 +805,20 @@ client may observe output progress stall until storage recovers, and a client
 restart alone neither owns nor resets the daemon-side wait.
 
 Persistent startup requires a real same-owner `0700` directory, regular
-same-owner `0600` database/WAL/SHM/lock files, and a process-lifetime exclusive
-state lock. Exact schema version, SQLite integrity, typed JSON, a required
-native `RunSpec` satisfying the live-start semantic rules, lifecycle, lineage,
-cursor, contiguous chunk, byte-accounting, and quota invariants are validated
-against the schema-4 format envelope before the socket is published. Schema 4
-stores the Runtime UUID in `runtime_meta`; bounded, restartable startup
-transactions reconcile prior running rows, evict the canonical terminal prefix
-to the operational 128-record ceiling, and finish serving-epoch publication before
-the socket becomes visible. Unknown versions, corrupt state, or an
-individually unprovable normalization unit fail startup; there is no migration,
-reset, salvage, or partial exposure.
+same-owner `0600` database/WAL/SHM/lock/replay files, and a process-lifetime
+exclusive state lock. Exact schema version, SQLite integrity, typed JSON, a
+required native `RunSpec` satisfying the live-start semantic rules, lifecycle,
+lineage, cursor, contiguous chunk, byte-accounting, and quota invariants are
+validated against the schema-5 format envelope before the socket is published.
+Schema 5 stores the Runtime UUID and active replay generation in `runtime_meta`;
+bounded, restartable startup transactions reconcile prior running rows, evict
+the canonical terminal prefix to the operational 128-record ceiling, remove
+orphan replay generations, truncate uncommitted tails, and finish
+serving-epoch publication before the socket becomes visible. Replay payloads
+come from the validated generation file, never an inline SQLite fallback. A
+missing or shortened referenced segment is a typed startup failure. Unknown
+versions, corrupt state, or an individually unprovable normalization unit fail
+startup; there is no migration, reset, salvage, or partial exposure.
 
 A prior-epoch running record not accompanied by the validated live handoff set
 becomes `interrupted { reason: daemon_restart }` with `pid: null`. A cold
