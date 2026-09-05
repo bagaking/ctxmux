@@ -28,6 +28,71 @@ struct Daemon {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detached_paced_output_commits_during_silence_and_recovers_after_crash() {
+    let temp = TempDir::new().unwrap();
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let mut first = Daemon::start(socket.clone(), &state_dir).await;
+    let client = first.client();
+    let run = client.start(shell_spec(
+        "stty -echo; printf ready; read go; i=0; while [ $i -lt 20 ]; do printf x; sleep 0.003; i=$((i+1)); done; printf tail; read end",
+    )).await.unwrap();
+    let (attachment, snapshot) = client.attach(run.id, 0).await.unwrap();
+    let mut ready = replay_bytes(&snapshot.replay.chunks);
+    timeout(scaled(Duration::from_secs(5)), async {
+        while ready.len() < 5 {
+            let RunEvent::Output { chunk } = attachment.next_event().await.unwrap().unwrap() else {
+                panic!("expected ready output");
+            };
+            ready.extend_from_slice(&chunk.data);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(ready, b"ready");
+    drop(attachment);
+    client.input(run.id, b"go\n".to_vec()).await.unwrap();
+    drop(client);
+
+    let expected = b"readyxxxxxxxxxxxxxxxxxxxxtail";
+    let observer = first.client();
+    timeout(scaled(Duration::from_secs(5)), async {
+        loop {
+            let info = observer.status(run.id).await.unwrap();
+            assert!(
+                info.state.is_running(),
+                "the detached Run waits for its next input"
+            );
+            if info.durable_output_bytes == Some(expected.len() as u64) {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the final quiet batch commits without exit or another append");
+    first.kill_and_wait();
+    let second = Daemon::start(socket, &state_dir).await;
+    let client = second.client();
+    let info = client.status(run.id).await.unwrap();
+    assert!(matches!(
+        info.state,
+        RunState::Interrupted {
+            reason: InterruptionReason::DaemonRestart
+        }
+    ));
+    assert_eq!(info.durable_output_bytes, Some(expected.len() as u64));
+    let (mut attachment, snapshot) = client.attach(run.id, 0).await.unwrap();
+    assert_eq!(replay_bytes(&snapshot.replay.chunks), expected);
+    assert!(matches!(
+        terminal_event(&mut attachment).await,
+        RunEvent::Interrupted {
+            reason: InterruptionReason::DaemonRestart
+        }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recovered_creation_keys_resolve_before_current_fork_state_checks() {
     let temp = TempDir::new().expect("create creation recovery fixture");
     let state_dir = temp.path().join("state");

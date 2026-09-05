@@ -456,6 +456,14 @@ The important guarantees are behavioral, not implied by lock types.
   nothing and leaves the previously confirmed size in place.
 - In persistent mode `durable_output_bytes` advances only after the store actor
   commits a contiguous replay batch. Live `latest_output_bytes` may be ahead.
+  The actor collects Appends for at most 10 ms from the first collected Append,
+  or until the existing 1 MiB payload ceiling. Subsequent arrivals do not reset
+  that deadline. Collection happens before opening a store transaction and can
+  span empty-queue intervals; it does not delay live output publication.
+  Lifecycle wakeups, FIFO barriers, and shutdown end collection early. Payload
+  sync and SQLite `FULL` commit still own durable cursor advancement; storage
+  stalls or retries can extend durable lag beyond the collection window. See
+  [small-output batching qualification](architecture/small-output-persistence-batching.md).
 - Persistence-capable activation, output recording, and native terminal
   publication serialize through one daemon-private per-Run transition gate,
   then acquire output, state, and persistence in that order for short snapshots.

@@ -151,6 +151,18 @@ same recoverable operation key, while native cleanup and finalization budgets
 remain separate. This closes the daemon-side contract without changing the
 external consumer's local projection or adding a compatibility path.
 
+## Small-output persistence qualification
+
+The small-output cost review closes at the persistence actor: schema 5 already
+removed the duplicate replay index, and bounded collection now combines spaced
+Appends before sync. Qualification compares process writes per output byte,
+sampled commits, CPU, live/durable/terminal latency, and actual replay recovery
+using isolated daemons. It also proves lifecycle priority under a full append
+queue, FIFO barriers, and planned exec continuity. The
+[qualification report](architecture/small-output-persistence-batching.md)
+records wins, the sparse-output tradeoff, and host-specific measurement limits.
+This delivery does not deploy or migrate an external consumer's state directory.
+
 ## Architecture evidence and failure corpus
 
 Before widening the runtime with Integrations, make the current system legible

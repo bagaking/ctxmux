@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -127,6 +127,12 @@ const _: () = assert!(
     "the format envelope must accept the serving ceiling plus the turnover overlap"
 );
 const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
+/// Maximum collection time from the first Append, before any store transaction.
+/// An empty queue is common for small output streams; wait briefly for the next
+/// Append rather than syncing one tiny row per PTY read. The deadline never
+/// slides, and a barrier, lifecycle wake or shutdown ends collection early.
+/// This bounds collection only: storage retries and sync can take longer.
+const APPEND_BATCH_WINDOW: Duration = Duration::from_millis(10);
 /// Target size of one `replay_chunks` row.
 ///
 /// A row costs the same fixed overhead whether it carries 200 bytes or 200 KiB:
@@ -480,6 +486,8 @@ struct PersistenceInner {
 #[derive(Default)]
 struct PersistenceTestHooks {
     append_transaction_commits: AtomicU64,
+    append_batch_window: Mutex<Option<Duration>>,
+    append_wait_started: Mutex<Option<mpsc::Sender<()>>>,
     fail_next_insert_after_commit: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
@@ -1728,6 +1736,7 @@ fn actor_main(
     }
 
     let mut pending = VecDeque::new();
+    let mut pending_lifecycle = None;
     loop {
         // Lifecycle first, at every dequeue. This is the whole of R25: the
         // command was never short of a slot (measured: 1 us blocked at
@@ -1739,9 +1748,12 @@ fn actor_main(
         // the lifecycle-vs-lifecycle edge that a `StageStart` must not cross —
         // it may not overtake the `Finalize` of a candidate it evicts — is
         // preserved by the single channel's own ordering.
-        let command = match lifecycle_rx.try_recv() {
-            Ok(command) => command,
-            Err(mpsc::TryRecvError::Disconnected | mpsc::TryRecvError::Empty) => {
+        let command = match pending_lifecycle
+            .take()
+            .or_else(|| lifecycle_rx.try_recv().ok())
+        {
+            Some(command) => command,
+            None => {
                 match pending.pop_front() {
                     Some(command) => command,
                     None => match receiver.try_recv() {
@@ -1852,8 +1864,41 @@ fn actor_main(
                 queue_depth.fetch_sub(1, Ordering::AcqRel);
                 let mut batch = vec![(id, replay, durable_head)];
                 let mut payload = replay_payload(&batch[0].1);
+                let window = APPEND_BATCH_WINDOW;
+                #[cfg(test)]
+                let window = mutex_lock(&test_hooks.append_batch_window).unwrap_or(window);
+                let deadline = Instant::now() + window;
                 while payload < MAX_TRANSACTION_PAYLOAD_BYTES {
-                    match receiver.try_recv() {
+                    // A lifecycle wake can be refused while the append queue
+                    // is full. Check the lifecycle lane before each dequeue so
+                    // draining that queue cannot turn into a timed wait with a
+                    // lifecycle receipt already pending. Preserve this command
+                    // ahead of newer lifecycle commands on the next actor turn.
+                    if let Ok(command) = lifecycle_rx.try_recv() {
+                        pending_lifecycle = Some(command);
+                        break;
+                    }
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break;
+                    };
+                    // Collection owns no SQLite transaction or replay writer.
+                    // Lifecycle senders also enqueue a wake here, so their
+                    // receipts do not have to wait for the deadline to expire.
+                    let next = match receiver.try_recv() {
+                        Ok(command) => Ok(command),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            Err(mpsc::RecvTimeoutError::Disconnected)
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            #[cfg(test)]
+                            if let Some(notify) = mutex_lock(&test_hooks.append_wait_started).take()
+                            {
+                                let _ = notify.send(());
+                            }
+                            receiver.recv_timeout(remaining)
+                        }
+                    };
+                    match next {
                         Ok(Command::Append {
                             id,
                             replay,
@@ -1869,7 +1914,11 @@ fn actor_main(
                             pending.push_back(command);
                             break;
                         }
-                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => {
+                            break;
+                        }
                     }
                 }
                 if mutex_lock(failure).is_none() {
@@ -8511,10 +8560,8 @@ mod tests {
     /// survive the transaction), so one batch is one row boundary and the batch
     /// is bounded by what `try_recv` can pull. Measured: 4 rows at capacity 64,
     /// 20 at capacity 16, which is a performance knob moving a correctness
-    /// assertion. Production never sees that coupling — eight reactor threads
-    /// keep `try_recv` non-empty, so a real batch fills to
-    /// `MAX_TRANSACTION_PAYLOAD_BYTES` and rows sit at the 64 KiB ceiling
-    /// regardless of depth (measured 64082 B/row at 16 vs 64059 B at 64).
+    /// assertion. This fixture verifies packing inside one collected batch;
+    /// separate actor tests cover collection across empty-queue intervals.
     #[test]
     fn many_small_appends_become_few_large_rows() {
         let temp = TempDir::new().expect("create coalescing fixture");
@@ -8573,6 +8620,250 @@ mod tests {
         );
         assert_eq!(recovered[0].replay.latest_output_bytes, head + 4);
         drop(reopened);
+    }
+
+    // A deliberately long fixture window makes early flush tests depend on a
+    // channel receipt, not on beating the production timer on a loaded host.
+    fn observe_collection_wait(persistence: &Persistence) -> std::sync::mpsc::Receiver<()> {
+        let (notify, reached) = std::sync::mpsc::channel();
+        *mutex_lock(&persistence.inner.test_hooks.append_batch_window) =
+            Some(Duration::from_secs(30));
+        *mutex_lock(&persistence.inner.test_hooks.append_wait_started) = Some(notify);
+        reached
+    }
+
+    #[test]
+    fn spaced_appends_share_a_commit_and_barrier_flushes_without_waiting() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, _) = Persistence::open(&state_dir).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let reached = observe_collection_wait(&persistence);
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"one")])));
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(durable.durable_head(), 0, "collecting is not a commit");
+        expect_queued(durable.append(info.id, replay(vec![chunk(3, b"two")])));
+        persistence.barrier().unwrap();
+        assert_eq!(durable.durable_head(), 6);
+        assert_eq!(
+            persistence
+                .inner
+                .test_hooks
+                .append_transaction_commits
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(durable);
+        drop(persistence);
+        let (_reopened, recovered) = Persistence::open(&state_dir).unwrap();
+        let bytes: Vec<u8> = recovered[0]
+            .replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(bytes, b"onetwo");
+    }
+
+    #[test]
+    fn lifecycle_wake_flushes_collected_output_and_finalizes_the_tail() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, _) = Persistence::open(&state_dir).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let reached = observe_collection_wait(&persistence);
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"one")])));
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        let finalizer = durable.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        let join = thread::spawn(move || {
+            finalizer.finalize(info.id, 42, replay(vec![chunk(3, b"tail")]), exited_state());
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lifecycle wake bypasses the 30-second fixture deadline");
+        join.join().unwrap();
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), 7);
+        drop(durable);
+        drop(persistence);
+        let (_reopened, recovered) = Persistence::open(&state_dir).unwrap();
+        assert_eq!(recovered[0].info.state, exited_state());
+        let bytes: Vec<u8> = recovered[0]
+            .replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.iter().copied())
+            .collect();
+        assert_eq!(bytes, b"onetail");
+    }
+
+    #[test]
+    fn lifecycle_with_a_refused_wake_does_not_wait_for_the_collection_deadline() {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        *mutex_lock(&persistence.inner.test_hooks.append_batch_window) =
+            Some(Duration::from_secs(30));
+        let (paused, release) = persistence.pause_next_append();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"x")])));
+        paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        for offset in 1..=PERSISTENCE_QUEUE_CAPACITY {
+            expect_queued(durable.append(info.id, replay(vec![chunk(offset as u64, b"x")])));
+        }
+        let (reply, received) = std::sync::mpsc::sync_channel(0);
+        // The append lane is exactly full, so send_lifecycle cannot enqueue
+        // its wake. Finalize carries the complete missing prefix, as the Run
+        // transition owner does when finalization overtakes queued Appends.
+        assert!(
+            persistence.inner.send_lifecycle(super::Command::Finalize {
+                id: info.id,
+                actual_pid: 42,
+                replay: replay(
+                    (0..=PERSISTENCE_QUEUE_CAPACITY)
+                        .map(|offset| chunk(offset as u64, b"x"))
+                        .collect()
+                ),
+                state: exited_state(),
+                durable_head: Arc::clone(&durable.durable_head),
+                metadata_bytes: Arc::clone(&durable.metadata_bytes),
+                reply,
+            })
+        );
+        release.send(()).unwrap();
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a refused wake must not cause a 30-second collection wait")
+            .expect("finalize commits the accepted prefix");
+        persistence.barrier().unwrap();
+        assert_eq!(
+            durable.durable_head(),
+            (PERSISTENCE_QUEUE_CAPACITY + 1) as u64
+        );
+        assert!(!persistence.is_failed());
+    }
+
+    #[test]
+    fn a_silent_stream_commits_without_a_later_append_or_barrier() {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"silent")])));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while durable.durable_head() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "silence must not leave accepted output buffered forever"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(durable.durable_head(), 6);
+        assert!(!persistence.is_failed());
+    }
+
+    #[test]
+    fn arriving_appends_do_not_slide_the_first_collection_deadline() {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        *mutex_lock(&persistence.inner.test_hooks.append_batch_window) =
+            Some(Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut head = 0;
+        while durable.durable_head() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "continuous small appends must not postpone the first commit indefinitely"
+            );
+            if durable.append(info.id, replay(vec![chunk(head, b"x")])) {
+                head += 1;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(head > 1);
+        assert!(!persistence.is_failed());
+    }
+
+    #[test]
+    fn append_collection_crash_recovers_only_committed_bytes() {
+        for (phase, expected) in [("collecting", &b""[..]), ("committed", &b"onetwo"[..])] {
+            let temp = TempDir::new().unwrap();
+            let state_dir = temp.path().join("state");
+            let output = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "persistence::tests::append_collection_crash_subprocess",
+                    "--nocapture",
+                ])
+                .env("CTXMUX_APPEND_COLLECTION_CRASH", phase)
+                .env("CTXMUX_APPEND_COLLECTION_STATE", &state_dir)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(86), "crash fixture: {output:?}");
+            let (_persistence, recovered) = Persistence::open(&state_dir).unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(
+                recovered[0].replay.latest_output_bytes,
+                expected.len() as u64
+            );
+            let bytes: Vec<u8> = recovered[0]
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(bytes, expected, "recovery must not invent buffered output");
+            assert!(matches!(
+                recovered[0].info.state,
+                RunState::Interrupted {
+                    reason: InterruptionReason::DaemonRestart
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn append_collection_crash_subprocess() {
+        let Ok(phase) = env::var("CTXMUX_APPEND_COLLECTION_CRASH") else {
+            return;
+        };
+        let state_dir = env::var_os("CTXMUX_APPEND_COLLECTION_STATE").unwrap();
+        let (persistence, _) = Persistence::open(std::path::PathBuf::from(state_dir)).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let reached = observe_collection_wait(&persistence);
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"one")])));
+        reached.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(durable.durable_head(), 0);
+        expect_queued(durable.append(info.id, replay(vec![chunk(3, b"two")])));
+        match phase.as_str() {
+            "collecting" => {}
+            "committed" => {
+                persistence.barrier().unwrap();
+                assert_eq!(durable.durable_head(), 6);
+            }
+            _ => panic!("unknown collection crash phase"),
+        }
+        // Terminate all threads without running Rust drops or shutdown flushes.
+        std::process::exit(86);
     }
 
     /// A finalize that overtakes its own Run's queued appends must not latch

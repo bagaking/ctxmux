@@ -620,6 +620,14 @@ chunks, and truncation describe exactly that committed retained window. A late
 attachment receives either one `exited` event or one `interrupted` event after
 replay reassembly.
 
+Output persistence batches small Appends across empty-queue intervals for up to
+10 ms from the first collected Append, with an independent 1 MiB payload cap.
+Live attachment delivery does not wait for that collection or commit. Lifecycle
+requests and durable barriers end collection early; terminal output and terminal
+state still commit before terminal publication. The collection window is not a
+durability latency guarantee: queued work, sync, checkpoints, and storage retries
+can make `durable_output_bytes` lag longer.
+
 Retained replay is not encoded into one potentially oversized JSON value. The
 initial `attached` frame carries replay cursors and `truncated` with no retained
 chunks; each retained chunk follows as one ordinary ordered `output` event.

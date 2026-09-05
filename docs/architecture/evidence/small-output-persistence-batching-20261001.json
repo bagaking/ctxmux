@@ -1,0 +1,1192 @@
+{
+  "baseline_commit": "5ea86238571ce5a148162e69ee3dc36630865955",
+  "date": "2026-10-01",
+  "platform": "macOS-26.3.2-arm64-arm-64bit",
+  "method": "three alternating baseline/final-10ms repetitions, then medians; no concurrent build; 1ms WAL marker and 10ms status sampling; Mach CPU time and disk write accounting; isolated sockets/state, abrupt daemon termination and byte-exact replay recovery; observed storage latency spikes retained",
+  "raw": {
+    "baseline": [
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "40ebe9d920226b006ca3cb9c991ac0c4486948a4934718c39d2217bc6615920c",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.340828,
+            "write_bytes": 6889472,
+            "cpu_s": 0.177758375,
+            "wal_commit_markers_lower_bound": 190,
+            "live_ms": {
+              "p50": 0.105,
+              "p95": 0.205,
+              "max": 2.244
+            },
+            "durable_observed_ms": {
+              "p50": 23.322,
+              "p95": 68.363,
+              "max": 118.184
+            },
+            "terminal_ms": {
+              "p50": 20.453,
+              "p95": 20.453,
+              "max": 20.453
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 2.485735,
+            "write_bytes": 303104,
+            "cpu_s": 0.03336425,
+            "wal_commit_markers_lower_bound": 15,
+            "live_ms": {
+              "p50": 0.112,
+              "p95": 0.234,
+              "max": 0.234
+            },
+            "durable_observed_ms": {
+              "p50": 18.419,
+              "p95": 146.237,
+              "max": 146.237
+            },
+            "terminal_ms": {
+              "p50": 138.113,
+              "p95": 138.113,
+              "max": 138.113
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.450639,
+            "write_bytes": 3629056,
+            "cpu_s": 0.18706908333333333,
+            "wal_commit_markers_lower_bound": 68,
+            "live_ms": {
+              "p50": 0.062,
+              "p95": 0.127,
+              "max": 0.596
+            },
+            "durable_observed_ms": {
+              "p50": 98.774,
+              "p95": 526.135,
+              "max": 583.547
+            },
+            "terminal_ms": {
+              "p50": 140.257,
+              "p95": 145.845,
+              "max": 145.845
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.784712,
+            "write_bytes": 16998400,
+            "cpu_s": 0.3795877916666667,
+            "wal_commit_markers_lower_bound": 245,
+            "live_ms": {
+              "p50": 0.097,
+              "p95": 0.179,
+              "max": 0.504
+            },
+            "durable_observed_ms": {
+              "p50": 27.57,
+              "p95": 64.85,
+              "max": 148.427
+            },
+            "terminal_ms": {
+              "p50": 15.456,
+              "p95": 15.456,
+              "max": 15.456
+            },
+            "recovered_replay_bytes": [
+              4153344
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      },
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "40ebe9d920226b006ca3cb9c991ac0c4486948a4934718c39d2217bc6615920c",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.337583,
+            "write_bytes": 7749632,
+            "cpu_s": 0.18622075,
+            "wal_commit_markers_lower_bound": 215,
+            "live_ms": {
+              "p50": 0.096,
+              "p95": 0.237,
+              "max": 2.575
+            },
+            "durable_observed_ms": {
+              "p50": 21.74,
+              "p95": 37.613,
+              "max": 55.196
+            },
+            "terminal_ms": {
+              "p50": 13.853,
+              "p95": 13.853,
+              "max": 13.853
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 2.393745,
+            "write_bytes": 303104,
+            "cpu_s": 0.030865833333333332,
+            "wal_commit_markers_lower_bound": 15,
+            "live_ms": {
+              "p50": 0.109,
+              "p95": 0.138,
+              "max": 0.138
+            },
+            "durable_observed_ms": {
+              "p50": 28.061,
+              "p95": 172.604,
+              "max": 172.604
+            },
+            "terminal_ms": {
+              "p50": 49.976,
+              "p95": 49.976,
+              "max": 49.976
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.473694,
+            "write_bytes": 2011136,
+            "cpu_s": 0.17501320833333334,
+            "wal_commit_markers_lower_bound": 45,
+            "live_ms": {
+              "p50": 0.063,
+              "p95": 0.155,
+              "max": 2.854
+            },
+            "durable_observed_ms": {
+              "p50": 254.945,
+              "p95": 330.134,
+              "max": 366.23
+            },
+            "terminal_ms": {
+              "p50": 130.905,
+              "p95": 153.577,
+              "max": 153.577
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.803485,
+            "write_bytes": 10579968,
+            "cpu_s": 0.24580579166666666,
+            "wal_commit_markers_lower_bound": 40,
+            "live_ms": {
+              "p50": 0.086,
+              "p95": 0.15,
+              "max": 1.809
+            },
+            "durable_observed_ms": {
+              "p50": 327.219,
+              "p95": 717.224,
+              "max": 797.159
+            },
+            "terminal_ms": {
+              "p50": 38.791,
+              "p95": 38.791,
+              "max": 38.791
+            },
+            "recovered_replay_bytes": [
+              4144128
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      },
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "40ebe9d920226b006ca3cb9c991ac0c4486948a4934718c39d2217bc6615920c",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.32515,
+            "write_bytes": 6295552,
+            "cpu_s": 0.13992,
+            "wal_commit_markers_lower_bound": 177,
+            "live_ms": {
+              "p50": 0.069,
+              "p95": 0.129,
+              "max": 1.951
+            },
+            "durable_observed_ms": {
+              "p50": 24.025,
+              "p95": 184.293,
+              "max": 250.5
+            },
+            "terminal_ms": {
+              "p50": 13.132,
+              "p95": 13.132,
+              "max": 13.132
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 2.337672,
+            "write_bytes": 303104,
+            "cpu_s": 0.026278875,
+            "wal_commit_markers_lower_bound": 15,
+            "live_ms": {
+              "p50": 0.106,
+              "p95": 0.233,
+              "max": 0.233
+            },
+            "durable_observed_ms": {
+              "p50": 17.23,
+              "p95": 131.121,
+              "max": 131.121
+            },
+            "terminal_ms": {
+              "p50": 10.127,
+              "p95": 10.127,
+              "max": 10.127
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.361304,
+            "write_bytes": 4255744,
+            "cpu_s": 0.19665754166666666,
+            "wal_commit_markers_lower_bound": 68,
+            "live_ms": {
+              "p50": 0.064,
+              "p95": 0.136,
+              "max": 3.039
+            },
+            "durable_observed_ms": {
+              "p50": 92.151,
+              "p95": 211.987,
+              "max": 261.743
+            },
+            "terminal_ms": {
+              "p50": 45.183,
+              "p95": 47.791,
+              "max": 47.791
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.805363,
+            "write_bytes": 15409152,
+            "cpu_s": 0.35489841666666666,
+            "wal_commit_markers_lower_bound": 196,
+            "live_ms": {
+              "p50": 0.098,
+              "p95": 0.181,
+              "max": 0.91
+            },
+            "durable_observed_ms": {
+              "p50": 35.642,
+              "p95": 176.164,
+              "max": 260.348
+            },
+            "terminal_ms": {
+              "p50": 30.451,
+              "p95": 30.451,
+              "max": 30.451
+            },
+            "recovered_replay_bytes": [
+              4177920
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      }
+    ],
+    "10ms": [
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "66ee716134e0be80ac434583dfeb0998fd67a6260200787f3683f93b58148359",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.347406,
+            "write_bytes": 3739648,
+            "cpu_s": 0.13738875,
+            "wal_commit_markers_lower_bound": 112,
+            "live_ms": {
+              "p50": 0.106,
+              "p95": 0.223,
+              "max": 2.283
+            },
+            "durable_observed_ms": {
+              "p50": 25.597,
+              "p95": 50.52,
+              "max": 90.607
+            },
+            "terminal_ms": {
+              "p50": 17.897,
+              "p95": 17.897,
+              "max": 17.897
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 2.510792,
+            "write_bytes": 303104,
+            "cpu_s": 0.03361879166666666,
+            "wal_commit_markers_lower_bound": 15,
+            "live_ms": {
+              "p50": 0.133,
+              "p95": 0.28,
+              "max": 0.28
+            },
+            "durable_observed_ms": {
+              "p50": 32.943,
+              "p95": 163.447,
+              "max": 163.447
+            },
+            "terminal_ms": {
+              "p50": 165.206,
+              "p95": 165.206,
+              "max": 165.206
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.365778,
+            "write_bytes": 3239936,
+            "cpu_s": 0.198800125,
+            "wal_commit_markers_lower_bound": 60,
+            "live_ms": {
+              "p50": 0.07,
+              "p95": 0.174,
+              "max": 3.102
+            },
+            "durable_observed_ms": {
+              "p50": 75.717,
+              "p95": 247.184,
+              "max": 344.085
+            },
+            "terminal_ms": {
+              "p50": 35.784,
+              "p95": 44.852,
+              "max": 44.852
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.916908,
+            "write_bytes": 12443648,
+            "cpu_s": 0.3657945,
+            "wal_commit_markers_lower_bound": 104,
+            "live_ms": {
+              "p50": 0.115,
+              "p95": 0.3,
+              "max": 9.972
+            },
+            "durable_observed_ms": {
+              "p50": 38.215,
+              "p95": 223.93,
+              "max": 357.655
+            },
+            "terminal_ms": {
+              "p50": 13.457,
+              "p95": 13.457,
+              "max": 13.457
+            },
+            "recovered_replay_bytes": [
+              4161536
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      },
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "66ee716134e0be80ac434583dfeb0998fd67a6260200787f3683f93b58148359",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.349255,
+            "write_bytes": 2334720,
+            "cpu_s": 0.08640579166666668,
+            "wal_commit_markers_lower_bound": 69,
+            "live_ms": {
+              "p50": 0.061,
+              "p95": 0.112,
+              "max": 1.74
+            },
+            "durable_observed_ms": {
+              "p50": 41.965,
+              "p95": 116.775,
+              "max": 158.255
+            },
+            "terminal_ms": {
+              "p50": 28.783,
+              "p95": 28.783,
+              "max": 28.783
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 3.737668,
+            "write_bytes": 139264,
+            "cpu_s": 0.03474895833333334,
+            "wal_commit_markers_lower_bound": 10,
+            "live_ms": {
+              "p50": 0.098,
+              "p95": 0.16,
+              "max": 0.16
+            },
+            "durable_observed_ms": {
+              "p50": 2417.122,
+              "p95": 3341.844,
+              "max": 3341.844
+            },
+            "terminal_ms": {
+              "p50": 1399.638,
+              "p95": 1399.638,
+              "max": 1399.638
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.378213,
+            "write_bytes": 2658304,
+            "cpu_s": 0.17560658333333334,
+            "wal_commit_markers_lower_bound": 56,
+            "live_ms": {
+              "p50": 0.059,
+              "p95": 0.127,
+              "max": 0.45
+            },
+            "durable_observed_ms": {
+              "p50": 104.933,
+              "p95": 270.963,
+              "max": 304.474
+            },
+            "terminal_ms": {
+              "p50": 62.906,
+              "p95": 67.762,
+              "max": 67.762
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.814411,
+            "write_bytes": 11526144,
+            "cpu_s": 0.301924125,
+            "wal_commit_markers_lower_bound": 76,
+            "live_ms": {
+              "p50": 0.096,
+              "p95": 0.171,
+              "max": 3.065
+            },
+            "durable_observed_ms": {
+              "p50": 51.046,
+              "p95": 150.024,
+              "max": 194.943
+            },
+            "terminal_ms": {
+              "p50": 23.047,
+              "p95": 23.047,
+              "max": 23.047
+            },
+            "recovered_replay_bytes": [
+              4172800
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      },
+      {
+        "platform": "macOS-26.3.2-arm64-arm-64bit",
+        "daemon_sha256": "66ee716134e0be80ac434583dfeb0998fd67a6260200787f3683f93b58148359",
+        "wal_sampling_interval_ms": 1,
+        "status_poll_interval_ms": 10,
+        "cases": [
+          {
+            "case": "paced",
+            "runs": 1,
+            "output_bytes": 76800,
+            "elapsed_s": 2.344472,
+            "write_bytes": 4009984,
+            "cpu_s": 0.12117575,
+            "wal_commit_markers_lower_bound": 120,
+            "live_ms": {
+              "p50": 0.079,
+              "p95": 0.146,
+              "max": 0.294
+            },
+            "durable_observed_ms": {
+              "p50": 23.99,
+              "p95": 40.285,
+              "max": 54.427
+            },
+            "terminal_ms": {
+              "p50": 17.505,
+              "p95": 17.505,
+              "max": 17.505
+            },
+            "recovered_replay_bytes": [
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sparse",
+            "runs": 1,
+            "output_bytes": 1536,
+            "elapsed_s": 2.354532,
+            "write_bytes": 303104,
+            "cpu_s": 0.03055579166666667,
+            "wal_commit_markers_lower_bound": 15,
+            "live_ms": {
+              "p50": 0.115,
+              "p95": 2.127,
+              "max": 2.127
+            },
+            "durable_observed_ms": {
+              "p50": 27.149,
+              "p95": 61.529,
+              "max": 61.529
+            },
+            "terminal_ms": {
+              "p50": 13.786,
+              "p95": 13.786,
+              "max": 13.786
+            },
+            "recovered_replay_bytes": [
+              1536
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "multi",
+            "runs": 4,
+            "output_bytes": 307200,
+            "elapsed_s": 2.428216,
+            "write_bytes": 3321856,
+            "cpu_s": 0.19597408333333335,
+            "wal_commit_markers_lower_bound": 65,
+            "live_ms": {
+              "p50": 0.066,
+              "p95": 0.162,
+              "max": 2.969
+            },
+            "durable_observed_ms": {
+              "p50": 85.204,
+              "p95": 136.548,
+              "max": 177.207
+            },
+            "terminal_ms": {
+              "p50": 93.633,
+              "p95": 119.812,
+              "max": 119.812
+            },
+            "recovered_replay_bytes": [
+              76800,
+              76800,
+              76800,
+              76800
+            ],
+            "terminal_recovery": "passed"
+          },
+          {
+            "case": "sustained",
+            "runs": 1,
+            "output_bytes": 8388608,
+            "elapsed_s": 2.905786,
+            "write_bytes": 10883072,
+            "cpu_s": 0.2868880416666667,
+            "wal_commit_markers_lower_bound": 50,
+            "live_ms": {
+              "p50": 0.098,
+              "p95": 0.182,
+              "max": 2.966
+            },
+            "durable_observed_ms": {
+              "p50": 161.405,
+              "p95": 590.961,
+              "max": 725.531
+            },
+            "terminal_ms": {
+              "p50": 79.983,
+              "p95": 79.983,
+              "max": 79.983
+            },
+            "recovered_replay_bytes": [
+              4169728
+            ],
+            "terminal_recovery": "passed"
+          }
+        ]
+      }
+    ]
+  },
+  "sweep": {
+    "25ms": {
+      "platform": "macOS-26.3.2-arm64-arm-64bit",
+      "daemon_sha256": "c790b9b7e2f722f40954ab078420a2381a3613b726452461f91217bad249780b",
+      "wal_sampling_interval_ms": 1,
+      "status_poll_interval_ms": 10,
+      "cases": [
+        {
+          "case": "paced",
+          "runs": 1,
+          "output_bytes": 76800,
+          "elapsed_s": 2.32986,
+          "write_bytes": 2625536,
+          "cpu_s": 0.08953754166666668,
+          "wal_commit_markers_lower_bound": 66,
+          "live_ms": {
+            "p50": 0.083,
+            "p95": 0.136,
+            "max": 0.453
+          },
+          "durable_observed_ms": {
+            "p50": 33.39,
+            "p95": 53.203,
+            "max": 66.602
+          },
+          "terminal_ms": {
+            "p50": 19.693,
+            "p95": 19.693,
+            "max": 19.693
+          },
+          "recovered_replay_bytes": [
+            76800
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "sparse",
+          "runs": 1,
+          "output_bytes": 1536,
+          "elapsed_s": 2.372465,
+          "write_bytes": 462848,
+          "cpu_s": 0.029442125,
+          "wal_commit_markers_lower_bound": 14,
+          "live_ms": {
+            "p50": 0.108,
+            "p95": 0.241,
+            "max": 0.241
+          },
+          "durable_observed_ms": {
+            "p50": 40.698,
+            "p95": 49.172,
+            "max": 49.172
+          },
+          "terminal_ms": {
+            "p50": 20.826,
+            "p95": 20.826,
+            "max": 20.826
+          },
+          "recovered_replay_bytes": [
+            1536
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "multi",
+          "runs": 4,
+          "output_bytes": 307200,
+          "elapsed_s": 2.356826,
+          "write_bytes": 3018752,
+          "cpu_s": 0.15868604166666667,
+          "wal_commit_markers_lower_bound": 46,
+          "live_ms": {
+            "p50": 0.055,
+            "p95": 0.119,
+            "max": 0.379
+          },
+          "durable_observed_ms": {
+            "p50": 78.527,
+            "p95": 113.646,
+            "max": 139.195
+          },
+          "terminal_ms": {
+            "p50": 48.549,
+            "p95": 57.601,
+            "max": 57.601
+          },
+          "recovered_replay_bytes": [
+            76800,
+            76800,
+            76800,
+            76800
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "sustained",
+          "runs": 1,
+          "output_bytes": 8388608,
+          "elapsed_s": 2.823957,
+          "write_bytes": 11657216,
+          "cpu_s": 0.30036666666666667,
+          "wal_commit_markers_lower_bound": 61,
+          "live_ms": {
+            "p50": 0.094,
+            "p95": 0.17,
+            "max": 2.528
+          },
+          "durable_observed_ms": {
+            "p50": 49.83,
+            "p95": 74.61,
+            "max": 84.013
+          },
+          "terminal_ms": {
+            "p50": 30.498,
+            "p95": 30.498,
+            "max": 30.498
+          },
+          "recovered_replay_bytes": [
+            4140032
+          ],
+          "terminal_recovery": "passed"
+        }
+      ]
+    },
+    "50ms": {
+      "platform": "macOS-26.3.2-arm64-arm-64bit",
+      "daemon_sha256": "982c5d3024a8053d534d75a6623dc3df8cba07cf70036a0bd2c3a908f2897088",
+      "wal_sampling_interval_ms": 1,
+      "status_poll_interval_ms": 10,
+      "cases": [
+        {
+          "case": "paced",
+          "runs": 1,
+          "output_bytes": 76800,
+          "elapsed_s": 2.331934,
+          "write_bytes": 1753088,
+          "cpu_s": 0.07665025,
+          "wal_commit_markers_lower_bound": 39,
+          "live_ms": {
+            "p50": 0.088,
+            "p95": 0.135,
+            "max": 1.081
+          },
+          "durable_observed_ms": {
+            "p50": 45.24,
+            "p95": 75.065,
+            "max": 91.34
+          },
+          "terminal_ms": {
+            "p50": 21.439,
+            "p95": 21.439,
+            "max": 21.439
+          },
+          "recovered_replay_bytes": [
+            76800
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "sparse",
+          "runs": 1,
+          "output_bytes": 1536,
+          "elapsed_s": 2.354546,
+          "write_bytes": 462848,
+          "cpu_s": 0.030470875,
+          "wal_commit_markers_lower_bound": 14,
+          "live_ms": {
+            "p50": 0.106,
+            "p95": 0.14,
+            "max": 0.14
+          },
+          "durable_observed_ms": {
+            "p50": 65.607,
+            "p95": 72.952,
+            "max": 72.952
+          },
+          "terminal_ms": {
+            "p50": 15.177,
+            "p95": 15.177,
+            "max": 15.177
+          },
+          "recovered_replay_bytes": [
+            1536
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "multi",
+          "runs": 4,
+          "output_bytes": 307200,
+          "elapsed_s": 2.429155,
+          "write_bytes": 2076672,
+          "cpu_s": 0.19323870833333334,
+          "wal_commit_markers_lower_bound": 32,
+          "live_ms": {
+            "p50": 0.085,
+            "p95": 0.354,
+            "max": 9.719
+          },
+          "durable_observed_ms": {
+            "p50": 114.591,
+            "p95": 206.733,
+            "max": 272.454
+          },
+          "terminal_ms": {
+            "p50": 87.239,
+            "p95": 97.146,
+            "max": 97.146
+          },
+          "recovered_replay_bytes": [
+            76800,
+            76800,
+            76800,
+            76800
+          ],
+          "terminal_recovery": "passed"
+        },
+        {
+          "case": "sustained",
+          "runs": 1,
+          "output_bytes": 8388608,
+          "elapsed_s": 2.917021,
+          "write_bytes": 10481664,
+          "cpu_s": 0.325817125,
+          "wal_commit_markers_lower_bound": 36,
+          "live_ms": {
+            "p50": 0.113,
+            "p95": 0.251,
+            "max": 12.569
+          },
+          "durable_observed_ms": {
+            "p50": 77.608,
+            "p95": 137.584,
+            "max": 172.349
+          },
+          "terminal_ms": {
+            "p50": 33.955,
+            "p95": 33.955,
+            "max": 33.955
+          },
+          "recovered_replay_bytes": [
+            4194304
+          ],
+          "terminal_recovery": "passed"
+        }
+      ]
+    }
+  },
+  "medians": {
+    "paced": {
+      "baseline": {
+        "output_bytes": 76800,
+        "elapsed_s": 2.337583,
+        "write_bytes": 6889472,
+        "cpu_s": 0.177758375,
+        "wal_commit_markers_lower_bound": 190,
+        "live_ms": {
+          "p50": 0.096,
+          "p95": 0.205,
+          "max": 2.244
+        },
+        "durable_observed_ms": {
+          "p50": 23.322,
+          "p95": 68.363,
+          "max": 118.184
+        },
+        "terminal_ms": {
+          "p50": 13.853,
+          "p95": 13.853,
+          "max": 13.853
+        },
+        "write_bytes_per_output_byte": 89.70666666666666
+      },
+      "10ms": {
+        "output_bytes": 76800,
+        "elapsed_s": 2.347406,
+        "write_bytes": 3739648,
+        "cpu_s": 0.12117575,
+        "wal_commit_markers_lower_bound": 112,
+        "live_ms": {
+          "p50": 0.079,
+          "p95": 0.146,
+          "max": 1.74
+        },
+        "durable_observed_ms": {
+          "p50": 25.597,
+          "p95": 50.52,
+          "max": 90.607
+        },
+        "terminal_ms": {
+          "p50": 17.897,
+          "p95": 17.897,
+          "max": 17.897
+        },
+        "write_bytes_per_output_byte": 48.693333333333335
+      }
+    },
+    "sparse": {
+      "baseline": {
+        "output_bytes": 1536,
+        "elapsed_s": 2.393745,
+        "write_bytes": 303104,
+        "cpu_s": 0.030865833333333332,
+        "wal_commit_markers_lower_bound": 15,
+        "live_ms": {
+          "p50": 0.109,
+          "p95": 0.233,
+          "max": 0.233
+        },
+        "durable_observed_ms": {
+          "p50": 18.419,
+          "p95": 146.237,
+          "max": 146.237
+        },
+        "terminal_ms": {
+          "p50": 49.976,
+          "p95": 49.976,
+          "max": 49.976
+        },
+        "write_bytes_per_output_byte": 197.33333333333334
+      },
+      "10ms": {
+        "output_bytes": 1536,
+        "elapsed_s": 2.510792,
+        "write_bytes": 303104,
+        "cpu_s": 0.03361879166666666,
+        "wal_commit_markers_lower_bound": 15,
+        "live_ms": {
+          "p50": 0.115,
+          "p95": 0.28,
+          "max": 0.28
+        },
+        "durable_observed_ms": {
+          "p50": 32.943,
+          "p95": 163.447,
+          "max": 163.447
+        },
+        "terminal_ms": {
+          "p50": 165.206,
+          "p95": 165.206,
+          "max": 165.206
+        },
+        "write_bytes_per_output_byte": 197.33333333333334
+      }
+    },
+    "multi": {
+      "baseline": {
+        "output_bytes": 307200,
+        "elapsed_s": 2.450639,
+        "write_bytes": 3629056,
+        "cpu_s": 0.18706908333333333,
+        "wal_commit_markers_lower_bound": 68,
+        "live_ms": {
+          "p50": 0.063,
+          "p95": 0.136,
+          "max": 2.854
+        },
+        "durable_observed_ms": {
+          "p50": 98.774,
+          "p95": 330.134,
+          "max": 366.23
+        },
+        "terminal_ms": {
+          "p50": 130.905,
+          "p95": 145.845,
+          "max": 145.845
+        },
+        "write_bytes_per_output_byte": 11.813333333333333
+      },
+      "10ms": {
+        "output_bytes": 307200,
+        "elapsed_s": 2.378213,
+        "write_bytes": 3239936,
+        "cpu_s": 0.19597408333333335,
+        "wal_commit_markers_lower_bound": 60,
+        "live_ms": {
+          "p50": 0.066,
+          "p95": 0.162,
+          "max": 2.969
+        },
+        "durable_observed_ms": {
+          "p50": 85.204,
+          "p95": 247.184,
+          "max": 304.474
+        },
+        "terminal_ms": {
+          "p50": 62.906,
+          "p95": 67.762,
+          "max": 67.762
+        },
+        "write_bytes_per_output_byte": 10.546666666666667
+      }
+    },
+    "sustained": {
+      "baseline": {
+        "output_bytes": 8388608,
+        "elapsed_s": 2.803485,
+        "write_bytes": 15409152,
+        "cpu_s": 0.35489841666666666,
+        "wal_commit_markers_lower_bound": 196,
+        "live_ms": {
+          "p50": 0.097,
+          "p95": 0.179,
+          "max": 0.91
+        },
+        "durable_observed_ms": {
+          "p50": 35.642,
+          "p95": 176.164,
+          "max": 260.348
+        },
+        "terminal_ms": {
+          "p50": 30.451,
+          "p95": 30.451,
+          "max": 30.451
+        },
+        "write_bytes_per_output_byte": 1.8369140625
+      },
+      "10ms": {
+        "output_bytes": 8388608,
+        "elapsed_s": 2.905786,
+        "write_bytes": 11526144,
+        "cpu_s": 0.301924125,
+        "wal_commit_markers_lower_bound": 76,
+        "live_ms": {
+          "p50": 0.098,
+          "p95": 0.182,
+          "max": 3.065
+        },
+        "durable_observed_ms": {
+          "p50": 51.046,
+          "p95": 223.93,
+          "max": 357.655
+        },
+        "terminal_ms": {
+          "p50": 23.047,
+          "p95": 23.047,
+          "max": 23.047
+        },
+        "write_bytes_per_output_byte": 1.3740234375
+      }
+    }
+  }
+}
