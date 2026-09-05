@@ -792,6 +792,28 @@ fn perform_exec_upgrade(
     // Draining the FIFO barrier here fences every byte ever read before we exec,
     // guaranteeing the persisted cursor covers all of them. A barrier *before*
     // extract would race the still-running reader and could leave a replay gap.
+    //
+    // The barrier fences what was OFFERED, which is only the same thing as what
+    // was READ once every outstanding byte has been offered. Ordinary admission
+    // may drop or skip an append under queue pressure and let the next push
+    // re-offer those bytes — and extract just removed every next push. So each
+    // Run settles its debt first, blocking; then the barrier's guarantee is the
+    // one this comment claims.
+    for run_id in live.iter().map(|descriptors| descriptors.run_id) {
+        let Some(run) = manager.registry.pin(run_id).map_err(|error| {
+            UpgradeAbort::AfterExtract(ServerError::Shutdown {
+                failures: format!(
+                    "Run {run_id} could not be pinned for its handoff offer: {}",
+                    error.message
+                ),
+            })
+        })?
+        else {
+            continue;
+        };
+        run.offer_outstanding_output_for_handoff()
+            .map_err(|failures| UpgradeAbort::AfterExtract(ServerError::Shutdown { failures }))?;
+    }
     manager
         .persistence_barrier()
         .map_err(UpgradeAbort::AfterExtract)?;
@@ -4208,6 +4230,43 @@ impl Run {
 
     fn mark_output_source_gap(&self) -> u64 {
         mutex_lock(&self.output).mark_source_gap()
+    }
+
+    /// Offer every byte this Run has read but never handed to persistence, so a
+    /// following durable barrier actually fences the whole log.
+    ///
+    /// Called once per Run on the exec-in-place path, between extract (which
+    /// stops the pty readers) and the barrier. Ordinary output admission is
+    /// allowed to drop or skip an append because the offered watermark stays put
+    /// and the NEXT push re-offers the same bytes; extract removes that next
+    /// push, so without this the barrier fences an offered watermark that lags
+    /// the log and the upgrade exec's over the difference. Those bytes are then
+    /// unrecoverable: they are out of the pty kernel buffer already, and the
+    /// incoming image resumes from the persisted cursor.
+    ///
+    /// Safe to call when nothing is outstanding, which is the common case: the
+    /// render is empty, `append_blocking` is never reached, and the barrier
+    /// behaves exactly as before.
+    fn offer_outstanding_output_for_handoff(&self) -> Result<(), String> {
+        let Some(persistence) = mutex_lock(&self.persistence).active().cloned() else {
+            return Ok(());
+        };
+        let replay = {
+            let output = mutex_lock(&self.output);
+            let outstanding = persistence.next_replay_start();
+            if output.latest_output_bytes() <= outstanding {
+                return Ok(());
+            }
+            output.replay(outstanding)
+        };
+        if persistence.append_blocking(self.id, replay) {
+            Ok(())
+        } else {
+            Err(format!(
+                "Run {} could not offer its outstanding output before the handoff barrier",
+                self.id
+            ))
+        }
     }
 
     fn subscribe(self: &Arc<Self>) -> (AttachmentGuard, LiveEventSubscription) {

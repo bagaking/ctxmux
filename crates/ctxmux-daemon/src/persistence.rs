@@ -924,6 +924,51 @@ impl PersistentRun {
         self.persistence.inner.queue_depth.load(Ordering::Acquire) < PERSISTENCE_QUEUE_CAPACITY
     }
 
+    /// Enqueue one final catch-up append, BLOCKING until the queue accepts it.
+    ///
+    /// The mirror image of [`Self::append`], for the one caller that has no
+    /// next push to fall back on. `append` may drop, and `record_output` may
+    /// skip the render outright, because the offered watermark stays put and
+    /// *the next push re-offers the same bytes*. Exec-in-place is where that
+    /// invariant runs out: extract stops each pty reader, so the push that was
+    /// going to carry the debt never happens, and the barrier that follows
+    /// fences only what was OFFERED — a skipped render is not outstanding work
+    /// as far as the barrier can see, so it exec's over the top of it and those
+    /// bytes are gone from both the queue and the kernel buffer.
+    ///
+    /// Blocking is affordable here precisely where dropping is not: this runs
+    /// once per upgrade on the SIGHUP path, past the point of no return, with
+    /// every reader already stopped. There is no pty left to starve — the whole
+    /// reason `append` must never block — and the actor is draining a queue that
+    /// nothing is adding to any more, so the wait is bounded by the depth
+    /// already enqueued.
+    #[must_use = "a failed final offer means the barrier cannot fence these bytes"]
+    pub(crate) fn append_blocking(&self, id: RunId, replay: OutputReplay) -> bool {
+        if mutex_lock(&self.persistence.inner.failure).is_some() {
+            return true;
+        }
+        let offered_through = replay.latest_output_bytes;
+        let accepted = self
+            .persistence
+            .inner
+            .sender
+            .send(Command::Append {
+                id,
+                replay,
+                durable_head: Arc::clone(&self.durable_head),
+            })
+            .is_ok();
+        if accepted {
+            self.offered_head
+                .fetch_max(offered_through, Ordering::AcqRel);
+            self.persistence
+                .inner
+                .queue_depth
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        accepted
+    }
+
     pub(crate) fn finalize(
         &self,
         id: RunId,
@@ -8831,6 +8876,135 @@ mod tests {
         drop(durable);
         persistence.assert_exclusive_owner();
         drop(persistence);
+    }
+
+    /// A barrier fences only what was OFFERED, so a final blocking offer is what
+    /// makes it fence what was READ.
+    ///
+    /// The exec-in-place invariant, stated where it can actually fail. Ordinary
+    /// admission may refuse an append and rely on the next push re-offering
+    /// those bytes; extract stops every pty reader, so on the upgrade path there
+    /// is no next push. Without [`PersistentRun::append_blocking`] the refused
+    /// bytes are simply never offered, the barrier returns satisfied anyway, and
+    /// the upgrade exec's over output it has told itself is durable.
+    ///
+    /// This drives exactly that sequence — refuse, then offer once, blocking,
+    /// then barrier — and asserts from the REOPENED database, so it measures
+    /// durability rather than queue bookkeeping. With `append_blocking` replaced
+    /// by `append` the refusal is unrecovered and the replay comes back short.
+    #[test]
+    fn a_blocking_offer_makes_the_barrier_fence_every_read_byte() {
+        const CHUNK: &[u8] = b"cccc";
+
+        let temp = TempDir::new().expect("create handoff-offer fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert handoff-offer fixture");
+
+        // Hold the actor so the queue saturates behind it, exactly as a slow
+        // fsync does under a chatty fleet.
+        let (reached, release) = persistence.pause_next_append();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, CHUNK)])));
+        reached
+            .recv()
+            .expect("the actor reaches the append barrier");
+
+        // Push until the queue refuses. Each refused append leaves the offered
+        // watermark behind the bytes the reader has already consumed — the debt
+        // that the next push would normally carry.
+        let mut whole = Vec::from(CHUNK);
+        let mut refusals = 0_usize;
+        for index in 1..=(PERSISTENCE_QUEUE_CAPACITY + 64) {
+            let offset = (index as u64) * CHUNK.len() as u64;
+            if !durable.append(info.id, replay(vec![chunk(offset, CHUNK)])) {
+                refusals += 1;
+            }
+            whole.extend_from_slice(CHUNK);
+        }
+        assert!(
+            refusals > 0,
+            "the fixture must actually overflow the queue; with no refusal there \
+             is no outstanding debt and this test proves nothing"
+        );
+        let outstanding = whole.len() as u64 - durable.next_replay_start();
+        assert!(
+            outstanding > 0,
+            "a refusal must leave bytes unoffered, otherwise the blocking offer \
+             below has nothing to settle"
+        );
+
+        // THE HANDOFF STEP. No further push will ever come: on the real path
+        // extract has already stopped this Run's reader. The queue is STILL full
+        // here, which is the whole point — a non-blocking append refuses at this
+        // instant and the debt is lost, so the offer must wait for a slot rather
+        // than drop. A helper releases the actor shortly, standing in for the
+        // fsync that eventually completes.
+        assert!(
+            !durable.queue_has_room(),
+            "the offer must be made while the queue is full, or a non-blocking \
+             append would succeed too and this test would not discriminate"
+        );
+        let releaser = thread::Builder::new()
+            .name("handoff-offer-releaser".to_owned())
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                let _ = release.send(());
+            })
+            .expect("spawn the barrier releaser");
+
+        let outstanding_from = durable.next_replay_start();
+        let offer_from = usize::try_from(outstanding_from).expect("fixture offsets fit usize");
+        assert!(
+            durable.append_blocking(
+                info.id,
+                replay(vec![chunk(outstanding_from, &whole[offer_from..],)]),
+            ),
+            "the final handoff offer must be accepted, not dropped: there is no \
+             next push to re-offer these bytes once extract has stopped the reader"
+        );
+        releaser.join().expect("the barrier releaser finishes");
+        persistence.barrier().expect("fence the handoff offer");
+
+        assert_eq!(
+            durable.durable_head(),
+            whole.len() as u64,
+            "after the blocking offer the barrier must fence every byte read, \
+             not merely every byte a non-blocking append happened to place"
+        );
+
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        // Durability, read back from disk: this is the property the upgrade path
+        // depends on, and the one a queue-depth assertion cannot establish.
+        let (reopened, recovered) = Persistence::open(state_dir).expect("reopen handoff state");
+        let run = recovered
+            .iter()
+            .find(|run| run.info.id == info.id)
+            .expect("the Run survives the handoff offer");
+        let recovered_bytes: Vec<u8> = run
+            .replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.data.clone())
+            .collect();
+        assert_eq!(
+            run.replay.latest_output_bytes,
+            whole.len() as u64,
+            "the recovered cursor must cover every byte the reader consumed"
+        );
+        assert_eq!(
+            recovered_bytes, whole,
+            "every byte the reader consumed before the handoff must be durable; \
+             a short replay here is the exec-over-unoffered-output defect"
+        );
+        drop(reopened);
     }
 
     /// The catch-up re-sends bytes that are already durable. That must be a
