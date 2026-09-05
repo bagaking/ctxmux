@@ -16,6 +16,19 @@ const METRIC_COUNT: usize = 13;
 const MAX_FRAME_BYTES: usize = 2048;
 const SNAPSHOT_QUEUE_CAPACITY: usize = 1;
 
+/// Wire labels for the `cumulative` array, in the exact order `coherent_values`
+/// reads the counter atomics. Same contract as `Gauge::ORDERED`: the harness
+/// asserts these equal its `GC_STAT_COUNTERS`, turning a reorder into a parse
+/// failure instead of a silent relabel.
+const CUMULATIVE_NAMES: [&str; 6] = [
+    "physical_starts_total",
+    "candidate_selections_total",
+    "candidate_evaluations_total",
+    "candidate_evaluations_max",
+    "candidate_fences_total",
+    "exact_replacements_total",
+];
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Gauge {
     RetainedRuns = 0,
@@ -31,6 +44,50 @@ pub(crate) enum Gauge {
     InputDrains = 10,
     Attachments = 11,
     TmuxOwners = 12,
+}
+
+impl Gauge {
+    /// Every gauge in discriminant order. The frame emits one bare positional
+    /// value array indexed by `gauge as usize`, so the label at wire position
+    /// `i` must be the name of the variant whose discriminant is `i`. The
+    /// `gauge_order_matches_discriminants` test pins `ORDERED[i] as usize == i`,
+    /// which is what ties `gauges` on the wire to those value positions; the
+    /// harness then asserts the emitted names equal its own `GC_STAT_GAUGES`.
+    /// Reorder either side and the divergence is a hard parse failure, not a
+    /// silent relabel of every gauge.
+    const ORDERED: [Self; METRIC_COUNT] = [
+        Self::RetainedRuns,
+        Self::CreationKeys,
+        Self::CreationFlights,
+        Self::PublicationReservations,
+        Self::CollectingTickets,
+        Self::OverlapOwners,
+        Self::CleanupOwners,
+        Self::DirectChildren,
+        Self::Readers,
+        Self::Waiters,
+        Self::InputDrains,
+        Self::Attachments,
+        Self::TmuxOwners,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::RetainedRuns => "retained_runs",
+            Self::CreationKeys => "creation_keys",
+            Self::CreationFlights => "creation_flights",
+            Self::PublicationReservations => "publication_reservations",
+            Self::CollectingTickets => "collecting_tickets",
+            Self::OverlapOwners => "overlap_owners",
+            Self::CleanupOwners => "cleanup_owners",
+            Self::DirectChildren => "direct_children",
+            Self::Readers => "readers",
+            Self::Waiters => "waiters",
+            Self::InputDrains => "input_drains",
+            Self::Attachments => "attachments",
+            Self::TmuxOwners => "tmux_owners",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -262,6 +319,8 @@ fn write_snapshot(inner: &Inner, sink: &OwnedFd, sequence: u64, final_snapshot: 
         "seq": sequence,
         "final": final_snapshot,
         "dropped_total": inner.dropped_total.load(Ordering::Acquire),
+        "gauges": Gauge::ORDERED.map(Gauge::name),
+        "counters": CUMULATIVE_NAMES,
         "current": current,
         "high_water": high_water,
         "cumulative": cumulative,
@@ -345,7 +404,22 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{Gauge, Inner, MAX_FRAME_BYTES, QualificationStats, named_values};
+    use super::{
+        CUMULATIVE_NAMES, Gauge, Inner, MAX_FRAME_BYTES, QualificationStats, named_values,
+    };
+
+    #[test]
+    fn gauge_order_matches_discriminants() {
+        for (index, gauge) in Gauge::ORDERED.iter().enumerate() {
+            assert_eq!(
+                *gauge as usize, index,
+                "Gauge::ORDERED[{index}] must sit at its own discriminant so the \
+                 emitted `gauges` labels line up with the positional value array"
+            );
+        }
+        assert_eq!(Gauge::ORDERED.len(), super::METRIC_COUNT);
+        assert_eq!(CUMULATIVE_NAMES.len(), 6);
+    }
 
     #[test]
     fn transition_frames_preserve_pulses_and_restart_resets_epoch() {
@@ -478,6 +552,8 @@ mod tests {
             "seq": u64::MAX,
             "final": true,
             "dropped_total": inner.dropped_total.load(Ordering::Acquire),
+            "gauges": Gauge::ORDERED.map(Gauge::name),
+            "counters": CUMULATIVE_NAMES,
             "current": named_values(&inner.current),
             "high_water": named_values(&inner.high_water),
             "cumulative": vec![u64::MAX; 6],

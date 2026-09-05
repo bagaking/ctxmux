@@ -54,6 +54,8 @@ interface QualificationStatsFrame {
   readonly seq: number;
   readonly final: boolean;
   readonly dropped_total: number;
+  readonly gauges: readonly string[];
+  readonly counters: readonly string[];
   readonly current: readonly number[];
   readonly high_water: readonly number[];
   readonly cumulative: readonly number[];
@@ -71,6 +73,8 @@ const FRAME_FIELDS = [
   "seq",
   "final",
   "dropped_total",
+  "gauges",
+  "counters",
   "current",
   "high_water",
   "cumulative",
@@ -271,6 +275,16 @@ function validateFrame(
     "qualification stats frame fields drifted",
   );
   assert.equal(value.schema, "ctxmux.qualification-stats.v1");
+  assert.deepEqual(
+    value.gauges,
+    GC_STAT_GAUGES,
+    "qualification stats gauge labels diverged from the daemon enum order",
+  );
+  assert.deepEqual(
+    value.counters,
+    GC_STAT_COUNTERS,
+    "qualification stats counter labels diverged from the daemon order",
+  );
   assert.ok(nonNegativeSafeInteger(value.timestamp_unix_ms));
   assert.equal(typeof value.daemon_instance, "string");
   assert.equal(typeof value.final, "boolean");
