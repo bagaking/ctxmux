@@ -233,10 +233,22 @@ impl NativeSession {
     /// swept by `signal_stragglers` off the census that `wait_quiescent` takes
     /// anyway. (One that called `setsid` left the session and was never owned by
     /// either path.)
+    /// Nobody left to signal is not a failure. `ESRCH` is the portable way the
+    /// kernel says the group is gone, but on Darwin an all-zombie group answers
+    /// `EPERM` instead: a zombie keeps the group ID alive while owning no
+    /// credentials to check a signal against. Measured directly — `killpg` on a
+    /// group whose only member is a zombie leader returns `EPERM` while `kill`
+    /// on that same PID returns success. So a `stop` that raced the child's own
+    /// exit reported `Unknown` on a session it had every right to signal, which
+    /// is how `concurrent_interrupt_and_stop_have_only_owner_declared_outcomes`
+    /// failed ~60% of local runs: the Interrupt reaped the shell first.
+    ///
+    /// Neither errno tells us the session is *empty* — `members()` is the sole
+    /// authority on that, and every caller consults it after this returns.
     fn signal_members(&self, signal: Signal) -> Result<(), String> {
         self.require_waitable_anchor()?;
         match kill_process_group(self.id, signal) {
-            Ok(()) | Err(Errno::SRCH) => Ok(()),
+            Ok(()) | Err(Errno::SRCH | Errno::PERM) => Ok(()),
             Err(error) => Err(format!(
                 "failed to signal native session {} process group: {error}",
                 self.id.as_raw_pid()
@@ -585,7 +597,7 @@ fn process_ids() -> Result<Vec<u32>, String> {
 mod tests {
     #[cfg(not(target_os = "macos"))]
     use std::time::{Duration, Instant};
-    use std::{process::Command, sync::Arc};
+    use std::{os::unix::process::CommandExt, process::Command, sync::Arc};
 
     use rustix::{io::Errno, process::Pid};
 
@@ -779,6 +791,52 @@ mod tests {
 
         let _ = sentinel.kill();
         let _ = sentinel.wait();
+    }
+
+    #[test]
+    fn signalling_an_all_zombie_group_is_not_a_failure() {
+        // Darwin answers `killpg` on a group whose members are all zombies with
+        // EPERM, not ESRCH: the zombie keeps the group ID alive but owns no
+        // credentials to check the signal against. Establish that kernel
+        // behaviour first, so this test fails loudly if the premise ever
+        // changes rather than silently proving nothing.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn a child that leads its own group and exits at once");
+        let pid = child.id();
+        std::mem::forget(child);
+        let group = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        let mut session = NativeSession::from_child_pid(pid)
+            .unwrap()
+            .with_leader_probe_for_test(Arc::new(|| Ok(false)));
+
+        let mut observed = None;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            if let Err(error) =
+                rustix::process::kill_process_group(group, rustix::process::Signal::TERM)
+            {
+                observed = Some(error);
+                break;
+            }
+        }
+        let observed = observed.expect("an exited leader's group stops accepting signals");
+        assert!(
+            matches!(observed, Errno::PERM | Errno::SRCH),
+            "unexpected errno {observed:?} for an all-zombie group; \
+             signal_members only forgives PERM and SRCH"
+        );
+
+        // The real assertion: whichever of the two this platform reports, a Stop
+        // that raced the child's own exit must not surface it as a failure.
+        session
+            .signal_members(rustix::process::Signal::KILL)
+            .expect("signalling a session nobody is left to receive it is not a Stop failure");
+
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+        let _ = session.reap_leader(&mut adopted);
     }
 
     #[test]
