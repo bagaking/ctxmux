@@ -5,7 +5,10 @@ use std::{
     fmt,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex, Weak},
+    sync::{
+        Arc, Condvar, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -251,6 +254,22 @@ struct NativeControlInner {
     reap_changed: Condvar,
     input_drains: InputDrainGate,
     owner_wake: OwnerWake,
+    /// `!state.child_commands.is_empty()`, readable without taking `state`.
+    ///
+    /// The owner sweep walks every entry on every edge just to ask this one
+    /// question, and for all but the Run that caused the edge the answer is
+    /// "no". Asking `state` costs a `Mutex` per entry per pass; this field
+    /// answers from the same cache line as `run_id`, which the sweep already
+    /// touches.
+    ///
+    /// It is a faithful mirror, not a hint: every push sets it and every take
+    /// clears it, both while holding `state`, so the two can never disagree
+    /// once the lock is released. A reader outside the lock can still observe a
+    /// stale `false` for a push in flight -- harmless, because that producer
+    /// pokes `owner_wake` immediately afterwards and the pass it triggers reads
+    /// the flag afresh. That is the same staleness argument the pass-wide
+    /// `any_child_exited` gate relies on.
+    pending_child_commands: AtomicBool,
 }
 
 /// Descriptor handles detached from a closed native incarnation after the
@@ -894,6 +913,7 @@ impl NativeControlOwner {
                 reap_changed: Condvar::new(),
                 input_drains,
                 owner_wake,
+                pending_child_commands: AtomicBool::new(false),
             }),
         }
     }
@@ -1184,11 +1204,14 @@ impl NativeControlOwner {
                             ),
                         ))
                     })?;
-                state.child_commands.push_back(ChildCommand::Signal {
-                    signal,
-                    foreground_group,
-                    reply: reply_tx,
-                });
+                self.inner.push_child_command(
+                    &mut state,
+                    ChildCommand::Signal {
+                        signal,
+                        foreground_group,
+                        reply: reply_tx,
+                    },
+                );
             }
         }
         self.inner.owner_wake.wake();
@@ -1224,9 +1247,8 @@ impl NativeControlOwner {
                     format!("cannot write to stopping Run {}", self.inner.run_id),
                 ),
             );
-            state
-                .child_commands
-                .push_back(ChildCommand::CleanupUnpublished);
+            self.inner
+                .push_child_command(&mut state, ChildCommand::CleanupUnpublished);
             rejected
         };
         send_rejections(rejected);
@@ -1262,10 +1284,13 @@ impl NativeControlOwner {
                 )));
             }
             state.stop_pending = true;
-            state.child_commands.push_back(ChildCommand::Stop {
-                reply: reply_tx,
-                deadline: Instant::now() + STOP_ADMISSION_TIMEOUT,
-            });
+            self.inner.push_child_command(
+                &mut state,
+                ChildCommand::Stop {
+                    reply: reply_tx,
+                    deadline: Instant::now() + STOP_ADMISSION_TIMEOUT,
+                },
+            );
         }
         self.inner.owner_wake.wake();
         Ok(reply_rx)
@@ -1318,14 +1343,24 @@ impl NativeControlOwner {
                 &mut state,
                 &invalid_phase_error(self.inner.run_id, phase, "write to"),
             );
-            (rejected, std::mem::take(&mut state.child_commands))
+            (rejected, self.inner.take_child_commands(&mut state))
         };
         send_rejections(rejected);
         reject_child_commands(commands, "native child owner is closed");
     }
 
     pub(crate) fn drain_child_commands(&self) -> VecDeque<ChildCommand> {
-        std::mem::take(&mut mutex_lock(&self.inner.state).child_commands)
+        let mut state = mutex_lock(&self.inner.state);
+        self.inner.take_child_commands(&mut state)
+    }
+
+    /// Whether [`Self::drain_child_commands`] would return anything, without
+    /// taking the control lock.
+    ///
+    /// For the owner sweep, which asks this of every entry on every edge and
+    /// hears "no" from all but the one that caused the edge.
+    pub(crate) fn has_child_commands(&self) -> bool {
+        self.inner.pending_child_commands.load(Ordering::Acquire)
     }
 
     pub(crate) fn fence_child_commands(&self) -> VecDeque<ChildCommand> {
@@ -1341,7 +1376,7 @@ impl NativeControlOwner {
                 &mut state,
                 &invalid_phase_error(self.inner.run_id, phase, "write to"),
             );
-            (rejected, std::mem::take(&mut state.child_commands))
+            (rejected, self.inner.take_child_commands(&mut state))
         };
         send_rejections(rejected);
         commands
@@ -1376,7 +1411,7 @@ impl NativeControlOwner {
                 &mut state,
                 &ProtocolError::new(ErrorCode::BackendUnavailable, error),
             );
-            (rejected, std::mem::take(&mut state.child_commands))
+            (rejected, self.inner.take_child_commands(&mut state))
         };
         send_rejections(rejected);
         reject_child_commands(commands, "native child wait authority was lost");
@@ -1697,6 +1732,26 @@ impl NativeControlOwner {
 }
 
 impl NativeControlInner {
+    /// Queue one child command and republish the mirror, under the caller's
+    /// `state` guard.
+    ///
+    /// Every producer goes through here, and [`Self::take_child_commands`] is
+    /// the only way back out, so `pending_child_commands` cannot drift from the
+    /// queue without a visible change to one of these two functions. A bare
+    /// `state.child_commands.push_back(..)` elsewhere would strand the Run
+    /// until an unrelated edge -- a correctness bug no latency benchmark would
+    /// show -- which is why the queue is not touched directly anywhere else.
+    fn push_child_command(&self, state: &mut NativeControlState, command: ChildCommand) {
+        state.child_commands.push_back(command);
+        self.pending_child_commands.store(true, Ordering::Release);
+    }
+
+    /// Take the queue and republish the mirror, under the caller's guard.
+    fn take_child_commands(&self, state: &mut NativeControlState) -> VecDeque<ChildCommand> {
+        self.pending_child_commands.store(false, Ordering::Release);
+        std::mem::take(&mut state.child_commands)
+    }
+
     fn has_scheduled_input(&self) -> bool {
         let state = mutex_lock(&self.state);
         state.input_scheduled && !state.input_queue.is_empty()
@@ -2483,6 +2538,98 @@ mod tests {
         let (released, wake) = &**release;
         *mutex_lock(released) = true;
         wake.notify_all();
+    }
+
+    #[test]
+    fn the_child_command_mirror_tracks_the_queue_through_every_producer_and_drain() {
+        // `has_child_commands` lets the owner sweep skip an entry without taking
+        // the control lock, so a mirror that reads `false` while a command is
+        // queued strands that Run until some unrelated edge runs a pass. That is
+        // a hang, and no latency measurement would show it -- hence a test that
+        // compares the flag against the queue itself, rather than against a
+        // re-derivation of the rule the flag is supposed to implement.
+        //
+        // The flag is only ever read outside the lock, so what is asserted here
+        // is the settled value after each call returns, which is the state any
+        // sweep triggered by that call's `owner_wake` poke will observe.
+        fn queue_is_empty(owner: &NativeControlOwner) -> bool {
+            mutex_lock(&owner.inner.state).child_commands.is_empty()
+        }
+        fn assert_mirrors(owner: &NativeControlOwner, context: &str) {
+            assert_eq!(
+                owner.has_child_commands(),
+                !queue_is_empty(owner),
+                "child command mirror disagrees with the queue {context}"
+            );
+        }
+
+        // Producer 1: Stop, drained by the sweep's `drain_child_commands`.
+        let (stopping, _child) = owner(
+            Box::new(io::sink()),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        assert_mirrors(&stopping, "on a fresh control");
+        assert!(
+            !stopping.has_child_commands(),
+            "a fresh control has no commands"
+        );
+
+        let _stop = stopping.begin_stop().expect("queue a Stop command");
+        assert_mirrors(&stopping, "after begin_stop");
+        assert!(
+            stopping.has_child_commands(),
+            "a queued Stop must be visible to the sweep without the lock"
+        );
+
+        let drained = stopping.drain_child_commands();
+        assert_eq!(drained.len(), 1, "the Stop is drained exactly once");
+        assert_mirrors(&stopping, "after drain_child_commands");
+        assert!(
+            !stopping.has_child_commands(),
+            "a drained queue must stop advertising work, or every pass sweeps it"
+        );
+
+        // Producer 2: CleanupUnpublished, drained by `fence_child_commands`
+        // (the terminal-leader path), which is a different take site.
+        let (fenced, _fenced_child) = owner(
+            Box::new(io::sink()),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        fenced
+            .cleanup_unpublished()
+            .expect("queue a cleanup command");
+        assert_mirrors(&fenced, "after cleanup_unpublished");
+        assert!(fenced.has_child_commands(), "a queued cleanup is work");
+
+        assert_eq!(
+            fenced.fence_child_commands().len(),
+            1,
+            "the fence takes the queued cleanup"
+        );
+        assert_mirrors(&fenced, "after fence_child_commands");
+        assert!(!fenced.has_child_commands(), "a fenced queue is empty");
+
+        // The remaining take site rejects rather than hands back, on a control
+        // that still has a command queued -- the case where a stale `true`
+        // would keep a dead entry sweeping forever. `mark_wait_authority_lost`
+        // is the fourth take site and is not driven here: it needs a `Child`
+        // fixture this module has none of, and it reaches the queue through the
+        // same `take_child_commands` as `mark_closed`.
+        let (closed, _closed_child) = owner(
+            Box::new(io::sink()),
+            Box::new(FakePty::new(0)),
+            InputDrainGate::default(),
+        );
+        let _closed_stop = closed.begin_stop().expect("queue a Stop to be rejected");
+        assert!(closed.has_child_commands(), "the Stop is queued");
+        closed.mark_closed();
+        assert_mirrors(&closed, "after mark_closed");
+        assert!(
+            !closed.has_child_commands(),
+            "mark_closed rejects the queue, so nothing is left to advertise"
+        );
     }
 
     #[test]

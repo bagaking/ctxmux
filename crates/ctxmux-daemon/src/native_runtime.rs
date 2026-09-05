@@ -904,6 +904,31 @@ fn drive_lifecycle(
     //   mid-pass.
     let any_child_exited = NativeSession::any_child_exited();
     'entries: for entry in entries {
+        // Decide whether this entry needs the sweep at all, before paying for
+        // it. Everything below -- the enum move, the `run_id()` deref, the
+        // command-queue lock -- is spent per entry per pass, and on a fleet of
+        // N watched Runs an edge concerns one of them. The four things that can
+        // make a `Watching` entry need work are each answerable from the entry
+        // or the pass-wide gate:
+        //
+        //   1. a queued `ChildCommand`  -> the control's own mirror flag;
+        //   2. a `pending_stop` past its deadline, or
+        //   3. a `pending_stop` that can now take a permit -> read off
+        //      `watching` directly, so any Run mid-Stop always sweeps;
+        //   4. the leader turned terminal -> `sweep_can_skip`, which is the
+        //      gate plus the two cases where a gated peek still does something.
+        //
+        // Skipping is therefore never a guess about the future: a command that
+        // lands after this test also pokes `owner_wake`, which runs another
+        // pass whose flag read is fresh. That is the same argument the gate
+        // above makes for its own staleness.
+        if let Lifecycle::Watching(watching) = &entry.lifecycle
+            && watching.pending_stop.is_none()
+            && !watching.control.has_child_commands()
+            && watching.session.sweep_can_skip(any_child_exited)
+        {
+            continue;
+        }
         let lifecycle = std::mem::replace(&mut entry.lifecycle, Lifecycle::Queued);
         let mut watching = match lifecycle {
             Lifecycle::WaitingCleanup(waiting) => {
