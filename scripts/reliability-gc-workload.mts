@@ -57,7 +57,7 @@ export function gcSpec(
     args: [contract.helper.path, contract.seed, mode, String(index)],
     cwd: resolve(root),
     env: {},
-    size: contract.run_spec.size,
+    initial_size: contract.run_spec.size,
     declared_inputs: [],
   };
 }
