@@ -1,5 +1,15 @@
 # R33 — the structural theory is too small, and both research tracks missed it
 
+> **WITHDRAWN BY R34.** The microbenchmark below under-prices its own subject by
+> 10×: it models the loop body's shape but omits the call every entry makes to
+> `leader_is_terminal_gated()`. Segmenting the product binary puts
+> `drive_lifecycle` at 82.76 µs/pass, not 7.85 — **89% of the owner's CPU slope,
+> not 8.5%**. The "retires a class" claim and the closing section's instruction
+> to stop looking at per-entry work are both wrong. See
+> `r34-the-gate-left-the-stop-passes-paying-all-n.md`. What survives: the
+> relative ranking within the modelled costs (the Mutex is 62% of *that* subset)
+> and the refutation of the pollfd-rebuild argument.
+
 **Outcome: direction closed before any code was written.** One microbenchmark,
 zero product risk, killed a candidate that two independent research tracks had
 just spent their whole budget designing.
@@ -92,25 +102,31 @@ It also retires a class, not just a candidate: **per-entry work in the owner
 sweep is capped at ~0.03 ms/stop** by the 4.0-pass multiplier and the measured
 per-entry cost. No future round should propose optimizing the sweep body.
 
+> **The paragraph above is withdrawn.** The cap was computed from a model that
+> omitted the loop's syscall, and the real figure is ~0.225 ms/stop. The rule the
+> round stated — *price the mechanism before designing the fix* — is right and
+> survives; what it got wrong is that **a microbenchmark of a loop body must
+> include what the body calls**, or it prices a different function than the one
+> named. A model that is 10× low retires the correct direction under the label
+> "already excluded," which is far more costly than one that is 10× high.
+
 ## Where the slope actually is
 
-By elimination, with everything measured:
+**This section is withdrawn — see the banner at the top.** Two rows are wrong by
+an order of magnitude, and the conclusion drawn from them points the next round
+away from where the cost actually is. R34 replaces it with segment measurements
+taken in the product binary:
 
 | | cost per stop | share of ~0.363 ms |
 | --- | --- | --- |
 | `poll()` scan | 0.010 ms | 2.8% |
 | the `waitid` gate (P_ALL, scales 0.4→6.6 µs) | 0.026 ms | 7.2% |
-| **entire `drive_lifecycle` body, all entries** | **0.031 ms** | **8.5%** |
+| ~~entire `drive_lifecycle` body, all entries~~ **0.031 ms** | **0.225 ms** | **62%** |
 | pollfd vector rebuild | 0.001 ms | 0.3% |
-| **unaccounted** | **~0.295 ms** | **~81%** |
+| ~~unaccounted ~0.295 ms / ~81%~~ | — | — |
 
-Four rounds of per-pass, per-entry candidates now account for under a fifth of
-the slope. The remainder is not in the owner's per-entry work at all, and the
-next round should stop looking there. The owner thread *does* carry the CPU (the
-ns-resolution probe is unambiguous), so the question becomes what the owner does
-**once per stop** — not once per entry — that grows with the fleet.
-
-One concrete lead worth pricing first: the R32 units correction showed the
-schedstat window covered start + stop + remove, so the per-verb split of that
-+1.013 ms is still unknown. If most of it belongs to `start` or `remove` rather
-than `stop`, the whole hunt has been aimed at the wrong verb.
+The error was not in the arithmetic but in the model: the microbenchmark priced
+the enum move, the `Arc` deref and the `Mutex`, and omitted the per-Run
+`waitid` peek that every entry pays whenever the pass-wide gate is open — which
+is exactly the passes a stop causes. The `P_ALL` gate row is also understated:
+measured per pass it runs 6.65 → 20.07 µs, so it does not hold constant either.
