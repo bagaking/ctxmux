@@ -8,7 +8,7 @@ answer — is the one that loses.
 | # | Change | Measured return | Raises the ceiling? |
 |---|--------|-----------------|---------------------|
 | 1 | Coalesce replay rows before commit | ~40% of the file back | no, but the file holds ~2x |
-| 2 | Move cold replay out of SQLite | ceiling becomes the disk | **yes** |
+| 2 | Move cold replay out of SQLite | main-database ceiling no longer caps payloads | **yes, for the SQLite main file** |
 | 3 | Compress chunk payloads | 2.1x on 58% of the file | no — a constant |
 
 1 and 2 are implemented. Candidate 1 coalesces rows before commit. Candidate 2
@@ -82,8 +82,8 @@ commits, and the active generation name is part of `runtime_meta`.
 
 What it buys:
 
-- the ceiling stops being a constant — retention becomes a disk-space policy,
-  not a `max_page_count`;
+- the SQLite main-database ceiling stops bounding payloads; logical replay and
+  aggregate state-directory limits remain explicit retention policy;
 - the 161.8 MiB of headers and indexes largely disappears;
 - a cold file compresses as a whole (4.3x measured, below) instead of per
   82-byte chunk (2.1x);
@@ -97,13 +97,14 @@ That last point is not a side benefit. It removes the failure mode that
 `c168c0a` currently has to work around from inside the allocation path.
 
 The consistency rule stays small: a failed transaction truncates its writer
-tail; startup truncates any unreferenced tail, removes orphan generations, and
-fails closed when a referenced segment is missing or short. Once a generation
-exceeds twice the logical replay budget, compaction writes a new generation,
-syncs it, switches all offsets in one SQLite transaction, and unlinks the old
-generation. No schema migration is provided; schema 5 is the only accepted
-format and earlier stores are rejected, so a pre-stable store must be
-recreated.
+tail; an outer commit with an unknown outcome preserves a harmless tail for
+startup resolution; startup truncates any unreferenced tail, removes orphan
+generations, and fails closed when a referenced segment is missing, short, or
+overlapping. Once a generation exceeds twice the logical replay budget,
+compaction writes a new generation, syncs its bytes and directory entry,
+switches all offsets in one SQLite transaction, and unlinks the old generation.
+No schema migration is provided; schema 5 is the only accepted format and
+earlier stores are rejected, so a pre-stable store must be recreated.
 
 ## 3 — Compression, and why it ranks last
 

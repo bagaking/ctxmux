@@ -86,7 +86,7 @@ bootstrap epoch immediately so an interrupted first open remains structurally
 reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
-application and operational invariants are revalidated. Protocol generation 14
+application and operational invariants are revalidated. Protocol generation 17
 and persistence schema 5 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed
@@ -116,9 +116,10 @@ or torn WAL recovery therefore yields the previous or next complete unit, never
 a lifecycle/cursor/chunk hybrid. A start or fork that cannot reserve one new
 record within the immutable record and metadata budgets rejects only that
 unpublished Run; because no row was written, the actor continues serving
-existing Runs and later admissible starts. A typed SQLite `DiskFull` from an
-output append or terminal finalize is the one retryable storage condition: the
-single actor keeps that exact unit at the head of its ordered work, waits 50 ms,
+existing Runs and later admissible starts. A typed SQLite `DiskFull`, write-side
+SQLite I/O pressure, or external `StorageFull` from an output append or terminal
+finalize is the retryable storage condition: the single actor keeps that exact
+unit at the head of its ordered work, waits 50 ms,
 and tries again. Its bounded queue then backpressures the PTY reader and child
 rather than admitting an unbounded in-memory durability gap. Daemon shutdown
 cancels the wait. The actor does not retry generic I/O, corruption, replay
@@ -149,13 +150,15 @@ Replay storage is external to SQLite. `replay_chunks` stores only `run_id`,
 byte ranges, generation name, file offset, and byte length; it has no inline
 payload fallback. The active generation is owner-only `0600` and named only by
 a validated basename. Appends are sequential and synced before the SQLite
-transaction commits. A failed transaction drops its unreferenced tail; an
-outer commit failure can leave harmless tail bytes that startup normalization
-truncates before the store becomes observable. When a generation exceeds twice
+transaction commits; generation directory entries are synced before a new
+generation name is published. A transaction that fails before its append is
+committed truncates its tail; an outer commit with an unknown outcome preserves
+the harmless tail so startup normalization can resolve the durable index and
+truncate it before the store becomes observable. When a generation exceeds twice
 the 256 MiB logical replay budget, compaction writes every retained segment to
 a new generation, fsyncs it, switches all offsets and `runtime_meta.replay_file`
-atomically, then unlinks the old generation. A missing, shortened, symlinked,
-or unreadable referenced segment fails startup closed.
+atomically, then unlinks the old generation. A missing, shortened, overlapping,
+symlinked, or unreadable referenced segment fails startup closed.
 
 Physical page pressure is an independent retention boundary. Before startup
 normalization or an allocating persistent mutation, the owner must reclaim
@@ -265,7 +268,10 @@ and state paths still do not provide discovery or activation policy.
 ## Wrong-case corpus
 
 - `PERSIST-01` (`i01`, `i02`): a persisted numeric PID can refer to an unrelated live process after restart. Ambiguous identity must become a non-recoverable typed state, never guessed adoption.
-- `PERSIST-02` (`i03`): interruption between state writes, flushes, rename, and directory durability can expose a parseable mixed generation. Recovery must select one validated generation or report corruption.
+- `PERSIST-02` (`i03`): interruption between payload sync, directory durability,
+  SQLite generation switch, and old-generation cleanup can expose a parseable
+  mixed generation. Recovery must select one validated generation or report
+  corruption.
 
 Linux pidfds demonstrate stable identity within one boot but are neither portable nor durable across restart. SQLite demonstrates the failure class and explicit storage assumptions; it does not mandate SQLite as the implementation.
 
@@ -287,11 +293,14 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - Active / `PERSIST-01`: a stored running row naming an unrelated live PID is
   reconciled to interrupted; the unrelated process and old orphan are neither
   opened nor signalled.
-- Active / `PERSIST-02`: a parseable cursor/chunk mixed generation returns a
-  typed startup corruption failure before socket publication or partial Run
-  exposure; SQLite transactions own old-or-new commit recovery.
-- Active: deterministic actor faults translate SQLite `DiskFull`, retry the
-  same append/finalize before later mutation, and stop waiting on shutdown;
+- Active / `PERSIST-02`: append rollback tails, orphan generations, and a
+  parseable cursor/chunk mixed generation are normalized or return a typed
+  startup corruption failure before socket publication or partial Run exposure;
+  SQLite transactions plus the synced generation directory own old-or-new
+  commit recovery.
+- Active: deterministic actor faults translate SQLite `DiskFull`, write-side
+  I/O pressure, or external `StorageFull`, retry the same append/finalize before
+  later mutation, and stop waiting on shutdown;
   the replay-conflict fixture still latches the actor.
 - Active: the 4 MiB per-Run replay boundary, state lock, exact schema version,
   owner-only directory/sidecar modes, and symlink rejection are executable.

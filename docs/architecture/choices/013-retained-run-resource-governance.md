@@ -58,8 +58,9 @@ closed exactly once and the reactor can stop reading a Run without racing the
 control owner's close; the compaction step below sheds the master and writer at
 end of life. The daemon-wide owner uses one 8 KiB stack buffer for each
 sequential ready read, not one permanent buffer or thread per Run. Persistent
-mode uses the same live bound while its 256 MiB durable SQLite
-logical replay limit remains independently authoritative.
+mode uses the same live bound while its 256 MiB durable replay limit remains
+independently authoritative; replay payloads live in generation files and
+SQLite stores only their window index.
 
 A retained Run always owns its replay and lifecycle truth, but it does not
 retain an empty live-event ring for a viewer that does not exist. The existing
@@ -482,7 +483,7 @@ WAL-frame fixture before the dependency can change.
 This implementation supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
 replacement. Decision 009 remains authoritative for schema-5 validation up to
-the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
+the pre-stable 4,096-row format envelope, the 64 MiB metadata and 256 MiB durable replay
 limits, file ceilings, recovery class, and SQLite durability assumptions.
 
 ### Client-requested removal
