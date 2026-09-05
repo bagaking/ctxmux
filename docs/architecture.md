@@ -656,4 +656,6 @@ Each decision record contains a `Wrong-case corpus（错题集）` section and a
 
 The formal docs deliberately do not depend on the local research corpus that seeded these cases; that working material stays a developer-local aid. The retained cases and their dispositions live in tracked sources instead: `fixtures/wrong-cases.json` carries the machine-readable trace with external `source_refs`, and each decision record restates its cases inline. The point is to keep a checkable disposition for every failure mode rather than an untraceable list of web folklore.
 
+The same discipline covers this repo's own measured performance/correctness rounds: the [`rNN-*` writeups](architecture/measured-rounds.md) are indexed with each round's one-line conclusion, disposition, whether its lesson has an executable guard, and — for rolled-back or refuted paths — a "do not retry" marker.
+
 The governing rule is compact: terminals are views, Runs are durable, and every stronger claim needs public-behavior evidence.
