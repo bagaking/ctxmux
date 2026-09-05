@@ -33,6 +33,10 @@ use crate::{
 
 const REGISTRATION_CAPACITY: usize = 8;
 const CLEANUP_MAX_ACTIVE: usize = 8;
+// Persistence finalization is serialized by the persistence actor. Keep a
+// separate bounded handoff budget so blocked publication cannot consume native
+// cleanup admission; the two limits describe different resources.
+const FINALIZE_MAX_ACTIVE: usize = CLEANUP_MAX_ACTIVE;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 
@@ -637,7 +641,6 @@ struct PendingStopAdmission {
 struct PendingTerminal {
     state: RunState,
     deadline: Instant,
-    permit: CleanupPermit,
 }
 
 enum CleanupKind {
@@ -653,7 +656,7 @@ struct CleanupJob {
     watching: Watching,
     kind: CleanupKind,
     after_wait: Option<AfterWait>,
-    permit: CleanupPermit,
+    _permit: CleanupPermit,
 }
 
 struct WaitingCleanup {
@@ -672,7 +675,6 @@ struct FinalizeJob {
     run: Arc<Run>,
     state: RunState,
     wait_failure: NativeWaitFailure,
-    _permit: CleanupPermit,
 }
 
 struct CleanupCompletion {
@@ -689,7 +691,6 @@ enum WorkerOutcome {
 enum CleanupOutcome {
     Terminal {
         state: RunState,
-        permit: CleanupPermit,
     },
     Resume {
         watching: Watching,
@@ -722,6 +723,8 @@ fn owner_main(
     let mut entries = Vec::<NativeEntry>::new();
     let mut queued = VecDeque::<WorkerJob>::new();
     let mut active = HashMap::<u64, thread::JoinHandle<()>>::new();
+    let mut active_cleanups = 0_usize;
+    let mut active_finalizers = 0_usize;
     let mut next_job_id = 0_u64;
     // Start "woken" so the first iteration drains the registrations that raced
     // the thread's startup. Thereafter a pass runs only on a real edge: the wake
@@ -738,11 +741,23 @@ fn owner_main(
         if owner_woken {
             if drain_commands(commands, &mut entries, diagnostics) {
                 detach_active_workers(&mut active);
-                drain_completions(&completion_rx, &mut entries, &mut active);
+                drain_completions(
+                    &completion_rx,
+                    &mut entries,
+                    &mut active,
+                    &mut active_cleanups,
+                    &mut active_finalizers,
+                );
                 preserve_shutdown_authority(&mut entries, &mut queued);
                 return;
             }
-            drain_completions(&completion_rx, &mut entries, &mut active);
+            drain_completions(
+                &completion_rx,
+                &mut entries,
+                &mut active,
+                &mut active_cleanups,
+                &mut active_finalizers,
+            );
             // Peek every watched leader on each edge. SIGCHLD is process-wide and
             // carries no pid we consult, so an exit signal means only "some
             // watched child may now be terminal" — hence the whole set is
@@ -758,6 +773,8 @@ fn owner_main(
         start_worker_jobs(
             &mut queued,
             &mut active,
+            &mut active_cleanups,
+            &mut active_finalizers,
             &completion_tx,
             wake,
             diagnostics,
@@ -768,6 +785,8 @@ fn owner_main(
         start_worker_jobs(
             &mut queued,
             &mut active,
+            &mut active_cleanups,
+            &mut active_finalizers,
             &completion_tx,
             wake,
             diagnostics,
@@ -916,7 +935,7 @@ fn drive_lifecycle(
                     watching: waiting.watching,
                     kind: waiting.kind,
                     after_wait: waiting.after_wait,
-                    permit,
+                    _permit: permit,
                 }));
                 continue;
             }
@@ -969,7 +988,7 @@ fn drive_lifecycle(
                 watching,
                 kind,
                 after_wait: entry.after_wait.take(),
-                permit,
+                _permit: permit,
             }));
             continue;
         }
@@ -1005,7 +1024,7 @@ fn drive_lifecycle(
                         watching,
                         kind: CleanupKind::Stop(pending.reply),
                         after_wait: entry.after_wait.take(),
-                        permit,
+                        _permit: permit,
                     }));
                     continue;
                 }
@@ -1055,7 +1074,7 @@ fn drive_lifecycle(
                     watching,
                     kind: CleanupKind::Natural { stop },
                     after_wait: entry.after_wait.take(),
-                    permit,
+                    _permit: permit,
                 }));
             }
             Err(error) => {
@@ -1070,19 +1089,25 @@ fn drive_lifecycle(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_worker_jobs(
     queued: &mut VecDeque<WorkerJob>,
     active: &mut HashMap<u64, thread::JoinHandle<()>>,
+    active_cleanups: &mut usize,
+    active_finalizers: &mut usize,
     completion_tx: &mpsc::Sender<CleanupCompletion>,
     wake: &OwnerWake,
     diagnostics: &OwnerDiagnostics,
     entries: &mut [NativeEntry],
     next_job_id: &mut u64,
 ) {
-    while active.len() < CLEANUP_MAX_ACTIVE {
-        let Some(job) = queued.pop_front() else {
-            return;
-        };
+    while let Some(index) = queued.iter().position(|job| match job {
+        WorkerJob::Cleanup(_) => *active_cleanups < CLEANUP_MAX_ACTIVE,
+        WorkerJob::Finalize(_) => *active_finalizers < FINALIZE_MAX_ACTIVE,
+    }) {
+        let job = queued
+            .remove(index)
+            .expect("eligible native worker job remains queued");
         *next_job_id = next_job_id.checked_add(1).expect("cleanup job id overflow");
         let job_id = *next_job_id;
         let run_id = match &job {
@@ -1131,6 +1156,11 @@ fn start_worker_jobs(
             Ok(handle) => {
                 let previous = active.insert(job_id, handle);
                 debug_assert!(previous.is_none());
+                match &worker_lifecycle {
+                    Lifecycle::Cleaning => *active_cleanups += 1,
+                    Lifecycle::Finalizing => *active_finalizers += 1,
+                    _ => unreachable!("native worker job has a lifecycle owner"),
+                }
                 set_lifecycle(entries, run_id, worker_lifecycle);
             }
             Err(error) => {
@@ -1192,7 +1222,6 @@ fn execute_cleanup(mut job: CleanupJob) -> CleanupOutcome {
             }
             CleanupOutcome::Terminal {
                 state: exit_state(&status),
-                permit: job.permit,
             }
         }
         Err(error) => match job.kind {
@@ -1255,10 +1284,24 @@ fn drain_completions(
     completions: &mpsc::Receiver<CleanupCompletion>,
     entries: &mut [NativeEntry],
     active: &mut HashMap<u64, thread::JoinHandle<()>>,
+    active_cleanups: &mut usize,
+    active_finalizers: &mut usize,
 ) {
     while let Ok(completion) = completions.try_recv() {
         if let Some(worker) = active.remove(&completion.job_id) {
             let _ = worker.join();
+        }
+        match &completion.outcome {
+            WorkerOutcome::Cleanup(_) => {
+                *active_cleanups = active_cleanups
+                    .checked_sub(1)
+                    .expect("native cleanup worker count cannot underflow");
+            }
+            WorkerOutcome::Finalized => {
+                *active_finalizers = active_finalizers
+                    .checked_sub(1)
+                    .expect("native finalizer worker count cannot underflow");
+            }
         }
         match completion.outcome {
             WorkerOutcome::Cleanup(outcome) => {
@@ -1276,12 +1319,11 @@ fn apply_cleanup_outcome(entries: &mut [NativeEntry], run_id: RunId, outcome: Cl
         return;
     };
     match outcome {
-        CleanupOutcome::Terminal { state, permit } => {
+        CleanupOutcome::Terminal { state } => {
             entry.lifecycle = Lifecycle::Done;
             entry.terminal = Some(PendingTerminal {
                 state,
                 deadline: Instant::now() + OUTPUT_DRAIN_TIMEOUT,
-                permit,
             });
         }
         CleanupOutcome::Resume {
@@ -1325,7 +1367,6 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
                 run,
                 state: terminal.state,
                 wait_failure: entry.wait_failure.clone(),
-                _permit: terminal.permit,
             }));
             entry.lifecycle = Lifecycle::Queued;
         }

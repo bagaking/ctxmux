@@ -24,9 +24,11 @@ Readiness therefore precedes every read under one unique owner.
 
 Stop and direct-exit descendant cleanup may block. The native owner hands those
 jobs FIFO to at most eight transient cleanup threads, which return the reap or
-fail-stop result before terminal publication. Unique Run creation separately
-uses a maximum of eight admitted short-lived threads. Neither bound grows with
-the number of ordinary live Runs.
+fail-stop result before terminal publication. Completion releases cleanup
+admission; terminal publication then uses its own bounded finalizer budget,
+independent of cleanup admission. Unique Run creation separately uses a maximum
+of eight admitted short-lived threads. Neither bound grows with the number of
+ordinary live Runs.
 
 The protocol is the stable client boundary. Rust ABI, N-API, and editor-process lifetime are not product boundaries.
 
@@ -57,7 +59,9 @@ ownership-safe exact replacement. Optional persistence recovers declared
 historical metadata and replay, but not live PTY authority. One daemon-wide
 owner thread is part of the fresh-daemon fixed census, so adding ordinary live
 Runs does not change the thread count; blocking cleanup can temporarily add at
-most eight bounded workers. A stalled cleanup can retain one of those slots.
+most eight bounded cleanup workers plus a separate bounded finalizer budget. A
+stalled cleanup can retain one cleanup slot, while durable finalization cannot
+consume another cleanup slot.
 Creation admission independently limits concurrent launches to eight,
 while its bounded shutdown drain cannot hard-cancel a launch thread that
 exceeds the deadline. Native-owner shutdown is itself bounded: the owner loop

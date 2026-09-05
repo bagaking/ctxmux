@@ -135,8 +135,14 @@ is claimed as flat, not as a win.
 **It does not make publication faster.** It makes the system stop lying about it.
 A 0.3-0.5 s stop under a loud fleet is still slow, and journald's other half —
 batching the fsync off the hot path, delivering durability as a completion ordered
-after the drained queue rather than as a caller blocking in FIFO — remains the real
-fix. That is a separate round with a separate gate.
+after the drained queue rather than as a caller blocking in FIFO — remains a
+separate performance change with a separate gate.
+
+The subsequent cleanup-isolation fix removes the shared-worker coupling:
+completed child cleanup releases its admission slot, and an independent bounded
+finalizer budget owns terminal publication. A stalled durable commit cannot
+consume the eight cleanup slots. Visible terminal state still waits for its
+durable commit.
 
 Both numbers here are chosen, not derived: 10 s is a backstop far past the measured
 0.3-3.6 s publication, and 64 is where R21 measured the convoy growth vanish. They

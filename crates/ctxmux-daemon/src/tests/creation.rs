@@ -1359,6 +1359,71 @@ async fn remove_waits_for_the_publication_a_reaped_run_is_owed() {
         .expect("remove accepts the published Run");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_durable_publication_does_not_consume_cleanup_admission() {
+    let temp = tempfile::tempdir().expect("create stalled-publication fixture");
+    let (persistence, recovered) =
+        Persistence::open(temp.path().join("state")).expect("open persistence");
+    let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+    let server = InProcessServer::start(Arc::clone(&manager));
+    let mut runs = Vec::new();
+    for _ in 0..16 {
+        runs.push(
+            server
+                .client
+                .start(long_running_spec())
+                .await
+                .expect("start Run"),
+        );
+    }
+    let (reached, release) = persistence.pause_next_finalize();
+    for (index, run) in runs.iter().enumerate() {
+        server
+            .client
+            .stop_once(run.id)
+            .await
+            .expect("reaped children must release cleanup admission while publication is stalled");
+        assert!(manager.get(run.id).unwrap().child_reaped());
+        assert!(
+            server
+                .client
+                .status(run.id)
+                .await
+                .unwrap()
+                .state
+                .is_running()
+        );
+        if index == 0 {
+            reached
+                .recv_timeout(Duration::from_secs(5))
+                .expect("finalize is stalled");
+        }
+    }
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for run in &runs {
+            while server
+                .client
+                .status(run.id)
+                .await
+                .unwrap()
+                .state
+                .is_running()
+            {
+                tokio::task::yield_now().await;
+            }
+            server
+                .client
+                .remove(run.id)
+                .await
+                .expect("remove finalized Run");
+        }
+    })
+    .await
+    .expect("all terminal publications converge after storage resumes");
+    assert!(!persistence.is_failed());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
     let temp = tempfile::tempdir().expect("create finalize shutdown fixture");

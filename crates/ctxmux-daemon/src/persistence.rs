@@ -3982,6 +3982,17 @@ impl StateStore {
         let mut transaction_payload = 0_usize;
         let mut expected_heads = HashMap::new();
         for (id, replay, durable_head) in batch {
+            // Finalize carries the final replay, so lifecycle removal can
+            // overtake old appends. A deleted Run owns no further output;
+            // discard its queued append without poisoning unrelated Runs.
+            let exists = self
+                .connection
+                .prepare_cached("SELECT 1 FROM runs WHERE id = ?1")
+                .and_then(|mut statement| statement.exists([id.to_string()]))
+                .map_err(PersistenceError::database)?;
+            if !exists {
+                continue;
+            }
             let groups = split_chunks(&replay.chunks)?;
             if groups.is_empty() {
                 // A chunkless replay still has an UPDATE to make -- its
