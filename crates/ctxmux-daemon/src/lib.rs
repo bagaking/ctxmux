@@ -85,7 +85,9 @@ use crate::native_control::{
     ControlResult, DetachedNativeDescriptors, HandoffInputState, InputDrainGate,
     NativeControlOwner, PendingInput, PendingSignal, PendingStop, to_pty_size,
 };
-use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
+use crate::native_runtime::{
+    LiveDescriptors, NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration,
+};
 use crate::native_session::{AdoptedChild, NativeSession};
 use crate::persistence::{
     CommittedStart, HandoffHint, Persistence, PersistentCandidate, PersistentRun,
@@ -750,6 +752,44 @@ fn prepare_exec_upgrade(
     Ok((handoff_file, exe))
 }
 
+/// Settle every extracted Run's unoffered output debt, so the durable barrier
+/// that follows fences every byte READ rather than merely every byte OFFERED.
+///
+/// Fail-stop on a Run that is no longer registered rather than skipping it. A
+/// Run whose descriptors were just extracted is by construction still
+/// registered and `Retained` — `extract_live_descriptors` validates every entry
+/// as `Watching` and refuses the whole attempt when one is crossing terminal
+/// cleanup. So `None` here is a broken invariant, and skipping it would exec
+/// over exactly the bytes this pass exists to save: the same silent-skip shape
+/// as the defect it fixes.
+fn offer_outstanding_output_before_barrier(
+    manager: &RunManager,
+    live: &[LiveDescriptors],
+) -> Result<(), UpgradeAbort> {
+    for run_id in live.iter().map(|descriptors| descriptors.run_id) {
+        let run = manager
+            .registry
+            .pin(run_id)
+            .map_err(|error| error.message.clone())
+            .and_then(|run| {
+                run.ok_or_else(|| {
+                    "it is no longer registered, though extract accepted it as live".to_owned()
+                })
+            })
+            .map_err(|reason| {
+                UpgradeAbort::AfterExtract(ServerError::Shutdown {
+                    failures: format!(
+                        "Run {run_id} cannot offer its outstanding output before the handoff \
+                         barrier: {reason}"
+                    ),
+                })
+            })?;
+        run.offer_outstanding_output_for_handoff()
+            .map_err(|failures| UpgradeAbort::AfterExtract(ServerError::Shutdown { failures }))?;
+    }
+    Ok(())
+}
+
 fn perform_exec_upgrade(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
@@ -799,21 +839,7 @@ fn perform_exec_upgrade(
     // re-offer those bytes — and extract just removed every next push. So each
     // Run settles its debt first, blocking; then the barrier's guarantee is the
     // one this comment claims.
-    for run_id in live.iter().map(|descriptors| descriptors.run_id) {
-        let Some(run) = manager.registry.pin(run_id).map_err(|error| {
-            UpgradeAbort::AfterExtract(ServerError::Shutdown {
-                failures: format!(
-                    "Run {run_id} could not be pinned for its handoff offer: {}",
-                    error.message
-                ),
-            })
-        })?
-        else {
-            continue;
-        };
-        run.offer_outstanding_output_for_handoff()
-            .map_err(|failures| UpgradeAbort::AfterExtract(ServerError::Shutdown { failures }))?;
-    }
+    offer_outstanding_output_before_barrier(manager, &live)?;
     manager
         .persistence_barrier()
         .map_err(UpgradeAbort::AfterExtract)?;
