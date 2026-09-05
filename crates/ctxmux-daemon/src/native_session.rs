@@ -884,7 +884,7 @@ fn process_ids() -> Result<Vec<u32>, String> {
 mod tests {
     #[cfg(not(target_os = "macos"))]
     use std::time::{Duration, Instant};
-    use std::{os::unix::process::CommandExt, process::Command, sync::Arc};
+    use std::{process::Command, sync::Arc};
 
     use rustix::{io::Errno, process::Pid};
 
@@ -1236,48 +1236,105 @@ mod tests {
 
     #[test]
     fn signalling_an_all_zombie_group_is_not_a_failure() {
-        // Darwin answers `killpg` on a group whose members are all zombies with
-        // EPERM, not ESRCH: the zombie keeps the group ID alive but owns no
-        // credentials to check the signal against. Establish that kernel
-        // behaviour first, so this test fails loudly if the premise ever
-        // changes rather than silently proving nothing.
-        let child = Command::new("/bin/sh")
-            .args(["-c", "exit 0"])
-            .process_group(0)
-            .spawn()
-            .expect("spawn a child that leads its own group and exits at once");
-        let pid = child.id();
-        std::mem::forget(child);
-        let group = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
-        let mut session = NativeSession::from_child_pid(pid)
-            .unwrap()
-            .with_leader_probe_for_test(Arc::new(|| Ok(false)));
+        use std::io::{Read, Write};
 
-        let mut observed = None;
-        for _ in 0..200 {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            if let Err(error) =
-                rustix::process::kill_process_group(group, rustix::process::Signal::TERM)
-            {
-                observed = Some(error);
-                break;
-            }
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+        // A real PTY child has the same session/group ownership as a Run.
+        // Keep its waitable status anchored: another session may not consume it
+        // merely to make a zombie process group disappear.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open the zombie fixture's real PTY");
+        let mut command = CommandBuilder::new(ctxmux_test_support::fixture_executable());
+        command.arg("--pty-exit-after-release");
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .expect("spawn a real session leader that exits after PTY release");
+        let pid = child.process_id().expect("PTY child has a PID");
+        let group = Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+        let session = NativeSession::from_child_pid(pid).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .expect("clone fixture reader");
+        let mut writer = pair.master.take_writer().expect("take release writer");
+        drop(pair.slave);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let ready_reader = std::thread::spawn(move || {
+            let mut ready = [0];
+            let _ = ready_tx.send(reader.read_exact(&mut ready).map(|()| ready[0]));
+        });
+        // Output proves exec and terminal setup finished before input; an
+        // earlier write can be flushed by the child's terminal initialization.
+        let ready =
+            ready_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
+        if !matches!(ready, Ok(Ok(b'R'))) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = ready_reader.join();
+            panic!("fixture did not publish readiness: {ready:?}");
         }
-        let observed = observed.expect("an exited leader's group stops accepting signals");
+        ready_reader.join().expect("readiness reader completed");
+        assert_eq!(super::candidate_session_id(group).unwrap(), Some(group));
+        writer
+            .write_all(b"ready\n")
+            .expect("release the proven leader");
+        // Preserve the original 200 * 5 ms observation window across readiness
+        // and exit. WNOWAIT proves death without consuming the exit status.
+        while !session.leader_is_terminal().expect("leader stays waitable") {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("owned PTY leader did not exit within the fixture window");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Darwin's getsid reports ESRCH after exit even while waitid retains
+        // the status. Session identity was proven before releasing the child.
+        #[cfg(target_os = "linux")]
+        assert_eq!(super::candidate_session_id(group).unwrap(), Some(group));
+        #[cfg(target_os = "macos")]
+        assert_eq!(super::candidate_session_id(group), Err(Errno::SRCH));
+
+        // Linux accepts a signal to an unreaped zombie group; Darwin reports
+        // PERM/SRCH. Both are supported outcomes, not emptiness or reap proof.
+        let observed = rustix::process::kill_process_group(group, rustix::process::Signal::TERM);
+        #[cfg(target_os = "linux")]
+        assert!(observed.is_ok(), "Linux zombie group signal: {observed:?}");
+        #[cfg(target_os = "macos")]
         assert!(
-            matches!(observed, Errno::PERM | Errno::SRCH),
-            "unexpected errno {observed:?} for an all-zombie group; \
-             signal_members only forgives PERM and SRCH"
+            matches!(observed, Err(Errno::PERM | Errno::SRCH)),
+            "Darwin zombie group signal: {observed:?}"
+        );
+        assert!(
+            session.leader_is_terminal().unwrap(),
+            "signal did not consume status"
         );
 
-        // The real assertion: whichever of the two this platform reports, a Stop
-        // that raced the child's own exit must not surface it as a failure.
+        // Exercise signal-after-exit with the real, still-waitable leader.
+        // A forced false probe would also deny the following actual reap and
+        // would turn the fixture into a characterization of its own hook.
+        let mut session = session;
         session
             .signal_members(rustix::process::Signal::KILL)
-            .expect("signalling a session nobody is left to receive it is not a Stop failure");
-
-        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
-        let _ = session.reap_leader(&mut adopted);
+            .expect("an exited owned group is not a Stop failure");
+        assert_eq!(
+            session
+                .reap_leader(child.as_mut())
+                .expect("exact owner reaps")
+                .exit_code(),
+            0,
+            "signals to a zombie must preserve its natural exit status"
+        );
+        assert!(session.leader_reaped);
     }
 
     #[test]

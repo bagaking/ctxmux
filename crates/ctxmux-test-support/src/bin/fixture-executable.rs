@@ -19,6 +19,25 @@ fn main() {
         }
         process::exit(99);
     }
+    if args.len() == 1 && args[0] == "--pty-exit-after-release" {
+        use std::io::{BufRead, Write};
+
+        // A real exec/read/write boundary for the waitable-zombie fixture.
+        // Publish readiness only after terminal setup; the parent then releases
+        // this owned process without a shell/interpreter loading dependency.
+        let mut output = std::io::stdout().lock();
+        output.write_all(b"R").expect("publish PTY readiness");
+        output.flush().expect("flush PTY readiness");
+        let mut release = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut release)
+            .expect("read PTY release");
+        if release != "ready\n" {
+            process::exit(99);
+        }
+        return;
+    }
     if args.len() == 1
         && args[0] == "--version"
         && let Ok(schema) = env::var("CTXMUX_FIXTURE_HANDOFF_SCHEMA")
