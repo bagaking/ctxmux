@@ -139,8 +139,8 @@ signal against, so the permission check fails before the "does it exist" check.
 returned `Io`/`Unknown` for a session it had every right to signal.
 
 This surfaced as `concurrent_interrupt_and_stop_have_only_owner_declared_outcomes`
-failing ~60% of local runs (5/8 measured, both before and after R29's commits, so
-it is this change's and not R29's): the concurrent Interrupt kills the shell, and
+failing ~60% of local runs (5/8 measured, both before and after R36's commits, so
+it is this change's and not R36's): the concurrent Interrupt kills the shell, and
 Stop's `killpg` then lands on an all-zombie group. Fixed by forgiving `EPERM`
 alongside `ESRCH` in `signal_members` — neither errno claims the session is
 _empty_, which `members()` alone decides and every caller still consults.

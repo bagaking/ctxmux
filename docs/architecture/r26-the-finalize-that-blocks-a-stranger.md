@@ -1,7 +1,7 @@
 # One Run's durable finalize blocks another Run's Stop receipt
 
 **Status: FIXED in
-[`r29-the-stop-that-did-not-need-the-actor`](r29-the-stop-that-did-not-need-the-actor.md).**
+[`r36-the-stop-that-did-not-need-the-actor`](r36-the-stop-that-did-not-need-the-actor.md).**
 Found while clearing red tests before round 26, and filed here because the round
 that fixes it needs the evidence, and because the fixture that catches it had
 been red for three rounds while I called those rounds green.
@@ -129,7 +129,7 @@ was chosen deliberately, and `publish_terminal_state`'s own comment says the
 ordering is defence in depth. Reversing it needs its own round and its own
 crash-consistency argument, not a patch appended to this one.
 
-**R29 update:** that direction was never needed. The Stop path did not require
+**R36 update:** that direction was never needed. The Stop path did not require
 terminal visibility — the wait it performed was R22's, added for `remove`'s
 benefit, and `docs/protocol.md` explicitly permits the receipt to precede
 publication. Moving the wait to `remove` closed the defect with the
@@ -142,4 +142,4 @@ unexplored and still needs its own crash-consistency round.
 one failure is this defect. Any future claim that the suite is green must say
 so explicitly.
 
-**R29 update:** now **250 passed, 0 failed**. The asterisk is retired.
+**R36 update:** now **250 passed, 0 failed**. The asterisk is retired.

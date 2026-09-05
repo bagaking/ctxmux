@@ -17,14 +17,14 @@ round.
 
 Each row is a measurement on cn3, and each one permanently removes a candidate.
 
-| Candidate | Verdict | Evidence |
-| --- | --- | --- |
-| `poll()` per pass | dead | +0.0026 ms/pass × 4 passes = 0.010 ms, 2.8% |
-| every per-pass full-fleet walk | bounded | **4.0 owner passes per stop at both 24 and 256** — a flat multiplier, so no per-pass walk can be large |
-| the linear `find` in `apply_cleanup_outcome`/`set_lifecycle` | dead | sub-microsecond over 256 small structs |
-| waiting (a lock or handoff) | dead | the slope is CPU, not wall-minus-CPU |
-| `waitid` call count | dead | counts scale 9.4× (fleet 10.7×), but `waitid(P_PID)` is **flat at 0.2–0.3 µs**, so +233 calls = **0.066 ms**, not 0.93 ms |
-| **`native_control.rs:646`, 18.6% of owner samples** | **dead — this round's change** | removing it moved owner CPU by −0.014 ms (4/6 pairs) and wall by −0.012 ms: noise on both |
+| Candidate                                                    | Verdict                        | Evidence                                                                                                                  |
+| ------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `poll()` per pass                                            | dead                           | +0.0026 ms/pass × 4 passes = 0.010 ms, 2.8%                                                                               |
+| every per-pass full-fleet walk                               | bounded                        | **4.0 owner passes per stop at both 24 and 256** — a flat multiplier, so no per-pass walk can be large                    |
+| the linear `find` in `apply_cleanup_outcome`/`set_lifecycle` | dead                           | sub-microsecond over 256 small structs                                                                                    |
+| waiting (a lock or handoff)                                  | dead                           | the slope is CPU, not wall-minus-CPU                                                                                      |
+| `waitid` call count                                          | dead                           | counts scale 9.4× (fleet 10.7×), but `waitid(P_PID)` is **flat at 0.2–0.3 µs**, so +233 calls = **0.066 ms**, not 0.93 ms |
+| **`native_control.rs:646`, 18.6% of owner samples**          | **dead — this round's change** | removing it moved owner CPU by −0.014 ms (4/6 pairs) and wall by −0.012 ms: noise on both                                 |
 
 Also established, and useful beyond this round: the owner thread carries the
 whole slope — `ctxmux-native-o` goes **0.234 → 1.247 ms on-CPU per measured
@@ -56,7 +56,7 @@ the same value (seeded from that very call in `into_entry`, and neither field is
 ever reassigned), so the fix was one line reading warm memory instead of cold.
 
 It did nothing. The F5 gate returned flat on all 12 cells; the ns-resolution
-owner-CPU probe, which *can* resolve a 0.1 ms effect, returned −0.014 ms with
+owner-CPU probe, which _can_ resolve a 0.1 ms effect, returned −0.014 ms with
 4/6 pairs — noise.
 
 The reason is visible once symbol and srcline are printed **together**:
@@ -68,7 +68,7 @@ The reason is visible once symbol and srcline are printed **together**:
 The samples are attributed to the symbol `owner_main` — line 646 is an **inlined
 frame**. For a trivial `#[inline]` accessor, the line table maps the instruction
 to the accessor's own declaration, even though the cost belongs to the
-surrounding code. The line was a *label* for a cache miss, not its cause:
+surrounding code. The line was a _label_ for a cache miss, not its cause:
 removing one of several derefs of the same cold pointer changes nothing, because
 whichever access comes first still pays the miss.
 
@@ -89,8 +89,8 @@ The prediction and its falsifier were written down before implementing:
 That is exactly what happened, so the result was a decision rather than a
 puzzle. The same discipline had already killed my `waitid` theory inside this
 round: the count scaled 9.4× with the fleet, which is precisely the signature
-that invites a fix, and writing *"per-call cost must rise to ~4 µs or the model
-is wrong"* first turned a plausible story into a refuted one before any code was
+that invites a fix, and writing _"per-call cost must rise to ~4 µs or the model
+is wrong"_ first turned a plausible story into a refuted one before any code was
 written.
 
 **A count that scales is not a cost that scales. A line that is hot is not a
@@ -102,7 +102,7 @@ would prove them wrong.
 The F5 gate reported "flat" on all 12 cells, but the cell that should carry the
 effect — `stop persist live=256` — has an **A/A floor of 0.112 ms** against a
 predicted effect of ~0.1 ms. That gate was underpowered for its own target, so
-its "flat" means *cannot resolve*, not *proven zero*. The rollback does not rest
+its "flat" means _cannot resolve_, not _proven zero_. The rollback does not rest
 on it; it rests on the ns-resolution owner-CPU probe, which resolves well below
 the predicted effect and also found nothing. Had only the gate been run, the
 right conclusion would have been "unresolved", not "inert".
@@ -111,11 +111,11 @@ right conclusion would have been "unresolved", not "inert".
 
 The owner-CPU figures above were originally written as "per stop". They are
 not: the schedstat probe's sampling window wraps one **start + stop + remove**
-per iteration, so `+1.013 ms` is per *triple*, not per stop. The per-verb split
+per iteration, so `+1.013 ms` is per _triple_, not per stop. The per-verb split
 is not known — the probe never separated them.
 
-Nothing else in this document changes. The rollback rests on a *paired
-difference* between two arms measured through the identical window, and the
+Nothing else in this document changes. The rollback rests on a _paired
+difference_ between two arms measured through the identical window, and the
 candidate-killing numbers (poll(), pass count, `waitid` per-call cost) come from
 probes with their own correct scopes. Only the absolute figure was mislabelled.
 
@@ -131,7 +131,7 @@ re-measure rather than inherit this number.
 The slope is real and still unexplained: **+1.013 ms of owner-thread CPU per
 measured iteration** (start + stop + remove — see the units note below)
 between 24 and 256 live Runs. The per-line reading of the profile is discredited
-as *attribution*, but the profile's coarse shape still holds — the samples are
+as _attribution_, but the profile's coarse shape still holds — the samples are
 in `owner_main`'s inlined body and in the allocator, and the mechanism that fits
 is structural rather than line-sized:
 
@@ -166,4 +166,3 @@ cannot forget to set it. The liveness backstop already exists and is already
 load-bearing: the buffered self-pipe byte is the sole production wake for child
 commands today, so a stale-false flag read degrades to "recovered on the next
 byte-driven pass", not to a stranded command.
-

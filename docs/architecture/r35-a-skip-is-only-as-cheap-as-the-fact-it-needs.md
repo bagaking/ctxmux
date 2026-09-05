@@ -3,7 +3,7 @@
 **Outcome: rolled back.** Predicted +0.280 ms/stop, measured +0.007. No metric
 degraded, none improved; under the ratchet that is a revert, not a merge.
 
-What makes this round worth a document is that the failure is *diagnosable*. A
+What makes this round worth a document is that the failure is _diagnosable_. A
 flat result usually cannot distinguish "the change does nothing" from "the change
 works and the cost is elsewhere". This one can, because the round counted.
 
@@ -20,8 +20,8 @@ mirroring `child_commands.is_empty()`, readable without the lock.
 Two arms, product binaries, 150 stops per shape, 4 alternating pairs, cn3 idle
 (busy fraction 0.002). Owner thread `ctxmux-native-o`, schedstat ns resolution.
 
-| arm | live=24 | live=256 | slope |
-| --- | --- | --- | --- |
+| arm  | live=24  | live=256 | slope         |
+| ---- | -------- | -------- | ------------- |
 | BASE | 0.241 ms | 1.230 ms | **+0.989 ms** |
 | CAND | 0.232 ms | 1.214 ms | **+0.982 ms** |
 
@@ -36,13 +36,13 @@ A negative result is harder to catch being wrong than a positive one, so the
 predicate was counted rather than assumed. Instrumented build, counts only, no
 timing:
 
-| | live=24 | live=256 |
-| --- | --- | --- |
+|                      | live=24        | live=256        |
+| -------------------- | -------------- | --------------- |
 | passes (open / shut) | 128 (27 / 101) | 704 (141 / 563) |
-| passes per stop | 5.33 | 4.69 |
-| entries visited | 3 291 | 180 929 |
-| **skip rate** | **76.4%** | **79.7%** |
-| entries per pass | 25.7 | 257.0 |
+| passes per stop      | 5.33           | 4.69            |
+| entries visited      | 3 291          | 180 929         |
+| **skip rate**        | **76.4%**      | **79.7%**       |
+| entries per pass     | 25.7           | 257.0           |
 
 144 269 of 180 929 entry visits were skipped. The predicate works. Skipping four
 entries in five removed 0.7% of the slope.
@@ -60,7 +60,7 @@ separately allocated control, once per entry. At 257 entries that is 257 likely
 cache misses per pass, which is the right order for the slope that survived.
 
 R33's arms had already priced this distinction and the round did not honour it:
-a flag read *through the Arc* left 3.2% of the modelled body standing versus 1.5%
+a flag read _through the Arc_ left 3.2% of the modelled body standing versus 1.5%
 for one reachable from the entry. **This round built `flag_arc` while calling it
 `flag_entry`.** The 2× in R33's model looked negligible against costs that turned
 out to be the wrong costs entirely; on the real slope that ratio is the whole
@@ -79,25 +79,25 @@ which kind of flat.
 
 Per-entry is the wrong granularity. The owner can decide **per pass**, in O(1):
 
-* one epoch counter, bumped by the three `child_commands` producers, read once
+- one epoch counter, bumped by the three `child_commands` producers, read once
   per pass — unchanged means no command arrived since the last sweep;
-* a count of entries that can make progress with no new edge (a `pending_stop`
+- a count of entries that can make progress with no new edge (a `pending_stop`
   awaiting its deadline or a permit, and anything in `WaitingCleanup` awaiting a
   permit), maintained by the sweep, which is the only writer;
-* the existing pass-wide gate.
+- the existing pass-wide gate.
 
 All three cheap and shut ⇒ skip the whole sweep, touching no entry at all. Read
-the epoch *before* sweeping and store it *after*, so a push racing the sweep
+the epoch _before_ sweeping and store it _after_, so a push racing the sweep
 leaves them unequal and costs one spurious sweep — never a missed one.
 
 On the measured mix this would skip roughly 400 of 704 passes at live=256
 (~65.8 µs each on shut passes ≈ 175 µs/stop), which clears the A/A floor. Two
 hazards are already visible and must not be argued away:
 
-* **`WaitingCleanup` is woken by a freed permit, not by an edge.** A worker
+- **`WaitingCleanup` is woken by a freed permit, not by an edge.** A worker
   completion pokes the wake pipe but bumps no epoch, so it must be in the blocked
   count or a queued cleanup strands.
-* **Fixtures drive terminality through `#[cfg(test)]` leader probes, not real
+- **Fixtures drive terminality through `#[cfg(test)]` leader probes, not real
   exits**, so the fast path has to be disabled under test — which means no
   integration test can reach it. The decision belongs in a pure function that is
   unit-tested exhaustively on its own.

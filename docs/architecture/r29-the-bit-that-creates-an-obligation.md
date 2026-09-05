@@ -18,7 +18,7 @@ optimisation dragged in behind it.
 
 The subtree sweep is only equivalent to the host walk while every session
 member is reachable from the daemon. A descendant whose parent exits first
-would reparent to init — leaving our subtree while *staying in the session* —
+would reparent to init — leaving our subtree while _staying in the session_ —
 so the sweep would go blind exactly where the census still saw it. Arming
 `PR_SET_CHILD_SUBREAPER` closes that: the orphan reparents to us instead.
 
@@ -56,7 +56,7 @@ emptiness depend on another task winning a race.
 
 `tmux::short_command` spawns a helper in its own process group, SIGKILLs the
 group on timeout, and `wait`s the direct child. A grandchild orphaned when the
-helper exits used to reparent to init. With the bit armed it reparents to *us*,
+helper exits used to reparent to init. With the bit armed it reparents to _us_,
 and nothing waits for it. `assert_process_gone` uses `kill(pid, 0)`, which
 succeeds on a zombie, so the test failed — correctly. In production the same
 orphan would be a permanent zombie holding a PID slot for the life of the
@@ -70,14 +70,14 @@ flag.
 ## Four wrong hypotheses, and what each one cost
 
 I got the mechanism wrong four times before instrumenting. Recording them
-because the *pattern* is the lesson, not the individual errors.
+because the _pattern_ is the lesson, not the individual errors.
 
-| # | Hypothesis | How it died |
-|---|---|---|
-| 1 | `setsid --wait X` forks X, so we adopt the wrapper and resolve the wrong session | Traced it: the adopted pid **is** the session leader, and the sweep returned exactly the host walk's answer. Difference empty. |
-| 2 | The reaper steals statuses from any non-session-leader child | Narrowed it to same-session only. 9 failures → 5. Right direction, wrong mechanism. |
-| 3 | An anchor pointing at the test process degenerates the filter | Added a "must be a real Run session" guard. Failure count did not move at all. |
-| 4 | Concurrent tests race the reaper for the same zombie | Ran the suite single-threaded. Still failed. Concurrency was never involved. |
+| #   | Hypothesis                                                                       | How it died                                                                                                                    |
+| --- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| 1   | `setsid --wait X` forks X, so we adopt the wrapper and resolve the wrong session | Traced it: the adopted pid **is** the session leader, and the sweep returned exactly the host walk's answer. Difference empty. |
+| 2   | The reaper steals statuses from any non-session-leader child                     | Narrowed it to same-session only. 9 failures → 5. Right direction, wrong mechanism.                                            |
+| 3   | An anchor pointing at the test process degenerates the filter                    | Added a "must be a real Run session" guard. Failure count did not move at all.                                                 |
+| 4   | Concurrent tests race the reaper for the same zombie                             | Ran the suite single-threaded. Still failed. Concurrency was never involved.                                                   |
 
 Every one of those was a plausible story I could tell from reading the code.
 The thing that actually settled it took two minutes: run the suite
@@ -111,10 +111,10 @@ Control is the candidate tree with only the three changed files reverted to
 the pre-existing `r29-base` tree reports the same 48 failures, so the control
 is not flattering the candidate.
 
-| arm | passed | failed |
-|---|---|---|
-| control (HEAD) | 199 | 48 |
-| candidate | 244 | 4 |
+| arm            | passed | failed |
+| -------------- | ------ | ------ |
+| control (HEAD) | 199    | 48     |
+| candidate      | 244    | 4      |
 
 The candidate's 4 failures are a strict subset of the control's 48 — `comm -23`
 on the sorted failure lists is empty, so the round introduces **zero** new

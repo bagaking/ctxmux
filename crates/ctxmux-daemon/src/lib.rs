@@ -127,7 +127,7 @@ const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// It is deliberately **not** on the Stop response path: that made every Stop
 /// wait out an unrelated Run's finalize on the one persistence actor. See
-/// `docs/architecture/r29-the-stop-that-did-not-need-the-actor.md`.
+/// `docs/architecture/r36-the-stop-that-did-not-need-the-actor.md`.
 const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_secs(10);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);

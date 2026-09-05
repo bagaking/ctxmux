@@ -18,10 +18,10 @@ it is not worth shipping."
 Measured on cn3 by speaking the wire protocol directly (`.tmp-r30-pingcost.py`,
 n=400, warmed):
 
-| path | median | p90 |
-|---|---|---|
-| connect + hello + close | **0.0419 ms** | 0.0495 ms |
-| connect + hello + list + close | 0.0728 ms | 0.0829 ms |
+| path                           | median        | p90       |
+| ------------------------------ | ------------- | --------- |
+| connect + hello + close        | **0.0419 ms** | 0.0495 ms |
+| connect + hello + list + close | 0.0728 ms     | 0.0829 ms |
 
 0.042 ms against an A/A noise floor of 0.46 ms — **11× below the floor.** The
 survey's estimate was an order of magnitude high. Killed by its own falsifier.
@@ -29,7 +29,7 @@ survey's estimate was an order of magnitude high. Killed by its own falsifier.
 **Candidate 1 (is the CLI floor a benchmark artifact?) — RESOLVED, partly.**
 Read from source rather than measured. agentmux holds a long-lived
 `CtxmuxClient` (`ctxmux-run-adapter.ts:804`), so it never pays the ~0.53 ms
-process spawn — that part of the floor *is* a harness artifact. But the SDK's
+process spawn — that part of the floor _is_ a harness artifact. But the SDK's
 `#request` opens a fresh connection and Hello per call
 (`packages/sdk/src/client.ts:640`, `:718`), so the consumer does pay one
 connect+handshake per verb. At 0.042 ms that is not worth attacking either.
@@ -45,14 +45,14 @@ memory-only from persistence-ON. Subtraction names a layer, not a line.
 Counted instead (`.tmp-r30-syscount.py`, strace on the daemon, 20 reps per verb,
 each verb's syscalls attributed to its own client-observed window):
 
-| verb | wall each | fsyncs per verb | fsync ms | share of wall |
-|---|---|---|---|---|
-| start (persist) | 9.485 ms | **4.85** | 0.805 each | **41.2%** |
-| remove (persist) | 4.938 ms | **3.85** | 0.720 each | **56.1%** |
-| start (memory) | 2.903 ms | 0 | — | — |
-| remove (memory) | 0.723 ms | 0 | — | — |
+| verb             | wall each | fsyncs per verb | fsync ms   | share of wall |
+| ---------------- | --------- | --------------- | ---------- | ------------- |
+| start (persist)  | 9.485 ms  | **4.85**        | 0.805 each | **41.2%**     |
+| remove (persist) | 4.938 ms  | **3.85**        | 0.720 each | **56.1%**     |
+| start (memory)   | 2.903 ms  | 0               | —          | —             |
+| remove (memory)  | 0.723 ms  | 0               | —          | —             |
 
-Not one barrier. Nearly five. Reducing the *count* of durability barriers is a
+Not one barrier. Nearly five. Reducing the _count_ of durability barriers is a
 different lever from weakening `synchronous`, which R-earlier already vetoed —
 one changes how many times we prove durability, the other changes whether we
 prove it.
@@ -87,26 +87,26 @@ store.try_fold_wal_once()   // PRAGMA wal_checkpoint(TRUNCATE)
 
 Its justification is real and is documented at the call site: folding costs
 ~1.6 ms/MiB, so pay it while the actor is idle rather than on a later verb. That
-reasoning is correct for a *large* WAL. It omits the other side of the ledger —
+reasoning is correct for a _large_ WAL. It omits the other side of the ledger —
 truncating to zero imposes a penalty on the next commit.
 
 Priced directly, plain SQLite with the daemon's pinned pragmas (WAL,
 `synchronous=FULL`, `wal_autocheckpoint=0`), `.tmp-r30-walfloor.py`, n=60:
 
-| next commit lands on | median | p90 |
-|---|---|---|
-| a WAL just truncated to zero | 1.9117 ms | 2.5208 ms |
-| a WAL already ~256 KiB long | 0.9167 ms | 1.1630 ms |
-| **penalty imposed by truncating** | **+0.9950 ms** | |
+| next commit lands on              | median         | p90       |
+| --------------------------------- | -------------- | --------- |
+| a WAL just truncated to zero      | 1.9117 ms      | 2.5208 ms |
+| a WAL already ~256 KiB long       | 0.9167 ms      | 1.1630 ms |
+| **penalty imposed by truncating** | **+0.9950 ms** |           |
 
 and the fold's own cost, by size:
 
 | WAL size | fold cost | ms/MiB |
-|---|---|---|
-| 0.07 MiB | 1.2541 ms | 17.72 |
-| 0.26 MiB | 1.4364 ms | 5.54 |
-| 1.00 MiB | 2.6143 ms | 2.61 |
-| 8.01 MiB | 9.6098 ms | 1.20 |
+| -------- | --------- | ------ |
+| 0.07 MiB | 1.2541 ms | 17.72  |
+| 0.26 MiB | 1.4364 ms | 5.54   |
+| 1.00 MiB | 2.6143 ms | 2.61   |
+| 8.01 MiB | 9.6098 ms | 1.20   |
 
 This matches the known mechanism recorded two rounds ago: a zero-length WAL
 forces the next commit to extend the file, which degrades `fdatasync` into a
@@ -114,7 +114,7 @@ full `fsync`, plus a separately-synced 32-byte header.
 
 **The trade the current code makes:** in a quiet fleet the WAL after one verb is
 a few KiB. The fold spends ~1.25 ms to clear those few KiB, and then charges the
-*next* verb ~1.00 ms for the privilege of starting from zero. It is paying twice
+_next_ verb ~1.00 ms for the privilege of starting from zero. It is paying twice
 to avoid a cost that, at that size, is smaller than either payment.
 
 ## The change
@@ -125,7 +125,7 @@ alone — a small WAL is the cheap state to commit onto, not a mess to clean up.
 
 This is the **opposite** direction from the already-rolled-back experiment that
 lowered the output-side fold threshold from 8 MiB to 1 MiB and made create
-0.7–0.9 ms *slower* by folding 8× more often. That result is evidence for this
+0.7–0.9 ms _slower_ by folding 8× more often. That result is evidence for this
 one: fewer, larger folds beat more, smaller folds.
 
 Floor value: **256 KiB**. Chosen as the smallest size in the measured table
@@ -146,7 +146,7 @@ and `fold_wal_below_ceiling` (`:3117`) already only folds above
 baseline is already a legal, load-bearing, shipped state. The ceilings still
 close arithmetically: nothing may charge more than 8 MiB, every path that must
 bound the WAL still folds above 8 MiB, so the post-commit absolute still cannot
-exceed the 16 MiB total. The floor changes only *when we volunteer* to fold, not
+exceed the 16 MiB total. The floor changes only _when we volunteer_ to fold, not
 any bound.
 
 ## Predictions, written before the data
@@ -160,7 +160,7 @@ any bound.
    whenever the fold runs, so the floor never engages and the code path is
    identical. A change in a chatty cell is evidence of something I have not
    understood — not a bonus.
-4. **Idle CPU stays at 0.000%.** The floor makes the fold strictly *less*
+4. **Idle CPU stays at 0.000%.** The floor makes the fold strictly _less_
    frequent, never more.
 
 Prediction 3 is the one I most expect to be wrong, and it is the one most likely

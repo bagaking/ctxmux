@@ -36,10 +36,10 @@ round trip even when the daemon is already up, then the command opens a second
 one. The survey estimated 0.2–0.4 ms. Measured against the shipping daemon by
 speaking the wire protocol directly (n=400, warmed):
 
-| path | median | p90 |
-|---|---|---|
-| connect + hello + close | **0.0419 ms** | 0.0495 ms |
-| connect + hello + list + close | 0.0728 ms | 0.0829 ms |
+| path                           | median        | p90       |
+| ------------------------------ | ------------- | --------- |
+| connect + hello + close        | **0.0419 ms** | 0.0495 ms |
+| connect + hello + list + close | 0.0728 ms     | 0.0829 ms |
 
 0.042 ms against an A/A noise floor of 0.46 ms — **eleven times below the
 floor**, and an order of magnitude below the estimate. Killed by its own
@@ -61,15 +61,15 @@ from persistence-ON, and **subtraction names a layer, not a line.**
 Counted instead, with strace on the daemon and each syscall attributed to the
 client-observed window of the verb that caused it:
 
-| verb | wall each | fsyncs per verb | ms each | share of wall |
-|---|---|---|---|---|
-| start (persist) | 9.485 ms | **4.85** | 0.805 | **41.2%** |
-| remove (persist) | 4.938 ms | **3.85** | 0.720 | **56.1%** |
-| start (memory) | 2.903 ms | 0 | — | — |
-| remove (memory) | 0.723 ms | 0 | — | — |
+| verb             | wall each | fsyncs per verb | ms each | share of wall |
+| ---------------- | --------- | --------------- | ------- | ------------- |
+| start (persist)  | 9.485 ms  | **4.85**        | 0.805   | **41.2%**     |
+| remove (persist) | 4.938 ms  | **3.85**        | 0.720   | **56.1%**     |
+| start (memory)   | 2.903 ms  | 0               | —       | —             |
+| remove (memory)  | 0.723 ms  | 0               | —       | —             |
 
 Not one barrier. Nearly five. That distinction is what made this round
-possible: reducing *how many times* we prove durability is a different lever
+possible: reducing _how many times_ we prove durability is a different lever
 from weakening `synchronous`, which an earlier round already tried and vetoed.
 One changes the count of proofs, the other changes whether there is a proof.
 
@@ -98,22 +98,22 @@ It omits the other side of the ledger.
 
 Priced directly, plain SQLite with the daemon's pinned pragmas (n=60):
 
-| next commit lands on | median | p90 |
-|---|---|---|
-| a WAL just truncated to zero | 1.9117 ms | 2.5208 ms |
-| a WAL already ~256 KiB long | 0.9167 ms | 1.1630 ms |
-| **penalty the truncation imposes** | **+0.9950 ms** | |
+| next commit lands on               | median         | p90       |
+| ---------------------------------- | -------------- | --------- |
+| a WAL just truncated to zero       | 1.9117 ms      | 2.5208 ms |
+| a WAL already ~256 KiB long        | 0.9167 ms      | 1.1630 ms |
+| **penalty the truncation imposes** | **+0.9950 ms** |           |
 
 and the fold's own cost by size: 1.25 ms at 0.07 MiB, 1.44 ms at 0.26 MiB,
 2.61 ms at 1 MiB, 9.61 ms at 8 MiB.
 
 So on a quiet fleet the old code spent ~1.25 ms clearing a few KiB, then charged
-the *next* verb ~1.00 ms for the privilege of starting from zero — **paying
+the _next_ verb ~1.00 ms for the privilege of starting from zero — **paying
 twice to avoid a cost smaller than either payment.** Under load the same trade
 is the good one the call site describes, because by then the WAL is megabytes.
 
 This is the mirror image of an experiment two rounds ago that lowered the
-*output-side* fold threshold from 8 MiB to 1 MiB and made create 0.7–0.9 ms
+_output-side_ fold threshold from 8 MiB to 1 MiB and made create 0.7–0.9 ms
 slower by folding eight times as often. That rollback is evidence for this
 change: fewer, larger folds beat more, smaller ones. Same axis, opposite
 direction, and the earlier result predicted the sign of this one.
@@ -126,12 +126,12 @@ the same cost. Four shapes, 16 cells, Holm-Bonferroni across all of them.
 
 **c=0, persistence ON — the target shape** (20 pairs, after the final rebuild):
 
-| verb | base | cand | delta | A/A | wins | p |
-|---|---|---|---|---|---|---|
-| start | 4.496 | 3.583 | **+0.914** | 0.100 | 20/20 | <1e-5 |
-| stop | 3.961 | 3.257 | **+0.704** | 0.122 | 20/20 | <1e-5 |
+| verb   | base  | cand  | delta      | A/A   | wins  | p     |
+| ------ | ----- | ----- | ---------- | ----- | ----- | ----- |
+| start  | 4.496 | 3.583 | **+0.914** | 0.100 | 20/20 | <1e-5 |
+| stop   | 3.961 | 3.257 | **+0.704** | 0.122 | 20/20 | <1e-5 |
 | remove | 3.557 | 2.708 | **+0.849** | 0.166 | 20/20 | <1e-5 |
-| list | 1.313 | 1.304 | +0.009 | 0.021 | 7/20 | 0.26 |
+| list   | 1.313 | 1.304 | +0.009     | 0.021 | 7/20  | 0.26  |
 
 Every other cell — c=1 persistence, c=8 persistence, c=0 memory-only — came back
 flat under Holm-Bonferroni against its own A/A floor. **No cell degraded.**
@@ -150,7 +150,7 @@ All four were written down before the data existed.
    because under load the WAL is megabytes whenever the fold runs and the floor
    never engages.
 4. **Idle CPU stays at 0.000%.** Held: 0.0000% on both arms across a 60 s quiet
-   window, including the new case where the candidate deliberately *keeps*
+   window, including the new case where the candidate deliberately _keeps_
    61,832 WAL bytes instead of truncating them.
 
 Prediction 3 was the one I flagged in advance as most likely to be wrong, on the
@@ -168,12 +168,12 @@ Rotated arm order across three arms so none is systematically last. tmux has no
 persistence to switch on, so it is compared against ctxmux **as shipped, with
 persistence ON** — that is the honest gap, not the flattering one.
 
-| 优先级 | # | 维度 | 这一维在测什么 | 什么时候真的咬人 | 子维度指标 | 我方 | 对手 | 比值 | 判定 |
-|---|---|---|---|---|---|---|---|---|---|
-| P0 | 1 | 创建延迟 | 起一个新 Run 到可用的端到端时间 | 舰队频繁拉起短任务时,直接叠加到每个任务的墙钟 | start 中位 (ms, c=0 持久化) | 3.550 | 3.046 | 1.17x | ❌ 输 |
-| P0 | 2 | 拆除延迟 | 停止并回收一个 Run 的完整代价 | 高 churn 场景下与创建同频发生 | stop+remove 中位 (ms) | 5.931 | 2.657 | 2.23x | ❌ 输 |
-| P1 | 3 | 枚举延迟 | 列出全部 Run 的代价 | 控制面轮询、UI 刷新 | list 中位 (ms) | 1.282 | 1.734 | 0.74x | ✅ 赢 |
-| P1 | 4 | 耐久性 | 进程崩溃后 Run 记录是否还在 | daemon 崩溃或重启后要恢复舰队 | 崩溃后可恢复 | 是 | 否 | — | 能力差异 |
+| 优先级 | #   | 维度     | 这一维在测什么                  | 什么时候真的咬人                              | 子维度指标                  | 我方  | 对手  | 比值  | 判定     |
+| ------ | --- | -------- | ------------------------------- | --------------------------------------------- | --------------------------- | ----- | ----- | ----- | -------- |
+| P0     | 1   | 创建延迟 | 起一个新 Run 到可用的端到端时间 | 舰队频繁拉起短任务时,直接叠加到每个任务的墙钟 | start 中位 (ms, c=0 持久化) | 3.550 | 3.046 | 1.17x | ❌ 输    |
+| P0     | 2   | 拆除延迟 | 停止并回收一个 Run 的完整代价   | 高 churn 场景下与创建同频发生                 | stop+remove 中位 (ms)       | 5.931 | 2.657 | 2.23x | ❌ 输    |
+| P1     | 3   | 枚举延迟 | 列出全部 Run 的代价             | 控制面轮询、UI 刷新                           | list 中位 (ms)              | 1.282 | 1.734 | 0.74x | ✅ 赢    |
+| P1     | 4   | 耐久性   | 进程崩溃后 Run 记录是否还在     | daemon 崩溃或重启后要恢复舰队                 | 崩溃后可恢复                | 是    | 否    | —     | 能力差异 |
 
 本轮把 start 对 tmux 的差距从 1.47x 收到 **1.17x**(关闭了 64.7% 的差距),
 teardown 从 2.92x 收到 **2.23x**(关闭 35.8%)。list 一直是赢的,本轮未动。
@@ -187,24 +187,24 @@ teardown 从 2.92x 收到 **2.23x**(关闭 35.8%)。list 一直是赢的,本轮�
 
 Full workspace suite on cn3, both arms:
 
-| arm | passed | failed |
-|---|---|---|
-| control | 436 | 16 |
-| candidate | 435 | 17 |
+| arm       | passed | failed |
+| --------- | ------ | ------ |
+| control   | 436    | 16     |
+| candidate | 435    | 17     |
 
-The failure *sets* differ by one test in each direction: the candidate failed
+The failure _sets_ differ by one test in each direction: the candidate failed
 `fresh_level_a_fork_materializes_then_releases_its_parent_before_reservation`,
 the control failed `multiple_terminal_candidates_replace_earliest_run_and_its_exact_key`.
 Both are pre-existing flaky tests. Running the daemon lib 20 times per arm:
 
-| test | control failed | candidate failed |
-|---|---|---|
-| `fresh_level_a_fork_materializes_…_before_reservation` | **4/20** | **0/20** |
-| `multiple_terminal_candidates_replace_earliest_run_…` | 8/20 | 6/20 |
+| test                                                   | control failed | candidate failed |
+| ------------------------------------------------------ | -------------- | ---------------- |
+| `fresh_level_a_fork_materializes_…_before_reservation` | **4/20**       | **0/20**         |
+| `multiple_terminal_candidates_replace_earliest_run_…`  | 8/20           | 6/20             |
 
 Per-run suite failure counts were 4–8 on the control and 4–6 on the candidate —
 the same distribution, wandering. **Candidate-only failures: none.** The one
-test the single gate run pinned on the candidate failed *zero* times out of
+test the single gate run pinned on the candidate failed _zero_ times out of
 twenty on that arm and four times on the control: not merely insignificant, the
 opposite sign. How that was nearly called a regression is the next section.
 
@@ -224,7 +224,7 @@ looked exactly like a right one.
 
 **A test-attribution probe that never ran a test.** To decide whether the
 differing failure was a regression, I ran each test in isolation with
-`--exact`. It reported 10/10 failures on *both* arms — for tests that had each
+`--exact`. It reported 10/10 failures on _both_ arms — for tests that had each
 passed once in the full suite. The isolated run measured a different condition
 than the gate did, so I rewrote it to run the suite. The rewrite passed
 `--test creation`, which is not a test target: those tests live in the daemon
@@ -241,7 +241,7 @@ when a run produces no parsable result, and refuses to score it.
 **An underpowered verdict stated as a conclusion.** The corrected probe, at
 n=5, reported 0/5 for the control and 2/5 for the candidate and printed
 `*** CANDIDATE-ONLY FAILURE -- roll back ***`. That threshold was wrong: against
-a suite whose failure count swings between 4 and 8 on *both* arms, 0/5 vs 2/5 is
+a suite whose failure count swings between 4 and 8 on _both_ arms, 0/5 vs 2/5 is
 p≈0.44 — indistinguishable from noise. The script stated a verdict its own
 sample size could not support.
 
@@ -260,7 +260,7 @@ change and the test** — it is a `multi_thread` fixture spinning on
 The lesson is not "run more reps." It is that a probe should state what its
 sample can support, and that a mechanism argument — is there even a path from
 the change to the symptom? — is often cheaper and stronger than more samples.
-Here it was also *right* while twenty times the data was still being collected.
+Here it was also _right_ while twenty times the data was still being collected.
 
 ## What I would do differently
 

@@ -9,16 +9,16 @@ The round opened aiming at teardown, which loses worst to tmux (5.931 ms vs
 2.657 ms). Splitting teardown by layer at the fleet size where that loss was
 measured (8 live Runs, 16 reps, no strace, interleaved arms):
 
-| verb | memory-only | persistence ON | persistence costs |
-|---|---|---|---|
-| start | 1.009 ms | 2.360 ms | +1.351 |
-| stop | 0.844 ms | 1.961 ms | +1.117 |
-| remove | 0.187 ms | 1.431 ms | +1.244 |
+| verb   | memory-only | persistence ON | persistence costs |
+| ------ | ----------- | -------------- | ----------------- |
+| start  | 1.009 ms    | 2.360 ms       | +1.351            |
+| stop   | 0.844 ms    | 1.961 ms       | +1.117            |
+| remove | 0.187 ms    | 1.431 ms       | +1.244            |
 
-| layer | stop+remove | against tmux 2.657 ms |
-|---|---|---|
-| process/PTY teardown (memory-only) | **1.031 ms** | **we win 2.58x** |
-| plus the durable commit (shipped) | 3.392 ms | we lose 1.28x |
+| layer                              | stop+remove  | against tmux 2.657 ms |
+| ---------------------------------- | ------------ | --------------------- |
+| process/PTY teardown (memory-only) | **1.031 ms** | **we win 2.58x**      |
+| plus the durable commit (shipped)  | 3.392 ms     | we lose 1.28x         |
 
 **The process-teardown layer already beats tmux by 2.6x.** All 2.361 ms of the
 loss (70%) is durable commit — two separate full commits, one in stop's finalize
@@ -35,10 +35,10 @@ So the teardown gap is not this round's target. Saying so is the result.
 A separate, real defect found on the way: **stop's cost scales with the number
 of live Runs.** Records held constant at 256, only the live/terminal split moved:
 
-| condition | live Runs | stop median |
-|---|---|---|
-| mostly-terminal | 24 | 0.778 ms |
-| mostly-live | 256 | **1.213 ms** |
+| condition       | live Runs | stop median  |
+| --------------- | --------- | ------------ |
+| mostly-terminal | 24        | 0.778 ms     |
+| mostly-live     | 256       | **1.213 ms** |
 
 **+0.435 ms (1.56x) from live Runs alone**, same record count, both interleaved
 passes agreeing. Confirmed by a fleet sweep: stop 0.860 → 1.686 ms from fleet 4
@@ -46,11 +46,11 @@ to 384.
 
 ### Mechanism
 
-`drive_lifecycle` peeks *every* watched leader on every owner edge. The call
+`drive_lifecycle` peeks _every_ watched leader on every owner edge. The call
 site says why: "SIGCHLD is process-wide and carries no pid we consult, so an
 exit signal means only 'some watched child may now be terminal' — hence the
 whole set is re-peeked." That is correct about the signal and it is why the
-timed 20 ms sweep could be removed. But it means an edge caused by a *command*
+timed 20 ms sweep could be removed. But it means an edge caused by a _command_
 — every Stop is delivered on one — pays a peek per live Run for an exit that
 usually has not happened.
 
@@ -61,19 +61,19 @@ Traced: 9 waitid/stop at fleet 4, 1482 at fleet 384 (165x).
 `waitid(P_ALL, WNOHANG|WNOWAIT)` answers "has any child exited?" in one
 syscall. Verified on cn3 rather than assumed:
 
-| property | result |
-|---|---|
-| P_ALL peek names an exited child | yes, `si_pid` filled |
-| non-consuming | yes — repeat peeks return the same pid |
+| property                             | result                                       |
+| ------------------------------------ | -------------------------------------------- |
+| P_ALL peek names an exited child     | yes, `si_pid` filled                         |
+| non-consuming                        | yes — repeat peeks return the same pid       |
 | can enumerate others without reaping | **no — stuck on one pid until it is reaped** |
-| advances after that pid is reaped | yes |
+| advances after that pid is reaped    | yes                                          |
 
 The third row rules out the tempting version: a "drain the exits with peeks"
 loop does not exist, and a loop that reaps as it goes would move reaping away
 from the sequenced `reap_leader`, which is a correctness change for a 0.435 ms
 prize. Not that.
 
-What the first row *does* buy is a gate. Every un-reaped leader is a direct
+What the first row _does_ buy is a gate. Every un-reaped leader is a direct
 child of the daemon (`require_waitable_anchor`), so **if the P_ALL peek reports
 no exited child, no watched leader can be terminal**, and the whole per-Run peek
 loop can be skipped. One syscall replaces N.
