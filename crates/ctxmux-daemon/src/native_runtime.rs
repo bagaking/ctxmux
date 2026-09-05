@@ -886,6 +886,23 @@ fn drive_lifecycle(
     queued: &mut VecDeque<WorkerJob>,
     cleanup_admission: &CleanupAdmission,
 ) {
+    // One syscall for the whole pass: if no child of this process has exited,
+    // no watched leader can be terminal, and the per-Run peeks below are all
+    // going to answer `false`. Most passes are like that -- every command edge
+    // runs one, and a Stop command is delivered on one -- so this replaces N
+    // peeks with one. See `NativeSession::any_child_exited`.
+    //
+    // Read once, and deliberately not refreshed inside the loop. Both ways it
+    // can go stale during a pass are safe:
+    //
+    // * stale `true` (a worker reaped the exit that opened the gate) just runs
+    //   the per-Run peeks, which is exactly the behaviour without this gate;
+    // * stale `false` would be the dangerous one -- an exit arriving after the
+    //   read -- but that exit raises SIGCHLD, whose relay writes a self-pipe
+    //   byte, so the owner runs another pass with a fresh gate. The byte is
+    //   buffered rather than edge-triggered, so it cannot be lost by arriving
+    //   mid-pass.
+    let any_child_exited = NativeSession::any_child_exited();
     'entries: for entry in entries {
         let lifecycle = std::mem::replace(&mut entry.lifecycle, Lifecycle::Queued);
         let mut watching = match lifecycle {
@@ -1001,8 +1018,9 @@ fn drive_lifecycle(
         // Peek the leader's terminal state without reaping. Reached on every
         // owner edge now that the timed sweep is gone; a SIGCHLD edge is what
         // makes this observe a fresh exit, but a command/completion edge peeks
-        // just as safely (idempotent WNOWAIT).
-        match watching.session.leader_is_terminal() {
+        // just as safely (idempotent WNOWAIT). The pass-wide gate skips the
+        // syscall entirely when the kernel says no child has exited at all.
+        match watching.session.leader_is_terminal_gated(any_child_exited) {
             Ok(false) => entry.lifecycle = Lifecycle::Watching(watching),
             Ok(true) => {
                 let Some(permit) = cleanup_admission.try_acquire() else {

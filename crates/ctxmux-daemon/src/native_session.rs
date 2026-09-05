@@ -366,6 +366,58 @@ impl NativeSession {
         Ok(members)
     }
 
+    /// Whether any child of this process has exited and not yet been reaped.
+    ///
+    /// Answers in one syscall what [`Self::leader_is_terminal`] answers per Run.
+    /// Every un-reaped session leader is a direct child of the daemon (that is
+    /// what [`Self::require_waitable_anchor`] keeps true), so `false` here means
+    /// no watched leader can be terminal, and a caller may skip peeking them
+    /// individually.
+    ///
+    /// `WNOWAIT` keeps this a peek: the status stays queued for the sequenced
+    /// `reap_leader`, which remains the sole reaper. Note the kernel reports the
+    /// *same* child until it is reaped, so this can only ever answer "is there
+    /// at least one", never enumerate them -- which is why it is a gate rather
+    /// than a replacement for the sweep.
+    ///
+    /// An error is reported as `true`, so a caller falls back to the per-Run
+    /// peeks that own the error handling. The gate never decides anything a
+    /// sweep would not; it only decides whether the sweep is worth running.
+    pub(crate) fn any_child_exited() -> bool {
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        match waitid(WaitId::All, options) {
+            Ok(status) => status.is_some(),
+            // ECHILD means there are no children at all, which is a definite
+            // "nothing to find". Anything else is unexpected, and an unexpected
+            // gate must not be the thing that hides an exit.
+            Err(Errno::CHILD) => false,
+            Err(_) => true,
+        }
+    }
+
+    /// [`Self::leader_is_terminal`], skipped when the daemon has no exited child.
+    ///
+    /// `any_child_exited` comes from one [`Self::any_child_exited`] call shared
+    /// by a whole sweep: `false` proves no leader is terminal, so N per-Run
+    /// peeks collapse into that single syscall.
+    ///
+    /// The test probe is consulted *before* the gate on purpose. A fixture that
+    /// simulates a terminal leader has no real exited child behind it, so
+    /// gating first would make the sweep skip exactly the Runs those fixtures
+    /// are about -- a performance knob silently deciding what the tests can
+    /// observe.
+    pub(crate) fn leader_is_terminal_gated(&self, any_child_exited: bool) -> Result<bool, String> {
+        self.require_waitable_anchor()?;
+        #[cfg(test)]
+        if let Some(probe) = &self.leader_probe {
+            return probe();
+        }
+        if !any_child_exited {
+            return Ok(false);
+        }
+        self.leader_is_terminal()
+    }
+
     pub(crate) fn leader_is_terminal(&self) -> Result<bool, String> {
         self.require_waitable_anchor()?;
         #[cfg(test)]
@@ -861,6 +913,77 @@ mod tests {
         assert!(
             error.contains("lost its waitable leader incarnation anchor"),
             "unexpected second-reap error: {error}"
+        );
+    }
+
+    #[test]
+    fn the_gate_agrees_with_the_per_run_peek_on_both_sides_of_an_exit() {
+        // The gate is only sound if `any_child_exited() == false` really does
+        // imply no leader is terminal. Prove it against a real child on both
+        // sides of its exit, and prove the gated peek matches the ungated one
+        // -- a gate that disagreed would be skipping work that mattered.
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.2; exit 5"])
+            .spawn()
+            .expect("spawn adoptable child");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        let mut session = NativeSession::from_child_pid(pid).unwrap();
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+
+        // While it lives, the gate must not claim an exit this child has not
+        // had. Another test's stray child could make the gate true, so assert
+        // the implication that actually matters rather than the raw value:
+        // a false gate must agree with the real peek.
+        if !NativeSession::any_child_exited() {
+            assert!(
+                !session
+                    .leader_is_terminal()
+                    .expect("fresh session retains its waitable anchor"),
+                "the gate reported no exited child while the leader was terminal"
+            );
+            assert!(
+                !session
+                    .leader_is_terminal_gated(false)
+                    .expect("gated peek keeps the anchor"),
+                "a closed gate must report not-terminal"
+            );
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !session
+            .leader_is_terminal()
+            .expect("non-reaping probe keeps working")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never became terminal within the deadline"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // Once this child is terminal the gate MUST be open: it is a child of
+        // this process and it has exited. This is the direction that would hide
+        // an exit forever if it were wrong.
+        assert!(
+            NativeSession::any_child_exited(),
+            "a child of this process has exited, so the gate must report it"
+        );
+        assert!(
+            session
+                .leader_is_terminal_gated(true)
+                .expect("gated peek keeps the anchor"),
+            "an open gate must defer to the per-Run peek, which sees the exit"
+        );
+
+        // And the gate is a peek, not a reap: the status is still there to take.
+        assert_eq!(
+            session
+                .reap_leader(&mut adopted)
+                .expect("the gate must not have consumed the exit status")
+                .exit_code(),
+            5
         );
     }
 
