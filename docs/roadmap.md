@@ -249,14 +249,21 @@ Acceptance:
 - a Level B request without host-owned provenance and a complete replacement
   `RunSpec` creates no Run and never falls back to Level A.
 
-Open: replay capacity past the frozen 384 MiB main-database ceiling. A
-production wedge on 2026-09-21 showed 42% of that ceiling spent on row headers
-and indexes rather than output (762,048 rows, median 82 B).
+Implemented: replay capacity past the frozen 384 MiB main-database ceiling.
+Production evidence on 2026-09-21 showed 42% of that ceiling spent on row
+headers and indexes rather than output (762,048 rows, median 82 B). Replay
+payloads now live in append-only generation files; SQLite retains only the
+contiguous window index and cursors. Startup truncates abandoned tails and
+removes orphan generations, while oversized generations compact through an
+atomic metadata switch. The main database ceiling remains fixed and old
+schema versions are rejected without migration.
 [replay-capacity-beyond-the-384-mib-ceiling](plans/replay-capacity-beyond-the-384-mib-ceiling.md)
 measures three candidates and ranks compression last — it is a constant factor
 against linear growth. Moving cold replay out of SQLite is the only one that
 makes the ceiling stop being a constant, and it also removes the dependency
-that makes freeing space require space.
+that makes freeing space require space. Compression remains deliberately
+deferred: it is a constant-factor optimization after the storage boundary is
+correct.
 
 ## M4 — tmux adapter
 

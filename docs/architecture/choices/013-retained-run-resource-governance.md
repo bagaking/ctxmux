@@ -90,15 +90,17 @@ multiply each existing local bound, while parser containers, transient clones,
 Run metadata, and allocator overhead remain measured RSS rather than being
 misrepresented as replay bytes.
 
-SQLite may accept a schema-4 store containing up to 4,096 structurally
+SQLite may accept a schema-5 store containing up to 4,096 structurally
 valid rows during fail-closed format validation. Bounded, restartable startup
 transactions reconcile prior running rows to interrupted, evict the canonical
 terminal prefix to `RETAINED_RUN_RECORDS` (currently `FD_BUDGET_LIVE_RUNS`; 128
 in the originally qualified policy), and finish serving-epoch publication before
 socket publication.
-The 4,096 value is a legacy format-validation envelope, not a second live
-capacity promise. The existing 64 MiB metadata, 256 MiB replay, database, WAL,
-SHM, and state-directory limits remain unchanged.
+The 4,096 value is a pre-stable format-validation envelope, not a second live
+capacity promise. The existing 64 MiB metadata, 256 MiB logical replay, 384 MiB
+SQLite main database, 16 MiB WAL, and 4 MiB SHM limits remain unchanged. Replay
+payloads are stored in owner-only generation files; the aggregate state-directory
+ceiling is 768 MiB and compaction bounds stale generations.
 
 T-026 unpublished-child cleanup is not a published Run record. It keeps its
 exact-key fence while retaining one of the shared eight overlap slots above.
@@ -479,7 +481,7 @@ WAL-frame fixture before the dependency can change.
 
 This implementation supersedes decision 009 only for live Registry
 capacity, operational startup normalization, and who selects rows for new-Run
-replacement. Decision 009 remains authoritative for schema-4 validation up to
+replacement. Decision 009 remains authoritative for schema-5 validation up to
 the legacy 4,096-row envelope, the 64 MiB metadata and 256 MiB durable replay
 limits, file ceilings, recovery class, and SQLite durability assumptions.
 
@@ -880,7 +882,7 @@ or deterministic-owner fixtures.
   attachment lookup paths
 - `crates/ctxmux-daemon/src/native_control.rs`: native child, reap, PTY, and
   input-drain ownership
-- `crates/ctxmux-daemon/src/persistence.rs`: schema-4 validation, SQLite actor,
+- `crates/ctxmux-daemon/src/persistence.rs`: schema-5 validation, SQLite actor,
   retention, and COMMIT disposition
 - `scripts/reliability-qualification.ts`: source-bound resource and soak
   receipts

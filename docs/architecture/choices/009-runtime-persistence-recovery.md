@@ -11,12 +11,15 @@ The current daemon makes Runs independent of clients but stores identity, metada
 
 Persistence is an explicit daemon mode selected with one dedicated
 operator-owned `--state-dir`. Without that directory, the daemon remains
-memory-only and makes no restart claim. With it, ctxmux uses one SQLite database
-owned by the daemon through a single persistence actor thread. `rusqlite` with
-the bundled maintained SQLite library is the selected implementation: it
-provides transactions, rollback/WAL recovery, integrity checks, and bounded
-incremental writes without inventing a second file-commit protocol or rewriting
-a whole retained replay on every PTY read.
+memory-only and makes no restart claim. With it, ctxmux uses one SQLite metadata
+database and one append-only replay generation directory, both owned by the
+daemon through a single persistence actor thread. `rusqlite` with the bundled
+maintained SQLite library remains the source of transactional identity,
+lifecycle, cursors, and retention indexes. Replay bytes are written and synced
+to the generation file before their SQLite coordinates commit; startup truncates
+an uncommitted tail and removes orphan generations. A generation switch is one
+SQLite transaction, so compaction leaves either the old or the new generation
+authoritative.
 
 The accepted recovery class is historical Run recovery:
 
@@ -62,7 +65,7 @@ creation keys, an exact BINARY unique-key index, and typed JSON, a required
 native `RunSpec` accepted by the same semantic validator as live
 start and fork, allowed lifecycle values, non-self lineage, byte totals,
 strictly contiguous retained byte ranges, matching durable first/latest
-cursors, and quota accounting. Schema 4 additionally stores one valid
+cursors, and quota accounting. Schema 5 additionally stores one valid
 `runtime_meta.runtime_id` UUID beside the serving epoch. It is created once for
 the state-directory lineage and survives cold replacement while the serving
 epoch changes; a planned exec reloads both preserved identities from this
@@ -73,7 +76,7 @@ and changes `daemonInstanceId`, while validated planned exec preserves both.
 The persistent-mode advertised capability record includes the two implemented
 `services.*` keys and omits memory-only `tmux.import`; the exact catalog and
 numeric semantics remain owned by [the protocol](../../protocol.md#connection-state).
-Schema-4 validation accepts its 4,096-record format envelope,
+Schema-5 validation accepts its 4,096-record format envelope,
 then startup normalization uses bounded,
 spill-disabled transactions to reconcile prior running rows and evict the
 canonical terminal prefix to the operational 128-record ceiling. Each batch
@@ -84,7 +87,7 @@ reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
 application and operational invariants are revalidated. Protocol generation 14
-and persistence schema 4 are pre-stable, so the current schema has no
+and persistence schema 5 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed
 startup failure. Ctxmux performs no repair, reset, migration, or partial
@@ -130,7 +133,7 @@ child behind a false success.
 
 Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
 replay tail remains. Persistent replay has a 256 MiB global logical byte budget
-and serialized metadata has a separate 64 MiB logical byte budget. Schema 4 can
+and serialized metadata has a separate 64 MiB logical byte budget. Schema 5 can
 validate a store containing up to 4,096 records, but a serving daemon
 normalizes it to the same 128 retained or projected records used by the
 Registry before socket publication. The oldest chunks are pruned across Runs
@@ -142,6 +145,32 @@ the same transaction. Running records are not deleted by ordinary admission; a
 start that cannot reserve its full record and metadata burden fails before
 child publication.
 
+Replay storage is external to SQLite. `replay_chunks` stores only `run_id`,
+byte ranges, generation name, file offset, and byte length; it has no inline
+payload fallback. The active generation is owner-only `0600` and named only by
+a validated basename. Appends are sequential and synced before the SQLite
+transaction commits. A failed transaction drops its unreferenced tail; an
+outer commit failure can leave harmless tail bytes that startup normalization
+truncates before the store becomes observable. When a generation exceeds twice
+the 256 MiB logical replay budget, compaction writes every retained segment to
+a new generation, fsyncs it, switches all offsets and `runtime_meta.replay_file`
+atomically, then unlinks the old generation. A missing, shortened, symlinked,
+or unreadable referenced segment fails startup closed.
+
+Physical page pressure is an independent retention boundary. Before startup
+normalization or an allocating persistent mutation, the owner must reclaim
+oldest replay prefixes when the main database lacks one admitted transaction's
+page headroom. Logical replay below 256 MiB does not prove physical capacity:
+small rows and partially occupied pages can exhaust the fixed page ceiling.
+Reclamation uses bounded, spill-disabled transactions under the existing WAL
+charge proof; it preserves Run/key/spec/lifecycle metadata and the durable head,
+and advances the surviving replay floor and truncation fact atomically. It must
+work on a valid same-schema database already at its physical limit and survive
+reopen without inventing contiguous bytes. The physical cap stays fixed; no
+VACUUM, migration, external database rewrite, or silent Run deletion is part of
+this operation. A page-limit exhaustion that cannot make progress is not an
+external transient disk-full event and must not monopolize the actor forever.
+
 The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main
 database). One transaction may append at most 8 MiB of WAL frames. Output is
 split into smaller ordered batches. Decision 013 supersedes the old logical
@@ -151,8 +180,9 @@ proves the exact spill-disabled transaction's WAL _growth_ from its
 cache-resident page upper bound before physical launch. It therefore preserves
 both the 8 MiB transaction and 16 MiB total WAL ceilings without assuming that
 a 4 MiB replay payload maps to 4 MiB of modified pages. The shared-memory file
-has a 4 MiB ceiling. The complete state directory has a 404 MiB hard file
-budget plus the small lock file. Exact replacement leaves freed pages reusable
+has a 4 MiB ceiling. The complete state directory has a 768 MiB hard file
+budget plus the small lock file; replay retention and generation compaction keep
+this bounded without enlarging the SQLite ceiling. Exact replacement leaves freed pages reusable
 inside the frozen main-database ceiling instead of running an uncharged
 post-COMMIT incremental vacuum. A failure discovered before COMMIT rejects
 admission without publishing a Run. Once replacement and the new Run/key row
@@ -160,8 +190,9 @@ commit, a physical-file postcheck failure is a committed error: it latches the
 actor, the daemon still publishes the committed Run/key mapping for retry
 convergence, and later mutations fail closed rather than widening the budget.
 
-Before SQLite open, existing database, WAL, SHM, and lock paths must be regular
-owner-matching files, never symlinks, with no group/other permissions. Newly
+Before SQLite open, existing database, WAL, SHM, lock, and replay-generation
+paths must be regular owner-matching files, never symlinks, with no group/other
+permissions. Newly
 created database and sidecars are set to `0600` and revalidated before the first
 Run transaction because `RunSpec`, declared references, environment additions,
 and output may contain secrets.

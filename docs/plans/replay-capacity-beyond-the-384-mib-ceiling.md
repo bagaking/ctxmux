@@ -1,4 +1,4 @@
-# Replay capacity past the 384 MiB ceiling: measured, ranked, and one rejection
+# Replay capacity past the 384 MiB ceiling: measured, ranked, and implemented
 
 ## Verdict
 
@@ -11,8 +11,10 @@ answer — is the one that loses.
 | 2 | Move cold replay out of SQLite | ceiling becomes the disk | **yes** |
 | 3 | Compress chunk payloads | 2.1x on 58% of the file | no — a constant |
 
-Do 1 first (smallest change, immediate), 2 for the actual ceiling, and 3 only
-after 2, where it is nearly free and where the ratio is 4.3x rather than 2.1x.
+1 and 2 are implemented. Candidate 1 coalesces rows before commit. Candidate 2
+stores replay payloads in append-only generation files and leaves SQLite with
+the durable window index. Candidate 3 remains deferred: compression is still a
+constant factor after the storage boundary is correct.
 
 ## The measurement
 
@@ -35,6 +37,10 @@ replay_chunks rows  762,048    mean 306 B/row, median 82 B
 | `sqlite_autoindex_replay_chunks_1` | 37.7 MiB |
 | `replay_chunks_run_start_byte` | 37.7 MiB |
 | `runs` + its indexes | 1.4 MiB |
+
+The duplicate explicit `(run_id, start_byte)` index in this table describes the
+pre-schema-5 production wedge. The new schema keeps only SQLite's unique
+constraint index and stores replay payloads outside the database.
 
 **42% of the ceiling stores the fact that we stored something.** 762,048 rows
 at a median of 82 B; the two indexes alone cost 75.4 MiB to index 222 MiB of
@@ -68,9 +74,11 @@ SQLite earns its cost on data that needs transactions and random mutation.
 Replay is append-only, read sequentially from a cursor, and never modified
 after the write. That is the shape of a file.
 
-Per Run: one append-only file, plus a small index row per segment
-(`run_id, start_byte, end_byte, path, offset`). Hundreds of index rows replace
-762,048 data rows.
+One shared append-only generation file serves every Run, plus one small index
+row per retained segment (`run_id, start_byte, end_byte, generation, offset,
+length`). Hundreds of index rows replace 762,048 inline payload rows. The
+generation is owner-only, payload bytes are synced before the SQLite row
+commits, and the active generation name is part of `runtime_meta`.
 
 What it buys:
 
@@ -79,17 +87,23 @@ What it buys:
 - the 161.8 MiB of headers and indexes largely disappears;
 - a cold file compresses as a whole (4.3x measured, below) instead of per
   82-byte chunk (2.1x);
-- **deleting a terminal Run's history becomes `unlink`, not a write
-  transaction.** On 2026-09-21 a single-row delete against the wedged store
-  hung 25 s and applied nothing: freeing space required space. A file delete
-  has no such dependency.
+- **deleting a terminal Run's history no longer copies payloads inside SQLite.**
+  The index delete is small, and the next generation compaction reclaims the
+  unreferenced bytes without requiring a main-database page allocation. On
+  2026-09-21 a single-row delete against the wedged store hung 25 s and applied
+  nothing: freeing space required space.
 
 That last point is not a side benefit. It removes the failure mode that
 `c168c0a` currently has to work around from inside the allocation path.
 
-Cost: two durable stores to keep consistent, crash-recovery for partially
-written segments, and an orphan-file sweep. This is the real work — it is a
-persistence-layer change, not an optimization.
+The consistency rule stays small: a failed transaction truncates its writer
+tail; startup truncates any unreferenced tail, removes orphan generations, and
+fails closed when a referenced segment is missing or short. Once a generation
+exceeds twice the logical replay budget, compaction writes a new generation,
+syncs it, switches all offsets in one SQLite transaction, and unlinks the old
+generation. No schema migration is provided; schema 5 is the only accepted
+format and earlier stores are rejected, so a pre-stable store must be
+recreated.
 
 ## 3 — Compression, and why it ranks last
 

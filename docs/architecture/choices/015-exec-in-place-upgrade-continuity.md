@@ -147,7 +147,7 @@ continues to own the PTY. 009's "fresh UUID per daemon" is refined to "fresh per
 cold start, preserved across intentional exec-in-place", because exec-in-place is
 by definition the same live-control owner.
 
-The logical Runtime ID is also preserved. It is reloaded from schema-4
+The logical Runtime ID is also preserved. It is reloaded from schema-5
 `runtime_meta` through the existing SQLite owner; it is not copied into the
 version-2 handoff manifest. Public Hello remains
 `runtimeIdPersistence: "state_dir"`. The incoming image constructs its own

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read, Seek, SeekFrom, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -15,7 +15,10 @@ use std::{
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicI32, AtomicU8};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicI32, AtomicU8},
+};
 
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, InterruptionReason, OutputChunk, OutputReplay,
@@ -27,9 +30,10 @@ use uuid::Uuid;
 
 use crate::{fd_budget::FD_BUDGET_LIVE_RUNS, run_spec::validate_run_spec};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
+const REPLAY_DIR: &str = "replay";
 const PAGE_SIZE_BYTES: u64 = 4 * 1024;
 const DATABASE_MAX_BYTES: u64 = 384 * 1024 * 1024;
 const DATABASE_MAX_PAGES: u64 = DATABASE_MAX_BYTES / PAGE_SIZE_BYTES;
@@ -58,9 +62,22 @@ const WAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 const WAL_IDLE_FOLD_FLOOR_BYTES: u64 = 256 * 1024;
 const WAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const SHM_MAX_BYTES: u64 = 4 * 1024 * 1024;
-const STATE_FILES_MAX_BYTES: u64 = 404 * 1024 * 1024;
+// Replay payloads live outside SQLite. Keep a bounded safety ceiling for the
+// state directory, while the logical replay budget remains the product-level
+// retention policy. The old 404 MiB aggregate was the SQLite ceiling plus WAL
+// and SHM; it would incorrectly reject a healthy store merely because its
+// retained bytes no longer fit in the metadata database.
+const STATE_FILES_MAX_BYTES: u64 = 768 * 1024 * 1024;
 const PER_RUN_REPLAY_BYTES: u64 = 4 * 1024 * 1024;
 const GLOBAL_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(not(test))]
+const REPLAY_COMPACTION_TRIGGER_BYTES: u64 = GLOBAL_REPLAY_BYTES * 2;
+#[cfg(test)]
+const TEST_REPLAY_COMPACTION_TRIGGER_BYTES: u64 = 1024;
+#[cfg(test)]
+const ACTIVE_REPLAY_COMPACTION_TRIGGER_BYTES: u64 = TEST_REPLAY_COMPACTION_TRIGGER_BYTES;
+#[cfg(not(test))]
+const ACTIVE_REPLAY_COMPACTION_TRIGGER_BYTES: u64 = REPLAY_COMPACTION_TRIGGER_BYTES;
 pub(crate) const METADATA_BYTES: u64 = 64 * 1024 * 1024;
 // Two durable row ceilings, for two different durable concerns. Neither is the
 // in-memory live-Run admission ceiling: that ceiling bounds live daemon
@@ -337,6 +354,10 @@ impl PersistenceError {
     fn is_transient_storage(&self) -> bool {
         self.is_disk_full()
             || self.is_storage_pressure_io_failure()
+            || matches!(
+                self,
+                Self::Io { source, .. } if source.kind() == io::ErrorKind::StorageFull
+            )
             || matches!(self, Self::WalCheckpointBusy { .. })
     }
 
@@ -821,8 +842,8 @@ impl PersistentRun {
     /// `is_fresh_contiguous` and gets a transaction (and an fsync) entirely to
     /// itself instead of coalescing to `MAX_TRANSACTION_PAYLOAD_BYTES`; and
     /// every chunk of it that has since committed takes the verify-against-
-    /// stored branch in `append_replay`, one `SELECT data` plus a full compare
-    /// per chunk. Slower commits deepen the queue, a deeper queue widens the
+    /// stored branch in `append_replay`, one indexed range lookup plus a bounded
+    /// file read per chunk. Slower commits deepen the queue, a deeper queue widens the
     /// gap between the two watermarks, and a wider gap makes the next catch-up
     /// bigger — a loop with no exit, which is why a chatty Run cost seconds per
     /// lifecycle verb rather than a bounded penalty.
@@ -1425,14 +1446,6 @@ impl Persistence {
     #[cfg(test)]
     pub(crate) fn startup_batch_wal_bytes(&self) -> Vec<u64> {
         mutex_lock(&self.inner.test_hooks.startup_batch_wal_bytes).clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn checkpoint_attempts(&self) -> u64 {
-        self.inner
-            .test_hooks
-            .checkpoint_attempts
-            .load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -2258,6 +2271,8 @@ impl StartupBatch<'_> {
 
 struct StateStore {
     state_dir: PathBuf,
+    replay_dir: PathBuf,
+    replay_file: String,
     database_path: PathBuf,
     wal_path: PathBuf,
     shm_path: PathBuf,
@@ -2321,6 +2336,7 @@ impl StateStore {
         self._state_lock.as_raw_fd()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn open(
         state_dir: &Path,
         admission_limits: AdmissionLimits,
@@ -2328,6 +2344,8 @@ impl StateStore {
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         prepare_state_dir(state_dir)?;
+        let replay_dir = state_dir.join(REPLAY_DIR);
+        prepare_replay_dir(&replay_dir)?;
         // On the exec-in-place path the process already holds the advisory lock
         // on this descriptor; adopt it (the flock is per open-file-description,
         // so a fresh open + try_lock would self-deadlock against our own lock).
@@ -2387,11 +2405,27 @@ impl StateStore {
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;")
             .map_err(PersistenceError::database)?;
+        let replay_file = if database_existed {
+            read_replay_file_name(&connection)?
+        } else {
+            format!("replay-{}.bin", Uuid::new_v4())
+        };
         let runtime_id = if database_existed {
             validate_existing_schema(&connection)?
         } else {
-            create_schema(&connection, &epoch)?
+            create_schema(&connection, &epoch, &replay_file)?
         };
+        validate_replay_file_name(&replay_file)?;
+        let replay_path = replay_dir.join(&replay_file);
+        if !replay_path.exists() {
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&replay_path)
+                .map_err(|source| PersistenceError::io(&replay_path, source))?;
+        }
+        validate_state_file(&replay_path)?;
         connection
             .pragma_update(
                 None,
@@ -2412,11 +2446,12 @@ impl StateStore {
             }
         }
         validate_quick_check(&connection)?;
-        validate_application_state(&connection)?;
-        validate_physical_limits(state_dir, &database_path, &wal_path, &shm_path)?;
+        validate_application_state(&connection, &replay_dir)?;
 
         let mut store = Self {
             state_dir: state_dir.to_path_buf(),
+            replay_dir,
+            replay_file,
             database_path,
             wal_path,
             shm_path,
@@ -2429,10 +2464,19 @@ impl StateStore {
             #[cfg(test)]
             test_hooks,
         };
+        store.normalize_replay_files()?;
+        store.maybe_compact_replay()?;
+        validate_physical_limits(
+            state_dir,
+            &store.replay_dir,
+            &store.database_path,
+            &store.wal_path,
+            &store.shm_path,
+        )?;
         store.normalize_startup()?;
-        validate_application_state(&store.connection)?;
+        validate_application_state(&store.connection, &store.replay_dir)?;
         store.validate_operational_state()?;
-        let recovered = load_recovered(&store.connection)?;
+        let recovered = load_recovered(&store.connection, &store.replay_dir)?;
         store.validate_files()?;
         Ok((store, recovered))
     }
@@ -4084,6 +4128,7 @@ impl StateStore {
             .collect())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn append_transaction_with_shutdown(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
@@ -4109,7 +4154,13 @@ impl StateStore {
             .map_err(PersistenceError::database)?;
         let mut cursor_updates = HashMap::new();
         for (id, replay, _) in coalesce_batch(batch) {
-            let _ = append_replay(&transaction, id, &replay)?;
+            let _ = append_replay_external(
+                &transaction,
+                id,
+                &replay,
+                &self.replay_dir,
+                &self.replay_file,
+            )?;
             let head = read_run_head(&transaction, id)?;
             cursor_updates.insert(id, head);
         }
@@ -4183,6 +4234,9 @@ impl StateStore {
         if let Some((metadata_owner, metadata_bytes)) = terminal_metadata {
             metadata_owner.store(metadata_bytes, Ordering::Release);
         }
+        if let Err(error) = self.maybe_compact_replay() {
+            eprintln!("ctxmux replay compaction deferred: {error}");
+        }
         self.finish_transaction()
     }
 
@@ -4221,10 +4275,144 @@ impl StateStore {
         }
         validate_physical_limits(
             &self.state_dir,
+            &self.replay_dir,
             &self.database_path,
             &self.wal_path,
             &self.shm_path,
         )
+    }
+
+    /// Remove abandoned replay generations and truncate an interrupted append
+    /// tail before the store becomes observable again.
+    fn normalize_replay_files(&self) -> Result<(), PersistenceError> {
+        let current = self.replay_dir.join(&self.replay_file);
+        let referenced_end: i64 = self
+            .connection
+            .query_row(
+                "SELECT coalesce(max(data_offset + data_bytes), 0)
+                 FROM replay_chunks WHERE data_file = ?1",
+                [&self.replay_file],
+                |row| row.get(0),
+            )
+            .map_err(PersistenceError::database)?;
+        let referenced_end = nonnegative_u64(referenced_end, "replay file end")?;
+        let actual = file_len(&current)?;
+        if actual < referenced_end {
+            return Err(PersistenceError::Corrupt(format!(
+                "replay file {} is shorter than its durable references",
+                self.replay_file
+            )));
+        }
+        if actual > referenced_end {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&current)
+                .map_err(|source| PersistenceError::io(&current, source))?;
+            file.set_len(referenced_end)
+                .map_err(|source| PersistenceError::io(&current, source))?;
+            file.sync_data()
+                .map_err(|source| PersistenceError::io(&current, source))?;
+        }
+        for entry in fs::read_dir(&self.replay_dir)
+            .map_err(|source| PersistenceError::io(&self.replay_dir, source))?
+        {
+            let entry = entry.map_err(|source| PersistenceError::io(&self.replay_dir, source))?;
+            let path = entry.path();
+            if path.file_name().and_then(std::ffi::OsStr::to_str) != Some(&self.replay_file) {
+                fs::remove_file(&path).map_err(|source| PersistenceError::io(&path, source))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Compact the append-only replay generation once stale prefixes make it
+    /// materially larger than the retained logical window. The new generation
+    /// is committed by name in the same `SQLite` transaction as its row offsets;
+    /// an interrupted compaction therefore leaves either the old generation or
+    /// the new one fully authoritative, and startup removes the loser.
+    #[allow(clippy::too_many_lines)]
+    fn maybe_compact_replay(&mut self) -> Result<(), PersistenceError> {
+        let old_path = self.replay_dir.join(&self.replay_file);
+        if file_len(&old_path)? <= ACTIVE_REPLAY_COMPACTION_TRIGGER_BYTES {
+            return Ok(());
+        }
+        let new_file = format!("replay-{}.bin", Uuid::new_v4());
+        let new_path = self.replay_dir.join(&new_file);
+        let mut generation = ReplayGenerationGuard::new(new_path.clone());
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&new_path)
+            .map_err(|source| PersistenceError::io(&new_path, source))?;
+        let mut offset = 0_u64;
+        let rows = self
+            .connection
+            .prepare(
+                "SELECT ordinal, data_file, data_offset, data_bytes
+                 FROM replay_chunks ORDER BY ordinal",
+            )
+            .map_err(PersistenceError::database)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(PersistenceError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PersistenceError::database)?;
+        for (_, data_file, data_offset, data_bytes) in &rows {
+            let payload = read_replay_segment(
+                &self.replay_dir,
+                data_file,
+                u64::try_from(*data_offset).unwrap_or(u64::MAX),
+                u64::try_from(*data_bytes).unwrap_or(u64::MAX),
+            )?;
+            output
+                .write_all(&payload)
+                .map_err(|source| PersistenceError::io(&new_path, source))?;
+            offset = offset.saturating_add(payload.len() as u64);
+        }
+        output
+            .sync_all()
+            .map_err(|source| PersistenceError::io(&new_path, source))?;
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(PersistenceError::database)?;
+        let mut next_offset = 0_u64;
+        for (ordinal, _, _, data_bytes) in &rows {
+            transaction
+                .execute(
+                    "UPDATE replay_chunks SET data_file = ?2, data_offset = ?3
+                 WHERE ordinal = ?1",
+                    params![
+                        ordinal,
+                        &new_file,
+                        i64::try_from(next_offset).unwrap_or(i64::MAX)
+                    ],
+                )
+                .map_err(PersistenceError::database)?;
+            next_offset = next_offset.saturating_add(u64::try_from(*data_bytes).map_err(|_| {
+                PersistenceError::Corrupt("replay chunk length exceeds u64".to_owned())
+            })?);
+        }
+        transaction
+            .execute(
+                "UPDATE runtime_meta SET replay_file = ?1 WHERE singleton = 1",
+                [&new_file],
+            )
+            .map_err(PersistenceError::database)?;
+        transaction.commit().map_err(PersistenceError::database)?;
+        generation.commit();
+        self.replay_file = new_file;
+        fs::remove_file(old_path).ok();
+        debug_assert_eq!(offset, next_offset);
+        Ok(())
     }
 }
 
@@ -4266,6 +4454,63 @@ fn prepare_state_dir(path: &Path) -> Result<(), PersistenceError> {
     Ok(())
 }
 
+fn prepare_replay_dir(path: &Path) -> Result<(), PersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(PersistenceError::InvalidDirectory {
+                    path: path.to_path_buf(),
+                    message: "replay path must be a real directory, not a symlink".to_owned(),
+                });
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|source| PersistenceError::io(path, source))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                .map_err(|source| PersistenceError::io(path, source))?;
+        }
+        Err(source) => return Err(PersistenceError::io(path, source)),
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| PersistenceError::io(path, source))?;
+    let expected_uid = rustix::process::geteuid().as_raw();
+    if metadata.uid() != expected_uid || metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err(PersistenceError::InvalidDirectory {
+            path: path.to_path_buf(),
+            message: "replay directory owner or permissions are invalid".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_replay_file_name(name: &str) -> Result<(), PersistenceError> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.is_absolute()
+        || path.components().count() != 1
+        || path.file_name().and_then(std::ffi::OsStr::to_str) != Some(name)
+        || Path::new(name)
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            != Some("bin")
+    {
+        return Err(PersistenceError::Corrupt(format!(
+            "invalid replay file name {name:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_replay_file_name(connection: &Connection) -> Result<String, PersistenceError> {
+    connection
+        .query_row(
+            "SELECT replay_file FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)
+}
+
 fn validate_optional_state_file(path: &Path) -> Result<(), PersistenceError> {
     match fs::symlink_metadata(path) {
         Ok(_) => validate_state_file(path),
@@ -4302,6 +4547,7 @@ fn validate_state_file(path: &Path) -> Result<(), PersistenceError> {
 fn create_schema(
     connection: &Connection,
     initial_epoch: &str,
+    replay_file: &str,
 ) -> Result<RuntimeId, PersistenceError> {
     let runtime_id = RuntimeId::new();
     connection
@@ -4313,7 +4559,8 @@ fn create_schema(
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 schema_version INTEGER NOT NULL,
                 runtime_id TEXT NOT NULL,
-                current_epoch TEXT NOT NULL
+                current_epoch TEXT NOT NULL,
+                replay_file TEXT NOT NULL
              );
              CREATE TABLE runs (
                 id TEXT PRIMARY KEY NOT NULL,
@@ -4339,22 +4586,24 @@ fn create_schema(
                 run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                 start_byte INTEGER NOT NULL CHECK (start_byte >= 0),
                 end_byte INTEGER NOT NULL CHECK (end_byte > start_byte),
-                data BLOB NOT NULL,
+                data_file TEXT NOT NULL,
+                data_offset INTEGER NOT NULL CHECK (data_offset >= 0),
+                data_bytes INTEGER NOT NULL CHECK (data_bytes > 0),
                 UNIQUE(run_id, start_byte)
-             );
-             CREATE INDEX replay_chunks_run_start_byte ON replay_chunks(run_id, start_byte);"
+             );"
         ))
         .map_err(PersistenceError::database)?;
     connection
         .execute(
-            "INSERT INTO runtime_meta(singleton, schema_version, runtime_id, current_epoch)
-             VALUES (1, ?1, ?2, ?3)",
-            params![SCHEMA_VERSION, runtime_id.to_string(), initial_epoch],
+            "INSERT INTO runtime_meta(singleton, schema_version, runtime_id, current_epoch, replay_file)
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            params![SCHEMA_VERSION, runtime_id.to_string(), initial_epoch, replay_file],
         )
         .map_err(PersistenceError::database)?;
     Ok(runtime_id)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, PersistenceError> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -4365,11 +4614,12 @@ fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, Persis
             expected: SCHEMA_VERSION,
         });
     }
-    let (meta_rows, meta_version, runtime_id, current_epoch): (i64, i64, String, String) = connection
+    let (meta_rows, meta_version, runtime_id, current_epoch, replay_file):
+        (i64, i64, String, String, String) = connection
         .query_row(
-            "SELECT count(*), min(schema_version), min(runtime_id), min(current_epoch) FROM runtime_meta",
+            "SELECT count(*), min(schema_version), min(runtime_id), min(current_epoch), min(replay_file) FROM runtime_meta",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .map_err(PersistenceError::database)?;
     if meta_rows != 1 || meta_version != SCHEMA_VERSION {
@@ -4381,6 +4631,7 @@ fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, Persis
     Uuid::parse_str(&current_epoch).map_err(|_| {
         PersistenceError::Corrupt("runtime metadata has an invalid daemon epoch".to_owned())
     })?;
+    validate_replay_file_name(&replay_file)?;
     let runtime_id = runtime_id.parse().map_err(|_| {
         PersistenceError::Corrupt("runtime metadata has an invalid Runtime identity".to_owned())
     })?;
@@ -4398,10 +4649,6 @@ fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, Persis
         .collect::<Result<BTreeSet<_>, _>>()
         .map_err(PersistenceError::database)?;
     let expected = BTreeSet::from([
-        (
-            "index".to_owned(),
-            "replay_chunks_run_start_byte".to_owned(),
-        ),
         ("index".to_owned(), "runs_creation_key".to_owned()),
         ("table".to_owned(), "replay_chunks".to_owned()),
         ("table".to_owned(), "runs".to_owned()),
@@ -4415,7 +4662,13 @@ fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, Persis
     validate_table_columns(
         connection,
         "runtime_meta",
-        &["singleton", "schema_version", "runtime_id", "current_epoch"],
+        &[
+            "singleton",
+            "schema_version",
+            "runtime_id",
+            "current_epoch",
+            "replay_file",
+        ],
     )?;
     validate_table_columns(
         connection,
@@ -4442,7 +4695,15 @@ fn validate_existing_schema(connection: &Connection) -> Result<RuntimeId, Persis
     validate_table_columns(
         connection,
         "replay_chunks",
-        &["ordinal", "run_id", "start_byte", "end_byte", "data"],
+        &[
+            "ordinal",
+            "run_id",
+            "start_byte",
+            "end_byte",
+            "data_file",
+            "data_offset",
+            "data_bytes",
+        ],
     )?;
     validate_creation_key_index(connection)?;
     validate_database_format_pragmas(connection)?;
@@ -4558,7 +4819,11 @@ fn validate_quick_check(connection: &Connection) -> Result<(), PersistenceError>
     Ok(())
 }
 
-fn validate_application_state(connection: &Connection) -> Result<(), PersistenceError> {
+#[allow(clippy::too_many_lines)]
+fn validate_application_state(
+    connection: &Connection,
+    replay_dir: &Path,
+) -> Result<(), PersistenceError> {
     let mut statement = connection
         .prepare(
             "SELECT id, creation_key, spec_json, lineage_json, state_kind, state_json, source_epoch, pid,
@@ -4645,7 +4910,15 @@ fn validate_application_state(connection: &Connection) -> Result<(), Persistence
                 "Run {id} metadata accounting does not match"
             )));
         }
-        validate_replay_window(connection, id, oldest, head, replay_bytes, truncated != 0)?;
+        validate_replay_window_in(
+            connection,
+            replay_dir,
+            id,
+            oldest,
+            head,
+            replay_bytes,
+            truncated != 0,
+        )?;
         metadata_total = metadata_total.saturating_add(stored_metadata);
         replay_total = replay_total.saturating_add(replay_bytes);
     }
@@ -4678,6 +4951,7 @@ fn decode_unique_creation_key(
     Ok(creation_key)
 }
 
+#[cfg(test)]
 fn validate_replay_window(
     connection: &Connection,
     id: RunId,
@@ -4686,9 +4960,29 @@ fn validate_replay_window(
     replay_bytes: u64,
     truncated: bool,
 ) -> Result<(), PersistenceError> {
+    validate_replay_window_in(
+        connection,
+        test_replay_dir(),
+        id,
+        oldest,
+        head,
+        replay_bytes,
+        truncated,
+    )
+}
+
+fn validate_replay_window_in(
+    connection: &Connection,
+    replay_dir: &Path,
+    id: RunId,
+    oldest: u64,
+    head: u64,
+    replay_bytes: u64,
+    truncated: bool,
+) -> Result<(), PersistenceError> {
     let mut statement = connection
         .prepare(
-            "SELECT start_byte, end_byte, length(data)
+            "SELECT start_byte, end_byte, data_file, data_offset, data_bytes
              FROM replay_chunks WHERE run_id = ?1 ORDER BY start_byte",
         )
         .map_err(PersistenceError::database)?;
@@ -4697,7 +4991,9 @@ fn validate_replay_window(
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(PersistenceError::database)?
@@ -4713,10 +5009,17 @@ fn validate_replay_window(
     }
     let mut expected = oldest;
     let mut bytes = 0_u64;
-    for (start_byte, end_byte, len) in chunks {
+    for (start_byte, end_byte, data_file, data_offset, data_bytes) in chunks {
         let start_byte = nonnegative_u64(start_byte, "chunk start byte")?;
         let end_byte = nonnegative_u64(end_byte, "chunk end byte")?;
-        let len = nonnegative_u64(len, "chunk length")?;
+        let len = nonnegative_u64(data_bytes, "chunk length")?;
+        let offset = nonnegative_u64(data_offset, "chunk file offset")?;
+        let actual = read_replay_segment(replay_dir, &data_file, offset, len)?.len() as u64;
+        if actual != len {
+            return Err(PersistenceError::Corrupt(format!(
+                "Run {id} replay chunk length does not match its payload"
+            )));
+        }
         if start_byte != expected || end_byte <= start_byte || end_byte - start_byte != len {
             return Err(PersistenceError::Corrupt(format!(
                 "Run {id} replay range [{start_byte}, {end_byte}) is invalid or not contiguous at {expected}"
@@ -4743,7 +5046,30 @@ fn validate_replay_window(
     Ok(())
 }
 
-fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, PersistenceError> {
+fn read_replay_segment(
+    replay_dir: &Path,
+    file_name: &str,
+    offset: u64,
+    length: u64,
+) -> Result<Vec<u8>, PersistenceError> {
+    validate_replay_file_name(file_name)?;
+    let path = replay_dir.join(file_name);
+    validate_state_file(&path)?;
+    let mut file = File::open(&path).map_err(|source| PersistenceError::io(&path, source))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| PersistenceError::io(&path, source))?;
+    let length = usize::try_from(length)
+        .map_err(|_| PersistenceError::Corrupt("replay segment is too large".to_owned()))?;
+    let mut data = vec![0; length];
+    file.read_exact(&mut data)
+        .map_err(|source| PersistenceError::io(&path, source))?;
+    Ok(data)
+}
+
+fn load_recovered(
+    connection: &Connection,
+    replay_dir: &Path,
+) -> Result<Vec<RecoveredRun>, PersistenceError> {
     let mut statement = connection
         .prepare(
             "SELECT id, creation_key, spec_json, lineage_json, state_json, pid, durable_first_available_byte,
@@ -4755,13 +5081,14 @@ fn load_recovered(connection: &Connection) -> Result<Vec<RecoveredRun>, Persiste
     let mut rows = statement.query([]).map_err(PersistenceError::database)?;
     let mut recovered = Vec::new();
     while let Some(row) = rows.next().map_err(PersistenceError::database)? {
-        recovered.push(decode_recovered_row(connection, row)?);
+        recovered.push(decode_recovered_row(connection, replay_dir, row)?);
     }
     Ok(recovered)
 }
 
 fn decode_recovered_row(
     connection: &Connection,
+    replay_dir: &Path,
     row: &rusqlite::Row<'_>,
 ) -> Result<RecoveredRun, PersistenceError> {
     let id_text: String = row.get(0).map_err(PersistenceError::database)?;
@@ -4833,7 +5160,7 @@ fn decode_recovered_row(
             current_size: None,
         },
         replay: OutputReplay {
-            chunks: load_recovered_chunks(connection, &id_text)?,
+            chunks: load_recovered_chunks(connection, replay_dir, &id_text)?,
             first_available_byte,
             latest_output_bytes,
             truncated,
@@ -4844,32 +5171,45 @@ fn decode_recovered_row(
 
 fn load_recovered_chunks(
     connection: &Connection,
+    replay_dir: &Path,
     id: &str,
 ) -> Result<Vec<OutputChunk>, PersistenceError> {
     let mut statement = connection
         .prepare(
-            "SELECT start_byte, end_byte, data
+            "SELECT start_byte, end_byte, data_file, data_offset, data_bytes
              FROM replay_chunks WHERE run_id = ?1 ORDER BY start_byte",
         )
         .map_err(PersistenceError::database)?;
     statement
         .query_map([id], |row| {
+            let start_byte = row.get::<_, i64>(0)?;
+            let end_byte = row.get::<_, i64>(1)?;
+            let data_file = row.get::<_, String>(2)?;
+            let data_offset = row.get::<_, i64>(3)?;
+            let data_bytes = row.get::<_, i64>(4)?;
+            let data = read_replay_segment(
+                replay_dir,
+                &data_file,
+                u64::try_from(data_offset).unwrap_or(u64::MAX),
+                u64::try_from(data_bytes).unwrap_or(u64::MAX),
+            )
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
             Ok(OutputChunk {
-                start_byte: u64::try_from(row.get::<_, i64>(0)?).map_err(|error| {
+                start_byte: u64::try_from(start_byte).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         0,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
                 })?,
-                end_byte: u64::try_from(row.get::<_, i64>(1)?).map_err(|error| {
+                end_byte: u64::try_from(end_byte).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
                         1,
                         rusqlite::types::Type::Integer,
                         Box::new(error),
                     )
                 })?,
-                data: row.get(2)?,
+                data,
             })
         })
         .map_err(PersistenceError::database)?
@@ -4977,7 +5317,7 @@ fn reset_window_to(
         .map_err(PersistenceError::database)?;
     transaction
         .query_row(
-            "SELECT coalesce(sum(length(data)), 0) FROM replay_chunks WHERE run_id = ?1",
+            "SELECT coalesce(sum(data_bytes), 0) FROM replay_chunks WHERE run_id = ?1",
             [id_text],
             |row| row.get(0),
         )
@@ -4992,71 +5332,50 @@ fn reset_window_to(
 /// `start_byte` instead finds nothing for any interior range, which reports
 /// honest durable bytes as lost and latches persistence off daemon-wide.
 ///
-/// The caller must have flushed any buffered bytes first — they are durable by
-/// `durable_head` but not yet a row, and this only sees rows.
-fn stored_range_matches(
+fn stored_range_matches_in(
     transaction: &Transaction<'_>,
+    replay_dir: &Path,
     id_text: &str,
     start_byte: i64,
     end_byte: i64,
     expected: &[u8],
 ) -> Result<bool, PersistenceError> {
-    let stored: Option<(i64, i64, Vec<u8>)> = transaction
+    let stored: Option<(i64, i64, String, i64, i64)> = transaction
         .prepare_cached(
-            "SELECT start_byte, end_byte, data FROM replay_chunks
+            "SELECT start_byte, end_byte, data_file, data_offset, data_bytes
+                 FROM replay_chunks
                  WHERE run_id = ?1 AND start_byte <= ?2
                  ORDER BY start_byte DESC LIMIT 1",
         )
         .and_then(|mut statement| {
             statement
                 .query_row(params![id_text, start_byte], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })
                 .optional()
         })
         .map_err(PersistenceError::database)?;
-    Ok(stored.is_some_and(|(row_start, row_end, data)| {
-        if start_byte < row_start || end_byte > row_end {
-            return false;
-        }
-        let from = usize::try_from(start_byte - row_start).unwrap_or(usize::MAX);
-        let to = usize::try_from(end_byte - row_start).unwrap_or(usize::MAX);
-        data.get(from..to) == Some(expected)
-    }))
-}
-
-/// Write the buffered contiguous bytes as one `replay_chunks` row.
-///
-/// Called whenever the buffer reaches [`COALESCE_ROW_BYTES`] and — critically —
-/// before anything else reads the table, so no caller can observe a range that
-/// is logically durable but still sitting in memory. `append_replay` advances
-/// `durable_head` as bytes are buffered, which is what makes those two facts
-/// diverge in between.
-fn flush_pending_row(
-    transaction: &Transaction<'_>,
-    id_text: &str,
-    pending_start: i64,
-    pending: &mut Vec<u8>,
-) -> Result<(), PersistenceError> {
-    if pending.is_empty() {
-        return Ok(());
+    let Some((row_start, row_end, data_file, data_offset, data_bytes)) = stored else {
+        return Ok(false);
+    };
+    if start_byte < row_start || end_byte > row_end {
+        return Ok(false);
     }
-    let len = i64::try_from(pending.len())
-        .map_err(|_| PersistenceError::Mutation("coalesced row is too large".to_owned()))?;
-    let end_byte = pending_start.checked_add(len).ok_or_else(|| {
-        PersistenceError::Mutation("coalesced row end byte exceeds SQLite".to_owned())
-    })?;
-    transaction
-        .prepare_cached(
-            "INSERT INTO replay_chunks(run_id, start_byte, end_byte, data)
-             VALUES (?1, ?2, ?3, ?4)",
-        )
-        .and_then(|mut statement| {
-            statement.execute(params![id_text, pending_start, end_byte, &*pending])
-        })
-        .map_err(PersistenceError::database)?;
-    pending.clear();
-    Ok(())
+    let data = read_replay_segment(
+        replay_dir,
+        &data_file,
+        u64::try_from(data_offset).unwrap_or(u64::MAX),
+        u64::try_from(data_bytes).unwrap_or(u64::MAX),
+    )?;
+    let from = usize::try_from(start_byte - row_start).unwrap_or(usize::MAX);
+    let to = usize::try_from(end_byte - row_start).unwrap_or(usize::MAX);
+    Ok(data.get(from..to) == Some(expected))
 }
 
 /// A Run's durable replay cursors plus the row currently being packed.
@@ -5071,6 +5390,144 @@ struct ReplayCursors {
     replay_bytes: i64,
     pending: Vec<u8>,
     pending_start: i64,
+    writer: ReplayFileWriter,
+}
+
+fn flush_pending_row_for_cursors(
+    transaction: &Transaction<'_>,
+    id_text: &str,
+    cursors: &mut ReplayCursors,
+) -> Result<(), PersistenceError> {
+    if cursors.pending.is_empty() {
+        return Ok(());
+    }
+    let len = i64::try_from(cursors.pending.len())
+        .map_err(|_| PersistenceError::Mutation("coalesced row is too large".to_owned()))?;
+    let end_byte = cursors.pending_start.checked_add(len).ok_or_else(|| {
+        PersistenceError::Mutation("coalesced row end byte exceeds SQLite".to_owned())
+    })?;
+    let offset = cursors.writer.append(&cursors.pending)?;
+    transaction
+        .prepare_cached(
+            "INSERT INTO replay_chunks(run_id, start_byte, end_byte, data_file,
+             data_offset, data_bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![
+                id_text,
+                cursors.pending_start,
+                end_byte,
+                &cursors.writer.file_name,
+                i64::try_from(offset).unwrap_or(i64::MAX),
+                len,
+            ])
+        })
+        .map_err(PersistenceError::database)?;
+    cursors.pending.clear();
+    Ok(())
+}
+
+/// Append-only payload owner for one persistence transaction.
+///
+/// `SQLite` stores only replay coordinates. Bytes are written and synced before
+/// the transaction commits; an abandoned tail is harmless and is reclaimed by
+/// the next startup/compaction sweep. The actor is the sole writer, so one
+/// shared file can serve every Run without cross-process locking.
+struct ReplayFileWriter {
+    dir: PathBuf,
+    file_name: String,
+    file: File,
+    base_len: u64,
+    committed: bool,
+}
+
+struct ReplayGenerationGuard {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl ReplayGenerationGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            committed: false,
+        }
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReplayGenerationGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl ReplayFileWriter {
+    fn open(dir: &Path, file_name: &str) -> Result<Self, PersistenceError> {
+        validate_replay_file_name(file_name)?;
+        let path = dir.join(file_name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => validate_state_file(&path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(PersistenceError::io(&path, source)),
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|source| PersistenceError::io(&path, source))?;
+        validate_state_file(&path)?;
+        let base_len = file
+            .metadata()
+            .map_err(|source| PersistenceError::io(&path, source))?
+            .len();
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            file_name: file_name.to_owned(),
+            file,
+            base_len,
+            committed: false,
+        })
+    }
+
+    fn append(&mut self, data: &[u8]) -> Result<u64, PersistenceError> {
+        let offset = self
+            .file
+            .metadata()
+            .map_err(|source| PersistenceError::io(self.path(), source))?
+            .len();
+        self.file
+            .write_all(data)
+            .map_err(|source| PersistenceError::io(self.path(), source))?;
+        self.file
+            .sync_data()
+            .map_err(|source| PersistenceError::io(self.path(), source))?;
+        Ok(offset)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.dir.join(&self.file_name)
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ReplayFileWriter {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.file.set_len(self.base_len);
+        }
+    }
 }
 
 /// Commit one chunk against the durable window: verify it, jump the floor for
@@ -5107,13 +5564,15 @@ fn apply_replay_chunk(
         // rather than written. Any buffered bytes must land first: they are
         // durable by `durable_head` but not yet a row, and the lookup would
         // otherwise miss them and report honest bytes as lost.
-        flush_pending_row(
+        flush_pending_row_for_cursors(transaction, id_text, cursors)?;
+        if !stored_range_matches_in(
             transaction,
+            cursors.writer.dir.as_path(),
             id_text,
-            cursors.pending_start,
-            &mut cursors.pending,
-        )?;
-        if !stored_range_matches(transaction, id_text, start_byte, end_byte, &chunk.data)? {
+            start_byte,
+            end_byte,
+            &chunk.data,
+        )? {
             return Err(PersistenceError::Mutation(format!(
                 "Run {id} replay range [{}, {}) is missing or changed bytes",
                 chunk.start_byte, chunk.end_byte
@@ -5154,12 +5613,7 @@ fn apply_replay_chunk(
         // Buffered bytes must become rows before that call: they are below the
         // new floor's predecessor and belong either in the prefix being dropped
         // or in the surviving sum, and the re-`SELECT` only sees rows.
-        flush_pending_row(
-            transaction,
-            id_text,
-            cursors.pending_start,
-            &mut cursors.pending,
-        )?;
+        flush_pending_row_for_cursors(transaction, id_text, cursors)?;
         cursors.replay_bytes = reset_window_to(transaction, id_text, start_byte)?;
         cursors.durable_oldest = start_byte;
         cursors.durable_head = start_byte;
@@ -5177,12 +5631,7 @@ fn apply_replay_chunk(
     }
     cursors.pending.extend_from_slice(&chunk.data);
     if cursors.pending.len() >= COALESCE_ROW_BYTES {
-        flush_pending_row(
-            transaction,
-            id_text,
-            cursors.pending_start,
-            &mut cursors.pending,
-        )?;
+        flush_pending_row_for_cursors(transaction, id_text, cursors)?;
     }
     cursors.durable_head = end_byte;
     cursors.replay_bytes = cursors.replay_bytes.saturating_add(
@@ -5192,10 +5641,38 @@ fn apply_replay_chunk(
     Ok(())
 }
 
+#[cfg(test)]
 fn append_replay(
     transaction: &Transaction<'_>,
     id: RunId,
     replay: &OutputReplay,
+) -> Result<bool, PersistenceError> {
+    let replay_file: String = transaction
+        .query_row(
+            "SELECT replay_file FROM runtime_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    append_replay_external(transaction, id, replay, test_replay_dir(), &replay_file)
+}
+
+fn append_replay_external(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    replay: &OutputReplay,
+    replay_dir: &Path,
+    replay_file: &str,
+) -> Result<bool, PersistenceError> {
+    append_replay_with_storage(transaction, id, replay, replay_dir, replay_file)
+}
+
+fn append_replay_with_storage(
+    transaction: &Transaction<'_>,
+    id: RunId,
+    replay: &OutputReplay,
+    replay_dir: &Path,
+    replay_file: &str,
 ) -> Result<bool, PersistenceError> {
     let id_text = id.to_string();
     let (durable_oldest, durable_head, replay_bytes, state_kind): (
@@ -5235,20 +5712,22 @@ fn append_replay(
         replay_bytes,
         pending: Vec::new(),
         pending_start: 0,
+        writer: ReplayFileWriter::open(replay_dir, replay_file)?,
     };
     for chunk in &replay.chunks {
         apply_replay_chunk(transaction, id, &id_text, replay, chunk, &mut cursors)?;
     }
+    // Every reader below -- the pruner's index walk, and `validate_replay_window`
+    // on the next open -- sees rows, not the buffer, so it must land first.
+    flush_pending_row_for_cursors(transaction, &id_text, &mut cursors)?;
     let ReplayCursors {
         mut durable_oldest,
         durable_head,
         mut replay_bytes,
-        mut pending,
-        pending_start,
+        pending: _,
+        pending_start: _,
+        mut writer,
     } = cursors;
-    // Every reader below -- the pruner's index walk, and `validate_replay_window`
-    // on the next open -- sees rows, not the buffer, so it must land first.
-    flush_pending_row(transaction, &id_text, pending_start, &mut pending)?;
     let evicted = prune_run_replay(
         transaction,
         id,
@@ -5273,6 +5752,7 @@ fn append_replay(
             ])
         })
         .map_err(PersistenceError::database)?;
+    writer.commit();
     Ok(evicted)
 }
 
@@ -5303,9 +5783,8 @@ fn prune_run_replay(
 /// 1.79x of the SQL layer's CPU on its own.
 ///
 /// The cut point is found by walking the index forward and accumulating
-/// lengths, which reads the same rows the old loop read but without a
-/// statement per row. `data` is never loaded: `length(data)` on a BLOB column
-/// is answered from the record header, so this stays a metadata walk.
+/// `data_bytes`, so the payload file is never loaded and the operation stays a
+/// metadata-only walk.
 fn prune_run_replay_to(
     transaction: &Transaction<'_>,
     id: RunId,
@@ -5319,7 +5798,7 @@ fn prune_run_replay_to(
     }
     let mut statement = transaction
         .prepare_cached(
-            "SELECT start_byte, length(data) FROM replay_chunks
+            "SELECT start_byte, data_bytes FROM replay_chunks
              WHERE run_id = ?1 ORDER BY start_byte",
         )
         .map_err(PersistenceError::database)?;
@@ -5392,7 +5871,7 @@ fn prune_global_replay_to(
         }
         let candidate: Option<(i64, String, i64, i64)> = transaction
             .query_row(
-                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, length(chunk.data)
+                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, chunk.data_bytes
                  FROM replay_chunks AS chunk
                  WHERE (SELECT count(*) FROM replay_chunks AS retained
                         WHERE retained.run_id = chunk.run_id) > 1
@@ -5452,18 +5931,27 @@ fn trim_oldest_row(
         if nonnegative_u64(total, "global replay bytes")? <= replay_limit || runs == 0 {
             return Ok(evicted);
         }
-        let largest: Option<(i64, String, i64, i64)> = transaction
+        let largest: Option<(i64, String, i64, i64, i64)> = transaction
             .query_row(
-                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, length(chunk.data)
+                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, chunk.data_bytes,
+                        chunk.data_offset
                  FROM replay_chunks AS chunk
                  JOIN runs ON runs.id = chunk.run_id
                  ORDER BY runs.replay_bytes DESC, chunk.ordinal LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(PersistenceError::database)?;
-        let Some((ordinal, run_id, start_byte, bytes)) = largest else {
+        let Some((ordinal, run_id, start_byte, bytes, data_offset)) = largest else {
             return Err(PersistenceError::Corrupt(
                 "global replay accounting has no chunks".to_owned(),
             ));
@@ -5479,11 +5967,16 @@ fn trim_oldest_row(
             // trimmed further without emptying one. Stop rather than spin.
             return Ok(evicted);
         }
+        if data_offset < 0 {
+            return Err(PersistenceError::Corrupt(
+                "replay row has no external offset".to_owned(),
+            ));
+        }
         transaction
             .execute(
-                "UPDATE replay_chunks SET start_byte = ?2, data = substr(data, ?3)
-                 WHERE ordinal = ?1",
-                params![ordinal, start_byte + shed, shed + 1],
+                "UPDATE replay_chunks SET start_byte = ?2, data_offset = ?3,
+                 data_bytes = ?4 WHERE ordinal = ?1",
+                params![ordinal, start_byte + shed, data_offset + shed, bytes - shed,],
             )
             .map_err(PersistenceError::database)?;
         evicted = true;
@@ -5615,6 +6108,7 @@ fn file_len(path: &Path) -> Result<u64, PersistenceError> {
 
 fn validate_physical_limits(
     state_dir: &Path,
+    replay_dir: &Path,
     database_path: &Path,
     wal_path: &Path,
     shm_path: &Path,
@@ -5622,6 +6116,7 @@ fn validate_physical_limits(
     let database = file_len(database_path)?;
     let wal = file_len(wal_path)?;
     let shm = file_len(shm_path)?;
+    let replay = directory_file_len(replay_dir)?;
     if database > DATABASE_MAX_BYTES {
         return Err(PersistenceError::Corrupt(
             "main database exceeds 384 MiB".to_owned(),
@@ -5635,13 +6130,37 @@ fn validate_physical_limits(
             "shared-memory sidecar exceeds 4 MiB".to_owned(),
         ));
     }
-    if database.saturating_add(wal).saturating_add(shm) > STATE_FILES_MAX_BYTES {
+    if database
+        .saturating_add(wal)
+        .saturating_add(shm)
+        .saturating_add(replay)
+        > STATE_FILES_MAX_BYTES
+    {
         return Err(PersistenceError::Corrupt(format!(
-            "state files in {} exceed 404 MiB",
+            "state files in {} exceed 768 MiB",
             state_dir.display()
         )));
     }
     Ok(())
+}
+
+fn directory_file_len(path: &Path) -> Result<u64, PersistenceError> {
+    let entries = fs::read_dir(path).map_err(|source| PersistenceError::io(path, source))?;
+    let mut total = 0_u64;
+    for entry in entries {
+        let entry = entry.map_err(|source| PersistenceError::io(path, source))?;
+        let child = entry.path();
+        let metadata =
+            fs::symlink_metadata(&child).map_err(|source| PersistenceError::io(&child, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(PersistenceError::InvalidDirectory {
+                path: child,
+                message: "replay directory may contain only regular files".to_owned(),
+            });
+        }
+        total = total.saturating_add(metadata.len());
+    }
+    Ok(total)
 }
 
 fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -5651,11 +6170,25 @@ fn mutex_lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
+fn test_replay_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("ctxmux-replay-tests-{}", std::process::id()));
+        fs::create_dir_all(&path).expect("create test replay directory");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("protect test replay directory");
+        path
+    })
+    .as_path()
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashSet},
         env,
         fs::{self, OpenOptions},
+        io,
         os::unix::{fs::MetadataExt, process::ExitStatusExt},
         path::{Path, PathBuf},
         process::{
@@ -5680,13 +6213,15 @@ mod tests {
         AdmissionLimits, CommitProbe, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
         MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
         PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
-        PersistentCandidate, PersistentStartCompletion, RETAINED_RUN_RECORDS,
+        PersistentCandidate, PersistentStartCompletion, REPLAY_DIR, RETAINED_RUN_RECORDS,
         RUN_RECORD_FORMAT_ENVELOPE, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase,
-        StartDisposition, StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES,
-        WAL_CHECKPOINT_MAX_RETRIES, WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES, append_replay,
-        create_schema, file_len, idle_fold_wal, metadata_size, mutex_lock, nonnegative_u64,
-        prune_global_replay_to, retry_transient_storage, retry_wal_checkpoint,
-        validate_existing_schema, validate_replay_window, wal_charge_for_cache,
+        StartDisposition, StartReceipt, StateLockGuard, StateStore,
+        TEST_REPLAY_COMPACTION_TRIGGER_BYTES, WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES,
+        WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES, append_replay, append_replay_external,
+        create_schema, directory_file_len, file_len, idle_fold_wal, load_recovered, metadata_size,
+        mutex_lock, nonnegative_u64, prune_global_replay_to, retry_transient_storage,
+        retry_wal_checkpoint, validate_existing_schema, validate_replay_window,
+        wal_charge_for_cache,
     };
     use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 
@@ -5799,10 +6334,12 @@ mod tests {
         assert_eq!(DATABASE_MAX_BYTES, 384 * 1024 * 1024);
         assert_eq!(WAL_MAX_BYTES, 16 * 1024 * 1024);
         assert_eq!(SHM_MAX_BYTES, 4 * 1024 * 1024);
-        assert_eq!(
-            DATABASE_MAX_BYTES + WAL_MAX_BYTES + SHM_MAX_BYTES,
-            STATE_FILES_MAX_BYTES
-        );
+        const {
+            assert!(
+                DATABASE_MAX_BYTES + WAL_MAX_BYTES + SHM_MAX_BYTES + GLOBAL_REPLAY_BYTES
+                    <= STATE_FILES_MAX_BYTES
+            );
+        }
         let worst_admitted_output =
             u64::try_from(MAX_TRANSACTION_PAYLOAD_BYTES).expect("payload limit fits u64") * 4
                 + 1024 * 1024;
@@ -6058,7 +6595,8 @@ mod tests {
     fn schema_bootstrap_uses_a_reopenable_epoch_before_normalization() {
         let connection = Connection::open_in_memory().expect("open bootstrap fixture");
         let epoch = uuid::Uuid::new_v4().to_string();
-        create_schema(&connection, &epoch).expect("create schema with a valid bootstrap epoch");
+        create_schema(&connection, &epoch, "replay-test.bin")
+            .expect("create schema with a valid bootstrap epoch");
         validate_existing_schema(&connection).expect("bootstrap schema is immediately reopenable");
         let stored: String = connection
             .query_row(
@@ -6232,7 +6770,7 @@ mod tests {
     #[test]
     fn creation_key_index_is_unique_binary_and_exactly_validated() {
         let connection = test_connection();
-        validate_existing_schema(&connection).expect("accept canonical schema 4 index");
+        validate_existing_schema(&connection).expect("accept canonical schema 5 index");
 
         connection
             .execute_batch(
@@ -6914,88 +7452,122 @@ mod tests {
     }
 
     #[test]
-    fn persistence_actor_survives_a_short_lived_external_checkpoint_reader() {
-        let temp = TempDir::new().expect("create WAL reader fixture");
+    fn persistence_actor_writes_replay_without_filling_the_main_wal() {
+        let temp = TempDir::new().expect("create replay file fixture");
         let state_dir = temp.path().join("state");
         let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
         assert!(recovered.is_empty());
-        let hooks = Arc::clone(&persistence.inner.test_hooks);
-        // This fixture's subject is a reader pinning WAL frames, so it needs
-        // those frames to still be there when the reader snapshots. The actor's
-        // idle fold would zero them first, leaving nothing to pin and no busy
-        // checkpoint to observe. Suppress before writing the row that creates
-        // them, not after: the actor can drain and fold in between.
-        hooks.suppress_idle_fold.store(true, Ordering::Release);
         let info = running_info(RunId::new());
         let durable = persistence
             .insert_start(&test_operation_key(info.id), &info)
-            .expect("insert reader fixture Run");
-
-        // Push the WAL past the checkpoint ceiling. A start only folds when the
-        // WAL is over it, so without this there is no checkpoint for the reader
-        // to make busy and the releaser below waits forever. Appends leave the
-        // WAL above the ceiling until the *next* transaction's admission folds
-        // it, and nothing else runs in between here.
-        let wal = state_dir.join(format!("{DATABASE_FILE}-wal"));
-        let payload = vec![b'x'; 256 * 1024];
-        let mut offset = 0_u64;
-        while file_len(&wal).unwrap_or(0) <= WAL_CHECKPOINT_BYTES {
-            expect_queued(durable.append(info.id, replay(vec![chunk(offset, &payload)])));
-            offset += payload.len() as u64;
-            persistence.barrier().expect("drain the WAL-growing append");
-            assert!(
-                offset < 64 * 1024 * 1024,
-                "appends never grew the WAL past its 8 MiB ceiling"
-            );
-        }
-
-        hooks.checkpoint_attempts.store(0, Ordering::Release);
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
-        let database_path = state_dir.join(DATABASE_FILE);
-        let reader = thread::spawn(move || {
-            let connection = Connection::open(database_path).expect("open reader connection");
-            connection
-                .execute_batch("PRAGMA busy_timeout=0; BEGIN;")
-                .expect("hold a WAL reader snapshot");
-            let _: i64 = connection
-                .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
-                .expect("read a WAL snapshot");
-            ready_tx.send(()).expect("signal reader snapshot");
-            release_rx.recv().expect("wait for checkpoint retry");
-            connection
-                .execute_batch("ROLLBACK")
-                .expect("release reader snapshot");
-        });
-        ready_rx.recv().expect("reader reaches snapshot");
-
-        let releaser_hooks = Arc::clone(&hooks);
-        let releaser = thread::spawn(move || {
-            while releaser_hooks.checkpoint_attempts.load(Ordering::Acquire) < 2 {
-                thread::yield_now();
-            }
-            release_tx
-                .send(())
-                .expect("release reader after checkpoint retries begin");
-        });
-        let next = running_info(RunId::new());
-        let prepared = persistence
-            .prepare_start(&test_operation_key(next.id), &next)
-            .expect("prepare reader fixture start");
-        let staged = persistence
-            .stage_start(prepared, Vec::new())
-            .expect("checkpoint retry eventually stages the next start");
-        staged
-            .abort()
-            .expect("abort staged fixture after checkpoint proof");
-        releaser.join().expect("join reader releaser");
-        reader.join().expect("join reader fixture");
-
+            .expect("insert replay fixture Run");
+        let payload = vec![b'x'; 4 * FOLD_FLOOR_PAYLOAD];
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, &payload)])));
+        persistence.barrier().expect("drain replay append");
+        let replay_bytes = directory_file_len(&state_dir.join(REPLAY_DIR))
+            .expect("measure external replay payload");
+        assert!(replay_bytes >= payload.len() as u64);
         assert!(!persistence.is_failed());
+    }
+
+    #[test]
+    fn oversized_replay_generation_compacts_without_changing_the_window() {
+        let temp = TempDir::new().expect("create replay compaction fixture");
+        let state_dir = temp.path().join("state");
+        let (mut store, recovered) = StateStore::open(
+            &state_dir,
+            AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .expect("open replay compaction store");
+        assert!(recovered.is_empty());
+
+        let id = RunId::new();
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("start compaction fixture transaction");
+        insert_test_run(&transaction, id, "running", 1);
+        append_replay_external(
+            &transaction,
+            id,
+            &replay(vec![chunk(0, b"retain this payload")]),
+            &store.replay_dir,
+            &store.replay_file,
+        )
+        .expect("write compaction fixture replay");
+        transaction.commit().expect("commit compaction fixture");
+
+        let old_file = store.replay_dir.join(&store.replay_file);
+        let old_len = file_len(&old_file).expect("measure current generation");
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&old_file)
+            .expect("open current replay generation");
+        file.set_len(TEST_REPLAY_COMPACTION_TRIGGER_BYTES + 1)
+            .expect("inflate replay generation");
+        drop(file);
+        assert!(file_len(&old_file).expect("measure inflated generation") > old_len);
+
+        store
+            .maybe_compact_replay()
+            .expect("compact oversized replay generation");
         assert!(
-            persistence.checkpoint_attempts() >= 2,
-            "the owner must have observed and retried the busy checkpoint"
+            !old_file.exists(),
+            "the obsolete generation must be removed"
         );
+        let recovered =
+            load_recovered(&store.connection, &store.replay_dir).expect("read compacted replay");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(
+            recovered[0].replay,
+            replay(vec![chunk(0, b"retain this payload")])
+        );
+        assert!(
+            file_len(&store.replay_dir.join(&store.replay_file))
+                .expect("measure compacted generation")
+                < old_len + 128,
+            "compaction must discard the sparse stale tail"
+        );
+    }
+
+    #[test]
+    fn truncated_replay_payload_fails_closed_on_reopen() {
+        let temp = TempDir::new().expect("create replay corruption fixture");
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = Persistence::open(&state_dir).expect("open persistence");
+        assert!(recovered.is_empty());
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .expect("insert replay corruption fixture Run");
+        durable.finalize(
+            info.id,
+            7,
+            replay(vec![chunk(0, b"payload that must remain intact")]),
+            exited_state(),
+        );
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+
+        let replay_file = fs::read_dir(state_dir.join(REPLAY_DIR))
+            .expect("read replay directory")
+            .map(|entry| entry.expect("read replay entry").path())
+            .next()
+            .expect("find current replay generation");
+        OpenOptions::new()
+            .write(true)
+            .open(&replay_file)
+            .expect("open replay generation for corruption")
+            .set_len(0)
+            .expect("truncate replay generation");
+
+        let Err(error) = Persistence::open(&state_dir) else {
+            panic!("truncated replay must be rejected");
+        };
+        assert!(matches!(error, PersistenceError::Io { .. }));
     }
 
     /// The change this whole round is: a lifecycle verb must NOT checkpoint a
@@ -7110,10 +7682,9 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            file_len(&wal).unwrap_or(u64::MAX),
-            0,
-            "a drained queue must leave the WAL folded, so the next start does not pay for it"
+        assert!(
+            file_len(&wal).unwrap_or(u64::MAX) <= WAL_IDLE_FOLD_FLOOR_BYTES,
+            "a drained queue must leave the WAL below the fold floor"
         );
         assert!(!persistence.is_failed());
     }
@@ -7271,7 +7842,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut folded = false;
         while Instant::now() < deadline {
-            if file_len(&wal).unwrap_or(u64::MAX) == 0 {
+            if file_len(&wal).unwrap_or(u64::MAX) <= WAL_IDLE_FOLD_FLOOR_BYTES {
                 folded = true;
                 break;
             }
@@ -7280,8 +7851,7 @@ mod tests {
 
         assert!(
             folded,
-            "a drained actor queue left {} WAL bytes; the next start will pay \
-             ~1.6 ms/MiB to fold them itself",
+            "a drained actor queue left {} WAL bytes above the fold floor",
             file_len(&wal).unwrap_or(u64::MAX)
         );
         assert!(!persistence.is_failed());
@@ -7507,6 +8077,11 @@ mod tests {
                 "extended code {extended} is not storage pressure and must stay fail-closed"
             );
         }
+        assert!(
+            PersistenceError::io("replay.bin", io::Error::from(io::ErrorKind::StorageFull),)
+                .is_transient_storage(),
+            "a full replay filesystem must retry the exact ordered append"
+        );
     }
 
     /// The reported incident, as a drill: a single `SQLITE_IOERR` during an
@@ -8294,8 +8869,12 @@ mod tests {
         connection
             .execute_batch("PRAGMA foreign_keys=ON;")
             .expect("enable test foreign keys");
-        create_schema(&connection, &uuid::Uuid::new_v4().to_string())
-            .expect("create test persistence schema");
+        create_schema(
+            &connection,
+            &uuid::Uuid::new_v4().to_string(),
+            &format!("replay-test-{}.bin", uuid::Uuid::new_v4()),
+        )
+        .expect("create test persistence schema");
         connection
             .execute(
                 "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
@@ -8803,8 +9382,8 @@ mod tests {
     /// re-splits by contiguity, so an overlapping replay is never
     /// `is_fresh_contiguous`: it gets a transaction, and an fsync, entirely to
     /// itself, and each already-committed chunk in the overlap additionally
-    /// takes the verify-against-stored branch (a `SELECT data` plus a full
-    /// compare). A queue N deep cost N transactions instead of one, and every
+    /// takes the verify-against-stored branch (an indexed range lookup plus a
+    /// bounded file read). A queue N deep cost N transactions instead of one, and every
     /// lifecycle verb waits behind all of them in the same FIFO — which is why
     /// ONE chatty Run cost seconds per create rather than a bounded penalty.
     ///

@@ -608,7 +608,7 @@ exact command at the head of the queue and retries after a short delay; later
 durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
 other storage, replay, budget, integrity, and owner-invariant failure remains
 fail-stop for later durable mutations. Startup performs journal
-recovery and exact schema/application validation against the schema-4 format
+recovery and exact schema/application validation against the schema-5 format
 envelope, then uses bounded, restartable page-admitted transactions to
 reconcile old running rows, normalize retained history to 128, and finally
 finish serving-epoch publication. Only after operational revalidation can the daemon
