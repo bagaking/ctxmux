@@ -115,6 +115,13 @@ slice needs them.
     workloads and failure cases so optimizing one fixture cannot conceal a
     regression in another performance dimension. Genuine improvements must
     not fail an oracle merely for differing from an old implementation.
+13. Shared owners must contain Run-local and derived-view failures. A change
+    that introduces parsing, rendering, checkpointing, or other derived work
+    into a shared owner must prove that the original bytes remain intact and
+    a second real Run keeps serving after a local fault. Report owner exit,
+    service availability, and exact applied/unknown input separately from
+    child lifecycle and static capabilities. Do not rely on stderr remaining
+    open, cached Running, silent retries, or replacing the Run to hide failure.
 
 ## Required Validation
 

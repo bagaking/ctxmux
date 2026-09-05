@@ -85,6 +85,27 @@ macOS validation and harness self-tests do not qualify Linux 4000-Run performanc
 The revised fleet objectives require an independently reviewed, committed
 baseline before candidate acceptance; historical thresholds are not rewritten.
 
+## P0 — shared Native owner failure containment and recovery qualification
+
+Feature `f-22vcz84zn` owns the accepted ctxmux optimization plan and final
+qualification for the [P0 incident](reviews/native-owner-failure-case-study.md).
+The original Native repair is preserved in its author worktree; ctxmux Root
+owns the joined runtime implementation and truthful service/input contracts;
+AgentMux owns consumer error/recovery behavior, installation, and product-use
+acceptance. The original `f-22tcz9d9r` resource audit retains its independent
+unfinished validation and is consumed at the final candidate join.
+
+The smallest slice contains local derived errors while two real Runs continue
+raw input/output through two public clients. Parser repair, truthful owner and
+input observations, blocked-writer isolation, and terminal resource governance
+converge before full Ctrl+C/disconnect/reconnect/restart qualification. The
+final candidate binds source, binaries, protocol, host, budget, byte order,
+identity, cleanup, and the separate AgentMux use receipt. User Runs remain
+preserved; no forced restart or weaker objective substitutes for recovery.
+
+This is accepted work, not a claim that the incident is recovered or all
+recovery classes are shipped. Live Task and gate state belongs only to Tracker.
+
 ## M0 — Repository foundation
 
 Establish the smallest Rust and TypeScript workspaces, shared quality commands,

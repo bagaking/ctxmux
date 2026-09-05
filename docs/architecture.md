@@ -442,6 +442,35 @@ Generated TypeScript types prevent a second handwritten wire schema. Current `u6
 
 ## Concurrency, ordering, and failure semantics
 
+### P0 shared-owner failure containment
+
+Accepted requirement; implementation and final qualification remain open under
+Feature `f-22vcz84zn`. The
+[P0 incident study](reviews/native-owner-failure-case-study.md) records
+the observed failure and separates proven source defects from the unknown
+first incident trigger.
+
+A terminal is a derived view of a Run. Parsing, rendering, checkpoint export,
+resize, and recovery of that view must not decide whether the daemon continues
+reading a Run's original PTY bytes or servicing unrelated Runs. Original-byte
+admission and ordering must survive a local derived-view fault; an unavailable
+derived continuation must be explicit, with its supported raw path remaining
+truthful. Recovery must not silently manufacture an equivalent terminal view.
+
+Child lifecycle, runtime-service availability, and view availability are
+separate facts. `RunState::Running` does not prove that an input/output owner
+still exists, and a static capability does not prove a particular operation
+was applied. Every long-lived owner must publish its real exit/failure result
+through the existing public observation boundary, with exact input operation
+and byte boundaries retained where known. A transport fault cannot invent
+an exited child or authorize replay of an unknown input.
+
+Containment belongs at the sole daemon owner. A second runtime, client-owned
+PTY reader, blanket restart, or one permanent thread per Run is not acceptance
+of this contract. Any unavoidable pressure or unsupported recovery class is
+reported explicitly. Both fault scope and resource cost require two real Runs
+and public clients before a shared-owner change is qualified.
+
 The important guarantees are behavioral, not implied by lock types.
 
 - Output byte ranges are allocated under the output-log mutex before broadcast.

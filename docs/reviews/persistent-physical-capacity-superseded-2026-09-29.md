@@ -3,45 +3,28 @@
 ## Summary
 
 Feature `f-22pczwrzr` ("Recover bounded persistent capacity before Run
-mutations") landed candidate `c168c0a` on branch `feat/f-22pczwrzr` at
-2026-09-21 01:06:48 +0800. In the same ~3h43m authoring session on that
-branch the same author kept going: a measurement doc at 02:52:15
-(`d42494f`, 1h45m after `c168c0a`), then a different mechanism at
-04:17:59 — externalizing replay payloads out of SQLite (`c5f6f45`,
-3h11m after `c168c0a`) — and its hardening at 04:49:34 (`aa590f1`,
-3h42m after). Those two mechanism commits were later reshaped onto
-`main` as `2f03c55` and `2677f76`; rebase preserved their author dates
-from an earlier writing pass on 2026-09-06, so on `main` the twins
-carry a timestamp 15 days earlier than `c168c0a`. The ADR 009 invariant
-"Physical page pressure is an independent retention boundary"
-(docs/architecture/choices/009-runtime-persistence-recovery.md:163-176)
-survives verbatim on `main`; only the implementation that satisfies it
-has changed. The feature goal is met on `main` today; this file records
-the audit so a later tracker closeout does not have to redo it. It does
-not modify tracker state, does not rewrite any branch, and does not
-claim `c168c0a` is buggy.
+mutations") landed candidate `c168c0a` on branch `feat/f-22pczwrzr`.
+The branch subsequently measured capacity (`d42494f`), externalized replay
+payloads from SQLite (`c5f6f45`), and hardened generation recovery (`aa590f1`).
+The latter mechanism commits were reshaped onto `main` as `2f03c55` and
+`2677f76`. Author dates are Git metadata and do not establish causal order.
+The ADR 009 invariant "Physical page pressure is an independent retention
+boundary" survives verbatim on `main`; its implementation changed.
+This historical audit does not modify Tracker state, rewrite branches, or
+claim `c168c0a` is buggy. Current qualification belongs to the active Tracker.
+The original timestamp-bearing report is retained in private audit evidence.
 
-## Timeline
+## Source lineage
 
-All SHAs below were verified with `git cat-file -t` (each returned
-`commit`) and `git log -1 --format='%H %s %ci'`. Commit subjects match
-one-for-one across the pairs. The table reports two author dates per
-row because the `main` twins were reshaped from earlier commits; see
-the footnote after the table.
+Each referenced SHA was checked as a Git commit. Paired subjects match;
+source identities, rather than workstation timestamps, bind this audit.
 
-| feat/branch author time (+0800) | feat/branch SHA | main author time (+0800) | main SHA | Subject |
-| --- | --- | --- | --- | --- |
-| 2026-09-21 01:06:48 | `c168c0a` | — | (only on `feat/f-22pczwrzr`) | fix(daemon): reclaim replay prefixes before the page limit refuses a write |
-| 2026-09-21 02:52:15 | `d42494f` | 2026-09-06 02:49:24 | `63583b0` | docs: measure replay capacity past the 384 MiB ceiling, rank compression last |
-| 2026-09-21 04:17:59 | `c5f6f45` | 2026-09-06 03:15:30 | `2f03c55` | fix(persistence): externalize replay payloads from sqlite |
-| 2026-09-21 04:49:34 | `aa590f1` | 2026-09-06 03:33:13 | `2677f76` | fix(persistence): harden replay generation recovery |
-
-The two time columns differ because the `main` twins were reshaped from
-earlier commits (rebase preserves author date). The 2026-09-06
-timestamps on `main` come from an earlier writing pass; the 2026-09-21
-timestamps on `feat/f-22pczwrzr` are when the current commit objects
-were authored. A reader spot-checking `2f03c55` will see 2026-09-06,
-which is expected.
+| Feature SHA | Main SHA            | Subject                                                                       |
+| ----------- | ------------------- | ----------------------------------------------------------------------------- |
+| `c168c0a`   | feature branch only | fix(daemon): reclaim replay prefixes before the page limit refuses a write    |
+| `d42494f`   | `63583b0`           | docs: measure replay capacity past the 384 MiB ceiling, rank compression last |
+| `c5f6f45`   | `2f03c55`           | fix(persistence): externalize replay payloads from sqlite                     |
+| `aa590f1`   | `2677f76`           | fix(persistence): harden replay generation recovery                           |
 
 `git branch -a --contains c168c0a` reports `feat/f-22pczwrzr` and
 `merge-tonight`; it does not report `main`. `git branch -a --contains
@@ -79,8 +62,8 @@ that file at persistence.rs:2411-2415, and `fn normalize_replay_files`
 (persistence.rs:4307) trims an interrupted append tail before the store
 becomes observable.
 
-Where `c168c0a` reclaimed *reactively when the SQLite page ceiling
-refused a write*, `main` prevents the refusal by keeping the bulk of the
+Where `c168c0a` reclaimed _reactively when the SQLite page ceiling
+refused a write_, `main` prevents the refusal by keeping the bulk of the
 bytes out of the page-limited file: the SQLite side stores only
 `run_id`, byte ranges, generation name, file offset, and byte length
 (ADR 009 lines 149-152).
@@ -176,7 +159,7 @@ reads verbatim on `main`:
 
 This paragraph is in `main`. What changed after `c168c0a` is the
 implementation that satisfies it: on `feat/f-22pczwrzr` reclamation ran
-*inside* SQLite (deleting whole replay-chunk prefixes in the same
+_inside_ SQLite (deleting whole replay-chunk prefixes in the same
 database that hit its page ceiling); on `main` the replay payload never
 lives inside SQLite at all, so the 384 MiB page ceiling is no longer
 the write-path bottleneck for retained output. The reclamation-before-

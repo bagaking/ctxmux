@@ -29,6 +29,23 @@ and real-host qualification.
 
 ## What coverage means
 
+The [P0 owner incident](reviews/native-owner-failure-case-study.md)
+adds a mandatory failure-domain qualification for shared-owner and derived-view
+changes. A parser-only GREEN is not Native availability evidence. Save/restore
+after shrink, legal narrow/wide geometry, single-row wrap, byte fragmentation,
+and checkpoint recovery must reach the actual owner. A local view fault must
+preserve the complete original chunk and leave a second real Run usable.
+Client disconnect, Ctrl+C, reconnect, blocked input, and declared restart
+classes require actual public clients, byte receipts, and child identities.
+
+The owning Task records the narrow proof. Final qualification consumes exact
+candidate-bound receipts and held-out workloads across correctness,
+reliability, throughput, latency, resources, capacity, recovery, and usability.
+Zero collected tests, a caught defect harness exiting zero, or a stale installed
+binary cannot qualify the result. Historical failures and implementation
+characterizations remain evidence; revised semantic objectives explain their
+premises without relaxing the accepted workload, budget, or fidelity.
+
 Ctxmux uses a vector of evidence instead of one coverage percentage:
 
 1. **Contract coverage:** every public guarantee maps to an executable oracle.
