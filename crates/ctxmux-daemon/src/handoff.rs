@@ -686,8 +686,7 @@ mod tests {
         let mut expected: Vec<String> = expected.iter().map(|s| (*s).to_owned()).collect();
         expected.sort();
         assert_eq!(
-            observed,
-            expected,
+            observed, expected,
             "the handoff manifest's serialized shape moved. A reader built before \
              this change cannot parse what this image now writes, and it finds out \
              only after an execve it cannot undo — every live Run dies. Bump \
