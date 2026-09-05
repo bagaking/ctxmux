@@ -43,9 +43,11 @@ correlation only.
 The existing complete-session Stop implementation remains the only signal,
 process census, cleanup, direct-child reap, and session-quiescence owner. This
 decision wraps that owner's admission and result; it adds no second walker,
-signal path, or Stop state machine. A settled retry returns the same
-`graceful` or `forced` receipt. Its accompanying `RunInfo` is a current metadata
-snapshot and may advance from `running` to `exited` between retries.
+signal path, or Stop state machine. A settled public success returns the same
+`graceful` or `forced` receipt only after that Run's terminal publication is
+visible. If the bounded visibility grace expires, the caller receives an
+`unknown` postcondition result and retains the same key; a retry waits for
+publication without entering the physical Stop owner again.
 
 ## Failure and retention algebra
 

@@ -143,6 +143,14 @@ consumer's owner. ctxmux does not create, plan, or modify external consumer
 Features or code. AgentSession, Provider, and Desktop Workbench close
 transaction semantics remain outside ctxmux.
 
+The c019b00 replay-capacity regression review added one ctxmux-owned tightening:
+a successful public Stop now waits for that Run's terminal publication before
+returning, so an immediate List or Remove cannot observe stale `running` state.
+The wait is bounded and per Run; an expired wait returns `unknown` with the
+same recoverable operation key, while native cleanup and finalization budgets
+remain separate. This closes the daemon-side contract without changing the
+external consumer's local projection or adding a compatibility path.
+
 ## Architecture evidence and failure corpus
 
 Before widening the runtime with Integrations, make the current system legible
