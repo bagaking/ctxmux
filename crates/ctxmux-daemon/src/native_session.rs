@@ -418,32 +418,6 @@ impl NativeSession {
         self.leader_is_terminal()
     }
 
-    /// Whether the pass-wide gate already proves a call to
-    /// [`Self::leader_is_terminal_gated`] would answer `Ok(false)`, so a sweep
-    /// with nothing else to do for this Run may skip the entry outright.
-    ///
-    /// This exists because answering `Ok(false)` is not free: reaching it costs
-    /// the caller an enum move, an `Arc` deref and a `Mutex`, per entry, per
-    /// pass. Deciding beforehand skips all of it.
-    ///
-    /// The two `false` cases are the reason this is a method here and not a
-    /// `!any_child_exited` test at the call site -- both are effects of
-    /// `leader_is_terminal_gated` that a naive skip would silently drop:
-    ///
-    /// * a reaped leader owes its caller the anchor error, which becomes a
-    ///   wait-authority transition; skipping would strand the Run in `Watching`;
-    /// * a test probe is consulted *before* the gate on purpose, so that a
-    ///   fixture simulating a terminal leader is not disqualified for having no
-    ///   real exited child behind it. Skipping first would defeat that for the
-    ///   same reason gating first would.
-    pub(crate) fn sweep_can_skip(&self, any_child_exited: bool) -> bool {
-        #[cfg(test)]
-        if self.leader_probe.is_some() {
-            return false;
-        }
-        !any_child_exited && !self.leader_reaped
-    }
-
     pub(crate) fn leader_is_terminal(&self) -> Result<bool, String> {
         self.require_waitable_anchor()?;
         #[cfg(test)]
