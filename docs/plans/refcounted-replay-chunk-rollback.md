@@ -35,20 +35,20 @@ per render, 11.1x cheaper.** The mechanism was real and the magnitude was real.
 
 Quiet shape (pop=8, chatty=0) — every delta inside the A/A noise floor:
 
-| metric | BEFORE (3 rounds) | AFTER (3 rounds) | A/A control |
-|---|---|---|---|
-| start (ms) | 6.231 / 6.247 / 6.250 | 6.127 / 6.169 / 6.183 | 6.027 / 6.210 |
-| list (ms) | 0.186 / 0.170 / 0.177 | 0.180 / 0.172 / 0.174 | 0.179 / 0.175 |
-| stop (ms) | 4.988 / 5.147 / 5.106 | 5.098 / 5.046 / 5.099 | 5.055 / 4.964 |
+| metric      | BEFORE (3 rounds)     | AFTER (3 rounds)      | A/A control   |
+| ----------- | --------------------- | --------------------- | ------------- |
+| start (ms)  | 6.231 / 6.247 / 6.250 | 6.127 / 6.169 / 6.183 | 6.027 / 6.210 |
+| list (ms)   | 0.186 / 0.170 / 0.177 | 0.180 / 0.172 / 0.174 | 0.179 / 0.175 |
+| stop (ms)   | 4.988 / 5.147 / 5.106 | 5.098 / 5.046 / 5.099 | 5.055 / 4.964 |
 | remove (ms) | 2.620 / 2.694 / 2.720 | 2.692 / 2.651 / 2.609 | 2.613 / 2.624 |
 
 Chatty shape (pop=8, chatty=1) — `remove` degrades, with zero interval overlap:
 
-| metric | BEFORE (3 rounds) | AFTER (3 rounds) | A/A control |
-|---|---|---|---|
-| start (ms) | 1566.9 / 1429.9 / 1272.4 | 1117.1 / 1110.4 / 1574.2 | 1435.9 / 1613.7 |
-| list (ms) | 0.179 / 0.175 / 0.180 | 0.191 / 0.180 / 0.280 | 0.206 / 0.251 |
-| stop (ms) | 109.9 / 108.7 / 108.6 | 107.2 / 106.7 / 106.7 | 109.7 / 109.3 |
+| metric          | BEFORE (3 rounds)         | AFTER (3 rounds)             | A/A control       |
+| --------------- | ------------------------- | ---------------------------- | ----------------- |
+| start (ms)      | 1566.9 / 1429.9 / 1272.4  | 1117.1 / 1110.4 / 1574.2     | 1435.9 / 1613.7   |
+| list (ms)       | 0.179 / 0.175 / 0.180     | 0.191 / 0.180 / 0.280        | 0.206 / 0.251     |
+| stop (ms)       | 109.9 / 108.7 / 108.6     | 107.2 / 106.7 / 106.7        | 109.7 / 109.3     |
 | **remove (ms)** | **886.5 / 963.1 / 679.6** | **1914.0 / 1755.8 / 2237.8** | **817.3 / 837.8** |
 
 Every AFTER `remove` sample is above every BEFORE sample and above both A/A
@@ -74,8 +74,8 @@ semantics:
 - `remove_terminal` uses a **blocking** `send` and then waits on the reply
   (`persistence.rs:1064`).
 
-So a remove's latency is proportional to *how many appends are actually sitting
-in the queue* when it arrives. Making the render 11.1x cheaper does not reduce
+So a remove's latency is proportional to _how many appends are actually sitting
+in the queue_ when it arrives. Making the render 11.1x cheaper does not reduce
 the work the actor must do; it lets the reactor thread **offer appends 11.1x
 faster**. The queue gets deeper, and the blocking remove waits behind more of
 it.
@@ -93,7 +93,7 @@ to go. Landing it requires first removing the coupling that turns extra output
 throughput into remove latency:
 
 - give lifecycle commands a reserved share of the actor's attention rather than
-  a pure FIFO position (note: a previous round established that *jumping* the
+  a pure FIFO position (note: a previous round established that _jumping_ the
   queue is wrong — `Barrier`'s semantics are its FIFO position — so this must be
   a quota, not a bypass); or
 - stop making `remove_terminal` block on the shared queue at all.

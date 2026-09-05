@@ -17,17 +17,17 @@ second arm ~1.41x faster, so a fixed order manufactures a winner). Six arms per
 side per shape. Zero skipped arms, zero refusals, zero leftover processes, host
 busy under 0.6% at every arm. Production config (`synchronous=FULL`).
 
-| shape | verb | ctxmux | tmux | ratio | who |
-|---|---|---|---|---|---|
-| c1 | start | 9.280 | 4.367 | 2.13x | **tmux** |
-| c1 | list | 0.214 | 3.152 | 0.07x | ctxmux 14.7x |
-| c1 | stop+remove | 12.903 | 4.063 | 3.18x | **tmux** |
-| c2 | start | 11.072 | 4.922 | 2.25x | **tmux** |
-| c2 | list | 0.214 | 3.545 | 0.06x | ctxmux 16.5x |
-| c2 | stop+remove | 14.023 | 4.419 | 3.17x | **tmux** |
-| c8 | start | 23.728 | 11.303 | 2.10x | **tmux** |
-| c8 | list | 0.273 | 9.224 | 0.03x | ctxmux 33.7x |
-| c8 | stop+remove | 22.247 | 10.597 | 2.10x | **tmux** |
+| shape | verb        | ctxmux | tmux   | ratio | who          |
+| ----- | ----------- | ------ | ------ | ----- | ------------ |
+| c1    | start       | 9.280  | 4.367  | 2.13x | **tmux**     |
+| c1    | list        | 0.214  | 3.152  | 0.07x | ctxmux 14.7x |
+| c1    | stop+remove | 12.903 | 4.063  | 3.18x | **tmux**     |
+| c2    | start       | 11.072 | 4.922  | 2.25x | **tmux**     |
+| c2    | list        | 0.214  | 3.545  | 0.06x | ctxmux 16.5x |
+| c2    | stop+remove | 14.023 | 4.419  | 3.17x | **tmux**     |
+| c8    | start       | 23.728 | 11.303 | 2.10x | **tmux**     |
+| c8    | list        | 0.273  | 9.224  | 0.03x | ctxmux 33.7x |
+| c8    | stop+remove | 22.247 | 10.597 | 2.10x | **tmux**     |
 
 `stop+remove` is summed because tmux's `kill-session` does both; the components
 are `stop` 6.111/6.458/9.352 and `remove` 6.873/7.543/12.521. This is a ratio of
@@ -51,11 +51,11 @@ measurement rather than argument, cheapest first.
 **Excluded: O(VMA count).** `vm_area_dup` and `anon_vma_fork` run once per VMA at
 ~100-300 ns. Sampling `/proc/<pid>/maps` while the fleet ran, three rounds:
 
-| chatty | VMAs | RSS | VmPTE | AnonHugePages |
-|---|---|---|---|---|
-| 0 | 70-71 | 7.5 MB | 92-100 kB | 0 |
-| 2 | 72-73 | 22-23 MB | 124 kB | 0 |
-| 8 | 76-79 | 55 MB | 188 kB | 0 |
+| chatty | VMAs  | RSS      | VmPTE     | AnonHugePages |
+| ------ | ----- | -------- | --------- | ------------- |
+| 0      | 70-71 | 7.5 MB   | 92-100 kB | 0             |
+| 2      | 72-73 | 22-23 MB | 124 kB    | 0             |
+| 8      | 76-79 | 55 MB    | 188 kB    | 0             |
 
 VMA count moves 11% while resident moves 7.3x. Eight extra VMAs buy at most
 2.4 us against a 2.05-2.76 ms gap — three orders of magnitude short. Dead.
@@ -65,7 +65,7 @@ the per-page slope applies in full rather than being amortised over 2 MB PMDs.
 **Confirmed: the child's `exit_mmap` teardown, and it is the larger half.** After
 `fork` the child owns a COW copy of the parent's mm. `execve` then runs
 `begin_new_exec` -> `exec_mmap` -> `mmput(old_mm)` -> `exit_mmap`, walking every
-inherited PTE and freeing the copied page tables — *before* `do_close_on_exec`.
+inherited PTE and freeing the copied page tables — _before_ `do_close_on_exec`.
 That ordering is the whole point: Rust's `Command::spawn` blocks reading a
 CLOEXEC pipe that only closes at `do_close_on_exec`, so the child's teardown sits
 inside the parent's measured spawn. Had the ordering been reversed the cost would
@@ -76,38 +76,38 @@ resident ballast, five rounds with the size order reversed on alternate rounds
 (a monotone sweep on a shared host lets background drift impersonate a slope in
 N, and a slope in N is exactly the claim):
 
-| resident | fork | +teardown | spawn total |
-|---|---|---|---|
-| 0 MiB | 64 us | 213 us | 275 us |
-| 16 MiB | 208 us | 532 us | 741 us |
-| 32 MiB | 312 us | 776 us | 1090 us |
-| 64 MiB | 513 us | 1120 us | 1633 us |
-| 128 MiB | 905 us | 1750 us | 2655 us |
+| resident | fork   | +teardown | spawn total |
+| -------- | ------ | --------- | ----------- |
+| 0 MiB    | 64 us  | 213 us    | 275 us      |
+| 16 MiB   | 208 us | 532 us    | 741 us      |
+| 32 MiB   | 312 us | 776 us    | 1090 us     |
+| 64 MiB   | 513 us | 1120 us   | 1633 us     |
+| 128 MiB  | 905 us | 1750 us   | 2655 us     |
 
-| boundary | slope | share |
-|---|---|---|
-| `fork` (`copy_pte_range`) | **6.43 us/MiB** | 36% |
-| exec teardown (`exit_mmap`) | **11.52 us/MiB** | 64% |
-| spawn total (what Rust waits on) | **17.95 us/MiB** | 100% |
+| boundary                         | slope            | share |
+| -------------------------------- | ---------------- | ----- |
+| `fork` (`copy_pte_range`)        | **6.43 us/MiB**  | 36%   |
+| exec teardown (`exit_mmap`)      | **11.52 us/MiB** | 64%   |
+| spawn total (what Rust waits on) | **17.95 us/MiB** | 100%  |
 
 Round-to-round spread at each size is ~3%, and reversing the order changed
 nothing. Teardown is real and is 1.79x the copy.
 
 ## What posix_spawn is actually worth
 
-The theory says `posix_spawn` removes *both* halves, because glibc uses
+The theory says `posix_spawn` removes _both_ halves, because glibc uses
 `CLONE_VM|CLONE_VFORK` — the child never gets a private mm, so there is nothing
 to copy and nothing to tear down. This project has been wrong about exactly this
 kind of kernel-internals claim before while the arithmetic looked fine, so it
 was measured on the same host with the same ballast:
 
 | resident | `posix_spawn` | `fork`+`exec` |
-|---|---|---|
-| 0 MiB | 121.3 us | 275 us |
-| 16 MiB | 120.5 us | 741 us |
-| 32 MiB | 116.3 us | 1090 us |
-| 64 MiB | 124.9 us | 1633 us |
-| 128 MiB | 124.5 us | 2655 us |
+| -------- | ------------- | ------------- |
+| 0 MiB    | 121.3 us      | 275 us        |
+| 16 MiB   | 120.5 us      | 741 us        |
+| 32 MiB   | 116.3 us      | 1090 us       |
+| 64 MiB   | 124.9 us      | 1633 us       |
+| 128 MiB  | 124.5 us      | 2655 us       |
 
 Slope **0.041 us/MiB** against 17.95. Flat, as predicted — 21x at 128 MiB. Both
 halves go, not one.
@@ -116,18 +116,18 @@ halves go, not one.
 
 My first reading of this was that spawn explains "about a third" of the gap.
 That was wrong, and the way it was wrong is instructive: it divided a
-*chatty-growth delta* (0.85 ms, the 47.5 MiB of resident growth from c0 to c8 at
-17.95 us/MiB) by a *per-operation total* (2.05-2.76 ms). Two different
+_chatty-growth delta_ (0.85 ms, the 47.5 MiB of resident growth from c0 to c8 at
+17.95 us/MiB) by a _per-operation total_ (2.05-2.76 ms). Two different
 denominators, and the ratio between them means nothing.
 
 Priced properly — absolute spawn cost at each shape's actual resident size,
 against that shape's measured `start`:
 
-| shape | resident | `fork`+`exec` | `posix_spawn` | saving | `start` after | vs tmux |
-|---|---|---|---|---|---|---|
-| c1 | ~15 MB | 0.54 ms | 0.12 ms | 0.42 ms | 9.28 -> 8.86 | 2.13x -> **2.03x** |
-| c2 | ~22 MB | 0.67 ms | 0.12 ms | 0.55 ms | 11.07 -> 10.52 | 2.25x -> **2.14x** |
-| c8 | ~55 MB | 1.26 ms | 0.12 ms | 1.14 ms | 23.73 -> 22.59 | 2.10x -> **2.00x** |
+| shape | resident | `fork`+`exec` | `posix_spawn` | saving  | `start` after  | vs tmux            |
+| ----- | -------- | ------------- | ------------- | ------- | -------------- | ------------------ |
+| c1    | ~15 MB   | 0.54 ms       | 0.12 ms       | 0.42 ms | 9.28 -> 8.86   | 2.13x -> **2.03x** |
+| c2    | ~22 MB   | 0.67 ms       | 0.12 ms       | 0.55 ms | 11.07 -> 10.52 | 2.25x -> **2.14x** |
+| c8    | ~55 MB   | 1.26 ms       | 0.12 ms       | 1.14 ms | 23.73 -> 22.59 | 2.10x -> **2.00x** |
 
 So the whole spawn path — both halves, copy and teardown — is **4.6-5.0% of
 `start`**. Removing all of it moves the tmux ratio from 2.10x to 2.00x.
@@ -143,16 +143,16 @@ respectable win.
 `posix_spawn` cannot run arbitrary child code, so every `pre_exec` job needs an
 attribute equivalent. Four map cleanly:
 
-| pre_exec job | posix_spawn equivalent |
-|---|---|
-| signals to `SIG_DFL` | `POSIX_SPAWN_SETSIGDEF` |
-| empty sigmask | `POSIX_SPAWN_SETSIGMASK` |
-| `setsid()` | `POSIX_SPAWN_SETSID` (glibc 2.26+) |
-| `close_random_fds()` | nothing needed — it already only *marks* fds CLOEXEC, and the kernel closes those at `execve` regardless |
-| `ioctl(0, TIOCSCTTY)` | **no attribute exists** |
+| pre_exec job          | posix_spawn equivalent                                                                                   |
+| --------------------- | -------------------------------------------------------------------------------------------------------- |
+| signals to `SIG_DFL`  | `POSIX_SPAWN_SETSIGDEF`                                                                                  |
+| empty sigmask         | `POSIX_SPAWN_SETSIGMASK`                                                                                 |
+| `setsid()`            | `POSIX_SPAWN_SETSID` (glibc 2.26+)                                                                       |
+| `close_random_fds()`  | nothing needed — it already only _marks_ fds CLOEXEC, and the kernel closes those at `execve` regardless |
+| `ioctl(0, TIOCSCTTY)` | **no attribute exists**                                                                                  |
 
 There is no `POSIX_SPAWN_SETCTTY`. The fallback relies on a Linux rule: a session
-leader with no controlling terminal acquires one by *opening* a tty without
+leader with no controlling terminal acquires one by _opening_ a tty without
 `O_NOCTTY`. That only works if glibc applies `SETSID` before file actions — an
 ordering question, and a silent one, because a PTY child with no ctty still runs,
 still prints, still exits 0. What breaks is job control and SIGWINCH on resize,
@@ -176,7 +176,7 @@ implementation is structurally possible. But `Child` requires `try_wait`, `wait`
 the already-reaped race that `std::process::Child` handles today — in a vendored
 dependency, on the path that every Run's lifetime depends on.
 
-At 4.6-5.0% of `start`, that is the wrong trade *right now*. Not because the
+At 4.6-5.0% of `start`, that is the wrong trade _right now_. Not because the
 change is bad — it is well understood, the blocker is cleared, and its benefit
 grows with resident memory, which grows with fleet size. But spending it now
 would mean writing the riskiest code in the round to collect the smallest

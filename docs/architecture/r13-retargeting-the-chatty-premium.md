@@ -16,19 +16,19 @@ Running the same binary (`R11-COALESCE`, `bb4bbd8d`) at c0/c2/c8 separates the
 two. c0 is the floor: whatever a verb costs with a silent fleet is what it costs
 when there is no queue at all.
 
-| verb | c0 (floor) | c2 | c8 | premium (c8 − c0) | recoverable share |
-|---|---|---|---|---|---|
-| start | 6.40 | 15.0 | 27.7 | **21.3 ms** | **77%** |
-| stop | 5.16 | 5.99 | 9.68 | 4.5 ms | 47% |
-| remove | 2.79 | 7.54 | 13.8 | **11.0 ms** | **80%** |
+| verb   | c0 (floor) | c2   | c8   | premium (c8 − c0) | recoverable share |
+| ------ | ---------- | ---- | ---- | ----------------- | ----------------- |
+| start  | 6.40       | 15.0 | 27.7 | **21.3 ms**       | **77%**           |
+| stop   | 5.16       | 5.99 | 9.68 | 4.5 ms            | 47%               |
+| remove | 2.79       | 7.54 | 13.8 | **11.0 ms**       | **80%**           |
 
 Six arms, both orders, each pair agreeing within 3% — which also clears cn3's
 usual ~1.41x second-arm bias for this shape.
 
 So `stop` is the smallest pot and the least recoverable one. `start` alone has
 nearly five times the headroom. Three rounds of attention went to the verb with
-the least to give, because the cliff being *visible* in `stop` was mistaken for
-the cost being *in* `stop`.
+the least to give, because the cliff being _visible_ in `stop` was mistaken for
+the cost being _in_ `stop`.
 
 ## Segmenting the two verbs that do have headroom
 
@@ -41,10 +41,10 @@ in every arm.
 
 c8, p50 (three independent probe builds, agreeing within 15%):
 
-| verb | queue | fold | body | sum | client-side |
-|---|---|---|---|---|---|
-| start | **16.6** | 4.3 | 5.3 | 26.7 | 28.4 |
-| remove | **6.4** | 3.0 | 2.0 | 11.6 | 12.2 |
+| verb   | queue    | fold | body | sum  | client-side |
+| ------ | -------- | ---- | ---- | ---- | ----------- |
+| start  | **16.6** | 4.3  | 5.3  | 26.7 | 28.4        |
+| remove | **6.4**  | 3.0  | 2.0  | 11.6 | 12.2        |
 
 The sums close against the client-side medians (within round-trip), so the
 segmentation is measuring the right thing.
@@ -78,12 +78,12 @@ mechanism.
 The granularity is striking. At c8 the actor received **121,723 Append commands**
 carrying 138.8 MiB, and committed them in **653 transactions**:
 
-| | c2 | c8 |
-|---|---|---|
-| bytes per Append command | 0.7 KiB | **1.2 KiB** |
-| Append commands merged per transaction | 74 | **186** |
-| depth at a `start`'s enqueue (p50) | 15 | **273** |
-| transaction cost | 1.52 ms | 2.93 ms |
+|                                        | c2      | c8          |
+| -------------------------------------- | ------- | ----------- |
+| bytes per Append command               | 0.7 KiB | **1.2 KiB** |
+| Append commands merged per transaction | 74      | **186**     |
+| depth at a `start`'s enqueue (p50)     | 15      | **273**     |
+| transaction cost                       | 1.52 ms | 2.93 ms     |
 
 Every PTY read becomes its own render, its own queue slot, and its own three
 mutexes — and 185 of every 186 of those renders are merged away by the actor

@@ -35,12 +35,12 @@ The obvious move was to assume this one is the same shape — R22 also raised
 (`dcd33f1`), and 10 s > the fixture's 2 s bound. Sweeping the constant looks
 like it confirms that:
 
-| `TERMINAL_VISIBILITY_GRACE` | result | wall |
-|---|---|---|
-| 100 ms | ok | 5 s |
-| 500 ms | ok | 5 s |
-| 3 s | **FAILED** | 7 s |
-| 10 s | **FAILED** | 15 s |
+| `TERMINAL_VISIBILITY_GRACE` | result     | wall |
+| --------------------------- | ---------- | ---- |
+| 100 ms                      | ok         | 5 s  |
+| 500 ms                      | ok         | 5 s  |
+| 3 s                         | **FAILED** | 7 s  |
+| 10 s                        | **FAILED** | 15 s |
 
 But read the wall-clock column. If the fixture were merely pinned to a stale
 constant, the Stop would return promptly and the 2 s bound would be arbitrary.
@@ -82,13 +82,13 @@ Stop receipt path at lib.rs:5619 — is the waiter.
 
 So the chain is: the control Run's `Finalize` is a command on the lifecycle
 lane. The lane is served by the single persistence actor. The fixture has that
-actor parked inside a *different* Run's `Finalize`. The control Run's finalize
+actor parked inside a _different_ Run's `Finalize`. The control Run's finalize
 is therefore never served, its `publish_terminal` never returns, its terminal
 state is never published, the waiter is never notified, and the Stop waits out
 the full grace before answering with whatever state it has.
 
 **R25 did not cause this and does not fix it.** R25 gave lifecycle commands
-priority *at the dequeue point* — they overtake queued appends. This is not a
+priority _at the dequeue point_ — they overtake queued appends. This is not a
 queue-position problem: the actor is not choosing what to serve next, it is
 stuck inside serving one command. Priority cannot help a server that is busy.
 This is KIP-291's mode 1 (blocked at admission), the mode R25's mechanism
@@ -108,7 +108,7 @@ lanes" as a product property, and this is the one lane where it does not hold.
 
 ## What is actually at stake
 
-The fixture uses a test barrier, but the barrier only *holds open* a window that
+The fixture uses a test barrier, but the barrier only _holds open_ a window that
 exists in production. R22's own measurement (`r22-the-stop-that-stops-lying.md`)
 recorded a real finalize waiting **296–485 ms** to be served under a loud fleet
 at queue depth 1024. During any such window, a Stop on an unrelated Run is

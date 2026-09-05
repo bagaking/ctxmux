@@ -23,14 +23,14 @@ round 10 rolls back regardless of how good the `chatty=1` number looks.
 
 `BASE` **cannot serve `chatty=2` at all.**
 
-| shape | arm | start | stop | remove | daemon CPU |
-|---|---|---|---|---|---|
-| chatty=1 | base | 1014 / 1179 ms | 107 / 107 | 788 / 899 | 58.2 / 64.8 s |
-| chatty=1 | after | 20.1 / 21.0 ms | 8.0 / 8.2 | 12.6 / 14.1 | 3.68 / 3.77 s |
-| chatty=2 | base | **TIMEOUT ×4** | — | — | ~425 s per arm |
-| chatty=2 | after | 49.9–93.3 ms | 68.5–106.7 | 459–975 | 34.0–43.5 s |
-| chatty=4 | base | **TIMEOUT** | — | — | 243.6 u / 39.8 s |
-| chatty=4 | after | **TIMEOUT** | — | — | 183.3 u / 80.4 s |
+| shape    | arm   | start          | stop       | remove      | daemon CPU       |
+| -------- | ----- | -------------- | ---------- | ----------- | ---------------- |
+| chatty=1 | base  | 1014 / 1179 ms | 107 / 107  | 788 / 899   | 58.2 / 64.8 s    |
+| chatty=1 | after | 20.1 / 21.0 ms | 8.0 / 8.2  | 12.6 / 14.1 | 3.68 / 3.77 s    |
+| chatty=2 | base  | **TIMEOUT ×4** | —          | —           | ~425 s per arm   |
+| chatty=2 | after | 49.9–93.3 ms   | 68.5–106.7 | 459–975     | 34.0–43.5 s      |
+| chatty=4 | base  | **TIMEOUT**    | —          | —           | 243.6 u / 39.8 s |
+| chatty=4 | after | **TIMEOUT**    | —          | —           | 183.3 u / 80.4 s |
 
 Four `BASE` arms at `chatty=2`, both orders, two rounds: **four timeouts at 240 s
 with no output at all**, each burning ~300 s utime + ~122 s stime. Four `AFTER`

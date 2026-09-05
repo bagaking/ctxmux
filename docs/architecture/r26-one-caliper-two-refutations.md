@@ -19,12 +19,12 @@ instruments and attributed the difference to the two systems.
 
 Three confounds, stacked:
 
-| | ratchet harness | the tmux harness |
-|---|---|---|
-| client in the timed window | Rust `ctxmux` CLI | tmux's C client |
-| producer | `/bin/dash`, 64 B, tight loop | `bash`, 32 B, tight loop |
-| population at measurement | fleet growing 0→48 | POP=8, settled 1.5 s |
-| pairing | paired sign test | ratio of medians, unpaired |
+|                            | ratchet harness               | the tmux harness           |
+| -------------------------- | ----------------------------- | -------------------------- |
+| client in the timed window | Rust `ctxmux` CLI             | tmux's C client            |
+| producer                   | `/bin/dash`, 64 B, tight loop | `bash`, 32 B, tight loop   |
+| population at measurement  | fleet growing 0→48            | POP=8, settled 1.5 s       |
+| pairing                    | paired sign test              | ratio of medians, unpaired |
 
 The dose is the `read()` message rate. dash spins faster than bash and the
 line is twice as long, so "chatty=8" meant two different physical loads.
@@ -44,28 +44,28 @@ Three of the four arms are **byte-identical copies of the same ctxmux
 binary**. Their spread is the instrument's resolution, measured in every cell
 rather than assumed:
 
-| shape | start | list | stop | remove |
-|---|---|---|---|---|
-| c=0 | 1.013x | 1.028x | 1.021x | 1.002x |
-| c=1 | 1.010x | 1.007x | 1.016x | 1.001x |
-| c=2 | 1.020x | 1.022x | 1.016x | 1.043x |
-| c=8 | 1.064x | 1.019x | 1.042x | 1.105x |
+| shape | start  | list   | stop   | remove |
+| ----- | ------ | ------ | ------ | ------ |
+| c=0   | 1.013x | 1.028x | 1.021x | 1.002x |
+| c=1   | 1.010x | 1.007x | 1.016x | 1.001x |
+| c=2   | 1.020x | 1.022x | 1.016x | 1.043x |
+| c=8   | 1.064x | 1.019x | 1.042x | 1.105x |
 
 Health across all 192 cells: 48/48 started everywhere, zero refused stops,
 zero failed removes.
 
 ## Result — ctxmux (durable) vs tmux 3.3a (in-memory)
 
-| shape | verb | ctxmux | tmux | ratio | A/A floor | sign test |
-|---|---|---|---|---|---|---|
-| c=0 | start | 6.53 ms | 4.24 ms | 1.54x | 1.013x | 0/12 |
-| c=1 | start | 7.03 ms | 4.94 ms | 1.42x | 1.010x | 0/12 |
-| c=2 | start | 8.24 ms | 5.91 ms | 1.40x | 1.020x | 0/12 |
-| **c=8** | **start** | **12.03 ms** | **10.58 ms** | **1.14x** | 1.064x | 0/12 |
-| c=0 | stop+remove | 12.93 ms | 3.86 ms | 3.35x | 1.011x | 0/12 |
-| c=8 | stop+remove | 22.47 ms | 10.31 ms | 2.18x | 1.079x | 0/12 |
-| c=0 | list | 2.62 ms | 3.34 ms | **0.78x** | 1.028x | 12/12 |
-| **c=8** | **list** | **3.01 ms** | **9.45 ms** | **0.32x** | 1.019x | 12/12 |
+| shape   | verb        | ctxmux       | tmux         | ratio     | A/A floor | sign test |
+| ------- | ----------- | ------------ | ------------ | --------- | --------- | --------- |
+| c=0     | start       | 6.53 ms      | 4.24 ms      | 1.54x     | 1.013x    | 0/12      |
+| c=1     | start       | 7.03 ms      | 4.94 ms      | 1.42x     | 1.010x    | 0/12      |
+| c=2     | start       | 8.24 ms      | 5.91 ms      | 1.40x     | 1.020x    | 0/12      |
+| **c=8** | **start**   | **12.03 ms** | **10.58 ms** | **1.14x** | 1.064x    | 0/12      |
+| c=0     | stop+remove | 12.93 ms     | 3.86 ms      | 3.35x     | 1.011x    | 0/12      |
+| c=8     | stop+remove | 22.47 ms     | 10.31 ms     | 2.18x     | 1.079x    | 0/12      |
+| c=0     | list        | 2.62 ms      | 3.34 ms      | **0.78x** | 1.028x    | 12/12     |
+| **c=8** | **list**    | **3.01 ms**  | **9.45 ms**  | **0.32x** | 1.019x    | 12/12     |
 
 Every cell 12/12 on the paired sign test, p = 0.0005.
 
@@ -77,17 +77,17 @@ ms — not the 8.4 ms I quoted. The R25 sentence was wrong.
 
 ## Refutation 1: the gap closes as load rises
 
-| verb | c=0 | c=1 | c=2 | c=8 |
-|---|---|---|---|---|
-| start | 1.54x | 1.43x | 1.41x | 1.15x |
+| verb        | c=0   | c=1   | c=2   | c=8   |
+| ----------- | ----- | ----- | ----- | ----- |
+| start       | 1.54x | 1.43x | 1.41x | 1.15x |
 | stop+remove | 3.37x | 2.86x | 2.77x | 2.15x |
-| list | 0.79x | 0.67x | 0.58x | 0.32x |
+| list        | 0.79x | 0.67x | 0.58x | 0.32x |
 
 Monotone on all three. **We are expensive at baseline and cheap at the
 margin** — tmux degrades faster than we do under a loud fleet.
 
 Every ratchet round from R19 to R25 targeted c=8, on the reasoning that the
-loud fleet is where the pain is. It is where the pain *was*, against our own
+loud fleet is where the pain is. It is where the pain _was_, against our own
 earlier baselines. Against tmux, c=8 is the shape we are **closest** to
 parity on, and c=0 — no queue, no fleet, no contention, where neither R24's
 depth nor R25's lane does anything — is where we lose by the most.
@@ -109,16 +109,16 @@ has looked only inside the persistence layer. But it was measured in a
 different batch, so R26 re-ran it as a third backend in the same rotation: the
 same binary with `--state-dir` omitted, 8 rounds.
 
-| shape | verb | durable | memory-only | tmux | memory-only vs tmux |
-|---|---|---|---|---|---|
-| c=0 | start | 6.39 | 3.96 | 4.20 | ctxmux 1.06x faster (8/8) |
-| c=8 | start | 11.03 | 6.11 | 10.55 | ctxmux 1.73x faster (8/8) |
-| c=0 | list | 2.62 | 2.63 | 3.34 | ctxmux 1.27x faster (8/8) |
-| c=8 | list | 3.06 | 3.23 | 9.34 | ctxmux 2.89x faster (8/8) |
-| **c=0** | **stop+remove** | 12.79 | **8.20** | **3.87** | **tmux 2.12x faster (0/8)** |
-| **c=1** | **stop+remove** | 13.36 | **8.42** | **4.72** | **tmux 1.78x faster (0/8)** |
-| **c=2** | **stop+remove** | 14.73 | **8.37** | **5.49** | **tmux 1.53x faster (0/8)** |
-| c=8 | stop+remove | 22.20 | 9.71 | 10.37 | ctxmux 1.07x faster (8/8) |
+| shape   | verb            | durable | memory-only | tmux     | memory-only vs tmux         |
+| ------- | --------------- | ------- | ----------- | -------- | --------------------------- |
+| c=0     | start           | 6.39    | 3.96        | 4.20     | ctxmux 1.06x faster (8/8)   |
+| c=8     | start           | 11.03   | 6.11        | 10.55    | ctxmux 1.73x faster (8/8)   |
+| c=0     | list            | 2.62    | 2.63        | 3.34     | ctxmux 1.27x faster (8/8)   |
+| c=8     | list            | 3.06    | 3.23        | 9.34     | ctxmux 2.89x faster (8/8)   |
+| **c=0** | **stop+remove** | 12.79   | **8.20**    | **3.87** | **tmux 2.12x faster (0/8)** |
+| **c=1** | **stop+remove** | 13.36   | **8.42**    | **4.72** | **tmux 1.78x faster (0/8)** |
+| **c=2** | **stop+remove** | 14.73   | **8.37**    | **5.49** | **tmux 1.53x faster (0/8)** |
+| c=8     | stop+remove     | 22.20   | 9.71        | 10.37    | ctxmux 1.07x faster (8/8)   |
 
 Stable round to round — c=0 memory-only stop+remove ran 7.94–8.62 ms across
 all 8 rounds while tmux ran 3.83–4.07 ms. Not noise.
@@ -137,9 +137,9 @@ aggregate row existed but the conclusion was written about "every verb".
 ### The persistence share, per verb
 
 | shape | start | stop | remove |
-|---|---|---|---|
-| c=0 | 38% | 28% | 49% |
-| c=8 | 45% | 54% | 59% |
+| ----- | ----- | ---- | ------ |
+| c=0   | 38%   | 28%  | 49%    |
+| c=8   | 45%   | 54%  | 59%    |
 
 R18 reported 85–99%. The difference is not a contradiction — R18's disk arm
 ran at 26.2 ms for c=8 start where ours runs at 11.0, because R24 and R25

@@ -55,16 +55,16 @@ functions.
 
 Measured directly, with a throwaway stamp around the wait (since reverted):
 
-| | median | p90 | max |
-|---|---|---|---|
-| PUB2, live child (the product case) | **0.040 ms** | 0.059 | 0.064 |
-| PUB2, already-exited child | *no samples — different path* | | |
+|                                     | median                        | p90   | max   |
+| ----------------------------------- | ----------------------------- | ----- | ----- |
+| PUB2, live child (the product case) | **0.040 ms**                  | 0.059 | 0.064 |
+| PUB2, already-exited child          | _no samples — different path_ |       |       |
 
 The pre-registered bar was 0.4 ms. **NO-GO.**
 
 This is [[ctxmux-segment-the-path-dont-guess-the-line]] again, one level up: I
-did segment rather than guess, but I segmented by *subtracting two client-side
-arms* instead of stamping the thing itself. A subtraction is only a measurement
+did segment rather than guess, but I segmented by _subtracting two client-side
+arms_ instead of stamping the thing itself. A subtraction is only a measurement
 if both arms execute the code being subtracted. Mine did not, and nothing in
 the arithmetic could reveal that — the numbers were plausible, stable, and
 reproduced across two independent batches. **Two batches agreeing is evidence
@@ -78,23 +78,23 @@ gap. It came from a local macOS run: floor 5.08 ms, stop+remove 13.69 ms.
 The floor itself was mostly the measuring apparatus. A C `posix_spawn` control
 against the Python-`subprocess` harness, same host:
 
-| macOS | C posix_spawn | python subprocess |
-|---|---|---|
-| `/usr/bin/true` | 4.009 ms | 4.737 ms |
-| `ctxmux --help` | 4.183 ms | 5.382 ms |
-| `tmux -V` | 4.121 ms | — |
+| macOS           | C posix_spawn | python subprocess |
+| --------------- | ------------- | ----------------- |
+| `/usr/bin/true` | 4.009 ms      | 4.737 ms          |
+| `ctxmux --help` | 4.183 ms      | 5.382 ms          |
+| `tmux -V`       | 4.121 ms      | —                 |
 
 Our CLI sits **0.17 ms** above the OS spawn floor; the ~5 ms is macOS process
 creation, not ctxmux. And R26's gap was never measured on macOS. On cn3, where
 it was:
 
-| cn3 (C posix_spawn, n=200) | |
-|---|---|
-| `/bin/true` — OS floor | 0.532 ms |
-| `ctxmux --help` | 0.899 ms |
-| `tmux -V` | 1.057 ms |
+| cn3 (C posix_spawn, n=200) |          |
+| -------------------------- | -------- |
+| `/bin/true` — OS floor     | 0.532 ms |
+| `ctxmux --help`            | 0.899 ms |
+| `tmux -V`                  | 1.057 ms |
 
-Linux spawn is **7.5× cheaper** than macOS. Our CLI startup is *faster* than
+Linux spawn is **7.5× cheaper** than macOS. Our CLI startup is _faster_ than
 tmux's. The floor cannot be 74% of anything on the host that matters, and
 "fusing stop+remove into one verb" — which `d70cde5` records for the owner as
 the largest lever, at the cost of a wire-contract break — is priced off that
@@ -102,7 +102,7 @@ same macOS number and is not worth a contract break at the real magnitude.
 
 **New instance of [[ctxmux-fullfsync-is-not-the-farm-shape]]:** that memory says
 fsync-class optimizations cannot be priced locally. The general rule is wider —
-*anything whose cost is dominated by an OS primitive* must be priced on the
+_anything whose cost is dominated by an OS primitive_ must be priced on the
 target host. Process spawn belongs on that list next to fsync.
 
 ## 3. What teardown actually costs on cn3
@@ -111,18 +111,18 @@ Same binaries R26 measured with (`r26-c/target/release`), memory-only, c=0,
 n=40. `list` is the control: same binary, same connect, same request/response,
 trivial daemon work.
 
-| | ms |
-|---|---|
-| CLI floor (`--help`) | 1.012 |
-| `list` (control verb) | 1.307 |
-| `start` | 2.232 |
-| `stop` | 4.353 |
-| `remove` | 1.381 |
-| **stop + remove** | **5.734** |
+|                                    | ms              |
+| ---------------------------------- | --------------- |
+| CLI floor (`--help`)               | 1.012           |
+| `list` (control verb)              | 1.307           |
+| `start`                            | 2.232           |
+| `stop`                             | 4.353           |
+| `remove`                           | 1.381           |
+| **stop + remove**                  | **5.734**       |
 | 2 × list (floor + IPC, paid twice) | 2.614 — **46%** |
-| daemon-side teardown work | 3.120 — **54%** |
-| — of which `stop` | 3.046 |
-| — of which `remove` | **0.074** |
+| daemon-side teardown work          | 3.120 — **54%** |
+| — of which `stop`                  | 3.046           |
+| — of which `remove`                | **0.074**       |
 
 `remove` is 0.074 ms of daemon work. It is finished; there is nothing in it to
 optimize, which retroactively confirms the one thing `d70cde5` got right about
@@ -133,11 +133,11 @@ optimize, which retroactively confirms the one thing `d70cde5` got right about
 PUB2 is 0.040 ms, 1.3% of it. The cost is the `/proc` census. A faithful
 standalone replica of `members()` on cn3 (868 processes):
 
-| | ms |
-|---|---|
-| `readdir` of `/proc`, numeric entries | 0.775 |
-| `getsid()` × 868 | 0.234 |
-| **one census** | **1.009** |
+|                                       | ms        |
+| ------------------------------------- | --------- |
+| `readdir` of `/proc`, numeric entries | 0.775     |
+| `getsid()` × 868                      | 0.234     |
+| **one census**                        | **1.009** |
 
 And `strace` on a real stop, counting `openat("/proc")`:
 
@@ -156,8 +156,8 @@ R27 classified the census as an untouchable semantic difference (we prove the
 whole owned session empty; tmux tracks only `wp->pid`). That framing is what
 stopped me looking at it — and it conflates two different questions:
 
-- *what* we prove (whole-session emptiness) — genuinely semantic, keep it
-- *how many times per stop* we pay 1.009 ms to prove it — not semantic at all
+- _what_ we prove (whole-session emptiness) — genuinely semantic, keep it
+- _how many times per stop_ we pay 1.009 ms to prove it — not semantic at all
 
 Only the second is in scope, and it was never examined because the first
 answer closed the file.
@@ -169,7 +169,7 @@ Three failures, in descending order of how much they cost.
 **A subtraction whose arms run different code.** The go/no-go compared two
 client-side arms and attributed the difference to a function that one arm never
 called. The fix is mechanical and cheap: when the target is a specific region
-of code, stamp *that region*, even if it means a throwaway build. The stamped
+of code, stamp _that region_, even if it means a throwaway build. The stamped
 build took twelve seconds to compile and answered in one run what two batches
 of careful subtraction had gotten backwards.
 
@@ -200,7 +200,7 @@ The open question for R28, stated so it can be refuted rather than assumed:
 `signal_members` takes a census to enumerate who to signal, and `wait_quiescent`
 takes another immediately after to check emptiness. Whether the second is
 redundant, or whether emptiness can be decided without a full host walk when the
-first census found only the leader, is a *measurement*, not an argument — and it
+first census found only the leader, is a _measurement_, not an argument — and it
 must be made on cn3, where the census costs what it costs.
 
 Correcting `d70cde5` matters more than the new lead. A wrong number in a

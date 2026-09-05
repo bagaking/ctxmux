@@ -15,7 +15,7 @@ The reason it was there is a real proof obligation, not an accident. ADR 013
 requires each staged transaction to prove, before it can launch a child, that it
 fits an 8 MiB per-transaction WAL ceiling and that the WAL as a whole stays under
 16 MiB. Starting from a zero-length WAL let one comparison of the WAL's
-*absolute* length cover both. It also made the check trivially auditable.
+_absolute_ length cover both. It also made the check trivially auditable.
 
 It was expensive for the same reason it was convenient. The output path
 deliberately lets the WAL ride up to its 8 MiB fold trigger, so under a chatty
@@ -25,7 +25,7 @@ at zero for 3.7% of samples at chatty=2. Every lifecycle op therefore folded
 
 ## Why the checkpoint could go
 
-The bound the ADR actually needs is on what one transaction *writes*, not on how
+The bound the ADR actually needs is on what one transaction _writes_, not on how
 long the file already is. Written as a delta it holds off any baseline:
 
 ```
@@ -69,7 +69,7 @@ means the harness broke rather than the hypothesis.
 
 Five WAL/fold tests already existed. All five stay green if
 `fold_wal_below_ceiling` is reverted to an unconditional truncate — they pin the
-*idle* fold, not the lifecycle one. Without a new test the change would have had
+_idle_ fold, not the lifecycle one. Without a new test the change would have had
 no test behind it at all.
 
 `a_lifecycle_verb_folds_only_a_wal_that_is_over_the_ceiling` asserts both halves
@@ -95,20 +95,20 @@ round parity; a tmux arm every fourth round. Statistic is the exact two-sided
 sign test on per-pair direction — a spread test called a +24 ms regression
 "noise" in round 12, so spread is not used here.
 
-| shape | verb | pairs | faster | median Δ | p | verdict |
-|---|---|---|---|---|---|---|
-| c1 | start | 12 | 12/12 | **−3.777 ms** | 0.000 | FASTER |
-| c1 | remove | 12 | 12/12 | **−2.868 ms** | 0.000 | FASTER |
-| c1 | stop | 12 | 5/12 | +0.129 ms | 0.774 | flat |
-| c1 | list | 12 | 6/12 | +0.002 ms | 1.000 | flat |
-| c2 | start | 12 | 12/12 | **−6.223 ms** | 0.000 | FASTER |
-| c2 | remove | 12 | 12/12 | **−4.768 ms** | 0.000 | FASTER |
-| c2 | stop | 12 | 4/12 | +0.212 ms | 0.388 | flat |
-| c2 | list | 12 | 6/12 | +0.002 ms | 1.000 | flat |
-| c8 | start | 12 | 12/12 | **−14.670 ms** | 0.000 | FASTER |
-| c8 | remove | 12 | 12/12 | **−9.230 ms** | 0.000 | FASTER |
-| c8 | stop | 12 | 8/12 | −1.058 ms | 0.388 | flat |
-| c8 | list | 12 | 4/12 | +0.032 ms | 0.388 | flat |
+| shape | verb   | pairs | faster | median Δ       | p     | verdict |
+| ----- | ------ | ----- | ------ | -------------- | ----- | ------- |
+| c1    | start  | 12    | 12/12  | **−3.777 ms**  | 0.000 | FASTER  |
+| c1    | remove | 12    | 12/12  | **−2.868 ms**  | 0.000 | FASTER  |
+| c1    | stop   | 12    | 5/12   | +0.129 ms      | 0.774 | flat    |
+| c1    | list   | 12    | 6/12   | +0.002 ms      | 1.000 | flat    |
+| c2    | start  | 12    | 12/12  | **−6.223 ms**  | 0.000 | FASTER  |
+| c2    | remove | 12    | 12/12  | **−4.768 ms**  | 0.000 | FASTER  |
+| c2    | stop   | 12    | 4/12   | +0.212 ms      | 0.388 | flat    |
+| c2    | list   | 12    | 6/12   | +0.002 ms      | 1.000 | flat    |
+| c8    | start  | 12    | 12/12  | **−14.670 ms** | 0.000 | FASTER  |
+| c8    | remove | 12    | 12/12  | **−9.230 ms**  | 0.000 | FASTER  |
+| c8    | stop   | 12    | 8/12   | −1.058 ms      | 0.388 | flat    |
+| c8    | list   | 12    | 4/12   | +0.032 ms      | 0.388 | flat    |
 
 36 of 36 pairs faster on `start`, 36 of 36 on `remove`, and the win grows with
 the shape — which is what the mechanism predicts, since a busier fleet keeps the
@@ -116,7 +116,7 @@ WAL closer to the ceiling the old code folded on every call.
 
 The A/A control is clean on all twelve cells (every p ≥ 0.146), so no verb is
 unjudgeable in this batch. Its floor is ±0.25 ms at c1/c2 and ±2.5 ms at c8 —
-the c8 floor is larger than the c1 *effect*, which is why the ratchet needs the
+the c8 floor is larger than the c1 _effect_, which is why the ratchet needs the
 control and not just the A/B.
 
 WAL peak is unchanged: BASE 8.43 / 8.50 / 8.76 MB against CAND 8.40 / 8.48 /
@@ -129,17 +129,17 @@ Ratio of medians, never a sign test: the two systems run different verb sets and
 pairing them would be false precision. `stop`+`remove` is compared as a pair
 because that is what one tmux `kill-session` does.
 
-| shape | verb | BASE | CAND | tmux | BASE ratio | CAND ratio |
-|---|---|---|---|---|---|---|
-| c1 | start | 10.248 | 6.519 | 4.551 | 2.25x | **1.43x** |
-| c1 | stop+remove | 14.283 | 11.237 | 4.389 | 3.25x | **2.56x** |
-| c1 | list | 0.217 | 0.220 | 3.448 | 0.06x | 0.06x |
-| c2 | start | 14.805 | 8.884 | 5.180 | 2.86x | **1.71x** |
-| c2 | stop+remove | 17.821 | 13.648 | 4.564 | 3.90x | **2.99x** |
-| c2 | list | 0.242 | 0.246 | 3.653 | 0.07x | 0.07x |
-| c8 | start | 38.035 | 22.621 | 11.511 | 3.30x | **1.97x** |
-| c8 | stop+remove | 29.873 | 21.210 | 11.216 | 2.66x | **1.89x** |
-| c8 | list | 0.261 | 0.284 | 9.276 | 0.03x | 0.03x |
+| shape | verb        | BASE   | CAND   | tmux   | BASE ratio | CAND ratio |
+| ----- | ----------- | ------ | ------ | ------ | ---------- | ---------- |
+| c1    | start       | 10.248 | 6.519  | 4.551  | 2.25x      | **1.43x**  |
+| c1    | stop+remove | 14.283 | 11.237 | 4.389  | 3.25x      | **2.56x**  |
+| c1    | list        | 0.217  | 0.220  | 3.448  | 0.06x      | 0.06x      |
+| c2    | start       | 14.805 | 8.884  | 5.180  | 2.86x      | **1.71x**  |
+| c2    | stop+remove | 17.821 | 13.648 | 4.564  | 3.90x      | **2.99x**  |
+| c2    | list        | 0.242  | 0.246  | 3.653  | 0.07x      | 0.07x      |
+| c8    | start       | 38.035 | 22.621 | 11.511 | 3.30x      | **1.97x**  |
+| c8    | stop+remove | 29.873 | 21.210 | 11.216 | 2.66x      | **1.89x**  |
+| c8    | list        | 0.261  | 0.284  | 9.276  | 0.03x      | 0.03x      |
 
 Taken alone, `remove` reaches 1.01x at c1 and **0.86x at c8** — the first verb
 other than `list` to pass tmux in the chatty shape. It does not clear the
@@ -150,7 +150,7 @@ teardown column, because our teardown is two verbs and `stop` is untouched.
 At c1 and c2, `stop` was +0.129 and +0.212 ms — same sign, growing with shape.
 There was a mechanism ready for it: the old code zeroed the WAL as a side effect
 of every `start` and `remove`, so removing it should leave the WAL nearer the
-ceiling, make the *output* path fold more often, and charge whoever is queued
+ceiling, make the _output_ path fold more often, and charge whoever is queued
 behind that fold. It predicted the regression should be largest at c8.
 
 c8 came back at **−1.058 ms, 8/12 faster**. The sign inverted exactly where the
@@ -160,7 +160,7 @@ them.
 
 Worth recording because the story was coherent and fit two shapes out of three.
 The only reason it did not become the round's conclusion is that it was written
-down as a falsifiable prediction *before* the third shape landed.
+down as a falsifiable prediction _before_ the third shape landed.
 
 ## Verdict
 

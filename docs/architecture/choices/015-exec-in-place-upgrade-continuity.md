@@ -99,7 +99,7 @@ serialization, CLOEXEC, or `execve` failure is fail-stop.
 ### The schema is a shape, and it is checked before the exec
 
 `HANDOFF_SCHEMA` gates whether the incoming image will adopt the manifest, and
-it is compared for exact equality *after* `execve`. That placement makes it the
+it is compared for exact equality _after_ `execve`. That placement makes it the
 one constant in the daemon whose value can kill every live Run: a mismatch is
 discovered when the old process image no longer exists, so nothing can refuse,
 retry, or roll back, and the incoming image's exit closes the inherited pty
@@ -108,7 +108,7 @@ masters — SIGHUP to every live child at once.
 Two consequences follow, and both are now enforced rather than documented.
 
 **The bump means one thing.** The schema names the manifest's serialized
-*shape*, not the code around it. History had been conflating two different
+_shape_, not the code around it. History had been conflating two different
 changes under one string: v1→v2 and v2→v3 each added a required field, which
 genuinely breaks a reader; v3→v4 changed only byte budgets and shedding policy
 and moved no field at all, spending a fatal bump on an upgrade whose bytes were

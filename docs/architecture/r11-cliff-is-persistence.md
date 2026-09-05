@@ -11,7 +11,7 @@
 
 [The regression check](r11-did-r10-regress.md) established that the chatty cliff
 predates R10 and survived it, moving from between 1 and 2 producers to between 2
-and 4. It did not establish *where* the cliff lives.
+and 4. It did not establish _where_ the cliff lives.
 
 The standing suspect was the create path's zero-WAL proof obligation. But
 conventions §5.2 says arithmetic that fits has only failed to be excluded, and
@@ -29,15 +29,15 @@ No code change required.
 
 ## The answer
 
-| shape | metric | persistent | memory-only | ratio |
-|---|---|---|---|---|
-| chatty=1 | start | 23.6 / 23.0 ms | 1.38 / 1.34 ms | 17x |
-| chatty=1 | remove | 15.0 / 15.0 ms | 0.119 / 0.123 ms | **125x** |
-| chatty=1 | daemon CPU | 3.19 s | **0.20 s** | 16x |
-| chatty=2 | start | 44.0 / 69.2 ms | 1.71 / 1.80 ms | 26–40x |
-| chatty=2 | remove | 33.3 / 1731.9 ms | 0.134 / 0.145 ms | **248–11900x** |
-| chatty=4 | start | **TIMEOUT 150 s** | 2.08 / 2.00 ms | — |
-| chatty=4 | remove | **TIMEOUT 150 s** | 0.158 / 0.149 ms | — |
+| shape    | metric     | persistent        | memory-only      | ratio          |
+| -------- | ---------- | ----------------- | ---------------- | -------------- |
+| chatty=1 | start      | 23.6 / 23.0 ms    | 1.38 / 1.34 ms   | 17x            |
+| chatty=1 | remove     | 15.0 / 15.0 ms    | 0.119 / 0.123 ms | **125x**       |
+| chatty=1 | daemon CPU | 3.19 s            | **0.20 s**       | 16x            |
+| chatty=2 | start      | 44.0 / 69.2 ms    | 1.71 / 1.80 ms   | 26–40x         |
+| chatty=2 | remove     | 33.3 / 1731.9 ms  | 0.134 / 0.145 ms | **248–11900x** |
+| chatty=4 | start      | **TIMEOUT 150 s** | 2.08 / 2.00 ms   | —              |
+| chatty=4 | remove     | **TIMEOUT 150 s** | 0.158 / 0.149 ms | —              |
 
 **Memory-only clears `chatty=4` outright** — 2.0 ms creates where the persistent
 build cannot serve a single verb in 150 s. The cliff does not exist without
