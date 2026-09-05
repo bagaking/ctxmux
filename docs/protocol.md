@@ -1,4 +1,4 @@
-# Local Protocol Generation 14
+# Local Protocol Generation 17
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
