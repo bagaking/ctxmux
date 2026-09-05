@@ -461,8 +461,14 @@ The important guarantees are behavioral, not implied by lock types.
   append/finalize waits hold the transition gate but no public read-path lock.
   The initial append is queued before the binding becomes observable; during a
   durable finalize, status/list/attach continue to see `Running` until the
-  receipt returns. Whether a fast child exits before or after activation,
-  exactly one owner finalizes the committed running row as terminal. Output
+  receipt returns. Native child cleanup is admitted by its own eight-slot
+  budget and releases that slot when child cleanup completes; durable
+  terminal publication uses its own bounded finalizer budget instead of
+  occupying a cleanup slot. Replay sync and SQLite commit still precede visible
+  terminal state. Lifecycle removal may overtake queued appends after finalization;
+  an append whose durable Run row has been deleted is discarded. Whether a fast
+  child exits before or after activation, exactly one owner finalizes the
+  committed running row as terminal. Output
   observed after terminal publication may enter incarnation-local replay and
   the internal broadcast channel, but it is not durable and is not guaranteed
   to an attachment after that attachment receives its terminal event.
