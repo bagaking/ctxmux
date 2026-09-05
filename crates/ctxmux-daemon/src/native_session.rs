@@ -791,10 +791,12 @@ fn in_session(pid: u32, session: u32) -> bool {
 
 /// Enumerate every process on the host.
 ///
-/// On Linux this is the fallback [`session_candidates`] takes when this process
-/// is not a child subreaper, so an orphan that reparented to init is still
-/// found; on macOS it is the only implementation, because
-/// `/proc/<pid>/task/<tid>/children` does not exist there.
+/// Linux-only, and reached only as the fallback [`session_candidates`] takes
+/// when this process is not a child subreaper, so an orphan that reparented to
+/// init is still found. macOS has no fallback to be: without
+/// `/proc/<pid>/task/<tid>/children` there is no subtree to descend, so its
+/// `session_candidates` is the host walk and calls `ctxmux_process_stats`
+/// directly.
 ///
 /// `members()` needs exactly one thing from each process: its session ID, which
 /// it obtains with `getsid`. It never reads a name, a command line, or memory
@@ -817,12 +819,6 @@ fn in_session(pid: u32, session: u32) -> bool {
 /// 256 KiB buffer saved 0.090 ms of 1.056 (8.7%) at 886 processes, because the
 /// cost is the kernel materialising one dentry per process. Only asking a
 /// smaller question removes it.
-#[cfg(target_os = "macos")]
-fn process_ids() -> Result<Vec<u32>, String> {
-    ctxmux_process_stats::process_ids()
-        .map_err(|error| format!("failed to enumerate native session members: {error}"))
-}
-
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<u32>, String> {
     let entries = std::fs::read_dir("/proc")
