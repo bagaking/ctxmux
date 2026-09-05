@@ -1244,6 +1244,176 @@ test("SC-02 validates tmux-owned and interrupted Run wire contracts", () => {
   }
 });
 
+test("SC-02 rejects surplus keys on every closed wire shape", () => {
+  // Each mutation is a wire-valid frame with one extra key on a hand-validated
+  // struct. Without the exactFields guard on that struct the surplus key is
+  // silently accepted (the RunInfo.current_size incident): a Rust field added
+  // to the struct would then pass tsc and every Rust test while the SDK never
+  // validates it. The guard turns each surplus key into a rejection at its own
+  // path, so removing any one exactFields call turns its row here red.
+  const native = runInfo();
+  const tmux = tmuxRunInfo();
+  const pane = tmuxPaneInfo();
+  const summary = runSummary();
+  const surplus = { candidate: 1 } as const;
+  const mutations: readonly [unknown, string][] = [
+    // RunInfo: the named incident. A new Rust field lands here as an unknown key.
+    [
+      {
+        type: "response",
+        response: { type: "status", run: { ...native, ...surplus } },
+      },
+      "$frame.response.run.candidate",
+    ],
+    // RunSpec, nested inside RunInfo.
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: { ...native, spec: { ...native.spec, ...surplus } },
+        },
+      },
+      "$frame.response.run.spec.candidate",
+    ],
+    // TerminalSize, nested twice deep.
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: {
+            ...native,
+            current_size: { ...native.current_size, ...surplus },
+          },
+        },
+      },
+      "$frame.response.run.current_size.candidate",
+    ],
+    // RunCapabilities.
+    [
+      {
+        type: "response",
+        response: {
+          type: "started",
+          run: {
+            ...native,
+            capabilities: { ...native.capabilities, ...surplus },
+          },
+        },
+      },
+      "$frame.response.run.capabilities.candidate",
+    ],
+    // RunBackend, tmux variant (inline enum payload).
+    [
+      {
+        type: "response",
+        response: {
+          type: "imported",
+          run: { ...tmux, backend: { ...tmux.backend, ...surplus } },
+        },
+      },
+      "$frame.response.run.backend.candidate",
+    ],
+    // RunSummary, in a list row.
+    [
+      {
+        type: "response",
+        response: {
+          type: "runs",
+          runs: [{ ...summary, ...surplus }],
+          next_cursor: null,
+        },
+      },
+      "$frame.response.runs[0].candidate",
+    ],
+    // TmuxPaneInfo.
+    [
+      {
+        type: "response",
+        response: {
+          type: "tmux_panes",
+          tmux_version: "3.6b",
+          panes: [{ ...pane, ...surplus }],
+        },
+      },
+      "$frame.response.panes[0].candidate",
+    ],
+    // AppliedInputRange.
+    [
+      {
+        type: "response",
+        response: {
+          type: "input_applied",
+          run: native,
+          range: { start_byte: 0, end_byte: 2, ...surplus },
+        },
+      },
+      "$frame.response.range.candidate",
+    ],
+    // RunState, exited variant (inline enum payload).
+    [
+      {
+        type: "event",
+        event: {
+          type: "exited",
+          state: { type: "exited", code: 0, signal: null, ...surplus },
+        },
+      },
+      "$frame.event.state.candidate",
+    ],
+    // RunEvent envelope, gap variant.
+    [
+      {
+        type: "event",
+        event: { type: "gap", latest_output_bytes: 1, ...surplus },
+      },
+      "$frame.event.candidate",
+    ],
+    // OutputChunk.
+    [
+      {
+        type: "event",
+        event: {
+          type: "output",
+          chunk: { start_byte: 0, end_byte: 1, data: "AA==", ...surplus },
+        },
+      },
+      "$frame.event.chunk.candidate",
+    ],
+    // OutputReplayHeader (subsumes the old explicit chunks check).
+    [
+      {
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(),
+          replay: { ...attachedHeader().replay, ...surplus },
+        },
+      },
+      "$frame.snapshot.replay.candidate",
+    ],
+    // ProtocolError.
+    [
+      {
+        type: "error",
+        error: { code: "internal", message: "boom", ...surplus },
+      },
+      "$frame.error.candidate",
+    ],
+    // Top-level ServerFrame envelope.
+    [{ type: "detached", ...surplus }, "$frame.candidate"],
+  ];
+
+  for (const [mutation, expectedPath] of mutations) {
+    assert.throws(
+      () => validateServerFrame(mutation),
+      (error: unknown) =>
+        error instanceof CtxmuxInvalidFrameError && error.path === expectedPath,
+      JSON.stringify(mutation),
+    );
+  }
+});
+
 test("LP-03 rejects malformed UTF-8, duplicate members, and invalid JSON", async (context) => {
   for (const { id, bytes } of MALFORMED_PROTOCOL_FRAMES) {
     const daemon = await mockDaemon(context, async (socket) => {

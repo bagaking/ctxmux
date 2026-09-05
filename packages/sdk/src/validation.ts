@@ -49,24 +49,31 @@ export function validateServerFrame(value: unknown): ServerFrame {
   const frame = record(value, "$frame");
   switch (discriminant(frame, "$frame")) {
     case "hello":
+      exactFields(frame, "$frame", ["type", "runtime"]);
       runtimeIdentity(frame.runtime, "$frame.runtime");
       break;
     case "response":
+      exactFields(frame, "$frame", ["type", "response"]);
       response(frame.response, "$frame.response");
       break;
     case "attached":
+      exactFields(frame, "$frame", ["type", "snapshot"]);
       attachedHeader(frame.snapshot, "$frame.snapshot");
       break;
     case "event":
+      exactFields(frame, "$frame", ["type", "event"]);
       runEvent(frame.event, "$frame.event");
       break;
     case "command_result":
+      exactFields(frame, "$frame", ["type", "command_id", "outcome"]);
       attachmentCommandId(frame.command_id, "$frame.command_id");
       controlOutcome(frame.outcome, "$frame.outcome");
       break;
     case "detached":
+      exactFields(frame, "$frame", ["type"]);
       break;
     case "error":
+      exactFields(frame, "$frame", ["type", "error"]);
       protocolError(frame.error, "$frame.error");
       break;
     default:
@@ -238,26 +245,32 @@ function response(value: unknown, path: string): void {
     case "imported":
     case "forked":
     case "status":
+      exactFields(valueRecord, path, ["type", "run"]);
       runInfo(valueRecord.run, `${path}.run`);
       return;
     case "control_accepted":
+      exactFields(valueRecord, path, ["type", "run", "receipt"]);
       runInfo(valueRecord.run, `${path}.run`);
       controlReceipt(valueRecord.receipt, `${path}.receipt`);
       return;
     case "control_rejected":
+      exactFields(valueRecord, path, ["type", "failure"]);
       controlFailure(valueRecord.failure, `${path}.failure`);
       return;
     case "input_applied":
+      exactFields(valueRecord, path, ["type", "run", "range"]);
       runInfo(valueRecord.run, `${path}.run`);
       appliedInputRange(valueRecord.range, `${path}.range`);
       return;
     case "tmux_panes":
+      exactFields(valueRecord, path, ["type", "tmux_version", "panes"]);
       string(valueRecord.tmux_version, `${path}.tmux_version`);
       array(valueRecord.panes, `${path}.panes`).forEach((pane, index) =>
         tmuxPaneInfo(pane, `${path}.panes[${index}]`),
       );
       return;
     case "runs":
+      exactFields(valueRecord, path, ["type", "runs", "next_cursor"]);
       array(valueRecord.runs, `${path}.runs`).forEach((run, index) =>
         runSummary(run, `${path}.runs[${index}]`),
       );
@@ -266,6 +279,7 @@ function response(value: unknown, path: string): void {
       }
       return;
     case "removed":
+      exactFields(valueRecord, path, ["type", "id"]);
       runId(valueRecord.id, `${path}.id`);
       return;
     default:
@@ -275,6 +289,7 @@ function response(value: unknown, path: string): void {
 
 function attachedHeader(value: unknown, path: string): void {
   const header = record(value, path);
+  exactFields(header, path, ["run", "replay"]);
   runInfo(header.run, `${path}.run`);
   outputReplayHeader(header.replay, `${path}.replay`);
 }
@@ -283,28 +298,35 @@ function runEvent(value: unknown, path: string): void {
   const event = record(value, path);
   switch (discriminant(event, path)) {
     case "output":
+      exactFields(event, path, ["type", "chunk"]);
       outputChunk(event.chunk, `${path}.chunk`);
       return;
     case "exited":
+      exactFields(event, path, ["type", "state"]);
       if (runState(event.state, `${path}.state`) !== "exited") {
         throw invalid(`${path}.state.type`, '"exited"');
       }
       return;
     case "interrupted":
+      exactFields(event, path, ["type", "reason"]);
       interruptionReason(event.reason, `${path}.reason`);
       return;
     case "tmux":
+      exactFields(event, path, ["type", "event"]);
       tmuxRunEvent(event.event, `${path}.event`);
       return;
     case "observation_discontinuity":
+      exactFields(event, path, ["type"]);
       return;
     case "resized":
+      exactFields(event, path, ["type", "size"]);
       // The owner only publishes a size it read back from the PTY, and it
       // rejects a zero read-back rather than reporting it, so a zero here is
       // a contract violation rather than a degenerate-but-legal terminal.
       terminalSize(event.size, `${path}.size`, true);
       return;
     case "gap":
+      exactFields(event, path, ["type", "latest_output_bytes"]);
       validateCursorValue(
         event.latest_output_bytes,
         `${path}.latest_output_bytes`,
@@ -317,6 +339,15 @@ function runEvent(value: unknown, path: string): void {
 
 function runSummary(value: unknown, path: string): void {
   const run = record(value, path);
+  exactFields(run, path, [
+    "id",
+    "backend",
+    "pid",
+    "state",
+    "latest_output_bytes",
+    "retained_output_bytes",
+    "attachments",
+  ]);
   runId(run.id, `${path}.id`);
   runBackendKind(run.backend, `${path}.backend`);
   if (run.pid !== null) {
@@ -340,6 +371,21 @@ function runBackendKind(value: unknown, path: string): "native" | "tmux" {
 
 function runInfo(value: unknown, path: string): void {
   const run = record(value, path);
+  exactFields(run, path, [
+    "id",
+    "spec",
+    "lineage",
+    "backend",
+    "capabilities",
+    "pid",
+    "state",
+    "latest_output_bytes",
+    "durable_output_bytes",
+    "first_available_byte",
+    "attachments",
+    "applied_input_bytes",
+    "current_size",
+  ]);
   runId(run.id, `${path}.id`);
   if (run.spec !== null) {
     runSpec(run.spec, `${path}.spec`);
@@ -395,6 +441,7 @@ function runInfo(value: unknown, path: string): void {
 
 function appliedInputRange(value: unknown, path: string): void {
   const range = record(value, path);
+  exactFields(range, path, ["start_byte", "end_byte"]);
   validateCursorValue(range.start_byte, `${path}.start_byte`);
   validateCursorValue(range.end_byte, `${path}.end_byte`);
   if ((range.end_byte as number) <= (range.start_byte as number)) {
@@ -404,6 +451,14 @@ function appliedInputRange(value: unknown, path: string): void {
 
 function runSpec(value: unknown, path: string): void {
   const spec = record(value, path);
+  exactFields(spec, path, [
+    "program",
+    "args",
+    "cwd",
+    "env",
+    "initial_size",
+    "declared_inputs",
+  ]);
   if (string(spec.program, `${path}.program`).length === 0) {
     throw invalid(`${path}.program`, "a non-empty string");
   }
@@ -428,8 +483,19 @@ function runBackend(value: unknown, path: string): "native" | "tmux" {
   const backend = record(value, path);
   switch (discriminant(backend, path)) {
     case "native":
+      exactFields(backend, path, ["type"]);
       return "native";
     case "tmux":
+      exactFields(backend, path, [
+        "type",
+        "socket_path",
+        "server_pid",
+        "server_started_at",
+        "session_id",
+        "window_id",
+        "pane_id",
+        "tmux_version",
+      ]);
       string(backend.socket_path, `${path}.socket_path`);
       unsignedInteger(backend.server_pid, `${path}.server_pid`, 0xffff_ffff);
       validateCursorValue(
@@ -452,6 +518,15 @@ function runCapabilities(
   backend: "native" | "tmux",
 ): void {
   const capabilities = record(value, path);
+  exactFields(capabilities, path, [
+    "input",
+    "resize",
+    "signal",
+    "stop",
+    "fork_level_a",
+    "fork_level_b",
+    "replay",
+  ]);
   const input = boolean(capabilities.input, `${path}.input`);
   const resize = boolean(capabilities.resize, `${path}.resize`);
   const signal = boolean(capabilities.signal, `${path}.signal`);
@@ -475,6 +550,17 @@ function runCapabilities(
 
 function tmuxPaneInfo(value: unknown, path: string): void {
   const pane = record(value, path);
+  exactFields(pane, path, [
+    "socket_path",
+    "tmux_version",
+    "server_pid",
+    "server_started_at",
+    "session_id",
+    "window_id",
+    "pane_id",
+    "pane_pid",
+    "size",
+  ]);
   string(pane.socket_path, `${path}.socket_path`);
   string(pane.tmux_version, `${path}.tmux_version`);
   unsignedInteger(pane.server_pid, `${path}.server_pid`, 0xffff_ffff);
@@ -490,12 +576,14 @@ function tmuxRunEvent(value: unknown, path: string): void {
   const event = record(value, path);
   switch (discriminant(event, path)) {
     case "session_renamed":
+      exactFields(event, path, ["type", "name"]);
       array(event.name, `${path}.name`).forEach((byte, index) =>
         unsignedInteger(byte, `${path}.name[${index}]`, 0xff),
       );
       return;
     case "paused":
     case "continued":
+      exactFields(event, path, ["type"]);
       return;
     default:
       throw invalid(`${path}.type`, "a known tmux Run event");
@@ -504,6 +592,7 @@ function tmuxRunEvent(value: unknown, path: string): void {
 
 function runInputReference(value: unknown, path: string): void {
   const input = record(value, path);
+  exactFields(input, path, ["kind", "reference"]);
   const kind = string(input.kind, `${path}.kind`);
   if (kind !== "workspace" && kind !== "artifact" && kind !== "context") {
     throw invalid(`${path}.kind`, "a known Run input kind");
@@ -515,6 +604,7 @@ function runInputReference(value: unknown, path: string): void {
 
 function runLineage(value: unknown, path: string): void {
   const lineage = record(value, path);
+  exactFields(lineage, path, ["parent", "fidelity"]);
   runId(lineage.parent, `${path}.parent`);
   const fidelity = string(lineage.fidelity, `${path}.fidelity`);
   if (fidelity !== "level_a" && fidelity !== "level_b") {
@@ -529,14 +619,17 @@ function runState(
   const state = record(value, path);
   switch (discriminant(state, path)) {
     case "running":
+      exactFields(state, path, ["type"]);
       return "running";
     case "exited":
+      exactFields(state, path, ["type", "code", "signal"]);
       unsignedInteger(state.code, `${path}.code`, 0xffff_ffff);
       if (state.signal !== null) {
         string(state.signal, `${path}.signal`);
       }
       return "exited";
     case "interrupted":
+      exactFields(state, path, ["type", "reason"]);
       interruptionReason(state.reason, `${path}.reason`);
       return "interrupted";
     default:
@@ -558,9 +651,14 @@ function interruptionReason(value: unknown, path: string): void {
 
 function outputReplayHeader(value: unknown, path: string): void {
   const replay = record(value, path);
-  if ("chunks" in replay) {
-    throw invalid(`${path}.chunks`, "absent from the metadata-only header");
-  }
+  // The metadata-only header carries no chunks; a `chunks` key means the
+  // fuller OutputReplay shape arrived where only bounds belong. exactFields
+  // rejects it (and any other surplus key) at `${path}.chunks`.
+  exactFields(replay, path, [
+    "first_available_byte",
+    "latest_output_bytes",
+    "truncated",
+  ]);
   validateCursorValue(
     replay.first_available_byte,
     `${path}.first_available_byte`,
@@ -574,6 +672,7 @@ function outputReplayHeader(value: unknown, path: string): void {
 
 function outputChunk(value: unknown, path: string): void {
   const chunk = record(value, path);
+  exactFields(chunk, path, ["start_byte", "end_byte", "data"]);
   validateCursorValue(chunk.start_byte, `${path}.start_byte`);
   validateCursorValue(chunk.end_byte, `${path}.end_byte`);
   const data = decodeOutputBytes(chunk.data, `${path}.data`);
@@ -620,9 +719,11 @@ function controlOutcome(value: unknown, path: string): void {
   const outcome = record(value, path);
   switch (discriminant(outcome, path)) {
     case "accepted":
+      exactFields(outcome, path, ["type", "receipt"]);
       controlReceipt(outcome.receipt, `${path}.receipt`);
       return;
     case "rejected":
+      exactFields(outcome, path, ["type", "failure"]);
       controlFailure(outcome.failure, `${path}.failure`);
       return;
     default:
@@ -634,6 +735,7 @@ function controlReceipt(value: unknown, path: string): void {
   const receipt = record(value, path);
   switch (discriminant(receipt, path)) {
     case "input":
+      exactFields(receipt, path, ["type", "written_bytes"]);
       unsignedInteger(
         receipt.written_bytes,
         `${path}.written_bytes`,
@@ -641,14 +743,17 @@ function controlReceipt(value: unknown, path: string): void {
       );
       return;
     case "resize":
+      exactFields(receipt, path, ["type", "applied_size"]);
       terminalSize(receipt.applied_size, `${path}.applied_size`, true);
       return;
     case "signal":
+      exactFields(receipt, path, ["type", "signal"]);
       if (string(receipt.signal, `${path}.signal`) !== "interrupt") {
         throw invalid(`${path}.signal`, '"interrupt"');
       }
       return;
     case "stop":
+      exactFields(receipt, path, ["type", "disposition"]);
       if (
         string(receipt.disposition, `${path}.disposition`) !== "graceful" &&
         receipt.disposition !== "forced"
@@ -663,6 +768,7 @@ function controlReceipt(value: unknown, path: string): void {
 
 function controlFailure(value: unknown, path: string): void {
   const failure = record(value, path);
+  exactFields(failure, path, ["error", "disposition"]);
   protocolError(failure.error, `${path}.error`);
   const disposition = string(failure.disposition, `${path}.disposition`);
   if (disposition !== "not_applied" && disposition !== "unknown") {
@@ -679,6 +785,7 @@ function controlFailure(value: unknown, path: string): void {
 
 function terminalSize(value: unknown, path: string, nonzero = false): void {
   const size = record(value, path);
+  exactFields(size, path, ["cols", "rows"]);
   const minimum = nonzero ? 1 : 0;
   unsignedInteger(size.cols, `${path}.cols`, 0xffff, minimum);
   unsignedInteger(size.rows, `${path}.rows`, 0xffff, minimum);
@@ -686,6 +793,7 @@ function terminalSize(value: unknown, path: string, nonzero = false): void {
 
 function protocolError(value: unknown, path: string): void {
   const error = record(value, path);
+  exactFields(error, path, ["code", "message"]);
   const code = string(error.code, `${path}.code`);
   if (!ERROR_CODES.has(code as ErrorCode)) {
     throw invalid(`${path}.code`, "a known protocol error code");
@@ -734,7 +842,7 @@ function exactFields(
   const allowed = new Set(expected);
   for (const field of Object.keys(value)) {
     if (!allowed.has(field)) {
-      throw invalid(`${path}.${field}`, "a declared Runtime field");
+      throw invalid(`${path}.${field}`, "a declared wire field");
     }
   }
 }
