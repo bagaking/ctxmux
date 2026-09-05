@@ -22,7 +22,7 @@ two censuses.
 .461000  waitid / wait4             <- reap: the confirm SUCCEEDED
 ```
 
-Census #2 is the proof of session-emptiness and it *wins* — the reap follows it
+Census #2 is the proof of session-emptiness and it _wins_ — the reap follows it
 directly. It is what makes a returned Stop mean "nothing of this Run is left",
 and it stays.
 
@@ -38,22 +38,22 @@ group in one syscall, with no enumeration.
 cn3, 20 paired cells per arm, arm order alternated every pair, sign test against
 an empirical A/A floor measured the same way:
 
-| verb | base ms | cand ms | delta | A/A floor | sign p | verdict |
-|---|---|---|---|---|---|---|
-| **stop** | 4.287 | **3.203** | **+1.079** | 0.078 | <0.0001 | **faster** |
-| start | 2.186 | 2.182 | +0.007 | 0.081 | 0.82 | inside floor |
-| remove | 1.356 | 1.352 | +0.004 | 0.034 | 0.26 | inside floor |
-| list | 1.274 | 1.286 | +0.002 | 0.033 | 0.82 | inside floor |
+| verb     | base ms | cand ms   | delta      | A/A floor | sign p  | verdict      |
+| -------- | ------- | --------- | ---------- | --------- | ------- | ------------ |
+| **stop** | 4.287   | **3.203** | **+1.079** | 0.078     | <0.0001 | **faster**   |
+| start    | 2.186   | 2.182     | +0.007     | 0.081     | 0.82    | inside floor |
+| remove   | 1.356   | 1.352     | +0.004     | 0.034     | 0.26    | inside floor |
+| list     | 1.274   | 1.286     | +0.002     | 0.033     | 0.82    | inside floor |
 
 20/20 pairs moved the same direction, and the effect is 14× the noise floor.
 Predicted 1.009 ms from the standalone census replica; measured 1.079 ms.
 
 The ratchet gate, two further shapes, same paired discipline (14 pairs):
 
-| shape | stop | start | remove | list |
-|---|---|---|---|---|
+| shape                   | stop                  | start               | remove | list   |
+| ----------------------- | --------------------- | ------------------- | ------ | ------ |
 | c=8 chatty, memory-only | **+0.582** (p=0.0001) | −0.149 (p=0.42, ns) | −0.006 | −0.019 |
-| c=0, persistence ON | **+0.794** (p=0.0001) | +0.066 | +0.025 | +0.010 |
+| c=0, persistence ON     | **+0.794** (p=0.0001) | +0.066              | +0.025 | +0.010 |
 
 Everything not `stop` sits inside its A/A floor or fails significance. The
 `start` −0.149 ms at c=8 is not significant and reverses sign at c=0 — noise,
@@ -61,19 +61,19 @@ not a mechanism. **No metric degraded in any shape.**
 
 ## The guarantee, and the test that holds it
 
-`killpg` signals the *group*; the old code signalled the *session*. Those differ
+`killpg` signals the _group_; the old code signalled the _session_. Those differ
 by exactly one class: a descendant that called `setpgid` (left the group) but
 not `setsid` (stayed in the session).
 
 Measured before writing any product code, with a C fixture (F2):
 
-| strategy | plain child | setpgid child | setsid child |
-|---|---|---|---|
-| session census (old) | dead | **dead** | ALIVE |
-| killpg alone (naive) | dead | **ALIVE** | ALIVE |
-| killpg + sweep (shipped) | dead | **dead** | ALIVE |
+| strategy                 | plain child | setpgid child | setsid child |
+| ------------------------ | ----------- | ------------- | ------------ |
+| session census (old)     | dead        | **dead**      | ALIVE        |
+| killpg alone (naive)     | dead        | **ALIVE**     | ALIVE        |
+| killpg + sweep (shipped) | dead        | **dead**      | ALIVE        |
 
-The middle row is the regression, and it had to be *observed* before the fix was
+The middle row is the regression, and it had to be _observed_ before the fix was
 worth writing. The `setsid` child survives all three — it left the session and
 was never owned by either design, which bounds what "whole-session" has ever
 meant here.
@@ -121,12 +121,43 @@ must now call `setpgid` itself.
 Both were caught by pre-registered checks rather than by inspection, which is
 the whole point of writing them down before the edit.
 
+## The third escapee, found by the gate two rounds later
+
+A `killpg` reaches a _group_, and a group whose every member is a zombie still
+exists — the zombie holds the group ID alive precisely so it cannot be recycled,
+which is the property this change relies on for reuse safety. What was missed is
+what the kernel answers in that state. Measured directly on Darwin:
+
+```
+killpg(zombie leader group) -> -1 EPERM (Operation not permitted)
+kill (zombie leader pid)    ->  0
+```
+
+`EPERM`, not `ESRCH`. A zombie retains the group ID but no credentials to check a
+signal against, so the permission check fails before the "does it exist" check.
+`signal_members` forgave only `ESRCH`, so a Stop that raced its own child's exit
+returned `Io`/`Unknown` for a session it had every right to signal.
+
+This surfaced as `concurrent_interrupt_and_stop_have_only_owner_declared_outcomes`
+failing ~60% of local runs (5/8 measured, both before and after R29's commits, so
+it is this change's and not R29's): the concurrent Interrupt kills the shell, and
+Stop's `killpg` then lands on an all-zombie group. Fixed by forgiving `EPERM`
+alongside `ESRCH` in `signal_members` — neither errno claims the session is
+_empty_, which `members()` alone decides and every caller still consults.
+
+Note the asymmetry with the census: in `classify_members`, `EPERM` must stay an
+error, because a lookup we are not permitted to make cannot prove absence. Same
+errno, opposite meaning, one syscall apart. Guarded by
+`signalling_an_all_zombie_group_is_not_a_failure`, which asserts the kernel
+premise before asserting the behaviour, so it fails loudly if Darwin ever changes
+rather than silently proving nothing.
+
 ## Still open
 
 `stop` is now 3.203 ms, of which ~1.0 ms is the remaining confirm census. That
 one is irreducible under `/proc`: proving a session empty requires observing its
 members gone. Removing it needs a different mechanism — cgroup v2's
-`cgroup.events:populated` gives emptiness as an *event* with no walk, and
+`cgroup.events:populated` gives emptiness as an _event_ with no walk, and
 `cgroup.kill` would also catch `setsid` escapees, strengthening the guarantee.
 It is gated on a delegated cgroup subtree and a spawn-path change
 `portable-pty` does not expose. One shell line decides whether it is even
