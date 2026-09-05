@@ -1,5 +1,10 @@
 # One Run's durable finalize blocks another Run's Stop receipt
 
+Scope correction: the R36 resolution described below applied to a weaker Stop
+completion contract. The [combined case study](case-study-replay-stop-convergence.md)
+records why public success now joins terminal visibility while native cleanup
+retains independent worker capacity. The causal measurements below are retained.
+
 **Status: FIXED in
 [`r36-the-stop-that-did-not-need-the-actor`](r36-the-stop-that-did-not-need-the-actor.md).**
 Found while clearing red tests before round 26, and filed here because the round
