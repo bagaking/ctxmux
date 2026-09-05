@@ -189,9 +189,9 @@ enum OwnerState {
 
 /// Live descriptors of one native Run, paired for exec-in-place handoff: the
 /// pty master fd number and the child pid that a post-exec daemon re-adopts.
-/// The fields have no production reader until the SIGHUP path lands; they are
-/// read only through the `#[cfg(test)]` handoff test today.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Produced by [`NativeRunOwner::extract_for_handoff`] on the shipped SIGHUP
+/// exec-in-place path and consumed by `perform_exec_upgrade` to build the
+/// handoff manifest.
 #[derive(Debug, Clone)]
 pub(crate) struct LiveDescriptors {
     pub run_id: RunId,
@@ -424,8 +424,8 @@ impl NativeRunOwner {
     /// Return the live pty master fd and child pid for every watched native
     /// Run, relinquishing the owner's reap/close authority for each so the
     /// child survives (unreaped) and its master fd stays open past a future
-    /// exec-in-place. No production caller exists until the SIGHUP path lands.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// exec-in-place. Called on the shipped SIGHUP exec-in-place path from
+    /// `perform_exec_upgrade`, past the point of no return.
     pub(crate) fn extract_for_handoff(&self) -> Result<Vec<LiveDescriptors>, String> {
         let commands = {
             let state = mutex_lock(&self.inner.state);
