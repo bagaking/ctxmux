@@ -249,6 +249,15 @@ Acceptance:
 - a Level B request without host-owned provenance and a complete replacement
   `RunSpec` creates no Run and never falls back to Level A.
 
+Open: replay capacity past the frozen 384 MiB main-database ceiling. A
+production wedge on 2026-09-21 showed 42% of that ceiling spent on row headers
+and indexes rather than output (762,048 rows, median 82 B).
+[replay-capacity-beyond-the-384-mib-ceiling](plans/replay-capacity-beyond-the-384-mib-ceiling.md)
+measures three candidates and ranks compression last — it is a constant factor
+against linear growth. Moving cold replay out of SQLite is the only one that
+makes the ceiling stop being a constant, and it also removes the dependency
+that makes freeing space require space.
+
 ## M4 — tmux adapter
 
 Status: implemented under Feature `f-224czneed`; required minimum/current
