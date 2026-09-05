@@ -32,12 +32,12 @@ Four arms per rate, both orders, two rounds. Fold counts normalized by arm
 duration (sample count ÷ 20 Hz) — raw counts are not comparable, since the
 `chatty=4` arms ran 144 s while `chatty=1` finished in 2.3 s.
 
-| chatty | secs | folds | folds/s | mean peak | **MB/s folded** | start |
-|---|---|---|---|---|---|---|
-| 0 | 0.3 | 0 | 0.00 | — | 0.0 | 6.1 ms |
-| 1 | 2.3 | 12 | 5.27 | 6.79 MB | 35.8 | 23.0 ms |
-| 2 | 17.9 | 130 | 7.27 | 7.56 MB | **55.0** | 59.5 ms |
-| 4 | 143.9 | 986 | 6.85 | 8.20 MB | **56.1** | TIMEOUT |
+| chatty | secs  | folds | folds/s | mean peak | **MB/s folded** | start   |
+| ------ | ----- | ----- | ------- | --------- | --------------- | ------- |
+| 0      | 0.3   | 0     | 0.00    | —         | 0.0             | 6.1 ms  |
+| 1      | 2.3   | 12    | 5.27    | 6.79 MB   | 35.8            | 23.0 ms |
+| 2      | 17.9  | 130   | 7.27    | 7.56 MB   | **55.0**        | 59.5 ms |
+| 4      | 143.9 | 986   | 6.85    | 8.20 MB   | **56.1**        | TIMEOUT |
 
 Two things move together and one does not:
 
@@ -86,7 +86,7 @@ periods, under which `try_recv` almost always finds a command waiting and the
 
 This is the second time in this project that **zero survivors** has been a
 suspicious signal rather than a passing one. An adversarial verifier's
-*refutations* need checking against measurement exactly as its confirmations do,
+_refutations_ need checking against measurement exactly as its confirmations do,
 and a well-argued refutation is the harder one to doubt.
 
 ## Round 11's target
@@ -101,7 +101,7 @@ pinned by `a_drained_queue_folds_the_wal_before_the_next_start_needs_it`
 (`:6283`). It is a real proof obligation, not an incidental cost.
 
 Note also what the fold rate implies about the existing idle fold: at 5–7 folds
-per second the actor *is* reaching its `Empty` branch regularly — the fold is
+per second the actor _is_ reaching its `Empty` branch regularly — the fold is
 firing, just not fast enough to keep the WAL below the ceiling under load. So the
 remedy is not "make the idle fold fire more often"; it is to reduce how many
 bytes need folding per unit of real output.

@@ -12,7 +12,7 @@ mechanism was half-formed, and reading the send path afterwards produced a
 competing story worth taking seriously: lifecycle verbs use a **blocking**
 `send()` against a bounded `sync_channel(16)` while eight reactor threads push
 with `try_send`. On that reading the command never reaches the queue at all —
-it starves at *admission*, losing every freed slot to a reactor.
+it starves at _admission_, losing every freed slot to a reactor.
 
 That is not a pedantic distinction. Kafka's KIP-291 separates exactly these two
 starvation modes because **they take different fixes**, and is explicit that
@@ -27,17 +27,17 @@ numbers per `finalize`: time blocked inside `send()` (SEG-A, admission), time
 from enqueue to dequeue (SEG-B, queue position), and the caller's whole wall
 time. cn3, 3 rounds × 24 `stop`s per cell, 72 samples per cell.
 
-| cell | SEG-A (admission) | SEG-B (queued) | on-actor | total |
-|---|---|---|---|---|
-| c=0 | 7 µs (0.3 %) | 17 µs (0.8 %) | 2047 µs (98.8 %) | 2071 µs |
-| **c=8** | **1 µs (0.0 %)** | **93035 µs (98.1 %)** | 1826 µs (1.9 %) | 94862 µs |
+| cell    | SEG-A (admission) | SEG-B (queued)        | on-actor         | total    |
+| ------- | ----------------- | --------------------- | ---------------- | -------- |
+| c=0     | 7 µs (0.3 %)      | 17 µs (0.8 %)         | 2047 µs (98.8 %) | 2071 µs  |
+| **c=8** | **1 µs (0.0 %)**  | **93035 µs (98.1 %)** | 1826 µs (1.9 %)  | 94862 µs |
 
 SEG-B scales **5472×** from a quiet fleet to a loud one. SEG-A does not move and
 is one microsecond.
 
 **My pre-registered prediction was that SEG-A would dominate. It is falsified.**
 Slots are never scarce; eight reactors do not starve one lifecycle sender. The
-wait is plain FIFO position — KIP-291 mode (2), which is the *cheap* branch,
+wait is plain FIFO position — KIP-291 mode (2), which is the _cheap_ branch,
 because the command is already admitted and merely standing in the wrong place.
 
 This also settles R24's mechanism properly: the win came from having fewer
@@ -94,7 +94,7 @@ bytes; a barrier carries none and is pure ordering.
 **Batch size is deliberately unchanged.** Shrinking batches to cut latency is
 fsync amplification, and this project has measured its teeth (a zero-length WAL
 costs the next commit 1.13 ms; folding costs ~1.6 ms/MiB). The lifecycle command
-slips *between* full-size batches; it never makes one smaller.
+slips _between_ full-size batches; it never makes one smaller.
 
 ## Why this does not re-trip the R21 latch
 
@@ -116,7 +116,7 @@ rather than reasoned about:
   merely queued.
 - **Lifecycle stays FIFO among itself.** One lifecycle channel drained in order
   preserves every lifecycle-vs-lifecycle edge the latch protects. There are no
-  priorities *within* lifecycle.
+  priorities _within_ lifecycle.
 
 ### The hazard is the reverse of the obvious one
 
@@ -139,7 +139,7 @@ a reopen recovers all the bytes.
 Version 1 passed with the lane and passed without it. An ordering probe showed
 why: only one append was ever dequeued — the wedged batch swallowed all three,
 so no overtake occurred. Version 2 produced a real `append → finalize → append`
-order, and the lane-removal mutation *still* did not redden it, because on the
+order, and the lane-removal mutation _still_ did not redden it, because on the
 append lane the end state is identical: the finalize is simply dequeued last.
 
 So the fixture was blind-tested against the **defect** rather than against the
@@ -152,17 +152,17 @@ that matters: it catches what it exists for.
 control, CAND), order rotated per round, four shapes × four verbs, adjudicated
 under Holm-Bonferroni across the 16 cells plus the control's own empirical floor.
 
-| shape | verb | BASE | CAND | ratio |
-|---|---|---|---|---|
-| c=1 | start | 8.67 ms | 6.87 ms | **1.26× faster** |
-| c=1 | stop | 9.53 ms | 7.98 ms | **1.19× faster** |
-| c=1 | remove | 6.51 ms | 4.94 ms | **1.32× faster** |
-| c=2 | start | 10.97 ms | 8.29 ms | **1.32× faster** |
-| c=2 | stop | 10.95 ms | 8.68 ms | **1.26× faster** |
-| c=2 | remove | 7.34 ms | 5.50 ms | 1.34× (below this run's floor) |
-| **c=8** | **start** | **89.41 ms** | **12.07 ms** | **7.41× faster** |
-| **c=8** | **stop** | **94.02 ms** | **14.37 ms** | **6.54× faster** |
-| **c=8** | **remove** | **103.48 ms** | **7.06 ms** | **14.66× faster** |
+| shape   | verb       | BASE          | CAND         | ratio                          |
+| ------- | ---------- | ------------- | ------------ | ------------------------------ |
+| c=1     | start      | 8.67 ms       | 6.87 ms      | **1.26× faster**               |
+| c=1     | stop       | 9.53 ms       | 7.98 ms      | **1.19× faster**               |
+| c=1     | remove     | 6.51 ms       | 4.94 ms      | **1.32× faster**               |
+| c=2     | start      | 10.97 ms      | 8.29 ms      | **1.32× faster**               |
+| c=2     | stop       | 10.95 ms      | 8.68 ms      | **1.26× faster**               |
+| c=2     | remove     | 7.34 ms       | 5.50 ms      | 1.34× (below this run's floor) |
+| **c=8** | **start**  | **89.41 ms**  | **12.07 ms** | **7.41× faster**               |
+| **c=8** | **stop**   | **94.02 ms**  | **14.37 ms** | **6.54× faster**               |
+| **c=8** | **remove** | **103.48 ms** | **7.06 ms**  | **14.66× faster**              |
 
 Every counted win is 12/12 on the paired sign test (p_holm = 0.008). Nothing
 regressed: all four `list` cells and all four `c=0` cells are flat, retained

@@ -8,15 +8,15 @@ how each number will be obtained.
 
 cn3, R26's own binaries, memory-only, c=0, n=40, 868 host processes:
 
-| | ms |
-|---|---|
-| stop + remove | 5.734 |
-| two CLI invocations (floor + IPC) | 2.614 (46%) |
-| daemon-side work | 3.120 (54%) |
-| — `remove` | 0.074 — **closed, nothing there** |
-| — `stop` | **3.046 — the whole target** |
-| two `/proc` censuses within it | 2.018 (66%) |
-| one census (readdir 0.775 + 868×getsid 0.234) | 1.009 |
+|                                               | ms                                |
+| --------------------------------------------- | --------------------------------- |
+| stop + remove                                 | 5.734                             |
+| two CLI invocations (floor + IPC)             | 2.614 (46%)                       |
+| daemon-side work                              | 3.120 (54%)                       |
+| — `remove`                                    | 0.074 — **closed, nothing there** |
+| — `stop`                                      | **3.046 — the whole target**      |
+| two `/proc` censuses within it                | 2.018 (66%)                       |
+| one census (readdir 0.775 + 868×getsid 0.234) | 1.009                             |
 
 ## Which census is which — settled by observation, not argument
 
@@ -41,11 +41,11 @@ Facts established:
    or deleting it saves nothing and would break the proof.
 2. **Census #1 exists only to build a list of PIDs to signal.** The signal it
    ultimately sends, in the common case, is one `kill()` to the leader.
-3. The leader is already `CLD_KILLED` *before* census #2 begins, so census #2
+3. The leader is already `CLD_KILLED` _before_ census #2 begins, so census #2
    walks all 868 processes purely to establish that **no descendants** exist.
 
 (Absolute times above are strace-inflated — each `getsid` costs ~25 µs under
-ptrace against ~0.3 µs untraced. The *order* is what this trace is for; the
+ptrace against ~0.3 µs untraced. The _order_ is what this trace is for; the
 1.009 ms per census comes from the untraced replica.)
 
 ## The candidate
@@ -74,7 +74,7 @@ the candidate adds no new guard.
 
 ### The one real behavioural gap
 
-`killpg` signals the *group*; today's code signals the *session*. The delta is
+`killpg` signals the _group_; today's code signals the _session_. The delta is
 exactly: a descendant that called `setpgid` (left the group) but not `setsid`
 (stayed in the session). Today it is signalled; under a naive killpg it is not.
 
@@ -82,7 +82,7 @@ exactly: a descendant that called `setpgid` (left the group) but not `setsid`
   the current code nor the candidate. No delta — it was never covered.
 - The `setpgid`-in-session straggler is the entire risk, and the confirm census
   already enumerates session members. So: after `killpg`, if the confirm finds
-  survivors, signal *those specific PIDs* through the existing per-member
+  survivors, signal _those specific PIDs_ through the existing per-member
   `getsid`-revalidate-then-`kill` path before escalating to KILL.
 
 Common case: 1 `killpg` + 1 confirm census. Straggler case: + a targeted pass.
@@ -104,14 +104,15 @@ engaged reports "flat").
 **F2 — the guarantee fixture, and it must FAIL first.**
 A leader that forks (a) a child calling `setpgid(0,0)`, staying in-session, and
 (b) a child calling `setsid()`. Three arms, checked with `kill -0`:
+
 - current code: (a) is killed
 - killpg **without** the fallback: (a) **survives** — this regression MUST be
   observed, or the fixture is not exercising the gap and proves nothing
 - killpg **with** the confirm-fallback: (a) is killed
 
 Nobody is expected to own (b). If arm 2 does not leave (a) alive, the fixture is
-wrong — fix the fixture, not the theory. *(Mutation-testing discipline: a test
-that cannot go red has not been shown to test anything.)*
+wrong — fix the fixture, not the theory. _(Mutation-testing discipline: a test
+that cannot go red has not been shown to test anything.)_
 
 **F3 — paired timing, alternating arm order.**
 ≥12 pairs, arms alternated (cn3's second arm runs systematically faster), sign
@@ -125,7 +126,7 @@ degrade. Any degradation on any metric → roll back and write the post-mortem.
 ## Out of scope, and why
 
 **cgroup v2** (`cgroup.kill` + `cgroup.events:populated` + inotify) would remove
-*both* censuses and is strictly stronger — it catches `setsid` escapees too. It
+_both_ censuses and is strictly stronger — it catches `setsid` escapees too. It
 is deferred, not rejected, on two constraints: it needs a delegated cgroup
 subtree (a non-root daemon on a bare host gets EPERM), and placing the child in
 its cgroup means changing the spawn path, which `portable-pty` does not expose.

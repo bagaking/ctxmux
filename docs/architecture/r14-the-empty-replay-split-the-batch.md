@@ -29,16 +29,16 @@ the property R13's segmentation lacked.
 
 For `start` at c8:
 
-| layer | value |
-|---|---|
-| queue wait | 17.70 ms |
-| ├ `append_us` | 16.28 ms = **92.0% of the wait** |
-| │ ├ write | 3.55 ms |
-| │ ├ prune | 0.01 ms (4 loops) |
-| │ └ **commit** | **10.70 ms = 87.6% of `append_us`** |
-| └ `admit_fold_us` | **0.00 ms** |
-| own fold | 5.21 ms |
-| body | 11.22 ms |
+| layer             | value                               |
+| ----------------- | ----------------------------------- |
+| queue wait        | 17.70 ms                            |
+| ├ `append_us`     | 16.28 ms = **92.0% of the wait**    |
+| │ ├ write         | 3.55 ms                             |
+| │ ├ prune         | 0.01 ms (4 loops)                   |
+| │ └ **commit**    | **10.70 ms = 87.6% of `append_us`** |
+| └ `admit_fold_us` | **0.00 ms**                         |
+| own fold          | 5.21 ms                             |
+| body              | 11.22 ms                            |
 
 `admit_fold_us = 0.00`. Not "under a third" — zero. The append path never folds
 on this workload, because every `start` and `remove` zeroes the WAL
@@ -53,8 +53,8 @@ A 16-agent survey ran in parallel on four candidate directions. All four were
 adversarially verified by three independent skeptics each; **0 of 4 survived**.
 Three of the four had converged on the fold, and their own stated discriminator
 was `admit_fold_us` — the measurement refutes them on their own terms. One
-dissenting verdict named what the accounting shows: *"the real unaccounted cost
-is the drain: 4 sub-budget transactions = 4 fsyncs."*
+dissenting verdict named what the accounting shows: _"the real unaccounted cost
+is the drain: 4 sub-budget transactions = 4 fsyncs."_
 
 ## Not composing medians
 
@@ -129,9 +129,9 @@ around it, not on the empty one.
 
 The same comment also wrote down how it would fail:
 
-> *"if a future change makes this empty append expensive (a dirty page, a schema
+> _"if a future change makes this empty append expensive (a dirty page, a schema
 > bump, an autocheckpoint), the cost moves but this assertion will not notice —
-> re-measure rather than trusting the count alone."*
+> re-measure rather than trusting the count alone."_
 
 It predicted its own blind spot, and pointed at the remedy. The lesson is
 narrower than "re-measure everything": **a cost attributed to an operation may
@@ -157,16 +157,16 @@ null for the A/B it was controlling.
 
 Rerun at 12 pairs with the A/A alternating exactly like the A/B:
 
-| shape | verb | A/B | p | A/A floor | verdict |
-|---|---|---|---|---|---|
-| c2 | start | 12/12  −2.86 ms  −20.8% | 0.0005 | +1.2% | **improved** |
-| c2 | remove | 8/12  −0.22 ms  −3.1% | 0.388 | +3.6% | no effect |
-| c2 | stop | 5/12  +0.25 ms  +3.9% | 0.774 | +1.0% | no effect |
-| c2 | list | 5/12  +0.01 ms | 0.774 | +4.0% | no effect |
-| c8 | start | 11/12  −5.78 ms  −17.6% | 0.006 | −1.6% | **improved** |
-| c8 | remove | 7/12  −0.18 ms  −1.4% | 0.774 | +2.2% | no effect |
-| c8 | stop | 6/12  +0.13 ms  +1.4% | 1.000 | +4.1% | no effect |
-| c8 | list | 6/12  +0.01 ms | 1.000 | +1.5% | no effect |
+| shape | verb   | A/B                   | p      | A/A floor | verdict      |
+| ----- | ------ | --------------------- | ------ | --------- | ------------ |
+| c2    | start  | 12/12 −2.86 ms −20.8% | 0.0005 | +1.2%     | **improved** |
+| c2    | remove | 8/12 −0.22 ms −3.1%   | 0.388  | +3.6%     | no effect    |
+| c2    | stop   | 5/12 +0.25 ms +3.9%   | 0.774  | +1.0%     | no effect    |
+| c2    | list   | 5/12 +0.01 ms         | 0.774  | +4.0%     | no effect    |
+| c8    | start  | 11/12 −5.78 ms −17.6% | 0.006  | −1.6%     | **improved** |
+| c8    | remove | 7/12 −0.18 ms −1.4%   | 0.774  | +2.2%     | no effect    |
+| c8    | stop   | 6/12 +0.13 ms +1.4%   | 1.000  | +4.1%     | no effect    |
+| c8    | list   | 6/12 +0.01 ms         | 1.000  | +1.5%     | no effect    |
 
 The `remove` regression was a thin-sample streak: at 12 pairs it is 8/12 in the
 **candidate's** favour. The A/B had to clear both a p<0.05 sign test and the
@@ -182,16 +182,16 @@ both directions.
 
 ## Absolute numbers
 
-| shape | verb | base | after |
-|---|---|---|---|
-| c2 | start | 13.78 ms | **10.89 ms** |
-| c2 | stop | 6.44 | 6.57 |
-| c2 | remove | 7.13 | 7.06 |
-| c2 | list | 0.212 | 0.216 |
-| c8 | start | 32.93 ms | **26.36 ms** |
-| c8 | stop | 9.69 | 9.58 |
-| c8 | remove | 12.87 | 12.35 |
-| c8 | list | 0.236 | 0.235 |
+| shape | verb   | base     | after        |
+| ----- | ------ | -------- | ------------ |
+| c2    | start  | 13.78 ms | **10.89 ms** |
+| c2    | stop   | 6.44     | 6.57         |
+| c2    | remove | 7.13     | 7.06         |
+| c2    | list   | 0.212    | 0.216        |
+| c8    | start  | 32.93 ms | **26.36 ms** |
+| c8    | stop   | 9.69     | 9.58         |
+| c8    | remove | 12.87    | 12.35        |
+| c8    | list   | 0.236    | 0.235        |
 
 Against R13's floor pricing, `start` at c8 had 21.3 ms recoverable above its
 6.40 ms quiet-shape floor. This takes 6.6 ms of it — **31% of what was
@@ -200,7 +200,7 @@ theoretically available**, from deleting eleven lines.
 ## What is still open
 
 - `commit` remains ~88% of the append work a `start` waits behind. This round
-  removed the *excess* fsyncs; the remaining ones are byte-forced by the 1 MiB
+  removed the _excess_ fsyncs; the remaining ones are byte-forced by the 1 MiB
   transaction budget. Lowering the count further means changing the budget or
   the durability contract, neither of which is a free win.
 - The unconditional `truncate_wal_to_zero` in both lifecycle prologues is why

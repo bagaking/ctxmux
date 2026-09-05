@@ -8,7 +8,7 @@ waiting in line.** Every round from R19 to R23 optimised the 7.3 ms.
 R19 through R23 all targeted the persistence path's own cost: fold cadence, WAL
 amplification, row coalescing, fsync batching, retention ceilings. Two shipped,
 three were rejected. None of them asked what fraction of a create the
-persistence work even *is*.
+persistence work even _is_.
 
 An earlier segmentation (claim c013) had measured it at a 28 ms client median:
 queue 16.6 ms, fold 4.3 ms, body 5.3 ms — the queue already 81 % of the premium.
@@ -23,14 +23,14 @@ queue depth at dequeue. cn3, 3 rounds × 64 creates, 8 chatty Runs at ~174 MiB/s
 The segments close against the client's wall time in every cell, which is the
 precondition for reading any of them.
 
-| | c=0 control | c=8 loud |
-|---|---|---|
-| client wall | 6.5 ms | **290.2 ms** |
-| on-actor work | 2.9 ms (45 %) | **7.3 ms (2.5 %)** |
+|                                    | c=0 control       | c=8 loud              |
+| ---------------------------------- | ----------------- | --------------------- |
+| client wall                        | 6.5 ms            | **290.2 ms**          |
+| on-actor work                      | 2.9 ms (45 %)     | **7.3 ms (2.5 %)**    |
 | — fold, `wal_checkpoint(TRUNCATE)` | 0.0 ms, fired 0 % | **0.0 ms, fired 7 %** |
-| — insert + commit | 2.9 ms | 7.3 ms |
-| residual (queue + IPC) | 3.6 ms (55 %) | **282.9 ms (97.5 %)** |
-| append queue depth at dequeue | 0 | **64 = capacity** |
+| — insert + commit                  | 2.9 ms            | 7.3 ms                |
+| residual (queue + IPC)             | 3.6 ms (55 %)     | **282.9 ms (97.5 %)** |
+| append queue depth at dequeue      | 0                 | **64 = capacity**     |
 
 tmux on the same host, same batch, same cell: 8.4 → 10.2 ms.
 
@@ -53,13 +53,13 @@ share.
 **My own previous probe refuted nothing.** It reported two findings, and both
 instruments were measuring the wrong thing:
 
-- *"The create is CPU-bound, not sleeping — 149 % of wall in CPU."*
+- _"The create is CPU-bound, not sleeping — 149 % of wall in CPU."_
   `/proc/<pid>/stat` is process-wide. During those 358 ms, eight PTY reactor
-  threads were running at ~250k reads/s. 149 % is what a busy *daemon* looks
+  threads were running at ~250k reads/s. 149 % is what a busy _daemon_ looks
   like. The create itself was neither sleeping nor computing — it was not
   scheduled at all.
-- *"Latency is insensitive to WAL size — 0 kb and 8875 kb both give 358 ms."*
-  The WAL was sampled *before* the create. At 174 MiB/s the fleet refills 8 MiB
+- _"Latency is insensitive to WAL size — 0 kb and 8875 kb both give 358 ms."_
+  The WAL was sampled _before_ the create. At 174 MiB/s the fleet refills 8 MiB
   in ~50 ms; the create takes 358 ms. The sample and the fold it was meant to
   price were seven refill cycles apart.
 
@@ -76,7 +76,7 @@ a precise number answering a question I had not asked.
 **Measured: `c=8` start 2.38×, stop 4.30×, remove 4.59× faster, 0/12 rounds
 slower on each, nothing else moved. Shipped.**
 
-The reasoning I *used* to pick it was wrong, and the write-up says so rather
+The reasoning I _used_ to pick it was wrong, and the write-up says so rather
 than retrofitting a mechanism to a result. What I claimed:
 
 > `COALESCE_ROW_BYTES` = 64 KiB bounds one append's payload, so 16 appends fill
@@ -93,13 +93,13 @@ of one" does not follow.
 The win is real and large; the arithmetic that predicted it is not the reason.
 A follow-up probe (6 rounds, arms alternated) measured what actually changes:
 
-| | capacity 64 | capacity 16 | ratio |
-|---|---|---|---|
-| create mean | 410 ms | 125 ms | **0.305** |
-| writes/s, steady state | 70738 | 70362 | 0.995 |
-| write KB/s, steady state | 186438 | 186324 | 0.999 |
-| **bytes per write** | **2696** | **2696** | **1.000** |
-| writes during the creates | 679256 | 205448 | 0.302 |
+|                           | capacity 64 | capacity 16 | ratio     |
+| ------------------------- | ----------- | ----------- | --------- |
+| create mean               | 410 ms      | 125 ms      | **0.305** |
+| writes/s, steady state    | 70738       | 70362       | 0.995     |
+| write KB/s, steady state  | 186438      | 186324      | 0.999     |
+| **bytes per write**       | **2696**    | **2696**    | **1.000** |
+| writes during the creates | 679256      | 205448      | 0.302     |
 
 Both follow-up hypotheses die here. It is **not commit size** — bytes per write
 is identical to the byte. It is **not render pressure** — the fleet's throughput
@@ -129,15 +129,15 @@ and the dropped bytes are re-carried by the next render from the still-unmoved
 offered watermark. The code's own comment: pressure "degrades into fewer, larger
 writes rather than into a stalled fleet."
 
-R22 moved this constant 1024 → 64 and shipped it, reasoning about *escalation
-across consecutive stops* — "depth sets the escalation, not the level". That
+R22 moved this constant 1024 → 64 and shipped it, reasoning about _escalation
+across consecutive stops_ — "depth sets the escalation, not the level". That
 remains true. This round moves it again for the reason the probe measured:
-depth *is* the level, because the create's wait is depth ÷ drain rate.
+depth _is_ the level, because the create's wait is depth ÷ drain rate.
 
 **Why not go lower than 16?** Not for the reason I first gave. I wrote that the
 fleet's unchanged throughput meant "the queue still absorbs its bursts at 16,
 and at 8 or 4 that headroom comes off the output path" — but the row probe in
-the fixture section shows the depth is not buying transaction size *at all* in
+the fixture section shows the depth is not buying transaction size _at all_ in
 this regime: rows are 1.0004× between the two arms, both pinned at the
 `COALESCE_ROW_BYTES` ceiling, because eight reactor threads keep `try_recv`
 non-empty and the batch fills to `MAX_TRANSACTION_PAYLOAD_BYTES` regardless. So
@@ -151,11 +151,11 @@ against a 93 ms operation. The knob is spent; what is left is structural.
 (md5 `79785885`), candidate differing by exactly the one constant and its
 assertion.
 
-| shape/verb | BASE | CAND | ratio | p_holm |
-|---|---|---|---|---|
-| c=8 remove | 455.7 ms | 99.4 ms | **4.59× faster** | 0.008 |
-| c=8 stop | 383.7 ms | 89.1 ms | **4.30× faster** | 0.008 |
-| c=8 start | 221.3 ms | 93.0 ms | **2.38× faster** | 0.008 |
+| shape/verb | BASE     | CAND    | ratio            | p_holm |
+| ---------- | -------- | ------- | ---------------- | ------ |
+| c=8 remove | 455.7 ms | 99.4 ms | **4.59× faster** | 0.008  |
+| c=8 stop   | 383.7 ms | 89.1 ms | **4.30× faster** | 0.008  |
+| c=8 start  | 221.3 ms | 93.0 ms | **2.38× faster** | 0.008  |
 
 0/12 rounds slower on each. Integrity clean in every cell: all 48 Runs started,
 0 stops refused, 0 removes failed. Retained bytes unmoved (`c=8` 34114 vs
@@ -185,7 +185,7 @@ Two corrections, both required:
    to p_holm = 0.617; the candidate's `c=1 remove` to 0.083; all three wins
    survive at 0.008.
 2. **An empirical floor** — a candidate's effect must exceed what the A/A
-   control produces on the *same* cell. The control's own spread on `c=8 start`
+   control produces on the _same_ cell. The control's own spread on `c=8 start`
    is 0.245, so nothing smaller than that is attributable there.
 
 The corrected gate was re-verified against five synthetic cases before being
@@ -201,8 +201,8 @@ numbers should not be read until it is fixed.
 ## A test that was asserting against the constant, twice
 
 `many_small_appends_become_few_large_rows` failed on **both** arms — pre-existing
-on the shipped source, not caused by the change. Its message says why: *"the
-persistence queue refused a fixture append"*. The fixture pushes 400 appends
+on the shipped source, not caused by the change. Its message says why: _"the
+persistence queue refused a fixture append"_. The fixture pushes 400 appends
 with no drain and treats the first `try_send` refusal as a failure, which is
 designed backpressure, not a defect — the R21 lesson written into a fixture.
 It is red at capacity 64 and goes red sooner at 16.
@@ -220,7 +220,7 @@ end (`persistence.rs:5084`), because the buffer does not survive the
 transaction. **One batch is therefore one row boundary**, and a batch is bounded
 by what the actor's `try_recv` loop can pull — which the capacity bounds. Four
 rows at 64, twenty at 16, 401 when coalescing is broken: the fixture was
-sensitive to coalescing *and* to a performance knob, and the second sensitivity
+sensitive to coalescing _and_ to a performance knob, and the second sensitivity
 is what makes a correctness test weld the knob in place.
 
 **That coupling does not exist in production**, and the question was settled by
@@ -228,11 +228,11 @@ measurement rather than by argument, because "row size did not change" is
 exactly the kind of claim that is convenient to believe. Six rounds on cn3, arms
 alternated, rows read straight out of `replay_chunks` after a clean shutdown:
 
-| | cap 64 | cap 16 | ratio |
-|---|---|---|---|
-| mean row bytes | 64059 | 64082 | **1.0004** |
-| rows | 510 | 515 | 1.010 |
-| write KB/s | 185517 | 184622 | 0.995 |
+|                | cap 64 | cap 16 | ratio      |
+| -------------- | ------ | ------ | ---------- |
+| mean row bytes | 64059  | 64082  | **1.0004** |
+| rows           | 510    | 515    | 1.010      |
+| write KB/s     | 185517 | 184622 | 0.995      |
 
 Both arms sit pinned at the `COALESCE_ROW_BYTES` ceiling. The fixture is a
 single producer that yields the moment it is refused, so the actor empties the

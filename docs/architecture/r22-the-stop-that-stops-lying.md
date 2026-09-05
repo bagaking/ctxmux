@@ -33,27 +33,27 @@ But publication can sit behind a durable `finalize`, and under a loud fleet that
 finalize is queued behind the appends it must be ordered after. Splitting
 `finalize`'s two blocking waits (measurement-only build):
 
-| | `send` (wait for a slot) | `serve` (wait to be served) | queue depth at entry |
-|---|---|---|---|
-| quiet | 6-10 µs | 1.9-2.9 ms | 0 |
-| plateau | 1 µs - 24 ms | **296-485 ms** | **1024 (full)** |
+|         | `send` (wait for a slot) | `serve` (wait to be served) | queue depth at entry |
+| ------- | ------------------------ | --------------------------- | -------------------- |
+| quiet   | 6-10 µs                  | 1.9-2.9 ms                  | 0                    |
+| plateau | 1 µs - 24 ms             | **296-485 ms**              | **1024 (full)**      |
 
 Properly queued, not starved. The crash-consistency requirement doing its job.
-Memory-only, same fleet, carries a *higher* message rate (265k vs 221k reads/s)
+Memory-only, same fleet, carries a _higher_ message rate (265k vs 221k reads/s)
 and has no defect at all — which exonerates the reactor, the PTY path and the Stop
 machinery, and killed "batch the reactor's reads" before it cost a round.
 
 ## Two symptoms, two mechanisms
 
-The defect had a *level* and a *slope*, and one knob each. Pricing them separately
+The defect had a _level_ and a _slope_, and one knob each. Pricing them separately
 would have judged a real combination dead — as it nearly did:
 
-| arm | c8 remove | c8 `t_stop` | grows per stop? |
-|---|---|---|---|
-| BASE (100 ms, 1024) | **0/40** | 110 ms | flat — because it is lying |
-| grace 10 s alone | **40/40** | 0.5-3.5 s | **climbs** 1.2 → 3.5 s |
-| depth 64 alone (R21) | **0/40** | — | climb gone |
-| **both** | **40/40** | 241-487 ms | **flat** (halves 0.92-1.11x) |
+| arm                  | c8 remove | c8 `t_stop` | grows per stop?              |
+| -------------------- | --------- | ----------- | ---------------------------- |
+| BASE (100 ms, 1024)  | **0/40**  | 110 ms      | flat — because it is lying   |
+| grace 10 s alone     | **40/40** | 0.5-3.5 s   | **climbs** 1.2 → 3.5 s       |
+| depth 64 alone (R21) | **0/40**  | —           | climb gone                   |
+| **both**             | **40/40** | 241-487 ms  | **flat** (halves 0.92-1.11x) |
 
 Raise the bound → the answer stops being wrong.
 Bound the depth → the wait stops escalating.
@@ -71,7 +71,7 @@ hold for `finalize`: it is called from `publish_terminal` on one of only **eight
 shared `ctxmux-native-blocking` workers, and a blocked finalize holds its pool
 permit for the whole wait. Eight of them blocked together and
 `start_worker_jobs`'s `while active.len() < CLEANUP_MAX_ACTIVE` dispatches nothing
-further — cleanup or finalize — for *any* Run.
+further — cleanup or finalize — for _any_ Run.
 
 So the queue depth is not just how far the fleet runs ahead of one fsync; it is the
 bound on how long a scarce daemon-wide worker is held. That is why cutting it
@@ -87,11 +87,11 @@ comparison measures what the host alone produces on each exact cell and verb.
 
 **Primary — the defect:**
 
-| shape | BASE | AA1 | AA2 | COMBO |
-|---|---|---|---|---|
-| c0 | 120/120 | 120/120 | 120/120 | 120/120 |
-| c1 | 120/120 | 120/120 | 120/120 | 120/120 |
-| c2 | 120/120 | 120/120 | 120/120 | 120/120 |
+| shape  | BASE      | AA1       | AA2       | COMBO       |
+| ------ | --------- | --------- | --------- | ----------- |
+| c0     | 120/120   | 120/120   | 120/120   | 120/120     |
+| c1     | 120/120   | 120/120   | 120/120   | 120/120     |
+| c2     | 120/120   | 120/120   | 120/120   | 120/120     |
 | **c8** | **0/120** | **0/120** | **0/120** | **120/120** |
 
 The A/A arms are the load-bearing rows. Identical bytes to BASE, identical failure:
@@ -99,12 +99,12 @@ the defect is in the code, not in the host, the arm order, or the day's load.
 
 **Rollback trigger — every cell against its own A/A floor:**
 
-| shape | verb | COMBO−BASE median | A/A floor | verdict |
-|---|---|---|---|---|
-| c0 | start / stop / remove | +0.059 / +0.085 / +0.077 ms | 0.560 / 1.133 / 0.540 | flat |
-| c1 | start / stop / remove | −0.105 / +0.051 / −0.174 ms | 1.160 / 1.351 / 1.120 | flat |
-| c2 | start / stop / remove | −0.139 / +0.253 / +0.441 ms | 0.984 / 2.095 / 1.194 | flat |
-| c8 | start | −20.720 ms | 52.343 | flat |
+| shape | verb                  | COMBO−BASE median           | A/A floor             | verdict |
+| ----- | --------------------- | --------------------------- | --------------------- | ------- |
+| c0    | start / stop / remove | +0.059 / +0.085 / +0.077 ms | 0.560 / 1.133 / 0.540 | flat    |
+| c1    | start / stop / remove | −0.105 / +0.051 / −0.174 ms | 1.160 / 1.351 / 1.120 | flat    |
+| c2    | start / stop / remove | −0.139 / +0.253 / +0.441 ms | 0.984 / 2.095 / 1.194 | flat    |
+| c8    | start                 | −20.720 ms                  | 52.343                | flat    |
 
 Zero cells degraded. The c1 `stop` signal that looked directional over 4 pairs
 (+1.05x, slower in 3/4) resolves at 12 pairs to **+0.051 ms against a 1.351 ms
@@ -118,7 +118,7 @@ stop    BASE 111 ms → COMBO 373 ms
 remove  BASE 3.9 ms → COMBO 370 ms
 ```
 
-**BASE completes 0/120 removes at c8.** Its 3.9 ms is a *failed* remove, not a fast
+**BASE completes 0/120 removes at c8.** Its 3.9 ms is a _failed_ remove, not a fast
 one. Comparing a failed operation's latency against a completed one is not
 like-for-like; per `docs/benchmark-comparison-conventions.md` this is a **capability
 difference**, not a loss. It is scored as neither a win nor a degradation, and the
@@ -153,10 +153,10 @@ test that cannot fail on the shape where the defect lives is not a guard.
 with the persistence queue actually full. Both arms build from identical test
 source; only the two constants differ:
 
-| arm | new test | existing test |
-|---|---|---|
-| 100 ms grace, depth 1024 | **FAILS** — 3/8 attempts refused | passes |
-| 10 s grace, depth 64 | passes | passes |
+| arm                      | new test                         | existing test |
+| ------------------------ | -------------------------------- | ------------- |
+| 100 ms grace, depth 1024 | **FAILS** — 3/8 attempts refused | passes        |
+| 10 s grace, depth 64     | passes                           | passes        |
 
 The first version of it passed on both arms, which made it worthless, and the
 reason is worth keeping: a four-Run fleet reached only 98k reads/s, and every Stop

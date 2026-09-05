@@ -26,42 +26,42 @@ per-Run output rate is fixed, and across harnesses it is not.
 
 Same host, same binary, same `chatty=8`, quiet Runs all `sleep 86400`:
 
-| fleet program | stop |
-|---|---|
+| fleet program                                             | stop                         |
+| --------------------------------------------------------- | ---------------------------- |
 | `/bin/sh -c 'while :; do echo <64 ch>; done'` (sh → dash) | **110 ms**, 12/12 in 109-114 |
-| `/bin/sh -c` + 32 ch | 12.5 ms |
-| `bash -c` + 64 ch | 16.7 ms |
-| `bash -c` + 32 ch | 12.4 ms |
+| `/bin/sh -c` + 32 ch                                      | 12.5 ms                      |
+| `bash -c` + 64 ch                                         | 16.7 ms                      |
+| `bash -c` + 32 ch                                         | 12.4 ms                      |
 
 Neither factor produces the cliff alone; only their product does. The obvious
 next reading — aggregate byte rate — is also wrong, and sharply:
 
-| n | shell | reads/s | **B/s** | stop |
-|---|---|---|---|---|
-| 8 | bash | 108,625 | **275 M** | 24 ms |
-| 4 | dash | 139,273 | **312 M** | **110 ms** |
-| 8 | dash | 215,952 | 265 M | **110 ms** |
+| n   | shell | reads/s | **B/s**   | stop       |
+| --- | ----- | ------- | --------- | ---------- |
+| 8   | bash  | 108,625 | **275 M** | 24 ms      |
+| 4   | dash  | 139,273 | **312 M** | **110 ms** |
+| 8   | dash  | 215,952 | 265 M     | **110 ms** |
 
 The 312 MB/s cell plateaus and the 275 MB/s cell does not. Aggregate read rate
 saturates near 270 MB/s in every loud cell, so bytes cannot separate them.
 
 Sorting all six measured cells by **read()/message rate** is monotone, 6/6:
 
-| reads/s | B/read | stop |
-|---|---|---|
-| 69,556 | 2105 | 12 ms |
-| 80,480 | 2303 | 13 ms |
-| 108,625 | 2529 | 24 ms |
-| 139,273 | 2238 | 110 ms |
-| 182,099 | 1445 | 110 ms |
-| 215,952 | 1227 | 110 ms |
+| reads/s | B/read | stop   |
+| ------- | ------ | ------ |
+| 69,556  | 2105   | 12 ms  |
+| 80,480  | 2303   | 13 ms  |
+| 108,625 | 2529   | 24 ms  |
+| 139,273 | 2238   | 110 ms |
+| 182,099 | 1445   | 110 ms |
+| 215,952 | 1227   | 110 ms |
 
 Every `read()` is one `record_output`, one append message, one slot of
 `PERSISTENCE_QUEUE_CAPACITY`. A queue counted in messages is blind to bytes per
 message, which is exactly the insensitivity the data shows.
 
 Two probes died on the way here and are worth naming so they are not re-run: a
-`/bin/sh -c` wrapper on the *quiet* Run (12.6 / 13.0 / 13.9 ms across direct,
+`/bin/sh -c` wrapper on the _quiet_ Run (12.6 / 13.0 / 13.9 ms across direct,
 shell, and exec-away — no effect), and `du` on the state dir as a rate meter
 (it reads **negative**; checkpointing shrinks the WAL). The daemon's own
 `/proc/<pid>/io` `rchar`/`syscr` is the instrument that works.
@@ -72,10 +72,10 @@ shell, and exec-away — no effect), and `du` on the state dir as a rate meter
 was never measured by anything in this project. Polling `status` after `stop`
 returns, until the Run is no longer `Running`:
 
-| | below knee | at the plateau |
-|---|---|---|
-| `t_stop` | 13 ms | 110 ms |
-| `t_visible` | 3.3 ms | **610 → 1874 ms**, monotone over 10 successive stops |
+|             | below knee | at the plateau                                       |
+| ----------- | ---------- | ---------------------------------------------------- |
+| `t_stop`    | 13 ms      | 110 ms                                               |
+| `t_visible` | 3.3 ms     | **610 → 1874 ms**, monotone over 10 successive stops |
 
 Publication is 6-17× larger than the clipped instrument could show, and it grows
 with every stop: a convoy. And the consequence is not latency. `remove` rejects a
@@ -104,16 +104,16 @@ appends `try_send` and drop rather than block — so a shallower queue shortens
 what a `finalize`'s blocking `sync_channel(0)` round-trip waits behind without
 being able to stall the fleet.
 
-Pre-registered before either binary existed: *SHIP requires 0/10 remove failures;
+Pre-registered before either binary existed: _SHIP requires 0/10 remove failures;
 if failures stay at 10/10, the depth is the wrong knob — kill the candidate, do
-not tune the number.*
+not tune the number._
 
 Four rounds, arms alternated by round parity, both binaries marker-verified:
 
-| | remove failures | `t_after` stop 1 → stop 10 |
-|---|---|---|
-| BASE (1024) | **40/40** | 0.85 → 3.38 s, monotone every round |
-| QD (64) | **40/40** | 0.40 → 0.17 s, **no growth** |
+|             | remove failures | `t_after` stop 1 → stop 10          |
+| ----------- | --------------- | ----------------------------------- |
+| BASE (1024) | **40/40**       | 0.85 → 3.38 s, monotone every round |
+| QD (64)     | **40/40**       | 0.40 → 0.17 s, **no growth**        |
 
 The falsifier fires. The candidate is dead, and per its own pre-registration the
 number does not get tuned.
@@ -121,7 +121,7 @@ number does not get tuned.
 The secondary outcome is worth keeping: the queue depth **is** the convoy. QD=64
 removes the growth entirely — the 10th stop costs less than the 1st. But a single
 finalize still costs 60-400 ms, far past the 100 ms grace, so every stop still
-fails the remove that follows it. Depth explains the *escalation*, not the *level*.
+fails the remove that follows it. Depth explains the _escalation_, not the _level_.
 
 ## What is now excluded
 
@@ -131,7 +131,7 @@ fails the remove that follows it. Depth explains the *escalation*, not the *leve
   (`persistence.rs:2588-2617`), so a client that observed `Exited` would find it
   interrupted after a restart. `creation.rs:1370/1381/1390` fails deterministically.
 - **Let finalize jump the queue** — already proven to fail here: the Barrier's
-  semantics *are* the FIFO position, and jumping latched the whole persistence
+  semantics _are_ the FIFO position, and jumping latched the whole persistence
   layer daemon-wide.
 - **Bound the queue depth** — this round's falsified candidate.
 
@@ -151,7 +151,7 @@ does not enter this regime at any `chatty` count it tests. Every "no regression"
 verdict this project has issued was issued about the cheap end of the curve.
 
 That does not invalidate the prior rollbacks — a rollback triggered by a real
-degradation is still a real degradation — but it means no prior round's *SHIP*
+degradation is still a real degradation — but it means no prior round's _SHIP_
 was ever tested against the shape where lifecycle verbs actually break.
 
 ## Method notes

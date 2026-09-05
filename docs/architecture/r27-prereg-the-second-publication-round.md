@@ -7,17 +7,17 @@ prediction below can be wrong in public.
 
 ## What is already measured (not assumed)
 
-| Fact | Source |
-|---|---|
-| memory-only c=0 stop+remove = 8.20 ms vs tmux kill-session 3.87 ms (0/8) | r26-one-caliper-two-refutations.md:118 |
-| memory-only c=0 stop = 5.74 ms, remove = 2.44 ms (persistence share 28% / 49%) | r26 doc §persistence-share; SEGMENT track |
-| c=0 is the biggest gap AND the lightest shape (unusual) | r26 doc Refutation 1 |
-| remove's 2.44 ms is ~entirely the CLI-process+connect+Hello floor; daemon work is µs | SEGMENT track removeSegments; creation.rs:2297 remove_memory |
-| stop synchronously reaps the child before replying | native_session.rs:307-319 reap_leader→child.wait(); lib.rs:5615 "receipt is proof the child was reaped" |
-| stop waits a SECOND round after reap for terminal publication | lib.rs:5619 await_terminal_visible; lib.rs:4445-4456 |
-| durable publish sets terminal_ordinal AFTER persistence.finalize | lib.rs:4412-4419 |
-| harness runs `stop` then `remove` as two separate CLI processes | .tmp-r26-cell.sh stop/remove loops |
-| per-cell A/A floor: 1.002-1.028x at c=0, up to 1.105x at c=8 remove | r26 doc §the-gate |
+| Fact                                                                                 | Source                                                                                                  |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| memory-only c=0 stop+remove = 8.20 ms vs tmux kill-session 3.87 ms (0/8)             | r26-one-caliper-two-refutations.md:118                                                                  |
+| memory-only c=0 stop = 5.74 ms, remove = 2.44 ms (persistence share 28% / 49%)       | r26 doc §persistence-share; SEGMENT track                                                               |
+| c=0 is the biggest gap AND the lightest shape (unusual)                              | r26 doc Refutation 1                                                                                    |
+| remove's 2.44 ms is ~entirely the CLI-process+connect+Hello floor; daemon work is µs | SEGMENT track removeSegments; creation.rs:2297 remove_memory                                            |
+| stop synchronously reaps the child before replying                                   | native_session.rs:307-319 reap_leader→child.wait(); lib.rs:5615 "receipt is proof the child was reaped" |
+| stop waits a SECOND round after reap for terminal publication                        | lib.rs:5619 await_terminal_visible; lib.rs:4445-4456                                                    |
+| durable publish sets terminal_ordinal AFTER persistence.finalize                     | lib.rs:4412-4419                                                                                        |
+| harness runs `stop` then `remove` as two separate CLI processes                      | .tmp-r26-cell.sh stop/remove loops                                                                      |
+| per-cell A/A floor: 1.002-1.028x at c=0, up to 1.105x at c=8 remove                  | r26 doc §the-gate                                                                                       |
 
 ## The segmentation (parent = client wall of one `ctxmux stop <id>`, c=0, memory-only)
 
@@ -159,15 +159,18 @@ Instrument the memory-only c=0 stop path on cn3, stamps behind
 (verify: same-dir double build + md5).
 
 CLIENT (ctxmux-client/src/lib.rs stop_once):
+
 - C0 = entry (:714); C1 = after connect_for_dispatch+Hello (:718) → connect+Hello
 - C2 = after send (:732); C3 = after receive (:733) → server-observed RTT
 
 DAEMON (ctxmux-daemon/src/lib.rs recoverable_stop_response):
+
 - D0 = entry (:5607); D1 = after begin_recoverable_stop (:5611) → admission+spawn+wake
 - D2 = after flight.resolve() (:5612) → REAP (segments 5-8)
 - D3 = after await_terminal_visible (:5620) → **PUB2 — the candidate's target**
 
 WORKER (native_runtime.rs execute_cleanup + native_session.rs stop):
+
 - W0 = execute_cleanup entry (:1140); W1 = after signal_members (native_session.rs:121)
   → SIGTERM scan; W2 = after session.stop returns (:122) → wait-for-reap incl. 2nd scan
 - SCAN: wrap process_ids() (native_session.rs:497) with a stamp + per-stop counter
@@ -178,9 +181,10 @@ set before or after persistence.finalize (lib.rs:4412-4419), to decide if the
 candidate ships durable or is blocked on the r26 finalize fix.
 
 CLOSURE (must hold within ~1.3x, segment-sums-must-close):
+
 - (C1-C0)+(D1-D0)+(D2-D1)+(D3-D2)+framing ≈ (C3-C2)
 - (C3-C0) + remove-median-as-process-floor ≈ harness stop median
-- n_scans × ms/scan ≈ bulk of (W2-W0)  [prices the census]
+- n_scans × ms/scan ≈ bulk of (W2-W0) [prices the census]
 
 Proceed to product code ONLY if D3−D2 (PUB2) ≥ 0.4 ms AND the census (SCAN) and
 reap floor are confirmed as the semantic parts to subtract.
@@ -194,18 +198,19 @@ without daemon instrumentation, from the client side, on a local memory-only
 daemon (macOS, n=25 per arm, two independent batches).
 
 The trick is to vary only the reap: stop a **live** `sleep 86400` (pays signal
-+ real reap + PUB2) against stop of an **already-exited** `/usr/bin/true`
-(reap is trivial, PUB2 remains). `list` supplies a read-only verb over the same
-CLI floor.
 
-| quantity | batch 1 | batch 2 |
-|---|---|---|
-| CLI floor (`--help`) | 6.77 ms | — |
-| `list` (read-only, same floor) | 7.01 ms | 6.49 ms |
-| stop of already-exited child (B) | 8.23 ms | 8.03 ms |
-| stop of live child (A) | 9.81 ms | 8.49 ms |
+- real reap + PUB2) against stop of an **already-exited** `/usr/bin/true`
+  (reap is trivial, PUB2 remains). `list` supplies a read-only verb over the same
+  CLI floor.
+
+| quantity                                  | batch 1     | batch 2     |
+| ----------------------------------------- | ----------- | ----------- |
+| CLI floor (`--help`)                      | 6.77 ms     | —           |
+| `list` (read-only, same floor)            | 7.01 ms     | 6.49 ms     |
+| stop of already-exited child (B)          | 8.23 ms     | 8.03 ms     |
+| stop of live child (A)                    | 9.81 ms     | 8.49 ms     |
 | **B − list = upper bound on PUB2 + hops** | **1.22 ms** | **1.55 ms** |
-| A − B = signal + real reap (semantic) | 1.58 ms | 0.46 ms |
+| A − B = signal + real reap (semantic)     | 1.58 ms     | 0.46 ms     |
 
 **GO.** Even the upper bound clears the 0.4 ms bar in both batches, so the
 falsifier does not fire. The reap term is the noisy one (1.58 vs 0.46 ms), but
@@ -222,15 +227,15 @@ go/no-go: PUB2 is not a rounding error, so the direction stays open.
 Measured on the same local memory-only daemon (n=25), timing each verb as its
 own CLI process exactly as the farm harness does:
 
-| | ms |
-|---|---|
-| CLI floor (`--help`, no daemon) | 5.08 |
-| stop | 7.70 |
-| remove | 6.00 |
-| **stop+remove** | **13.69** |
-| floor × 2 | 10.15 — **74% of the pair** |
-| daemon-side work, both verbs | 3.54 |
-| — of which `remove`-specific | **0.92** |
+|                                 | ms                          |
+| ------------------------------- | --------------------------- |
+| CLI floor (`--help`, no daemon) | 5.08                        |
+| stop                            | 7.70                        |
+| remove                          | 6.00                        |
+| **stop+remove**                 | **13.69**                   |
+| floor × 2                       | 10.15 — **74% of the pair** |
+| daemon-side work, both verbs    | 3.54                        |
+| — of which `remove`-specific    | **0.92**                    |
 
 So ~74% of the c=0 stop+remove number is the per-invocation client-process
 floor, paid **twice** because our teardown is two verbs where tmux's
@@ -242,5 +247,5 @@ agentmux's pinned consumer. Recorded for the owner, not actioned here.
 
 PUB2 stays the round's target because it is real daemon-side cost, it is
 convention rather than contract (protocol.md:501-503 says stop's `RunInfo` may
-still read `running`), and it does not re-open R22 — it publishes *earlier*
-rather than waiting *less*.
+still read `running`), and it does not re-open R22 — it publishes _earlier_
+rather than waiting _less_.
