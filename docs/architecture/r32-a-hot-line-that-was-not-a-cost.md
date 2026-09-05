@@ -27,7 +27,8 @@ Each row is a measurement on cn3, and each one permanently removes a candidate.
 | **`native_control.rs:646`, 18.6% of owner samples** | **dead — this round's change** | removing it moved owner CPU by −0.014 ms (4/6 pairs) and wall by −0.012 ms: noise on both |
 
 Also established, and useful beyond this round: the owner thread carries the
-whole slope — `ctxmux-native-o` goes **0.234 → 1.247 ms/stop on-CPU** between
+whole slope — `ctxmux-native-o` goes **0.234 → 1.247 ms on-CPU per measured
+iteration** (see the units note below) between
 the two fleet sizes.
 
 ## The two instrument failures, and their fixes
@@ -106,9 +107,29 @@ on it; it rests on the ns-resolution owner-CPU probe, which resolves well below
 the predicted effect and also found nothing. Had only the gate been run, the
 right conclusion would have been "unresolved", not "inert".
 
+## A units correction, found after this doc was first committed
+
+The owner-CPU figures above were originally written as "per stop". They are
+not: the schedstat probe's sampling window wraps one **start + stop + remove**
+per iteration, so `+1.013 ms` is per *triple*, not per stop. The per-verb split
+is not known — the probe never separated them.
+
+Nothing else in this document changes. The rollback rests on a *paired
+difference* between two arms measured through the identical window, and the
+candidate-killing numbers (poll(), pass count, `waitid` per-call cost) come from
+probes with their own correct scopes. Only the absolute figure was mislabelled.
+
+It is worth recording anyway, because it is the same defect this round is about:
+**the instrument's scope did not match the thing being named.** That is the
+lesson of [[ctxmux-daemon-wide-cpu-cannot-price-one-operation]], committed to
+memory long before this round, and I reproduced it while writing the round up.
+The next round needs the per-verb split as its prediction base, so it must
+re-measure rather than inherit this number.
+
 ## What is left for the next round
 
-The slope is real and still unexplained: **+1.013 ms/stop of owner-thread CPU**
+The slope is real and still unexplained: **+1.013 ms of owner-thread CPU per
+measured iteration** (start + stop + remove — see the units note below)
 between 24 and 256 live Runs. The per-line reading of the profile is discredited
 as *attribution*, but the profile's coarse shape still holds — the samples are
 in `owner_main`'s inlined body and in the allocator, and the mechanism that fits
@@ -126,9 +147,23 @@ and for 255 of 256 entries the answer is "nothing happened".
 The next attempt should therefore **neutralize the mechanism and watch the slope
 collapse**, rather than price another line. Isolated pricing cannot see
 externalities, and — as this round shows twice — it cannot distinguish a
-correlate from a cause either. Concretely: skip the replace/lock/move entirely
-for entries with no pending work, which needs a lock-free "has work" signal.
-That signal is a real invariant across seven call sites and a missed update
-strands a command (a hung Run, much worse than a slow one), so it earns its risk
-only against a measured win — and the measurement must be the ns-resolution
-owner-CPU probe, since the F5 gate cannot resolve effects this size.
+correlate from a cause either.
+
+R33's research narrowed this further, and one finding rules an option out before
+it is attempted: **the pass is O(N) no matter what we do to `drive_lifecycle`**,
+because `poll_and_read_outputs` rebuilds a `PollFd` vector over every entry with
+an output fd on every pass. So an intrusive "entries with work" queue — the
+structure that would turn the scan into O(work) — cannot collect its own
+benefit while that O(N) floor stands, and it would reintroduce a per-entry
+atomic as its dedup bit anyway: the same invariant, plus a shared queue, plus
+re-queue-and-teardown logic.
+
+That leaves a narrower and safer candidate: keep the O(N) walk, make each step
+cheap. The per-entry mutex (~12% of owner samples) becomes an atomic flag cached
+inside the lock, and — critically — **the flag is encapsulated in the queue type
+rather than maintained by discipline at seven call sites**, so a future producer
+cannot forget to set it. The liveness backstop already exists and is already
+load-bearing: the buffered self-pipe byte is the sole production wake for child
+commands today, so a stale-false flag read degrades to "recovered on the next
+byte-driven pass", not to a stranded command.
+
