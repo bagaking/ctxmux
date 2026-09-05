@@ -495,12 +495,16 @@ Receipts name the precise owner boundary reached:
 - `signal { signal }` proves the daemon's retained native PTY owner delivered
   the requested portable signal. On macOS the kernel selected the PTY's current
   foreground process group at the `TIOCSIG` mutation boundary.
-- `stop { disposition }` proves the waiter reaped the direct child and observed
-  the complete owned session empty. `graceful` means no forced phase was needed,
+- `stop { disposition }` proves the waiter reaped the direct child, observed
+  the complete owned session empty, and the public terminal state is visible
+  before the response is returned. `graceful` means no forced phase was needed,
   including an owner-ordered natural exit after Stop admission; `forced` means
-  at least one session member required `SIGKILL`. Public
-  `exited` publication remains a later lifecycle event, so the returned
-  `RunInfo` can still say `running` while no owned process remains.
+  at least one session member required `SIGKILL`. Cleanup and durable
+  finalization remain independently scheduled, so a slow store cannot consume
+  cleanup admission. If terminal publication cannot be confirmed within the
+  bounded visibility grace, the response is `unknown`; the caller retains the
+  same operation key and retries it to confirm the postcondition without
+  entering the physical Stop owner again.
 
 Every wire `ControlFailure` carries `not_applied` or `unknown`. `not_applied` means
 the command did not cross its mutation boundary. `unknown` means it may have

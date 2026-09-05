@@ -1980,6 +1980,19 @@ async fn recoverable_stop_response_loss_recovers_from_a_fresh_client() {
     assert_eq!(recovered.run.id, run.id);
     assert_eq!(replayed.run.id, run.id);
     assert_eq!(replayed.receipt, recovered.receipt);
+    assert!(
+        !recovered.run.state.is_running(),
+        "a successful Stop response carries terminal public state"
+    );
+    assert!(
+        !fresh_client
+            .status(run.id)
+            .await
+            .expect("read state immediately after Stop")
+            .state
+            .is_running(),
+        "a fresh client cannot observe running after a successful Stop"
+    );
     assert_eq!(
         wait_for_stop_marker_lines(&marker, 1).await,
         vec!["TERM"],

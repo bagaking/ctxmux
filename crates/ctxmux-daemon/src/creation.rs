@@ -17,7 +17,10 @@ use ctxmux_protocol::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, watch};
 
-use super::{Run, RunControl, STOP_ACK_TIMEOUT, control_not_applied, read_lock, write_lock};
+use super::{
+    Run, RunControl, STOP_ACK_TIMEOUT, TERMINAL_VISIBILITY_GRACE, control_not_applied,
+    control_unknown, read_lock, write_lock,
+};
 use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
 use crate::native_control::{ControlResult, DetachedNativeDescriptors, PendingStop};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
@@ -1318,7 +1321,29 @@ pub(crate) struct RecoverableStopFlight {
 
 impl RecoverableStopFlight {
     pub(crate) async fn resolve(self) -> (Arc<Run>, ControlResult) {
-        let result = self.cell.wait().await;
+        let result = match self.cell.wait().await {
+            Ok(receipt) => {
+                // A successful public Stop promises more than process reaping:
+                // callers commonly list or remove the Run immediately after
+                // the response. Keep cleanup independent of persistence, but
+                // join the response to the terminal publication it owes.
+                self.run
+                    .await_reaped_publication(Instant::now() + TERMINAL_VISIBILITY_GRACE)
+                    .await;
+                if self.run.info().state.is_running() {
+                    Err(control_unknown(ProtocolError::new(
+                        ErrorCode::Internal,
+                        format!(
+                            "Run {} stopped but terminal publication is not yet visible",
+                            self.run.id
+                        ),
+                    )))
+                } else {
+                    Ok(receipt)
+                }
+            }
+            result => result,
+        };
         (self.run, result)
     }
 }

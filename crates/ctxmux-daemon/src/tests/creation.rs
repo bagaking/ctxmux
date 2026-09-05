@@ -1164,11 +1164,10 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
 
     let stop_operation = fresh_stop(&server.client, run.id).await;
-    server
-        .client
-        .stop(stop_operation)
-        .await
-        .expect("stop finalize response Run");
+    let stop = tokio::spawn({
+        let client = server.client.clone();
+        async move { client.stop(stop_operation).await }
+    });
     finalize_reached
         .recv_timeout(Duration::from_secs(5))
         .expect("persistence actor reaches finalize barrier");
@@ -1197,10 +1196,10 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     .expect("another Run Signal is not blocked by finalize")
     .expect("another Run Signal reaches its owner");
     let control_stop = fresh_stop(&server.client, control_run.id).await;
-    tokio::time::timeout(Duration::from_secs(2), server.client.stop(control_stop))
-        .await
-        .expect("another Run Stop receipt stays bounded during finalize")
-        .expect("another Run Stop retains exact cleanup admission");
+    let control_stop = tokio::spawn({
+        let client = server.client.clone();
+        async move { client.stop(control_stop).await }
+    });
 
     let registration_before = manager.native_runs.diagnostic_snapshot().registrations;
     let registration_id = RunId::new();
@@ -1237,6 +1236,13 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
 
     assert_finalize_reads_responsive(&server, run.id, initial_head).await;
     record_late_output_after_finalize(&recorded, &finalize_release).await;
+    stop.await
+        .expect("Stop waiter remains live while finalization is paused")
+        .expect("Stop returns after terminal publication");
+    control_stop
+        .await
+        .expect("independent Stop waiter remains live during the parked finalize")
+        .expect("independent Stop returns after its terminal publication");
 
     let terminal = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
         .await
@@ -1335,28 +1341,33 @@ async fn remove_waits_for_the_publication_a_reaped_run_is_owed() {
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
 
     let stop_operation = fresh_stop(&server.client, run.id).await;
-    server
-        .client
-        .stop(stop_operation)
-        .await
-        .expect("the Stop receipt does not wait on the parked publication");
+    let stop = tokio::spawn({
+        let client = server.client.clone();
+        async move { client.stop(stop_operation).await }
+    });
     finalize_reached
         .recv_timeout(Duration::from_secs(5))
         .expect("persistence actor reaches the finalize barrier");
 
-    let mut removal = Box::pin(server.client.remove(run.id));
+    let mut stop = stop;
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut removal)
+        tokio::time::timeout(Duration::from_millis(200), &mut stop)
             .await
             .is_err(),
-        "remove waits for the parked publication instead of refusing the Run"
+        "Stop waits for the parked publication instead of returning a false success"
     );
 
     drop(finalize_release);
-    tokio::time::timeout(Duration::from_secs(5), removal)
+    tokio::time::timeout(Duration::from_secs(5), stop)
         .await
-        .expect("remove completes once publication lands")
-        .expect("remove accepts the published Run");
+        .expect("Stop completes once publication lands")
+        .expect("Stop task remains live")
+        .expect("Stop accepts the published Run");
+    server
+        .client
+        .remove(run.id)
+        .await
+        .expect("remove sees terminal state immediately after Stop");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1377,13 +1388,31 @@ async fn stalled_durable_publication_does_not_consume_cleanup_admission() {
         );
     }
     let (reached, release) = persistence.pause_next_finalize();
-    for (index, run) in runs.iter().enumerate() {
-        server
-            .client
-            .stop_once(run.id)
-            .await
-            .expect("reaped children must release cleanup admission while publication is stalled");
-        assert!(manager.get(run.id).unwrap().child_reaped());
+    let stops = runs
+        .iter()
+        .map(|run| {
+            let client = server.client.clone();
+            let id = run.id;
+            tokio::spawn(async move { client.stop_once(id).await })
+        })
+        .collect::<Vec<_>>();
+    reached
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first finalize is stalled");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if runs
+                .iter()
+                .all(|run| manager.get(run.id).is_ok_and(|run| run.child_reaped()))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all stopped children are reaped while publication is stalled");
+    for run in &runs {
         assert!(
             server
                 .client
@@ -1393,25 +1422,15 @@ async fn stalled_durable_publication_does_not_consume_cleanup_admission() {
                 .state
                 .is_running()
         );
-        if index == 0 {
-            reached
-                .recv_timeout(Duration::from_secs(5))
-                .expect("finalize is stalled");
-        }
     }
     drop(release);
     tokio::time::timeout(Duration::from_secs(5), async {
+        for stop in stops {
+            stop.await
+                .expect("Stop waiter remains live while finalize is stalled")
+                .expect("Stop returns after terminal publication");
+        }
         for run in &runs {
-            while server
-                .client
-                .status(run.id)
-                .await
-                .unwrap()
-                .state
-                .is_running()
-            {
-                tokio::task::yield_now().await;
-            }
             server
                 .client
                 .remove(run.id)
@@ -1438,11 +1457,10 @@ async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
         .expect("start finalize shutdown Run");
     let (finalize_reached, finalize_release) = persistence.pause_next_finalize();
     let stop_operation = fresh_stop(&server.client, run.id).await;
-    server
-        .client
-        .stop(stop_operation)
-        .await
-        .expect("Stop receipt precedes durable finalize");
+    let stop = tokio::spawn({
+        let client = server.client.clone();
+        async move { client.stop(stop_operation).await }
+    });
     finalize_reached
         .recv_timeout(Duration::from_secs(5))
         .expect("terminal finalizer reaches persistence barrier");
@@ -1459,13 +1477,12 @@ async fn active_durable_finalize_cannot_extend_native_owner_shutdown() {
     finalize_release
         .send(())
         .expect("release detached terminal finalizer");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while manager.get(run.id).unwrap().info().state.is_running() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached finalizer still publishes durable terminal truth");
+    tokio::time::timeout(Duration::from_secs(5), stop)
+        .await
+        .expect("Stop completes after detached finalizer resumes")
+        .expect("Stop waiter remains live")
+        .expect("Stop returns terminal truth");
+    assert!(!manager.get(run.id).unwrap().info().state.is_running());
     drop(server);
 }
 

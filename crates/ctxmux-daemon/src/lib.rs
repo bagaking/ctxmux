@@ -106,8 +106,8 @@ const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
-/// How long `remove` waits for a reaped Run's terminal state to become visible
-/// before reading the state as it stands.
+/// How long a public Stop or `remove` waits for a reaped Run's terminal state to
+/// become visible before treating publication as unconfirmed.
 ///
 /// Publication happens on a worker that is already running by the time a Stop
 /// receipt exists: measured at 1-6 ms on a persistent daemon. But publication
@@ -127,10 +127,10 @@ const STOP_FORCED_TIMEOUT: Duration = Duration::from_secs(1);
 /// `PERSISTENCE_QUEUE_CAPACITY`, which is what stops the wait escalating across
 /// consecutive stops; see `docs/architecture/r22-the-stop-that-stops-lying.md`.
 ///
-/// It is deliberately **not** on the Stop response path: that made every Stop
-/// wait out an unrelated Run's finalize on the one persistence actor. See
-/// `docs/architecture/r36-the-stop-that-did-not-need-the-actor.md`.
-const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_secs(10);
+/// The wait is per Run and does not consume cleanup admission. This keeps a
+/// slow durable finalizer from delaying unrelated controls while making a
+/// successful public Stop safe to follow with List or Remove.
+pub(crate) const TERMINAL_VISIBILITY_GRACE: Duration = Duration::from_secs(10);
 const UNPUBLISHED_REAP_INLINE_TIMEOUT: Duration = Duration::from_millis(25);
 const TMUX_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -2347,10 +2347,9 @@ impl RunManager {
         let Some(_persistence) = &self.persistence else {
             return self.registry.remove_memory(id);
         };
-        // A Stop receipt proves the child was reaped, not that publication has
-        // landed, and the caller's next line is usually this `remove`. Wait out
-        // the publication it is owed before reading the state it writes -- the
-        // drop releases the pin `validate_removable_entry` requires be unique.
+        // Stop already waits for its own publication. Keep this wait for
+        // natural exits and older in-flight removal callers; it also releases
+        // the pin `validate_removable_entry` requires to be unique.
         if let Ok(run) = self.pin(id) {
             run.await_reaped_publication(Instant::now() + TERMINAL_VISIBILITY_GRACE)
                 .await;
@@ -4601,7 +4600,7 @@ impl Run {
     ///
     /// A Run whose child is not yet reaped is genuinely live: no publication is
     /// coming, so it gets no wait and `remove` refuses it promptly.
-    async fn await_reaped_publication(&self, deadline: Instant) {
+    pub(crate) async fn await_reaped_publication(&self, deadline: Instant) {
         loop {
             let notified = self.terminal_visible.notified();
             if !self.is_running() || !self.child_reaped() {
@@ -5776,11 +5775,6 @@ async fn recoverable_stop_response(
     };
     let (run, result) = flight.resolve().await;
     Ok(match result {
-        // The receipt proves this Run's child was reaped, and reaping never
-        // touches the persistence actor. Publication does, so waiting for it
-        // here made every Stop queue behind *another* Run's durable finalize;
-        // `remove` owns that wait now, which is the only caller that needed it.
-        // `docs/protocol.md` already promises this receipt may say `running`.
         Ok(receipt) => Response::ControlAccepted {
             run: run.info(),
             receipt,

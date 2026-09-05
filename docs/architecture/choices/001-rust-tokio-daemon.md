@@ -26,9 +26,11 @@ Stop and direct-exit descendant cleanup may block. The native owner hands those
 jobs FIFO to at most eight transient cleanup threads, which return the reap or
 fail-stop result before terminal publication. Completion releases cleanup
 admission; terminal publication then uses its own bounded finalizer budget,
-independent of cleanup admission. Unique Run creation separately uses a maximum
-of eight admitted short-lived threads. Neither bound grows with the number of
-ordinary live Runs.
+independent of cleanup admission. Public Stop waits for its own terminal
+publication, with an explicit unknown result if the bounded visibility grace
+expires; that wait consumes no cleanup slot. Unique Run creation separately
+uses a maximum of eight admitted short-lived threads. Neither bound grows with
+the number of ordinary live Runs.
 
 The protocol is the stable client boundary. Rust ABI, N-API, and editor-process lifetime are not product boundaries.
 

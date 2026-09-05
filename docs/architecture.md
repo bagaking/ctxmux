@@ -123,11 +123,13 @@ driver selects its current foreground process group atomically without changing
 the Run phase. `stop` fences later controls, sends `SIGTERM` to revalidated
 session members, escalates remaining members to `SIGKILL`, reaps the direct
 child, and returns only after the session is empty. Its receipt names whether
-the graceful or forced phase completed cleanup. Acknowledgement can still
-precede public `Exited` publication, so returned `RunInfo` may say `running`
-while the owned process scope is already quiescent. A descendant that creates a
-new session deliberately crosses this POSIX ownership boundary. In persistent
-mode a new daemon epoch converts prior `running` rows to `interrupted {
+the graceful or forced phase completed cleanup. A successful Stop response is
+also joined to public `Exited` publication, so a caller that lists or removes
+immediately after success observes terminal truth. If durable publication
+exceeds the bounded visibility grace, Stop returns an explicit unknown result
+while retaining its operation key for later confirmation; the process cleanup
+is never repeated. A descendant that creates a new session deliberately crosses
+this POSIX ownership boundary. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted {
 daemon_restart }`, clears their PID, and exposes no live control. Terminal Runs
 remain retained until admission reaches the 128-record ceiling, then the
 Registry fences exact fully quiescent candidates; persistent COMMIT removes the

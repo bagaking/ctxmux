@@ -105,8 +105,9 @@ The hook is not a public fault API and cannot change production scheduling.
 transactional snapshot. Concurrent writers and resizers have no product-level
 arbitration. Signal admission and the Stop phase transition share the native
 owner lock, so Interrupt is either ordered before Stop or rejected without
-application. Stop acknowledgement proves direct-child reap plus an empty owned
-session but still precedes terminal-state publication. The natural-exit path
+application. A successful public Stop proves direct-child reap, an empty owned
+session, and visible terminal state; an expired visibility grace is reported as
+unknown and remains recoverable by the same operation key. The natural-exit path
 closes command admission under that same lock before draining the channel, so a
 Stop sent after one native-owner poll but before the exit fence reuses the
 final cleanup/reap receipt instead of becoming unknown. Broadcast lag reports
