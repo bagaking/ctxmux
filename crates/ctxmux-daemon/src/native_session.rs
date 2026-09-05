@@ -413,7 +413,6 @@ impl NativeSession {
 /// `Child` implementation reaps that number through `waitid`, letting an
 /// adopted child route through the same `NativeSession` reap machinery as a
 /// freshly spawned one.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct AdoptedChild {
     pid: Pid,
@@ -421,7 +420,6 @@ pub(crate) struct AdoptedChild {
 }
 
 impl AdoptedChild {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_pid(pid: u32) -> Result<Self, String> {
         let raw = i32::try_from(pid)
             .map_err(|_| format!("adopted child PID {pid} does not fit a POSIX process ID"))?;

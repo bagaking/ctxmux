@@ -27,12 +27,10 @@ use rustix::termios::{Winsize, tcgetwinsize, tcsetwinsize};
 /// (via `ctxmux_inherited_fd`), it exposes the same operations a freshly
 /// spawned `portable_pty` master offers: [`resize`](Self::resize),
 /// [`get_size`](Self::get_size), and platform-split foreground signalling.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct AdoptedMasterPty {
     fd: OwnedFd,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl AdoptedMasterPty {
     /// Adopt an already-owned inherited master descriptor.
     ///

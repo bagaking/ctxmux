@@ -283,11 +283,11 @@ struct UnpublishedCleanupInner {
 #[derive(Default)]
 struct UnpublishedCleanupState {
     owned: usize,
-    entries: HashMap<CreateOperationKey, UnpublishedCleanupFence>,
+    entries: HashMap<CreateOperationKey, PendingCleanupOwners>,
     tmux_entries: Vec<TmuxCleanupEntry>,
 }
 
-struct UnpublishedCleanupFence {
+struct PendingCleanupOwners {
     request: CreationRequest,
     owners: Vec<UnpublishedCleanupEntry>,
 }
@@ -554,7 +554,7 @@ impl UnpublishedCleanupReservation {
         };
         match state.entries.entry(operation_key) {
             Entry::Vacant(entry) => {
-                entry.insert(UnpublishedCleanupFence {
+                entry.insert(PendingCleanupOwners {
                     request,
                     owners: vec![owner],
                 });
