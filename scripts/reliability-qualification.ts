@@ -1540,7 +1540,7 @@ async function runSecurityMatrix(
       args: ["%s", literal],
       cwd: null,
       env: {},
-      size: { cols: 80, rows: 24 },
+      initial_size: { cols: 80, rows: 24 },
       declared_inputs: [],
     });
     await waitForRunExit(daemon.client, argvRun.id);
@@ -2959,7 +2959,7 @@ function idleSpec(): RunSpec {
     args: [],
     cwd: null,
     env: {},
-    size: { cols: 80, rows: 24 },
+    initial_size: { cols: 80, rows: 24 },
     declared_inputs: [],
   };
 }
@@ -2974,7 +2974,7 @@ function shellSpec(script: string): RunSpec {
     args: ["-c", script],
     cwd: null,
     env: {},
-    size: { cols: 80, rows: 24 },
+    initial_size: { cols: 80, rows: 24 },
     declared_inputs: [],
   };
 }
