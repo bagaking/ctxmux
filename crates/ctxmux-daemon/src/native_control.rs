@@ -2084,7 +2084,7 @@ fn unknown(error: ProtocolError) -> ControlFailure {
     }
 }
 
-const fn to_pty_size(size: TerminalSize) -> PtySize {
+pub(crate) const fn to_pty_size(size: TerminalSize) -> PtySize {
     PtySize {
         rows: size.rows,
         cols: size.cols,

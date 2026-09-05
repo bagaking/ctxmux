@@ -64,7 +64,7 @@ use ctxmux_protocol::{
     encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
-use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, PtySize, native_pty_system};
+use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, native_pty_system};
 use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
@@ -83,7 +83,7 @@ use crate::creation::{
 };
 use crate::native_control::{
     ControlResult, DetachedNativeDescriptors, HandoffInputState, InputDrainGate,
-    NativeControlOwner, PendingInput, PendingSignal, PendingStop,
+    NativeControlOwner, PendingInput, PendingSignal, PendingStop, to_pty_size,
 };
 use crate::native_runtime::{NativeRunOwner as NativeRuntimeOwner, NativeRunRegistration};
 use crate::native_session::{AdoptedChild, NativeSession};
@@ -199,15 +199,7 @@ impl ServerError {
 /// ctxmux-owned runtime work cannot be drained or Backend control processes
 /// cannot be cleaned up during shutdown.
 pub async fn serve(socket_path: impl Into<PathBuf>) -> Result<(), ServerError> {
-    serve_with_qualification(socket_path, None).await
-}
-
-#[doc(hidden)]
-pub async fn serve_with_qualification(
-    socket_path: impl Into<PathBuf>,
-    qualification_stats_fd: Option<OwnedFd>,
-) -> Result<(), ServerError> {
-    serve_with_inherited_descriptors(socket_path, qualification_stats_fd, None).await
+    serve_with_inherited_descriptors(socket_path, None, None).await
 }
 
 #[doc(hidden)]
@@ -236,23 +228,7 @@ pub async fn serve_with_state_dir(
     socket_path: impl Into<PathBuf>,
     state_dir: impl Into<PathBuf>,
 ) -> Result<(), ServerError> {
-    serve_with_state_dir_and_qualification(socket_path, state_dir, None).await
-}
-
-#[doc(hidden)]
-pub async fn serve_with_state_dir_and_qualification(
-    socket_path: impl Into<PathBuf>,
-    state_dir: impl Into<PathBuf>,
-    qualification_stats_fd: Option<OwnedFd>,
-) -> Result<(), ServerError> {
-    serve_with_state_dir_and_inherited_descriptors(
-        socket_path,
-        state_dir,
-        qualification_stats_fd,
-        None,
-        None,
-    )
-    .await
+    serve_with_state_dir_and_inherited_descriptors(socket_path, state_dir, None, None, None).await
 }
 
 #[doc(hidden)]
@@ -690,8 +666,9 @@ fn snapshot_stop_operations_for_upgrade(
 /// here, and this signature is where to add one.
 ///
 /// Returns the unlinked manifest file and the verified exec target.
-fn prepare_exec_upgrade(state_dir: &std::path::Path) -> Result<(std::fs::File, PathBuf), UpgradeAbort>
-{
+fn prepare_exec_upgrade(
+    state_dir: &std::path::Path,
+) -> Result<(std::fs::File, PathBuf), UpgradeAbort> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     // A regular, immediately unlinked state-dir file avoids the pipe-capacity
@@ -5287,15 +5264,6 @@ fn cleanup_unknown_persistent_creation(
         ));
     }
     Err(error)
-}
-
-const fn to_pty_size(size: TerminalSize) -> PtySize {
-    PtySize {
-        rows: size.rows,
-        cols: size.cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }
 }
 
 fn spawn_error(action: &str, error: impl fmt::Display) -> ProtocolError {
