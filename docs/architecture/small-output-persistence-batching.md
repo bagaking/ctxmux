@@ -31,12 +31,16 @@ new configuration surface.
 ## Measurement
 
 [`scripts/measure-small-output.py`](../../scripts/measure-small-output.py)
-uses protocol 17 and independent macOS daemons, sockets and temporary state
+used protocol 17 for the historical measurements below and independent macOS daemons, sockets and temporary state
 directories. Each Python child enters raw PTY mode and signals readiness before
 input opens its output gate. Every line contains a shared monotonic timestamp;
 the harness samples committed heads through Status and receives live output
 through Attach. After SIGKILL and reopen, it compares retained replay bytes
 with the original stream, including output beyond the 4 MiB per-Run limit.
+The tool now defaults to the workspace's public protocol generation and records
+it in new reports; `--protocol` selects an exact historical binary contract for
+an explicit comparison arm. It never silently negotiates a weaker generation.
+The original workloads and stored observations are unchanged.
 
 The [raw measurements](evidence/small-output-persistence-batching-20261001.json)
 bind each executable by SHA-256. Final comparisons alternate baseline and the
@@ -50,12 +54,12 @@ cost is outside process counter deltas; sampled WAL markers also include
 pre-existing startup frames. A final 100 ms settling period includes the idle
 checkpoint in both arms. Other host workloads and storage noise remain.
 
-| Output fixture | Output bytes | Process writes/output byte, baseline → 10 ms | Write change | CPU change |
-| --- | ---: | ---: | ---: | ---: |
-| 600 × 128 B, 3 ms spacing | 76,800 | 89.71 → 48.69 | −45.7% | −31.8% |
-| 12 × 128 B, 200 ms spacing | 1,536 | 197.33 → 197.33 | 0% | +8.9% |
-| Four concurrent paced Runs | 307,200 | 11.81 → 10.55 | −10.7% | +4.8% |
-| 2,048 × 4 KiB, 1 ms spacing | 8,388,608 | 1.84 → 1.37 | −25.2% | −14.9% |
+| Output fixture              | Output bytes | Process writes/output byte, baseline → 10 ms | Write change | CPU change |
+| --------------------------- | -----------: | -------------------------------------------: | -----------: | ---------: |
+| 600 × 128 B, 3 ms spacing   |       76,800 |                                89.71 → 48.69 |       −45.7% |     −31.8% |
+| 12 × 128 B, 200 ms spacing  |        1,536 |                              197.33 → 197.33 |           0% |      +8.9% |
+| Four concurrent paced Runs  |      307,200 |                                11.81 → 10.55 |       −10.7% |      +4.8% |
+| 2,048 × 4 KiB, 1 ms spacing |    8,388,608 |                                  1.84 → 1.37 |       −25.2% |     −14.9% |
 
 Paced live-output p95 is 0.205 → 0.146 ms; observed durable p95 is
 68.363 → 50.520 ms. Sampled commit markers are 190 → 112. Terminal-event

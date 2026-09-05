@@ -291,3 +291,61 @@ async fn ping_uses_the_runtime_dir_default_when_no_socket_is_supplied() {
         .await
         .expect("default-socket daemon should remain reachable");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closed_cli_listing_pipe_exits_cleanly_and_preserves_the_run() {
+    use std::os::{fd::OwnedFd, unix::net::UnixStream};
+    use std::process::Stdio;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("ctxmux.sock");
+    let server = tokio::spawn(ctxmux_daemon::serve(socket.clone()));
+    let client = Client::new(&socket);
+    tokio::time::timeout(deadline(), async {
+        while client.ping().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let run = client
+        .start(RunSpec {
+            program: "/bin/cat".to_owned(),
+            args: vec![],
+            cwd: None,
+            env: BTreeMap::new(),
+            initial_size: TerminalSize::default(),
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let (reader, writer) = UnixStream::pair().unwrap();
+    drop(reader); // No reader exists before the CLI can issue its first write.
+    let writer: OwnedFd = writer.into();
+    let output = Command::new(ctxmux_bin())
+        .arg("--socket")
+        .arg(&socket)
+        .arg("list")
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let status = client.status(run.id).await.unwrap();
+    client.stop_once(run.id).await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert!(
+        output.status.success(),
+        "closed listing pipe: {:?}, {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "normal consumer closure emitted an error"
+    );
+    assert!(
+        status.state.is_running(),
+        "CLI stdout closure terminated the Run"
+    );
+    assert_eq!(status.pid, run.pid);
+}

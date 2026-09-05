@@ -14,6 +14,11 @@ export type ServerFrame =
   | { type: "hello"; runtime: RuntimeIdentity }
   | { type: "response"; response: Response }
   | { type: "attached"; snapshot: AttachedHeader }
+  | {
+      type: "replay_window";
+      first_available_byte: number;
+      latest_output_bytes: number;
+    }
   | { type: "event"; event: RunEvent }
   | {
       type: "command_result";

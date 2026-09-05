@@ -1248,13 +1248,15 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .await
         .expect("terminal event arrives after finalize")
         .expect("read terminal event")
-        .event;
+        .event()
+        .into_owned();
     assert!(matches!(terminal, RunEvent::Exited { .. }));
     let late = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
         .await
         .expect("late output remains broadcast")
         .expect("read late output event")
-        .event;
+        .event()
+        .into_owned();
     assert!(matches!(
         late,
         RunEvent::Output { chunk } if chunk.data == b"late-after-terminal"
@@ -1302,7 +1304,17 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     drop(registration_run);
     drop(registration_control);
     wait_for_run_workers(&manager).await;
-    drop(server);
+    server.abort_and_wait().await;
+    // Cancellation is scheduled, not synchronous destruction. The listener
+    // and short-lived public connection tasks must release their manager before
+    // the persistence actor can relinquish the state lock.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while Arc::strong_count(&manager) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fixture connections release their manager before cold reopening");
     drop(manager);
     drop(persistence);
 
@@ -2250,7 +2262,14 @@ async fn stop_run_and_wait(manager: &RunManager, id: RunId) {
 async fn wait_for_run_workers(manager: &RunManager) {
     let runs = manager.registry.snapshot();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while runs.iter().any(|run| Arc::strong_count(run) != 2) {
+        while runs.iter().any(|run| {
+            Arc::strong_count(run) != 2
+                    || run.collection_ordinal().is_none()
+                    // A final completion can still briefly upgrade its Weak
+                    // after publication. Await retirement in the native owner,
+                    // rather than mistaking a momentary Arc count for its fence.
+                    || !manager.native_runs.handoff_ready(run.id).is_ok_and(|ready| ready)
+        }) {
             tokio::task::yield_now().await;
         }
     })
@@ -2909,12 +2928,15 @@ async fn trigger_persistent_commit_unwind(
     let request_manager = Arc::clone(&manager);
     let request_key = operation_key.clone();
     let request_spec = spec.clone();
-    let request = tokio::spawn(async move {
+    let mut request = tokio::spawn(async move {
         request_manager
             .create(request_key, CreationRequest::Start { spec: request_spec })
             .await
     });
-    wait_for_spawned_marker(&mut reached, &marker, 1).await;
+    tokio::select! {
+        () = wait_for_spawned_marker(&mut reached, &marker, 1) => {},
+        result = &mut request => panic!("creation returned before the post-spawn barrier: {result:?}"),
+    }
     let committed_pid = read_marker_pids(&marker)[0];
     hook.release();
     let error = request

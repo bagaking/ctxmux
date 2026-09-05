@@ -93,7 +93,12 @@ impl TestDaemon {
             command.arg("--state-dir").arg(state_dir);
         }
         if let Some(tmux_bin) = tmux_bin {
-            command.env("CTXMUX_TMUX_BIN", tmux_bin);
+            // Keep every fake script behavior and argv intact. The native
+            // launcher execs its interpreter in-place, preserving PID/pgid,
+            // pipes and production timeout/kill-reap ownership.
+            command
+                .env("CTXMUX_TMUX_BIN", ctxmux_test_support::fixture_executable())
+                .env("CTXMUX_FIXTURE_TMUX_SCRIPT", tmux_bin);
         }
         if let Some(worker_threads) = worker_threads {
             command.env("TOKIO_WORKER_THREADS", worker_threads);
@@ -470,7 +475,7 @@ impl Drop for TmuxServer {
 
 struct FakeTmuxControl {
     _fixture_owner: TmuxFixtureReservation,
-    _directory: TempDir,
+    directory: TempDir,
     _socket_listener: UnixListener,
     pane_process: Child,
     socket: PathBuf,
@@ -486,8 +491,7 @@ struct FakeTmuxControl {
     include_linked_duplicate: PathBuf,
     refresh_log: PathBuf,
     control_pids_file: PathBuf,
-    descendant_pids_file: PathBuf,
-    hold_stdout_open: PathBuf,
+    stdout_listener: UnixListener,
     short_command_mode: PathBuf,
     short_command_pids_file: PathBuf,
 }
@@ -517,8 +521,9 @@ impl FakeTmuxControl {
         let include_linked_duplicate = directory.path().join("include-linked-duplicate");
         let refresh_log = directory.path().join("refresh.log");
         let control_pids_file = directory.path().join("control.pids");
-        let descendant_pids_file = directory.path().join("descendant.pids");
-        let hold_stdout_open = directory.path().join("hold-stdout-open");
+        let stdout_listener = UnixListener::bind(directory.path().join("stdout.sock"))
+            .expect("bind test-owned stdout transfer socket");
+        stdout_listener.set_nonblocking(true).unwrap();
         let short_command_mode = directory.path().join("short-command-mode");
         let short_command_pids_file = directory.path().join("short-command.pids");
         std::fs::write(
@@ -537,7 +542,7 @@ include_linked_duplicate=$fixture_dir/include-linked-duplicate
 refresh_log=$fixture_dir/refresh.log
 pane_pid=$(cat "$fixture_dir/pane.pid")
 control_pids_file=$fixture_dir/control.pids
-descendant_pids_file=$fixture_dir/descendant.pids
+stdout_socket=$fixture_dir/stdout.sock
 hold_stdout_open=$fixture_dir/hold-stdout-open
 short_command_mode=$fixture_dir/short-command-mode
 short_command_pids_file=$fixture_dir/short-command.pids
@@ -579,19 +584,33 @@ if [ "$1" = "list-panes" ]; then
     else
         version=3.6
     fi
-    printf '%s\t4100\t1700000000\t$0\t@0\t%%0\t%s\t80\t24\t0\n' "$version" "$pane_pid"
+    server_epoch=1700000000
+    pane_id='%0'
+    pane_dead=0
+    pane_width=80
+    case "$mode" in
+        changed-server) server_epoch=1700000001 ;;
+        missing-target) pane_id='%1' ;;
+        dead-target) pane_dead=1 ;;
+        changed-target) pane_pid=4199 ;;
+        resized-target) pane_width=160 ;;
+    esac
+    printf '%s\t4100\t%s\t$0\t@0\t%s\t%s\t%s\t24\t%s\n' "$version" "$server_epoch" "$pane_id" "$pane_pid" "$pane_width" "$pane_dead"
     if [ -f "$include_dead_pane" ]; then
         printf '%s\t4100\t1700000000\t$0\t@1\t%%1\t4199\t80\t24\t1\n' "$version"
     fi
     if [ -f "$include_linked_duplicate" ]; then
         printf '%s\t4100\t1700000000\t$1\t@2\t%%0\t%s\t80\t24\t0\n' "$version" "$pane_pid"
     fi
+    if [ "$mode" = "unlink-after-discovery" ]; then
+        rm -f "$fixture_dir/tmux.sock"
+    fi
     exit 0
 fi
 
 if [ "$#" -ne 6 ] || [ "$1" != "-C" ] || [ "$2" != "attach-session" ] || \
    [ "$3" != "-t" ] || [ "$4" != '$0' ] || [ "$5" != "-f" ] || \
-   [ "$6" != "read-only,ignore-size,no-detach-on-destroy,pause-after=1" ]; then
+   [ "$6" != "read-only,ignore-size,pause-after=1" ]; then
     exit 22
 fi
 
@@ -600,8 +619,16 @@ if [ "$mode" = "hang-readiness" ]; then
     exec sleep 30
 fi
 if [ -f "$hold_stdout_open" ]; then
+    # Transfer the actual stdout writer to the test process. The foreground
+    # sender is waited by this shell; there is no orphan or zombie barrier.
+    python3 -c 'import array,socket,sys
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+s.sendmsg([b"F"],[(socket.SOL_SOCKET,socket.SCM_RIGHTS,array.array("i",[1]))])' "$stdout_socket" || exit 24
+fi
+if [ -f "$fixture_dir/spawn-owned-descendant" ]; then
     sleep 30 &
-    printf '%s\n' "$!" >> "$descendant_pids_file"
+    printf '%s\n' "$!" >> "$fixture_dir/owned-descendant.pids"
 fi
 control_startup_mode=default
 if [ -f "$control_startup_mode_file" ]; then
@@ -770,7 +797,7 @@ exit 0
             .expect("make fake tmux executable executable");
         Self {
             _fixture_owner: fixture_owner,
-            _directory: directory,
+            directory,
             _socket_listener: socket_listener,
             pane_process,
             socket,
@@ -786,8 +813,7 @@ exit 0
             include_linked_duplicate,
             refresh_log,
             control_pids_file,
-            descendant_pids_file,
-            hold_stdout_open,
+            stdout_listener,
             short_command_mode,
             short_command_pids_file,
         }
@@ -854,7 +880,7 @@ exit 0
     }
 
     fn hold_stdout_open_after_control_exit(&self) {
-        std::fs::write(&self.hold_stdout_open, b"hold\n")
+        std::fs::write(self.directory.path().join("hold-stdout-open"), b"hold\n")
             .expect("enable held fake Control Mode stdout");
     }
 
@@ -870,14 +896,65 @@ exit 0
         wait_for_pid_file(&self.control_pids_file, expected)
     }
 
-    fn descendant_pids(&self, expected: usize) -> Vec<u32> {
-        wait_for_pid_file(&self.descendant_pids_file, expected)
-    }
+    fn take_stdout_holders(&self, expected: usize) -> Vec<std::os::fd::OwnedFd> {
+        use rustix::net::{RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, recvmsg};
+        use std::{io::IoSliceMut, mem::MaybeUninit};
 
-    fn terminate_descendants(&self) {
-        for pid in read_pid_file(&self.descendant_pids_file) {
-            terminate_process(pid);
+        let deadline = Instant::now() + PUBLIC_ATTACHMENT_TIMEOUT;
+        let mut holders = Vec::new();
+        while holders.len() < expected {
+            let (stream, _) = match self.stdout_listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "stdout ownership transfer timed out"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accept stdout ownership transfer: {error}"),
+            };
+            stream.set_nonblocking(true).unwrap();
+            let mut marker = [0];
+            let mut buffer = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
+            let mut ancillary = RecvAncillaryBuffer::new(&mut buffer);
+            let received = loop {
+                match recvmsg(
+                    &stream,
+                    &mut [IoSliceMut::new(&mut marker)],
+                    &mut ancillary,
+                    RecvFlags::empty(),
+                ) {
+                    Ok(received) => break received,
+                    Err(rustix::io::Errno::AGAIN) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "stdout descriptor transfer timed out"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("receive the actual stdout writer: {error}"),
+                }
+            };
+            assert_eq!(received.bytes, 1);
+            assert_eq!(marker, [b'F']);
+            let before = holders.len();
+            for message in ancillary.drain() {
+                if let RecvAncillaryMessage::ScmRights(fds) = message {
+                    for fd in fds {
+                        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC).unwrap();
+                        holders.push(fd);
+                    }
+                }
+            }
+            assert_eq!(
+                holders.len(),
+                before + 1,
+                "transfer exactly one writer per Control client"
+            );
         }
+        holders
     }
 
     fn assert_refresh_command(&self) {
@@ -913,9 +990,8 @@ fn lock_tmux_fixture_owner() -> TmuxFixtureReservation {
 
 impl Drop for FakeTmuxControl {
     fn drop(&mut self) {
-        for pid in read_pid_file(&self.descendant_pids_file)
+        for pid in read_pid_file(&self.short_command_pids_file)
             .into_iter()
-            .chain(read_pid_file(&self.short_command_pids_file))
             .chain(read_pid_file(&self.control_pids_file))
         {
             if !process_exists(pid) {
@@ -1044,24 +1120,6 @@ fn wait_for_pid_file(path: &Path, expected: usize) -> Vec<u32> {
         "fixture did not record {expected} process PIDs at {}",
         path.display()
     );
-}
-
-fn terminate_process(pid: u32) {
-    if !process_exists(pid) {
-        return;
-    }
-    let status = Command::new("kill")
-        .arg("-TERM")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("terminate fixture process");
-    assert!(
-        status.success() || !process_exists(pid),
-        "terminate fixture process {pid}: {status}"
-    );
-    assert_process_exits(pid);
 }
 
 async fn attach_with_timeout(
@@ -1805,16 +1863,16 @@ async fn replacement_tmux_socket_path_invalidates_the_import_identity() {
     let run = import_fake_pane(&client, &fake).await;
     let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
     let control_pid = fake.control_pid();
-    let descendant_pids = fake.descendant_pids(1);
+    let stdout_holders = fake.take_stdout_holders(1);
 
     let _replacement_listener = fake.replace_socket_path();
     assert_process_exits(control_pid);
-    assert!(
-        descendant_pids.iter().all(|pid| process_exists(*pid)),
-        "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+    assert_eq!(
+        stdout_holders.len(),
+        1,
+        "test retains the stdout barrier after the direct child was reaped"
     );
-    fake.terminate_descendants();
-    assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
+    drop(stdout_holders);
     assert_eq!(
         next_event_with_timeout(&mut attachment)
             .await
@@ -1903,14 +1961,14 @@ async fn open_command_block_before_readiness_rejects_import_with_transcript_deta
     let import =
         tokio::spawn(async move { import_client.import_tmux(socket_path, &pane_id).await });
     let control_pid = fake.control_pid();
-    let descendant_pids = fake.descendant_pids(1);
+    let stdout_holders = fake.take_stdout_holders(1);
     assert_process_exits(control_pid);
-    assert!(
-        descendant_pids.iter().all(|pid| process_exists(*pid)),
-        "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+    assert_eq!(
+        stdout_holders.len(),
+        1,
+        "test retains the stdout barrier after the direct child was reaped"
     );
-    fake.terminate_descendants();
-    assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
+    drop(stdout_holders);
 
     match import
         .await
@@ -1957,15 +2015,15 @@ async fn control_eof_distinguishes_server_loss_from_an_open_command_block() {
         let run = import_fake_pane(&client, &fake).await;
         let (mut attachment, _) = attach_with_timeout(&client, run.id, 0).await;
         let control_pid = fake.control_pid();
-        let descendant_pids = fake.descendant_pids(1);
+        let stdout_holders = fake.take_stdout_holders(1);
         fake.trigger_control(trigger);
         assert_process_exits(control_pid);
-        assert!(
-            descendant_pids.iter().all(|pid| process_exists(*pid)),
-            "stdout holder barrier opened before the Control child was reaped: {descendant_pids:?}",
+        assert_eq!(
+            stdout_holders.len(),
+            1,
+            "test retains the stdout barrier after the direct child was reaped"
         );
-        fake.terminate_descendants();
-        assert!(descendant_pids.into_iter().all(|pid| !process_exists(pid)));
+        drop(stdout_holders);
         assert_eq!(
             next_event_with_timeout(&mut attachment)
                 .await
@@ -1979,6 +2037,74 @@ async fn control_eof_distinguishes_server_loss_from_an_open_command_block() {
             None
         );
         wait_for_interruption(&client, run.id, expected).await;
+        assert!(process_exists(fake.pane_pid()));
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn natural_control_loss_checks_the_full_target_identity() {
+    for (mode, expected) in [
+        ("resized-target", InterruptionReason::TmuxServerUnavailable),
+        ("changed-server", InterruptionReason::TmuxTargetChanged),
+        ("missing-target", InterruptionReason::TmuxTargetChanged),
+        ("dead-target", InterruptionReason::TmuxTargetChanged),
+        ("changed-target", InterruptionReason::TmuxTargetChanged),
+        ("linked-target", InterruptionReason::TmuxTargetChanged),
+    ] {
+        let fake = FakeTmuxControl::create();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        fake.set_short_command_mode(mode);
+        if mode == "linked-target" {
+            fake.include_linked_duplicate();
+        }
+        fake.trigger_control("eof");
+        wait_for_interruption(&client, run.id, expected).await;
+        assert_process_exits(fake.control_pid());
+        assert!(
+            process_exists(fake.pane_pid()),
+            "ctxmux must not kill the tmux-owned pane"
+        );
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_control_loss_probe_is_bounded_and_reaped() {
+    for mode in ["hang-version", "hang-discovery", "overflow-discovery"] {
+        let fake = FakeTmuxControl::create();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        fake.set_short_command_mode(mode);
+        fake.trigger_control("eof");
+        wait_for_interruption(&client, run.id, InterruptionReason::TmuxServerUnavailable).await;
+        assert_process_exits(fake.control_pid());
+        for pid in fake.short_command_pids(1) {
+            assert_process_exits(pid);
+        }
+        assert!(process_exists(fake.pane_pid()));
+        daemon.shutdown_clean();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_tmux_socket_does_not_claim_identity_replacement() {
+    for during_discovery in [false, true] {
+        let fake = FakeTmuxControl::create();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        if during_discovery {
+            fake.set_short_command_mode("unlink-after-discovery");
+        } else {
+            std::fs::remove_file(&fake.socket).expect("remove unavailable server socket");
+        }
+        fake.trigger_control("eof");
+        wait_for_interruption(&client, run.id, InterruptionReason::TmuxServerUnavailable).await;
+        assert_process_exits(fake.control_pid());
         assert!(process_exists(fake.pane_pid()));
         daemon.shutdown_clean();
     }
@@ -2182,6 +2308,40 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
     assert!(process_exists(fake.pane_pid()));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_owner_reaps_its_orphaned_group_without_killing_the_pane() {
+    for shutdown in [false, true] {
+        let fake = FakeTmuxControl::create();
+        std::fs::write(
+            fake.directory.path().join("spawn-owned-descendant"),
+            b"spawn",
+        )
+        .unwrap();
+        let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
+        let client = daemon.client();
+        let run = import_fake_pane(&client, &fake).await;
+        let control_pid = fake.control_pid();
+        let descendant =
+            wait_for_pid_file(&fake.directory.path().join("owned-descendant.pids"), 1)[0];
+        assert!(process_exists(descendant));
+        if shutdown {
+            daemon.shutdown_clean();
+        } else {
+            fake.trigger_control("eof");
+            wait_for_interruption(&client, run.id, InterruptionReason::TmuxServerUnavailable).await;
+        }
+        // kill(pid, 0) must fail: a zombie counts as a leak, just like the
+        // direct-child oracle. No global reaper may steal another owner's PID.
+        assert_process_exits(control_pid);
+        assert_process_exits(descendant);
+        assert!(process_exists(fake.pane_pid()));
+        if !shutdown {
+            daemon.shutdown_clean();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_failure_is_nonzero_and_bounded_across_multiple_control_clients() {
     const CONTROL_CLIENTS: usize = 3;
@@ -2203,9 +2363,9 @@ async fn shutdown_failure_is_nonzero_and_bounded_across_multiple_control_clients
             .expect("import an independent fake Control Mode client");
     }
     let control_pids = fake.control_pids(CONTROL_CLIENTS);
-    let descendant_pids = fake.descendant_pids(CONTROL_CLIENTS);
+    let stdout_holders = fake.take_stdout_holders(CONTROL_CLIENTS);
     assert!(control_pids.iter().all(|pid| process_exists(*pid)));
-    assert!(descendant_pids.iter().all(|pid| process_exists(*pid)));
+    assert_eq!(stdout_holders.len(), CONTROL_CLIENTS);
 
     let started = Instant::now();
     let status = daemon.shutdown_status(Duration::from_secs(8));
@@ -2223,7 +2383,7 @@ async fn shutdown_failure_is_nonzero_and_bounded_across_multiple_control_clients
         assert_process_exits(pid);
     }
 
-    fake.terminate_descendants();
+    drop(stdout_holders);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

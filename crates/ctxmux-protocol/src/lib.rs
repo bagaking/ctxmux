@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 17;
+pub const PROTOCOL_VERSION: u16 = 18;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -1673,6 +1673,13 @@ pub enum ServerFrame {
     Response { response: Response },
     /// Initial attachment metadata. Retained output follows as event frames.
     Attached { snapshot: AttachedHeader },
+    /// Initial replay lost a prefix while pages were being streamed. The
+    /// client discards its partial assembly and resumes from this newer floor
+    /// through the unchanged advertised head. This is not a live Gap cursor.
+    ReplayWindow {
+        first_available_byte: u64,
+        latest_output_bytes: u64,
+    },
     /// Live attachment event.
     Event { event: RunEvent },
     /// Result of one attachment-local control command.
@@ -1936,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_16_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_18_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1954,7 +1961,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 17,
+                    "protocolGeneration": 18,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {

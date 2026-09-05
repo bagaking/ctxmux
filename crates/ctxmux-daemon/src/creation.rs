@@ -3,7 +3,7 @@ use std::{
     hash::{BuildHasher, Hasher},
     sync::{
         Arc, Condvar, Mutex, OnceLock, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use super::{
     Run, RunControl, STOP_ACK_TIMEOUT, TERMINAL_VISIBILITY_GRACE, control_not_applied,
     control_unknown, read_lock, write_lock,
 };
-use crate::fd_budget::FD_BUDGET_LIVE_RUNS;
+use crate::ResourceLimits;
 use crate::native_control::{ControlResult, DetachedNativeDescriptors, PendingStop};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
@@ -135,6 +135,10 @@ impl Default for CreationFlightOwner {
 
 impl CreationFlightOwner {
     pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self::with_slots(qualification_stats, MAX_CREATION_OWNER_SLOTS)
+    }
+
+    pub(crate) fn with_slots(qualification_stats: QualificationStats, slots: usize) -> Self {
         Self {
             inner: Arc::new(CreationFlightInner {
                 state: Mutex::new(CreationFlightState {
@@ -142,7 +146,7 @@ impl CreationFlightOwner {
                     active: 0,
                 }),
                 drained: Condvar::new(),
-                admission: Arc::new(Semaphore::new(MAX_CREATION_OWNER_SLOTS)),
+                admission: Arc::new(Semaphore::new(slots)),
             }),
             qualification_stats,
         }
@@ -280,6 +284,7 @@ pub(crate) struct UnpublishedCleanupOwner {
 
 #[derive(Default)]
 struct UnpublishedCleanupInner {
+    max_owned: usize,
     state: Mutex<UnpublishedCleanupState>,
 }
 
@@ -336,8 +341,15 @@ pub(crate) struct PendingPublication {
 
 impl UnpublishedCleanupOwner {
     pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self::with_slots(qualification_stats, MAX_CREATION_OWNER_SLOTS)
+    }
+
+    pub(crate) fn with_slots(qualification_stats: QualificationStats, slots: usize) -> Self {
         Self {
-            inner: Arc::default(),
+            inner: Arc::new(UnpublishedCleanupInner {
+                max_owned: slots,
+                state: Mutex::default(),
+            }),
             qualification_stats,
         }
     }
@@ -384,7 +396,7 @@ impl UnpublishedCleanupOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_reaped(&mut state);
         sync_cleanup_stats(&self.qualification_stats, &state);
-        if state.owned >= MAX_CREATION_OWNER_SLOTS {
+        if state.owned >= self.inner.max_owned {
             return Err(ProtocolError::new(
                 ErrorCode::BackendUnavailable,
                 "Run publication cleanup capacity is exhausted",
@@ -408,7 +420,7 @@ impl UnpublishedCleanupOwner {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         prune_reaped(&mut state);
         sync_cleanup_stats(&self.qualification_stats, &state);
-        if state.owned >= MAX_CREATION_OWNER_SLOTS {
+        if state.owned >= self.inner.max_owned {
             return Err(ProtocolError::new(
                 ErrorCode::BackendUnavailable,
                 "Run publication cleanup capacity is exhausted",
@@ -748,22 +760,14 @@ mod tests {
     use crate::retention::RetentionBudget;
 
     #[test]
-    fn clamp_record_capacity_only_lowers_the_ceiling() {
+    fn descriptor_pressure_never_reduces_terminal_history_capacity() {
         let registry = super::RunRegistry::default();
-        // The default admission ceiling is the descriptor concurrency target,
-        // not a hardcoded record count.
-        assert_eq!(registry.record_capacity(), super::FD_BUDGET_LIVE_RUNS);
-        // A funded ceiling at or above the default changes nothing: the fd
-        // budget funds at least its own target, so a generous host stays there.
-        registry.clamp_record_capacity(super::FD_BUDGET_LIVE_RUNS + 10);
-        assert_eq!(registry.record_capacity(), super::FD_BUDGET_LIVE_RUNS);
-        // A scarce funded ceiling lowers the effective admission ceiling.
-        registry.clamp_record_capacity(5);
-        assert_eq!(registry.record_capacity(), 5);
-        // A later, larger funded ceiling never raises it back above the last
-        // clamp — clamping is monotonically downward within one incarnation.
-        registry.clamp_record_capacity(50);
-        assert_eq!(registry.record_capacity(), 5);
+        assert_eq!(registry.record_capacity(), usize::MAX);
+        registry.clamp_live_capacity(5);
+        assert_eq!(registry.record_capacity(), usize::MAX);
+        assert_eq!(super::read_lock(&registry.state).live_capacity, 5);
+        registry.clamp_live_capacity(50);
+        assert_eq!(super::read_lock(&registry.state).live_capacity, 5);
     }
 
     /// Build a `RegistryState` holding `count` terminal, collection-eligible
@@ -785,11 +789,13 @@ mod tests {
                     run,
                     operation_key: None,
                     stop_operation: None,
-                    metadata_bytes: None,
+                    metadata_bytes: Some(Arc::new(super::AtomicU64::new(256))),
+                    metadata_charge: 256,
                     residency: RegistryResidency::Retained,
                 },
             );
         }
+        state.retained_metadata_bytes = count as u64 * 256;
         state
     }
 
@@ -813,7 +819,7 @@ mod tests {
             // so the largest case is genuinely below it rather than at the
             // default fd concurrency target.
             state.record_capacity = count + 1;
-            let below = select_publication_candidates(&state, None);
+            let below = select_publication_candidates(&state, Some(256));
             assert_eq!(
                 below.evaluated, 0,
                 "no-pressure publication at {count} retained Runs must scan nothing"
@@ -823,7 +829,7 @@ mod tests {
             // At the ceiling: eviction pressure forces the scan, so every
             // eligible record is walked to find the one exact replacement.
             state.record_capacity = count.max(1);
-            let at_ceiling = select_publication_candidates(&state, None);
+            let at_ceiling = select_publication_candidates(&state, Some(256));
             assert_eq!(
                 at_ceiling.evaluated, count,
                 "an at-ceiling publication must still walk every retained record"
@@ -831,18 +837,18 @@ mod tests {
         }
     }
 
-    /// Mean nanoseconds per `select_publication_candidates(state, None)` call
+    /// Mean nanoseconds per `select_publication_candidates(state, Some(256))` call
     /// over `iterations`, after a warm-up to settle allocator/cache effects.
     /// Uses `as_secs_f64` (not `as_nanos as f64`) to stay clear of the
     /// precision-loss lint while keeping nanosecond resolution.
     #[cfg(test)]
     fn mean_selection_nanos(state: &RegistryState, iterations: u32) -> f64 {
         for _ in 0..64 {
-            std::hint::black_box(select_publication_candidates(state, None));
+            std::hint::black_box(select_publication_candidates(state, Some(256)));
         }
         let start = Instant::now();
         for _ in 0..iterations {
-            std::hint::black_box(select_publication_candidates(state, None));
+            std::hint::black_box(select_publication_candidates(state, Some(256)));
         }
         start.elapsed().as_secs_f64() * 1e9 / f64::from(iterations)
     }
@@ -1256,6 +1262,14 @@ impl StopOperationCell {
 struct StopOperationRecord {
     key: StopOperationKey,
     cell: Arc<StopOperationCell>,
+    _memory: crate::resources::BytePermit,
+}
+
+fn stop_receipt_charge(key: &StopOperationKey) -> usize {
+    key.as_str().len() * 2
+        + std::mem::size_of::<StopOperationRecord>()
+        + std::mem::size_of::<StopOperationCell>()
+        + crate::native_control::HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
 }
 
 /// Settled recoverable Stop truth carried only across a same-incarnation
@@ -1294,6 +1308,10 @@ impl HandoffStopOperation {
 
     /// Diagnostic bytes this settled Stop result carries in the manifest. Only an
     /// Unknown outcome retains one (bounded per item); an Accepted outcome is 0.
+    pub(crate) fn control_memory_bytes(&self) -> u64 {
+        stop_receipt_charge(&self.operation_key) as u64
+    }
+
     pub(crate) fn diagnostic_bytes(&self) -> usize {
         match &self.outcome {
             HandoffStopOutcome::Unknown { failure } => failure.error.message.len(),
@@ -1414,22 +1432,13 @@ struct RegistryState {
     stop_runs: HashMap<StopOperationKey, RunId>,
     reservations: HashMap<PublicationTicket, RegistryReservation>,
     next_ticket: u64,
-    /// The live-Run admission ceiling: the descriptor concurrency target the
-    /// daemon provisions for (`FD_BUDGET_LIVE_RUNS`), clamped down at startup to
-    /// what `RLIMIT_NOFILE` actually funds (`clamp_record_capacity`). This is the
-    /// point admission refuses a new Run with `run_capacity` unless it can evict
-    /// an eligible terminal one by exact replacement.
-    ///
-    /// It is a descriptor-derived ceiling, not the old `MAX_RETAINED_RUNS = 128`
-    /// count cap. That cap bounded *records* and, incidentally, was the only
-    /// thing bounding retained memory and durable rows; both are now bounded by
-    /// their own resource — the daemon-wide retained-byte budget (`retention.rs`)
-    /// and the durable row ceiling (`persistence.rs`). Anchoring the live ceiling
-    /// to the same `FD_BUDGET_LIVE_RUNS` those two already cite keeps one honest
-    /// number — descriptors — gating live admission, so an agent host that funds
-    /// thousands of descriptors admits thousands of Runs rather than refusing at
-    /// 128.
+    /// Optional retained-record policy. Independent of physical live resources.
     record_capacity: usize,
+    live_capacity: usize,
+    live_resources: Arc<AtomicUsize>,
+    metadata_capacity: u64,
+    retained_metadata_bytes: u64,
+    control_budget: crate::resources::ByteBudget,
 }
 
 impl Default for RegistryState {
@@ -1440,17 +1449,33 @@ impl Default for RegistryState {
             stop_runs: HashMap::new(),
             reservations: HashMap::new(),
             next_ticket: 0,
-            record_capacity: FD_BUDGET_LIVE_RUNS,
+            record_capacity: usize::MAX,
+            live_capacity: usize::MAX,
+            live_resources: Arc::new(AtomicUsize::new(0)),
+            metadata_capacity: ResourceLimits::DEFAULT.metadata_bytes,
+            retained_metadata_bytes: 0,
+            control_budget: crate::resources::ByteBudget::new(
+                ResourceLimits::DEFAULT.control_state_bytes,
+            ),
         }
     }
 }
 
 /// One Registry-owned Run identity and its optional exact creation mapping.
+pub(crate) const fn registry_owner_bytes() -> usize {
+    // Two buckets per entry cover HashMap's load factor and its key indexes;
+    // these are real owner type sizes rather than a population-derived ceiling.
+    2 * (std::mem::size_of::<RegistryEntry>()
+        + std::mem::size_of::<(CreateOperationKey, RunId)>()
+        + std::mem::size_of::<(RunId, std::sync::Weak<Run>)>())
+}
+
 struct RegistryEntry {
     run: Arc<Run>,
     operation_key: Option<CreateOperationKey>,
     stop_operation: Option<StopOperationRecord>,
     metadata_bytes: Option<Arc<AtomicU64>>,
+    metadata_charge: u64,
     residency: RegistryResidency,
 }
 
@@ -1522,7 +1547,7 @@ fn select_publication_candidates(
             .map_or(0, |(new_bytes, projected)| {
                 projected
                     .saturating_add(new_bytes)
-                    .saturating_sub(super::persistence::METADATA_BYTES)
+                    .saturating_sub(state.metadata_capacity)
             });
     let needs_record = projected_records >= state.record_capacity;
 
@@ -1576,13 +1601,8 @@ fn select_publication_candidates(
         if (!needs_record || !candidates.is_empty()) && candidate_metadata >= metadata_to_fund {
             break;
         }
-        candidate_metadata = candidate_metadata.saturating_add(
-            state
-                .runs
-                .get(&id)
-                .and_then(|entry| entry.metadata_bytes.as_ref())
-                .map_or(0, |bytes| bytes.load(Ordering::Acquire)),
-        );
+        candidate_metadata = candidate_metadata
+            .saturating_add(state.runs.get(&id).map_or(0, |entry| entry.metadata_charge));
         candidates.push(id);
     }
     if (needs_record && candidates.is_empty()) || candidate_metadata < metadata_to_fund {
@@ -1618,12 +1638,10 @@ fn select_publication_candidates(
 }
 
 fn projected_metadata_bytes(state: &RegistryState) -> u64 {
-    let retained = state
-        .runs
-        .values()
-        .filter_map(|entry| entry.metadata_bytes.as_ref())
-        .map(|bytes| bytes.load(Ordering::Acquire))
-        .sum::<u64>();
+    // Metadata charges reserve the longest lifecycle state before publication,
+    // so this owner total remains stable as a Run exits. Only reservations are
+    // walked; their population is bounded by creation ownership, not history.
+    let retained = state.retained_metadata_bytes;
     let reserved = state
         .reservations
         .values()
@@ -1633,8 +1651,7 @@ fn projected_metadata_bytes(state: &RegistryState) -> u64 {
                     .candidates
                     .iter()
                     .filter_map(|id| state.runs.get(id))
-                    .filter_map(|entry| entry.metadata_bytes.as_ref())
-                    .map(|bytes| bytes.load(Ordering::Acquire))
+                    .map(|entry| entry.metadata_charge)
                     .sum::<u64>();
                 new_bytes.saturating_sub(candidates)
             })
@@ -1680,6 +1697,16 @@ pub(crate) struct PublicationReservation {
     qualification_stats: QualificationStats,
     ticket: Option<PublicationTicket>,
     removed: Vec<RegistryEntry>,
+    live_permit: Option<LiveResourcePermit>,
+    metadata_bytes: u64,
+}
+
+/// One funded physical live resource slot, held through final owner quiescence.
+pub(crate) struct LiveResourcePermit(Arc<AtomicUsize>);
+impl Drop for LiveResourcePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Incarnation-local owner for a durable outcome `SQLite` could not classify.
@@ -1688,6 +1715,7 @@ pub(crate) struct PublicationReservation {
 pub(crate) struct CommitUnknownReservation {
     _state: Arc<RwLock<RegistryState>>,
     _ticket: PublicationTicket,
+    _live_permit: Option<LiveResourcePermit>,
 }
 
 /// Byte-exact durable identity passed from the Registry fence to `SQLite`.
@@ -1714,22 +1742,49 @@ impl Default for RunRegistry {
 
 impl RunRegistry {
     pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
+        Self::with_stats_and_resources(qualification_stats, ResourceLimits::default())
+    }
+
+    pub(crate) fn with_stats_and_resources(
+        qualification_stats: QualificationStats,
+        resources: ResourceLimits,
+    ) -> Self {
         Self {
-            state: Arc::new(RwLock::default()),
+            state: Arc::new(RwLock::new(RegistryState {
+                record_capacity: resources.retained_runs.unwrap_or(usize::MAX),
+                live_capacity: resources.live_runs.unwrap_or(usize::MAX),
+                metadata_capacity: resources.metadata_bytes,
+                control_budget: crate::resources::ByteBudget::new(resources.control_state_bytes),
+                ..RegistryState::default()
+            })),
             creation_stripes: std::array::from_fn(|_| Arc::new(AsyncMutex::new(()))),
             creation_hash: RandomState::new(),
             qualification_stats,
         }
     }
-    pub(crate) fn recovered_with_stats(
+    pub(crate) fn control_budget(&self) -> crate::resources::ByteBudget {
+        read_lock(&self.state).control_budget.clone()
+    }
+
+    pub(crate) fn recovered_with_resources(
         runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>,
         qualification_stats: QualificationStats,
+        resources: ResourceLimits,
     ) -> Self {
-        let registry = Self::with_stats(qualification_stats);
+        let registry = Self::with_stats_and_resources(qualification_stats, resources);
         {
             let mut state = write_lock(&registry.state);
             for (operation_key, run, metadata_bytes) in runs {
                 let id = run.id;
+                if run.is_running() {
+                    state.live_resources.fetch_add(1, Ordering::AcqRel);
+                    *super::mutex_lock(&run.live_permit) =
+                        Some(LiveResourcePermit(Arc::clone(&state.live_resources)));
+                }
+                let metadata_charge = metadata_bytes.load(Ordering::Acquire)
+                    + super::resident_run_owner_bytes()
+                    + run.resident_metadata_bytes();
+                state.retained_metadata_bytes += metadata_charge;
                 let previous_run = state.runs.insert(
                     id,
                     RegistryEntry {
@@ -1737,6 +1792,7 @@ impl RunRegistry {
                         operation_key: Some(operation_key.clone()),
                         stop_operation: None,
                         metadata_bytes: Some(metadata_bytes),
+                        metadata_charge,
                         residency: RegistryResidency::Retained,
                     },
                 );
@@ -1753,8 +1809,11 @@ impl RunRegistry {
         runs: Vec<(CreateOperationKey, Arc<Run>, Arc<AtomicU64>)>,
         stop_operations: Vec<HandoffStopOperation>,
         qualification_stats: QualificationStats,
+        resources: ResourceLimits,
+        control_budget: crate::resources::ByteBudget,
     ) -> Result<Self, ProtocolError> {
-        let registry = Self::recovered_with_stats(runs, qualification_stats);
+        let registry = Self::recovered_with_resources(runs, qualification_stats, resources);
+        write_lock(&registry.state).control_budget = control_budget;
         registry.restore_handoff_stop_operations(stop_operations)?;
         Ok(registry)
     }
@@ -1803,6 +1862,12 @@ impl RunRegistry {
                 operation_key: key,
                 outcome,
             } = operation;
+            let memory = state
+                .control_budget
+                .reserve(stop_receipt_charge(&key))
+                .ok_or_else(|| {
+                    invalid("handed-off Stop control state exceeds preserved policy".to_owned())
+                })?;
             let cell = Arc::new(StopOperationCell::from_settled(outcome.into_result()));
             state
                 .runs
@@ -1811,6 +1876,7 @@ impl RunRegistry {
                 .stop_operation = Some(StopOperationRecord {
                 key: key.clone(),
                 cell,
+                _memory: memory,
             });
             let previous = state.stop_runs.insert(key, id);
             debug_assert!(previous.is_none());
@@ -1923,8 +1989,9 @@ impl RunRegistry {
         &self,
         new_run_id: RunId,
         operation_key: Option<CreateOperationKey>,
+        metadata_bytes: u64,
     ) -> Result<PublicationReservation, ProtocolError> {
-        self.reserve_publication(new_run_id, operation_key, None, None)
+        self.reserve_publication(new_run_id, operation_key, None, Some(metadata_bytes))
     }
 
     /// Reserve persistent record and metadata capacity before `SQLite` or spawn.
@@ -1939,7 +2006,7 @@ impl RunRegistry {
             new_run_id,
             Some(operation_key),
             Some(request),
-            Some(new_metadata_bytes),
+            Some(new_metadata_bytes.saturating_add(super::resident_run_owner_bytes())),
         )
     }
 
@@ -1958,6 +2025,23 @@ impl RunRegistry {
                 .is_none_or(|key| !state.creation_runs.contains_key(key))
         );
 
+        if state.live_resources.load(Ordering::Acquire) >= state.live_capacity {
+            // An input/cleanup clone can briefly outlive terminal publication.
+            // Reclaim only proven closed owners, on pressure rather than every
+            // create, so terminal history never pins descriptor admission.
+            for entry in state.runs.values() {
+                entry.run.release_closed_resources();
+            }
+        }
+        if state.live_resources.load(Ordering::Acquire) >= state.live_capacity {
+            return Err(ProtocolError::new(
+                ErrorCode::RunCapacity,
+                format!(
+                    "physical live Run resources exhausted at {} slots",
+                    state.live_capacity
+                ),
+            ));
+        }
         let selection = select_publication_candidates(&state, new_metadata_bytes);
         self.qualification_stats
             .record_candidate_selection(selection.evaluated);
@@ -2017,14 +2101,17 @@ impl RunRegistry {
                 ));
             }
         };
+        let live_resources = Arc::clone(&state.live_resources);
+        live_resources.fetch_add(1, Ordering::AcqRel);
         drop(state);
         drop(detached);
-
         Ok(PublicationReservation {
             state: Arc::clone(&self.state),
             qualification_stats: self.qualification_stats.clone(),
             ticket: Some(ticket),
             removed,
+            live_permit: Some(LiveResourcePermit(live_resources)),
+            metadata_bytes: new_metadata_bytes.unwrap_or(0),
         })
     }
 
@@ -2043,19 +2130,36 @@ impl RunRegistry {
         let mut state = write_lock(&self.state);
         debug_assert!(!state.creation_runs.contains_key(&operation_key));
         debug_assert!(!state.runs.contains_key(&id));
+        let memory_metadata_bytes = reservation.as_ref().map_or_else(
+            || publication_run.registry_metadata_bytes(Some(&operation_key)),
+            |reservation| reservation.metadata_bytes,
+        );
         let (removed, entry_operation_key) = if let Some(reservation) = reservation {
             debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
+            *super::mutex_lock(&run.live_permit) = reservation.live_permit.take();
             consume_reservation(&mut state, reservation, id, Some(&operation_key))
         } else {
             (Vec::new(), Some(operation_key.clone()))
         };
+        let metadata_owner = publication_run
+            .persistent_metadata_owner()
+            .unwrap_or_else(|| Arc::new(AtomicU64::new(memory_metadata_bytes)));
+        let metadata_charge = if activate_persistence {
+            metadata_owner.load(Ordering::Acquire)
+                + super::resident_run_owner_bytes()
+                + publication_run.resident_metadata_bytes()
+        } else {
+            memory_metadata_bytes
+        };
+        state.retained_metadata_bytes += metadata_charge;
         state.runs.insert(
             id,
             RegistryEntry {
                 run,
                 operation_key: entry_operation_key,
                 stop_operation: None,
-                metadata_bytes: publication_run.persistent_metadata_owner(),
+                metadata_bytes: Some(metadata_owner),
+                metadata_charge,
                 residency: RegistryResidency::Retained,
             },
         );
@@ -2078,16 +2182,20 @@ impl RunRegistry {
         let id = run.id;
         let mut state = write_lock(&self.state);
         debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
+        *super::mutex_lock(&run.live_permit) = reservation.live_permit.take();
+        let metadata_bytes = reservation.metadata_bytes;
         let (removed, entry_operation_key) =
             consume_reservation(&mut state, &mut reservation, id, None);
         debug_assert!(entry_operation_key.is_none());
+        state.retained_metadata_bytes += metadata_bytes;
         let previous = state.runs.insert(
             id,
             RegistryEntry {
                 run,
                 operation_key: None,
                 stop_operation: None,
-                metadata_bytes: None,
+                metadata_bytes: Some(Arc::new(AtomicU64::new(metadata_bytes))),
+                metadata_charge: metadata_bytes,
                 residency: RegistryResidency::Retained,
             },
         );
@@ -2103,6 +2211,10 @@ impl RunRegistry {
     /// retained Run remains pinned. The Registry lock is the sole order
     /// between the Runtime-global key index, the per-Run record, and native
     /// Stop admission.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one Registry lock orders receipt funding, key binding and the first Stop side effect"
+    )]
     pub(crate) fn begin_recoverable_stop(
         &self,
         id: RunId,
@@ -2176,6 +2288,15 @@ impl RunRegistry {
             ))
         })?;
 
+        let memory = state
+            .control_budget
+            .reserve(stop_receipt_charge(&key))
+            .ok_or_else(|| {
+                control_not_applied(ProtocolError::new(
+                    ErrorCode::ControlBackpressure,
+                    "daemon control_state_bytes cannot fund a Stop receipt before its side effect",
+                ))
+            })?;
         let entry = state
             .runs
             .get_mut(&id)
@@ -2185,6 +2306,7 @@ impl RunRegistry {
         entry.stop_operation = Some(StopOperationRecord {
             key: key.clone(),
             cell: Arc::clone(&cell),
+            _memory: memory,
         });
         let run = Arc::clone(&entry.run);
         let previous = state.stop_runs.insert(key.clone(), id);
@@ -2479,7 +2601,6 @@ impl RunRegistry {
             .collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<Arc<Run>> {
         read_lock(&self.state)
             .runs
@@ -2499,6 +2620,7 @@ impl RunRegistry {
                 operation_key: None,
                 stop_operation: None,
                 metadata_bytes: None,
+                metadata_charge: 0,
                 residency: RegistryResidency::Retained,
             },
         );
@@ -2513,9 +2635,9 @@ impl RunRegistry {
     /// ceiling instead of the daemon hitting EMFILE mid-spawn. Startup-only,
     /// before the socket is published, so no reservation or Collecting fence is
     /// in flight.
-    pub(crate) fn clamp_record_capacity(&self, funded_ceiling: usize) {
+    pub(crate) fn clamp_live_capacity(&self, funded_ceiling: usize) {
         let mut state = write_lock(&self.state);
-        state.record_capacity = state.record_capacity.min(funded_ceiling);
+        state.live_capacity = state.live_capacity.min(funded_ceiling);
     }
 
     #[cfg(test)]
@@ -2575,6 +2697,7 @@ impl PublicationReservation {
         self.ticket.take().map(|ticket| CommitUnknownReservation {
             _state: Arc::clone(&self.state),
             _ticket: ticket,
+            _live_permit: self.live_permit.take(),
         })
     }
 }
@@ -2641,6 +2764,9 @@ fn remove_registry_entry(state: &mut RegistryState, id: RunId) -> RegistryEntry 
         .runs
         .remove(&id)
         .expect("validated removal candidate remains Registry-owned");
+    state.retained_metadata_bytes = state
+        .retained_metadata_bytes
+        .saturating_sub(removed.metadata_charge);
     if let Some(operation_key) = &removed.operation_key {
         let mapped = state.creation_runs.remove(operation_key);
         debug_assert_eq!(mapped, Some(id));
@@ -2745,14 +2871,10 @@ fn restore_reservation(state: &mut RegistryState, ticket: PublicationTicket) {
 
 fn sync_registry_stats(telemetry: &QualificationStats, registry_state: &RegistryState) {
     let collecting = registry_state
-        .runs
+        .reservations
         .values()
-        .filter_map(|entry| match entry.residency {
-            RegistryResidency::Retained | RegistryResidency::Removing => None,
-            RegistryResidency::Collecting(ticket) => Some(ticket),
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .len();
+        .filter(|reservation| !reservation.candidates.is_empty())
+        .count();
     telemetry.set_many(&[
         (QualificationGauge::RetainedRuns, registry_state.runs.len()),
         (
@@ -2786,19 +2908,8 @@ fn consume_reservation(
     debug_assert!(reservation_owner.removed.is_empty());
     debug_assert!(reservation_owner.removed.capacity() >= reservation.candidates.len());
     for candidate in reservation.candidates {
-        let removed = state
-            .runs
-            .remove(&candidate)
-            .expect("publication removes its exact fenced candidate");
+        let removed = remove_registry_entry(state, candidate);
         debug_assert_eq!(removed.residency, RegistryResidency::Collecting(ticket));
-        if let Some(candidate_key) = &removed.operation_key {
-            let mapped = state.creation_runs.remove(candidate_key);
-            debug_assert_eq!(mapped, Some(candidate));
-        }
-        if let Some(stop_operation) = &removed.stop_operation {
-            let mapped = state.stop_runs.remove(&stop_operation.key);
-            debug_assert_eq!(mapped, Some(candidate));
-        }
         reservation_owner.removed.push(removed);
     }
     (

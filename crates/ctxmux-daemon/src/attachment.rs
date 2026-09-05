@@ -50,16 +50,35 @@ pub(super) async fn handle_pinned(
     request_permit: UpgradeRequestPermit,
     initial_response: Option<Response>,
 ) -> Result<(), ConnectionError> {
-    let (_guard, subscription) = run.subscribe();
+    let (_guard, subscription) = match run.try_subscribe() {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            send(&mut wire, &ServerFrame::Error { error }).await?;
+            return Ok(());
+        }
+    };
     let mut events = subscription.receiver;
     let mut live_cursor = subscription.cursor;
     #[cfg(test)]
     if let Some(hook) = &manager.attachment_hook {
         hook.pause_once(AttachmentHookPoint::AfterSubscribe).await;
     }
-    let snapshot = run.attachment_snapshot(after_byte);
+    let snapshot = match run.attachment_snapshot(after_byte).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            send(
+                &mut wire,
+                &ServerFrame::Error {
+                    error: ProtocolError::new(ErrorCode::Io, error.to_string()),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let (header, replay_chunks, terminal_state) = split_snapshot(snapshot);
     let mut sent_through_byte = header.replay.latest_output_bytes;
+    let initial_floor = header.replay.first_available_byte;
     // The attachment header embeds a full RunInfo, whose RunSpec is
     // caller-controlled and unbounded. If it cannot be framed, the client gets a
     // typed ResponseTooLarge error rather than a silently dropped socket, and we
@@ -68,7 +87,51 @@ pub(super) async fn handle_pinned(
         drop(request_permit);
         return Ok(());
     }
+    let mut replay_cursor = replay_chunks
+        .last()
+        .map_or(after_byte.max(initial_floor), |chunk| chunk.end_byte);
     send_replay(&mut wire, replay_chunks).await?;
+    #[cfg(test)]
+    if let Some(hook) = &manager.attachment_hook {
+        hook.pause_once(AttachmentHookPoint::AfterReplayPage).await;
+    }
+    while replay_cursor < sent_through_byte {
+        let page = match run
+            .attachment_replay_page(replay_cursor, sent_through_byte)
+            .await
+        {
+            Ok(page) => page,
+            Err(error) => {
+                send(
+                    &mut wire,
+                    &ServerFrame::Error {
+                        error: ProtocolError::new(ErrorCode::Io, error.to_string()),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        if page.first_available_byte > replay_cursor {
+            send(
+                &mut wire,
+                &ServerFrame::ReplayWindow {
+                    first_available_byte: page.first_available_byte.min(sent_through_byte),
+                    latest_output_bytes: sent_through_byte,
+                },
+            )
+            .await?;
+        }
+        let next = page
+            .chunks
+            .last()
+            .map_or(sent_through_byte, |chunk| chunk.end_byte);
+        if next <= replay_cursor {
+            break;
+        }
+        replay_cursor = next;
+        send_replay(&mut wire, page.chunks).await?;
+    }
     if let Some(response) = initial_response {
         send(&mut wire, &ServerFrame::Response { response }).await?;
     }
@@ -154,23 +217,22 @@ pub(super) async fn handle_pinned(
                             }
                         }
                         live_cursor = envelope.after;
-                        match envelope.event {
+                        let event = envelope.event();
+                        match event.as_ref() {
                             RunEvent::Output { chunk }
                                 if chunk.end_byte <= sent_through_byte => {}
                             RunEvent::Output { chunk } => {
                                 sent_through_byte = chunk.end_byte;
-                                send(&mut wire, &ServerFrame::Event {
-                                    event: RunEvent::Output { chunk },
-                                }).await?;
+                                send_event(&mut wire, event.as_ref()).await?;
                             }
                             event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => {
                                 if controls.pending_stops.is_empty() {
-                                    send(&mut wire, &ServerFrame::Event { event }).await?;
+                                    send_event(&mut wire, event).await?;
                                     return Ok(());
                                 }
-                                controls.held_terminal = Some(event);
+                                controls.held_terminal = Some(event.clone());
                             }
-                            event => send(&mut wire, &ServerFrame::Event { event }).await?,
+                            event => send_event(&mut wire, event).await?,
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -181,6 +243,27 @@ pub(super) async fn handle_pinned(
             }
         }
     }
+}
+
+// Borrow the shared, funded payload while encoding. Broadcast fanout must not
+// deep-clone Vec bytes into unleased envelopes held across an async send.
+async fn send_event(
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    event: &RunEvent,
+) -> Result<(), ConnectionError> {
+    #[derive(serde::Serialize)]
+    struct EventFrame<'a> {
+        r#type: &'static str,
+        event: &'a RunEvent,
+    }
+    send(
+        wire,
+        &EventFrame {
+            r#type: "event",
+            event,
+        },
+    )
+    .await
 }
 
 async fn finish_terminal_snapshot(

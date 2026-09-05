@@ -29,6 +29,11 @@ use super::{
 type WireSink = SplitSink<Wire, String>;
 type WireStream = SplitStream<Wire>;
 
+// Per-attachment pipeline windows bound queued envelopes and payload while a
+// peer is slow. Count limits cover empty/small commands; byte limits cover large
+// commands. Exhaustion is explicit backpressure before enqueue, with recoverable
+// command identity preserved. These windows do not cap fleet/lifetime work;
+// independent short-client requests use the same public protocol.
 const MAX_PENDING_COMMANDS: usize = 64;
 const MAX_PENDING_INPUT_COMMANDS: usize = 32;
 const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
@@ -828,7 +833,8 @@ async fn reader_loop(mut stream: WireStream, shared: Arc<AttachmentShared>) {
                 );
                 return;
             }
-            ServerFrame::Hello { .. }
+            ServerFrame::ReplayWindow { .. }
+            | ServerFrame::Hello { .. }
             | ServerFrame::Response { .. }
             | ServerFrame::Attached { .. } => {
                 Err("daemon sent a non-attachment frame after attach")

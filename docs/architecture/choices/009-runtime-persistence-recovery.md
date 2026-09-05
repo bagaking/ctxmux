@@ -2,6 +2,7 @@
 
 - Status: accepted and implemented
 - Scope: durability beyond one daemon lifetime
+- Resource-policy amendment: [019](019-resource-policy-and-honest-qualification.md) replaces population/format quotas and fixed byte ceilings with independent configured budgets; the durability boundaries below remain authoritative.
 
 ## Context
 
@@ -17,9 +18,11 @@ daemon through a single persistence actor thread. `rusqlite` with the bundled
 maintained SQLite library remains the source of transactional identity,
 lifecycle, cursors, and retention indexes. Replay bytes are written and synced
 to the generation file before their SQLite coordinates commit; startup truncates
-an uncommitted tail and removes orphan generations. A generation switch is one
-SQLite transaction, so compaction leaves either the old or the new generation
-authoritative.
+uncommitted tails and removes only unreferenced generations. Compaction first
+publishes a synced active destination, then migrates coordinates in bounded,
+spill-disabled page-admitted transactions. Each committed extent is authoritative:
+a crash may leave both source and destination durably referenced, and recovery
+validates and resumes that state before serving.
 
 The accepted recovery class is historical Run recovery:
 
@@ -76,17 +79,17 @@ and changes `daemonInstanceId`, while validated planned exec preserves both.
 The persistent-mode advertised capability record includes the two implemented
 `services.*` keys and omits memory-only `tmux.import`; the exact catalog and
 numeric semantics remain owned by [the protocol](../../protocol.md#connection-state).
-Schema-5 validation accepts its 4,096-record format envelope,
-then startup normalization uses bounded,
-spill-disabled transactions to reconcile prior running rows and evict the
-canonical terminal prefix to the operational 128-record ceiling. Each batch
+Schema-5 validation has no record-count format ceiling. A valid store that
+exceeds the selected operator policy reports resource pressure without evicting
+history to fit that policy. Startup normalization uses bounded,
+spill-disabled transactions to reconcile prior running rows. Each batch
 starts from a zero WAL, proves its cache-resident page charge before COMMIT,
 and may be resumed after interruption. A new schema stores its valid UUID as a
 bootstrap epoch immediately so an interrupted first open remains structurally
 reopenable; an existing store retains its previous epoch during normalization.
 In both cases the final startup transaction completes serving-epoch
 publication only after normalization, and the socket is published only after
-application and operational invariants are revalidated. Protocol generation 17
+application and operational invariants are revalidated. Protocol generation 18
 and persistence schema 5 are pre-stable, so the current schema has no
 migration, downgrade, reset, salvage, or compatibility fallback. An unknown
 version, failed integrity check, or invalid application invariant is a typed
@@ -114,7 +117,7 @@ mode and transactions define four indivisible application units:
 Output batches may lag live delivery but advance only contiguously. Process crash
 or torn WAL recovery therefore yields the previous or next complete unit, never
 a lifecycle/cursor/chunk hybrid. A start or fork that cannot reserve one new
-record within the immutable record and metadata budgets rejects only that
+record within the configured record and metadata budgets rejects only that
 unpublished Run; because no row was written, the actor continues serving
 existing Runs and later admissible starts. A typed SQLite `DiskFull`, write-side
 SQLite I/O pressure, or external `StorageFull` from an output append or terminal
@@ -132,14 +135,14 @@ uncommitted rollback would permit a second physical child. Already-owned live
 Runs may still be explicitly controlled so storage failure does not strand a
 child behind a false success.
 
-Retention is part of the format, not deferred GC. The existing 4 MiB per-Run
-replay tail remains. Persistent replay has a 256 MiB global logical byte budget
-and serialized metadata has a separate 64 MiB logical byte budget. Schema 5 can
-validate a store containing up to 4,096 records, but a serving daemon
-normalizes it to the same 128 retained or projected records used by the
-Registry before socket publication. The oldest chunks are pruned across Runs
-while keeping each retained replay window contiguous and its truncation cursors
-exact. The oldest exact terminal or interrupted candidates are removed when
+Retention cursors and byte accounting are format invariants; the selected
+retention budgets are operator policy. The defaults are a 4 MiB per-Run disk
+replay tail, 256 MiB aggregate disk replay and 64 MiB resident metadata.
+Hot replay has separate budgets. Live and retained Run counts have no default
+population quota; optional explicit quotas do not become schema constraints.
+The oldest replay prefixes are clipped across Runs, including inside an extent,
+while keeping each retained window contiguous and its truncation cursors exact.
+The oldest exact terminal or interrupted candidates are removed when
 record or metadata admission requires replacement. Because the creation key is
 a required column of that same row, retention removes the durable mapping in
 the same transaction. Running records are not deleted by ordinary admission; a
@@ -155,10 +158,20 @@ generation name is published. A transaction that fails before its append is
 committed truncates its tail; an outer commit with an unknown outcome preserves
 the harmless tail so startup normalization can resolve the durable index and
 truncate it before the store becomes observable. When a generation exceeds twice
-the 256 MiB logical replay budget, compaction writes every retained segment to
-a new generation, fsyncs it, switches all offsets and `runtime_meta.replay_file`
-atomically, then unlinks the old generation. A missing, shortened, overlapping,
-symlinked, or unreadable referenced segment fails startup closed.
+the 256 MiB logical replay budget, compaction creates and syncs a packed
+replacement, durably publishes its active name, and copies retained segments in
+bounded batches. Payload sync precedes every coordinate COMMIT, which uses the
+same measured cache-page WAL proof as Run admission. Source files remain until
+all their references have moved. Startup validates non-overlap independently
+within each referenced file, truncates only beyond its committed extent tail,
+removes only unreferenced files, and resumes an interrupted migration. Packed
+offsets rebase; neither lifetime output nor sparse-allocation fragmentation
+becomes a new capacity limit. Maintenance runs before append/finalize COMMIT,
+so safe storage-pressure retry cannot repeat an already committed lifecycle
+transition. An uncertain maintenance COMMIT retains every possibly referenced
+file and latches writes even if the underlying error resembles disk-full.
+A missing, shortened, overlapping, symlinked, or unreadable referenced segment
+still fails startup closed.
 
 Physical page pressure is an independent retention boundary. Before startup
 normalization or an allocating persistent mutation, the owner must reclaim
@@ -169,24 +182,28 @@ Reclamation uses bounded, spill-disabled transactions under the existing WAL
 charge proof; it preserves Run/key/spec/lifecycle metadata and the durable head,
 and advances the surviving replay floor and truncation fact atomically. It must
 work on a valid same-schema database already at its physical limit and survive
-reopen without inventing contiguous bytes. The physical cap stays fixed; no
+reopen without inventing contiguous bytes. The configured physical cap stays fixed during the mutation; no
 VACUUM, migration, external database rewrite, or silent Run deletion is part of
 this operation. A page-limit exhaustion that cannot make progress is not an
 external transient disk-full event and must not monopolize the actor forever.
 
-The SQLite page size is 4 KiB and `max_page_count` is 98,304 (384 MiB main
-database). One transaction may append at most 8 MiB of WAL frames. Output is
-split into smaller ordered batches. Decision 013 supersedes the old logical
-payload estimate for retained-Run replacement: the actor now folds the WAL below
-the 8 MiB checkpoint ceiling, records that length as its admission baseline, and
-proves the exact spill-disabled transaction's WAL _growth_ from its
-cache-resident page upper bound before physical launch. It therefore preserves
-both the 8 MiB transaction and 16 MiB total WAL ceilings without assuming that
-a 4 MiB replay payload maps to 4 MiB of modified pages. The shared-memory file
-has a 4 MiB ceiling. The complete state directory has a 768 MiB hard file
-budget plus the small lock file; replay retention and generation compaction keep
-this bounded without enlarging the SQLite ceiling. Exact replacement leaves freed pages reusable
-inside the frozen main-database ceiling instead of running an uncharged
+The SQLite page size is a 4 KiB format constant. `max_page_count` derives from
+`database_bytes`; its 384 MiB default funds 98,304 pages. Staged transactions
+use `wal_checkpoint_bytes` (8 MiB by default), and total WAL funding is twice
+that window. Output, coordinate migration and reclamation split into smaller
+ordered batches when their measured page charge requires it. The actor folds
+the WAL below the configured checkpoint window, records its admission baseline,
+and proves the exact spill-disabled transaction's WAL _growth_ from its
+cache-resident page upper bound before COMMIT. Payload length is never a proxy
+for modified pages. SHM funding derives from SQLite's 32 KiB WAL-index blocks
+and the permitted frame count (64 KiB under the default WAL policy), not an
+unrelated 4 MiB ceiling. The complete file budget funds the configured database,
+WAL and SHM, an old generation of up to twice retained replay, a packed
+replacement of up to retained replay, and one 1 MiB append work unit.
+This derives necessary compaction scratch headroom. A valid oversized WAL is
+checkpointed after integrity validation during recovery; excess size alone is
+resource pressure, never corruption. Exact replacement leaves freed pages reusable
+inside the configured main-database ceiling instead of running an uncharged
 post-COMMIT incremental vacuum. A failure discovered before COMMIT rejects
 admission without publishing a Run. Once replacement and the new Run/key row
 commit, a physical-file postcheck failure is a committed error: it latches the
@@ -270,8 +287,10 @@ and state paths still do not provide discovery or activation policy.
 - `PERSIST-01` (`i01`, `i02`): a persisted numeric PID can refer to an unrelated live process after restart. Ambiguous identity must become a non-recoverable typed state, never guessed adoption.
 - `PERSIST-02` (`i03`): interruption between payload sync, directory durability,
   SQLite generation switch, and old-generation cleanup can expose a parseable
-  mixed generation. Recovery must select one validated generation or report
-  corruption.
+  mixed generation. A durably indexed migration prefix is valid; recovery must
+  validate all referenced files and exact extent coordinates. Missing or
+  inconsistent coordinates fail closed, while legitimate intermediate states
+  resume without losing retained bytes.
 
 Linux pidfds demonstrate stable identity within one boot but are neither portable nor durable across restart. SQLite demonstrates the failure class and explicit storage assumptions; it does not mandate SQLite as the implementation.
 
@@ -296,18 +315,21 @@ Linux pidfds demonstrate stable identity within one boot but are neither portabl
 - Active / `PERSIST-02`: append rollback tails, orphan generations, and a
   parseable cursor/chunk mixed generation are normalized or return a typed
   startup corruption failure before socket publication or partial Run exposure;
-  SQLite transactions plus the synced generation directory own old-or-new
-  commit recovery.
+  SQLite transactions plus synced payloads and generation directory entries
+  own exact committed-coordinate recovery. High-cardinality, fragmented-row,
+  mid-copy crash and uncertain-COMMIT fixtures cover this boundary.
 - Active: deterministic actor faults translate SQLite `DiskFull`, write-side
   I/O pressure, or external `StorageFull`, retry the same append/finalize before
   later mutation, and stop waiting on shutdown;
   the replay-conflict fixture still latches the actor.
 - Active: the 4 MiB per-Run replay boundary, state lock, exact schema version,
   owner-only directory/sidecar modes, and symlink rejection are executable.
-- Qualification constants and admission checks cover the 256 MiB replay, 64
-  MiB metadata, 4,096-record, 384 MiB main database, 16 MiB WAL, 4 MiB SHM,
-  eviction, checkpoint, and complete state-directory boundaries without
-  allocating every production ceiling in each ordinary Gate run.
+- Qualification constants describe operating points, not format or fleet-size
+  limits. Admission checks cover configured replay, metadata, record, database,
+  staged-WAL, derived SHM and complete state-directory budgets. Held-out recovery
+  preserves 5,003 records beyond the historical 4,000/4,096 assumptions, and
+  smaller WAL policies exercise adaptive fragmentation/reclamation without
+  changing the accepted work or exact recovery oracle.
 - Future: version migration and rollback fixtures activate only when a second
   schema is actually proposed.
 

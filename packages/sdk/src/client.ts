@@ -843,6 +843,8 @@ async function receiveReplay(
   afterByte: number,
   header: Extract<ServerFrame, { readonly type: "attached" }>["snapshot"],
 ): Promise<AttachedSnapshot> {
+  let replay = { ...header.replay };
+  let run = { ...header.run };
   const chunks: AttachedSnapshot["replay"]["chunks"] = [];
   if (afterByte >= header.replay.latest_output_bytes) {
     return {
@@ -856,6 +858,26 @@ async function receiveReplay(
     if (frame.type === "error") {
       throw protocolError(frame.error);
     }
+    if (frame.type === "replay_window") {
+      if (
+        frame.latest_output_bytes !== header.replay.latest_output_bytes ||
+        frame.first_available_byte <= expectedByte ||
+        frame.first_available_byte > frame.latest_output_bytes
+      )
+        throw unexpected(
+          "a strictly newer replay floor through the advertised head",
+          frame.type,
+        );
+      chunks.length = 0;
+      expectedByte = frame.first_available_byte;
+      replay = {
+        ...replay,
+        first_available_byte: expectedByte,
+        truncated: true,
+      };
+      run = { ...run, first_available_byte: expectedByte };
+      continue;
+    }
     if (
       frame.type !== "event" ||
       frame.event.type !== "output" ||
@@ -868,8 +890,8 @@ async function receiveReplay(
     expectedByte = frame.event.chunk.end_byte;
   }
   return {
-    run: header.run,
-    replay: { ...header.replay, chunks },
+    run,
+    replay: { ...replay, chunks },
   };
 }
 

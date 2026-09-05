@@ -91,6 +91,8 @@ impl TestDaemon {
             .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
+            .arg("--resource-limits")
+            .arg(r#"{"live_runs":4000}"#)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -103,7 +105,8 @@ impl TestDaemon {
     /// Spawn a memory-only daemon under a lowered *soft-only* `RLIMIT_NOFILE`,
     /// leaving the hard limit untouched. `ulimit -S -n N` lets the daemon raise
     /// its soft limit back toward the budget, which is what a managed child then
-    /// inherits.
+    /// inherits. The explicit 4000-Run workload tests this inheritance path
+    /// without tying it to the population-unbounded default's metadata budget.
     async fn start_memory_only_with_soft_nofile_limit(soft_limit: u32) -> Self {
         let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
@@ -116,6 +119,8 @@ impl TestDaemon {
             .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
+            .arg("--resource-limits")
+            .arg(r#"{"live_runs":4000}"#)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -3028,7 +3033,7 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
     assert_eq!(
-        PROTOCOL_VERSION, 17,
+        PROTOCOL_VERSION, 18,
         "fixture must name the current generation"
     );
     let daemon = TestDaemon::start().await;
@@ -3163,8 +3168,11 @@ async fn retained_replay_larger_than_one_frame_streams_exactly_to_the_client() {
         .expect("stream retained replay across protocol frames");
     let replay = replay_bytes(&snapshot.replay.chunks);
     assert!(snapshot.replay.truncated);
-    assert!(replay.len() >= 4 * 1024 * 1024 - 8192);
-    assert!(replay.len() <= 4 * 1024 * 1024);
+    assert_eq!(
+        replay.len(),
+        4 * 1024 * 1024,
+        "the complete funded suffix must remain available"
+    );
     let marker = b"FRAME-SPLIT-FINAL";
     let zero_prefix = replay
         .len()
@@ -3344,14 +3352,18 @@ async fn already_exited_run_replays_exact_binary_bytes_before_one_exit_event() {
             b'F', b'I', b'N', b'A', b'L',
         ]
     );
-    assert!(
-        snapshot
-            .replay
-            .chunks
-            .windows(2)
-            .any(|pair| pair[0].end_byte == 8 && pair[1].start_byte == 8),
-        "the fixture must split the three-byte UTF-8 scalar after its first byte"
+    // Packing may combine PTY reads. The public byte cursor must still split
+    // this UTF-8 scalar after its first byte, irrespective of chunk shape.
+    let (_, split) = daemon
+        .client
+        .attach(run.id, 8)
+        .await
+        .expect("attach inside UTF-8 scalar");
+    assert_eq!(
+        replay_bytes(&split.replay.chunks),
+        &replay_bytes(&snapshot.replay.chunks)[8..]
     );
+    assert_eq!(split.replay.chunks.first().unwrap().start_byte, 8);
     let interior = snapshot
         .replay
         .chunks
@@ -4027,7 +4039,7 @@ async fn failed_upgrade_before_extract_restores_complete_service() {
 
     let state_dir = daemon.directory.path().join("state");
     std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500))
-        .expect("make handoff-file creation fail before extract");
+        .expect("invalidate the incoming state-directory contract before extract");
     daemon.sighup();
     let aborted = daemon
         .wait_stderr_line(
@@ -4037,7 +4049,7 @@ async fn failed_upgrade_before_extract_restores_complete_service() {
         )
         .await;
     assert!(
-        aborted.contains("ctxmux-handoff"),
+        aborted.contains("permissions must be exactly 0700"),
         "unexpected abort: {aborted}"
     );
     std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))

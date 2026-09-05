@@ -1214,6 +1214,9 @@ where
         || after_byte.max(snapshot.replay.first_available_byte),
         |chunk| chunk.end_byte,
     );
+    if expected_byte >= snapshot.replay.latest_output_bytes {
+        return Ok(());
+    }
     loop {
         match receive_optional(wire).await?.ok_or(ClientError::Closed)? {
             ServerFrame::Event {
@@ -1228,6 +1231,22 @@ where
                 expected_byte = chunk.end_byte;
                 snapshot.replay.chunks.push(chunk);
                 if complete {
+                    return Ok(());
+                }
+            }
+            ServerFrame::ReplayWindow {
+                first_available_byte,
+                latest_output_bytes,
+            } if latest_output_bytes == snapshot.replay.latest_output_bytes
+                && first_available_byte > expected_byte
+                && first_available_byte <= latest_output_bytes =>
+            {
+                snapshot.replay.chunks.clear();
+                snapshot.replay.first_available_byte = first_available_byte;
+                snapshot.run.first_available_byte = first_available_byte;
+                snapshot.replay.truncated = true;
+                expected_byte = first_available_byte;
+                if expected_byte == latest_output_bytes {
                     return Ok(());
                 }
             }

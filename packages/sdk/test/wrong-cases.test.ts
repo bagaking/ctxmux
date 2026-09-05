@@ -1459,6 +1459,137 @@ test("LP-02 enforces the exact frame ceiling with and without a delimiter", asyn
   }
 });
 
+test("initial replay discards stale assembly when the retained floor advances", async (context) => {
+  for (const empty of [false, true]) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      assert.deepEqual(await peer.receive(), {
+        type: "request",
+        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+      });
+      peer.send({
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(8),
+          replay: {
+            first_available_byte: 0,
+            latest_output_bytes: 8,
+            truncated: false,
+          },
+        },
+      });
+      peer.send({
+        type: "event",
+        event: {
+          type: "output",
+          chunk: {
+            start_byte: 0,
+            end_byte: 2,
+            data: new Uint8Array([0, 1]),
+          },
+        },
+      });
+      peer.send({
+        type: "replay_window",
+        first_available_byte: 4,
+        latest_output_bytes: 8,
+      });
+      peer.send({
+        type: "event",
+        event: {
+          type: "output",
+          chunk: {
+            start_byte: 4,
+            end_byte: 6,
+            data: new Uint8Array([4, 5]),
+          },
+        },
+      });
+      peer.send({
+        type: "replay_window",
+        first_available_byte: empty ? 8 : 7,
+        latest_output_bytes: 8,
+      });
+      if (!empty)
+        peer.send({
+          type: "event",
+          event: {
+            type: "output",
+            chunk: {
+              start_byte: 7,
+              end_byte: 8,
+              data: new Uint8Array([7]),
+            },
+          },
+        });
+    });
+    const attachment = await new CtxmuxClient({
+      socketPath: daemon.socketPath,
+    }).attach(RUN_ID);
+    assert.equal(attachment.snapshot.replay.truncated, true);
+    assert.equal(
+      attachment.snapshot.replay.first_available_byte,
+      empty ? 8 : 7,
+    );
+    assert.equal(attachment.snapshot.replay.latest_output_bytes, 8);
+    assert.equal(attachment.snapshot.run.first_available_byte, empty ? 8 : 7);
+    assert.deepEqual(
+      attachment.snapshot.replay.chunks,
+      empty ? [] : [{ start_byte: 7, end_byte: 8, data: new Uint8Array([7]) }],
+    );
+    attachment.close();
+  }
+});
+
+test("initial replay refuses a stale floor or a changed captured head", async (context) => {
+  for (const [floor, head] of [
+    [1, 5],
+    [2, 5],
+    [4, 6],
+  ]) {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      assert.deepEqual(await peer.receive(), {
+        type: "request",
+        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+      });
+      peer.send({
+        type: "attached",
+        snapshot: {
+          ...attachedHeader(5),
+          replay: {
+            first_available_byte: 0,
+            latest_output_bytes: 5,
+            truncated: false,
+          },
+        },
+      });
+      peer.send({
+        type: "event",
+        event: {
+          type: "output",
+          chunk: {
+            start_byte: 0,
+            end_byte: 2,
+            data: new Uint8Array([0, 1]),
+          },
+        },
+      });
+      peer.send({
+        type: "replay_window",
+        first_available_byte: floor!,
+        latest_output_bytes: head!,
+      });
+    });
+    await assert.rejects(
+      new CtxmuxClient({ socketPath: daemon.socketPath }).attach(RUN_ID),
+      /expected a strictly newer replay floor through the advertised head, received replay_window/u,
+    );
+  }
+});
+
 test("LP-02 reassembles retained replay streamed across bounded frames", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);

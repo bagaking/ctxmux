@@ -267,7 +267,7 @@ fn reap_orphaned_group_members(process_group: Pid) {
 #[cfg(target_os = "macos")]
 fn reap_orphaned_group_members(_process_group: Pid) {}
 
-fn terminate_and_reap(child: &mut Child, process_group: Pid) -> Result<(), String> {
+pub(super) fn terminate_and_reap(child: &mut Child, process_group: Pid) -> Result<(), String> {
     let mut failures = Vec::new();
     let initial_group_error = match kill_process_group(process_group, Signal::KILL) {
         Ok(()) | Err(Errno::SRCH) => None,

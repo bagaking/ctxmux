@@ -1,158 +1,21 @@
-//! Daemon-wide retained-output byte budget and its cross-Run reclamation policy.
-//!
-//! # The hazard this closes
-//!
-//! `OUTPUT_RETENTION_BYTES` (4 MiB) is a *per-Run* cap enforced inside
-//! `OutputLog::push`: a Run trims its own oldest chunks the moment its own log
-//! crosses 4 MiB. That leaves two holes, both of which this module fills.
-//!
-//! 1. **No aggregate bound.** N Runs authorize N × 4 MiB with nothing watching
-//!    the sum. The old record cap (`MAX_RETAINED_RUNS = 128`) only *incidentally*
-//!    bounded this at 128 × 4 MiB = 512 MiB, and that cap has since been removed
-//!    because this is an agent runtime that runs thousands of concurrent Runs
-//!    (live admission is now bounded by the descriptor budget, `fd_budget.rs`).
-//!    At 4000 Runs the un-bounded design authorizes 16 GiB.
-//! 2. **Quiet Runs pin memory forever.** Per-Run eviction fires *only on that
-//!    Run's own push*. A Run that fills 4 MiB and then goes silent never pushes
-//!    again, so nothing ever reclaims its 4 MiB — even under global pressure.
-//!    A farm measurement drove RSS from 390 MiB to 810 MiB with 2048 verbose
-//!    Runs in 20 s, still climbing, precisely because of this.
-//!
-//! tmux solves the same shape by bounding *memory* (every pane has a
-//! `history-limit`), never *pane count*. We were bounding count and not memory
-//! — backwards. This module bounds memory.
-//!
-//! # The three decisions, and the alternatives rejected
-//!
-//! ## What the budget is: 1 GiB (see [`RETENTION_BUDGET_BYTES`])
-//!
-//! Chosen against two hard reference points, not to match `128 × 4 MiB`:
-//!
-//! - **Floor (must not go below):** the frozen `reliability-gc-contract.json`
-//!   replay-pressure phase retains 128 terminal Runs at 4 MiB *plus* an 8-wide
-//!   replacement overlap = `retained_plus_overlap_payload_bytes = 570_425_344`
-//!   (544 MiB), and asserts every one of those replays is `truncated == false`.
-//!   If the budget sat at or below that peak, reclamation would fire *during the
-//!   gate* and truncate a replay the gate demands intact. The budget must clear
-//!   the peak with headroom, exactly as `fd_budget` funds its concurrency target
-//!   without clamping at it. [`GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES`] pins that
-//!   floor at compile time.
-//! - **Ceiling (must be defensible for thousands of Runs):** the pathological
-//!   4000-Run × 4 MiB = 16 GiB must be capped hard. 1 GiB caps it 16×. Output
-//!   payload dominates daemon RSS at that scale (the fd-budget measurements put
-//!   4000 active Runs near ~476 MiB of *non-payload* steady RSS), so a ~1 GiB
-//!   scrollback ceiling is a credible line for an agent host: it can afford a
-//!   gigabyte of retained terminal output, it cannot afford sixteen.
-//!
-//! Relationship to the persistence-side budgets (`persistence.rs`): those pin a
-//! 64 MiB durable *metadata* total and a 256 MiB durable *replay* total —
-//! disk-backed, restart-surviving, and a different resource from this hot
-//! in-memory payload. ADR 013 already lets the live 512 MiB in-memory payload
-//! coexist with the 256 MiB durable cap; a live-memory budget larger than the
-//! durable one is expected, not a contradiction. We deliberately do **not**
-//! reuse 64 MiB or 256 MiB: they govern bytes on disk, not resident RSS.
-//!
-//! ## Who gets evicted: oldest bytes of the fattest, unattached Runs first
-//!
-//! Reclamation trims oldest chunks (front of the deque) from the Runs holding
-//! the most retained bytes, preferring Runs with **no live attachment** over
-//! Runs a client is actively reading. This directly targets the quiet-Run
-//! hole: a Run that filled 4 MiB and went silent is the *largest* retained log
-//! and (usually) unattached, so it is the first victim — reclaimed by *another*
-//! Run's push, which is the event we already have.
-//!
-//! - *Rejected: refuse-admission projection* (the shape `persistence.rs` uses
-//!   at its admission boundary — check the post-state and reject rather than
-//!   evict after the fact). You cannot refuse a running child's stdout: the
-//!   bytes already exist in the kernel PTY buffer and the read already happened.
-//!   Persistence can refuse because a *new Run* is what crosses its boundary;
-//!   here the boundary is bytes from a live process, which has no "no" to hear.
-//! - *Rejected: per-Run-only eviction* (today's design). It cannot reclaim a
-//!   quiet Run — that is the bug.
-//! - *Rejected: strict least-recently-read.* It needs a per-Run read timestamp
-//!   updated on every replay, i.e. new write traffic on the hot attach path for
-//!   a second-order quality gain. The attachment-aware size policy captures the
-//!   first-order win (evict quiet fat Runs) without that cost. Attachment state
-//!   is read best-effort during a scan that only ever runs *over* budget.
-//!
-//! ## When it runs: on push, single-flighted, never on a timer
-//!
-//! Reclamation is driven by the same event that admits new bytes — a
-//! `record_output` push. There is **no periodic sweep**: idle CPU is the
-//! subject of a sibling task, and a quiet daemon that is already at rest under
-//! budget has nothing to reclaim (the push that last put it over budget already
-//! reclaimed on its way through). The fast path is a single relaxed atomic load
-//! (`total <= limit` → return); the expensive scan is gated behind a
-//! `try_lock` so that a burst of concurrent over-budget pushes elects exactly
-//! one reclaimer and the rest return immediately.
-//!
-//! ## What a client observes: the existing truncation signal, unchanged
-//!
-//! Trimming here uses the *same* front-pop mechanic as per-Run eviction, so a
-//! client observes the *same* honest signal it already handles: `replay`
-//! reports `truncated = true` and an advanced `first_available_byte`, and a
-//! live attachment sees the discontinuity exactly as it does when a Run
-//! overruns its own 4 MiB. No new observable state, no silent data loss, and a
-//! log is never emptied below its last chunk — `latest_output_bytes` and the
-//! replay cursor stay monotonic so persistence finalize and live cursors are
-//! never rewound.
-//!
-//! # Lock discipline (this crate is `#![forbid(unsafe_code)]`)
-//!
-//! The budget holds only [`Weak`] participant handles, never `Arc<Run>`:
-//! collection and `remove` require `Arc::strong_count == 1`, so a strong ref
-//! here would immortalize every Run. A victim is `upgrade`d transiently, only
-//! inside a reclamation scan that only runs over budget (never during the
-//! frozen gate, which stays under the limit), so the brief strong-count bump
-//! cannot make collection's eligibility check flake in any measured workload.
-//!
-//! Accounting is tied to `OutputLog`'s own lifetime: the log increments the
-//! shared total on push, decrements it on every trim (per-Run *and* global),
-//! and decrements the remainder in `Drop`. Because the log drops exactly when
-//! its `Run` drops, every reclamation path — ordinary drop, Registry
-//! collection/replacement, and the explicit `remove` verb — decrements the
-//! total for free, with no separate accounting hook to keep in sync. The
-//! `remove` path and a budget trim therefore leave the same observable state: a
-//! smaller (or absent) retained log with an honest truncation cursor.
-//!
-//! The only ordering rule reclamation must obey: never hold the participants
-//! lock while locking a victim's `output`, and never hold two `output` locks at
-//! once. `record_output` locks its own `output`, releases it, *then* calls
-//! reclamation, which takes the participants lock, releases it with a snapshot,
-//! then locks victims one at a time. No cycle is constructible.
+//! Bounded hot replay cache, configured independently of fleet qualification.
+//! Oldest bytes of the largest unattached Runs are reclaimed first. Accounted
+//! bytes follow each `OutputLog` through trim and drop; cursors report truncation.
+//! No production budget is derived from, or forced above, a fixture workload.
 
-use std::sync::{
-    Arc, Mutex, Weak,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use ctxmux_protocol::RunId;
 
-/// Daemon-wide ceiling on the sum of retained `OutputLog` payload bytes across
-/// every live and terminal Run. See the module docs for the full derivation.
-///
-/// 1 GiB: above the 544 MiB frozen-gate peak with headroom so reclamation never
-/// fires during qualification, and 16× below the 16 GiB a 4000-Run host would
-/// otherwise authorize.
-pub(crate) const RETENTION_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
-
-/// The frozen replay-pressure peak the budget must clear: 128 retained Runs
-/// plus an 8-wide replacement overlap, each at the 4 MiB per-Run cap. Pinned in
-/// `reliability-gc-contract.json` as `retained_plus_overlap_payload_bytes` and
-/// in ADR 013 as the 544 MiB retained-plus-overlap bound. Expressed as a literal
-/// (not `MAX_RETAINED_RUNS * OUTPUT_RETENTION_BYTES`) so it stays a valid floor
-/// now that the record cap has been removed and no such constant exists.
-const GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES: u64 = 570_425_344;
-
-/// The budget must clear the frozen gate peak, or reclamation would truncate a
-/// replay the gate asserts intact. Enforced at compile time so the two numbers
-/// cannot drift into that contradiction. This is a *lower* bound only; the
-/// magnitude above it is the defensible-for-thousands-of-Runs ceiling argued in
-/// the module docs.
-const _: () = assert!(
-    RETENTION_BUDGET_BYTES > GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES,
-    "the retained-byte budget must sit above the frozen replay-pressure peak"
-);
+/// Default host replay cache allowance; operator policy can change it.
+#[cfg(test)]
+pub(crate) const RETENTION_BUDGET_BYTES: u64 = crate::ResourceLimits::DEFAULT.hot_output_bytes;
 
 /// One Run, viewed by the reclamation policy through a `Weak` handle.
 ///
@@ -170,15 +33,17 @@ pub(crate) trait RetentionVictim: Send + Sync {
     /// between this read and a subsequent [`reclaim_output`](Self::reclaim_output).
     fn retained_output_bytes(&self) -> usize;
 
+    /// Already offered history that can fund a subsequent actual read.
+    fn reclaimable_output_bytes(&self) -> usize;
+
     /// Whether a client is currently attached and replaying this Run. An
     /// attached Run is a worse eviction victim than a quiet one, but the replay
     /// contract already tolerates truncation, so this only *orders* victims.
     fn is_attached(&self) -> bool;
 
-    /// Trim oldest chunks until at least `drop_at_least` bytes are shed or only
-    /// one chunk remains, decrementing the shared total as it goes. Returns the
-    /// bytes actually reclaimed. Never empties the log below its final chunk, so
-    /// `latest_output_bytes` and the replay cursor stay monotonic.
+    /// Trim the requested reclaimable prefix, decrementing the shared total.
+    /// Returns bytes actually reclaimed. A window may become empty while its
+    /// independently stored lifetime head remains monotone.
     fn reclaim_output(&self, drop_at_least: usize) -> usize;
 }
 
@@ -194,13 +59,15 @@ struct Inner {
     /// Hard ceiling on `total`. Reclamation targets bringing `total` at or
     /// below this.
     limit: u64,
+    per_run_limit: usize,
+    event_budget: crate::resources::ByteBudget,
     /// Sum of `retained_bytes` across every participating `OutputLog`. Mutated
     /// only by `OutputLog` accounting (add on push, sub on trim/drop).
     total: AtomicU64,
     /// Weak handles to every participating Run. Pruned opportunistically. Never
     /// strong: a strong ref would break collection's `strong_count == 1`
     /// eligibility.
-    participants: Mutex<Vec<Weak<dyn RetentionVictim + Send + Sync>>>,
+    participants: Mutex<HashMap<RunId, Weak<dyn RetentionVictim + Send + Sync>>>,
     /// Single-flight gate: a burst of over-budget pushes elects one reclaimer
     /// via `try_lock`; the rest return without contending on the scan.
     reclaiming: Mutex<()>,
@@ -208,18 +75,54 @@ struct Inner {
 
 impl RetentionBudget {
     /// The production budget: [`RETENTION_BUDGET_BYTES`].
+    #[cfg(test)]
     pub(crate) fn production() -> Self {
-        Self::with_limit(RETENTION_BUDGET_BYTES)
+        Self::with_limits(
+            crate::ResourceLimits::DEFAULT.hot_output_bytes,
+            crate::ResourceLimits::DEFAULT.run_output_bytes,
+        )
     }
 
     /// A budget with an explicit limit, for tests that must reach the ceiling
     /// without allocating a gigabyte.
+    #[cfg(test)]
     pub(crate) fn with_limit(limit: u64) -> Self {
+        Self::with_limits(limit, crate::ResourceLimits::DEFAULT.run_output_bytes)
+    }
+
+    pub(crate) fn per_run_limit(&self) -> usize {
+        self.inner.per_run_limit
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(limit: u64, per_run_limit: usize) -> Self {
+        Self::with_event_limits(
+            limit,
+            per_run_limit,
+            crate::ResourceLimits::DEFAULT.live_event_bytes,
+        )
+    }
+
+    pub(crate) fn with_resources(resources: crate::ResourceLimits) -> Self {
+        Self::with_event_limits(
+            resources.hot_output_bytes,
+            resources.run_output_bytes,
+            resources.live_event_bytes,
+        )
+    }
+
+    pub(crate) fn event_budget(&self) -> crate::resources::ByteBudget {
+        self.inner.event_budget.clone()
+    }
+
+    fn with_event_limits(limit: u64, per_run_limit: usize, event_bytes: u64) -> Self {
         Self {
             inner: Arc::new(Inner {
                 limit,
+                per_run_limit,
+                event_budget: crate::resources::ByteBudget::new(event_bytes),
                 total: AtomicU64::new(0),
-                participants: Mutex::new(Vec::new()),
+                participants: Mutex::new(HashMap::new()),
                 reclaiming: Mutex::new(()),
             }),
         }
@@ -234,7 +137,6 @@ impl RetentionBudget {
 
     /// Current retained total across all participants. Test-only observability
     /// for the aggregate-bound assertions.
-    #[cfg(test)]
     pub(crate) fn retained_total(&self) -> u64 {
         self.inner.total.load(Ordering::Acquire)
     }
@@ -262,8 +164,7 @@ impl RetentionBudget {
     /// participant list stays proportional to live Runs without a sweeper.
     pub(crate) fn register(&self, victim: &Arc<dyn RetentionVictim + Send + Sync>) {
         let mut participants = lock(&self.inner.participants);
-        participants.retain(|weak| weak.strong_count() > 0);
-        participants.push(Arc::downgrade(victim));
+        participants.insert(victim.run_id(), Arc::downgrade(victim));
     }
 
     /// Bring `total` back to at or below `limit` by trimming oldest bytes from
@@ -273,9 +174,50 @@ impl RetentionBudget {
     ///
     /// Fast path is a single atomic load. The scan runs only over budget and is
     /// single-flighted; see the module docs for the lock discipline it obeys.
+    pub(crate) fn unregister(&self, id: RunId) {
+        lock(&self.inner.participants).remove(&id);
+    }
+
+    pub(crate) fn available_for_read(
+        &self,
+        except: RunId,
+        wanted: usize,
+        own_reclaimable: usize,
+    ) -> usize {
+        // Admission checks funding without evicting anything. EOF, EIO or an
+        // interrupted read adds no bytes and must not discard existing history.
+        // The one native reader records an actual read, then reclaims its exact
+        // cost. Its fixed read buffer bounds the transient overlap.
+        let wanted = (wanted as u64).min(self.inner.limit);
+        let mut available = self
+            .inner
+            .limit
+            .saturating_sub(self.retained_total())
+            .saturating_add(own_reclaimable as u64);
+        if available < wanted {
+            let victims: Vec<_> = lock(&self.inner.participants)
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for victim in victims {
+                if victim.run_id() != except {
+                    available = available.saturating_add(victim.reclaimable_output_bytes() as u64);
+                }
+                if available >= wanted {
+                    break;
+                }
+            }
+        }
+        usize::try_from(available.min(wanted)).unwrap_or(usize::MAX)
+    }
+
     pub(crate) fn reclaim_excess(&self, except: RunId) {
+        self.reclaim_to(except, self.inner.limit);
+    }
+
+    fn reclaim_to(&self, except: RunId, target: u64) {
         // Cheap fast path: the common case is under budget, one relaxed load.
-        if self.inner.total.load(Ordering::Acquire) <= self.inner.limit {
+        if self.inner.total.load(Ordering::Acquire) <= target {
             return;
         }
         // Elect a single reclaimer. A loser returns immediately: the winner is
@@ -290,7 +232,7 @@ impl RetentionBudget {
             .inner
             .total
             .load(Ordering::Acquire)
-            .saturating_sub(self.inner.limit);
+            .saturating_sub(target);
         if over == 0 {
             return;
         }
@@ -300,8 +242,8 @@ impl RetentionBudget {
         // never while locking a victim's output.
         let mut victims: Vec<Arc<dyn RetentionVictim + Send + Sync>> = {
             let mut participants = lock(&self.inner.participants);
-            participants.retain(|weak| weak.strong_count() > 0);
-            participants.iter().filter_map(Weak::upgrade).collect()
+            participants.retain(|_, weak| weak.strong_count() > 0);
+            participants.values().filter_map(Weak::upgrade).collect()
         };
 
         // Order victims: unattached before attached, then most-retained first,
@@ -339,10 +281,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use std::sync::Mutex;
 
-    use super::{
-        GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES, RETENTION_BUDGET_BYTES, RetentionBudget,
-        RetentionVictim,
-    };
+    use super::{RETENTION_BUDGET_BYTES, RetentionBudget, RetentionVictim};
     use ctxmux_protocol::RunId;
 
     /// A minimal victim: a deque of chunk sizes standing in for `OutputLog`
@@ -382,6 +321,10 @@ mod tests {
             self.retained()
         }
 
+        fn reclaimable_output_bytes(&self) -> usize {
+            self.retained()
+        }
+
         fn is_attached(&self) -> bool {
             self.attached
         }
@@ -389,11 +332,15 @@ mod tests {
         fn reclaim_output(&self, drop_at_least: usize) -> usize {
             let mut chunks = self.chunks.lock().unwrap();
             let mut freed = 0usize;
-            // Mirror OutputLog: keep at least one chunk so the log is never
-            // emptied below its final unit.
-            while freed < drop_at_least && chunks.len() > 1 {
+            while freed < drop_at_least {
                 if let Some(size) = chunks.pop_front() {
-                    freed += size;
+                    let shed = size.min(drop_at_least - freed);
+                    if shed < size {
+                        chunks.push_front(size - shed);
+                    }
+                    freed += shed;
+                } else {
+                    break;
                 }
             }
             self.budget.sub(freed);
@@ -408,37 +355,14 @@ mod tests {
     }
 
     #[test]
-    fn budget_clears_the_frozen_gate_peak() {
-        // The `const _` guard above enforces the ordering at compile time; this
-        // pins the concrete numbers so a reader sees the relationship the guard
-        // protects.
-        assert_eq!(RETENTION_BUDGET_BYTES, 1024 * 1024 * 1024);
+    fn configured_budget_can_be_below_a_frozen_fixture_peak() {
+        let budget = RetentionBudget::with_limits(4096, 512);
+        assert_eq!(budget.limit(), 4096);
+        assert_eq!(budget.per_run_limit(), 512);
         assert_eq!(
-            GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES,
-            136 * 4 * 1024 * 1024
+            RETENTION_BUDGET_BYTES,
+            crate::ResourceLimits::DEFAULT.hot_output_bytes
         );
-    }
-
-    #[test]
-    fn floor_tracks_the_frozen_gate_contract_not_a_local_literal() {
-        // The floor is a *read* figure, not a measured one: it must equal the
-        // value the reliability gate freezes, or the compile-time ordering guard
-        // is protecting a number that has quietly drifted from what the gate
-        // actually replays. Bind the literal to its single source of truth so
-        // the two cannot diverge without this test failing.
-        let contract: serde_json::Value =
-            serde_json::from_str(include_str!("../../../reliability-gc-contract.json"))
-                .expect("reliability-gc-contract.json parses");
-        let frozen = contract["replay_pressure"]["retained_plus_overlap_payload_bytes"]
-            .as_u64()
-            .expect("retained_plus_overlap_payload_bytes is a u64");
-        assert_eq!(
-            GATE_RETAINED_PLUS_OVERLAP_FLOOR_BYTES, frozen,
-            "the floor const drifted from the frozen gate contract"
-        );
-        // And the budget must clear that frozen peak (the guard, restated on the
-        // contract-sourced value rather than the local copy).
-        assert!(RETENTION_BUDGET_BYTES > frozen);
     }
 
     #[test]

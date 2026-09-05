@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use ctxmux_protocol::{DaemonInstanceId, RunId};
 
-use crate::{creation::HandoffStopOperation, native_control::HandoffInputState};
+use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::HandoffInputState};
 
 /// The manifest's **structural** contract, and nothing else.
 ///
@@ -48,7 +48,7 @@ use crate::{creation::HandoffStopOperation, native_control::HandoffInputState};
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v4";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v5";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -145,37 +145,8 @@ pub fn verify_exec_target(exe: &Path) -> Result<(), String> {
         )),
     }
 }
-// The only Run-count-multiplied payload in this manifest is recoverable Input:
-// each Run may retain up to INPUT_RESULT_MAX_REQUEST_BYTES (1 MiB) of request
-// bytes. Multiplying that by the Run count is exactly the bound that fails at
-// thousands of Runs (128 * 1 MiB was 128 MiB; 4000 would be ~4 GiB in one line
-// that must be serialized, written, and re-read across the exec). So the
-// aggregate carried across a handoff is a fixed daemon-wide total that every
-// retained Run shares, mirroring persistence.rs's GLOBAL_REPLAY_BYTES capping
-// PER_RUN_REPLAY_BYTES rather than summing it per Run. 128 MiB keeps the prior
-// 128-Run ceiling as the whole-daemon budget: below it nothing sheds, and above
-// it the newest handoffs shed their oldest idempotency results (a client that
-// re-sends a shed key is simply re-applied, fenced by the input cursor) until
-// the total fits. This does not grow with Run count.
-const MAX_HANDOFF_INPUT_REQUEST_BYTES: usize = 128 * 1024 * 1024;
-// The read ceiling bounds the whole inherited file. Its dominant term is the
-// aggregate Input payload above, base64-inflated 4/3 in JSON; the fixed 64 MiB
-// slack then covers the manifest's structural content: fd numbers, keys,
-// ranges, epoch, and the bounded per-Run diagnostics. That structural content
-// is still O(Runs) — every live Run contributes one irreducible descriptor set
-// that must cross the exec — but at a few hundred bytes per Run the slack
-// absorbs far beyond the thousands-of-Runs target. What this derivation removes
-// is the 1 MiB * Run-count *payload* term that produced ~8 GiB at 4000 Runs: the
-// dominant term is now a fixed aggregate, not a per-Run cap multiplied by count.
-const MAX_HANDOFF_MANIFEST_BYTES: u64 =
-    (MAX_HANDOFF_INPUT_REQUEST_BYTES as u64) * 4 / 3 + 64 * 1024 * 1024;
-// Stop results carry no request payload; only an Unknown outcome retains a
-// bounded diagnostic (HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES, 4 KiB per item). The
-// old check bounded their *count* by the Run cap; the byte-equivalent daemon
-// budget is a fixed 16 MiB total that every Run shares, which does not grow
-// with Run count and stays well within the manifest's structural allowance.
-const MAX_HANDOFF_STOP_DIAGNOSTIC_BYTES: usize = 16 * 1024 * 1024;
-
+// Upgrade budgets belong to the runtime policy. Complete settled receipts cross
+// the same-incarnation boundary; exceeding a budget must abort before extraction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HandoffManifest {
     pub schema: String,
@@ -184,6 +155,14 @@ pub struct HandoffManifest {
     pub state_lock_fd: RawFd,
     pub runs: Vec<HandoffRun>,
     pub stop_operations: Vec<HandoffStopOperation>,
+    pub closed_inputs: Vec<HandoffClosedInput>,
+    pub resources: ResourceLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffClosedInput {
+    pub run_id: RunId,
+    pub input_state: HandoffInputState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,30 +190,44 @@ impl HandoffManifest {
         runs: Vec<HandoffRun>,
         stop_operations: Vec<HandoffStopOperation>,
     ) -> Self {
-        let mut manifest = Self {
+        Self::configured(
+            epoch,
+            listener_fd,
+            state_lock_fd,
+            runs,
+            stop_operations,
+            Vec::new(),
+            ResourceLimits::default(),
+        )
+    }
+
+    pub(crate) fn configured(
+        epoch: String,
+        listener_fd: RawFd,
+        state_lock_fd: RawFd,
+        runs: Vec<HandoffRun>,
+        stop_operations: Vec<HandoffStopOperation>,
+        closed_inputs: Vec<HandoffClosedInput>,
+        resources: ResourceLimits,
+    ) -> Self {
+        Self {
             schema: HANDOFF_SCHEMA.to_string(),
             epoch,
             listener_fd,
             state_lock_fd,
             runs,
             stop_operations,
-        };
-        // Enforce the daemon-wide aggregate at construction, not merely at read
-        // time: a daemon running thousands of Runs would otherwise serialize a
-        // manifest it cannot re-read. Shedding here keeps the produced manifest
-        // inside the bound by construction; validate() then re-checks it so a
-        // corrupt inherited file still fails closed.
-        manifest.shed_recoverable_input_to_budget(MAX_HANDOFF_INPUT_REQUEST_BYTES);
-        manifest.shed_stop_diagnostics_to_budget(MAX_HANDOFF_STOP_DIAGNOSTIC_BYTES);
-        manifest
+            closed_inputs,
+            resources,
+        }
     }
 
     /// Total recoverable-Input request bytes across every retained Run. This is
     /// the only payload in the manifest that scales with both Run count and a
     /// 1 MiB per-Run cap, so it is the term the aggregate budget governs.
     fn retained_input_request_bytes(&self) -> usize {
-        self.runs.iter().fold(0, |sum, run| {
-            sum.saturating_add(run.input_state.retained_request_bytes())
+        self.input_states().fold(0, |sum, state| {
+            sum.saturating_add(state.retained_request_bytes())
         })
     }
 
@@ -246,39 +239,30 @@ impl HandoffManifest {
             .fold(0, |sum, op| sum.saturating_add(op.diagnostic_bytes()))
     }
 
-    /// Shed the oldest retained Input results, Run by Run, until the daemon-wide
-    /// total fits `budget`. A shed result is only an idempotency cache entry: a
-    /// client that re-sends its key after the exec is re-applied under the same
-    /// incarnation-fenced Input cursor, so shedding reduces what the handoff
-    /// carries without ever corrupting Input state. Parameterized by `budget` so
-    /// tests exercise it without allocating [`MAX_HANDOFF_INPUT_REQUEST_BYTES`].
-    fn shed_recoverable_input_to_budget(&mut self, budget: usize) {
-        let mut total = self.retained_input_request_bytes();
-        for run in &mut self.runs {
-            if total <= budget {
-                break;
-            }
-            while total > budget {
-                let freed = run.input_state.shed_oldest_operation();
-                if freed == 0 {
-                    break;
-                }
-                total = total.saturating_sub(freed);
-            }
-        }
+    fn input_states(&self) -> impl Iterator<Item = &HandoffInputState> {
+        self.runs
+            .iter()
+            .map(|run| &run.input_state)
+            .chain(self.closed_inputs.iter().map(|run| &run.input_state))
     }
 
-    /// Shed the oldest settled Stop results until their aggregate diagnostic
-    /// bytes fit `budget`. The Stop ledger is a best-effort same-incarnation
-    /// idempotency cache (cold restart never loads it), and Stop is idempotent by
-    /// disposition, so dropping the oldest entry only shrinks that cache rather
-    /// than losing required truth.
-    fn shed_stop_diagnostics_to_budget(&mut self, budget: usize) {
-        let mut total = self.stop_diagnostic_bytes();
-        while total > budget && !self.stop_operations.is_empty() {
-            let freed = self.stop_operations.remove(0).diagnostic_bytes();
-            total = total.saturating_sub(freed);
-        }
+    /// Serialize and validate while all native owners still retain authority.
+    pub(crate) fn write_preflight(&self, file: &mut std::fs::File) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        self.validate(file.as_raw_fd())?;
+        file.set_len(0)?;
+        file.rewind()?;
+        // The byte-limited writer refuses before growing a file that the next
+        // image could not read. No retained result is removed to fit the budget.
+        let mut writer = BoundedWriter {
+            inner: file,
+            remaining: self.resources.handoff_bytes,
+        };
+        serde_json::to_writer(&mut writer, self).map_err(std::io::Error::other)?;
+        writer.write_all(b"\n")?;
+        writer.inner.flush()?;
+        writer.inner.rewind()?;
+        Ok(())
     }
 
     /// Every fd number this manifest expects to survive the exec: the process
@@ -290,6 +274,9 @@ impl HandoffManifest {
     }
 
     fn validate(&self, manifest_fd: RawFd) -> std::io::Result<()> {
+        self.resources
+            .validate()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.epoch.parse::<DaemonInstanceId>().map_err(|error| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -300,20 +287,22 @@ impl HandoffManifest {
         // exec is the daemon-wide recoverable-Input total and the Stop-diagnostic
         // total, each shared by every retained Run rather than multiplied by it.
         let input_bytes = self.retained_input_request_bytes();
-        if input_bytes > MAX_HANDOFF_INPUT_REQUEST_BYTES {
+        if input_bytes > self.resources.handoff_input_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "handoff retains {input_bytes} recoverable Input request bytes; maximum is {MAX_HANDOFF_INPUT_REQUEST_BYTES}"
+                    "handoff retains {input_bytes} recoverable Input request bytes; maximum is {}",
+                    self.resources.handoff_input_bytes
                 ),
             ));
         }
         let stop_diagnostic_bytes = self.stop_diagnostic_bytes();
-        if stop_diagnostic_bytes > MAX_HANDOFF_STOP_DIAGNOSTIC_BYTES {
+        if stop_diagnostic_bytes > self.resources.handoff_diagnostic_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "handoff retains {stop_diagnostic_bytes} native Stop diagnostic bytes; maximum is {MAX_HANDOFF_STOP_DIAGNOSTIC_BYTES}"
+                    "handoff retains {stop_diagnostic_bytes} native Stop diagnostic bytes; maximum is {}",
+                    self.resources.handoff_diagnostic_bytes
                 ),
             ));
         }
@@ -335,8 +324,36 @@ impl HandoffManifest {
                 ));
             }
             run.input_state
-                .validate()
+                .validate_with_resources(self.resources)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        for run in &self.closed_inputs {
+            if !run_ids.insert(run.run_id) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "handoff closed Input Runs must be unique and separate from live Runs",
+                ));
+            }
+            run.input_state
+                .validate_with_resources(self.resources)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        }
+        let control_bytes = self
+            .input_states()
+            .fold(0_u64, |total, state| {
+                total.saturating_add(state.control_memory_bytes())
+            })
+            .saturating_add(
+                self.stop_operations
+                    .iter()
+                    .map(HandoffStopOperation::control_memory_bytes)
+                    .sum::<u64>(),
+            );
+        if control_bytes > self.resources.control_state_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "handoff control state exceeds the preserved runtime policy",
+            ));
         }
         let mut stop_runs = HashSet::new();
         let mut stop_keys = HashSet::new();
@@ -369,24 +386,27 @@ impl HandoffManifest {
 /// Returns an error if the descriptor cannot be read or the content is not a
 /// current-schema manifest.
 pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
-    use std::io::Read;
+    read_manifest_with_limit(fd, ResourceLimits::DEFAULT.handoff_bytes)
+}
 
+pub(crate) fn read_manifest_with_limit(
+    fd: OwnedFd,
+    limit: u64,
+) -> std::io::Result<HandoffManifest> {
+    use std::io::Read;
     let manifest_fd = fd.as_raw_fd();
     let mut file = std::fs::File::from(fd);
     let mut buf = Vec::new();
     file.by_ref()
-        .take(MAX_HANDOFF_MANIFEST_BYTES + 1)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut buf)?;
-    if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_HANDOFF_MANIFEST_BYTES {
+    if buf.len() as u64 > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "handoff manifest exceeds its bounded size",
+            "handoff manifest exceeds the preserved byte budget",
         ));
     }
-    // `split` always yields at least one slice, so an empty buffer becomes an
-    // empty first line that fails the parse below — a fail-closed InvalidData.
-    let line = buf.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let manifest: HandoffManifest = serde_json::from_slice(line)
+    let manifest: HandoffManifest = serde_json::from_slice(&buf)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     if manifest.schema != HANDOFF_SCHEMA {
         return Err(std::io::Error::new(
@@ -395,7 +415,33 @@ pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
         ));
     }
     manifest.validate(manifest_fd)?;
+    if buf.len() as u64 > manifest.resources.handoff_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "handoff exceeds its own runtime policy",
+        ));
+    }
     Ok(manifest)
+}
+
+struct BoundedWriter<'a> {
+    inner: &'a mut std::fs::File,
+    remaining: u64,
+}
+impl std::io::Write for BoundedWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if data.len() as u64 > self.remaining {
+            return Err(std::io::Error::other(
+                "handoff exceeds handoff_bytes; upgrade remains reversible",
+            ));
+        }
+        let written = std::io::Write::write(self.inner, data)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(self.inner)
+    }
 }
 
 #[cfg(test)]
@@ -537,7 +583,7 @@ mod tests {
         );
 
         let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
-        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v4");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v5");
         assert_eq!(parsed.stop_operations, [operation]);
     }
 
@@ -652,6 +698,31 @@ mod tests {
         observed.dedup();
 
         let expected = [
+            ".closed_inputs:array",
+            ".resources:object",
+            ".resources.live_runs:null",
+            ".resources.retained_runs:null",
+            ".resources.hot_output_bytes:number",
+            ".resources.live_event_bytes:number",
+            ".resources.run_output_bytes:number",
+            ".resources.metadata_bytes:number",
+            ".resources.durable_replay_bytes:number",
+            ".resources.durable_run_output_bytes:number",
+            ".resources.database_bytes:number",
+            ".resources.wal_checkpoint_bytes:number",
+            ".resources.handoff_input_bytes:number",
+            ".resources.handoff_diagnostic_bytes:number",
+            ".resources.handoff_bytes:number",
+            ".resources.control_state_bytes:number",
+            ".resources.creation_workers:number",
+            ".resources.input_workers:number",
+            ".resources.cleanup_workers:number",
+            ".resources.finalize_workers:number",
+            ".resources.input_queue_commands:number",
+            ".resources.input_queue_bytes:number",
+            ".resources.input_result_entries:number",
+            ".resources.input_result_bytes:number",
+            ".resources.tmux_discovery_bytes:number",
             ".schema:string",
             ".epoch:string",
             ".listener_fd:number",
@@ -887,11 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_input_budget_does_not_scale_with_run_count() {
-        // Two Runs, each already at the per-Run 1 MiB cap, would pass every
-        // per-Run check yet exceed a fixed 1 MiB daemon budget between them. The
-        // manifest must shed down to the aggregate regardless of how the bytes
-        // are distributed across Runs.
+    fn upgrade_refuses_pressure_without_discarding_results() {
         let mut manifest = HandoffManifest::new(
             DaemonInstanceId::new().to_string(),
             100,
@@ -901,80 +968,29 @@ mod tests {
                 run_with_input("run-b", 103, &[600, 600]),
             ],
         );
+        manifest.resources.handoff_input_bytes = 1000;
+        let original = manifest.clone();
+        let mut file = tempfile::tempfile().unwrap();
+        assert!(manifest.write_preflight(&mut file).is_err());
+        assert_eq!(manifest, original);
         assert_eq!(manifest.retained_input_request_bytes(), 2400);
-
-        // Budget below the total: the oldest results shed Run by Run until the
-        // daemon-wide sum fits, and the survivors are still a valid ledger.
-        manifest.shed_recoverable_input_to_budget(1000);
-        assert!(manifest.retained_input_request_bytes() <= 1000);
-        manifest.validate(99).expect("shed ledger stays valid");
+        manifest.resources.handoff_input_bytes = 2400;
+        manifest.resources.handoff_bytes = 32;
+        assert!(manifest.write_preflight(&mut file).is_err());
+        manifest.resources.handoff_bytes = 64 * 1024;
+        manifest.write_preflight(&mut file).unwrap();
+        let parsed = read_manifest(file.into()).unwrap();
+        assert_eq!(parsed, manifest);
     }
 
     #[test]
-    fn construction_sheds_recoverable_input_to_the_daemon_budget() {
-        // Enforced at construction, not merely asserted at read time. Driving the
-        // real 128 MiB constant would need a 128 MiB allocation, so this checks
-        // the observable invariant the constructor guarantees: whatever the input
-        // distribution, the built manifest never exceeds the aggregate budget.
-        // The dedicated budget-shedding coverage above uses a small budget; here
-        // we confirm the production constructor path applies that shedding.
-        let manifest = HandoffManifest::new(
-            DaemonInstanceId::new().to_string(),
-            100,
-            101,
-            vec![
-                run_with_input("run-a", 102, &[4096, 4096]),
-                run_with_input("run-b", 103, &[4096]),
-            ],
-        );
-        assert!(manifest.retained_input_request_bytes() <= MAX_HANDOFF_INPUT_REQUEST_BYTES);
-        // Well under the budget, so nothing sheds and the ledger survives intact.
-        assert_eq!(manifest.retained_input_request_bytes(), 12288);
-        manifest
-            .validate(99)
-            .expect("constructed manifest is valid");
-    }
-
-    #[test]
-    fn validate_rejects_an_input_total_over_the_aggregate() {
-        // A corrupt inherited file that bypasses construction-time shedding must
-        // still fail closed at read time.
-        let mut manifest = HandoffManifest::new(
-            DaemonInstanceId::new().to_string(),
-            100,
-            101,
-            vec![run_with_input("run-a", 102, &[8])],
-        );
-        manifest.runs[0].input_state = HandoffInputState {
-            applied_input_bytes: (MAX_HANDOFF_INPUT_REQUEST_BYTES + 1) as u64,
-            input_failure: None,
-            operations: vec![HandoffInputOperation::Completed {
-                key: InputOperationKey::new("oversized").unwrap(),
-                expected_byte: 0,
-                data: vec![b'x'; MAX_HANDOFF_INPUT_REQUEST_BYTES + 1],
-                range: AppliedInputRange {
-                    start_byte: 0,
-                    end_byte: (MAX_HANDOFF_INPUT_REQUEST_BYTES + 1) as u64,
-                },
-            }],
-        };
-        let error = manifest.validate(99).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            error
-                .to_string()
-                .contains("recoverable Input request bytes")
-        );
-    }
-
-    #[test]
-    fn stop_diagnostic_budget_sheds_oldest_and_validate_enforces_it() {
-        let unknown_stop = |key: &str, message: &str| HandoffStopOperation {
+    fn upgrade_never_sheds_unknown_stop_results() {
+        let operation = HandoffStopOperation {
             run_id: RunId::new(),
-            operation_key: StopOperationKey::new(key).unwrap(),
+            operation_key: StopOperationKey::new("stop-a").unwrap(),
             outcome: HandoffStopOutcome::Unknown {
                 failure: ctxmux_protocol::ControlFailure {
-                    error: ProtocolError::new(ErrorCode::Io, message.to_owned()),
+                    error: ProtocolError::new(ErrorCode::Io, "diagnostic"),
                     disposition: ctxmux_protocol::CommandDisposition::Unknown,
                 },
             },
@@ -984,23 +1000,13 @@ mod tests {
             100,
             101,
             Vec::new(),
-            vec![unknown_stop("stop-a", "aaaa"), unknown_stop("stop-b", "bb")],
+            vec![operation.clone()],
         );
-        assert_eq!(manifest.stop_diagnostic_bytes(), 6);
-
-        // A budget below the total sheds the oldest entry first.
-        manifest.shed_stop_diagnostics_to_budget(3);
-        assert_eq!(manifest.stop_operations.len(), 1);
-        assert_eq!(manifest.stop_operations[0].operation_key.as_str(), "stop-b");
-        manifest.validate(99).expect("shed Stop ledger stays valid");
-
-        // Read-time enforcement of a total past the aggregate ceiling.
-        manifest.stop_operations = vec![unknown_stop(
-            "stop-big",
-            &"z".repeat(MAX_HANDOFF_STOP_DIAGNOSTIC_BYTES + 1),
-        )];
-        let error = manifest.validate(99).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
-        assert!(error.to_string().contains("Stop diagnostic bytes"));
+        manifest.resources.handoff_diagnostic_bytes = 3;
+        let mut file = tempfile::tempfile().unwrap();
+        assert!(manifest.write_preflight(&mut file).is_err());
+        assert_eq!(manifest.stop_operations, [operation]);
+        manifest.resources.handoff_diagnostic_bytes = 64;
+        manifest.write_preflight(&mut file).unwrap();
     }
 }

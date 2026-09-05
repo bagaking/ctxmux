@@ -845,3 +845,202 @@ function delay(milliseconds: number): Promise<void> {
     setTimeout(resolvePromise, milliseconds),
   );
 }
+
+test(
+  "resource policy applies before effects and releases live slots without deleting history",
+  { timeout: scaled(20_000) },
+  async (context) => {
+    const directory = await temporaryDirectory(context, "ctxmux-policy-");
+    let activation: RuntimeActivation | undefined;
+    context.after(async () => shutdownOwned(activation));
+    activation = await activateRuntime({
+      executable: daemonBinary,
+      socketPath: join(directory, "sock"),
+      resourceLimits: { live_runs: 2, creation_workers: 2 },
+      env: { CTXMUX_RESOURCE_LIMITS: '{"live_runs":1}' },
+      timeoutMs: scaled(5_000),
+    });
+    const client = activation.client;
+    const spec = defineRun("/bin/sh", {
+      args: ["-c", "sleep 60"],
+      cwd: directory,
+    });
+    const first = await client.start(spec);
+    const second = await client.start(spec);
+    await assert.rejects(
+      client.start(spec),
+      (error: unknown) => (error as { code?: string }).code === "run_capacity",
+    );
+    await client.stop(await client.prepareStop(first.id));
+    const third = await client.start(spec);
+    assert.notEqual(third.id, first.id);
+    const history = await client.list();
+    assert.deepEqual(
+      new Set(history.map((run) => run.id)),
+      new Set([first.id, second.id, third.id]),
+    );
+    assert.notEqual((await client.status(first.id)).state.type, "running");
+  },
+);
+
+test(
+  "small hot cache preserves complete durable replay across cold restart",
+  { timeout: scaled(30_000) },
+  async (context) => {
+    const directory = await temporaryDirectory(context, "ctxmux-small-cache-");
+    const socketPath = join(directory, "sock");
+    const stateDir = join(directory, "state");
+    const resourceLimits = {
+      hot_output_bytes: 64 * 1024,
+      run_output_bytes: 64 * 1024,
+    };
+    let activation: RuntimeActivation | undefined;
+    context.after(async () => shutdownOwned(activation));
+    activation = await activateRuntime({
+      executable: daemonBinary,
+      socketPath,
+      stateDir,
+      resourceLimits,
+      timeoutMs: scaled(5_000),
+    });
+    const expected = Buffer.from("0123456789abcdef".repeat(16 * 1024));
+    const run = await activation.client.start(
+      defineRun(process.execPath, {
+        args: [
+          "-e",
+          'process.stdout.write("0123456789abcdef".repeat(16*1024))',
+        ],
+        cwd: directory,
+      }),
+    );
+    const deadline = Date.now() + scaled(10_000);
+    while (true) {
+      const info = await activation.client.status(run.id);
+      if (
+        info.state.type !== "running" &&
+        info.durable_output_bytes === expected.length
+      ) {
+        assert.ok(
+          (await activation.client.list()).find((value) => value.id === run.id)!
+            .retained_output_bytes <= resourceLimits.hot_output_bytes,
+        );
+        break;
+      }
+      assert.ok(
+        Date.now() < deadline,
+        "finite output drains under a small cache",
+      );
+      await delay(10);
+    }
+    for (let incarnation = 0; incarnation < 2; incarnation++) {
+      const attached: Attachment = await activation.client.attach(run.id);
+      const replay = Buffer.concat(
+        attached.snapshot.replay.chunks.map((chunk) => Buffer.from(chunk.data)),
+      );
+      assert.equal(attached.snapshot.replay.truncated, false);
+      assert.equal(attached.snapshot.replay.first_available_byte, 0);
+      assert.deepEqual(replay, expected);
+      attached.close();
+      if (incarnation === 0) {
+        await activation.shutdown();
+        activation = await activateRuntime({
+          executable: daemonBinary,
+          socketPath,
+          stateDir,
+          resourceLimits,
+          timeoutMs: scaled(5_000),
+        });
+        const recovered = await activation.client.status(run.id);
+        assert.equal(recovered.latest_output_bytes, expected.length);
+        assert.ok(
+          (await activation.client.list()).find((value) => value.id === run.id)!
+            .retained_output_bytes <= resourceLimits.hot_output_bytes,
+        );
+      }
+    }
+  },
+);
+
+test("invalid resource policy fails before creating a Runtime directory", async (context) => {
+  const directory = await temporaryDirectory(context, "ctxmux-invalid-policy-");
+  const stateDir = join(directory, "never-created");
+  await assert.rejects(
+    activateRuntime({
+      executable: daemonBinary,
+      socketPath: join(directory, "sock"),
+      stateDir,
+      resourceLimits: { database_bytes: 4097 },
+    }),
+    TypeError,
+  );
+  await assert.rejects(lstat(stateDir), { code: "ENOENT" });
+});
+
+test(
+  "fully evicted history attaches as an explicit empty window before and after cold restart",
+  { timeout: scaled(20_000) },
+  async (context) => {
+    const directory = await temporaryDirectory(context, "ctxmux-empty-window-");
+    const socketPath = join(directory, "sock");
+    const stateDir = join(directory, "state");
+    const resourceLimits = {
+      hot_output_bytes: 1,
+      run_output_bytes: 1,
+      durable_replay_bytes: 1,
+    };
+    let activation: RuntimeActivation | undefined;
+    context.after(async () => shutdownOwned(activation));
+    activation = await activateRuntime({
+      executable: daemonBinary,
+      socketPath,
+      stateDir,
+      resourceLimits,
+      timeoutMs: scaled(5_000),
+    });
+    const run = await activation.client.start(
+      defineRun(process.execPath, {
+        args: ["-e", 'process.stdout.write("abcdef")'],
+        cwd: directory,
+      }),
+    );
+    async function completed(id: string, bytes: number): Promise<void> {
+      const deadline = Date.now() + scaled(5_000);
+      while (true) {
+        const info = await activation!.client.status(id);
+        if (
+          info.state.type !== "running" &&
+          info.durable_output_bytes === bytes
+        )
+          return;
+        assert.ok(Date.now() < deadline);
+        await delay(10);
+      }
+    }
+    await completed(run.id, 6);
+    const newer = await activation.client.start(
+      defineRun(process.execPath, {
+        args: ["-e", 'process.stdout.write("z")'],
+        cwd: directory,
+      }),
+    );
+    await completed(newer.id, 1);
+    for (let incarnation = 0; incarnation < 2; incarnation++) {
+      const attachment: Attachment = await activation.client.attach(run.id);
+      assert.equal(attachment.snapshot.replay.latest_output_bytes, 6);
+      assert.equal(attachment.snapshot.replay.first_available_byte, 6);
+      assert.equal(attachment.snapshot.replay.truncated, true);
+      assert.deepEqual(attachment.snapshot.replay.chunks, []);
+      attachment.close();
+      if (incarnation === 0) {
+        await activation.shutdown();
+        activation = await activateRuntime({
+          executable: daemonBinary,
+          socketPath,
+          stateDir,
+          resourceLimits,
+          timeoutMs: scaled(5_000),
+        });
+      }
+    }
+  },
+);

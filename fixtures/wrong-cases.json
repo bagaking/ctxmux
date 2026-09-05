@@ -585,11 +585,11 @@
       "choice": "009-runtime-persistence-recovery",
       "source_ids": ["i03"],
       "source_refs": ["https://www.sqlite.org/atomiccommit.html"],
-      "failure_mechanism": "A crash exposes a parseable mixture of two persistent generations.",
-      "invariant": "Recovery selects one complete generation or reports typed corruption.",
+      "failure_mechanism": "Recovery confuses an inconsistent replay index with a valid partially committed generation migration.",
+      "invariant": "Recovery exposes exact SQLite-committed replay coordinates across every referenced generation, or reports a typed integrity failure.",
       "preconditions": "A stopped SQLite store contains a parseable Run row and replay window.",
-      "action": "Create a cursor/chunk mixed generation that SQLite accepts, then restart through the public daemon entrypoint.",
-      "oracle": "Startup returns typed corruption before publishing the socket or exposing any Run.",
+      "action": "Exercise inconsistent coordinates and crash or lose a COMMIT response during valid packed generation migration, then restart.",
+      "oracle": "Inconsistent coordinates fail before socket publication; valid interrupted migration resumes with byte-exact replay, and unknown COMMIT fences serving writes.",
       "platform": ["unix"],
       "tags": ["persistence", "atomicity", "crash", "corruption"],
       "disposition": "active",
@@ -597,6 +597,18 @@
         {
           "path": "crates/ctxmux-daemon/tests/persistence_recovery.rs",
           "anchor": "corrupt_replay_generation_fails_closed_without_partial_run_exposure"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "replay_compaction_of_many_small_extents_preserves_wal_and_recovery"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "interrupted_compaction_preserves_fragmented_extents_across_generations"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "uncertain_compaction_commit_latches_even_when_error_looks_like_disk_full"
         }
       ]
     },
@@ -809,11 +821,11 @@
       "source_refs": [
         "https://github.com/tmux/tmux/commit/800837ff3f21799281525af3d8537f362e5cb43e"
       ],
-      "failure_mechanism": "Transferred from l03: queued pane output races Control Mode detach or teardown and leaves dangling adapter ownership. Ctxmux-local regression extension, not derived from l03: a terminal imported Run retains its dead Control writer and creates a per-terminal descriptor slope.",
+      "failure_mechanism": "Transferred from l03: queued pane output races Control Mode detach or teardown and leaves dangling adapter ownership. Ctxmux-local regression extension, not derived from l03: a terminal imported Run retains its dead Control writer and creates a per-terminal descriptor slope. Linux owner extension: a Control helper descendant can outlive its direct parent and become an unreaped daemon-adopted zombie; EOF alone can misclassify intact or changed target identity.",
       "invariant": "Queued detach settles once with exact queued replay; successful EOF cleanup releases Control stdin and stdout reader descriptors, reaps the Control process, and has no per-terminal slope while terminal history and tmux pane ownership remain.",
       "preconditions": "For the transferred l03 failure, a real tmux pane is imported through a required qualified-version lane. For the ctxmux-local regression extension, a deterministic fake Control client and an independent pane process sentinel support repeated successful import and EOF cleanup in one daemon.",
       "action": "Against real tmux, detach while pane output and Control Mode notifications remain queued and recover exact output by cursor. Against fake Control, repeat public import and EOF interruption while retaining terminal Runs and counting daemon descriptors.",
-      "oracle": "The real-session detach settles without crash, exact queued replay survives, and tmux ownership remains. Every qualified fake-Control cleanup retains historical status and terminal attach behavior, leaves the independent pane sentinel alive, and returns daemon descriptors exactly to baseline.",
+      "oracle": "The real-session detach settles without crash, exact queued replay survives, and tmux ownership remains. Every qualified fake-Control cleanup retains historical status and terminal attach behavior, leaves the independent pane sentinel alive, and returns daemon descriptors exactly to baseline. Exact Control helper-group descendants disappear including zombies; full target identity is checked after ready-client loss without killing the external pane.",
       "platform": ["unix"],
       "tags": ["tmux", "detach", "teardown", "ownership", "fd", "terminal"],
       "disposition": "active",
@@ -829,6 +841,18 @@
         {
           "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
           "anchor": "terminal_tmux_runs_release_control_writers_without_a_daemon_fd_slope"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "natural_control_loss_checks_the_full_target_identity"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "missing_tmux_socket_does_not_claim_identity_replacement"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "control_owner_reaps_its_orphaned_group_without_killing_the_pane"
         }
       ]
     },
@@ -876,6 +900,10 @@
         {
           "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
           "anchor": "oversized_discovery_output_fails_explicitly_without_publication"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/tmux_adapter.rs",
+          "anchor": "unavailable_control_loss_probe_is_bounded_and_reaped"
         }
       ]
     },
@@ -1133,6 +1161,48 @@
         {
           "path": "crates/ctxmux-daemon/tests/remote_owner_host_endpoint.rs",
           "anchor": "output_written_while_disconnected_replays_from_the_caller_cursor"
+        }
+      ]
+    },
+    {
+      "id": "RESOURCE-001",
+      "choice": "019-resource-policy-and-honest-qualification",
+      "source_ids": ["i03"],
+      "source_refs": ["https://www.sqlite.org/atomiccommit.html"],
+      "failure_mechanism": "Ctxmux-local regression extension to SQLite committed-state authority: fixture fleet sizes become production population or format ceilings, rejecting or evicting otherwise valid committed history.",
+      "invariant": "Resource policy is independent of qualification tiers; valid committed history above old population caps survives cold recovery, and invalid policy fails before owner effects.",
+      "preconditions": "A valid schema-5 store holds 5,003 terminal Runs within byte funding; public activation can supply independent live and retained policies.",
+      "action": "Cold-reopen the held-out store, inspect all IDs and states, exercise public live-slot release without history deletion, and reject invalid page policy before Runtime creation.",
+      "oracle": "All 5,003 committed IDs and terminal states survive unchanged; live-slot reuse preserves history; invalid policy leaves no new Runtime owner or directory. This is a regression workload, not a new production capacity target.",
+      "platform": ["unix", "node"],
+      "tags": [
+        "resource-policy",
+        "recovery",
+        "population",
+        "holdout",
+        "admission"
+      ],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "valid_history_above_old_record_caps_survives_cold_recovery"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/resources.rs",
+          "anchor": "population_is_not_bound_to_a_qualification_tier"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/resources.rs",
+          "anchor": "invalid_policy_fails_before_owner_creation"
+        },
+        {
+          "path": "packages/sdk/test/activation.test.ts",
+          "anchor": "resource policy applies before effects and releases live slots without deleting history"
+        },
+        {
+          "path": "packages/sdk/test/activation.test.ts",
+          "anchor": "invalid resource policy fails before creating a Runtime directory"
         }
       ]
     }

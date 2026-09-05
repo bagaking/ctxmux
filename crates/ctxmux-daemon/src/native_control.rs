@@ -22,12 +22,12 @@ use crate::adopted_pty::AdoptedMasterPty;
 use crate::native_runtime::OwnerWake;
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
-const INPUT_QUEUE_MAX_COMMANDS: usize = 1_024;
-const INPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const INPUT_DRAIN_MAX_ACTIVE: usize = 8;
 const INPUT_BURST_MAX_COMMANDS: usize = 64;
 const INPUT_BURST_MAX_BYTES: usize = 256 * 1024;
+#[cfg(test)]
 const INPUT_RESULT_MAX_ENTRIES: usize = 256;
+#[cfg(test)]
 const INPUT_RESULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub(crate) const HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1024;
 const STOP_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
@@ -98,6 +98,8 @@ pub(crate) struct InputDrainGate {
 }
 
 struct InputDrainGateInner {
+    control_budget: crate::resources::ByteBudget,
+    resources: crate::ResourceLimits,
     state: Mutex<InputDrainGateState>,
     max_active: usize,
     burst_max_commands: usize,
@@ -121,7 +123,41 @@ impl Default for InputDrainGate {
     }
 }
 
+pub(crate) const fn resident_control_owner_bytes() -> usize {
+    std::mem::size_of::<NativeControlInner>()
+}
+
 impl InputDrainGate {
+    pub(crate) fn with_stats_and_resources(
+        stats: QualificationStats,
+        resources: crate::ResourceLimits,
+    ) -> Self {
+        Self::with_stats_resources_and_budget(
+            stats,
+            resources,
+            crate::resources::ByteBudget::new(resources.control_state_bytes),
+        )
+    }
+
+    pub(crate) fn with_stats_resources_and_budget(
+        stats: QualificationStats,
+        resources: crate::ResourceLimits,
+        budget: crate::resources::ByteBudget,
+    ) -> Self {
+        let mut gate = Self::with_stats(stats);
+        Arc::get_mut(&mut gate.inner)
+            .expect("new input gate has one owner")
+            .control_budget = budget;
+        let inner = Arc::get_mut(&mut gate.inner).expect("new gate has one owner");
+        inner.resources = resources;
+        inner.max_active = resources.input_workers;
+        gate
+    }
+
+    pub(crate) fn control_budget(&self) -> crate::resources::ByteBudget {
+        self.inner.control_budget.clone()
+    }
+
     pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
         Self::with_limits_and_stats(
             INPUT_DRAIN_MAX_ACTIVE,
@@ -151,6 +187,10 @@ impl InputDrainGate {
         debug_assert!(burst_max_bytes > 0);
         Self {
             inner: Arc::new(InputDrainGateInner {
+                control_budget: crate::resources::ByteBudget::new(
+                    crate::ResourceLimits::DEFAULT.control_state_bytes,
+                ),
+                resources: crate::ResourceLimits::DEFAULT,
                 state: Mutex::new(InputDrainGateState::default()),
                 max_active,
                 burst_max_commands,
@@ -321,6 +361,7 @@ enum ControlPhase {
 }
 
 struct InputCommand {
+    _memory: Option<crate::resources::BytePermit>,
     data: Arc<[u8]>,
     reply: InputReply,
 }
@@ -333,10 +374,25 @@ enum InputReply {
     },
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct InputOperationRequest {
+    memory: Option<Arc<crate::resources::BytePermit>>,
     expected_byte: u64,
     data: Arc<[u8]>,
+}
+
+impl PartialEq for InputOperationRequest {
+    fn eq(&self, other: &Self) -> bool {
+        self.expected_byte == other.expected_byte && self.data == other.data
+    }
+}
+impl Eq for InputOperationRequest {}
+
+fn input_receipt_charge(key: &InputOperationKey, data: &[u8]) -> usize {
+    data.len()
+        + key.as_str().len() * 2
+        + std::mem::size_of::<InputOperationEntry>()
+        + HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
 }
 
 enum InputOperationEntry {
@@ -393,10 +449,15 @@ impl HandoffInputState {
         }
     }
 
-    pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.operations.len() > INPUT_RESULT_MAX_ENTRIES {
+    pub(crate) fn validate_with_resources(
+        &self,
+        resources: crate::ResourceLimits,
+    ) -> Result<(), String> {
+        let max_entries = resources.input_result_entries;
+        let max_bytes = resources.input_result_bytes;
+        if self.operations.len() > max_entries {
             return Err(format!(
-                "handoff native Input ledger has {} entries; maximum is {INPUT_RESULT_MAX_ENTRIES}",
+                "handoff native Input ledger has {} entries; maximum is {max_entries}",
                 self.operations.len()
             ));
         }
@@ -479,9 +540,9 @@ impl HandoffInputState {
                 .checked_add(data.len())
                 .ok_or("handoff native Input retained-byte count overflows")?;
         }
-        if retained_bytes > INPUT_RESULT_MAX_REQUEST_BYTES {
+        if retained_bytes > max_bytes {
             return Err(format!(
-                "handoff native Input ledger retains {retained_bytes} request bytes; maximum is {INPUT_RESULT_MAX_REQUEST_BYTES}"
+                "handoff native Input ledger retains {retained_bytes} request bytes; maximum is {max_bytes}"
             ));
         }
         if unknown_count > 1 {
@@ -502,18 +563,14 @@ impl HandoffInputState {
             .fold(0, |sum, op| sum.saturating_add(op.request_len()))
     }
 
-    /// Drop the oldest retained operation, returning the request bytes it freed
-    /// (0 when the ledger is empty). Completed idempotency results are ordered
-    /// ahead of the single Unknown record, so the pure result cache is shed
-    /// before the poisoned-lane diagnostic. Every suffix of the operation order
-    /// is still a valid ledger under [`HandoffInputState::validate`] — dropping
-    /// the front only lowers `completed_end` for the survivors and leaves the
-    /// Unknown's cursor fence intact — so front-shedding never corrupts state.
-    pub(crate) fn shed_oldest_operation(&mut self) -> usize {
-        if self.operations.is_empty() {
-            return 0;
-        }
-        self.operations.remove(0).request_len()
+    pub(crate) fn control_memory_bytes(&self) -> u64 {
+        self.operations.iter().fold(0_u64, |total, operation| {
+            let (key, data) = match operation {
+                HandoffInputOperation::Completed { key, data, .. }
+                | HandoffInputOperation::Unknown { key, data, .. } => (key, data),
+            };
+            total.saturating_add(input_receipt_charge(key, data) as u64)
+        })
     }
 }
 
@@ -687,14 +744,15 @@ impl NativeControlOwner {
         owner_wake: OwnerWake,
         input_state: HandoffInputState,
     ) -> Self {
+        let limits = input_drains.inner.resources;
         Self::new_with_pty_and_input_state(
             run_id,
             Box::new(adopted),
             writer,
             input_drains,
             owner_wake,
-            INPUT_RESULT_MAX_ENTRIES,
-            INPUT_RESULT_MAX_REQUEST_BYTES,
+            limits.input_result_entries,
+            limits.input_result_bytes,
             input_state,
         )
     }
@@ -758,14 +816,15 @@ impl NativeControlOwner {
         input_drains: InputDrainGate,
         owner_wake: OwnerWake,
     ) -> Self {
+        let limits = input_drains.inner.resources;
         Self::new_with_pty_and_input_results(
             run_id,
             pty,
             writer,
             input_drains,
             owner_wake,
-            INPUT_RESULT_MAX_ENTRIES,
-            INPUT_RESULT_MAX_REQUEST_BYTES,
+            limits.input_result_entries,
+            limits.input_result_bytes,
         )
     }
 
@@ -801,14 +860,59 @@ impl NativeControlOwner {
         input_result_max_request_bytes: usize,
         input_state: HandoffInputState,
     ) -> Self {
+        Self::new_with_components(
+            run_id,
+            Some(pty),
+            Some(writer),
+            input_drains,
+            owner_wake,
+            input_result_max_entries,
+            input_result_max_request_bytes,
+            input_state,
+            false,
+        )
+    }
+
+    pub(crate) fn closed_with_input_state(
+        run_id: RunId,
+        input_state: HandoffInputState,
+        input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
+    ) -> Self {
+        let limits = input_drains.inner.resources;
+        Self::new_with_components(
+            run_id,
+            None,
+            None,
+            input_drains,
+            owner_wake,
+            limits.input_result_entries,
+            limits.input_result_bytes,
+            input_state,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_components(
+        run_id: RunId,
+        pty: Option<Box<dyn PtyControl>>,
+        writer: Option<Box<dyn Write + Send>>,
+        input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
+        input_result_max_entries: usize,
+        input_result_max_request_bytes: usize,
+        input_state: HandoffInputState,
+        closed: bool,
+    ) -> Self {
         debug_assert!(input_result_max_entries > 0);
         debug_assert!(input_result_max_request_bytes > 0);
         // Read the master before it moves into the mutex. A failure here is not
         // fatal: the Run is fully usable, it just has no confirmed size to
         // report until its first resize supplies one.
-        let pty_size = pty.get_size().ok();
+        let pty_size = pty.as_ref().and_then(|pty| pty.get_size().ok());
         input_state
-            .validate()
+            .validate_with_resources(input_drains.inner.resources)
             .expect("re-adopted native Input state is validated before construction");
         let retained_input_request_bytes = input_state
             .operations
@@ -832,6 +936,7 @@ impl NativeControlOwner {
                         key.clone(),
                         InputOperationEntry::Completed {
                             request: InputOperationRequest {
+                                memory: Some(Arc::new(input_drains.inner.control_budget.reserve(input_receipt_charge(&key, &data)).expect("handed-off control state was admitted by the same policy"))),
                                 expected_byte,
                                 data: Arc::from(data),
                             },
@@ -847,9 +952,10 @@ impl NativeControlOwner {
                     failure,
                 } => {
                     input_operations.insert(
-                        key,
+                        key.clone(),
                         InputOperationEntry::Unknown {
                             request: InputOperationRequest {
+                                memory: Some(Arc::new(input_drains.inner.control_budget.reserve(input_receipt_charge(&key, &data)).expect("handed-off control state was admitted by the same policy"))),
                                 expected_byte,
                                 data: Arc::from(data),
                             },
@@ -862,10 +968,14 @@ impl NativeControlOwner {
         Self {
             inner: Arc::new(NativeControlInner {
                 run_id,
-                pty: Mutex::new(Some(pty)),
-                writer: Mutex::new(Some(writer)),
+                pty: Mutex::new(pty),
+                writer: Mutex::new(writer),
                 state: Mutex::new(NativeControlState {
-                    phase: ControlPhase::Open,
+                    phase: if closed {
+                        ControlPhase::Closed
+                    } else {
+                        ControlPhase::Open
+                    },
                     // Ask the master what it actually opened rather than
                     // echoing the requested size back. The kernel is free to
                     // clamp, and the requested value already lives in the
@@ -883,13 +993,17 @@ impl NativeControlOwner {
                     retained_input_request_bytes,
                     input_result_max_entries,
                     input_result_max_request_bytes,
-                    child_open: true,
+                    child_open: !closed,
                     stop_pending: false,
                     child_commands: VecDeque::new(),
                 }),
-                reap: Mutex::new(ChildReapState::Pending {
-                    cleanup_error: None,
-                    wait_error: None,
+                reap: Mutex::new(if closed {
+                    ChildReapState::Reaped
+                } else {
+                    ChildReapState::Pending {
+                        cleanup_error: None,
+                        wait_error: None,
+                    }
                 }),
                 reap_changed: Condvar::new(),
                 input_drains,
@@ -911,8 +1025,15 @@ impl NativeControlOwner {
             if let Some(error) = &state.input_failure {
                 return Err(not_applied(error.clone()));
             }
-            if state.input_commands >= INPUT_QUEUE_MAX_COMMANDS
-                || data.len() > INPUT_QUEUE_MAX_BYTES.saturating_sub(state.input_bytes)
+            if state.input_commands >= self.inner.input_drains.inner.resources.input_queue_commands
+                || data.len()
+                    > self
+                        .inner
+                        .input_drains
+                        .inner
+                        .resources
+                        .input_queue_bytes
+                        .saturating_sub(state.input_bytes)
             {
                 return Err(not_applied(ProtocolError::new(
                     ErrorCode::ControlBackpressure,
@@ -923,10 +1044,23 @@ impl NativeControlOwner {
                 )));
             }
 
+            let memory = self
+                .inner
+                .input_drains
+                .inner
+                .control_budget
+                .reserve(data.len() + std::mem::size_of::<InputCommand>())
+                .ok_or_else(|| {
+                    not_applied(ProtocolError::new(
+                        ErrorCode::ControlBackpressure,
+                        "daemon input queue byte budget is full",
+                    ))
+                })?;
             let (reply_tx, reply_rx) = oneshot::channel();
             state.input_commands += 1;
             state.input_bytes += data.len();
             state.input_queue.push_back(InputCommand {
+                _memory: Some(memory),
                 data: Arc::from(data),
                 reply: InputReply::Legacy(reply_tx),
             });
@@ -946,6 +1080,10 @@ impl NativeControlOwner {
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "duplicate resolution and funded admission precede all PTY effects"
+    )]
     pub(crate) fn begin_recoverable_input(
         &self,
         key: InputOperationKey,
@@ -964,7 +1102,8 @@ impl NativeControlOwner {
                 "recoverable native Input must not be empty",
             )));
         }
-        let request = InputOperationRequest {
+        let mut request = InputOperationRequest {
+            memory: None,
             expected_byte,
             data: Arc::from(data),
         };
@@ -991,8 +1130,16 @@ impl NativeControlOwner {
                     > state
                         .input_result_max_request_bytes
                         .saturating_sub(state.retained_input_request_bytes)
-                || state.input_commands >= INPUT_QUEUE_MAX_COMMANDS
-                || request.data.len() > INPUT_QUEUE_MAX_BYTES.saturating_sub(state.input_bytes)
+                || state.input_commands
+                    >= self.inner.input_drains.inner.resources.input_queue_commands
+                || request.data.len()
+                    > self
+                        .inner
+                        .input_drains
+                        .inner
+                        .resources
+                        .input_queue_bytes
+                        .saturating_sub(state.input_bytes)
             {
                 return Err(not_applied(ProtocolError::new(
                     ErrorCode::ControlBackpressure,
@@ -1003,6 +1150,19 @@ impl NativeControlOwner {
                 )));
             }
 
+            request.memory = Some(Arc::new(
+                self.inner
+                    .input_drains
+                    .inner
+                    .control_budget
+                    .reserve(input_receipt_charge(&key, &request.data))
+                    .ok_or_else(|| {
+                        not_applied(ProtocolError::new(
+                            ErrorCode::ControlBackpressure,
+                            "daemon control-state byte budget is full",
+                        ))
+                    })?,
+            ));
             let (completion, result) = watch::channel(None);
             state.input_commands += 1;
             state.input_bytes += request.data.len();
@@ -1015,6 +1175,7 @@ impl NativeControlOwner {
                 },
             );
             state.input_queue.push_back(InputCommand {
+                _memory: None,
                 data: Arc::clone(&request.data),
                 reply: InputReply::Recoverable { key, completion },
             });
@@ -1046,8 +1207,7 @@ impl NativeControlOwner {
     /// before any ownership is relinquished.
     pub(crate) fn handoff_input_state(&self) -> Result<HandoffInputState, String> {
         let state = mutex_lock(&self.inner.state);
-        if state.phase != ControlPhase::Open
-            || !state.child_open
+        if !matches!(state.phase, ControlPhase::Open | ControlPhase::Closed)
             || state.stop_pending
             || !state.child_commands.is_empty()
             || state.input_scheduled
@@ -1125,7 +1285,7 @@ impl NativeControlOwner {
             input_failure: state.input_failure.clone(),
             operations,
         };
-        snapshot.validate()?;
+        snapshot.validate_with_resources(self.inner.input_drains.inner.resources)?;
         Ok(snapshot)
     }
 

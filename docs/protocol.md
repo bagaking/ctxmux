@@ -1,4 +1,4 @@
-# Local Protocol Generation 17
+# Local Protocol Generation 18
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -213,7 +213,7 @@ Closing a client socket only removes that attachment. It does not stop the Run.
   reads its full `RunInfo` with `status`.
 - `status`: return current metadata for one Run.
 - `remove`: reclaim one already-terminal, unpinned Run so its retained record
-  slot returns to the 128-record budget, replying `removed { id }`. This never
+  metadata and physical resource ownership is released, replying `removed { id }`. This never
   forces teardown: a running Run is refused `invalid_run_state`; an attached,
   pinned, still-collecting, or not-yet-quiescent Run is refused
   `backend_unavailable`; and an unknown or already-removed id returns
@@ -371,7 +371,7 @@ Input may have advanced it after this operation completed.
 
 While an operation is pending or retained, an exact retry joins or returns the
 same result; another payload or expected cursor with that key returns
-`input_operation_conflict`. The Run-local ledger retains at most 256 entries and
+`input_operation_conflict`. By default the Run-local ledger retains at most 256 entries and
 1 MiB of request bytes. It is incarnation-local, not connection-local. A
 planned exec-in-place upgrade carries its complete completed/unknown entries,
 poisoned-lane state, and applied cursor in the validated handoff manifest; a
@@ -580,8 +580,14 @@ open command block is incomplete framing. Before readiness, malformed or
 incomplete framing and invalid or unowned command results reject import with an
 explicit Backend error, and no Run is published. After readiness, the same
 faults interrupt the imported Run with `tmux_protocol_error`. A true EOF before
-readiness rejects import; after readiness it interrupts the Run with
-`tmux_server_unavailable`. The adapter admits one pre-session attach bootstrap
+readiness rejects import. After readiness, natural control loss (EOF, `%exit`,
+child exit or a failed periodic write) triggers one bounded public identity
+query. A replaced socket, changed server epoch, missing/dead target or changed
+or ambiguous target tuple interrupts the Run with `tmux_target_changed`.
+An unavailable query or an intact target with a lost observation connection
+interrupts it with `tmux_server_unavailable`; neither path reattaches. Shutdown
+and confirmed protocol faults keep their own disposition. Control-client exit
+alone is not evidence of server death. The adapter admits one pre-session attach bootstrap
 result and keeps at most one identity probe plus one continue request pending.
 Generation 14 does not claim general tmux command correlation beyond those bounded
 serial operations.
@@ -593,8 +599,9 @@ the pane.
 
 ## Output and reconnect
 
-PTY output is divided into contiguous half-open cumulative byte ranges. The daemon currently
-retains at most 4 MiB per Run. An attachment supplies its last observed byte cursor
+PTY output is divided into contiguous half-open cumulative byte ranges. The
+daemon defaults to 4 MiB hot and durable replay per Run, with independent
+configurable per-Run and aggregate budgets. An attachment supplies its last observed byte cursor
 and receives:
 
 - retained bytes after that cursor, slicing the first range when it falls inside a retained chunk;
@@ -605,8 +612,9 @@ and receives:
 
 The daemon subscribes an attachment before taking its replay snapshot and
 deduplicates live events already covered by that snapshot. Before publishing an
-exit event, it gives the PTY reader a bounded opportunity to drain the child's
-final output.
+exit event, it drains readable final output, including output paused for durable
+backpressure. An idle surviving writer receives a one-second terminal drain
+deadline; an idle cutoff records a source gap instead of claiming complete output.
 
 Attachment command results are multiplexed beside these events but are not
 part of replay and are never retained across reconnect. A client that permits
@@ -782,11 +790,15 @@ write, while later attachment commands receive an explicit retryable
 `backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
-fail-stop. The version-2 handoff manifest and every carried descriptor are
-strictly bounded, unique, and validated; generation 16 gains no upgrade wire
-operation.
+fail-stop. The schema-v5 handoff manifest carries the complete established
+resource policy, live owners and retained terminal Input receipts. It and every
+carried descriptor are validated, and serialized manifest/control funding is
+preflighted before extraction. Known persistence failure rejects upgrade before
+target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellation
+and exec serialize through one final gate. Protocol generation 18 has no upgrade
+wire operation.
 
-A valid store at its fixed main-database page ceiling reclaims bounded oldest
+A valid store at its configured main-database page ceiling reclaims bounded oldest
 replay prefixes before allocating mutations or startup reconciliation. This
 physical-pressure retention preserves Run/key/metadata and the durable head,
 while advancing the replay floor and truncation fact in the same transaction.
@@ -796,11 +808,16 @@ See ADR 009 for the independent physical and logical retention bounds.
 Replay payloads are append-only files under the state directory. SQLite stores
 only the contiguous window index and the active generation name. The writer
 syncs payload bytes before committing their index row; startup truncates an
-unreferenced tail and removes generations that lost the atomic generation
-switch. Once a generation exceeds twice the global replay budget, retained
-segments are copied to a new generation and the index is switched in one
-transaction. Compaction is transparent to protocol cursors and does not widen
-the main-database ceiling.
+unreferenced tails and removes only unreferenced generations. Once a generation
+exceeds twice the global replay budget, a synced packed destination becomes the
+active writer and retained coordinates migrate through bounded page-admitted
+transactions. Both generations can be durably referenced during migration;
+startup validates their indexed extents and resumes before serving. Source files
+are removed only after their last reference moves. An uncertain maintenance
+COMMIT fences later writes even when its underlying error resembles storage
+pressure. Compaction precedes append/finalize COMMIT and remains transparent to
+protocol cursors. Its file budget includes the required source/destination
+scratch overlap; the main-database ceiling is unchanged.
 
 An output append or terminal finalize that receives external storage `DiskFull`,
 or whose WAL admission is temporarily blocked by a reader during
@@ -810,8 +827,8 @@ no later durable mutation ahead of it. Its bounded queue applies backpressure
 while storage is unavailable; daemon shutdown cancels the wait. A checkpoint
 that remains busy through its bounded local retry budget is reported as
 retryable storage pressure and the ordered unit continues waiting; it is not
-latched as durable corruption. Other database, I/O, replay-conflict,
-file-budget, integrity, and owner-invariant failures still latch persistence and
+latched as durable corruption. Non-transient database and I/O errors, replay
+conflicts, integrity, uncertain-commit and owner-invariant failures latch persistence and
 reject later durable mutations. This changes no wire frame or error code: a
 client may observe output progress stall until storage recovers, and a client
 restart alone neither owns nor resets the daemon-side wait.
@@ -820,11 +837,11 @@ Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock/replay files, and a process-lifetime
 exclusive state lock. Exact schema version, SQLite integrity, typed JSON, a
 required native `RunSpec` satisfying the live-start semantic rules, lifecycle,
-lineage, cursor, contiguous chunk, byte-accounting, and quota invariants are
+lineage, cursor, contiguous chunk and byte-accounting invariants are
 validated against the schema-5 format envelope before the socket is published.
 Schema 5 stores the Runtime UUID and active replay generation in `runtime_meta`;
-bounded, restartable startup transactions reconcile prior running rows, evict
-the canonical terminal prefix to the operational 128-record ceiling, remove
+bounded, restartable startup transactions reconcile prior running rows, preserve
+valid retained history under the configured policy, remove
 orphan replay generations, truncate uncommitted tails, and finish
 serving-epoch publication before the socket becomes visible. Replay payloads
 come from the validated generation file, never an inline SQLite fallback; the
@@ -855,3 +872,25 @@ request, attachment, event, and error frames as the Rust client. It also
 validates the complete nested generation-16 frame at runtime, rejects duplicate
 JSON members and malformed UTF-8, and rejects `u64` cursor values outside
 JavaScript's safe-integer range rather than exposing rounded state.
+
+## Resource policy and initial replay window updates
+
+[Decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md)
+owns daemon `--resource-limits`, `CTXMUX_RESOURCE_LIMITS` and SDK activation
+`resourceLimits`. Counts are optional operator policy, not format ceilings.
+Valid over-policy state is preserved and reported as resource pressure.
+`RunInfo.first_available_byte` describes the hot view; Attach metadata reports
+the earliest available range for that replay, including durable readback.
+`RunSummary.retained_output_bytes` measures hot payload, not disk history or
+lifetime output.
+
+Generation 18 extends initial paged replay with
+`replay_window { first_available_byte, latest_output_bytes }`. Concurrent
+retention can advance the floor while a client receives pages. The update must
+advance beyond the current assembly cursor, remain at or before the original
+advertised head and carry that exact head. Clients discard the partial replay,
+set its new floor and truncation flag, and assemble the remaining contiguous
+suffix. A window emptied through the head completes initial replay immediately.
+Live `Gap.latest_output_bytes` retains its existing meaning and is never used
+as an initial replay floor. Both Rust and TypeScript clients implement this
+generation; older clients fail the Hello version fence.

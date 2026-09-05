@@ -31,12 +31,9 @@ use crate::{
     qualification_stats::GaugeGuard,
 };
 
-const REGISTRATION_CAPACITY: usize = 8;
-const CLEANUP_MAX_ACTIVE: usize = 8;
 // Persistence finalization is serialized by the persistence actor. Keep a
 // separate bounded handoff budget so blocked publication cannot consume native
 // cleanup admission; the two limits describe different resources.
-const FINALIZE_MAX_ACTIVE: usize = CLEANUP_MAX_ACTIVE;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 
@@ -204,6 +201,8 @@ pub(crate) struct LiveDescriptors {
     pub input_state: HandoffInputState,
 }
 
+type HandoffPreflight = Box<dyn FnOnce(&[LiveDescriptors]) -> Result<(), String> + Send>;
+
 enum OwnerCommand {
     Register(NativeRunRegistration),
     HandoffReady {
@@ -211,6 +210,7 @@ enum OwnerCommand {
         respond: mpsc::Sender<bool>,
     },
     ExtractForHandoff {
+        preflight: HandoffPreflight,
         respond: mpsc::Sender<Result<Vec<LiveDescriptors>, String>>,
     },
     Shutdown,
@@ -276,6 +276,8 @@ impl NativeRunRegistration {
             run_id: control.run_id(),
             run: self.run.clone(),
             output: Some(OutputOwner {
+                paused: false,
+                pending_offer: false,
                 reader: self
                     .reader
                     .take()
@@ -317,7 +319,13 @@ impl Drop for NativeRunRegistration {
 
 impl Default for NativeRunOwner {
     fn default() -> Self {
-        let (commands, receiver) = mpsc::sync_channel(REGISTRATION_CAPACITY);
+        Self::with_resources(crate::ResourceLimits::DEFAULT)
+    }
+}
+
+impl NativeRunOwner {
+    pub(crate) fn with_resources(resources: crate::ResourceLimits) -> Self {
+        let (commands, receiver) = mpsc::sync_channel(resources.creation_workers);
         let (wake, wake_reader) = match OwnerWake::pair() {
             Ok(pair) => pair,
             Err(error) => {
@@ -329,7 +337,7 @@ impl Default for NativeRunOwner {
                         wake: OwnerWake::unavailable(),
                         signal_driven: Arc::new(AtomicBool::new(false)),
                         cleanup_admission: CleanupAdmission::new(
-                            CLEANUP_MAX_ACTIVE,
+                            resources.cleanup_workers,
                             OwnerWake::unavailable(),
                         ),
                         diagnostics: Arc::new(OwnerDiagnostics::default()),
@@ -337,7 +345,7 @@ impl Default for NativeRunOwner {
                 };
             }
         };
-        let cleanup_admission = CleanupAdmission::new(CLEANUP_MAX_ACTIVE, wake.clone());
+        let cleanup_admission = CleanupAdmission::new(resources.cleanup_workers, wake.clone());
         let diagnostics = Arc::new(OwnerDiagnostics::default());
         // Default false: a freshly constructed owner arms the timed backstop so
         // any construction site (all of which are unit tests today) detects a
@@ -358,6 +366,7 @@ impl Default for NativeRunOwner {
                     &owner_cleanup,
                     &owner_diagnostics,
                     &owner_signal_driven,
+                    resources,
                 );
             }) {
             Ok(thread) => OwnerState::Running { commands, thread },
@@ -430,7 +439,15 @@ impl NativeRunOwner {
     /// child survives (unreaped) and its master fd stays open past a future
     /// exec-in-place. Called on the shipped SIGHUP exec-in-place path from
     /// `perform_exec_upgrade`, past the point of no return.
+    #[cfg(test)]
     pub(crate) fn extract_for_handoff(&self) -> Result<Vec<LiveDescriptors>, String> {
+        self.extract_for_handoff_after_preflight(Box::new(|_| Ok(())))
+    }
+
+    pub(crate) fn extract_for_handoff_after_preflight(
+        &self,
+        preflight: HandoffPreflight,
+    ) -> Result<Vec<LiveDescriptors>, String> {
         let commands = {
             let state = mutex_lock(&self.inner.state);
             match &*state {
@@ -440,7 +457,10 @@ impl NativeRunOwner {
         };
         let (tx, rx) = mpsc::channel();
         if commands
-            .send(OwnerCommand::ExtractForHandoff { respond: tx })
+            .send(OwnerCommand::ExtractForHandoff {
+                preflight,
+                respond: tx,
+            })
             .is_err()
         {
             return Err("daemon-wide native owner stopped before handoff extraction".to_owned());
@@ -598,6 +618,10 @@ impl Drop for OwnerInner {
     }
 }
 
+pub(crate) const fn resident_runtime_owner_bytes() -> usize {
+    std::mem::size_of::<NativeEntry>()
+}
+
 struct NativeEntry {
     run_id: RunId,
     run: Weak<Run>,
@@ -610,6 +634,8 @@ struct NativeEntry {
 
 struct OutputOwner {
     reader: File,
+    paused: bool,
+    pending_offer: bool,
     _control: NativeControlOwner,
     _guard: GaugeGuard,
 }
@@ -718,6 +744,7 @@ fn owner_main(
     cleanup_admission: &CleanupAdmission,
     diagnostics: &OwnerDiagnostics,
     signal_driven: &AtomicBool,
+    resources: crate::ResourceLimits,
 ) {
     let (completion_tx, completion_rx) = mpsc::channel();
     let mut entries = Vec::<NativeEntry>::new();
@@ -780,6 +807,7 @@ fn owner_main(
             diagnostics,
             &mut entries,
             &mut next_job_id,
+            resources,
         );
         queue_ready_terminals(&mut entries, &mut queued);
         start_worker_jobs(
@@ -792,6 +820,7 @@ fn owner_main(
             diagnostics,
             &mut entries,
             &mut next_job_id,
+            resources,
         );
         entries.retain(|entry| {
             entry.output.is_some()
@@ -824,8 +853,8 @@ fn drain_commands(
                     .is_none_or(|entry| matches!(entry.lifecycle, Lifecycle::Watching(_)));
                 let _ = respond.send(ready);
             }
-            Ok(OwnerCommand::ExtractForHandoff { respond }) => {
-                let _ = respond.send(extract_live_descriptors(entries));
+            Ok(OwnerCommand::ExtractForHandoff { preflight, respond }) => {
+                let _ = respond.send(extract_live_descriptors(entries, preflight));
             }
             Ok(OwnerCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => return true,
             Err(mpsc::TryRecvError::Empty) => return false,
@@ -838,7 +867,10 @@ fn drain_commands(
 /// Mirrors `retain_unwaited_child`'s authority discipline (`mem::forget` the
 /// control), but handoff is not a failure: no `wait_failure.record` and no
 /// `mark_wait_authority_lost` — just forget child and control so each lives on.
-fn extract_live_descriptors(entries: &mut [NativeEntry]) -> Result<Vec<LiveDescriptors>, String> {
+fn extract_live_descriptors(
+    entries: &mut [NativeEntry],
+    preflight: HandoffPreflight,
+) -> Result<Vec<LiveDescriptors>, String> {
     // Validate every entry before relinquishing the first owner. A terminal
     // publication or cleanup already in flight is allowed to finish in the old
     // image; this SIGHUP attempt aborts and can be retried. Silently skipping it
@@ -869,6 +901,7 @@ fn extract_live_descriptors(entries: &mut [NativeEntry]) -> Result<Vec<LiveDescr
         })
         .collect::<Result<Vec<_>, String>>()?;
 
+    preflight(&descriptors)?;
     for entry in entries {
         let Lifecycle::Watching(watching) =
             std::mem::replace(&mut entry.lifecycle, Lifecycle::Done)
@@ -1100,10 +1133,11 @@ fn start_worker_jobs(
     diagnostics: &OwnerDiagnostics,
     entries: &mut [NativeEntry],
     next_job_id: &mut u64,
+    resources: crate::ResourceLimits,
 ) {
     while let Some(index) = queued.iter().position(|job| match job {
-        WorkerJob::Cleanup(_) => *active_cleanups < CLEANUP_MAX_ACTIVE,
-        WorkerJob::Finalize(_) => *active_finalizers < FINALIZE_MAX_ACTIVE,
+        WorkerJob::Cleanup(_) => *active_cleanups < resources.cleanup_workers,
+        WorkerJob::Finalize(_) => *active_finalizers < resources.finalize_workers,
     }) {
         let job = queued
             .remove(index)
@@ -1308,6 +1342,13 @@ fn drain_completions(
                 apply_cleanup_outcome(entries, completion.run_id, outcome);
             }
             WorkerOutcome::Finalized => {
+                if let Some(run) = entries
+                    .iter()
+                    .find(|entry| entry.run_id == completion.run_id)
+                    .and_then(|entry| entry.run.upgrade())
+                {
+                    run.release_closed_resources();
+                }
                 set_lifecycle(entries, completion.run_id, Lifecycle::Done);
             }
         }
@@ -1355,7 +1396,29 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
         if !ready {
             continue;
         }
-        if drain_expired {
+        if drain_expired && let Some(output) = &entry.output {
+            // This is an idle-writer deadline, never a deadline for consuming a
+            // finite unread tail. A ready PTY or paused durable reader retains
+            // its output owner and gets another drain turn.
+            let mut readiness = [PollFd::new(&output.reader, PollFlags::IN)];
+            let ready_now =
+                poll(&mut readiness, Some(&Timespec::default())).is_ok_and(|count| count > 0);
+            let durable_paused = entry
+                .run
+                .upgrade()
+                .is_some_and(|run| run.prepare_output_read() == 0);
+            if ready_now || durable_paused {
+                if let Some(terminal) = entry.terminal.as_mut() {
+                    terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+                }
+                continue;
+            }
+            if let Some(run) = entry.run.upgrade() {
+                let latest_output_bytes = run.mark_output_source_gap();
+                run.publish_event(crate::RunEvent::Gap {
+                    latest_output_bytes,
+                });
+            }
             entry.output = None;
         }
         let Some(terminal) = entry.terminal.take() else {
@@ -1427,21 +1490,34 @@ fn poll_deadline(entries: &[NativeEntry], signal_driven: &AtomicBool) -> Option<
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one poll turn keeps fd borrowing, pressure admission and read ownership ordered"
+)]
 fn poll_and_read_outputs(
     entries: &mut [NativeEntry],
     wake_reader: &mut UnixStream,
     signal_driven: &AtomicBool,
     diagnostics: &OwnerDiagnostics,
 ) -> bool {
+    let deadline = poll_deadline(entries, signal_driven);
     let mut poll_fds = vec![PollFd::new(&*wake_reader, PollFlags::IN)];
     let mut indices = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        if let Some(output) = &entry.output {
+    for (index, entry) in entries.iter_mut().enumerate() {
+        if let Some(output) = &mut entry.output {
+            if (output.paused || output.pending_offer)
+                && let Some(run) = entry.run.upgrade()
+            {
+                output.paused = run.prepare_output_read() == 0;
+                output.pending_offer = run.output_has_unoffered();
+            }
+            if output.paused {
+                continue;
+            }
             poll_fds.push(PollFd::new(&output.reader, PollFlags::IN));
             indices.push(index);
         }
     }
-    let deadline = poll_deadline(entries, signal_driven);
     let timeout = deadline.map(|deadline| {
         Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
             .expect("native poll duration fits Timespec")
@@ -1499,15 +1575,30 @@ fn poll_and_read_outputs(
     }
 
     for index in ready {
+        let capacity = entries[index]
+            .run
+            .upgrade()
+            .map_or(0, |run| run.prepare_output_read())
+            .min(OUTPUT_READ_BUFFER_BYTES);
+        if capacity == 0 {
+            if let Some(output) = &mut entries[index].output {
+                output.paused = true;
+            }
+            continue;
+        }
         let Some(output) = entries[index].output.as_mut() else {
             continue;
         };
         let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
-        match output.reader.read(&mut buffer) {
+        match output.reader.read(&mut buffer[..capacity]) {
             Ok(0) => entries[index].output = None,
             Ok(read) => {
                 if let Some(run) = entries[index].run.upgrade() {
                     run.record_output(buffer[..read].to_vec());
+                    output.pending_offer = run.output_has_unoffered();
+                    if let Some(terminal) = entries[index].terminal.as_mut() {
+                        terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+                    }
                 } else {
                     entries[index].output = None;
                 }

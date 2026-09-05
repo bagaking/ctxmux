@@ -80,8 +80,11 @@ recoverable-Input operations remain addressable after reconnect.
 
 ### Handoff and reconciliation
 
-The upgrade carries a version-2 manifest containing the epoch and, for every
-live Run, `{ RunId, child PID, master fd, complete settled input state }`. It is
+The upgrade carries a schema-v5 manifest containing the epoch and, for every
+live Run, `{ RunId, child PID, master fd, complete settled input state }`,
+complete settled Stop operations, descriptor-free terminal Input ledgers and the
+established resource policy. These additional required fields distinguish v5
+from v4. It is
 written to an owner-only regular file created inside the state directory and
 immediately unlinked, avoiding pipe-capacity deadlock for bounded ledgers while
 leaving no pathname. Close-on-exec is cleared on exactly the listener, state
@@ -89,13 +92,25 @@ lock, live masters, and manifest file; every other descriptor remains
 close-on-exec.
 
 Before changing admission, all fallible file/executable setup is completed.
+This includes revalidating the existing state directory's real-directory,
+no-symlink, effective-owner and exact-0700 invariants without repairing it.
+Successful temporary-file creation alone cannot prove those startup invariants:
+a privileged process can create a file in a directory that the incoming image
+will still reject. Such a change must reject before extraction and retain full
+service in the original image.
 The request gate then transitions `Open -> Draining`, waits for its permit count
-to reach zero, and seals. The native owner preflights every entry before
-relinquishing the first: lifecycle must be `Watching`, the master and PID must
+to reach zero, and seals. Under the same native owner turn, complete serialization and resource/control
+preflight occur before relinquishing the first entry: lifecycle must be `Watching`, the master and PID must
 exist, and no input, signal, Stop, child command, or pending recoverable
 operation may cross the snapshot. Timeout or preflight failure drops the fence
-and restores full service. Extraction is the point of no return; later barrier,
-serialization, CLOEXEC, or `execve` failure is fail-stop.
+and restores full service. Extraction is the point of no return; later barrier, CLOEXEC or `execve`
+failure is fail-stop. A known persistence failure rejects before extraction.
+SIGHUP runs its ordered worker without blocking Ctrl-C: cancellation ends
+storage retries, and a shared final mutex gate chooses cancellation or exec
+atomically even if the durable barrier has just completed. No timeout discards
+committed output merely to complete an upgrade faster. [Decision 019](019-resource-policy-and-honest-qualification.md)
+owns the configurable byte and worker policy; preflight never sheds settled
+receipts to fit it.
 
 ### The schema is a shape, and it is checked before the exec
 
@@ -115,7 +130,8 @@ genuinely breaks a reader; v3→v4 changed only byte budgets and shedding policy
 and moved no field at all, spending a fatal bump on an upgrade whose bytes were
 compatible. A unit test pins the schema string to the serialized field set, so
 the first kind of change fails the build and the second passes untouched.
-Budgets, policies and limits are free to move; fields are not.
+A budget change alone needs no shape bump; v5 adds actual required fields.
+The complete policy crosses exec so the replacement cannot silently change it.
 
 **The target is asked first.** `ctxmuxd --version` declares the schema it
 accepts, and the outgoing image probes the exec target before the point of no
@@ -150,7 +166,7 @@ by definition the same live-control owner.
 
 The logical Runtime ID is also preserved. It is reloaded from schema-5
 `runtime_meta` through the existing SQLite owner; it is not copied into the
-version-2 handoff manifest. Public Hello remains
+schema-v5 handoff manifest. Public Hello remains
 `runtimeIdPersistence: "state_dir"`. The incoming image constructs its own
 build label, Rust target `platform` and `arch`, and advertised capability
 record from that image and the active persistence mode. These facts may remain

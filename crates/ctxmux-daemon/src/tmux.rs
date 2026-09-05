@@ -3,7 +3,10 @@ use std::{
     ffi::OsString,
     fs,
     io::{self, BufRead},
-    os::unix::fs::{FileTypeExt, MetadataExt},
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt},
+        process::CommandExt,
+    },
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     time::{Duration, Instant},
 };
@@ -15,13 +18,17 @@ use crate::qualification_stats::{Gauge as QualificationGauge, GaugeGuard, Qualif
 
 mod short_command;
 
+// One framed Control Mode notification/command payload has a 1 MiB parser
+// budget. It does not cap Run output: successive output notifications stream.
+// Empty command lines still allocate Vec headers; the separate 32K line budget
+// funds at most 768 KiB of headers on 64-bit hosts. Discovery has its own
+// configurable capture budget because pane population is an operator workload.
 pub(crate) const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 const MAX_COMMAND_BLOCK_LINES: usize = 32 * 1024;
 const MINIMUM_TMUX_MAJOR: u32 = 3;
 const MINIMUM_TMUX_MINOR: u32 = 4;
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const VERSION_STDOUT_BYTES: usize = 4 * 1024;
-const DISCOVERY_STDOUT_BYTES: usize = 128 * 1024;
 const SHORT_COMMAND_STDERR_BYTES: usize = 16 * 1024;
 const PANE_FORMAT: &str = concat!(
     "#{version}\t#{pid}\t#{start_time}\t#{session_id}\t#{window_id}\t#{pane_id}\t",
@@ -46,6 +53,7 @@ pub(crate) struct PendingControl {
 
 pub(crate) struct ObservedControl {
     child: Child,
+    cleanup: Option<Result<(), String>>,
     _direct_child_guard: GaugeGuard,
     _tmux_owner_guard: GaugeGuard,
 }
@@ -55,16 +63,32 @@ impl ObservedControl {
         self.child.id()
     }
 
-    pub(crate) fn kill(&mut self) -> io::Result<()> {
-        self.child.kill()
+    pub(crate) fn exited_without_reaping(&self) -> io::Result<bool> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        // Keep the leader waitable until its group has been killed: its PID
+        // anchors the PGID and prevents signalling an unrelated reused group.
+        waitid(
+            WaitId::Pid(Pid::from_child(&self.child)),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        )
+        .map(|status| status.is_some())
+        .map_err(io::Error::from)
     }
 
-    pub(crate) fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
-        self.child.wait()
+    pub(crate) fn terminate_and_reap(&mut self) -> Result<(), String> {
+        if let Some(result) = &self.cleanup {
+            return result.clone();
+        }
+        let group = rustix::process::Pid::from_child(&self.child);
+        let result = short_command::terminate_and_reap(&mut self.child, group);
+        self.cleanup = Some(result.clone());
+        result
     }
+}
 
-    pub(crate) fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
-        self.child.try_wait()
+impl Drop for ObservedControl {
+    fn drop(&mut self) {
+        let _ = self.terminate_and_reap();
     }
 }
 
@@ -95,8 +119,7 @@ impl PendingControl {
 impl Drop for PendingControl {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.terminate_and_reap();
         }
     }
 }
@@ -104,6 +127,7 @@ impl Drop for PendingControl {
 pub(crate) fn discover(
     socket_path: &str,
     deadline: Instant,
+    stdout_bytes: usize,
 ) -> Result<TmuxDiscovery, ProtocolError> {
     ensure_before_deadline(deadline, "tmux pane discovery")?;
     if socket_path.is_empty() {
@@ -123,7 +147,7 @@ pub(crate) fn discover(
     let output = run_short_command(
         &mut command,
         deadline,
-        DISCOVERY_STDOUT_BYTES,
+        stdout_bytes,
         "run tmux pane discovery",
     )?;
     ensure_before_deadline(deadline, "tmux pane discovery")?;
@@ -136,12 +160,7 @@ pub(crate) fn discover(
             ),
         ));
     }
-    if current_socket_identity(socket_path).ok() != Some(socket_identity) {
-        return Err(ProtocolError::new(
-            ErrorCode::TargetChanged,
-            "tmux socket changed during pane discovery",
-        ));
-    }
+    confirm_socket_identity(socket_path, socket_identity)?;
     let socket_path = socket_path.to_owned();
     let mut version = None;
     let mut panes = Vec::new();
@@ -184,9 +203,10 @@ pub(crate) fn spawn_control(
     pane_id: &str,
     discovery_deadline: Instant,
     qualification_stats: &QualificationStats,
+    stdout_bytes: usize,
 ) -> Result<PendingControl, ProtocolError> {
     validate_pane_id(pane_id)?;
-    let discovery = discover(socket_path, discovery_deadline)?;
+    let discovery = discover(socket_path, discovery_deadline, stdout_bytes)?;
     let socket_identity = discovery.socket_identity;
     let mut matches = discovery
         .panes
@@ -208,11 +228,12 @@ pub(crate) fn spawn_control(
     }
     let executable = executable();
     let child = base_command(&executable)
+        .process_group(0)
         .arg("-S")
         .arg(socket_path)
         .arg("-C")
         .args(["attach-session", "-t", &target.session_id, "-f"])
-        .arg("read-only,ignore-size,no-detach-on-destroy,pause-after=1")
+        .arg("read-only,ignore-size,pause-after=1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -221,16 +242,13 @@ pub(crate) fn spawn_control(
     qualification_stats.record_physical_start();
     let mut child = ObservedControl {
         child,
+        cleanup: None,
         _direct_child_guard: qualification_stats.guard(QualificationGauge::DirectChildren),
         _tmux_owner_guard: qualification_stats.guard(QualificationGauge::TmuxOwners),
     };
-    if current_socket_identity(socket_path).ok() != Some(socket_identity) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(ProtocolError::new(
-            ErrorCode::TargetChanged,
-            "tmux socket changed while starting the Control Mode client",
-        ));
+    if let Err(error) = confirm_socket_identity(socket_path, socket_identity) {
+        let _ = child.terminate_and_reap();
+        return Err(error);
     }
     let stdin = child.child.stdin.take().ok_or_else(|| {
         ProtocolError::new(
@@ -496,8 +514,62 @@ fn current_socket_identity(socket_path: &str) -> io::Result<SocketIdentity> {
     })
 }
 
-pub(crate) fn socket_identity_matches(socket_path: &str, expected: SocketIdentity) -> bool {
-    current_socket_identity(socket_path).ok() == Some(expected)
+pub(crate) fn socket_identity_changed(socket_path: &str, expected: SocketIdentity) -> bool {
+    // An absent/uninspectable socket cannot prove replacement. Server loss is
+    // resolved separately from a successfully observed different identity.
+    fs::metadata(socket_path).is_ok_and(|metadata| {
+        !metadata.file_type().is_socket()
+            || metadata.dev() != expected.device
+            || metadata.ino() != expected.inode
+    })
+}
+
+fn confirm_socket_identity(
+    socket_path: &str,
+    expected: SocketIdentity,
+) -> Result<(), ProtocolError> {
+    match current_socket_identity(socket_path) {
+        Ok(identity) if identity == expected => Ok(()),
+        Ok(_) => Err(ProtocolError::new(
+            ErrorCode::TargetChanged,
+            "tmux socket identity changed",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(ProtocolError::new(
+            ErrorCode::TargetChanged,
+            "tmux socket path was replaced by a non-socket",
+        )),
+        Err(error) => Err(backend_error("confirm tmux socket identity", error)),
+    }
+}
+
+pub(crate) fn target_changed_after_control_loss(
+    target: &TmuxPaneInfo,
+    expected_socket: SocketIdentity,
+    deadline: Instant,
+    stdout_bytes: usize,
+) -> Result<bool, ProtocolError> {
+    if socket_identity_changed(&target.socket_path, expected_socket) {
+        return Ok(true);
+    }
+    // Control-client death is not server death (notably when tmux 3.4 destroys
+    // the attached session). Reuse the bounded public discovery owner and its
+    // kill/reap behavior; no private wire access or automatic reattachment.
+    let discovery = match discover(&target.socket_path, deadline, stdout_bytes) {
+        Ok(discovery) => discovery,
+        Err(_) if socket_identity_changed(&target.socket_path, expected_socket) => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if discovery.socket_identity != expected_socket {
+        return Ok(true);
+    }
+    let mut matches = discovery
+        .panes
+        .iter()
+        .filter(|pane| pane.pane_id == target.pane_id);
+    Ok(matches
+        .next()
+        .is_none_or(|pane| TargetIdentity::from(pane) != TargetIdentity::from(target))
+        || matches.next().is_some())
 }
 
 #[derive(Debug, Eq, PartialEq)]

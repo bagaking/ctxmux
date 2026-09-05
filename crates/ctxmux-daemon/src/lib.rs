@@ -33,7 +33,9 @@ mod native_session;
 mod native_spawn_env;
 mod persistence;
 mod qualification_stats;
+pub mod resources;
 mod retention;
+pub use resources::ResourceLimits;
 mod run_spec;
 mod tmux;
 
@@ -100,6 +102,7 @@ use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
 
+#[cfg(test)]
 const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
 const LIVE_EVENT_CAPACITY: usize = 256;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
@@ -219,6 +222,7 @@ pub async fn serve_with_inherited_descriptors(
         None,
         qualification_stats_fd,
         readiness_fd,
+        ResourceLimits::default(),
     )
     .await
 }
@@ -245,14 +249,50 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
     readiness_fd: Option<OwnedFd>,
     handoff_fd: Option<OwnedFd>,
 ) -> Result<(), ServerError> {
+    serve_configured(
+        socket_path.into(),
+        Some(state_dir.into()),
+        qualification_stats_fd,
+        readiness_fd,
+        handoff_fd,
+        ResourceLimits::default(),
+    )
+    .await
+}
+
+/// Serve with an explicit resource policy. Existing listener reuse is handled
+/// by activation clients; this policy applies when this daemon starts.
+///
+/// # Errors
+/// Returns an error for invalid policy, unsafe state, or runtime owner failure.
+pub async fn serve_configured(
+    socket_path: PathBuf,
+    state_dir: Option<PathBuf>,
+    qualification_stats_fd: Option<OwnedFd>,
+    readiness_fd: Option<OwnedFd>,
+    handoff_fd: Option<OwnedFd>,
+    resources: ResourceLimits,
+) -> Result<(), ServerError> {
+    resources
+        .validate()
+        .map_err(|error| ServerError::Adopt(format!("invalid resource policy: {error}")))?;
+    let Some(state_dir) = state_dir else {
+        return serve_with_persistence(
+            socket_path,
+            None,
+            qualification_stats_fd,
+            readiness_fd,
+            resources,
+        )
+        .await;
+    };
     let handoff = match handoff_fd {
         Some(fd) => Some(
-            crate::handoff::read_manifest(fd)
+            crate::handoff::read_manifest_with_limit(fd, resources.handoff_bytes)
                 .map_err(|source| ServerError::io("<handoff-fd>", source))?,
         ),
         None => None,
     };
-    let state_dir = state_dir.into();
     let manager = if let Some(manifest) = &handoff {
         // Incoming exec-in-place image: reuse the handed-off epoch, exclude
         // the still-live Run set from reconciliation, and adopt the inherited
@@ -277,7 +317,8 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
                     .map_err(|source| ServerError::io("<handoff state-lock fd>", source))?,
             ),
         };
-        let (persistence, recovered) = Persistence::open_with_handoff(state_dir.clone(), hint)?;
+        let (persistence, recovered) =
+            Persistence::open_with_resources(state_dir.clone(), manifest.resources, Some(hint))?;
         let stats = QualificationStats::from_optional_inherited_fd(
             qualification_stats_fd,
             persistence.daemon_instance().to_string(),
@@ -290,11 +331,13 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
                 stats,
                 adopt,
                 manifest.stop_operations.clone(),
+                manifest.closed_inputs.clone(),
             )
             .map_err(|error| ServerError::Adopt(error.message))?,
         )
     } else {
-        let (persistence, recovered) = Persistence::open(state_dir.clone())?;
+        let (persistence, recovered) =
+            Persistence::open_with_resources(state_dir.clone(), resources, None)?;
         let stats = QualificationStats::from_optional_inherited_fd(
             qualification_stats_fd,
             persistence.daemon_instance().to_string(),
@@ -306,14 +349,8 @@ pub async fn serve_with_state_dir_and_inherited_descriptors(
             stats,
         ))
     };
-    serve_with_persistence_manager(
-        socket_path.into(),
-        manager,
-        readiness_fd,
-        handoff,
-        Some(state_dir),
-    )
-    .await
+    serve_with_persistence_manager(socket_path, manager, readiness_fd, handoff, Some(state_dir))
+        .await
 }
 
 async fn serve_with_persistence(
@@ -321,6 +358,7 @@ async fn serve_with_persistence(
     persistence: Option<(Persistence, Vec<RecoveredRun>)>,
     qualification_stats_fd: Option<OwnedFd>,
     readiness_fd: Option<OwnedFd>,
+    resources: ResourceLimits,
 ) -> Result<(), ServerError> {
     let manager = if let Some((persistence, recovered)) = persistence {
         let stats = QualificationStats::from_optional_inherited_fd(
@@ -340,7 +378,11 @@ async fn serve_with_persistence(
             daemon_instance.to_string(),
         )
         .map_err(|source| ServerError::io("qualification stats fd", source))?;
-        Arc::new(RunManager::with_instance_and_stats(daemon_instance, stats))
+        Arc::new(RunManager::with_instance_stats_and_resources(
+            daemon_instance,
+            stats,
+            resources,
+        ))
     };
     serve_with_persistence_manager(socket_path, manager, readiness_fd, None, None).await
 }
@@ -432,7 +474,7 @@ fn accept_error_is_fatal(source: &io::Error) -> bool {
 /// target provisions for, instead of the daemon reaching EMFILE by surprise
 /// mid-spawn.
 fn apply_startup_fd_budget(manager: &RunManager) {
-    let outcome = fd_budget::apply_fd_budget();
+    let outcome = fd_budget::apply_fd_budget(manager.resources);
     let describe =
         |limit: Option<u64>| limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
     if outcome.clamped {
@@ -443,8 +485,8 @@ fn apply_startup_fd_budget(manager: &RunManager) {
             describe(outcome.effective_soft),
             describe(outcome.hard),
             outcome.run_ceiling,
-            fd_budget::FD_BUDGET_LIVE_RUNS,
-            fd_budget::fd_budget(),
+            outcome.provisioned_runs,
+            outcome.provisioned_fds,
         );
     } else if outcome.raised {
         eprintln!(
@@ -455,7 +497,7 @@ fn apply_startup_fd_budget(manager: &RunManager) {
             outcome.run_ceiling,
         );
     }
-    manager.registry.clamp_record_capacity(outcome.run_ceiling);
+    manager.registry.clamp_live_capacity(outcome.run_ceiling);
 }
 
 /// Register the process-wide SIGCHLD relay that drives native Run exit
@@ -541,6 +583,10 @@ fn become_child_subreaper() {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one select loop makes cancellation, upgrade and fail-stop ordering visible"
+)]
 async fn serve_with_manager(
     socket_path: PathBuf,
     listener: UnixListener,
@@ -549,6 +595,7 @@ async fn serve_with_manager(
     handoff: Option<crate::handoff::HandoffManifest>,
     state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
+    let listener = Arc::new(listener);
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
     apply_startup_fd_budget(&manager);
     if let Some(handoff) = &handoff {
@@ -635,7 +682,10 @@ async fn serve_with_manager(
                     );
                     continue;
                 };
-                match perform_exec_upgrade(&socket_path, state_dir, &listener, &manager) {
+                let Some(result) = drive_exec_upgrade(
+                    socket_path.clone(), state_dir.to_path_buf(), Arc::clone(&listener), Arc::clone(&manager)
+                ).await? else { return Ok(()); };
+                match result {
                     Ok(()) => unreachable!(
                         "a successful exec-in-place replaces the process image and never returns"
                     ),
@@ -716,6 +766,9 @@ fn prepare_exec_upgrade(
 ) -> Result<(std::fs::File, PathBuf), UpgradeAbort> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
+    persistence::validate_state_dir(state_dir)
+        .map_err(|error| UpgradeAbort::BeforeExtract(ServerError::Persistence(error)))?;
+
     // A regular, immediately unlinked state-dir file avoids the pipe-capacity
     // deadlock that a complete bounded Input ledger could trigger before exec:
     // no incoming reader exists until the image has already been replaced.
@@ -737,6 +790,11 @@ fn prepare_exec_upgrade(
     })?;
     let exe = std::env::current_exe()
         .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io("<current_exe>", source)))?;
+    // A libtest process cannot advertise the daemon CLI's schema. The signal
+    // cancellation fixture supplies a probe target; verification still runs and
+    // that fixture must cancel before exec is reachable.
+    #[cfg(test)]
+    let exe = std::env::var_os("CTXMUX_TEST_UPGRADE_TARGET").map_or(exe, PathBuf::from);
 
     // Ask the target what it accepts, while refusing is still free. This is the
     // last moment it is: the schema is checked again on the far side of the exec
@@ -790,19 +848,98 @@ fn offer_outstanding_output_before_barrier(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one reversible preflight to irreversible extraction boundary keeps upgrade ownership auditable"
+)]
+async fn drive_exec_upgrade(
+    socket_path: PathBuf,
+    state_dir: PathBuf,
+    listener: Arc<UnixListener>,
+    manager: Arc<RunManager>,
+) -> Result<Option<Result<(), UpgradeAbort>>, ServerError> {
+    let upgrade_manager = Arc::clone(&manager);
+    let upgrade_socket = socket_path.clone();
+    let cancellation = Arc::new(UpgradeCancellation::default());
+    let worker_cancellation = Arc::clone(&cancellation);
+    let mut upgrade = tokio::task::spawn_blocking(move || {
+        perform_exec_upgrade(
+            &upgrade_socket,
+            &state_dir,
+            &listener,
+            &upgrade_manager,
+            &worker_cancellation,
+        )
+    });
+    // Storage retries stay user-cancellable while requests are quiesced.
+    // A timeout must not trade away committed output to make upgrade faster.
+    tokio::select! {
+        result = &mut upgrade => result.map(Some).map_err(|error|
+            ServerError::Shutdown { failures: error.to_string() }),
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|source| ServerError::io(&socket_path, source))?;
+            cancellation.cancel();
+            if let Some(durable) = &manager.persistence { durable.cancel_storage_waits(); }
+            let _ = upgrade.await;
+            manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
+            manager.qualification_stats.finish();
+            Ok(None)
+        }
+    }
+}
+
+#[derive(Default)]
+struct UpgradeCancellation {
+    cancelled: Mutex<bool>,
+    #[cfg(test)]
+    changed: std::sync::Condvar,
+}
+
+impl UpgradeCancellation {
+    fn cancel(&self) {
+        *mutex_lock(&self.cancelled) = true;
+        #[cfg(test)]
+        self.changed.notify_all();
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if *mutex_lock(&self.cancelled) {
+            Err("exec-in-place upgrade cancelled".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "reversible preflight and irreversible descriptor extraction form one ordered transaction"
+)]
 fn perform_exec_upgrade(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
     listener: &UnixListener,
     manager: &RunManager,
+    cancellation: &Arc<UpgradeCancellation>,
 ) -> Result<(), UpgradeAbort> {
-    use std::io::{Seek as _, Write as _};
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
     // --- Reversible phase (before the point of no return) ---
 
-    let (mut handoff_file, exe) = prepare_exec_upgrade(state_dir)?;
+    cancellation
+        .check()
+        .map_err(|failures| UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures }))?;
+    if manager
+        .persistence
+        .as_ref()
+        .is_some_and(Persistence::is_failed)
+    {
+        return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: "durable state requires recovery; live ownership was preserved".to_owned(),
+        }));
+    }
+    let (handoff_file, exe) = prepare_exec_upgrade(state_dir)?;
 
     // Fence new request mutations and wait until every already-admitted request
     // has written its response. The fence is RAII-reversible until extraction,
@@ -814,17 +951,103 @@ fn perform_exec_upgrade(
             UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures: failure })
         })?;
 
+    let durable = manager
+        .persistence
+        .as_ref()
+        .expect("persistent upgrade")
+        .clone();
+    if durable.is_failed() {
+        return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: "durable state requires recovery; live ownership was preserved".to_owned(),
+        }));
+    }
+    let deadline = Instant::now() + UPGRADE_QUIESCE_TIMEOUT;
+    if !manager.creation_flights.wait_until(deadline) {
+        return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: "in-flight creation still owns unpublished native resources".to_owned(),
+        }));
+    }
+    let cleanup_failures = manager.unpublished_cleanups.wait_until(deadline);
+    if !cleanup_failures.is_empty() {
+        return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: cleanup_failures.join("; "),
+        }));
+    }
     let stop_operations = snapshot_stop_operations_for_upgrade(manager)?;
-
-    // --- POINT OF NO RETURN: extract relinquishes reap/close authority for
-    // every live native child; from here, any failure is fail-stop. ---
+    let retained = manager.registry.snapshot();
+    let epoch = manager.daemon_instance.to_string();
+    let listener_fd = listener.as_raw_fd();
+    let state_lock_fd = manager
+        .persistence
+        .as_ref()
+        .expect("persistent upgrade")
+        .state_lock_fd();
+    let resources = manager.resources;
+    let prepared = Arc::new(Mutex::new(None));
+    let prepared_by_owner = Arc::clone(&prepared);
+    let owner_cancellation = Arc::clone(cancellation);
+    // Snapshot, validate, and serialize under the same native owner turn that
+    // extracts descriptors. Any preflight error returns before forgetting a
+    // child or closing a reader, so the request fence restores service.
     let live = manager
         .native_runs
-        .extract_for_handoff()
-        .map_err(|failure| {
-            UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures: failure })
-        })?;
+        .extract_for_handoff_after_preflight(Box::new(move |live| {
+            owner_cancellation.check()?;
+            if durable.is_failed() {
+                return Err(
+                    "durable state requires recovery; live ownership was preserved".to_owned(),
+                );
+            }
+            let retained_ids: HashSet<_> = retained.iter().map(|run| run.id).collect();
+            if live.iter().any(|run| !retained_ids.contains(&run.run_id)) {
+                return Err("handoff native owner contains an unpublished Run".to_owned());
+            }
+            let live_ids: HashSet<_> = live.iter().map(|run| run.run_id).collect();
+            let mut closed_inputs = Vec::new();
+            for run in &retained {
+                if live_ids.contains(&run.id) {
+                    continue;
+                }
+                if run.is_running() {
+                    return Err(format!("Run {} has no live handoff owner", run.id));
+                }
+                if let Some(RunControl::Native(control)) = &run.incarnation_control {
+                    control.closed_quiescence_result()?;
+                    closed_inputs.push(crate::handoff::HandoffClosedInput {
+                        run_id: run.id,
+                        input_state: control.handoff_input_state()?,
+                    });
+                }
+            }
+            let manifest = crate::handoff::HandoffManifest::configured(
+                epoch,
+                listener_fd,
+                state_lock_fd,
+                live.iter()
+                    .map(|run| crate::handoff::HandoffRun {
+                        run_id: run.run_id,
+                        child_pid: run.child_pid,
+                        master_fd: run.master_fd,
+                        input_state: run.input_state.clone(),
+                    })
+                    .collect(),
+                stop_operations,
+                closed_inputs,
+                resources,
+            );
+            let mut file = handoff_file;
+            manifest
+                .write_preflight(&mut file)
+                .map_err(|error| error.to_string())?;
+            *mutex_lock(&prepared_by_owner) = Some((file, manifest));
+            Ok(())
+        }))
+        .map_err(|failures| UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures }))?;
     request_fence.commit();
+    #[cfg(test)]
+    if let Some(marker) = std::env::var_os("CTXMUX_TEST_UPGRADE_EXTRACTED") {
+        fs::write(marker, b"extracted").expect("publish subprocess upgrade barrier");
+    }
 
     // Durable-commit barrier AFTER extract (corrected order): extract closes
     // each run's pty reader (via `entry.output = None`) and relinquishes its
@@ -844,48 +1067,18 @@ fn perform_exec_upgrade(
         .persistence_barrier()
         .map_err(UpgradeAbort::AfterExtract)?;
 
-    // Build the manifest from the extracted descriptors + the process listener
-    // and state-lock fds.
-    let runs: Vec<crate::handoff::HandoffRun> = live
-        .into_iter()
-        .map(|d| crate::handoff::HandoffRun {
-            run_id: d.run_id,
-            child_pid: d.child_pid,
-            master_fd: d.master_fd,
-            input_state: d.input_state,
-        })
-        .collect();
-    let epoch = manager.daemon_instance.to_string();
-    let listener_fd = listener.as_raw_fd();
-    let state_lock_fd = manager
-        .persistence
-        .as_ref()
-        .expect("perform_exec_upgrade requires persistent mode (verified by caller)")
-        .state_lock_fd();
-    let manifest = crate::handoff::HandoffManifest::new_with_stop_operations(
-        epoch,
-        listener_fd,
-        state_lock_fd,
-        runs,
-        stop_operations,
-    );
+    #[cfg(test)]
+    if let Some(marker) = std::env::var_os("CTXMUX_TEST_UPGRADE_BEFORE_EXEC") {
+        fs::write(marker, b"barrier committed").expect("publish pre-exec cancellation barrier");
+        let mut cancelled = mutex_lock(&cancellation.cancelled);
+        while !*cancelled {
+            cancelled = cancellation.changed.wait(cancelled).unwrap();
+        }
+    }
 
-    // Serialize directly into the unlinked file, append one NDJSON newline, and
-    // rewind it for the incoming image. This keeps transient memory bounded by
-    // serde's per-value work instead of cloning every retained Input payload.
-    serde_json::to_writer(&mut handoff_file, &manifest).map_err(|source| {
-        UpgradeAbort::AfterExtract(ServerError::io(
-            "<handoff manifest>",
-            std::io::Error::other(source),
-        ))
-    })?;
-    handoff_file
-        .write_all(b"\n")
-        .and_then(|()| handoff_file.flush())
-        .and_then(|()| handoff_file.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
-        .map_err(|source| {
-            UpgradeAbort::AfterExtract(ServerError::io("<handoff manifest>", source))
-        })?;
+    let (handoff_file, manifest) = mutex_lock(&prepared)
+        .take()
+        .expect("successful extraction completed manifest preflight");
     let read_fd = handoff_file.as_raw_fd();
 
     // Clear CLOEXEC LAST, immediately before execve, on exactly the fds that
@@ -909,8 +1102,19 @@ fn perform_exec_upgrade(
         .arg("--state-dir")
         .arg(state_dir)
         .arg("--handoff-fd")
-        .arg(read_fd.to_string());
+        .arg(read_fd.to_string())
+        .arg("--resource-limits")
+        .arg(serde_json::to_string(&resources).expect("resource policy serializes"));
+    // Linearize the last cancel/exec decision. A completed storage barrier
+    // must not override cancellation already accepted by the signal handler.
+    let cancelled = mutex_lock(&cancellation.cancelled);
+    if *cancelled {
+        return Err(UpgradeAbort::AfterExtract(ServerError::Shutdown {
+            failures: "exec-in-place upgrade cancelled".to_owned(),
+        }));
+    }
     let exec_error = command.exec(); // only returns on failure
+    drop(cancelled);
     // Keep the manifest file alive until here so the fd is not closed before exec.
     drop(handoff_file);
     Err(UpgradeAbort::AfterExtract(ServerError::io(
@@ -1023,6 +1227,7 @@ struct RunManager {
     native_runs: NativeRuntimeOwner,
     qualification_stats: QualificationStats,
     retention_budget: RetentionBudget,
+    resources: ResourceLimits,
     live_event_capacity: usize,
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
@@ -1445,6 +1650,7 @@ impl Drop for PersistentPublicationOwner<'_> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttachmentHookPoint {
     AfterSubscribe,
+    AfterReplayPage,
     AfterSnapshot,
     BeforeDetachAck,
 }
@@ -1577,18 +1783,44 @@ impl RunManager {
         daemon_instance: DaemonInstanceId,
         qualification_stats: QualificationStats,
     ) -> Self {
+        Self::with_instance_stats_and_resources(
+            daemon_instance,
+            qualification_stats,
+            ResourceLimits::default(),
+        )
+    }
+
+    fn with_instance_stats_and_resources(
+        daemon_instance: DaemonInstanceId,
+        qualification_stats: QualificationStats,
+        resources: ResourceLimits,
+    ) -> Self {
+        let registry =
+            RunRegistry::with_stats_and_resources(qualification_stats.clone(), resources);
+        let native_input_drains = InputDrainGate::with_stats_resources_and_budget(
+            qualification_stats.clone(),
+            resources,
+            registry.control_budget(),
+        );
         Self {
             runtime_id: RuntimeId::new(),
             daemon_instance,
             build_id: runtime_build_id(),
-            registry: RunRegistry::with_stats(qualification_stats.clone()),
-            creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
-            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
+            registry,
+            creation_flights: CreationFlightOwner::with_slots(
+                qualification_stats.clone(),
+                resources.creation_workers,
+            ),
+            unpublished_cleanups: UnpublishedCleanupOwner::with_slots(
+                qualification_stats.clone(),
+                resources.creation_workers,
+            ),
             terminal_publications: TerminalPublicationOwner::default(),
-            native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
-            native_runs: NativeRuntimeOwner::default(),
+            native_input_drains,
+            native_runs: NativeRuntimeOwner::with_resources(resources),
             qualification_stats,
-            retention_budget: RetentionBudget::production(),
+            retention_budget: RetentionBudget::with_resources(resources),
+            resources,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1652,7 +1884,8 @@ impl RunManager {
         qualification_stats: QualificationStats,
     ) -> Self {
         let terminal_publications = TerminalPublicationOwner::default();
-        let retention_budget = RetentionBudget::production();
+        let resources = persistence.resources();
+        let retention_budget = RetentionBudget::with_resources(resources);
         let runs = recovered
             .into_iter()
             .map(|recovered| {
@@ -1680,18 +1913,32 @@ impl RunManager {
                 )
             })
             .collect();
+        let registry =
+            RunRegistry::recovered_with_resources(runs, qualification_stats.clone(), resources);
+        let native_input_drains = InputDrainGate::with_stats_resources_and_budget(
+            qualification_stats.clone(),
+            resources,
+            registry.control_budget(),
+        );
         Self {
             runtime_id: persistence.runtime_id(),
             daemon_instance: persistence.daemon_instance(),
             build_id: runtime_build_id(),
-            registry: RunRegistry::recovered_with_stats(runs, qualification_stats.clone()),
-            creation_flights: CreationFlightOwner::with_stats(qualification_stats.clone()),
-            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
+            registry,
+            creation_flights: CreationFlightOwner::with_slots(
+                qualification_stats.clone(),
+                resources.creation_workers,
+            ),
+            unpublished_cleanups: UnpublishedCleanupOwner::with_slots(
+                qualification_stats.clone(),
+                resources.creation_workers,
+            ),
             terminal_publications,
-            native_input_drains: InputDrainGate::with_stats(qualification_stats.clone()),
-            native_runs: NativeRuntimeOwner::default(),
+            native_input_drains,
+            native_runs: NativeRuntimeOwner::with_resources(resources),
             qualification_stats,
             retention_budget,
+            resources,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1717,20 +1964,43 @@ impl RunManager {
     /// persistence did not recover — not expected, since live rows stay in the
     /// recovered set) has its `OwnedFd` dropped and closed at function end. That
     /// is an acceptable fail-safe; no extra validation is added for it.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one recovery funnel restores live and descriptor-free settled owners together"
+    )]
     fn persistent_with_handoff_and_stats(
         persistence: Persistence,
         recovered: Vec<RecoveredRun>,
         qualification_stats: QualificationStats,
         mut adopt: HashMap<RunId, (OwnedFd, u32, HandoffInputState)>,
         stop_operations: Vec<HandoffStopOperation>,
+        closed_inputs: Vec<crate::handoff::HandoffClosedInput>,
     ) -> Result<Self, ProtocolError> {
+        let resources = persistence.resources();
         let terminal_publications = TerminalPublicationOwner::default();
-        let native_runs = NativeRuntimeOwner::default();
-        let native_input_drains = InputDrainGate::with_stats(qualification_stats.clone());
-        let creation_flights = CreationFlightOwner::with_stats(qualification_stats.clone());
+        let native_runs = NativeRuntimeOwner::with_resources(resources);
+        let native_input_drains =
+            InputDrainGate::with_stats_and_resources(qualification_stats.clone(), resources);
+        let creation_flights = CreationFlightOwner::with_slots(
+            qualification_stats.clone(),
+            resources.creation_workers,
+        );
         let incarnation_failure = IncarnationFailure::default();
-        let retention_budget = RetentionBudget::production();
+        let retention_budget = RetentionBudget::with_resources(resources);
+        let known: HashSet<_> = recovered.iter().map(|run| run.info.id).collect();
+        if adopt.keys().any(|id| !known.contains(id))
+            || closed_inputs.iter().any(|run| !known.contains(&run.run_id))
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::Internal,
+                "handoff contains a Run absent from durable Registry",
+            ));
+        }
+        let mut closed_inputs: HashMap<_, _> = closed_inputs
+            .into_iter()
+            .map(|run| (run.run_id, run.input_state))
+            .collect();
         let mut runs = Vec::with_capacity(recovered.len());
         for recovered in recovered {
             let operation_key = recovered.operation_key.clone();
@@ -1743,8 +2013,10 @@ impl RunManager {
                 metadata_bytes,
             );
             let metadata_owner = durable.metadata_bytes_owner();
-            let run = match adopt.remove(&recovered.info.id) {
-                Some((master_fd, child_pid, input_state)) => Run::readopt(
+            let run = if let Some((master_fd, child_pid, input_state)) =
+                adopt.remove(&recovered.info.id)
+            {
+                Run::readopt(
                     recovered,
                     durable,
                     master_fd,
@@ -1760,15 +2032,25 @@ impl RunManager {
                         incarnation_failure: incarnation_failure.clone(),
                     },
                     retention_budget.clone(),
-                )?,
-                None => Run::recover(
+                )?
+            } else {
+                let control = closed_inputs.remove(&recovered.info.id).map(|input_state| {
+                    RunControl::Native(NativeControlOwner::closed_with_input_state(
+                        recovered.info.id,
+                        input_state,
+                        native_input_drains.clone(),
+                        native_runs.owner_wake(),
+                    ))
+                });
+                Run::recover_with_control(
                     recovered,
                     durable,
                     LIVE_EVENT_CAPACITY,
                     terminal_publications.clone(),
                     qualification_stats.clone(),
                     retention_budget.clone(),
-                ),
+                    control,
+                )
             };
             runs.push((operation_key, run, metadata_owner));
         }
@@ -1780,14 +2062,20 @@ impl RunManager {
                 runs,
                 stop_operations,
                 qualification_stats.clone(),
+                resources,
+                native_input_drains.control_budget(),
             )?,
             creation_flights,
-            unpublished_cleanups: UnpublishedCleanupOwner::with_stats(qualification_stats.clone()),
+            unpublished_cleanups: UnpublishedCleanupOwner::with_slots(
+                qualification_stats.clone(),
+                resources.creation_workers,
+            ),
             terminal_publications,
             native_input_drains,
             native_runs,
             qualification_stats,
             retention_budget,
+            resources,
             live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
@@ -1954,9 +2242,14 @@ impl RunManager {
         new_run_id: RunId,
     ) -> Result<CreationPublication<'a>, ProtocolError> {
         let Some(persistence) = &self.persistence else {
-            let reservation = self
-                .registry
-                .reserve_memory_publication(new_run_id, Some(operation_key.clone()))?;
+            let reservation = self.registry.reserve_memory_publication(
+                new_run_id,
+                Some(operation_key.clone()),
+                registry_metadata_bytes(
+                    &materialized.persistence_start_info(new_run_id),
+                    Some(operation_key),
+                ),
+            )?;
             return Ok(CreationPublication::Memory(reservation));
         };
         let prospective = materialized.persistence_start_info(new_run_id);
@@ -1967,7 +2260,9 @@ impl RunManager {
             new_run_id,
             operation_key.clone(),
             materialized.request.clone(),
-            prepared.metadata_bytes(),
+            prepared
+                .metadata_bytes()
+                .saturating_add(resident_run_metadata_bytes(&prospective)),
         )?;
         let candidates = reservation
             .persistent_candidates()
@@ -2132,7 +2427,11 @@ impl RunManager {
     ) -> Result<Option<PublicationReservation>, ProtocolError> {
         if self.persistence_mode() == PersistenceMode::MemoryOnly {
             self.registry
-                .reserve_memory_publication(new_run_id, operation_key)
+                .reserve_memory_publication(
+                    new_run_id,
+                    operation_key,
+                    std::mem::size_of::<Run>() as u64,
+                )
                 .map(Some)
         } else {
             Ok(None)
@@ -2161,7 +2460,11 @@ impl RunManager {
 
     fn discover_tmux(&self, socket_path: &str) -> Result<tmux::TmuxDiscovery, ProtocolError> {
         self.with_tmux_operation(|| {
-            tmux::discover(socket_path, Instant::now() + TMUX_DISCOVERY_TIMEOUT)
+            tmux::discover(
+                socket_path,
+                Instant::now() + TMUX_DISCOVERY_TIMEOUT,
+                self.resources.tmux_discovery_bytes,
+            )
         })
     }
 
@@ -2175,8 +2478,11 @@ impl RunManager {
         self.with_tmux_operation(|| {
             let cleanup_reservation = self.unpublished_cleanups.reserve_tmux()?;
             let new_run_id = RunId::new();
-            let registry_reservation =
-                self.registry.reserve_memory_publication(new_run_id, None)?;
+            let registry_reservation = self.registry.reserve_memory_publication(
+                new_run_id,
+                None,
+                (std::mem::size_of::<Run>() + socket_path.len() + pane_id.len()) as u64,
+            )?;
             let started_at = Instant::now();
             #[cfg(test)]
             if let Some(hook) = &self.creation_hook {
@@ -2190,6 +2496,7 @@ impl RunManager {
                     live_event_capacity: self.live_event_capacity,
                     terminal_publications: self.terminal_publications.clone(),
                     discovery_deadline: started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
+                    discovery_bytes: self.resources.tmux_discovery_bytes,
                     prepare_deadline: started_at + TMUX_IMPORT_PREPARE_TIMEOUT,
                     total_deadline: started_at + TMUX_IMPORT_TOTAL_TIMEOUT,
                     qualification_stats: self.qualification_stats.clone(),
@@ -2568,7 +2875,11 @@ impl RunManager {
         G: FnOnce() + Send + 'static,
     {
         let new_run_id = RunId::new();
-        let reservation = self.registry.reserve_memory_publication(new_run_id, None)?;
+        let reservation = self.registry.reserve_memory_publication(
+            new_run_id,
+            None,
+            serde_json::to_vec(&spec).unwrap().len() as u64 + std::mem::size_of::<Run>() as u64,
+        )?;
         let run = Run::spawn_with_wait_hook_owner(
             new_run_id,
             spec,
@@ -2650,6 +2961,7 @@ impl From<PersistentCollectionCandidate> for PersistentCandidate {
 }
 
 struct TmuxImportConfig {
+    discovery_bytes: usize,
     id: RunId,
     live_event_capacity: usize,
     terminal_publications: TerminalPublicationOwner,
@@ -2842,6 +3154,7 @@ struct Run {
     qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
+    live_permit: Mutex<Option<creation::LiveResourcePermit>>,
     /// Woken once terminal state is visible, so a Stop can report the state its
     /// own receipt implies rather than the one that predates publication.
     ///
@@ -2857,11 +3170,13 @@ struct Run {
 
 struct LiveEventOwner {
     capacity: usize,
+    budget: crate::resources::ByteBudget,
     state: Mutex<LiveEventState>,
 }
 
 struct LiveEventState {
     sender: Option<broadcast::Sender<LiveRunEvent>>,
+    ring_memory: Option<crate::resources::BytePermit>,
     cursor: LiveEventCursor,
 }
 
@@ -2884,9 +3199,43 @@ struct LiveEventCursor {
 
 #[derive(Clone, Debug)]
 struct LiveRunEvent {
-    event: RunEvent,
+    published: PublishedRunEvent,
     before: LiveEventCursor,
     after: LiveEventCursor,
+}
+
+#[derive(Debug)]
+struct FundedRunEvent {
+    event: RunEvent,
+    _memory: crate::resources::BytePermit,
+}
+
+// Pressure markers contain no heap data. They remain deliverable when every
+// leased allocation is held by slow receivers outside the broadcast ring.
+#[derive(Clone, Debug)]
+enum PublishedRunEvent {
+    Funded(Arc<FundedRunEvent>),
+    OutputGap(u64),
+    ObservationDiscontinuity,
+}
+
+const EVENT_ALLOCATION_BYTES: usize =
+    std::mem::size_of::<FundedRunEvent>() + 2 * std::mem::size_of::<usize>();
+
+impl LiveRunEvent {
+    fn event(&self) -> std::borrow::Cow<'_, RunEvent> {
+        match &self.published {
+            PublishedRunEvent::Funded(funded) => std::borrow::Cow::Borrowed(&funded.event),
+            PublishedRunEvent::OutputGap(latest_output_bytes) => {
+                std::borrow::Cow::Owned(RunEvent::Gap {
+                    latest_output_bytes: *latest_output_bytes,
+                })
+            }
+            PublishedRunEvent::ObservationDiscontinuity => {
+                std::borrow::Cow::Owned(RunEvent::ObservationDiscontinuity)
+            }
+        }
+    }
 }
 
 struct LiveEventSubscription {
@@ -2895,11 +3244,21 @@ struct LiveEventSubscription {
 }
 
 impl LiveEventOwner {
-    const fn new(capacity: usize) -> Self {
+    #[cfg(test)]
+    fn new(capacity: usize) -> Self {
+        Self::with_budget(
+            capacity,
+            crate::resources::ByteBudget::new(ResourceLimits::DEFAULT.live_event_bytes),
+        )
+    }
+
+    fn with_budget(capacity: usize, budget: crate::resources::ByteBudget) -> Self {
         Self {
             capacity,
+            budget,
             state: Mutex::new(LiveEventState {
                 sender: None,
+                ring_memory: None,
                 cursor: LiveEventCursor {
                     output_bytes: 0,
                     output_discontinuity_revision: 0,
@@ -2912,8 +3271,48 @@ impl LiveEventOwner {
         }
     }
 
-    fn publish(&self, event: RunEvent) {
+    fn publish(&self, mut event: RunEvent) {
         let mut state = mutex_lock(&self.state);
+        // The lease follows each heap envelope past ring eviction and across
+        // async sends, including events with no variable payload.
+        let memory = if state
+            .sender
+            .as_ref()
+            .is_some_and(|sender| sender.receiver_count() > 0)
+        {
+            let bytes = match &event {
+                RunEvent::Output { chunk } => chunk.data.capacity(),
+                RunEvent::Tmux {
+                    event: TmuxRunEvent::SessionRenamed { name },
+                } => name.capacity(),
+                RunEvent::Exited {
+                    state:
+                        RunState::Exited {
+                            signal: Some(signal),
+                            ..
+                        },
+                    ..
+                } => signal.capacity(),
+                _ => 0,
+            };
+            if let Some(permit) = self
+                .budget
+                .reserve(bytes.saturating_add(EVENT_ALLOCATION_BYTES))
+            {
+                Some(permit)
+            } else {
+                event = match &event {
+                    RunEvent::Output { chunk } => RunEvent::Gap {
+                        latest_output_bytes: chunk.end_byte,
+                    },
+                    _ => RunEvent::ObservationDiscontinuity,
+                };
+                None
+            }
+        } else {
+            None
+        };
+
         let before = state.cursor;
         match &event {
             RunEvent::Output { chunk } => {
@@ -2951,12 +3350,24 @@ impl LiveEventOwner {
                     .expect("live resize revision remains representable");
             }
         }
-        let envelope = LiveRunEvent {
-            event,
-            before,
-            after: state.cursor,
-        };
         if let Some(sender) = state.sender.as_ref() {
+            let published = match memory {
+                Some(memory) => PublishedRunEvent::Funded(Arc::new(FundedRunEvent {
+                    event,
+                    _memory: memory,
+                })),
+                None => match event {
+                    RunEvent::Gap {
+                        latest_output_bytes,
+                    } => PublishedRunEvent::OutputGap(latest_output_bytes),
+                    _ => PublishedRunEvent::ObservationDiscontinuity,
+                },
+            };
+            let envelope = LiveRunEvent {
+                published,
+                before,
+                after: state.cursor,
+            };
             let _ = sender.send(envelope);
         }
     }
@@ -3019,6 +3430,12 @@ impl NativeRunOwner for PendingPublication {
     }
 }
 
+impl Drop for Run {
+    fn drop(&mut self) {
+        self.retention_budget.unregister(self.id);
+    }
+}
+
 impl RetentionVictim for Run {
     fn run_id(&self) -> RunId {
         self.id
@@ -3026,6 +3443,15 @@ impl RetentionVictim for Run {
 
     fn retained_output_bytes(&self) -> usize {
         mutex_lock(&self.output).retained_bytes()
+    }
+
+    fn reclaimable_output_bytes(&self) -> usize {
+        let protected = self.output_protected_from();
+        let output = mutex_lock(&self.output);
+        output.retained_bytes().min(
+            usize::try_from(protected.saturating_sub(output.first_available_byte()))
+                .unwrap_or(usize::MAX),
+        )
     }
 
     fn is_attached(&self) -> bool {
@@ -3036,7 +3462,13 @@ impl RetentionVictim for Run {
         // Takes only this Run's own `output` lock, matching the trait's
         // one-lock-at-a-time contract so the daemon-wide reclaimer never holds
         // two `output` locks or the participants lock while trimming.
-        mutex_lock(&self.output).trim_front(drop_at_least)
+        let protected = self.output_protected_from();
+        let mut output = mutex_lock(&self.output);
+        let reclaimable = protected.saturating_sub(output.first_available_byte());
+        output.trim_front_bounded(
+            drop_at_least,
+            usize::try_from(reclaimable).unwrap_or(usize::MAX),
+        )
     }
 }
 
@@ -3272,6 +3704,13 @@ struct TmuxTermination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TmuxReaderTermination {
     failure: TmuxTermination,
+    ready: bool,
+}
+
+struct TmuxTerminationContext<'a> {
+    target: &'a ctxmux_protocol::TmuxPaneInfo,
+    socket_identity: TmuxSocketIdentity,
+    discovery_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3328,8 +3767,12 @@ impl Run {
             qualification_stats: QualificationStats::default(),
             terminal_publications: terminal_publications.clone(),
             terminal_ordinal,
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::new(LIVE_EVENT_CAPACITY),
+            events: LiveEventOwner::with_budget(
+                LIVE_EVENT_CAPACITY,
+                retention_budget.event_budget(),
+            ),
             retention_budget,
         })
     }
@@ -3642,8 +4085,12 @@ impl Run {
             qualification_stats: config.qualification_stats,
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::new(config.live_event_capacity),
+            events: LiveEventOwner::with_budget(
+                config.live_event_capacity,
+                config.retention_budget.event_budget(),
+            ),
             retention_budget: config.retention_budget,
         });
         Self::register_retention(run)
@@ -3657,6 +4104,11 @@ impl Run {
     fn register_retention(run: Arc<Self>) -> Arc<Self> {
         let victim: Arc<dyn RetentionVictim + Send + Sync> = run.clone();
         run.retention_budget.register(&victim);
+        if let (Some(durable), Some(native)) =
+            (mutex_lock(&run.persistence).active(), &run.native_runs)
+        {
+            durable.register_output_wake(native.owner_wake());
+        }
         run
     }
 
@@ -3675,6 +4127,7 @@ impl Run {
             pane_id,
             config.discovery_deadline,
             &config.qualification_stats,
+            config.discovery_bytes,
         )?;
         let target = pending.target.clone();
         let socket_identity = pending.socket_identity;
@@ -3715,8 +4168,12 @@ impl Run {
             qualification_stats: config.qualification_stats.clone(),
             terminal_publications: config.terminal_publications,
             terminal_ordinal: OnceLock::new(),
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::new(config.live_event_capacity),
+            events: LiveEventOwner::with_budget(
+                config.live_event_capacity,
+                config.retention_budget.event_budget(),
+            ),
             retention_budget: config.retention_budget,
         });
         let run = Self::register_retention(run);
@@ -3744,6 +4201,7 @@ impl Run {
         let wait_run = Arc::clone(pending_publication.run());
         let wait_target = target;
         let wait_ready = ready_tx;
+        let discovery_bytes = config.discovery_bytes;
         let (child_tx, child_rx) = mpsc::sync_channel(0);
         let waiter_guard = config
             .qualification_stats
@@ -3769,14 +4227,18 @@ impl Run {
                     &wait_ready,
                     &completion_tx,
                     control_pid,
+                    &TmuxTerminationContext {
+                        target: &wait_target,
+                        socket_identity,
+                        discovery_bytes,
+                    },
                 );
             })
             .map_err(|error| backend_protocol_error("start tmux control waiter", error))?;
         let child = pending.take_child();
         if let Err(error) = child_tx.send(child) {
             let mut child = error.0;
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.terminate_and_reap();
             return Err(backend_protocol_error(
                 "handoff tmux control child",
                 "waiter stopped before taking ownership",
@@ -3836,6 +4298,27 @@ impl Run {
         qualification_stats: QualificationStats,
         retention_budget: RetentionBudget,
     ) -> Arc<Self> {
+        Self::recover_with_control(
+            recovered,
+            persistence,
+            live_event_capacity,
+            terminal_publications,
+            qualification_stats,
+            retention_budget,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_with_control(
+        recovered: RecoveredRun,
+        persistence: PersistentRun,
+        live_event_capacity: usize,
+        terminal_publications: TerminalPublicationOwner,
+        qualification_stats: QualificationStats,
+        retention_budget: RetentionBudget,
+        control: Option<RunControl>,
+    ) -> Arc<Self> {
         let terminal_ordinal = OnceLock::new();
         terminal_publications.recover(&terminal_ordinal);
         let run = Arc::new(Self {
@@ -3849,8 +4332,9 @@ impl Run {
             output: Mutex::new(OutputLog::from_replay(
                 recovered.replay,
                 retention_budget.clone(),
+                recovered.source_gap_after_byte,
             )),
-            incarnation_control: None,
+            incarnation_control: control,
             native_runs: None,
             persistence_mode: PersistenceMode::PersistentCapable,
             persistence_transition: Mutex::new(()),
@@ -3859,8 +4343,12 @@ impl Run {
             qualification_stats,
             terminal_publications,
             terminal_ordinal,
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::new(live_event_capacity),
+            events: LiveEventOwner::with_budget(
+                live_event_capacity,
+                retention_budget.event_budget(),
+            ),
             retention_budget,
         });
         Self::register_retention(run)
@@ -3965,6 +4453,7 @@ impl Run {
             output: Mutex::new(OutputLog::from_replay(
                 recovered.replay,
                 retention_budget.clone(),
+                recovered.source_gap_after_byte,
             )),
             incarnation_control: Some(RunControl::Native(native_control)),
             native_runs: Some(native_runs),
@@ -3975,8 +4464,12 @@ impl Run {
             qualification_stats,
             terminal_publications,
             terminal_ordinal,
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::new(live_event_capacity),
+            events: LiveEventOwner::with_budget(
+                live_event_capacity,
+                retention_budget.event_budget(),
+            ),
             retention_budget,
         });
         let run = Self::register_retention(run);
@@ -4010,7 +4503,37 @@ impl Run {
         Ok(run)
     }
 
+    fn resident_metadata_bytes(&self) -> u64 {
+        resident_metadata_parts(self.spec.as_ref(), &self.backend)
+    }
+
+    fn registry_metadata_bytes(&self, key: Option<&CreateOperationKey>) -> u64 {
+        registry_metadata_bytes(&self.info(), key)
+    }
+
+    fn release_closed_resources(&self) {
+        if self.is_running() {
+            return;
+        }
+        if let Some(RunControl::Native(control)) = &self.incarnation_control {
+            if let Ok(descriptors) = control.detach_closed_descriptors_after_owner_fence() {
+                drop(descriptors);
+                mutex_lock(&self.live_permit).take();
+            }
+        } else if self
+            .incarnation_control
+            .as_ref()
+            .is_none_or(|control| match control {
+                RunControl::Tmux(control) => control.closed_quiescence_result().is_ok(),
+                RunControl::Native(_) => false,
+            })
+        {
+            mutex_lock(&self.live_permit).take();
+        }
+    }
+
     fn info(&self) -> RunInfo {
+        self.release_closed_resources();
         // Read the native control cursor BEFORE taking `output`. That was the
         // one gratuitous edge here: `output -> native_control.state` exists
         // nowhere else in the daemon and nothing in this method needs the log
@@ -4175,6 +4698,65 @@ impl Run {
             .begin_stop()
     }
 
+    fn output_protected_from(&self) -> u64 {
+        if self.persistence_mode == PersistenceMode::MemoryOnly {
+            return u64::MAX;
+        }
+        mutex_lock(&self.persistence).active().map_or(0, |durable| {
+            if durable.is_failed() {
+                u64::MAX
+            } else {
+                durable.next_replay_start()
+            }
+        })
+    }
+
+    /// Protect unoffered output and pause only this PTY when storage falls
+    /// behind. Queue-space wakeups re-offer debt even if the child goes quiet.
+    fn output_has_unoffered(&self) -> bool {
+        self.persistence_mode == PersistenceMode::PersistentCapable
+            && mutex_lock(&self.output).latest_output_bytes() > self.output_protected_from()
+    }
+
+    fn prepare_output_read(&self) -> usize {
+        if self.persistence_mode == PersistenceMode::PersistentCapable {
+            let _transition = mutex_lock(&self.persistence_transition);
+            let durable = mutex_lock(&self.persistence).active().cloned();
+            if let Some(durable) = durable
+                && !durable.is_failed()
+                && durable.queue_has_room()
+            {
+                let replay = {
+                    let output = mutex_lock(&self.output);
+                    let from = durable.next_replay_start();
+                    (output.latest_output_bytes() > from).then(|| output.offer_replay(from))
+                };
+                if let Some(replay) = replay {
+                    durable.request_output_wake();
+                    let _accepted = durable.append(self.id, replay);
+                }
+            }
+        }
+        // Fund a whole native read quantum, rather than reclaiming one byte
+        // per poll turn at the cache ceiling. Small operator budgets use their
+        // actual positive capacity. Unoffered durable bytes remain protected.
+        let wanted = 8192.min(self.retention_budget.per_run_limit());
+        let protected = self.output_protected_from();
+        let output = mutex_lock(&self.output);
+        let unoffered = output.latest_output_bytes().saturating_sub(protected);
+        let per_run_available = self
+            .retention_budget
+            .per_run_limit()
+            .saturating_sub(usize::try_from(unoffered).unwrap_or(usize::MAX));
+        let reclaimable = usize::try_from(protected.saturating_sub(output.first_available_byte()))
+            .unwrap_or(usize::MAX);
+        let reclaimable = reclaimable.min(output.retained_bytes());
+        drop(output);
+        self.retention_budget
+            .available_for_read(self.id, wanted, reclaimable)
+            .min(per_run_available)
+    }
+
     fn record_output(&self, data: Vec<u8>) {
         if data.is_empty() {
             return;
@@ -4185,7 +4767,17 @@ impl Run {
                 let _transition = mutex_lock(&self.persistence_transition);
                 let (chunk, replay, running, persistence) = {
                     let mut output = mutex_lock(&self.output);
-                    let chunk = output.push(data);
+                    let protected = mutex_lock(&self.persistence).active().map_or(0, |durable| {
+                        if durable.is_failed() {
+                            u64::MAX
+                        } else {
+                            durable.next_replay_start()
+                        }
+                    });
+                    if protected == u64::MAX && output.source_gap_after_byte.is_none() {
+                        output.mark_source_gap();
+                    }
+                    let chunk = output.push_protected(data, protected);
                     let running = mutex_lock(&self.state).is_running();
                     let persistence = mutex_lock(&self.persistence).active().cloned();
                     // Skip the render entirely when the queue is already full.
@@ -4201,7 +4793,7 @@ impl Run {
                     // through renders from here and carries these bytes.
                     let replay = match persistence.as_ref() {
                         None => Some(output.replay(chunk.start_byte)),
-                        Some(durable) if durable.queue_has_room() => {
+                        Some(durable) if !durable.is_failed() && durable.queue_has_room() => {
                             // Render only what is actually outstanding: every
                             // byte past the newest ACCEPTED append. Normally
                             // that is this push alone, because the previous
@@ -4224,7 +4816,7 @@ impl Run {
                             // the actor's coalescing so each one pays its own
                             // fsync. Both effects deepen the queue that caused
                             // them.
-                            Some(output.replay(durable.next_replay_start()))
+                            Some(output.offer_replay(durable.next_replay_start()))
                         }
                         Some(_) => None,
                     };
@@ -4276,29 +4868,53 @@ impl Run {
         let Some(persistence) = mutex_lock(&self.persistence).active().cloned() else {
             return Ok(());
         };
-        let replay = {
-            let output = mutex_lock(&self.output);
-            let outstanding = persistence.next_replay_start();
-            if output.latest_output_bytes() <= outstanding {
-                return Ok(());
+        loop {
+            if persistence.is_failed() {
+                return Err(format!("Run {} persistence requires recovery", self.id));
             }
-            output.replay(outstanding)
-        };
-        if persistence.append_blocking(self.id, replay) {
-            Ok(())
-        } else {
-            Err(format!(
-                "Run {} could not offer its outstanding output before the handoff barrier",
-                self.id
-            ))
+            let replay = {
+                let output = mutex_lock(&self.output);
+                let outstanding = persistence.next_replay_start();
+                if output.latest_output_bytes() <= outstanding {
+                    return Ok(());
+                }
+                output.offer_replay(outstanding)
+            };
+            if !persistence.append_blocking(self.id, replay) {
+                return Err(format!(
+                    "Run {} could not offer output before handoff",
+                    self.id
+                ));
+            }
         }
     }
 
+    #[cfg(test)]
     fn subscribe(self: &Arc<Self>) -> (AttachmentGuard, LiveEventSubscription) {
+        self.try_subscribe().expect("test attachment is funded")
+    }
+
+    fn try_subscribe(
+        self: &Arc<Self>,
+    ) -> Result<(AttachmentGuard, LiveEventSubscription), ProtocolError> {
         // Publish checks the attachment count before taking this same lock.
         // Taking the lock first closes the count-to-subscription race: once
         // publishers can observe the new attachment, its receiver exists.
         let mut event_state = mutex_lock(&self.events.state);
+        if event_state.sender.is_none() {
+            // Tokio broadcast uses a power-of-two boxed ring of Mutex<Slot<T>>;
+            // Slot owns remaining receivers, position and Option<T>. Shared
+            // control/allocator headers have an additional 1 KiB reservation.
+            let slots = self.events.capacity.next_power_of_two();
+            let bytes = slots
+                .saturating_mul(std::mem::size_of::<
+                    Mutex<(AtomicUsize, u64, Option<LiveRunEvent>)>,
+                >())
+                .saturating_add(1024);
+            event_state.ring_memory = Some(self.events.budget.reserve(bytes).ok_or_else(|| ProtocolError::new(
+                ErrorCode::BackendUnavailable, "live event buffer policy exhausted; increase live_event_bytes or release an attachment",
+            ))?);
+        }
         self.attachments.fetch_add(1, Ordering::AcqRel);
         let receiver = event_state
             .sender
@@ -4319,15 +4935,45 @@ impl Run {
             run: Arc::clone(self),
             _qualification_guard: qualification_guard,
         };
-        (guard, subscription)
+        Ok((guard, subscription))
     }
 
-    fn attachment_snapshot(&self, after_byte: u64) -> AttachedSnapshot {
-        let replay = mutex_lock(&self.output).replay(after_byte);
-        AttachedSnapshot {
-            run: self.info(),
-            replay,
+    async fn attachment_snapshot(
+        &self,
+        after_byte: u64,
+    ) -> Result<AttachedSnapshot, persistence::PersistenceError> {
+        let replay = self.attachment_replay_page(after_byte, u64::MAX).await?;
+        let mut run = self.info();
+        run.latest_output_bytes = replay.latest_output_bytes;
+        run.first_available_byte = replay.first_available_byte;
+        Ok(AttachedSnapshot { run, replay })
+    }
+
+    async fn attachment_replay_page(
+        &self,
+        after: u64,
+        through: u64,
+    ) -> Result<OutputReplay, persistence::PersistenceError> {
+        let (floor, head) = {
+            let output = mutex_lock(&self.output);
+            (
+                output.first_available_byte(),
+                output.latest_output_bytes().min(through),
+            )
+        };
+        let durable = mutex_lock(&self.persistence).active().cloned();
+        if after < floor
+            && let Some(durable) = durable
+        {
+            let mut page = durable
+                .read_replay_page(self.id, after, floor.min(head))
+                .await?;
+            if !page.chunks.is_empty() {
+                page.latest_output_bytes = head;
+                return Ok(page);
+            }
         }
+        Ok(mutex_lock(&self.output).replay_page(after, head))
     }
 
     fn publish_event(&self, event: RunEvent) {
@@ -4492,6 +5138,9 @@ impl Run {
                 panic!("persistent Run installs one committed binding")
             }
         };
+        if let Some(native) = &self.native_runs {
+            persistence.register_output_wake(native.owner_wake());
+        }
         *binding = PersistenceBinding::CommittedPendingActivation {
             durable: persistence,
             terminal,
@@ -4501,7 +5150,7 @@ impl Run {
     /// Activate output durability only after the Run and exact key are public.
     fn activate_persistence_after_publication(&self) {
         let _transition = mutex_lock(&self.persistence_transition);
-        let replay = mutex_lock(&self.output).replay(0);
+        let replay = mutex_lock(&self.output).durable_replay(0);
         let (persistence, terminal) = {
             let mut binding = mutex_lock(&self.persistence);
             let (durable, terminal) =
@@ -4519,6 +5168,7 @@ impl Run {
             (durable, terminal)
         };
         if let Some(terminal) = terminal {
+            persistence.mark_source_gap(mutex_lock(&self.output).source_gap_after_byte);
             persistence.finalize(
                 self.id,
                 self.pid.expect("native Run has a child PID"),
@@ -4560,7 +5210,11 @@ impl Run {
                 }
             }
         };
-        let replay = mutex_lock(&self.output).replay(0);
+        let replay = {
+            let output = mutex_lock(&self.output);
+            persistence.mark_source_gap(output.source_gap_after_byte);
+            output.durable_replay(0)
+        };
         persistence.finalize(
             self.id,
             self.pid.expect("native Run has a child PID"),
@@ -4727,7 +5381,7 @@ fn wait_for_tmux_control(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if Instant::now() >= next_target_poll {
-            if !tmux::socket_identity_matches(&target.socket_path, socket_identity) {
+            if tmux::socket_identity_changed(&target.socket_path, socket_identity) {
                 return TmuxWaitOutcome {
                     cause: TmuxWaitCause::SocketTargetChanged,
                     cleanup: terminate_tmux_control_child(child),
@@ -4742,14 +5396,14 @@ fn wait_for_tmux_control(
             }
             next_target_poll = Instant::now() + TARGET_POLL;
         }
-        match child.try_wait() {
-            Ok(Some(_)) => {
+        match child.exited_without_reaping() {
+            Ok(true) => {
                 return TmuxWaitOutcome {
                     cause: TmuxWaitCause::ChildExited,
-                    cleanup: Ok(()),
+                    cleanup: terminate_tmux_control_child(child),
                 };
             }
-            Ok(None) => {}
+            Ok(false) => {}
             Err(error) => {
                 return TmuxWaitOutcome {
                     cause: TmuxWaitCause::ChildStatusFailed(error.to_string()),
@@ -4770,6 +5424,7 @@ fn complete_tmux_control(
     ready: &mpsc::SyncSender<Result<(), ProtocolError>>,
     completion: &mpsc::SyncSender<Result<(), String>>,
     control_pid: u32,
+    context: &TmuxTerminationContext<'_>,
 ) {
     let (reader_termination, cleanup) = match output_done.recv_timeout(TMUX_OUTPUT_DRAIN_TIMEOUT) {
         Ok(termination) => (Some(termination), outcome.cleanup),
@@ -4788,13 +5443,52 @@ fn complete_tmux_control(
             ),
         ),
     };
-    let termination = resolve_tmux_termination(outcome.cause, reader_termination, control_pid);
+    let confirm_identity = reader_termination
+        .as_ref()
+        .is_some_and(|reader| reader.ready)
+        && matches!(
+            &outcome.cause,
+            TmuxWaitCause::ReaderTerminated
+                | TmuxWaitCause::ChildExited
+                | TmuxWaitCause::ProbeWriteFailed(_)
+        );
+    let mut termination = resolve_tmux_termination(outcome.cause, reader_termination, control_pid);
+    if confirm_identity && termination.reason == InterruptionReason::TmuxServerUnavailable {
+        match tmux::target_changed_after_control_loss(
+            context.target,
+            context.socket_identity,
+            Instant::now() + TMUX_DISCOVERY_TIMEOUT,
+            context.discovery_bytes,
+        ) {
+            Ok(true) => {
+                termination = tmux_control_failure(
+                    ProtocolError::new(
+                        ErrorCode::TargetChanged,
+                        "tmux target identity no longer exists after control loss",
+                    ),
+                    InterruptionReason::TmuxTargetChanged,
+                );
+            }
+            Err(error) if error.code == ErrorCode::TargetChanged => {
+                termination = tmux_control_failure(error, InterruptionReason::TmuxTargetChanged);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                termination
+                    .error
+                    .message
+                    .push_str("; target identity unconfirmed: ");
+                termination.error.message.push_str(&error.message);
+            }
+        }
+    }
     if let Some(RunControl::Tmux(control)) = &run.incarnation_control {
         control.close_writer();
     }
     let _ = ready.try_send(Err(termination.error));
     run.publish_interrupted(termination.reason);
     let _ = completion.send(cleanup);
+    run.release_closed_resources();
 }
 
 fn resolve_tmux_termination(
@@ -4807,6 +5501,12 @@ fn resolve_tmux_termination(
             .map_or_else(
                 || fallback_tmux_termination(cause, control_pid),
                 |termination| termination.failure,
+            ),
+        cause @ TmuxWaitCause::ProbeWriteFailed(_) => reader
+            .filter(|reader| reader.failure.reason != InterruptionReason::TmuxServerUnavailable)
+            .map_or_else(
+                || fallback_tmux_termination(cause, control_pid),
+                |reader| reader.failure,
             ),
         cause => fallback_tmux_termination(cause, control_pid),
     }
@@ -4871,34 +5571,7 @@ const fn interruption_error_code(reason: InterruptionReason) -> ErrorCode {
 }
 
 fn terminate_tmux_control_child(child: &mut tmux::ObservedControl) -> Result<(), String> {
-    let status_error = match child.try_wait() {
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => None,
-        Err(error) => Some(error),
-    };
-
-    let kill_error = child.kill().err();
-    let wait_error = child.wait().err();
-    match (kill_error, wait_error) {
-        (None | Some(_), None) => Ok(()),
-        (kill_error, Some(wait_error)) => {
-            let mut failures = Vec::new();
-            if let Some(status_error) = status_error {
-                failures.push(format!(
-                    "failed to query tmux Control Mode client before termination: {status_error}"
-                ));
-            }
-            if let Some(kill_error) = kill_error {
-                failures.push(format!(
-                    "failed to terminate tmux Control Mode client: {kill_error}"
-                ));
-            }
-            failures.push(format!(
-                "failed to reap tmux Control Mode client: {wait_error}"
-            ));
-            Err(failures.join("; "))
-        }
-    }
+    child.terminate_and_reap()
 }
 
 fn combine_cleanup_failure(existing: Result<(), String>, failure: &str) -> Result<(), String> {
@@ -4973,7 +5646,10 @@ fn read_tmux_output(
             break failure;
         }
     };
-    TmuxReaderTermination { failure }
+    TmuxReaderTermination {
+        failure,
+        ready: readiness.ready,
+    }
 }
 
 #[derive(Default)]
@@ -5198,6 +5874,7 @@ impl Drop for AttachmentGuard {
         let mut state = mutex_lock(&self.run.events.state);
         if self.run.attachments.load(Ordering::Acquire) == 0 {
             state.sender.take();
+            state.ring_memory.take();
         }
     }
 }
@@ -5211,8 +5888,14 @@ impl Drop for AttachmentGuard {
 /// every reclamation path — ordinary drop, Registry collection/replacement, and
 /// the explicit `remove` verb — decrements the total for free, with no separate
 /// accounting hook to keep in sync.
+// Bounds cache extent overhead and fits worst-case JSON byte inflation in one frame.
+const REPLAY_CACHE_BLOCK_BYTES: usize = 64 * 1024;
+
 struct OutputLog {
     chunks: VecDeque<OutputChunk>,
+    // Logical head inside the first block. Advancing it avoids repeatedly
+    // copying a 64 KiB block under small writes while retaining the exact suffix.
+    front_skip: usize,
     retained_bytes: usize,
     latest_output_bytes: u64,
     source_gap_after_byte: Option<u64>,
@@ -5225,6 +5908,7 @@ impl OutputLog {
     fn new(budget: RetentionBudget) -> Self {
         Self {
             chunks: VecDeque::new(),
+            front_skip: 0,
             retained_bytes: 0,
             latest_output_bytes: 0,
             source_gap_after_byte: None,
@@ -5235,6 +5919,7 @@ impl OutputLog {
     fn with_initial_truncation(budget: RetentionBudget) -> Self {
         Self {
             chunks: VecDeque::new(),
+            front_skip: 0,
             retained_bytes: 0,
             latest_output_bytes: 0,
             source_gap_after_byte: Some(0),
@@ -5242,7 +5927,7 @@ impl OutputLog {
         }
     }
 
-    fn from_replay(replay: OutputReplay, budget: RetentionBudget) -> Self {
+    fn from_replay(replay: OutputReplay, budget: RetentionBudget, source_gap: Option<u64>) -> Self {
         let retained_bytes = replay.chunks.iter().map(|chunk| chunk.data.len()).sum();
         // Recovered bytes are live retained payload the moment they load, so
         // they count against the budget exactly as freshly pushed bytes do.
@@ -5250,8 +5935,12 @@ impl OutputLog {
         Self {
             retained_bytes,
             chunks: replay.chunks.into(),
+            front_skip: 0,
             latest_output_bytes: replay.latest_output_bytes,
-            source_gap_after_byte: None,
+            source_gap_after_byte: source_gap.or_else(|| {
+                (replay.truncated && replay.first_available_byte == 0)
+                    .then_some(replay.latest_output_bytes)
+            }),
             budget,
         }
     }
@@ -5262,6 +5951,10 @@ impl OutputLog {
     }
 
     fn push(&mut self, data: Vec<u8>) -> OutputChunk {
+        self.push_protected(data, u64::MAX)
+    }
+
+    fn push_protected(&mut self, data: Vec<u8>, protected: u64) -> OutputChunk {
         assert!(
             !data.is_empty(),
             "output chunks must contain at least one byte"
@@ -5278,43 +5971,53 @@ impl OutputLog {
         self.latest_output_bytes = end_byte;
         self.retained_bytes = self.retained_bytes.saturating_add(chunk.data.len());
         self.budget.add(chunk.data.len());
-        self.chunks.push_back(chunk.clone());
-        // Per-Run cap: an individual Run never retains more than 4 MiB of its
-        // own scrollback. This is the first, cheapest line of defense and the
-        // one the frozen reliability contract measures; the daemon-wide budget
-        // sits above it and only reclaims across Runs under aggregate pressure.
-        while self.retained_bytes > OUTPUT_RETENTION_BYTES && self.chunks.len() > 1 {
-            if let Some(evicted) = self.chunks.pop_front() {
-                self.retained_bytes = self.retained_bytes.saturating_sub(evicted.data.len());
-                self.budget.sub(evicted.data.len());
+        for (index, data) in chunk.data.chunks(REPLAY_CACHE_BLOCK_BYTES).enumerate() {
+            let start_byte = chunk.start_byte + (index * REPLAY_CACHE_BLOCK_BYTES) as u64;
+            let end_byte = start_byte + data.len() as u64;
+            if let Some(tail) = self.chunks.back_mut().filter(|tail| {
+                tail.end_byte == start_byte
+                    && tail.data.len() + data.len() <= REPLAY_CACHE_BLOCK_BYTES
+            }) {
+                tail.data.extend_from_slice(data);
+                tail.end_byte = end_byte;
+            } else {
+                self.chunks.push_back(OutputChunk {
+                    start_byte,
+                    end_byte,
+                    data: data.to_vec(),
+                });
             }
         }
+        let excess = self
+            .retained_bytes
+            .saturating_sub(self.budget.per_run_limit());
+        let reclaimable = usize::try_from(protected.saturating_sub(self.first_available_byte()))
+            .unwrap_or(usize::MAX);
+        self.trim_front_bounded(excess, reclaimable);
         chunk
     }
 
-    /// Trim oldest chunks until at least `drop_at_least` bytes are shed or only
-    /// one chunk remains, decrementing the shared budget as it goes. Returns the
-    /// bytes actually reclaimed.
-    ///
-    /// This is the *same* front-pop mechanic `push` uses for the per-Run 4 MiB
-    /// cap — only the trigger differs (aggregate pressure, not this Run's own
-    /// overrun). It therefore inherits that mechanic's safety: it removes only
-    /// already-recorded history (for a persistent Run every chunk was durably
-    /// enqueued at push time, so trimming memory never loses durability), it
-    /// only advances `first_available_byte` forward (never rewinding a cursor),
-    /// and it never empties the log below its final chunk, so
-    /// `latest_output_bytes` and the replay cursor stay monotonic. A client
-    /// observes the ordinary `truncated = true` replay signal, identical to a
-    /// per-Run overrun.
-    fn trim_front(&mut self, drop_at_least: usize) -> usize {
+    /// Trim exactly the requested reclaimable prefix, even inside a block.
+    /// Only offered persistent bytes can be reclaimed. Emptying a window never
+    /// rewinds its independently stored lifetime head. A partially consumed
+    /// block keeps at most one 64 KiB allocation until fully consumed; no copy
+    /// per tiny trim and no over-eviction to satisfy an allocation boundary.
+    fn trim_front_bounded(&mut self, drop_at_least: usize, maximum: usize) -> usize {
         let mut freed = 0;
-        while freed < drop_at_least && self.chunks.len() > 1 {
-            if let Some(evicted) = self.chunks.pop_front() {
-                let bytes = evicted.data.len();
-                self.retained_bytes = self.retained_bytes.saturating_sub(bytes);
-                self.budget.sub(bytes);
-                freed += bytes;
+        while freed < drop_at_least && freed < maximum {
+            let Some(evicted) = self.chunks.pop_front() else {
+                break;
+            };
+            let skipped = std::mem::take(&mut self.front_skip);
+            let available = evicted.data.len() - skipped;
+            let bytes = available.min(drop_at_least - freed).min(maximum - freed);
+            if bytes < available {
+                self.front_skip = skipped + bytes;
+                self.chunks.push_front(evicted);
             }
+            self.retained_bytes -= bytes;
+            self.budget.sub(bytes);
+            freed += bytes;
         }
         freed
     }
@@ -5328,7 +6031,64 @@ impl OutputLog {
     }
 
     fn first_available_byte(&self) -> u64 {
-        self.chunks.front().map_or(0, |chunk| chunk.start_byte)
+        self.chunks
+            .front()
+            .map_or(self.latest_output_bytes, |chunk| {
+                chunk.start_byte + self.front_skip as u64
+            })
+    }
+
+    fn replay_page(&self, after_byte: u64, through: u64) -> OutputReplay {
+        // A work unit fits worst-case JSON byte inflation inside MAX_FRAME_BYTES.
+        let first = after_byte.max(self.first_available_byte());
+        let last = through.min(first.saturating_add(64 * 1024));
+        let mut replay = OutputReplay {
+            chunks: Vec::new(),
+            first_available_byte: self.first_available_byte(),
+            latest_output_bytes: through.min(self.latest_output_bytes()),
+            truncated: after_byte < self.first_available_byte()
+                || self
+                    .source_gap_after_byte
+                    .is_some_and(|gap| after_byte <= gap),
+        };
+        for chunk in &self.chunks {
+            let start = chunk.start_byte.max(first);
+            let end = chunk.end_byte.min(last);
+            if start < end {
+                replay.chunks.push(OutputChunk {
+                    start_byte: start,
+                    end_byte: end,
+                    data: chunk.data[usize::try_from(start - chunk.start_byte)
+                        .expect("slice offset fits its allocated chunk")
+                        ..usize::try_from(end - chunk.start_byte)
+                            .expect("slice end fits its allocated chunk")]
+                        .to_vec(),
+                });
+            }
+        }
+        replay
+    }
+
+    // Cache eviction is not durable retention. Persistence already owns every
+    // offered prefix; only the actor's disk policy may change its history floor.
+    fn durable_replay(&self, after_byte: u64) -> OutputReplay {
+        let mut replay = self.replay(after_byte);
+        replay.first_available_byte = 0;
+        replay.truncated = self.source_gap_after_byte.is_some();
+        replay
+    }
+
+    // Bound one asynchronous append's copy to the same 64 KiB replay work unit.
+    // The offered watermark advances only through bytes actually in this page.
+    fn offer_replay(&self, after_byte: u64) -> OutputReplay {
+        let mut replay = self.replay_page(after_byte, self.latest_output_bytes());
+        replay.first_available_byte = 0;
+        replay.truncated = self.source_gap_after_byte.is_some();
+        replay.latest_output_bytes = replay
+            .chunks
+            .last()
+            .map_or(after_byte, |chunk| chunk.end_byte);
+        replay
     }
 
     fn replay(&self, after_byte: u64) -> OutputReplay {
@@ -5337,7 +6097,7 @@ impl OutputLog {
             chunks: self
                 .chunks
                 .iter()
-                .filter_map(|chunk| retained_after(chunk, after_byte))
+                .filter_map(|chunk| retained_after(chunk, after_byte.max(first_available_byte)))
                 .collect(),
             first_available_byte,
             latest_output_bytes: self.latest_output_bytes(),
@@ -5359,6 +6119,77 @@ impl Drop for OutputLog {
     fn drop(&mut self) {
         self.budget.sub(self.retained_bytes);
     }
+}
+
+pub(crate) const fn resident_run_owner_bytes() -> u64 {
+    (std::mem::size_of::<Run>()
+        + native_control::resident_control_owner_bytes()
+        + native_runtime::resident_runtime_owner_bytes()
+        + creation::registry_owner_bytes()) as u64
+}
+
+/// Resident variable-size owners, separate from serialized durable accounting.
+/// Vec capacity includes spare slots. The `BTreeMap` charge reserves nodes
+/// at minimum occupancy (headers/edges included), covering sparse nodes
+/// without turning an argument count into a product capability limit.
+pub(crate) fn resident_spec_bytes(spec: &RunSpec) -> u64 {
+    let strings = spec.program.capacity()
+        + spec.cwd.as_ref().map_or(0, String::capacity)
+        + spec.args.iter().map(String::capacity).sum::<usize>()
+        + spec
+            .env
+            .iter()
+            .map(|(key, value)| key.capacity() + value.capacity())
+            .sum::<usize>()
+        + spec
+            .declared_inputs
+            .iter()
+            .map(|input| input.reference.capacity())
+            .sum::<usize>();
+    let vectors = spec.args.capacity() * std::mem::size_of::<String>()
+        + spec.declared_inputs.capacity()
+            * std::mem::size_of::<ctxmux_protocol::RunInputReference>();
+    // std BTreeMap nodes hold eleven key/value slots and twelve edges;
+    // non-root nodes have at least five entries. Round up for the root.
+    let map_nodes = spec.env.len().div_ceil(5)
+        * (11 * std::mem::size_of::<(String, String)>() + 14 * std::mem::size_of::<usize>());
+    (strings + vectors + map_nodes) as u64
+}
+
+pub(crate) fn resident_run_metadata_bytes(info: &RunInfo) -> u64 {
+    resident_metadata_parts(info.spec.as_ref(), &info.backend)
+}
+
+fn resident_metadata_parts(spec: Option<&RunSpec>, backend: &RunBackend) -> u64 {
+    let spec = spec.map_or(0, resident_spec_bytes);
+    let backend = match backend {
+        RunBackend::Native => 0,
+        RunBackend::Tmux {
+            socket_path,
+            session_id,
+            window_id,
+            pane_id,
+            tmux_version,
+            ..
+        } => {
+            (socket_path.capacity()
+                + session_id.capacity()
+                + window_id.capacity()
+                + pane_id.capacity()
+                + tmux_version.capacity()) as u64
+        }
+    };
+    spec + backend
+}
+
+fn registry_metadata_bytes(info: &RunInfo, key: Option<&CreateOperationKey>) -> u64 {
+    // Serialized variable-size Run metadata plus the retained Rust owner and
+    // lifecycle state reservation; output and control queues have byte owners.
+    resident_run_metadata_bytes(info)
+        + (serde_json::to_vec(info).expect("RunInfo serializes").len()
+            + key.map_or(0, |key| key.as_str().len())
+            + usize::try_from(resident_run_owner_bytes()).expect("owner type sizes fit host")
+            + 128) as u64
 }
 
 fn retained_after(chunk: &OutputChunk, after_byte: u64) -> Option<OutputChunk> {
@@ -5844,7 +6675,7 @@ fn clamp_list_limit(limit: Option<u32>) -> usize {
 
 async fn send(
     wire: &mut Framed<UnixStream, LinesCodec>,
-    frame: &ServerFrame,
+    frame: &impl serde::Serialize,
 ) -> Result<(), ConnectionError> {
     wire.send(encode_frame(frame)?).await?;
     Ok(())
@@ -5960,7 +6791,7 @@ mod tests {
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep, LiveRunEvent,
+        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep,
         NativeRuntimeOwner, NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
         PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode, RecoveredRun,
         Run, RunManager, ServerError, ServerFrame, TMUX_DISCOVERY_TIMEOUT,
@@ -6401,6 +7232,7 @@ mod tests {
 
         let run_id = RunId::new();
         let recovered = RecoveredRun {
+            source_gap_after_byte: None,
             operation_key: CreateOperationKey::new("readopt-fixture")
                 .expect("valid readopt operation key"),
             info: RunInfo {
@@ -6978,6 +7810,7 @@ mod tests {
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
             events: super::LiveEventOwner::new(1),
             retention_budget: crate::retention::RetentionBudget::production(),
@@ -7148,12 +7981,17 @@ mod tests {
             reason: InterruptionReason::TmuxProtocolError,
         };
 
-        for cause in [TmuxWaitCause::ReaderTerminated, TmuxWaitCause::ChildExited] {
+        for cause in [
+            TmuxWaitCause::ReaderTerminated,
+            TmuxWaitCause::ChildExited,
+            TmuxWaitCause::ProbeWriteFailed("broken pipe".to_owned()),
+        ] {
             assert_eq!(
                 resolve_tmux_termination(
                     cause,
                     Some(TmuxReaderTermination {
                         failure: observed.clone(),
+                        ready: true,
                     }),
                     42,
                 ),
@@ -7165,6 +8003,7 @@ mod tests {
     #[test]
     fn tmux_owner_causes_are_not_overwritten_by_cleanup_eof() {
         let cleanup_eof = TmuxReaderTermination {
+            ready: true,
             failure: TmuxTermination {
                 error: ProtocolError::new(
                     ErrorCode::BackendUnavailable,
@@ -7459,6 +8298,16 @@ mod tests {
                 task,
             }
         }
+
+        async fn abort_and_wait(mut self) {
+            self.task.abort();
+            assert!(
+                (&mut self.task)
+                    .await
+                    .is_err_and(|error| error.is_cancelled()),
+                "fixture listener must release its owner before cold reopening"
+            );
+        }
     }
 
     impl Drop for InProcessServer {
@@ -7550,6 +8399,266 @@ mod tests {
         assert_eq!(conflict.error.code, ErrorCode::StopOperationConflict);
         assert_eq!(conflict.disposition, CommandDisposition::NotApplied);
         wait_for_exit(&server.client, run.id).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_attach_completes_an_empty_retained_window_without_extra_frames() {
+        let resources = super::ResourceLimits {
+            hot_output_bytes: 1,
+            run_output_bytes: 1,
+            ..super::ResourceLimits::DEFAULT
+        };
+        let manager = Arc::new(RunManager::with_instance_stats_and_resources(
+            ctxmux_protocol::DaemonInstanceId::new(),
+            super::QualificationStats::default(),
+            resources,
+        ));
+        let server = InProcessServer::start(manager);
+        let first = server.client.start(long_running_spec()).await.unwrap();
+        let second = server.client.start(long_running_spec()).await.unwrap();
+        server
+            .manager
+            .get(first.id)
+            .unwrap()
+            .record_output(b"abcdef".to_vec());
+        server
+            .manager
+            .get(second.id)
+            .unwrap()
+            .record_output(b"z".to_vec());
+        let (attachment, snapshot) =
+            tokio::time::timeout(Duration::from_secs(5), server.client.attach(first.id, 0))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.replay.first_available_byte, 6);
+        assert_eq!(snapshot.replay.latest_output_bytes, 6);
+        assert!(snapshot.replay.chunks.is_empty());
+        assert!(snapshot.replay.truncated);
+        attachment.detach().await.unwrap();
+        for id in [first.id, second.id] {
+            server.manager.get(id).unwrap().stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latched_persistence_refuses_upgrade_before_extract_and_keeps_public_controls() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = super::Persistence::open(&state_dir).unwrap();
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let first = server.client.start(long_running_spec()).await.unwrap();
+        persistence.fail_next_insert_after_commit();
+        assert!(server.client.start(long_running_spec()).await.is_err());
+        assert!(persistence.is_failed());
+        let listener = tokio::net::UnixListener::bind(temp.path().join("upgrade.sock")).unwrap();
+        assert!(matches!(
+            super::perform_exec_upgrade(
+                &server.directory.path().join("ctxmux.sock"),
+                &state_dir,
+                &listener,
+                &server.manager,
+                &Arc::new(super::UpgradeCancellation::default())
+            ),
+            Err(super::UpgradeAbort::BeforeExtract(super::ServerError::Shutdown { failures }))
+                if failures == "durable state requires recovery; live ownership was preserved"
+        ));
+        assert!(
+            server
+                .client
+                .status(first.id)
+                .await
+                .unwrap()
+                .state
+                .is_running()
+        );
+        assert!(process_exists(first.pid.unwrap()));
+        let (attachment, _) = server.client.attach(first.id, 0).await.unwrap();
+        server
+            .client
+            .input(first.id, b"still-owned\n".to_vec())
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(5), attachment.next_event())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, RunEvent::Output { .. }));
+        attachment.detach().await.unwrap();
+        server.manager.get(first.id).unwrap().stop().await.unwrap();
+    }
+
+    #[test]
+    fn upgrade_storage_pressure_subprocess() {
+        let Some(directory) = std::env::var_os("CTXMUX_TEST_UPGRADE_PRESSURE_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (persistence, recovered) =
+                    super::Persistence::open(directory.join("state")).unwrap();
+                if std::env::var_os("CTXMUX_TEST_UPGRADE_BEFORE_EXEC").is_none() {
+                    persistence.force_append_storage_full();
+                }
+                let manager = Arc::new(RunManager::persistent(persistence, recovered));
+                let socket = directory.join("sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                super::serve_with_manager(
+                    socket,
+                    listener,
+                    manager,
+                    None,
+                    None,
+                    Some(directory.join("state")),
+                )
+                .await
+                .unwrap();
+            });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_sighup_storage_wait_remains_ctrl_c_cancellable_after_extract() {
+        signal_upgrade_cancellation(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_ctrl_c_after_durable_upgrade_barrier_prevents_exec() {
+        signal_upgrade_cancellation(true).await;
+    }
+
+    async fn signal_upgrade_cancellation(after_barrier: bool) {
+        struct ProcessGuard(std::process::Child);
+        impl Drop for ProcessGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("extracted");
+        let before_exec = temp.path().join("before-exec");
+        let target = ctxmux_test_support::fixture_executable();
+        let log = fs::File::create(temp.path().join("daemon.log")).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        if after_barrier {
+            command.env("CTXMUX_TEST_UPGRADE_BEFORE_EXEC", &before_exec);
+        }
+        let mut child = ProcessGuard(
+            command
+                .args([
+                    "--exact",
+                    "tests::upgrade_storage_pressure_subprocess",
+                    "--nocapture",
+                ])
+                .env("CTXMUX_TEST_UPGRADE_PRESSURE_DIR", temp.path())
+                .env("CTXMUX_TEST_UPGRADE_EXTRACTED", &marker)
+                .env("CTXMUX_TEST_UPGRADE_TARGET", target)
+                .env(
+                    "CTXMUX_FIXTURE_HANDOFF_SCHEMA",
+                    super::handoff::HANDOFF_SCHEMA,
+                )
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let client = Client::new(temp.path().join("sock"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.ping().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let run = client.start(long_running_spec()).await.unwrap();
+        client.input(run.id, b"pressure\n".to_vec()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.status(run.id).await.unwrap().latest_output_bytes == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let pid = rustix::process::Pid::from_raw(i32::try_from(child.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(if after_barrier { &before_exec } else { &marker }).exists() {
+                assert!(child.0.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "upgrade did not reach extraction: {error}; {}",
+                fs::read_to_string(temp.path().join("daemon.log")).unwrap()
+            )
+        });
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "durable barrier really waits under pressure"
+        );
+        rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Ctrl-C cancels a real post-extract storage wait");
+        assert!(
+            status.success(),
+            "{}",
+            fs::read_to_string(temp.path().join("daemon.log")).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_attach_accepts_retention_advancing_during_initial_replay() {
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterReplayPage);
+        let info = server.client.start(long_running_spec()).await.unwrap();
+        let run = server.manager.get(info.id).unwrap();
+        run.record_output(vec![b'a'; 192 * 1024]);
+        let client = server.client.clone();
+        let attaching = tokio::spawn(async move { client.attach(info.id, 0).await });
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Actual native child remains daemon-owned while this client is paused.
+        // Advance beyond the captured head using normal-sized output pieces.
+        for _ in 0..64 {
+            run.record_output(vec![b'b'; 64 * 1024]);
+        }
+        hook.release.notify_one();
+        let (attachment, snapshot) = attaching
+            .await
+            .unwrap()
+            .expect("forward window movement is an explicit replay fact");
+        assert_eq!(snapshot.replay.first_available_byte, 192 * 1024);
+        assert_eq!(snapshot.replay.latest_output_bytes, 192 * 1024);
+        assert!(snapshot.replay.truncated);
+        assert!(
+            snapshot.replay.chunks.is_empty(),
+            "a partial old prefix cannot masquerade as the available suffix"
+        );
+        assert!(run.info().state.is_running());
+        assert!(process_exists(info.pid.unwrap()));
+        attachment.detach().await.unwrap();
+        run.stop().await.unwrap();
+        wait_for_exit(&server.client, info.id).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7981,6 +9090,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one dropped-offer fixture verifies both durable count and exact recovered bytes"
+    )]
     fn record_output_survives_a_dropped_append_without_losing_bytes() {
         // `Run::record_output` is allowed to DROP an append when the persistence
         // actor is behind — that is what stops one slow fsync from stalling the
@@ -8029,6 +9142,7 @@ mod tests {
             .durable;
 
         let recovered = RecoveredRun {
+            source_gap_after_byte: None,
             operation_key,
             info,
             replay: OutputReplay {
@@ -8110,6 +9224,17 @@ mod tests {
             "every byte must reach the disk despite thousands of dropped \
              appends; a short count means the offer was a delta, not a catch-up"
         );
+        let mut expected_bytes = b"alpha".to_vec();
+        expected_bytes.extend(std::iter::repeat_n(b'x', 2 * 1024));
+        expected_bytes.extend_from_slice(b"omegatail");
+        assert_eq!(
+            row.replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            expected_bytes
+        );
         drop(reopened);
     }
 
@@ -8165,6 +9290,7 @@ mod tests {
             .durable;
         let run = Run::recover(
             RecoveredRun {
+                source_gap_after_byte: None,
                 operation_key,
                 info,
                 replay: OutputReplay {
@@ -8320,6 +9446,7 @@ mod tests {
             .durable;
         let run = Run::recover(
             RecoveredRun {
+                source_gap_after_byte: None,
                 operation_key,
                 info,
                 replay: OutputReplay {
@@ -8422,6 +9549,7 @@ mod tests {
             .durable;
         let run = Run::recover(
             RecoveredRun {
+                source_gap_after_byte: None,
                 operation_key,
                 info,
                 replay: OutputReplay {
@@ -8623,70 +9751,57 @@ mod tests {
 
     #[test]
     fn replay_cursor_and_retention_boundaries_are_exact() {
-        // OR-002: retained ranges and truncation are caller-cursor relative.
+        // OR-002: exact retention and byte-cursor semantics, independent of
+        // private packing boundaries. Keep the same full 4 MiB + 1 workload.
         let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         let first_size = OUTPUT_RETENTION_BYTES / 2;
-        let second_size = OUTPUT_RETENTION_BYTES - first_size;
-        output.push(vec![b'a'; first_size]);
-        output.push(vec![b'b'; second_size]);
-
-        let exact_limit = output.replay(0);
-        assert!(!exact_limit.truncated);
-        assert_eq!(exact_limit.first_available_byte, 0);
+        let mut expected = vec![b'a'; first_size];
+        expected.extend(vec![b'b'; OUTPUT_RETENTION_BYTES - first_size]);
+        output.push(expected[..first_size].to_vec());
+        output.push(expected[first_size..].to_vec());
+        let exact = output.replay(0);
+        assert!(!exact.truncated);
+        assert_eq!(exact.first_available_byte, 0);
+        assert_eq!(exact.latest_output_bytes, OUTPUT_RETENTION_BYTES as u64);
         assert_eq!(
-            exact_limit.latest_output_bytes,
-            OUTPUT_RETENTION_BYTES as u64
-        );
-        assert_eq!(
-            exact_limit
+            exact
                 .chunks
                 .iter()
-                .map(|chunk| (chunk.start_byte, chunk.end_byte))
+                .flat_map(|chunk| &chunk.data)
+                .copied()
                 .collect::<Vec<_>>(),
-            vec![
-                (0, first_size as u64),
-                (first_size as u64, OUTPUT_RETENTION_BYTES as u64),
-            ]
+            expected
         );
-
         output.push(vec![b'c']);
+        expected.push(b'c');
         let evicted = output.replay(0);
         assert!(evicted.truncated);
-        assert_eq!(evicted.first_available_byte, first_size as u64);
+        assert_eq!(evicted.first_available_byte, 1);
         assert_eq!(
             evicted.latest_output_bytes,
             OUTPUT_RETENTION_BYTES as u64 + 1
         );
+        assert_eq!(output.retained_bytes(), OUTPUT_RETENTION_BYTES);
         assert_eq!(
             evicted
                 .chunks
                 .iter()
-                .map(|chunk| (chunk.start_byte, chunk.end_byte))
+                .flat_map(|chunk| &chunk.data)
+                .copied()
                 .collect::<Vec<_>>(),
-            vec![
-                (first_size as u64, OUTPUT_RETENTION_BYTES as u64),
-                (
-                    OUTPUT_RETENTION_BYTES as u64,
-                    OUTPUT_RETENTION_BYTES as u64 + 1
-                ),
-            ]
+            expected[1..]
         );
-
-        let immediately_before_oldest = output.replay(first_size as u64);
-        assert!(!immediately_before_oldest.truncated);
-        assert_eq!(immediately_before_oldest.chunks, evicted.chunks);
-        assert_eq!(
-            output
-                .replay(OUTPUT_RETENTION_BYTES as u64)
+        assert!(
+            evicted
                 .chunks
-                .iter()
-                .map(|chunk| (chunk.start_byte, chunk.end_byte))
-                .collect::<Vec<_>>(),
-            vec![(
-                OUTPUT_RETENTION_BYTES as u64,
-                OUTPUT_RETENTION_BYTES as u64 + 1
-            )]
+                .windows(2)
+                .all(|pair| pair[0].end_byte == pair[1].start_byte)
         );
+        assert!(!output.replay(1).truncated);
+        assert_eq!(output.replay(1).chunks, evicted.chunks);
+        let tail = output.replay(OUTPUT_RETENTION_BYTES as u64);
+        assert_eq!(tail.chunks[0].data, b"c");
+        assert_eq!(tail.chunks[0].start_byte, OUTPUT_RETENTION_BYTES as u64);
         assert!(
             output
                 .replay(OUTPUT_RETENTION_BYTES as u64 + 1)
@@ -8729,26 +9844,55 @@ mod tests {
     }
 
     #[test]
-    fn one_oversized_output_chunk_is_retained_as_an_honest_replay_unit() {
+    fn oversized_output_preserves_exact_tail_and_monotone_cursors() {
         let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
         let oversized = vec![0xa5; OUTPUT_RETENTION_BYTES + 1];
-        output.push(oversized.clone());
-
+        let live = output.push(oversized.clone());
+        assert_eq!(live.data, oversized);
         let replay = output.replay(0);
-        assert!(!replay.truncated);
-        assert_eq!(replay.first_available_byte, 0);
+        assert!(replay.truncated);
+        assert_eq!(replay.first_available_byte, 1);
         assert_eq!(replay.latest_output_bytes, oversized.len() as u64);
-        assert_eq!(replay.chunks[0].data, oversized);
-
-        output.push(vec![0x5a]);
-        let after_eviction = output.replay(0);
-        assert!(after_eviction.truncated);
-        assert_eq!(after_eviction.first_available_byte, oversized.len() as u64);
-        assert_eq!(
-            after_eviction.latest_output_bytes,
-            oversized.len() as u64 + 1
+        assert!(
+            replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| &chunk.data)
+                .copied()
+                .eq(oversized[1..].iter().copied()),
+            "packing boundaries cannot change the exact retained suffix"
         );
-        assert_eq!(after_eviction.chunks[0].data, vec![0x5a]);
+        assert_eq!(output.retained_bytes(), OUTPUT_RETENTION_BYTES);
+        output.push(vec![0x5a]);
+        let tail = output.replay(oversized.len() as u64);
+        assert!(!tail.truncated);
+        assert_eq!(tail.latest_output_bytes, oversized.len() as u64 + 1);
+        assert_eq!(tail.chunks[0].data, vec![0x5a]);
+    }
+
+    #[test]
+    fn tiny_prefix_trims_keep_exact_bytes_without_recopying_the_cache_block() {
+        let size = super::REPLAY_CACHE_BLOCK_BYTES;
+        let budget = crate::retention::RetentionBudget::with_limits((size * 2) as u64, size);
+        let mut output = OutputLog::new(budget.clone());
+        output.push(vec![b'a'; size]);
+        let allocation = output.chunks.front().unwrap().data.as_ptr();
+        for _ in 0..32 {
+            output.push(vec![b'b']);
+            assert_eq!(output.chunks.front().unwrap().data.as_ptr(), allocation);
+        }
+        let replay = output.replay(0);
+        assert_eq!(replay.first_available_byte, 32);
+        assert_eq!(output.retained_bytes(), size);
+        assert_eq!(budget.retained_total(), size as u64);
+        let bytes: Vec<_> = replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.data)
+            .copied()
+            .collect();
+        assert!(bytes[..size - 32].iter().all(|byte| *byte == b'a'));
+        assert_eq!(&bytes[size - 32..], vec![b'b'; 32]);
     }
 
     #[tokio::test]
@@ -8774,7 +9918,7 @@ mod tests {
                 .iter()
                 .map(|chunk| (chunk.start_byte, chunk.end_byte))
                 .collect::<Vec<_>>(),
-            vec![(0, 1), (1, 2), (2, 3), (3, 4)]
+            vec![(0, 4)]
         );
         assert_eq!(
             replay
@@ -8784,6 +9928,76 @@ mod tests {
                 .collect::<Vec<_>>(),
             b"abcd"
         );
+    }
+
+    #[tokio::test]
+    async fn broadcast_receivers_share_one_funded_payload_until_the_last_owner_drops() {
+        let bytes = super::EVENT_ALLOCATION_BYTES + 8;
+        let budget = crate::resources::ByteBudget::new(bytes as u64);
+        let owner = super::LiveEventOwner::with_budget(2, budget.clone());
+        let (sender, mut first) = tokio::sync::broadcast::channel(2);
+        let mut second = sender.subscribe();
+        mutex_lock(&owner.state).sender = Some(sender);
+        owner.publish(RunEvent::Output {
+            chunk: ctxmux_protocol::OutputChunk {
+                start_byte: 0,
+                end_byte: 8,
+                data: b"12345678".to_vec(),
+            },
+        });
+        let first = first.recv().await.unwrap();
+        let second = second.recv().await.unwrap();
+        assert!(
+            matches!((&first.published, &second.published),
+                (super::PublishedRunEvent::Funded(first), super::PublishedRunEvent::Funded(second))
+                if Arc::ptr_eq(first, second)),
+            "broadcast fanout must share payload and its lease"
+        );
+        assert!(budget.reserve(1).is_none());
+        drop(first);
+        assert!(budget.reserve(1).is_none());
+        drop(second);
+        assert!(
+            budget.reserve(bytes).is_some(),
+            "the last payload owner releases its bytes and envelope"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_event_envelopes_remain_funded_after_ring_eviction() {
+        let bytes = super::EVENT_ALLOCATION_BYTES;
+        let budget = crate::resources::ByteBudget::new(bytes as u64);
+        let owner = super::LiveEventOwner::with_budget(1, budget.clone());
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        mutex_lock(&owner.state).sender = Some(sender);
+        owner.publish(RunEvent::Resized {
+            size: TerminalSize::default(),
+        });
+        let held = receiver.recv().await.unwrap();
+        assert!(matches!(
+            held.published,
+            super::PublishedRunEvent::Funded(_)
+        ));
+        for _ in 0..3 {
+            owner.publish(RunEvent::Resized {
+                size: TerminalSize::default(),
+            });
+            let marker = receiver.recv().await.unwrap();
+            assert!(matches!(
+                marker.published,
+                super::PublishedRunEvent::ObservationDiscontinuity
+            ));
+            assert!(matches!(
+                marker.event().as_ref(),
+                RunEvent::ObservationDiscontinuity
+            ));
+            assert!(
+                budget.reserve(1).is_none(),
+                "held envelope keeps its lease after eviction"
+            );
+        }
+        drop(held);
+        assert!(budget.reserve(bytes).is_some());
     }
 
     #[test]
@@ -8804,12 +10018,12 @@ mod tests {
             latest_output_bytes: 7,
         });
         assert!(matches!(
-            first_events.receiver.try_recv(),
-            Ok(LiveRunEvent {
-                event: RunEvent::Gap {
-                    latest_output_bytes: 7
-                },
-                ..
+            first_events
+                .receiver
+                .try_recv()
+                .map(|envelope| envelope.event().into_owned()),
+            Ok(RunEvent::Gap {
+                latest_output_bytes: 7
             })
         ));
 
@@ -8855,6 +10069,7 @@ mod tests {
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
             terminal_publications: TerminalPublicationOwner::default(),
             terminal_ordinal: std::sync::OnceLock::new(),
+            live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
             events: super::LiveEventOwner::new(live_event_capacity),
             retention_budget: crate::retention::RetentionBudget::production(),

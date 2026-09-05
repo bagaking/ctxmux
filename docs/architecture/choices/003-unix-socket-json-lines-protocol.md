@@ -1,6 +1,6 @@
-# 003 — Unix socket and NDJSON protocol generation 15
+# 003 — Unix socket and NDJSON protocol generation 18
 
-- Status: accepted for generation 15; pre-stable
+- Status: accepted for generation 18; pre-stable
 - Scope: local transport, framing, handshake, and public error envelope
 
 ## Context
@@ -9,7 +9,7 @@ Rust and TypeScript clients need a simple local boundary that survives client re
 
 ## Decision
 
-Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The daemon operator still supplies the socket path to `ctxmuxd`. The first-party CLI may omit that path: it uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` or a process-temp fallback, and starts a sibling `ctxmuxd` when nothing is listening. Other clients, including the SDK, still select the socket explicitly and do not start the daemon. The daemon creates the socket with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
+Every connection uses one Unix domain socket and newline-delimited UTF-8 JSON frames. The daemon operator still supplies the socket path to `ctxmuxd`. The first-party CLI may omit that path: it uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` or a process-temp fallback, and starts a sibling `ctxmuxd` when nothing is listening. Ordinary clients select the socket explicitly and connect only; the SDK also exposes explicit connect-or-activate ownership through its activation helper. The daemon creates the socket with mode `0600`, refuses non-socket targets, checks whether an existing socket accepts connections, and removes only an inactive socket. Startup stale cleanup rechecks device/inode identity and performs a second live probe before unlink; an observed replacement returns `SocketTargetChanged` without removing it.
 
 The first frame is an exact protocol-generation handshake. A successful Hello
 returns one exact camelCase `RuntimeIdentity`: logical Runtime ID and explicit
@@ -18,7 +18,9 @@ OS and architecture, exact protocol generation, and a flat JavaScript-safe
 positive-integer capability record. Short-lived connections carry one request.
 Attachment connections carry one metadata snapshot header, bounded ordered
 replay-output frames through that header's replay head, then bidirectional
-control frames and live events. One encoded frame is limited to 1 MiB; total
+control frames and live events. A generation-18 `replay_window` frame may advance
+the retained floor during initial replay; clients discard partial old assembly
+and resume the newer contiguous suffix through the same captured head. One encoded frame is limited to 1 MiB; total
 retained replay is not required to fit in one frame.
 
 Optional capability requirements remain client-local. The only client
@@ -72,7 +74,11 @@ writable parent directory is not made safe by it. Malformed, invalid-UTF-8, or
 oversized frames can terminate the connection at the codec layer without a
 structured `InvalidRequest` frame.
 
-Protocol generation 15 directly replaces generation 14. It adds the `remove`
+The current pre-stable generation 18 directly replaces 17. It adds the explicit
+initial replay-window update when concurrent retention advances the floor;
+there is no live Gap cursor substitution or compatibility fallback. Generation
+17 names `RunSpec.initial_size`; generation 16 introduces thin paged List so fleet
+population does not need to fit in one frame. Generation 15 replaced generation 14. It adds the `remove`
 request and its `removed { id }` response so a client can reclaim one
 already-terminal, unpinned Run's retained record slot; the verb refuses a
 running Run with `invalid_run_state` and an attached, pinned, collecting, or

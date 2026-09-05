@@ -49,8 +49,10 @@ bytes. This avoids unbounded tombstones or a second identity owner. Empty
 recoverable input is rejected because it cannot leave cursor evidence after
 result eviction.
 
-The per-Run result ledger is bounded by both entry count and retained request
-bytes. Once a successful result is evicted, its original expected cursor is
+The per-Run result ledger is bounded by configured entry count and retained
+request bytes, additionally leased against the shared control-state budget.
+Duplicate lookup precedes new allocation admission. [Decision 019](019-resource-policy-and-honest-qualification.md)
+owns these operating points; a full budget refuses new work before effects. Once a successful result is evicted, its original expected cursor is
 necessarily behind the Run cursor, so replay fails closed rather than becoming
 a new operation. A partial write, flush failure after an uncertain write, or
 writer panic consumes or fences that operation, returns `unknown`, and poisons

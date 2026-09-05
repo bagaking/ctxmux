@@ -74,6 +74,12 @@ Control Mode transcript corruption has its own public failure meaning,
 `tmux_protocol_error`. A malformed escape, oversized record, invalid command
 block, or other framing violation after import is not reported as ordinary
 server unavailability.
+After a ready Control client exits naturally, EOF alone does not prove target
+loss. Bounded public discovery compares the original server epoch and complete
+pane association: a proven replacement, missing/dead pane or ambiguous linked
+association means `tmux_target_changed`; an intact target or unavailable query
+means `tmux_server_unavailable`. A missing socket is unavailability, not evidence
+of a replacement inode. A legitimate resize preserves identity.
 An empty LF or CRLF record remains a record rather than masquerading as EOF;
 EOF inside an open command block is transcript corruption. Adapter commands
 use one bounded serial tracker: at most one identity probe and one continue
@@ -89,7 +95,10 @@ daemon.
 ## Quality attributes and invariants
 
 - ctxmux client disconnect and daemon shutdown terminate only ctxmux-owned
-  Control Mode clients; they never kill the tmux pane, session, or server.
+  Control Mode clients and their helper process groups; they never kill the tmux
+  pane, session, or server. Control helpers start in an independent process group.
+  A non-reaping exit observation keeps the leader as the PGID anchor until group
+  termination; Linux subreaper adoption is drained only for that exact group.
 - Target replacement, relocation, respawn, death, and server loss are explicit
   public interruption or import errors.
 - Unsupported native semantics are capability-visible instead of emulated.

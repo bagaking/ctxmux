@@ -1,50 +1,19 @@
-// Measurement and verdict core for scripts/check-fleet-scale.sh.
-//
-// This is the acceptance half the repository was missing. Several scripts
-// already MEASURE fleet resource behaviour and emit tables; none renders a
-// pass/fail VERDICT. "The farm results" have therefore never existed as a
-// judgement, and no claim that large-scale behaviour was accepted is currently
-// supportable. This module makes the verdict exist: it derives thresholds from
-// farm-host observations with the same rules the darwin budget uses, then
-// compares fresh measurements against them and exits nonzero when they are not
-// met.
-//
-// It reuses the DERIVATION RULES of scripts/reliability-budget-contract.mjs by
-// importing deriveBudgetCeiling and deriveObservedMaxima. It does not edit that
-// module and does not touch its frozen COUNTS ["1","32","128"] — editing either
-// would rehash the measurement contract and invalidate every committed darwin
-// baseline bound to it (reliability-baseline-policy.mjs:834-843). This harness
-// keeps its OWN thresholds file and its OWN receipts, and never writes
-// reliability-budgets.json.
-//
-// Two disciplines are load-bearing and mirror the house precedent
-// (scripts/remote-cost-measure.mjs):
-//
-//   Fail loudly, never silently.  A fleet acceptance harness that reported a
-//   zero where it should have refused would accept a fleet it never measured.
-//   Every quantity that cannot be honestly produced is a refusal, not a zero,
-//   and --self-test proves each refusal fires. A tier the daemon will not admit
-//   (see the admission-cap note below) is a blocked precondition, reported as
-//   such, not an empty measurement.
-//
-//   Name the lane.  Every number says which host produced it and at which tier.
-//   The 128 tier overlaps the existing darwin gate on purpose: if the farm's
-//   128 numbers disagree with the darwin baseline on a per-Run structural cost,
-//   the cross-check refuses and names the direction, because the two directions
-//   have opposite remedies. Above the baseline means the daemon regressed or the
-//   harnesses measure different things, and the larger tiers cannot be trusted.
-//   Below it means the daemon got cheaper than the frozen baseline records, so
-//   the baseline is stale and no longer cross-checks anything. Both refuse; only
-//   one is a defect. That cross-check is emitted in the report, not buried here.
-//
-// HOST IDENTITY IS ENFORCED, NOT MERELY RECORDED. The darwin baseline records
-// os: darwin and never checks it, which is exactly how a darwin-derived
-// fds_per_run ceiling of 3.25 came to gate every Linux PR. This module refuses
-// a receipt whose host class does not match the thresholds it is checked
-// against.
+// Fleet observations are proposals, never a candidate's acceptance criteria.
+// Accept reads frozen thresholds and verifies workload, environment and source
+// identities. Smaller resource costs pass only with the full byte-exact work.
 
+import { execFileSync } from "node:child_process";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import process from "node:process";
 
 import {
@@ -65,13 +34,8 @@ const TIERS = [128, 512, 2048, 4000];
 /// The tier that overlaps the existing gate, singled out for the cross-check.
 const OVERLAP_TIER = 128;
 
-/// The daemon's own live-Run admission cap: `FD_BUDGET_LIVE_RUNS` in
-/// crates/ctxmux-daemon/src/fd_budget.rs.
-///
-/// This is the only tier at which a refusal can be observed — below it the
-/// daemon has no reason to refuse, above it the harness does not measure. It
-/// is deliberately separate from OVERLAP_TIER: conflating the two is what made
-/// the 512 and 2048 tiers fail for not exercising a ceiling they sit under.
+/// Explicit policy used by this qualification workload. Production has no
+/// population ceiling; this exercises operator admission at 4000 + one request.
 const DAEMON_ADMISSION_CAP = 4000;
 
 /// Wall-clock ceiling for enumerating the whole fleet, in milliseconds.
@@ -149,6 +113,7 @@ function parseArgs(argv) {
     mode: "",
     tiersPath: "",
     thresholdsPath: "",
+    baselineRef: "",
     out: "",
     selfTest: false,
     root: ".",
@@ -169,6 +134,9 @@ function parseArgs(argv) {
         break;
       case "--observations":
         options.tiersPath = takeValue(arg);
+        break;
+      case "--baseline-ref":
+        options.baselineRef = takeValue(arg);
         break;
       case "--thresholds":
         options.thresholdsPath = takeValue(arg);
@@ -207,6 +175,20 @@ const hostClassLabel = (host) => `${host.os}-${host.architecture}`;
 function assertCompleteCell(cell, label) {
   if (cell === null || typeof cell !== "object") {
     throw new Error(`${label}: census cell is missing entirely`);
+  }
+  for (const field of [
+    "list_latency_ms",
+    "replay_wall_ms",
+    "active_wall_ms",
+    "active_cpu_ms",
+    "cpu_tick_ms",
+  ]) {
+    if (
+      !Number.isFinite(cell[field]) ||
+      cell[field] < 0 ||
+      (field === "cpu_tick_ms" && cell[field] === 0)
+    )
+      throw new Error(`${label}: invalid ${field}`);
   }
   const directFields = OBSERVED_FIELDS.filter(
     (field) => field !== "steady_rss_kib" && field !== "cleanup_threads_delta",
@@ -250,7 +232,29 @@ function observedMaximaForTier(rounds, tier, mode) {
   rounds.forEach((cell, index) =>
     assertCompleteCell(cell, `tier ${tier} ${mode} round ${index + 1}`),
   );
-  return deriveObservedMaxima(rounds);
+  for (const cell of rounds) {
+    const workload = judgeWorkload(cell, Number(tier), mode);
+    if (!workload.pass) throw new Error(workload.reason);
+    assertSampling(cell);
+    assertExecutionEnvironment(cell.execution_environment, false);
+    assertSameExecutionEnvironment(
+      rounds[0].execution_environment,
+      cell.execution_environment,
+    );
+  }
+  const maxima = deriveObservedMaxima(rounds);
+  for (const field of [
+    "list_latency_ms",
+    "replay_wall_ms",
+    "cpu_tick_ms",
+    ...(mode === "active" ? ["active_wall_ms", "active_cpu_ms"] : []),
+  ]) {
+    const values = rounds.map((cell) => cell[field]);
+    if (!values.every((value) => Number.isFinite(value) && value >= 0))
+      throw new Error(`invalid ${field}`);
+    maxima[field] = Math.max(...values);
+  }
+  return maxima;
 }
 
 /// Fields whose only correct value is zero, whatever the fleet was observed to
@@ -275,9 +279,9 @@ const ABSOLUTE_ZERO_FIELDS = Object.freeze([
 /// Derive the full ceiling set for one tier/mode from its observed maxima.
 ///
 /// Cost ceilings are deriveBudgetCeiling(field, observed) — the same rational
-/// rule the darwin budget is pinned to. No manual margin is applied; a
-/// hand-written ceiling is exactly the post-observation edit the contract
-/// forbids. Leak fields (ABSOLUTE_ZERO_FIELDS) are not derived at all: their
+/// rule the darwin budget is pinned to. Additional timing/CPU totals use
+/// the predeclared host-noise/measurement-quantum policy below, frozen with
+/// the contract. A candidate cannot edit the derived ceilings. Leak fields (ABSOLUTE_ZERO_FIELDS) are not derived at all: their
 /// ceiling is the constant 0, which no observation may raise.
 function ceilingsForTier(maxima) {
   const ceilings = {};
@@ -285,6 +289,22 @@ function ceilingsForTier(maxima) {
     ceilings[`max_${field}`] = ABSOLUTE_ZERO_FIELDS.includes(field)
       ? 0
       : deriveBudgetCeiling(field, maxima[field]);
+  }
+  // A predeclared host-noise policy, not a confidence interval: retain the
+  // existing cost contract's 50% margin. Timing is serialized to 0.001 ms;
+  // CPU deltas have two endpoint tick quantization errors. Utilization percent
+  // describes parallelism and never penalizes faster completion of equal work.
+  for (const field of [
+    "list_latency_ms",
+    "replay_wall_ms",
+    "active_wall_ms",
+    "active_cpu_ms",
+  ]) {
+    if (maxima[field] !== undefined)
+      ceilings[`max_${field}`] = Math.max(
+        maxima[field] * 1.5,
+        field === "active_cpu_ms" ? 2 * maxima.cpu_tick_ms : 0.001,
+      );
   }
   return ceilings;
 }
@@ -298,6 +318,7 @@ function ceilingsForTier(maxima) {
 /// being that file.
 function deriveThresholds(observations) {
   assertHostClass(observations.host, "observation host");
+  let executionEnvironment;
   const observedMaxima = {};
   const budgets = {};
   for (const mode of MODES) {
@@ -306,14 +327,27 @@ function deriveThresholds(observations) {
     for (const tier of TIERS) {
       const rounds = observations.modes?.[mode]?.[String(tier)];
       const maxima = observedMaximaForTier(rounds, tier, mode);
+      for (const cell of rounds) {
+        assertExecutionEnvironment(cell.execution_environment, true);
+        executionEnvironment ??= cell.execution_environment;
+        assertSameExecutionEnvironment(
+          executionEnvironment,
+          cell.execution_environment,
+        );
+      }
       observedMaxima[mode][String(tier)] = maxima;
       budgets[mode][String(tier)] = ceilingsForTier(maxima);
     }
   }
+  assertProvenance(observations.provenance);
+  assertResourcePolicy(observations.resource_policy);
   const contractSha = measurementContractSha();
   return {
-    schema: "ctxmux.fleet-scale-thresholds.v1",
+    schema: "ctxmux.fleet-scale-thresholds.v2",
     derived_from: {
+      provenance: observations.provenance,
+      resource_policy: FLEET_RESOURCE_POLICY,
+      execution_environment: executionEnvironment,
       rounds: ROUNDS,
       tiers: TIERS,
       host: observations.host,
@@ -334,12 +368,201 @@ function deriveThresholds(observations) {
 /// this is a self-check that the rules this harness derived against are the
 /// ones it later verifies against, so a thresholds file cannot be silently
 /// re-pointed at a different contract.
+const FLEET_RESOURCE_POLICY = Object.freeze({
+  live_runs: 4000,
+  retained_runs: null,
+  hot_output_bytes: 1073741824,
+  live_event_bytes: 67108864,
+  run_output_bytes: 4194304,
+  metadata_bytes: 67108864,
+  durable_replay_bytes: 268435456,
+  durable_run_output_bytes: 4194304,
+  database_bytes: 402653184,
+  wal_checkpoint_bytes: 8388608,
+  handoff_input_bytes: 134217728,
+  handoff_diagnostic_bytes: 16777216,
+  handoff_bytes: 268435456,
+  control_state_bytes: 134217728,
+  creation_workers: 8,
+  input_workers: 8,
+  cleanup_workers: 8,
+  finalize_workers: 8,
+  input_queue_commands: 1024,
+  input_queue_bytes: 4194304,
+  input_result_entries: 256,
+  input_result_bytes: 1048576,
+  tmux_discovery_bytes: 131072,
+});
 function measurementContractSha() {
-  const source = readFileSync(
-    new URL("./reliability-budget-contract.mjs", import.meta.url),
-    "utf8",
+  const hash = createHash("sha256");
+  for (const name of [
+    "reliability-budget-contract.mjs",
+    "fleet-scale-measure.mjs",
+    "check-fleet-scale.sh",
+  ])
+    hash
+      .update(name)
+      .update(readFileSync(new URL(`./${name}`, import.meta.url)));
+  return hash.digest("hex");
+}
+function sourceIdentity(root = process.cwd()) {
+  const names = execFileSync(
+    "git",
+    ["ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+    { encoding: "utf8", cwd: root },
+  )
+    .split("\0")
+    .filter((name) =>
+      /^(crates\/|third_party\/|\.cargo\/|build\.rs$|packages\/sdk\/src\/|scripts\/|Cargo\.(toml|lock)$|package(-lock)?\.json$|rust-toolchain\.toml$)/u.test(
+        name,
+      ),
+    )
+    .sort();
+  const hash = createHash("sha256");
+  for (const name of names)
+    hash
+      .update(name)
+      .update("\0")
+      .update(readFileSync(path.join(root, name)));
+  return hash.digest("hex");
+}
+function assertResourcePolicy(policy) {
+  if (
+    !policy ||
+    Object.keys(policy).length !== Object.keys(FLEET_RESOURCE_POLICY).length ||
+    Object.entries(FLEET_RESOURCE_POLICY).some(
+      ([key, value]) => policy[key] !== value,
+    )
+  )
+    throw new Error("complete qualification resource policy changed");
+}
+function assertSampling(cell) {
+  const sampling = cell?.rss_sampling;
+  if (
+    sampling?.complete !== true ||
+    sampling.samples < 2 ||
+    !Number.isFinite(sampling.max_gap_ms) ||
+    sampling.max_gap_ms > 250 ||
+    sampling.max_gap_ms < 0
+  ) {
+    throw new Error(
+      "RSS sampling did not cover the complete workload within five 50 ms periods",
+    );
+  }
+}
+function assertExecutionEnvironment(environment, requireComplete) {
+  if (
+    environment?.schema !== "ctxmux.fleet-execution-environment.v1" ||
+    !/^[a-f0-9]{64}$/u.test(environment.sha256 ?? "") ||
+    environment.sha256 === createHash("sha256").update("").digest("hex") ||
+    typeof environment.complete_cgroup_hierarchy !== "boolean"
+  )
+    throw new Error(
+      "actual daemon execution environment is missing or invalid",
+    );
+  const raw = Buffer.from(environment.canonical_text_base64 ?? "", "base64");
+  if (
+    raw.length === 0 ||
+    raw.toString("base64") !== environment.canonical_text_base64 ||
+    createHash("sha256").update(raw).digest("hex") !== environment.sha256 ||
+    !raw
+      .toString("utf8")
+      .startsWith("ctxmux.fleet-execution-environment.v1\n") ||
+    !raw
+      .toString("utf8")
+      .endsWith(
+        `complete_cgroup_hierarchy=${environment.complete_cgroup_hierarchy}\n`,
+      )
+  )
+    throw new Error(
+      "execution environment canonical evidence is missing or differs from its fingerprint",
+    );
+  if (requireComplete && !environment.complete_cgroup_hierarchy)
+    throw new Error(
+      "comparative performance requires the daemon's complete cgroup hierarchy; collect from the host namespace",
+    );
+}
+function assertSameExecutionEnvironment(expected, actual) {
+  assertExecutionEnvironment(expected, false);
+  assertExecutionEnvironment(actual, false);
+  if (
+    expected.sha256 !== actual.sha256 ||
+    expected.complete_cgroup_hierarchy !== actual.complete_cgroup_hierarchy
+  )
+    throw new Error(
+      "actual daemon execution environment changed; kernel resource allocations cannot be scored as code improvements",
+    );
+}
+function assertThresholdDerivation(thresholds) {
+  assertExecutionEnvironment(
+    thresholds.derived_from?.execution_environment,
+    true,
   );
-  return createHash("sha256").update(source).digest("hex");
+  if (
+    thresholds.derived_from?.rounds !== ROUNDS ||
+    JSON.stringify(thresholds.derived_from?.tiers) !== JSON.stringify(TIERS)
+  )
+    throw new Error("baseline workload tiers/rounds changed");
+  for (const mode of MODES)
+    for (const tier of TIERS) {
+      const maxima = thresholds.observed_maxima?.[mode]?.[String(tier)];
+      if (
+        !maxima ||
+        JSON.stringify(ceilingsForTier(maxima)) !==
+          JSON.stringify(thresholds.budgets?.[mode]?.[String(tier)])
+      )
+        throw new Error(
+          `baseline ceilings were modified after derivation: ${mode}/${tier}`,
+        );
+    }
+}
+function loadFrozenThresholds(filename, baselineRef) {
+  if (!/^[a-f0-9]{40}$/u.test(baselineRef ?? ""))
+    throw new Error(
+      "accept requires a predeclared full --baseline-ref commit identity",
+    );
+  execFileSync("git", ["merge-base", "--is-ancestor", baselineRef, "HEAD"]);
+  const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+    encoding: "utf8",
+  }).trim();
+  const relative = path.relative(root, path.resolve(filename));
+  if (relative.startsWith("..") || path.isAbsolute(relative))
+    throw new Error("frozen baseline must be a committed repository artifact");
+  const frozen = execFileSync("git", ["show", `${baselineRef}:${relative}`]);
+  const current = readFileSync(filename);
+  if (!frozen.equals(current))
+    throw new Error("baseline differs from the predeclared committed artifact");
+  return {
+    thresholds: JSON.parse(frozen),
+    baselineAnchor: {
+      commit: baselineRef,
+      artifact_sha256: createHash("sha256").update(frozen).digest("hex"),
+    },
+  };
+}
+function assertProvenance(provenance) {
+  for (const field of ["daemon_sha256", "client_sha256", "source_sha256"])
+    if (!/^[a-f0-9]{64}$/.test(provenance?.[field] ?? ""))
+      throw new Error(`missing binary/source identity ${field}`);
+}
+function judgeWorkload(cell, tier, mode) {
+  const work = cell.workload;
+  const input = mode === "active" ? 4096 : 0;
+  const pass =
+    work?.input_bytes_per_run === input &&
+    work?.expected_output_bytes_per_run === input + 1 &&
+    work?.driver_concurrency === 8 &&
+    work?.live_runs_confirmed === tier &&
+    work?.completed_runs === tier &&
+    work?.byte_exact_runs === tier;
+  return {
+    pass,
+    ...(pass
+      ? {}
+      : {
+          reason: `tier ${tier} ${mode}: byte-exact fixed workload was incomplete or changed`,
+        }),
+  };
 }
 
 function assertHostClass(host, label) {
@@ -373,13 +596,33 @@ function assertHostClass(host, label) {
   }
 }
 
+// machine-id(5): one nonzero, lowercase 128-bit value rendered as 32 hex
+// characters. Missing/uninitialized image identity cannot bind a host baseline.
+// Canonical LF preserves the fingerprint of ordinary systemd machine-id files.
+function machineIdentity(raw) {
+  if (typeof raw !== "string" || !/^[a-f0-9]{32}\n?$/.test(raw))
+    throw new Error("measurement host has no valid initialized machine-id");
+  const id = raw.endsWith("\n") ? raw.slice(0, -1) : raw;
+  if (id === "0".repeat(32))
+    throw new Error(
+      "measurement host has an uninitialized all-zero machine-id",
+    );
+  return createHash("sha256").update(`${id}\n`).digest("hex");
+}
+
 /// Enforce that two host identities are the same class before comparing numbers.
 function assertSameHostClass(derivedHost, receiptHost) {
   assertHostClass(derivedHost, "thresholds host");
   assertHostClass(receiptHost, "receipt host");
   if (
     derivedHost.os !== receiptHost.os ||
-    derivedHost.architecture !== receiptHost.architecture
+    derivedHost.architecture !== receiptHost.architecture ||
+    derivedHost.os_release !== receiptHost.os_release ||
+    derivedHost.logical_cpus !== receiptHost.logical_cpus ||
+    !/^[a-f0-9]{64}$/.test(derivedHost.machine_id_sha256 ?? "") ||
+    derivedHost.machine_id_sha256 ===
+      createHash("sha256").update("").digest("hex") ||
+    derivedHost.machine_id_sha256 !== receiptHost.machine_id_sha256
   ) {
     throw new Error(
       `receipt host ${hostClassLabel(receiptHost)} does not match the ` +
@@ -391,10 +634,11 @@ function assertSameHostClass(derivedHost, receiptHost) {
 
 /// The admission-cap precondition, checked before a tier's numbers are trusted.
 ///
-/// The shipped daemon bounds live admission by its file-descriptor budget, not
-/// by a fixed record count: startup raises RLIMIT_NOFILE toward descriptors for
-/// FD_BUDGET_LIVE_RUNS (4000) concurrent live Runs and clamps the effective
-/// ceiling down to whatever the OS actually funds, refusing beyond it with
+/// This workload requests an explicit 4000-Run operator quota. The daemon also
+/// funds actual native descriptors from RLIMIT_NOFILE; production defaults have
+/// no fixed population ceiling. Descriptor pressure below the requested tier
+/// is explicit, rather than silently reducing the accepted work or its quota.
+/// At the workload's operator quota, one further request must refuse with
 /// run_capacity. So a tier is reachable only where the host funds that many
 /// descriptors; a tier the host cannot fund is a BLOCKED PRECONDITION. The
 /// measuring side records how many Runs it actually admitted; if that is short
@@ -411,8 +655,8 @@ function assertTierWasReached(cell, tier, mode) {
   if (admitted < tier) {
     throw new Error(
       `tier ${tier} ${mode}: the daemon admitted only ${admitted} of ${tier} Runs. Live ` +
-        "admission is bounded by the descriptor budget (FD_BUDGET_LIVE_RUNS clamped to what " +
-        "RLIMIT_NOFILE funds); a tier this host cannot fund descriptors for is a blocked " +
+        "admission uses the explicit operator policy and actual RLIMIT_NOFILE descriptor " +
+        "funding; a tier this host cannot fund descriptors for is a blocked " +
         "precondition rather than a measurable tier. Refusing to score a fleet that never " +
         "reached its target size.",
     );
@@ -457,26 +701,13 @@ function judgeCell(cell, ceilings, tier, mode) {
   return checks;
 }
 
-/// Flatten a census cell into the OBSERVED_FIELDS the ceilings are keyed by.
-///
-/// The `retained_output_bytes_per_run` key is the frozen contract's name and
-/// cannot change here: OBSERVED_FIELDS is hashed into every committed darwin
-/// baseline, so renaming it would rehash the measurement contract and invalidate
-/// budgets this harness deliberately never writes. The census-side field it
-/// reads is named for what it actually holds — total output produced over each
-/// Run's lifetime, from the monotonic `head=` counter — which is NOT the
-/// currently-retained bytes the 4 MiB per-Run and 1 GiB fleet-wide retention
-/// caps bound. The darwin gate measures the real quantity by summing replay
-/// lengths; this one cannot, because retained_bytes is not on the protocol wire.
-/// So the mapping is deliberate and lossy in a known direction: it grades a
-/// lifetime total against a ceiling derived from lifetime totals on the same
-/// host, which is a coherent cost check, and it is NOT evidence about retention.
+/// Retention is measured from retained=, never mapped from lifetime head=.
 function readingsForCell(cell) {
   return {
     cpu_core_percent: cell.cpu_core_percent,
     peak_rss_kib: cell.peak_rss_kib,
     steady_rss_kib: cell.steady.rss_kib,
-    retained_output_bytes_per_run: cell.output_bytes_lifetime_per_run,
+    retained_output_bytes_per_run: cell.retained_output_bytes_per_run,
     rss_kib_per_run: cell.rss_kib_per_run,
     threads_per_run: cell.threads_per_run,
     fds_per_run: cell.fds_per_run,
@@ -522,46 +753,35 @@ const OVERLAP_UNIT_TOLERANCE = 4;
 /// One field's farm/darwin comparison. Pure, so the self-test can exercise
 /// every branch without a budgets file on disk.
 function compareOverlapField(field, farmValue, darwinValue, fleet) {
-  const fleetDelta = Math.abs(farmValue - darwinValue) * fleet;
-  const agree = fleetDelta < OVERLAP_UNIT_TOLERANCE;
+  if (
+    ![farmValue, darwinValue].every(
+      (value) => Number.isFinite(value) && value >= 0,
+    ) ||
+    !Number.isInteger(fleet) ||
+    fleet <= 0
+  ) {
+    throw new Error(`invalid resource observation for ${field}`);
+  }
+  const signedDelta = (farmValue - darwinValue) * fleet;
+  const fleetDelta = Math.abs(signedDelta);
+  const agree = signedDelta < OVERLAP_UNIT_TOLERANCE;
   return {
     field,
     farm: farmValue,
     darwin: darwinValue,
     fleet_delta_units: Number(fleetDelta.toFixed(3)),
     agree,
-    ...(agree
-      ? {}
-      : {
-          // Direction carries the diagnosis, and getting it wrong costs real
-          // time. Reading "the harnesses do not measure the same thing" sent
-          // me hunting for a measurement defect when the cause was the
-          // opposite: #52 replaced the per-Run thread with one shared SIGCHLD
-          // source, so the farm honestly measures 0 threads/Run while the
-          // frozen baseline still records the 2 the daemon used to cost. The
-          // cross-check failed *because the optimization worked*.
-          //
-          // Below the baseline cannot mean an unnoticed regression — the
-          // daemon is cheaper than the gate believes — so it is reported as
-          // what it is. It still refuses: a baseline that no longer describes
-          // the daemon has stopped cross-checking anything, and silently
-          // passing it would let the farm tiers run unanchored forever. The
-          // remedy is a reviewed re-baseline, not a looser predicate.
-          direction: farmValue > darwinValue ? "above" : "below",
-          reason:
-            farmValue > darwinValue
-              ? `farm ${field} ${farmValue} at ${OVERLAP_TIER} exceeds the darwin baseline ` +
-                `${darwinValue} by ${fleetDelta.toFixed(1)} units across the fleet; this per-Run ` +
-                "cost is platform-invariant by design, so the daemon either regressed or the " +
-                "two harnesses do not measure the same thing, and the larger farm tiers " +
-                "cannot be trusted until that is resolved"
-              : `farm ${field} ${farmValue} at ${OVERLAP_TIER} is BELOW the darwin baseline ` +
-                `${darwinValue} by ${fleetDelta.toFixed(1)} units across the fleet. The daemon ` +
-                "costs less than the gate records, so this is not a regression and not a " +
-                "measurement mismatch: the darwin baseline is older than the daemon and no " +
-                "longer cross-checks anything. Re-baseline darwin as its own reviewed step, " +
-                "preserving the freeze-then-optimize property",
-        }),
+    direction: signedDelta > 0 ? "above" : signedDelta < 0 ? "below" : "equal",
+    ...(signedDelta <= -OVERLAP_UNIT_TOLERANCE
+      ? {
+          improvement: true,
+          reason: `resource cost below the historical baseline by ${fleetDelta.toFixed(1)} fleet units; correctness and workload checks remain required`,
+        }
+      : agree
+        ? {}
+        : {
+            reason: `farm ${field} exceeds the historical baseline by ${fleetDelta.toFixed(1)} fleet units; investigate a regression or measurement mismatch`,
+          }),
   };
 }
 
@@ -629,13 +849,30 @@ function tierRefusalReasons(tierVerdicts) {
 ///
 /// Fails closed: any tier/mode that cannot be judged (missing cell, unreached
 /// tier, host mismatch, contract drift) is a nonzero exit, not an omission.
-function renderVerdict({ thresholds, receipt, root }) {
-  if (thresholds?.schema !== "ctxmux.fleet-scale-thresholds.v1") {
+function renderVerdict({ thresholds, receipt, root, baselineAnchor }) {
+  if (thresholds?.schema !== "ctxmux.fleet-scale-thresholds.v2") {
     throw new Error(
       `thresholds file has unexpected schema ${JSON.stringify(thresholds?.schema)}`,
     );
   }
+  if (
+    !/^[a-f0-9]{40}$/u.test(baselineAnchor?.commit ?? "") ||
+    !/^[a-f0-9]{64}$/u.test(baselineAnchor?.artifact_sha256 ?? "")
+  )
+    throw new Error("missing frozen baseline anchor");
+  assertThresholdDerivation(thresholds);
   assertSameHostClass(thresholds.derived_from?.host, receipt?.host);
+  assertProvenance(thresholds.derived_from.provenance);
+  assertProvenance(receipt.provenance);
+  assertResourcePolicy(thresholds.derived_from.resource_policy);
+  assertResourcePolicy(receipt.resource_policy);
+  if (
+    thresholds.derived_from.provenance.source_sha256 ===
+    receipt.provenance.source_sha256
+  )
+    throw new Error(
+      "candidate cannot certify itself from its own observations",
+    );
   const expectedSha = measurementContractSha();
   if (thresholds.derived_from?.measurement_contract_sha256 !== expectedSha) {
     throw new Error(
@@ -654,11 +891,42 @@ function renderVerdict({ thresholds, receipt, root }) {
           `thresholds file has no ceilings for ${mode} tier ${tier}; cannot render a verdict`,
         );
       }
+      assertSampling(cell);
+      assertExecutionEnvironment(cell.execution_environment, true);
+      assertSameExecutionEnvironment(
+        thresholds.derived_from.execution_environment,
+        cell.execution_environment,
+      );
+      if (
+        cell.cpu_tick_ms !==
+        thresholds.observed_maxima[mode][String(tier)].cpu_tick_ms
+      )
+        throw new Error("CPU measurement resolution changed");
       const checks = judgeCell(cell, ceilings, tier, mode);
+      for (const field of [
+        "list_latency_ms",
+        "replay_wall_ms",
+        ...(mode === "active" ? ["active_wall_ms", "active_cpu_ms"] : []),
+      ]) {
+        const value = cell[field],
+          ceiling = ceilings[`max_${field}`];
+        checks.push({
+          field,
+          value,
+          ceiling,
+          pass:
+            Number.isFinite(value) &&
+            value >= 0 &&
+            Number.isFinite(ceiling) &&
+            value <= ceiling,
+        });
+      }
+      const workload = judgeWorkload(cell, tier, mode);
       tierVerdicts.push({
         tier,
         mode,
         checks,
+        workload,
         admitted_runs: cell.admitted_runs,
         list_latency_ms: cell.list_latency_ms ?? null,
         list_success: cell.list_success ?? null,
@@ -678,6 +946,7 @@ function renderVerdict({ thresholds, receipt, root }) {
         aggregate_retained_bytes: cell.aggregate_retained_bytes ?? null,
         retention_verdict: judgeRetentionBudget(cell),
         pass:
+          workload.pass &&
           checks.every((entry) => entry.pass) &&
           judgeListBehaviour(cell, tier, mode).pass &&
           judgeAdmissionBehaviour(cell, tier, mode).pass &&
@@ -693,11 +962,30 @@ function renderVerdict({ thresholds, receipt, root }) {
   const tiersPass = tierVerdicts.every((entry) => entry.pass);
   return {
     schema: "ctxmux.fleet-scale-verdict.v1",
+    provenance: receipt.provenance,
+    baseline_provenance: thresholds.derived_from.provenance,
+    resource_policy: FLEET_RESOURCE_POLICY,
+    execution_environment: thresholds.derived_from.execution_environment,
+    metric_scope: [
+      "byte_exact_output",
+      "admission",
+      "teardown",
+      "idle_cpu",
+      "active_cpu",
+      "active_completion_time",
+      "list_latency",
+      "sampled_peak_rss",
+      "steady_rss",
+      "fd",
+      "thread",
+      "hot_replay_bytes",
+    ],
     host: receipt.host,
     thresholds_host: thresholds.derived_from.host,
     tiers: tierVerdicts,
     overlap_cross_check: overlaps,
     accepted: tiersPass && overlapAgrees,
+    baseline_anchor: baselineAnchor,
     ...(tiersPass && overlapAgrees
       ? {}
       : {
@@ -784,15 +1072,12 @@ function judgeListBehaviour(cell, tier, mode) {
   return { pass: true, latency_ms: round(latency) };
 }
 
-/// The daemon-wide retained-byte ceiling, mirrored from
-/// `RETENTION_BUDGET_BYTES` in crates/ctxmux-daemon/src/retention.rs.
+/// The retained-byte envelope explicitly passed by FLEET_RESOURCE_POLICY.
 ///
-/// HARDCODED ON PURPOSE, and this is the whole point of the check. Every other
-/// cost ceiling in this harness is derived from the same run that produces the
-/// receipt (observed x 1.5), so a daemon that regressed simply authorizes its
-/// own new cost. A retention cap cannot be graded that way: the quantity is a
-/// promise the daemon makes, so the number must come from the source and be
-/// changed only by editing both places together.
+/// This is a fixed workload promise, independent of production defaults and
+/// measured cost. Cost ceilings also come from independent frozen observations;
+/// a candidate cannot authorize itself. Changing the workload resource envelope
+/// requires new observations, rather than silently reusing the old baseline.
 const RETENTION_BUDGET_CEILING_BYTES = 1024 * 1024 * 1024;
 
 /// Verdict on the fleet-wide retained-byte cap of #47.
@@ -857,7 +1142,7 @@ function judgeAdmissionBehaviour(cell, tier, mode) {
     // Only the tier at the daemon's own cap exercises refusal; below it there
     // is nothing to refuse, so absence is acceptable there and only there.
     //
-    // That cap is FD_BUDGET_LIVE_RUNS, not the overlap tier. This predicate
+    // That cap is this workload's explicit live_runs policy, not the overlap tier. This predicate
     // used to read `tier <= OVERLAP_TIER` (128) — the deleted count cap — so
     // the 512 and 2048 tiers, which sit below the real ceiling and cannot
     // refuse anything, were failed for not refusing.
@@ -920,10 +1205,33 @@ function selfTest() {
     }
   };
 
+  const environmentFixture = (complete = true, allocation = "fixed") => {
+    const raw = `ctxmux.fleet-execution-environment.v1\nfixture allocation=${allocation}\ncomplete_cgroup_hierarchy=${complete}\n`;
+    return {
+      schema: "ctxmux.fleet-execution-environment.v1",
+      sha256: createHash("sha256").update(raw).digest("hex"),
+      canonical_text_base64: Buffer.from(raw).toString("base64"),
+      complete_cgroup_hierarchy: complete,
+    };
+  };
   const goodCell = (overrides = {}) => ({
+    execution_environment: environmentFixture(),
+    workload: {
+      input_bytes_per_run: 0,
+      expected_output_bytes_per_run: 1,
+      driver_concurrency: 8,
+      live_runs_confirmed: 128,
+      completed_runs: 128,
+      byte_exact_runs: 128,
+    },
+    active_wall_ms: 10,
+    active_cpu_core_percent: 1,
+    active_cpu_ms: 1,
+    cpu_tick_ms: 10,
+    replay_wall_ms: 10,
+    rss_sampling: { complete: true, samples: 100, max_gap_ms: 50 },
     cpu_core_percent: 1,
     peak_rss_kib: 10000,
-    output_bytes_lifetime_per_run: 0,
     retained_output_bytes_per_run: 0,
     rss_kib_per_run: 100,
     threads_per_run: 2,
@@ -947,6 +1255,563 @@ function selfTest() {
     },
     ...overrides,
   });
+
+  expectSuccess(
+    "the actual daemon collector binds limits and all visible ancestors",
+    () => {
+      const producer = readFileSync(
+        new URL("./check-fleet-scale.sh", import.meta.url),
+        "utf8",
+      );
+      const begin = producer.indexOf("collect_execution_environment() {");
+      const end = producer.indexOf("\n}\n", begin) + 3;
+      if (begin < 0 || end < 3)
+        throw new Error("execution collector not found");
+      const directory = mkdtempSync(
+        path.join(tmpdir(), "ctxmux-execution-envelope-"),
+      );
+      const put = (name, value) => {
+        mkdirSync(path.dirname(path.join(directory, name)), {
+          recursive: true,
+        });
+        writeFileSync(path.join(directory, name), value);
+      };
+      try {
+        put(
+          "proc/self/mountinfo",
+          `0 0 0:0 / ${directory}/cgroup rw - cgroup2 cgroup rw\n`,
+        );
+        put("proc/42/cgroup", "0::/parent/leaf\n");
+        put(
+          "proc/42/limits",
+          "Limit Soft Hard Units\nMax open files 65536 1048576 files\n",
+        );
+        put(
+          "proc/42/status",
+          "Cpus_allowed_list:\t0-7\nMems_allowed_list:\t0\n",
+        );
+        for (const name of ["cgroup", "cgroup/parent", "cgroup/parent/leaf"])
+          put(`${name}/cgroup.controllers`, "cpu cpuset memory pids io\n");
+        const configs = [
+          ["cgroup/parent/leaf/cpu.max", "800000 100000\n", "max 100000\n"],
+          ["cgroup/parent/cpu.max", "max 100000\n", "200000 100000\n"],
+          ["cgroup/parent/leaf/memory.max", "17179869184\n", "max\n"],
+          ["cgroup/parent/memory.max", "max\n", "8589934592\n"],
+          ["cgroup/parent/leaf/pids.max", "8192\n", "max\n"],
+          [
+            "proc/42/limits",
+            "Limit Soft Hard Units\nMax open files 65536 1048576 files\n",
+            "Limit Soft Hard Units\nMax open files 32768 1048576 files\n",
+          ],
+          [
+            "proc/42/status",
+            "Cpus_allowed_list:\t0-7\nMems_allowed_list:\t0\n",
+            "Cpus_allowed_list:\t0-3\nMems_allowed_list:\t0\n",
+          ],
+        ];
+        for (const [name, before] of configs) put(name, before);
+        const collect = () =>
+          JSON.parse(
+            execFileSync(
+              "bash",
+              [
+                "-euo",
+                "pipefail",
+                "-c",
+                `proc=$1\n${producer.slice(begin, end)}\ncollect_execution_environment 42 "$2"`,
+                "_",
+                path.join(directory, "proc"),
+                path.join(directory, "environment.txt"),
+              ],
+              { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+            ),
+          );
+        let writeFailureRejected = false;
+        try {
+          execFileSync(
+            "bash",
+            [
+              "-euo",
+              "pipefail",
+              "-c",
+              `proc=$1\n${producer.slice(begin, end)}\nprintf() { if [[ \${2-} == 'Max open files '* ]]; then return 1; fi; builtin printf "$@"; }\nif collect_execution_environment 42 "$2"; then exit 0; else exit 7; fi`,
+              "_",
+              path.join(directory, "proc"),
+              path.join(directory, "environment.txt"),
+            ],
+            { stdio: "pipe" },
+          );
+        } catch {
+          writeFailureRejected = true;
+        }
+        if (!writeFailureRejected)
+          throw new Error(
+            "a failed intermediate manifest write produced passing evidence",
+          );
+        const baseline = collect();
+        assertExecutionEnvironment(baseline, true);
+        for (const changed of [
+          { ...baseline, canonical_text_base64: undefined },
+          {
+            ...baseline,
+            canonical_text_base64: baseline.canonical_text_base64 + "!",
+          },
+          { ...baseline, sha256: "1".repeat(64) },
+          { ...baseline, complete_cgroup_hierarchy: false },
+        ]) {
+          let refused = false;
+          try {
+            assertExecutionEnvironment(changed, false);
+          } catch {
+            refused = true;
+          }
+          if (!refused)
+            throw new Error(
+              "missing, edited or mis-scoped canonical evidence accepted",
+            );
+        }
+
+        for (const [name, before, after] of configs) {
+          put(name, after);
+          const changed = collect();
+          if (changed.sha256 === baseline.sha256)
+            throw new Error(`unbound configuration: ${name}`);
+          let rejected = false;
+          try {
+            assertSameExecutionEnvironment(baseline, changed);
+          } catch {
+            rejected = true;
+          }
+          if (!rejected)
+            throw new Error(`changed allocation accepted: ${name}`);
+          put(name, before);
+        }
+        put("cgroup/cgroup.events", "populated 1\n");
+        const hidden = collect();
+        if (hidden.complete_cgroup_hierarchy !== false)
+          throw new Error("namespace root accepted as full hierarchy");
+        let refused = false;
+        try {
+          assertExecutionEnvironment(hidden, true);
+        } catch {
+          refused = true;
+        }
+        if (!refused)
+          throw new Error("hidden ancestors qualified comparative performance");
+        rmSync(path.join(directory, "cgroup/parent/cgroup.controllers"));
+        try {
+          collect();
+          throw new Error("missing ancestor silently accepted");
+        } catch (error) {
+          if (error.message === "missing ancestor silently accepted")
+            throw error;
+        }
+        return "real producer: quota, ancestor quota, memory, pids, affinity and ready-PID RLIMIT changes refused; hidden/missing ancestors fail comparative qualification";
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  expectSuccess(
+    "the real census recognizes only the CLI quota error code",
+    () => {
+      const producer = readFileSync(
+        new URL("./check-fleet-scale.sh", import.meta.url),
+        "utf8",
+      );
+      const begin = producer.indexOf("is_run_capacity_error() {");
+      const end = producer.indexOf("\n}\n", begin) + 3;
+      if (begin < 0 || end < 3)
+        throw new Error("census admission classifier not found");
+      const classifier = producer.slice(begin, end);
+      for (const [message, expected] of [
+        [
+          "ctxmux: ctxmux request failed (RunCapacity): physical live Run resources exhausted at 4000 slots",
+          "true",
+        ],
+        [
+          "ctxmux: ctxmux request failed (BackendUnavailable): live Run capacity helper failed",
+          "false",
+        ],
+        [
+          "ctxmux: ctxmux request failed (BackendUnavailable): RunCapacity diagnostic text",
+          "false",
+        ],
+        ["ctxmux: failed to connect to ctxmux daemon", "false"],
+      ]) {
+        const actual = execFileSync(
+          "bash",
+          [
+            "-euo",
+            "pipefail",
+            "-c",
+            classifier +
+              '\nif is_run_capacity_error "$1"; then printf true; else printf false; fi',
+            "_",
+            message,
+          ],
+          { encoding: "utf8" },
+        );
+        if (actual !== expected)
+          throw new Error(
+            `quota error ${JSON.stringify(message)}: expected ${expected}, got ${actual}`,
+          );
+      }
+      return "captured real quota error; unrelated capacity text cannot pass";
+    },
+  );
+
+  expectSuccess(
+    "the real census counts exact tab-separated output heads",
+    () => {
+      const producer = readFileSync(
+        new URL("./check-fleet-scale.sh", import.meta.url),
+        "utf8",
+      );
+      const begin = producer.indexOf("count_output_heads() {");
+      const end = producer.indexOf("\n}\n", begin) + 3;
+      if (begin < 0 || end < 3) throw new Error("census counter not found");
+      const counter = producer.slice(begin, end);
+      const listing =
+        "run1\tRunning\thead=1\tretained=1\nrun2\tRunning\thead=11\tretained=11\nrun3\tRunning\tretained=1\nrun4\tRunning\thead=1\n";
+      for (const [expected, count] of [
+        [1, 2],
+        [11, 1],
+        [4097, 0],
+      ]) {
+        const actual = execFileSync(
+          "bash",
+          [
+            "-euo",
+            "pipefail",
+            "-c",
+            counter + `\ncount_output_heads ${expected}`,
+          ],
+          { input: listing, encoding: "utf8" },
+        ).trim();
+        if (actual !== String(count))
+          throw new Error(`head=${expected}: expected ${count}, got ${actual}`);
+      }
+    },
+  );
+
+  expectSuccess("the actual shell producer emits the judged contract", () => {
+    const producer = readFileSync(
+      new URL("./check-fleet-scale.sh", import.meta.url),
+      "utf8",
+    );
+    const begin = producer.indexOf("\nprintf '{'\n");
+    const end = producer.indexOf("\nCENSUS\n", begin);
+    if (begin < 0 || end < 0) throw new Error("census formatter not found");
+    const assignments = `
+execution_environment='${JSON.stringify(goodCell().execution_environment)}'
+input_bytes=0 expected_bytes=1 live_runs_confirmed=128 completed_runs=128 byte_exact_runs=128
+active_wall_ms=10 active_cpu_percent=1 active_cpu_ms=1 cpu_tick_ms=10 replay_wall_ms=10
+sampling_complete=true sampling_count=100 sampling_max_gap=50 admitted=128 daemon_alive_after_census=true
+cpu_core_percent=1 peak_rss=10000 retained_per_run=1 rss_per_run=100
+threads_per_run=2 fds_per_run=3 cleanup_children=0 stop_failures=0
+cleanup_attachments=0 steady_rss=9000 baseline_threads=8 cleanup_threads=8
+list_latency=5 list_success=true aggregate_bytes=128 aggregate_retained_bytes=128
+refused_clean=0 emfile=0
+`;
+    const cell = JSON.parse(
+      execFileSync(
+        "bash",
+        ["-euo", "pipefail", "-c", assignments + producer.slice(begin, end)],
+        { encoding: "utf8" },
+      ),
+    );
+    assertCompleteCell(cell, "real producer");
+    if (
+      !judgeWorkload(cell, 128, "idle").pass ||
+      !judgeListBehaviour(cell, 128, "idle").pass
+    ) {
+      throw new Error("producer and judge disagree");
+    }
+    return "census printf output, not a hand-written JSON fixture";
+  });
+  expectFailure(
+    "exact replay without live PID ownership cannot establish capacity",
+    () => {
+      const cell = goodCell();
+      cell.workload.live_runs_confirmed = 0;
+      observedMaximaForTier([cell, cell, cell], 128, "idle");
+    },
+  );
+  expectFailure("missing live PID evidence cannot establish capacity", () => {
+    const cell = goodCell();
+    delete cell.workload.live_runs_confirmed;
+    observedMaximaForTier([cell, cell, cell], 128, "idle");
+  });
+  expectFailure(
+    "zero completed active work cannot establish a baseline",
+    () => {
+      const cell = goodCell({
+        workload: {
+          input_bytes_per_run: 4096,
+          expected_output_bytes_per_run: 4097,
+          driver_concurrency: 8,
+          live_runs_confirmed: 0,
+          completed_runs: 0,
+          byte_exact_runs: 0,
+        },
+      });
+      observedMaximaForTier([cell, cell, cell], 128, "active");
+    },
+  );
+  expectSuccess(
+    "high candidate cost fails independently frozen ceilings",
+    () => {
+      const ceilings = ceilingsForTier(
+        observedMaximaForTier(
+          [goodCell(), goodCell(), goodCell()],
+          128,
+          "idle",
+        ),
+      );
+      const checks = judgeCell(
+        goodCell({ cpu_core_percent: 600, peak_rss_kib: 8 * 1024 * 1024 }),
+        ceilings,
+        128,
+        "idle",
+      );
+      for (const field of ["cpu_core_percent", "peak_rss_kib"]) {
+        if (checks.find((check) => check.field === field)?.pass !== false)
+          throw new Error(`${field} regression self-certified`);
+      }
+      return "600% CPU and 8 GiB RSS cannot redefine their acceptance bar";
+    },
+  );
+
+  expectFailure("a partial RSS sample cannot certify peak memory", () =>
+    assertSampling(
+      goodCell({ rss_sampling: { complete: true, samples: 1, max_gap_ms: 0 } }),
+    ),
+  );
+  expectSuccess("faster equal-CPU work is a performance improvement", () => {
+    const baseline = goodCell({
+      active_wall_ms: 10000,
+      active_cpu_ms: 1000,
+      workload: {
+        input_bytes_per_run: 4096,
+        expected_output_bytes_per_run: 4097,
+        driver_concurrency: 8,
+        live_runs_confirmed: 128,
+        completed_runs: 128,
+        byte_exact_runs: 128,
+      },
+    });
+    const ceilings = ceilingsForTier(
+      observedMaximaForTier([baseline, baseline, baseline], 128, "active"),
+    );
+    if (1000 > ceilings.max_active_wall_ms || 1000 > ceilings.max_active_cpu_ms)
+      throw new Error("equal CPU work rejected for higher utilization");
+    return "ten times faster with equal total CPU remains eligible";
+  });
+  expectFailure("accept cannot use an uncommitted or unanchored baseline", () =>
+    loadFrozenThresholds("unused", "HEAD"),
+  );
+
+  expectSuccess(
+    "source identity includes local PTY dependency and Cargo configuration",
+    () => {
+      const directory = mkdtempSync(
+        path.join(tmpdir(), "ctxmux-source-identity-"),
+      );
+      try {
+        execFileSync("git", ["init", "--quiet", directory]);
+        execFileSync("mkdir", [
+          "-p",
+          path.join(directory, "third_party/portable-pty/src"),
+          path.join(directory, ".cargo"),
+          path.join(directory, "docs"),
+        ]);
+        writeFileSync(
+          path.join(directory, "third_party/portable-pty/src/lib.rs"),
+          "first",
+        );
+        writeFileSync(path.join(directory, ".cargo/config.toml"), "first");
+        const first = sourceIdentity(directory);
+        writeFileSync(
+          path.join(directory, "third_party/portable-pty/src/lib.rs"),
+          "changed",
+        );
+        const second = sourceIdentity(directory);
+        writeFileSync(path.join(directory, ".cargo/config.toml"), "changed");
+        const third = sourceIdentity(directory);
+        writeFileSync(path.join(directory, "docs/baseline.json"), "receipt");
+        if (
+          first === second ||
+          second === third ||
+          third !== sourceIdentity(directory)
+        )
+          throw new Error(
+            "build input or receipt exclusion is not bound correctly",
+          );
+        return "PTY and Cargo changes alter identity; receipt artifacts cannot fake a new candidate";
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  expectSuccess("frozen artifact identity detects real file changes", () => {
+    const directory = mkdtempSync(
+      path.join(tmpdir(), "ctxmux-frozen-baseline-"),
+    );
+    const previous = process.cwd();
+    try {
+      process.chdir(directory);
+      execFileSync("git", ["init", "--quiet"]);
+      writeFileSync("baseline.json", '{"example":1}\n');
+      execFileSync("git", ["add", "baseline.json"]);
+      execFileSync("git", [
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--quiet",
+        "-m",
+        "Freeze baseline",
+      ]);
+      const ref = execFileSync("git", ["rev-parse", "HEAD"], {
+        encoding: "utf8",
+      }).trim();
+      loadFrozenThresholds("baseline.json", ref);
+      writeFileSync("baseline.json", '{"example":2}\n');
+      let rejected = false;
+      try {
+        loadFrozenThresholds("baseline.json", ref);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected)
+        throw new Error("edited baseline passed committed identity");
+      return "actual Git artifact accepted, modified artifact refused";
+    } finally {
+      process.chdir(previous);
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+  expectSuccess(
+    "full verdict accepts valid work and refuses edited ceilings or self-certification",
+    () => {
+      const host = {
+        os: "linux",
+        os_release: "fixture-kernel",
+        architecture: "x64",
+        logical_cpus: 64,
+        machine_id_sha256: "a".repeat(64),
+      };
+      const provenance = {
+        daemon_sha256: "b".repeat(64),
+        client_sha256: "c".repeat(64),
+        source_sha256: "d".repeat(64),
+      };
+      const observations = {
+        host,
+        provenance,
+        resource_policy: FLEET_RESOURCE_POLICY,
+        modes: {},
+      };
+      const receipt = {
+        host,
+        provenance: { ...provenance, source_sha256: "e".repeat(64) },
+        resource_policy: FLEET_RESOURCE_POLICY,
+        modes: {},
+      };
+      for (const mode of MODES) {
+        observations.modes[mode] = {};
+        receipt.modes[mode] = {};
+        for (const tier of TIERS) {
+          const input = mode === "active" ? 4096 : 0;
+          const cell = goodCell({
+            admitted_runs: tier,
+            workload: {
+              input_bytes_per_run: input,
+              expected_output_bytes_per_run: input + 1,
+              driver_concurrency: 8,
+              live_runs_confirmed: tier,
+              completed_runs: tier,
+              byte_exact_runs: tier,
+            },
+          });
+          observations.modes[mode][tier] = [cell, cell, cell];
+          receipt.modes[mode][tier] = cell;
+        }
+      }
+      const thresholds = deriveThresholds(observations);
+      const baselineAnchor = {
+        commit: "f".repeat(40),
+        artifact_sha256: "f".repeat(64),
+      };
+      if (
+        !renderVerdict({ thresholds, receipt, root: ".", baselineAnchor })
+          .accepted
+      )
+        throw new Error("complete fixed work failed its frozen baseline");
+      for (const environment of [
+        undefined,
+        { ...goodCell().execution_environment, sha256: "1".repeat(64) },
+        {
+          ...goodCell().execution_environment,
+          complete_cgroup_hierarchy: false,
+        },
+      ]) {
+        const changed = structuredClone(receipt);
+        changed.modes.active["4000"].execution_environment = environment;
+        let refused = false;
+        try {
+          renderVerdict({
+            thresholds,
+            receipt: changed,
+            root: ".",
+            baselineAnchor,
+          });
+        } catch {
+          refused = true;
+        }
+        if (!refused)
+          throw new Error(
+            "full verdict accepted changed or missing execution allocation",
+          );
+      }
+      const changedRounds = structuredClone(observations);
+      changedRounds.modes.active["4000"][2].execution_environment.sha256 =
+        "1".repeat(64);
+      try {
+        deriveThresholds(changedRounds);
+        throw new Error("mixed allocations derived a baseline");
+      } catch (error) {
+        if (error.message === "mixed allocations derived a baseline")
+          throw error;
+      }
+      const edited = structuredClone(thresholds);
+      edited.budgets.idle["128"].max_peak_rss_kib = 8_000_000;
+      try {
+        assertThresholdDerivation(edited);
+        throw new Error("ceiling edit accepted");
+      } catch (error) {
+        if (!error.message.includes("modified after derivation")) throw error;
+      }
+      try {
+        renderVerdict({
+          thresholds,
+          receipt: { ...receipt, provenance },
+          root: ".",
+          baselineAnchor,
+        });
+        throw new Error("self-certification accepted");
+      } catch (error) {
+        if (!error.message.includes("cannot certify itself")) throw error;
+      }
+      return "full production judge, independent identity and deterministic ceilings";
+    },
+  );
 
   // The derivation rules really compute ceilings from farm observations.
   expectSuccess("derivation yields a ceiling from three rounds", () => {
@@ -1044,6 +1909,94 @@ function selfTest() {
     );
     return "linux/x64 accepted";
   });
+  expectSuccess(
+    "initialized host identity preserves its canonical fingerprint",
+    () => {
+      const id = "0123456789abcdef0123456789abcdef";
+      const expected = createHash("sha256").update(`${id}\n`).digest("hex");
+      if (
+        machineIdentity(id) !== expected ||
+        machineIdentity(`${id}\n`) !== expected
+      )
+        throw new Error(
+          "valid host identity changed its canonical fingerprint",
+        );
+      return "nonzero 128-bit identity, with or without its final LF";
+    },
+  );
+  for (const raw of [
+    "",
+    "\n",
+    "uninitialized\n",
+    "0".repeat(32),
+    "a".repeat(31),
+    "g".repeat(32),
+    `${"a".repeat(32)}\n\n`,
+  ]) {
+    expectFailure(
+      "uninitialized or malformed measurement host identity is refused",
+      () => machineIdentity(raw),
+    );
+  }
+  expectFailure(
+    "matching empty-input fingerprints cannot bind two hosts",
+    () => {
+      const host = {
+        os: "linux",
+        architecture: "x64",
+        os_release: "same-kernel",
+        logical_cpus: 64,
+        machine_id_sha256: createHash("sha256").update("").digest("hex"),
+      };
+      assertSameHostClass(host, { ...host });
+    },
+  );
+  expectSuccess(
+    "actual shell host collector refuses empty identity and failed SSH",
+    () => {
+      const producer = readFileSync(
+        new URL("./check-fleet-scale.sh", import.meta.url),
+        "utf8",
+      );
+      const start = producer.indexOf("\nctxmux_fleet_remote_host_id=$(\n");
+      const end = producer.indexOf("\nctxmux_fleet_daemon_sha=", start);
+      if (start < 0 || end < 0)
+        throw new Error("host identity collector not found");
+      const script =
+        `ctxmux_fleet_dest=fixture
+ssh() { [[ $2 == 'cat /etc/machine-id' ]] || return 99; printf '%s' "$CTXMUX_TEST_MACHINE_ID"; return "$CTXMUX_TEST_SSH_STATUS"; }
+` +
+        producer.slice(start, end) +
+        '\nprintf "%s" "$ctxmux_fleet_remote_host_id"\n';
+      const id = "0123456789abcdef0123456789abcdef\n";
+      const run = (raw, status) =>
+        execFileSync("bash", ["-euo", "pipefail", "-c", script], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CTXMUX_TEST_MACHINE_ID: raw,
+            CTXMUX_TEST_SSH_STATUS: String(status),
+          },
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+      if (run(id, 0) !== machineIdentity(id))
+        throw new Error("collector lost valid identity");
+      for (const [raw, status] of [
+        ["", 0],
+        [id, 7],
+      ]) {
+        let refused = false;
+        try {
+          run(raw, status);
+        } catch {
+          refused = true;
+        }
+        if (!refused)
+          throw new Error("collector accepted absent identity or failed SSH");
+      }
+      return "exact producer pipeline preserves valid identity and propagates both failures";
+    },
+  );
   expectFailure("a receipt from another host class is refused", () => {
     assertSameHostClass(
       {
@@ -1100,30 +2053,24 @@ function selfTest() {
     }
     return `${OVERLAP_UNIT_TOLERANCE} units vs ${smallestRealDefect}-unit defect`;
   });
-  expectSuccess("below the baseline is reported as a stale baseline", () => {
-    // The live case: #52 removed the per-Run thread, so the farm measures 0
-    // where the frozen darwin baseline still records 2. The daemon got
-    // cheaper. Reporting that as "the harnesses disagree" points the reader
-    // at a measurement defect that does not exist.
+  expectSuccess("lower cost is an improvement under the same workload", () => {
     const entry = compareOverlapField("threads_per_run", 0, 2, 128);
-    if (entry.agree) throw new Error("a 256-thread gap was not caught");
-    if (entry.direction !== "below") {
-      throw new Error(`expected direction below, got ${entry.direction}`);
+    if (!entry.agree || !entry.improvement || entry.direction !== "below") {
+      throw new Error("an actual resource improvement was penalized");
     }
-    if (!entry.reason.includes("older than the daemon")) {
-      throw new Error(`the reason does not name the stale baseline`);
-    }
-    if (entry.reason.includes("cannot be trusted")) {
-      throw new Error("a cheaper daemon was reported as untrustworthy tiers");
-    }
-    return `${entry.fleet_delta_units} fleet units, direction ${entry.direction}`;
+    return `${entry.fleet_delta_units} fewer fleet units; frozen evidence preserved`;
   });
-  expectSuccess("a stale baseline still refuses rather than passing", () => {
-    // Honest naming must not become an exemption: a baseline that no longer
-    // describes the daemon has stopped cross-checking anything.
-    const entry = compareOverlapField("threads_per_run", 0, 2, 128);
-    if (entry.agree) throw new Error("a stale baseline was silently accepted");
-    return "below-baseline disagreement still fails closed";
+  expectSuccess("invalid low observations never become improvements", () => {
+    for (const value of [-1, NaN, undefined]) {
+      let rejected = false;
+      try {
+        compareOverlapField("threads_per_run", value, 2, 128);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) throw new Error("invalid observation was rewarded");
+    }
+    return "negative, NaN, and missing resource observations rejected";
   });
 
   // The fleet-wide retention cap of #47. Unlike every other ceiling here, this
@@ -1412,6 +2359,19 @@ function main() {
     return;
   }
 
+  if (options.mode === "resource-policy") {
+    console.log(JSON.stringify(FLEET_RESOURCE_POLICY));
+    return;
+  }
+  if (options.mode === "verify-baseline") {
+    const { thresholds } = loadFrozenThresholds(
+      options.thresholdsPath,
+      options.baselineRef,
+    );
+    assertThresholdDerivation(thresholds);
+    assertResourcePolicy(thresholds.derived_from.resource_policy);
+    return;
+  }
   if (options.mode === "derive") {
     if (!options.tiersPath || !options.out) {
       throw new Error("derive requires --observations <path> and --out <path>");
@@ -1433,9 +2393,17 @@ function main() {
         "verdict requires --thresholds <path> and --observations <path>",
       );
     }
-    const thresholds = JSON.parse(readFileSync(options.thresholdsPath, "utf8"));
+    const { thresholds, baselineAnchor } = loadFrozenThresholds(
+      options.thresholdsPath,
+      options.baselineRef,
+    );
     const receipt = JSON.parse(readFileSync(options.tiersPath, "utf8"));
-    const verdict = renderVerdict({ thresholds, receipt, root: options.root });
+    const verdict = renderVerdict({
+      thresholds,
+      receipt,
+      root: options.root,
+      baselineAnchor,
+    });
     const rendered = JSON.stringify(verdict, null, 2);
     console.log(rendered);
     if (options.out) {
@@ -1490,14 +2458,26 @@ function main() {
   );
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`check-fleet-scale: ${error.message}`);
-  process.exitCode = 1;
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`check-fleet-scale: ${error.message}`);
+    process.exitCode = 1;
+  }
 }
 
 export {
+  machineIdentity,
+  sourceIdentity,
+  judgeWorkload,
+  FLEET_RESOURCE_POLICY,
+  assertThresholdDerivation,
+  loadFrozenThresholds,
+  measurementContractSha,
   deriveThresholds,
   renderVerdict,
   observedMaximaForTier,

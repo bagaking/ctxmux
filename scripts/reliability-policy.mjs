@@ -42,6 +42,7 @@ import {
 import {
   assertReliabilityGcIdentities,
   loadReliabilityGcContract,
+  qualificationResourceLimits,
 } from "./reliability-gc-contract.mts";
 import { validateQualificationStatsArtifact } from "./reliability-gc-stats.mts";
 
@@ -61,6 +62,13 @@ const EXPECTED_CHECK_CORE_SHA256 =
   "94558aefe994235bdff099d8fe7145b7848bd32f2fadf7f1163403fb0b451b26";
 const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
   "ea4b034e70736db01d40e61dc530d81efdc1752f455f56697c93c222b4e11f9b";
+// ADR 019's inherited qualification operating points, encoded as a flat JSON
+// object with ASCII-sorted field names. This independent pin prevents a changed
+// producer policy from certifying itself against the old resource ceilings.
+// A policy change needs independent observations and an explicit review; it
+// must never silently refreeze the envelope merely to obtain a passing score.
+const EXPECTED_QUALIFICATION_RESOURCE_LIMITS_SHA256 =
+  "aad59bfd4701af66957b9bd913e67ad779a771667caa30538c6eaeb85d45c449";
 const EXPECTED_QUALIFICATION_POLICY = {
   schema: "ctxmux.reliability-qualification-policy.v1",
   profiles: {
@@ -651,14 +659,38 @@ export function validatePassingQualificationReceiptV3({
     "build provenance does not match the fixed locked envelope",
   );
 
-  const limits = value.declared_limits;
+  const { resource_limits, gc_resource_limits, ...limits } =
+    value.declared_limits ?? {};
+  expect(
+    isObject(resource_limits) &&
+      crypto
+        .createHash("sha256")
+        .update(
+          JSON.stringify(
+            Object.fromEntries(
+              Object.keys(resource_limits)
+                .sort()
+                .map((key) => [key, resource_limits[key]]),
+            ),
+          ),
+        )
+        .digest("hex") === EXPECTED_QUALIFICATION_RESOURCE_LIMITS_SHA256 &&
+      isDeepStrictEqual(resource_limits, qualificationResourceLimits(gc)) &&
+      isDeepStrictEqual(
+        gc_resource_limits,
+        expectedProfile === "nightly" || expectedProfile === "release"
+          ? qualificationResourceLimits(gc, true)
+          : null,
+      ),
+    "resource policies are incomplete, altered, or assigned to the wrong stage",
+  );
   validateQualificationWorkload(
     limits,
     receiptPath,
     errors,
     {
-      global_run_quota: gc.contract.bounded_churn.run_ceiling,
-      exited_run_gc: "exact_terminal_replacement",
+      global_run_quota: null,
+      exited_run_gc: "resource_funded_terminal_replacement",
       qualification_stage: "all",
       resource_counts: profilePolicy?.resource_counts,
       soak_seconds: profilePolicy?.soak_seconds,

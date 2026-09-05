@@ -8,7 +8,7 @@ use std::{
 use ctxmux_protocol::PROTOCOL_VERSION;
 
 fn usage() -> &'static str {
-    "usage: ctxmuxd --socket <path> [--state-dir <path>] [--readiness-fd <fd>] [--handoff-fd <fd>]\n       ctxmuxd --version"
+    "usage: ctxmuxd --socket <path> [--state-dir <path>] [--resource-limits <json>] [--readiness-fd <fd>] [--handoff-fd <fd>]\n       ctxmuxd --version"
 }
 
 fn inherited_fd(raw_fd: Option<RawFd>, label: &str) -> Result<Option<OwnedFd>, ExitCode> {
@@ -72,25 +72,17 @@ async fn serve(
     qualification_stats_fd: Option<OwnedFd>,
     readiness_fd: Option<OwnedFd>,
     handoff_fd: Option<OwnedFd>,
+    resources: ctxmux_daemon::ResourceLimits,
 ) -> Result<(), ctxmux_daemon::ServerError> {
-    if let Some(state_dir) = state_dir {
-        ctxmux_daemon::serve_with_state_dir_and_inherited_descriptors(
-            socket,
-            state_dir,
-            qualification_stats_fd,
-            readiness_fd,
-            handoff_fd,
-        )
-        .await
-    } else {
-        debug_assert!(handoff_fd.is_none());
-        ctxmux_daemon::serve_with_inherited_descriptors(
-            socket,
-            qualification_stats_fd,
-            readiness_fd,
-        )
-        .await
-    }
+    ctxmux_daemon::serve_configured(
+        socket,
+        state_dir,
+        qualification_stats_fd,
+        readiness_fd,
+        handoff_fd,
+        resources,
+    )
+    .await
 }
 
 /// Print what this binary is and what it can adopt.
@@ -109,6 +101,10 @@ fn print_version() {
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one strict CLI parse validates policy and inherited descriptors before any owner is created"
+)]
 fn main() -> ExitCode {
     let mut args = env::args_os().skip(1).peekable();
     if args.peek().is_some_and(|value| value == "--version") {
@@ -121,12 +117,25 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    let mut resource_json = None;
     let mut socket = None;
     let mut state_dir = None;
     let mut qualification_stats_fd = None;
     let mut readiness_fd = None;
     let mut handoff_fd = None;
     while let Some(flag) = args.next() {
+        if flag == "--resource-limits" {
+            if resource_json.is_some() {
+                eprintln!("duplicate --resource-limits");
+                return ExitCode::from(2);
+            }
+            let Some(value) = args.next().and_then(|value| value.into_string().ok()) else {
+                eprintln!("--resource-limits requires UTF-8 JSON");
+                return ExitCode::from(2);
+            };
+            resource_json = Some(value);
+            continue;
+        }
         if flag == "--qualification-stats-fd" || flag == "--readiness-fd" || flag == "--handoff-fd"
         {
             let target = if flag == "--qualification-stats-fd" {
@@ -173,6 +182,17 @@ fn main() -> ExitCode {
         eprintln!("{}", usage());
         return ExitCode::from(2);
     };
+    let resource_json = resource_json.or_else(|| env::var("CTXMUX_RESOURCE_LIMITS").ok());
+    let resources = match resource_json.map_or_else(
+        || Ok(ctxmux_daemon::ResourceLimits::default()),
+        |json| ctxmux_daemon::ResourceLimits::from_json(&json),
+    ) {
+        Ok(resources) => resources,
+        Err(error) => {
+            eprintln!("ctxmuxd: invalid resource policy: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let descriptors = match resolve_inherited_descriptors(
         qualification_stats_fd,
         readiness_fd,
@@ -199,6 +219,7 @@ fn main() -> ExitCode {
         descriptors.qualification_stats,
         descriptors.readiness,
         descriptors.handoff,
+        resources,
     ));
     match result {
         Ok(()) => ExitCode::SUCCESS,

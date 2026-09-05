@@ -32,6 +32,14 @@ use std::{
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+/// Host-native, build-owned target for real fixture process/probe boundaries.
+/// Its path is produced by this crate's build dependency, never guessed from
+/// a target directory or satisfied by an old binary left on the machine.
+#[must_use]
+pub fn fixture_executable() -> &'static std::path::Path {
+    std::path::Path::new(env!("CTXMUX_FIXTURE_EXECUTABLE"))
+}
+
 /// Read one unsigned test knob, falling back to `default` when unset.
 ///
 /// Matches the existing repository convention: a malformed value is a harness
@@ -176,6 +184,27 @@ pub async fn daemon_spawn_permit() -> DaemonSpawnPermit {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_DAEMON_SPAWN_LIMIT, scaled, scaled_polls, time_scale};
+
+    #[test]
+    fn native_fixture_probe_declares_only_the_selected_schema_and_rejects_exec() {
+        let probe = std::process::Command::new(super::fixture_executable())
+            .env_remove("CTXMUX_FIXTURE_TMUX_SCRIPT")
+            .env("CTXMUX_FIXTURE_HANDOFF_SCHEMA", "fixture-schema")
+            .arg("--version")
+            .output()
+            .expect("run build-owned native fixture probe");
+        assert!(probe.status.success());
+        assert_eq!(probe.stdout, b"ctxmuxd fixture handoff fixture-schema\n");
+        let unexpected = std::process::Command::new(super::fixture_executable())
+            .env_remove("CTXMUX_FIXTURE_TMUX_SCRIPT")
+            .env("CTXMUX_FIXTURE_HANDOFF_SCHEMA", "fixture-schema")
+            .arg("--handoff-fd")
+            .arg("3")
+            .output()
+            .expect("exercise accidental exec rejection");
+        assert_eq!(unexpected.status.code(), Some(99));
+        assert!(unexpected.stdout.is_empty());
+    }
     use std::time::Duration;
 
     #[test]

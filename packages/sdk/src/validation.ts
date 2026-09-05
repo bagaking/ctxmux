@@ -60,6 +60,28 @@ export function validateServerFrame(value: unknown): ServerFrame {
       exactFields(frame, "$frame", ["type", "snapshot"]);
       attachedHeader(frame.snapshot, "$frame.snapshot");
       break;
+    case "replay_window":
+      exactFields(frame, "$frame", [
+        "type",
+        "first_available_byte",
+        "latest_output_bytes",
+      ]);
+      safeUnsignedInteger(
+        frame.first_available_byte,
+        "$frame.first_available_byte",
+      );
+      safeUnsignedInteger(
+        frame.latest_output_bytes,
+        "$frame.latest_output_bytes",
+      );
+      if (
+        Number(frame.first_available_byte) > Number(frame.latest_output_bytes)
+      )
+        throw invalid(
+          "$frame.first_available_byte",
+          "no later than the replay head",
+        );
+      break;
     case "event":
       exactFields(frame, "$frame", ["type", "event"]);
       runEvent(frame.event, "$frame.event");

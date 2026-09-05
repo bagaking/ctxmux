@@ -329,15 +329,15 @@ impl NativeSession {
         self.require_waitable_anchor()?;
         let candidates = session_candidates(self.id)?;
         #[cfg(not(target_os = "macos"))]
-        reap_inherited_orphans(self.id, &candidates);
-        self.classify_members(candidates, include_leader, |pid| getsid(Some(pid)))
+        reap_inherited_orphans(self.id, &candidates)?;
+        self.classify_members(candidates, include_leader, candidate_session_id)
     }
 
     fn classify_members(
         &self,
         process_ids: Vec<u32>,
         include_leader: bool,
-        mut session_for: impl FnMut(Pid) -> Result<Pid, Errno>,
+        mut session_for: impl FnMut(Pid) -> Result<Option<Pid>, Errno>,
     ) -> Result<Vec<Pid>, String> {
         let mut members = Vec::new();
         for process_pid in process_ids {
@@ -348,7 +348,7 @@ impl NativeSession {
                 continue;
             };
             match session_for(pid) {
-                Ok(session) if session == self.id => {
+                Ok(Some(session)) if session == self.id => {
                     if include_leader || pid != self.id {
                         members.push(pid);
                     }
@@ -474,6 +474,17 @@ impl NativeSession {
         self.leader_probe = Some(probe);
         self
     }
+}
+
+/// A host census includes Linux kernel tasks whose getsid result is zero.
+/// Such a task has no user session and cannot belong to a positive Run SID.
+/// nix already backs portable-pty and preserves that raw result; rustix's
+/// getsid converts it to a nonzero Pid unchecked, which panics in debug and is
+/// invalid in release. Keep errno distinct from this successful absence.
+fn candidate_session_id(pid: Pid) -> Result<Option<Pid>, Errno> {
+    nix::unistd::getsid(Some(nix::unistd::Pid::from_raw(pid.as_raw_pid())))
+        .map(|session| Pid::from_raw(session.as_raw()))
+        .map_err(|error| Errno::from_raw_os_error(error as i32))
 }
 
 /// A live child inherited across an exec-in-place upgrade, addressable only by
@@ -736,9 +747,9 @@ fn session_candidates(leader: Pid) -> Result<Vec<u32>, String> {
 /// instant they are reaped.
 ///
 /// **What keeps this from stealing a status someone else owns.** The candidate
-/// list is the authority. `session_candidates` already proved every entry is
-/// both a descendant of this daemon and a member of *this* session, so the set
-/// is exactly this Run's own processes -- a `tmux` short command's orphan sits
+/// list is a conservative candidate set: the full-host fallback may include
+/// unrelated children. Every candidate's session is therefore proved immediately
+/// before waitpid consumes its status. A `tmux` short command's orphan sits
 /// in the daemon's session under its own group and never appears, and neither
 /// does another Run's member. The leader is excluded by pid on top of that,
 /// leaving its status to the sequenced `reap_leader`, which stays the only
@@ -748,7 +759,7 @@ fn session_candidates(leader: Pid) -> Result<Vec<u32>, String> {
 /// `WNOHANG` throughout: a still-running member is left alone rather than
 /// blocking the poll loop.
 #[cfg(not(target_os = "macos"))]
-fn reap_inherited_orphans(leader: Pid, candidates: &[u32]) {
+fn reap_inherited_orphans(leader: Pid, candidates: &[u32]) -> Result<(), String> {
     use rustix::process::{WaitOptions, waitpid};
 
     let raw_leader = leader.as_raw_pid().unsigned_abs();
@@ -760,8 +771,28 @@ fn reap_inherited_orphans(leader: Pid, candidates: &[u32]) {
         let Some(pid) = Pid::from_raw(candidate.cast_signed()) else {
             continue;
         };
-        let _ = waitpid(Some(pid), WaitOptions::NOHANG);
+        // The conservative fallback is a full host census, not an already
+        // filtered subtree. Validate ownership before consuming any status.
+        match candidate_session_id(pid) {
+            Ok(Some(session)) if session == leader => {}
+            Ok(_) | Err(Errno::SRCH) => continue,
+            Err(error) => {
+                return Err(format!(
+                    "failed to classify inherited process {candidate} before reap: {error}"
+                ));
+            }
+        }
+        match waitpid(Some(pid), WaitOptions::NOHANG) {
+            Ok(_) | Err(Errno::CHILD | Errno::SRCH) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to reap inherited native session {} process {candidate}: {error}",
+                    leader.as_raw_pid()
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 /// Whether this process inherits orphaned descendants.
@@ -858,6 +889,61 @@ mod tests {
     use rustix::{io::Errno, process::Pid};
 
     use super::{AdoptedChild, NativeSession};
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn inherited_reap_preserves_a_foreign_childs_waitable_status() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 17"])
+            .spawn()
+            .expect("spawn a foreign child whose creator owns its status");
+        let pid = Pid::from_child(&child);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = rustix::process::waitid(
+                rustix::process::WaitId::Pid(pid),
+                rustix::process::WaitIdOptions::EXITED
+                    | rustix::process::WaitIdOptions::NOHANG
+                    | rustix::process::WaitIdOptions::NOWAIT,
+            )
+            .expect("the foreign child's status stays waitable");
+            if status.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "foreign child did not exit");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // This synthetic session cannot own a real process: it models the
+        // disappeared-leader branch that conservatively enumerates the host.
+        let other_session = Pid::from_raw(2_000_000_000).unwrap();
+        super::reap_inherited_orphans(other_session, &[child.id()]).unwrap();
+        assert_eq!(
+            child
+                .wait()
+                .expect("foreign creator retains exact reap")
+                .code(),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn zero_session_does_not_belong_to_a_positive_run_session() {
+        let own_pid = std::process::id();
+        let session = NativeSession::from_child_pid(own_pid).unwrap();
+        assert!(
+            session
+                .classify_members(vec![own_pid], true, |_| Ok(None))
+                .unwrap()
+                .is_empty(),
+            "a successful zero SID is outside every positive Run session"
+        );
+        let pid = Pid::from_raw(own_pid.cast_signed()).unwrap();
+        assert_eq!(
+            super::candidate_session_id(pid).unwrap(),
+            Some(rustix::process::getsid(Some(pid)).unwrap()),
+            "the raw-safe census agrees with the current real user session"
+        );
+    }
 
     #[test]
     fn adopted_child_probes_then_reaps_by_pid_with_latch() {
@@ -1212,7 +1298,7 @@ mod tests {
 
         let session_id = Pid::from_raw(i32::try_from(own_pid).unwrap()).unwrap();
         let present = session
-            .classify_members(vec![own_pid], true, |_| Ok(session_id))
+            .classify_members(vec![own_pid], true, |_| Ok(Some(session_id)))
             .expect("matching SID is retained");
         assert_eq!(present, [session_id]);
     }

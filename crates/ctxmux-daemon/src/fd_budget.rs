@@ -1,50 +1,12 @@
-//! Startup file-descriptor budget and honest live-Run clamp.
-//!
-//! `ctxmuxd` holds three descriptors per live native Run (the PTY master in the
-//! control owner, one CLOEXEC reader dup in the daemon-wide output reactor, and
-//! one writer dup from `take_writer`, all aliasing the same master — see ADR
-//! 013) on top of a fixed process baseline. It never read, raised, or clamped
-//! its own `RLIMIT_NOFILE`, so on a stock macOS soft limit of 256 it hit EMFILE
-//! near 82 live Runs. The operator then saw an opaque PTY/spawn error instead of
-//! the designed `run_capacity`: the limit they hit was not the ceiling they were
-//! told about.
-//!
-//! At startup this module reads the soft and hard limits, raises the soft limit
-//! toward [`fd_budget`] — descriptors for [`FD_BUDGET_LIVE_RUNS`] concurrent live
-//! Runs — never touching the hard limit, re-reads what the OS actually granted,
-//! and clamps the *effective* Run ceiling when the granted limit funds fewer
-//! Runs than the daemon would admit, so admission refuses cleanly with
-//! `run_capacity` at the real descriptor ceiling instead of failing opaquely
-//! mid-spawn.
-//!
-//! [`FD_BUDGET_LIVE_RUNS`] *is* the daemon's live-Run admission ceiling now that
-//! the `MAX_RETAINED_RUNS = 128` record cap is gone: the Registry seeds its
-//! admission ceiling from this target and this module only clamps it *down* to
-//! what the OS funds. Descriptors are the resource that scales one-per-live-Run,
-//! so they are what bounds live admission; retained memory and durable rows are
-//! bounded by their own budgets (`retention.rs`, `persistence.rs`).
-//!
-//! Child / exec inheritance is deliberate and unbounded by design. `portable_pty`
-//! owns the child `pre_exec` and exposes no passthrough, and this crate is
-//! `#![forbid(unsafe_code)]`, so a managed Run's soft limit cannot be restored
-//! per-spawn without reimplementing the PTY launch. The daemon therefore lets
-//! every managed child — and the exec-in-place re-exec image — inherit the raised
-//! soft limit. This is safe at any budget, because the soft limit is a *ceiling*,
-//! not a floor: fd numbers are kernel-assigned as the lowest available, so a
-//! raised ceiling never pushes a child's fds to higher numbers — it only lets a
-//! child that opens many fds open more. The `select(2)`/`FD_SETSIZE` hazard (stack
-//! corruption for an fd >= 1024) therefore does not follow from the inheritance;
-//! it strikes only a child that itself opens 1024+ fds and then calls `select`,
-//! which is independently broken anywhere its own soft limit exceeds 1024 and is
-//! not something our raise creates. (This is why systemd keeps the *soft* default
-//! at 1024 while raising the hard limit — protecting legacy `select` users
-//! without capping everyone else — rather than by bounding process concurrency.)
-//! Bounding the daemon's Run count so the budget stayed below 1024 was the
-//! earlier design; it forfeited the host's entire concurrency ceiling (~306 live
-//! Runs) to guard a hazard the inheritance does not cause, and has been removed.
+//! Host descriptor admission, independent of historical qualification tiers.
+//! Every native live owner keeps three descriptors. Startup reserves fixed
+//! process/attachment/creation headroom, raises toward explicit live policy
+//! or the metadata budget's minimum-owner population, and admits what the OS
+//! actually funds. A generous existing soft limit is never clamped to a tier.
 
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
+#[cfg(test)]
 use crate::creation::MAX_CREATION_OWNER_SLOTS;
 
 /// Descriptors one live native Run keeps open: PTY master + reader dup + writer
@@ -52,60 +14,17 @@ use crate::creation::MAX_CREATION_OWNER_SLOTS;
 /// `fds_per_run` in the reliability contracts.
 pub(crate) const FDS_PER_RUN: usize = 3;
 
-/// Concurrent live Runs the startup budget provisions descriptors for.
-///
-/// This is what the daemon *provisions* for, not on its own what it will
-/// admit. The effective ceiling is the smallest of three things: this target,
-/// what `RLIMIT_NOFILE` funds (`RegistryState::record_capacity` defaults here
-/// and is only ever clamped *down*, see `run_ceiling_for_soft_limit`), and
-/// whatever ptys the kernel will still hand out. The third term is not
-/// budgeted, because it cannot be known in advance — see below.
-///
-/// It is a descriptor *concurrency target*, not the removed
-/// `MAX_RETAINED_RUNS = 128` record count — attachment and turnover fan-out are
-/// not record-count-bounded, retained memory is now bounded by the daemon-wide
-/// retained-byte budget (`retention.rs`), and durable rows by the persistence
-/// ceiling (`persistence.rs`, also anchored here). Descriptors are the one
-/// resource that scales one-per-live-Run, so they are what admission is bounded
-/// by. Measured cost at this target on a 64-core Linux host: ~12k fds, ~14 MiB
-/// RSS, ~21% of one core — comparable to `tmux` at the same Run count, which
-/// imposes no count limit.
-///
-/// # The pty ceiling, and why it is not probed
-///
-/// Every live Run holds a pty, and the kernel caps those independently of
-/// descriptors. Measured:
-///
-/// * Linux exposes `/proc/sys/kernel/pty/{max,nr,reserve}` (a directory, not a
-///   `pty.max` file). The farm hosts read `max=65536`, so the kernel ceiling is
-///   an order of magnitude above this target and never binds there.
-/// * macOS exposes `kern.tty.ptmx_max`, 511 by default. With ~180 ptys already
-///   held by an ordinary desktop session, `openpty` began failing at 346 — so
-///   darwin's real headroom is roughly a tenth of this target, and the pty
-///   ceiling binds long before the descriptor budget does.
-///
-/// The daemon deliberately does not probe either at startup and clamp against
-/// it. macOS publishes the ceiling but no current-allocation counter, so a
-/// probe there cannot subtract what the rest of the system holds and would be
-/// wrong by a different amount every minute. Linux does publish `nr`, but it is
-/// live — it moved by tens of thousands during a single measurement run — so a
-/// startup snapshot is stale immediately. A probed ceiling would look
-/// authoritative and still be wrong.
-///
-/// The honest arrangement is this fixed budget plus a truthful refusal when the
-/// kernel declines: pty exhaustion surfaces as `ErrorCode::RunCapacity` (not
-/// `SpawnFailed`) on both platforms, keyed on the errnos each one reports. A
-/// darwin fleet is therefore expected to refuse cleanly somewhere near 350 Runs
-/// rather than reach this target, which is also why the darwin lane cannot
-/// exercise admission at this ceiling.
+/// Historical 4000-Run qualification example, used only to test descriptor
+/// arithmetic. Production admission has no dependency on this fixture size.
+#[cfg(test)]
 pub(crate) const FD_BUDGET_LIVE_RUNS: usize = 4000;
 
 /// Fixed non-Run descriptors the daemon holds regardless of Run count: stdio,
 /// the accepted listener socket, tokio's kqueue/epoll, signal registrations, up
 /// to three inherited handoff/readiness/qualification-stats fds, and the
 /// `SQLite` db/WAL/SHM/state-lock quartet, with a little slack. Measured at ~12
-/// (ADR 013); rounded up so a normally provisioned daemon never clamps below
-/// its cap.
+/// (ADR 013); rounded to 16 to fund fixed-owner variation. This reservation
+/// reduces the measured host funding, rather than setting a product cap.
 const FD_BASELINE: usize = 16;
 
 /// Concurrent client attachment/control sockets to keep reachable on top of the
@@ -117,6 +36,7 @@ const FD_ATTACHMENT_HEADROOM: usize = 64;
 /// Fixed descriptors reserved before any live-Run descriptor: the baseline, the
 /// attachment headroom, and the PTYs the eight-slot physical-overlap owner can
 /// hold un-published alongside the retained records during turnover (ADR 013).
+#[cfg(test)]
 const fn reserved_fds() -> usize {
     FD_BASELINE + FD_ATTACHMENT_HEADROOM + MAX_CREATION_OWNER_SLOTS * FDS_PER_RUN
 }
@@ -135,31 +55,35 @@ const fn reserved_fds() -> usize {
 /// whoever adds it to drop `const` here — a visible, reviewable diff — rather
 /// than letting the real per-Run cost drift above the budgeted 3 the way an
 /// earlier per-Run pidfd once did, unnoticed until EMFILE at a few thousand Runs.
+#[cfg(test)]
 pub(crate) const fn fd_budget() -> usize {
     FD_BUDGET_LIVE_RUNS * FDS_PER_RUN + reserved_fds()
 }
 
-/// Live-Run ceiling the effective soft limit actually funds. `None` means the
-/// soft limit is unlimited, which funds the full concurrency target. Reserves
-/// the same fixed descriptors the budget accounts for, then divides the
-/// remainder among Runs at [`FDS_PER_RUN`] each; saturating so an absurdly small
-/// limit yields zero rather than underflowing. Never exceeds the daemon's own
-/// concurrency target [`FD_BUDGET_LIVE_RUNS`] — a soft limit funding more Runs
-/// than the daemon provisions for does not raise admission above the target it
-/// budgeted, sized, and measured against.
+/// Funded live owners after baseline, attachment and creation headroom.
+/// An unlimited host limit has no population ceiling. PTY exhaustion is
+/// discovered by actual allocation and returns `RunCapacity` without pretending
+/// a stale startup PTY census predicts current host availability.
+#[cfg(test)]
 pub(crate) fn run_ceiling_for_soft_limit(effective_soft: Option<u64>) -> usize {
+    run_ceiling_with_reserved(effective_soft, reserved_fds())
+}
+
+fn run_ceiling_with_reserved(effective_soft: Option<u64>, reserved: usize) -> usize {
     let Some(soft) = effective_soft else {
-        return FD_BUDGET_LIVE_RUNS;
+        return usize::MAX;
     };
-    let reserved = reserved_fds() as u64;
+    let reserved = reserved as u64;
     let per_run = FDS_PER_RUN as u64;
     let for_runs = soft.saturating_sub(reserved);
-    let admissible = (for_runs / per_run).min(FD_BUDGET_LIVE_RUNS as u64);
-    usize::try_from(admissible).expect("admissible count is bounded by FD_BUDGET_LIVE_RUNS")
+    let admissible = for_runs / per_run;
+    usize::try_from(admissible).unwrap_or(usize::MAX)
 }
 
 /// Outcome of applying the startup budget, for logging and clamping.
 pub(crate) struct FdBudgetOutcome {
+    pub(crate) provisioned_runs: usize,
+    pub(crate) provisioned_fds: u64,
     /// Soft limit in effect after any raise; `None` means unlimited.
     pub(crate) effective_soft: Option<u64>,
     /// Live-Run ceiling the effective soft limit funds.
@@ -193,11 +117,21 @@ pub(crate) struct FdBudgetOutcome {
 /// requested soft limit faithfully through `getrlimit` even above
 /// `kern.maxfilesperproc`, enforcing that wall at `open()` time instead — so the
 /// re-read is a portable honesty guard, cheap where it is a no-op.)
-pub(crate) fn apply_fd_budget() -> FdBudgetOutcome {
+pub(crate) fn apply_fd_budget(resources: crate::ResourceLimits) -> FdBudgetOutcome {
     let limits = getrlimit(Resource::Nofile);
     let original_soft = limits.current;
     let hard = limits.maximum;
-    let budget = u64::try_from(fd_budget()).expect("fd budget fits u64");
+    let provisioned_runs = resources.live_runs.unwrap_or_else(|| {
+        usize::try_from(resources.metadata_bytes / crate::resident_run_owner_bytes())
+            .unwrap_or(usize::MAX)
+            .max(1)
+    });
+    let reserved = FD_BASELINE
+        .saturating_add(FD_ATTACHMENT_HEADROOM)
+        .saturating_add(resources.creation_workers.saturating_mul(FDS_PER_RUN));
+    let budget = (provisioned_runs as u64)
+        .saturating_mul(FDS_PER_RUN as u64)
+        .saturating_add(reserved as u64);
 
     // Desired soft: the budget, but never above the hard ceiling. Requesting a
     // soft limit above the hard limit only fails; `None` hard is unlimited, so
@@ -225,12 +159,15 @@ pub(crate) fn apply_fd_budget() -> FdBudgetOutcome {
     // honor would otherwise make the advertised ceiling lie.
     let effective_soft = getrlimit(Resource::Nofile).current;
 
-    let run_ceiling = run_ceiling_for_soft_limit(effective_soft);
+    let run_ceiling = run_ceiling_with_reserved(effective_soft, reserved)
+        .min(resources.live_runs.unwrap_or(usize::MAX));
     FdBudgetOutcome {
         effective_soft,
         run_ceiling,
         raised,
-        clamped: run_ceiling < FD_BUDGET_LIVE_RUNS,
+        clamped: run_ceiling < provisioned_runs,
+        provisioned_runs,
+        provisioned_fds: budget,
         original_soft,
         hard,
     }
@@ -301,20 +238,20 @@ mod tests {
     /// clamping.
     #[test]
     fn unlimited_soft_funds_the_full_target() {
-        assert_eq!(run_ceiling_for_soft_limit(None), FD_BUDGET_LIVE_RUNS);
+        assert_eq!(run_ceiling_for_soft_limit(None), usize::MAX);
     }
 
     /// A soft limit funding more Runs than the daemon provisions for does not
     /// raise admission above the concurrency target it budgeted and measured
     /// against: the ceiling stays pinned at the target.
     #[test]
-    fn generous_limit_does_not_raise_above_the_target() {
+    fn generous_limit_funds_runs_beyond_the_historical_fixture() {
         let per_run = u64::try_from(FDS_PER_RUN).unwrap();
         let reserved = u64::try_from(reserved_fds()).unwrap();
         let beyond_target = reserved + u64::try_from(FD_BUDGET_LIVE_RUNS + 1000).unwrap() * per_run;
         assert_eq!(
             run_ceiling_for_soft_limit(Some(beyond_target)),
-            FD_BUDGET_LIVE_RUNS
+            FD_BUDGET_LIVE_RUNS + 1000
         );
     }
 

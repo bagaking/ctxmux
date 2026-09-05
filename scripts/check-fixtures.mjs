@@ -194,10 +194,11 @@ const sourceRegistry = new Map();
 const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
-  // 41 retained cases plus the six REMOTE cases owned by decision 018.
-  if (corpus.cases.length !== 47) {
+  // Preserve 41 runtime cases and six REMOTE cases, plus decision 019's
+  // population-independent resource/recovery regression.
+  if (corpus.cases.length !== 48) {
     fail(
-      `corpus must contain all 47 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 48 retained cases, got ${corpus.cases.length}`,
     );
   }
 

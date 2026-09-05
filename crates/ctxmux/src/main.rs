@@ -59,7 +59,7 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("ctxmux: {error}");
+            let _ = writeln!(io::stderr().lock(), "ctxmux: {error}");
             ExitCode::FAILURE
         }
     }
@@ -68,11 +68,11 @@ async fn main() -> ExitCode {
 async fn run() -> Result<(), String> {
     let mut args = env::args_os().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|arg| arg == "--version") {
-        println!(
+        print_stdout(format_args!(
             "ctxmux {} (protocol {})",
             env!("CARGO_PKG_VERSION"),
             PROTOCOL_VERSION
-        );
+        ))?;
         return Ok(());
     }
 
@@ -103,7 +103,7 @@ async fn run() -> Result<(), String> {
         "ping" => {
             ensure_empty(&args)?;
             client.ping().await.map_err(|error| error.to_string())?;
-            println!("ok");
+            print_stdout(format_args!("ok"))?;
         }
         "runtime" => {
             ensure_empty(&args)?;
@@ -111,11 +111,11 @@ async fn run() -> Result<(), String> {
                 .runtime_info()
                 .await
                 .map_err(|error| error.to_string())?;
-            println!(
+            print_stdout(format_args!(
                 "{}",
                 serde_json::to_string(&runtime)
                     .map_err(|error| format!("failed to encode Runtime identity: {error}"))?
-            );
+            ))?;
         }
         "start" => start(&client, args).await?,
         "tmux-list" => tmux_list(&client, args).await?,
@@ -126,20 +126,22 @@ async fn run() -> Result<(), String> {
             // The client pages internally, so the CLI keeps its whole-fleet
             // listing without knowing about cursors.
             for run in client.list().await.map_err(|error| error.to_string())? {
-                print_summary(&run);
+                if !print_summary(&run)? {
+                    break;
+                }
             }
         }
         "status" => {
             let id = take_run_id(&mut args)?;
             ensure_empty(&args)?;
             let run = client.status(id).await.map_err(|error| error.to_string())?;
-            print_run(&run);
+            print_run(&run)?;
         }
         "remove" => {
             let id = take_run_id(&mut args)?;
             ensure_empty(&args)?;
             client.remove(id).await.map_err(|error| error.to_string())?;
-            println!("{id}\tremoved");
+            print_stdout(format_args!("{id}\tremoved"))?;
         }
         "input" => input(&client, args).await?,
         "resize" => resize(&client, args).await?,
@@ -150,7 +152,7 @@ async fn run() -> Result<(), String> {
                 .interrupt(id)
                 .await
                 .map_err(|error| error.to_string())?;
-            print_run(&accepted.run);
+            print_run(&accepted.run)?;
         }
         "attach" => attach(&client, args).await?,
         "stop" => stop(&client, args).await?,
@@ -223,7 +225,7 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         )
         .await
         .map_err(|error| error.to_string())?;
-    println!("{}", run.id);
+    print_stdout(format_args!("{}", run.id))?;
     Ok(())
 }
 
@@ -246,7 +248,7 @@ async fn fork(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         )
         .await
         .map_err(|error| error.to_string())?;
-    print_run(&run);
+    print_run(&run)?;
     Ok(())
 }
 
@@ -270,7 +272,7 @@ async fn tmux_list(client: &Client, mut args: Vec<OsString>) -> Result<(), Strin
         .await
         .map_err(|error| error.to_string())?;
     for pane in panes {
-        println!(
+        if !print_stdout(format_args!(
             "{}\tsession={}\twindow={}\tpid={}\tsize={}x{}\ttmux={}",
             pane.pane_id,
             pane.session_id,
@@ -279,7 +281,9 @@ async fn tmux_list(client: &Client, mut args: Vec<OsString>) -> Result<(), Strin
             pane.size.cols,
             pane.size.rows,
             version
-        );
+        ))? {
+            break;
+        }
     }
     Ok(())
 }
@@ -292,7 +296,7 @@ async fn tmux_import(client: &Client, mut args: Vec<OsString>) -> Result<(), Str
         .import_tmux(socket, pane_id)
         .await
         .map_err(|error| error.to_string())?;
-    print_run(&run);
+    print_run(&run)?;
     Ok(())
 }
 
@@ -386,8 +390,10 @@ async fn stop(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         StopDisposition::Graceful => "graceful",
         StopDisposition::Forced => "forced",
     };
-    println!("stop={disposition}");
-    print_run(&accepted.run);
+    if !print_stdout(format_args!("stop={disposition}"))? {
+        return Ok(());
+    }
+    print_run(&accepted.run)?;
     Ok(())
 }
 
@@ -404,7 +410,8 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         .await
         .map_err(|error| error.to_string())?;
     if snapshot.replay.truncated {
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "ctxmux: output before byte {} is no longer retained",
             snapshot.replay.first_available_byte
         );
@@ -710,18 +717,32 @@ fn format_run_state(state: &RunState) -> String {
     }
 }
 
+// A closed downstream pipe is a normal consumer boundary. Propagate every
+// other write failure, and unwind normally so terminal/attachment guards run.
+fn print_stdout(arguments: std::fmt::Arguments<'_>) -> Result<bool, String> {
+    print_line(&mut io::stdout().lock(), arguments)
+}
+
+fn print_line(writer: &mut impl Write, arguments: std::fmt::Arguments<'_>) -> Result<bool, String> {
+    match writeln!(writer, "{arguments}") {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(format!("failed to write stdout: {error}")),
+    }
+}
+
 /// Print one thin `list` row.
 ///
 /// A `list` page carries [`RunSummary`] values, not full `RunInfo`, so this
 /// deliberately omits lineage and the durable head that `status` still shows —
 /// those live on the fat per-Run record. It keeps the run id first so scripts
 /// and the CLI smoke test can still find a Run by grepping the listing.
-fn print_summary(run: &RunSummary) {
+fn print_summary(run: &RunSummary) -> Result<bool, String> {
     let backend = match run.backend {
         RunBackendKind::Native => "native",
         RunBackendKind::Tmux => "tmux",
     };
-    println!(
+    print_stdout(format_args!(
         "{}\t{}\tpid={}\tbackend={}\tattachments={}\thead={}\tretained={}",
         run.id,
         format_run_state(&run.state),
@@ -735,10 +756,10 @@ fn print_summary(run: &RunSummary) {
         // it across a listing is how an external harness checks the daemon's
         // fleet-wide retention cap without needing the daemon's own counter.
         run.retained_output_bytes,
-    );
+    ))
 }
 
-fn print_run(run: &RunInfo) {
+fn print_run(run: &RunInfo) -> Result<bool, String> {
     let state = format_run_state(&run.state);
     let lineage = run.lineage.as_ref().map_or_else(
         || "root".to_owned(),
@@ -754,7 +775,7 @@ fn print_run(run: &RunInfo) {
         ctxmux_protocol::RunBackend::Native => "native".to_owned(),
         ctxmux_protocol::RunBackend::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
     };
-    println!(
+    print_stdout(format_args!(
         "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}\tsize={}",
         run.id,
         state,
@@ -771,7 +792,7 @@ fn print_run(run: &RunInfo) {
         // no owner can confirm a tmux pane or a recovered Run -- so it is not
         // filled in from the spec.
         format_current_size(run.current_size)
-    );
+    ))
 }
 
 fn format_current_size(size: Option<TerminalSize>) -> String {
@@ -785,7 +806,40 @@ fn format_current_size(size: Option<TerminalSize>) -> String {
 mod tests {
     use ctxmux_protocol::{RunEvent, TerminalSize};
 
-    use super::{PrefixRouter, format_current_size, normalize_terminal_size, write_event};
+    use super::{
+        PrefixRouter, format_current_size, normalize_terminal_size, print_line, write_event,
+    };
+
+    #[test]
+    fn stdout_pipe_closure_is_distinct_from_other_write_failures() {
+        struct FailedWriter(std::io::ErrorKind);
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(self.0))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(
+            !print_line(
+                &mut FailedWriter(std::io::ErrorKind::BrokenPipe),
+                format_args!("one row")
+            )
+            .unwrap()
+        );
+        assert!(
+            print_line(
+                &mut FailedWriter(std::io::ErrorKind::PermissionDenied),
+                format_args!("one row")
+            )
+            .unwrap_err()
+            .contains("failed to write stdout")
+        );
+        let mut bytes = Vec::new();
+        assert!(print_line(&mut bytes, format_args!("run\thead=1")).unwrap());
+        assert_eq!(bytes, b"run\thead=1\n");
+    }
 
     #[test]
     fn status_reports_the_confirmed_size_and_admits_when_there_is_none() {

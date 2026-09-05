@@ -29,6 +29,11 @@ import { CtxmuxInvalidFrameError, validateServerFrame } from "./validation.js";
 import { encodeJsonLine, WireClosedError } from "./wire.js";
 
 const MAX_ATTACHMENT_COMMAND_ID = 0xffff_ffff;
+// Per-attachment pipeline windows bound queued envelopes and payload while a
+// peer is slow. Count limits cover empty/small commands; byte limits cover large
+// commands. Exhaustion is explicit backpressure before enqueue, with recoverable
+// command identity preserved. These windows do not cap fleet/lifetime work;
+// independent short-client requests use the same public protocol.
 const MAX_PENDING_COMMANDS = 64;
 const MAX_PENDING_INPUT_COMMANDS = 32;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;

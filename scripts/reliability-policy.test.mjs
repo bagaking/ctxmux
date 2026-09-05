@@ -33,7 +33,10 @@ import {
   readOwnedJson,
   writeOwnedJsonAtomically,
 } from "./reliability-artifact-owner.mts";
-import { loadReliabilityGcContract } from "./reliability-gc-contract.mts";
+import {
+  loadReliabilityGcContract,
+  qualificationResourceLimits,
+} from "./reliability-gc-contract.mts";
 
 const root = path.resolve(import.meta.dirname, "..");
 const receiptPaths = [
@@ -688,8 +691,10 @@ function passingNightlyV3ReceiptFixture() {
     },
   ];
   Object.assign(receipt.value.declared_limits, {
-    global_run_quota: 128,
-    exited_run_gc: "exact_terminal_replacement",
+    global_run_quota: null,
+    exited_run_gc: "resource_funded_terminal_replacement",
+    resource_limits: qualificationResourceLimits(gc),
+    gc_resource_limits: qualificationResourceLimits(gc, true),
     qualification_stage: "all",
     resource_counts: [1, 32, 128],
     resource_modes: ["idle", "active"],
@@ -1067,6 +1072,29 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
     [
       "declared workload envelope",
       (value) => (value.declared_limits.frame_bytes += 1),
+    ],
+    [
+      "fictional global quota",
+      (value) => (value.declared_limits.global_run_quota = 128),
+    ],
+    [
+      "missing resource policy",
+      (value) => delete value.declared_limits.resource_limits,
+    ],
+    [
+      "changed worker policy",
+      (value) => (value.declared_limits.resource_limits.input_workers = 1),
+    ],
+    [
+      "changed GC workload policy",
+      (value) => (value.declared_limits.gc_resource_limits.retained_runs = 127),
+    ],
+    [
+      "GC policy assigned globally",
+      (value) =>
+        (value.declared_limits.resource_limits = structuredClone(
+          value.declared_limits.gc_resource_limits,
+        )),
     ],
     [
       "GC stage",

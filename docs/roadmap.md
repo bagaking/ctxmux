@@ -69,6 +69,22 @@ fan-out, protocol encoding, thresholds, compatibility behavior, tmux semantics,
 or add a downstream product pin. The external comparison explains priority but
 does not become ctxmux benchmark truth or authorize publication.
 
+## Runtime resource-policy correction
+
+The WAL-overflow incident and first-principles audit are owned by
+`f-22tcz9d9r`; [decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md)
+owns the resulting resource and qualification contract. Run population is
+funded by host descriptors and metadata, with optional operator quotas. Valid
+resource pressure is distinct from corruption; output, generation authority and
+child ownership remain intact under pressure and uncertain commits.
+
+Acceptance keeps historical workloads and replay digests, exercises fragmented
+state, cold recovery, small independent cache/storage budgets and real public
+child boundaries, and judges completion work alongside resource cost. Local
+macOS validation and harness self-tests do not qualify Linux 4000-Run performance.
+The revised fleet objectives require an independently reviewed, committed
+baseline before candidate acceptance; historical thresholds are not rewritten.
+
 ## M0 — Repository foundation
 
 Establish the smallest Rust and TypeScript workspaces, shared quality commands,
@@ -275,9 +291,12 @@ Production evidence on 2026-09-21 showed 42% of that ceiling spent on row
 headers and indexes rather than output (762,048 rows, median 82 B). Replay
 payloads now live in append-only generation files; SQLite retains only the
 contiguous window index and cursors. Startup truncates abandoned tails and
-removes orphan generations, while oversized generations compact through an
-atomic metadata switch. Directory durability, rollback-tail recovery, and
-before/after-switch crash fixtures cover the generation boundary. The main
+removes unreferenced generations, while oversized generations compact through
+page-admitted coordinate batches into a synced active destination. Recovery
+validates both referenced generations during interrupted migration. Directory
+durability, rollback-tail recovery, high-cardinality/fragmented extents,
+mid-migration crashes and uncertain-COMMIT fixtures cover the generation
+boundary. The main
 database ceiling remains fixed and old schema versions are rejected without
 migration.
 [replay-capacity-beyond-the-384-mib-ceiling](plans/replay-capacity-beyond-the-384-mib-ceiling.md)

@@ -30,6 +30,9 @@ ctxmux-protocol = { path = "../ctxmux-protocol" }
 ctxmux-inherited-fd = { path = "../ctxmux-inherited-fd" }
 ctxmux-sqlite-status = { path = "../ctxmux-sqlite-status" }
 futures-util.workspace = true
+# Reuse portable-pty's existing nix version for getsid: its raw ID can
+# represent Linux kernel tasks with SID 0, unlike rustix::process::Pid.
+nix = { version = "0.28", default-features = false, features = ["process"] }
 portable-pty.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
@@ -51,6 +54,7 @@ sysinfo.workspace = true
 workspace = true
 
 [dev-dependencies]
+rustix = { workspace = true, features = ["net"] }
 ctxmux-client = { path = "../ctxmux-client" }
 ctxmux-remote = { path = "../ctxmux-remote" }
 ctxmux-test-support = { path = "../ctxmux-test-support" }

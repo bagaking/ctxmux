@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, posix, resolve, win32 } from "node:path";
 
+import type { RuntimeResourceLimits } from "../packages/sdk/src/index.ts";
+
 export const GC_CONTRACT_PATH = "reliability-gc-contract.json";
 export const GC_CONTRACT_SHA256 =
   "92960ffd3369b5f408c3df2846f7fa4170fc1c0023b6c21ac518d04783af8049";
@@ -119,6 +121,57 @@ export interface LoadedReliabilityGcContract {
   readonly contract: ReliabilityGcContract;
   readonly workload_contract: GcFileIdentity;
   readonly workload_helper: GcFileIdentity;
+}
+
+// Fixed qualification operating points, independently of candidate defaults or
+// ambient CTXMUX_RESOURCE_LIMITS. Budgets permit the same work on every arm;
+// neither these byte budgets nor the GC workload define production capacity.
+const QUALIFICATION_RESOURCE_LIMITS: Readonly<Required<RuntimeResourceLimits>> =
+  Object.freeze({
+    live_runs: null,
+    retained_runs: null,
+    hot_output_bytes: 1024 * 1024 * 1024,
+    live_event_bytes: 64 * 1024 * 1024,
+    run_output_bytes: 4 * 1024 * 1024,
+    metadata_bytes: 64 * 1024 * 1024,
+    durable_replay_bytes: 256 * 1024 * 1024,
+    durable_run_output_bytes: 4 * 1024 * 1024,
+    database_bytes: 384 * 1024 * 1024,
+    wal_checkpoint_bytes: 8 * 1024 * 1024,
+    handoff_input_bytes: 128 * 1024 * 1024,
+    handoff_diagnostic_bytes: 16 * 1024 * 1024,
+    handoff_bytes: 256 * 1024 * 1024,
+    control_state_bytes: 128 * 1024 * 1024,
+    creation_workers: 8,
+    input_workers: 8,
+    cleanup_workers: 8,
+    finalize_workers: 8,
+    input_queue_commands: 1024,
+    input_queue_bytes: 4 * 1024 * 1024,
+    input_result_entries: 256,
+    input_result_bytes: 1024 * 1024,
+    tmux_discovery_bytes: 128 * 1024,
+  });
+
+export function qualificationResourceLimits(
+  loaded: LoadedReliabilityGcContract,
+  gcPolicy = false,
+): Readonly<Required<RuntimeResourceLimits>> {
+  return {
+    ...QUALIFICATION_RESOURCE_LIMITS,
+    ...(gcPolicy
+      ? {
+          retained_runs: loaded.contract.bounded_churn.run_ceiling,
+          run_output_bytes:
+            loaded.contract.payload_modes.memory_replay_pressure!.payload_bytes,
+          durable_replay_bytes:
+            loaded.contract.replay_pressure.persistent_durable_replay_max_bytes,
+          durable_run_output_bytes:
+            loaded.contract.payload_modes.persistent_replay_pressure!
+              .payload_bytes,
+        }
+      : {}),
+  };
 }
 
 export function assertReliabilityGcIdentities(

@@ -45,6 +45,7 @@ import {
   assertCanonicalGcQualificationInvocation,
   gcResourceBudgets,
   loadReliabilityGcContract,
+  qualificationResourceLimits,
   type LoadedReliabilityGcContract,
 } from "./reliability-gc-contract.mts";
 import {
@@ -428,9 +429,15 @@ async function qualify(options: QualificationOptions): Promise<void> {
       frame_bytes: MAX_FRAME_BYTES,
       retained_output_bytes_per_run: 4 * 1024 * 1024,
       live_event_capacity: 256,
-      global_run_quota: options.gc.contract.bounded_churn.run_ceiling,
+      global_run_quota: null,
       global_attachment_quota: null,
-      exited_run_gc: "exact_terminal_replacement",
+      exited_run_gc: "resource_funded_terminal_replacement",
+      resource_limits: qualificationResourceLimits(options.gc),
+      gc_resource_limits:
+        options.stage === "all" &&
+        (options.profile === "nightly" || options.profile === "release")
+          ? qualificationResourceLimits(options.gc, true)
+          : null,
       qualification_stage: options.stage,
       resource_counts: options.resourceCounts,
       resource_modes: options.resourceModes,
@@ -438,7 +445,7 @@ async function qualify(options: QualificationOptions): Promise<void> {
       peak_rss_sample_interval_ms: 25,
       soak_seconds: options.soakSeconds,
       seed_controls: [...QUALIFICATION_POLICY.seed_controls],
-      note: "Run retention is bounded by exact terminal replacement; attachment fan-out remains outside this qualification claim.",
+      note: "Base stages use explicit resource funding without a population quota; only the GC stage sets its historical retained-record quota. Attachment fan-out remains outside this qualification claim.",
     },
     action_trace: [],
     stages: [],
@@ -633,6 +640,7 @@ async function runBoundedGcChurn(
     directory,
     persistent,
     preserveDirectory: true,
+    gcPolicy: true,
   });
   const epochs: Array<Record<string, unknown>> = [];
   const turnovers: Array<Record<string, unknown>> = [];
@@ -759,7 +767,12 @@ async function runBoundedGcChurn(
           `gc-${mode}-${String(window)}`,
           options,
           receipt,
-          { directory, persistent: true, preserveDirectory: true },
+          {
+            directory,
+            persistent: true,
+            preserveDirectory: true,
+            gcPolicy: true,
+          },
         );
         assert.equal(
           (await daemon.synchronizedStats()).cumulative.physical_starts_total,
@@ -826,6 +839,7 @@ async function runGcReplayPressure(
     directory,
     persistent,
     preserveDirectory: true,
+    gcPolicy: true,
   });
   let sampler: RssSampler | undefined;
   let retained: GcRunExpectation[] = [];
@@ -990,6 +1004,7 @@ async function runGcReplayPressure(
           directory,
           persistent: true,
           preserveDirectory: true,
+          gcPolicy: true,
         },
       );
       let recoveredSampler: RssSampler | undefined;
@@ -2168,6 +2183,7 @@ class DaemonFixture {
       readonly directory?: string;
       readonly persistent?: boolean;
       readonly preserveDirectory?: boolean;
+      readonly gcPolicy?: boolean;
     } = {},
   ): Promise<DaemonFixture> {
     assert.deepEqual(
@@ -2185,7 +2201,14 @@ class DaemonFixture {
       autoClose: true,
     });
     const statsFd = 3;
-    const args = ["--socket", socketPath];
+    const args = [
+      "--socket",
+      socketPath,
+      "--resource-limits",
+      JSON.stringify(
+        qualificationResourceLimits(options.gc, settings.gcPolicy === true),
+      ),
+    ];
     if (settings.persistent === true) {
       args.push("--state-dir", join(directory, "state"));
     }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated macOS daemon measurement through protocol 17 (Python stdlib only).
+"""Isolated macOS daemon measurement through the public protocol (stdlib only).
 
 WAL marker counts are sampled lower bounds, not a trace of durable commits.
 Process rusage covers replay, database and WAL writes, including checkpoints.
@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import socket
 import struct
 import subprocess
@@ -66,15 +67,24 @@ def usage(pid):
     return value
 
 
-def connect(path):
+def connect(path, protocol):
     stream = socket.socket(socket.AF_UNIX)
     stream.settimeout(30)
-    stream.connect(str(path))
-    wire = stream.makefile("rwb")
-    send(wire, {"type": "hello", "hello": {"protocol": 17}})
-    hello = receive(wire)
-    assert hello["type"] == "hello", hello
-    return stream, wire
+    wire = None
+    try:
+        stream.connect(str(path))
+        wire = stream.makefile("rwb")
+        send(wire, {"type": "hello", "hello": {"protocol": protocol}})
+        hello = receive(wire)
+        if (hello["type"] != "hello"
+                or hello["runtime"]["protocolGeneration"] != protocol):
+            raise RuntimeError(f"invalid protocol handshake: {hello}")
+        return stream, wire
+    except BaseException:
+        if wire is not None:
+            wire.close()
+        stream.close()
+        raise
 
 
 def send(wire, value):
@@ -92,8 +102,8 @@ def receive(wire):
     return value
 
 
-def request(path, value):
-    stream, wire = connect(path)
+def request(path, value, protocol):
+    stream, wire = connect(path, protocol)
     try:
         send(wire, {"type": "request", "request": value})
         return receive(wire)["response"]
@@ -102,25 +112,29 @@ def request(path, value):
         stream.close()
 
 
-def spawn(binary, path, state, stderr):
+def spawn(binary, path, state, stderr, protocol):
     process = subprocess.Popen(
         [str(binary), "--socket", str(path), "--state-dir", str(state)],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
     )
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"daemon exited: {process.returncode}")
-        try:
-            stream, wire = connect(path)
-            wire.close()
-            stream.close()
-            return process
-        except (OSError, RuntimeError):
-            time.sleep(0.01)
-    process.kill()
-    process.wait()
-    raise RuntimeError("daemon readiness timeout")
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"daemon exited: {process.returncode}")
+            try:
+                stream, wire = connect(path, protocol)
+                wire.close()
+                stream.close()
+                return process
+            except (OSError, RuntimeError):
+                time.sleep(0.01)
+        raise RuntimeError("daemon readiness timeout")
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait()
+        raise
 
 
 def quantiles(values):
@@ -129,7 +143,7 @@ def quantiles(values):
             for name, fraction in (("p50", 0.5), ("p95", 0.95), ("max", 1))}
 
 
-def measure(binary, name, runs, count, size, interval):
+def measure(binary, name, runs, count, size, interval, protocol):
     child_code = (
         "import os,time,tty,ctypes; "
         "lib=ctypes.CDLL('/usr/lib/libSystem.B.dylib'); "
@@ -147,7 +161,7 @@ def measure(binary, name, runs, count, size, interval):
         root = Path(directory)
         path, state = root / "socket", root / "state"
         with (root / "stderr").open("wb") as stderr:
-            process = spawn(binary, path, state, stderr)
+            process = spawn(binary, path, state, stderr, protocol)
             stop = threading.Event()
             markers = set()
             rows = []
@@ -173,7 +187,7 @@ def measure(binary, name, runs, count, size, interval):
 
             def observe_run(row):
                 try:
-                    stream, wire = connect(path)
+                    stream, wire = connect(path, protocol)
                     with stream, wire:
                         send(wire, {"type": "request", "request": {
                             "type": "attach", "id": row["id"], "after_byte": 0}})
@@ -213,7 +227,7 @@ def measure(binary, name, runs, count, size, interval):
                     info = request(path, {"type": "start", "operation_key": str(uuid.uuid4()),
                         "spec": {"program": sys.executable, "args": ["-c", child_code],
                                  "cwd": None, "env": {"CTXMUX_MEASURE_READY": str(ready_file)}, "declared_inputs": [],
-                                 "initial_size": {"cols": 80, "rows": 24}}})["run"]
+                                 "initial_size": {"cols": 80, "rows": 24}}}, protocol)["run"]
                     row = {"id": info["id"], "lines": [], "acks": [],
                            "ready": threading.Event()}
                     rows.append(row)
@@ -229,19 +243,19 @@ def measure(binary, name, runs, count, size, interval):
                 wal_thread = threading.Thread(target=observe_wal)
                 wal_thread.start()
                 for row in rows:
-                    request(path, {"type": "input", "id": row["id"], "data": [103]})
+                    request(path, {"type": "input", "id": row["id"], "data": [103]}, protocol)
                 deadline = time.monotonic() + 30
                 while any(row["thread"].is_alive() for row in rows):
                     assert not errors, errors
                     assert time.monotonic() < deadline, "fixture timeout"
                     for row in rows:
-                        info = request(path, {"type": "status", "id": row["id"]})["run"]
+                        info = request(path, {"type": "status", "id": row["id"]}, protocol)["run"]
                         row["acks"].append((info["durable_output_bytes"], now_ns()))
                     time.sleep(0.01)
                 assert not errors, errors
                 for row in rows:
                     row["thread"].join()
-                    info = request(path, {"type": "status", "id": row["id"]})["run"]
+                    info = request(path, {"type": "status", "id": row["id"]}, protocol)["run"]
                     assert info["state"]["type"] == "exited", info
                     assert info["durable_output_bytes"] == count * size
                     row["acks"].append((count * size, now_ns()))
@@ -274,13 +288,13 @@ def measure(binary, name, runs, count, size, interval):
                 for row in rows:
                     row["thread"].join(timeout=2)
             # Actually reopen after SIGKILL, rather than infer recovery from status.
-            process = spawn(binary, path, state, stderr)
+            process = spawn(binary, path, state, stderr, protocol)
             try:
                 for row in rows:
-                    info = request(path, {"type": "status", "id": row["id"]})["run"]
+                    info = request(path, {"type": "status", "id": row["id"]}, protocol)["run"]
                     assert info["state"]["type"] == "exited"
                     assert info["latest_output_bytes"] == count * size
-                    stream, wire = connect(path)
+                    stream, wire = connect(path, protocol)
                     with stream, wire:
                         send(wire, {"type": "request", "request": {
                             "type": "attach", "id": row["id"], "after_byte": 0}})
@@ -313,18 +327,27 @@ def measure(binary, name, runs, count, size, interval):
 
 
 def main():
+    protocol_source = Path(__file__).resolve().parents[1] / "crates/ctxmux-protocol/src/lib.rs"
+    match = re.search(r"\bPROTOCOL_VERSION: u16 = ([0-9]+);", protocol_source.read_text())
+    if match is None:
+        raise RuntimeError("cannot read the authoritative protocol generation")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--daemon", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--case", choices=["all", "paced", "sparse", "multi", "sustained"], default="all")
+    parser.add_argument("--protocol", type=int, default=int(match[1]),
+                        help="exact public protocol generation; defaults to the workspace contract; set explicitly for a historical binary")
     args = parser.parse_args()
+    if not 0 < args.protocol <= 65535:
+        parser.error("--protocol must fit a positive u16 wire generation")
     cases = [("paced", 1, 600, 128, .003), ("sparse", 1, 12, 128, .2),
              ("multi", 4, 600, 128, .003), ("sustained", 1, 2048, 4096, .001)]
-    report = {"platform": platform.platform(), "daemon_sha256": hashlib.sha256(args.daemon.read_bytes()).hexdigest(),
+    report = {"platform": platform.platform(), "protocol": args.protocol,
+              "daemon_sha256": hashlib.sha256(args.daemon.read_bytes()).hexdigest(),
               "wal_sampling_interval_ms": 1, "status_poll_interval_ms": 10, "cases": []}
     for case in cases:
         if args.case in ("all", case[0]):
-            value = measure(args.daemon.resolve(), *case)
+            value = measure(args.daemon.resolve(), *case, args.protocol)
             report["cases"].append(value)
             args.out.write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps(value), flush=True)

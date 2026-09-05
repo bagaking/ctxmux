@@ -5,11 +5,11 @@
 Three candidates, ranked by measured return. Compression — the intuitive
 answer — is the one that loses.
 
-| # | Change | Measured return | Raises the ceiling? |
-|---|--------|-----------------|---------------------|
-| 1 | Coalesce replay rows before commit | ~40% of the file back | no, but the file holds ~2x |
-| 2 | Move cold replay out of SQLite | main-database ceiling no longer caps payloads | **yes, for the SQLite main file** |
-| 3 | Compress chunk payloads | 2.1x on 58% of the file | no — a constant |
+| #   | Change                             | Measured return                               | Raises the ceiling?               |
+| --- | ---------------------------------- | --------------------------------------------- | --------------------------------- |
+| 1   | Coalesce replay rows before commit | ~40% of the file back                         | no, but the file holds ~2x        |
+| 2   | Move cold replay out of SQLite     | main-database ceiling no longer caps payloads | **yes, for the SQLite main file** |
+| 3   | Compress chunk payloads            | 2.1x on 58% of the file                       | no — a constant                   |
 
 1 and 2 are implemented. Candidate 1 coalesces rows before commit. Candidate 2
 stores replay payloads in append-only generation files and leaves SQLite with
@@ -31,12 +31,12 @@ replay_chunks rows  762,048    mean 306 B/row, median 82 B
 
 `dbstat`:
 
-| object | size |
-|--------|------|
-| `replay_chunks` (table) | 306.8 MiB |
-| `sqlite_autoindex_replay_chunks_1` | 37.7 MiB |
-| `replay_chunks_run_start_byte` | 37.7 MiB |
-| `runs` + its indexes | 1.4 MiB |
+| object                             | size      |
+| ---------------------------------- | --------- |
+| `replay_chunks` (table)            | 306.8 MiB |
+| `sqlite_autoindex_replay_chunks_1` | 37.7 MiB  |
+| `replay_chunks_run_start_byte`     | 37.7 MiB  |
+| `runs` + its indexes               | 1.4 MiB   |
 
 The duplicate explicit `(run_id, start_byte)` index in this table describes the
 pre-schema-5 production wedge. The new schema keeps only SQLite's unique
@@ -144,7 +144,7 @@ rather than inflating it.
 
 Triggered by a production wedge on 2026-09-21: `start` failed deterministically
 with `WireClosedError` while reads served in 6 ms and all 28 live Runs stayed
-healthy. `c168c0a` fixed the *reaction* to a full store — reclaim before
+healthy. `c168c0a` fixed the _reaction_ to a full store — reclaim before
 allocating, instead of refusing the write. It deliberately did not touch the
 ceiling or the row shape. This document covers what it left.
 

@@ -1,5 +1,16 @@
 # 013 — Retained Run resource governance
 
+Current policy is amended by [decision 019](019-resource-policy-and-honest-qualification.md).
+Production has no fixed record/population ceiling; live owners follow host funding
+and optional operator quotas, independently of retained metadata and replay.
+Exact candidate fencing, quiescent cleanup, truthful receipts and atomic durable
+replacement from this decision remain required.
+
+## Historical decision and qualification record
+
+The following records the implementation and declared workload before decision 019. Its 128/4096/4000 and fixed byte/worker policies are historical evidence, not
+the current production policy. No historical baseline is requalified by this amendment.
+
 - Status: accepted, implemented, and source-bound sustained qualification
   complete for the declared workload
 - Amended-by: the live retained-record count cap this decision introduced (128)

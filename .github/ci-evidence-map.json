@@ -552,7 +552,7 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/native_session.rs",
       "invariants": [
-        "a waitable leader anchors native session census authority until descendant cleanup, a foreign member is rejected immediately before numeric signalling, and only ESRCH proves census absence; the practical POSIX contract retains the documented PID-reuse syscall gap"
+        "a waitable leader anchors native session census authority until descendant cleanup, a foreign member is rejected immediately before numeric signalling, inherited orphan reaping first proves the exact Run SID even in a full-host fallback, and a successful zero SID denotes a kernel task outside every positive Run session while permission/query errors stay fatal; the practical POSIX contract retains the documented PID-reuse syscall gap"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -695,7 +695,28 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/retention.rs",
       "invariants": [
-        "the daemon-wide retained-output budget clears the frozen replay-pressure gate peak, holds a set of Runs at or below one shared total, reclaims a filled-then-quiet Run under another Run's pressure, evicts unattached before attached Runs, releases a dropped participant's bytes, and lets a single-flight reclamation loser return without blocking"
+        "configured retained-output funding bounds available hot payload without inheriting a fixture's working set, protects unoffered persistent bytes, reclaims offered quiet history under pressure, prefers unattached Runs, releases dropped participants and permits single-flight reclamation losers to return without blocking"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
+      "id": "daemon-resource-policy-contracts",
+      "kind": "test",
+      "path": "crates/ctxmux-daemon/src/resources.rs",
+      "invariants": [
+        "optional live and retained quotas remain independent of qualification tiers and default to no population ceiling",
+        "unknown fields, zero budgets and invalid page or overflow arithmetic reject resource policy before owner creation"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -715,7 +736,7 @@
       "kind": "test",
       "path": "crates/ctxmux-daemon/src/persistence.rs",
       "invariants": [
-        "durable format ceilings, byte-exact creation-key ownership, terminal-record reservation, and cross-Run replay pruning remain exact"
+        "durable structural invariants, configured resource admission, byte-exact creation-key ownership, terminal-record reservation and cross-Run replay pruning remain exact; valid historical populations are preserved independently of fixture tiers"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -736,7 +757,7 @@
       "path": "crates/ctxmux-sqlite-status/src/lib.rs",
       "invariants": [
         "the private raw SQLite status boundary stays pinned to the source-bound library and returns nonnegative pager-cache counters",
-        "a spill-disabled transaction bounds its WAL growth from the observed pre-COMMIT cache footprint, off any admission baseline up to the 8 MiB checkpoint ceiling"
+        "a spill-disabled transaction bounds its WAL growth from the observed pre-COMMIT cache footprint, off any admission baseline within the configured checkpoint window"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -993,7 +1014,8 @@
       "path": "crates/ctxmux-test-support/src/lib.rs",
       "invariants": [
         "an unset environment preserves every original test budget, so the default suite observes true timing",
-        "the daemon spawn gate bounds only concurrent startups and extends no deadline, so a genuinely slow readiness still fails"
+        "the daemon spawn gate bounds only concurrent startups and extends no deadline, so a genuinely slow readiness still fails",
+        "the build-owned native fixture probe declares exactly the selected schema and fails unexpected exec; tmux and signal tests preserve actual process and deadline boundaries"
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
@@ -1373,6 +1395,28 @@
       ],
       "selection_ref": "scripts/check.sh",
       "selection_anchor": "cargo test --workspace --all-targets",
+      "reach": [
+        {
+          "job": "critical",
+          "platforms": ["ubuntu-24.04", "macos-15"]
+        },
+        {
+          "job": "coverage",
+          "platforms": ["ubuntu-24.04"]
+        }
+      ]
+    },
+    {
+      "id": "fleet-census-failure-cleanup",
+      "kind": "test",
+      "path": "scripts/fleet-scale-cleanup.test.mjs",
+      "invariants": [
+        "the real Linux census cleanup bounds hanging public Stop under one shared deadline, joins its sampler, retires exact owned processes, preserves the original failure and propagates cleanup failure; the platform-specific oracle is explicitly skipped on macOS",
+        "live fleet capacity requires distinct Running leaders confirmed in Linux procfs under the exact daemon parent; exited, foreign-owner, duplicated and zombie leaders cannot qualify even with retained output",
+        "execution environment reads actual ready leader RLIMIT and cgroup configuration; different real NOFILE allocations must produce different fingerprints, and the collector's own process cleanup is exact"
+      ],
+      "selection_ref": "scripts/check.sh",
+      "selection_anchor": "node --test --test-concurrency=1 scripts/*.test.mjs",
       "reach": [
         {
           "job": "critical",

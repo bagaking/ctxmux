@@ -86,3 +86,15 @@ guard still owns ordinary terminal restoration on that error path.
 - `crates/ctxmux/tests/interactive_attach.rs`
 - `crates/ctxmux-client/src/lib.rs`: `Attachment::detach`
 - `Cargo.toml`: `crossterm`, `vt100`
+
+## Ordinary command output
+
+CLI listing and command responses use fallible stdout writes. Closing the
+consumer's pipe ends rendering cleanly and returns through ordinary stack
+unwinding; it does not panic, exit past terminal guards, or stop a Run. List rows
+retain their complete tab-separated public fields. Other output write errors
+remain explicit command failures. A public real-Run regression closes the
+listing pipe before the first write and checks successful CLI exit, no error
+output, and unchanged running PID; a unit counterexample preserves non-pipe
+write failures. Attach byte-stream write failures keep their existing explicit
+error behavior.

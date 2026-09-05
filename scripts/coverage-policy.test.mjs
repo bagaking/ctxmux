@@ -853,6 +853,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
           "crates/ctxmux-daemon/src/handoff.rs",
           "crates/ctxmux-daemon/src/fd_budget.rs",
           "crates/ctxmux-daemon/src/retention.rs",
+          "crates/ctxmux-daemon/src/resources.rs",
           "crates/ctxmux-daemon/src/qualification_stats.rs",
           "crates/ctxmux-daemon/src/main.rs",
           "crates/ctxmux-inherited-fd/src/lib.rs",
@@ -952,7 +953,7 @@ test("checked-in policy fixes every current product owner and floor", () => {
         id: "rust-test-support-load-model",
         category: "test_only",
         language: "rust",
-        glob: "crates/ctxmux-test-support/src/**",
+        glob: "crates/ctxmux-test-support/**",
       },
       {
         id: "rust-remote-test-forwarder",

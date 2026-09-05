@@ -20,6 +20,7 @@ import {
   assertCanonicalGcQualificationInvocation,
   GC_CONTRACT_SHA256,
   loadReliabilityGcContract,
+  qualificationResourceLimits,
 } from "./reliability-gc-contract.mts";
 
 const MIB = 1024 * 1024;
@@ -29,6 +30,35 @@ const loaded = loadReliabilityGcContract(repositoryPath);
 const contract = loaded.contract;
 const helperUrl = new URL(contract.helper.path, repositoryUrl);
 const helperPath = fileURLToPath(helperUrl);
+
+test("qualification scopes the historical GC quota without inheriting candidate policy", () => {
+  const base = qualificationResourceLimits(loaded);
+  const gc = qualificationResourceLimits(loaded, true);
+  assert.equal(base.live_runs, null);
+  assert.equal(base.retained_runs, null);
+  assert.equal(gc.live_runs, null);
+  assert.equal(gc.retained_runs, contract.bounded_churn.run_ceiling);
+  assert.equal(
+    gc.durable_replay_bytes,
+    contract.replay_pressure.persistent_durable_replay_max_bytes,
+  );
+  assert.equal(
+    gc.run_output_bytes,
+    contract.payload_modes.memory_replay_pressure.payload_bytes,
+  );
+  assert.equal(
+    gc.durable_run_output_bytes,
+    contract.payload_modes.persistent_replay_pressure.payload_bytes,
+  );
+  assert.deepEqual(Object.keys(base).sort(), Object.keys(gc).sort());
+  // One consumer cannot edit the next invocation's frozen operating point.
+  base.input_workers = 1;
+  assert.equal(qualificationResourceLimits(loaded).input_workers, 8);
+  const changed = Object.keys(gc).filter(
+    (key) => gc[key] !== qualificationResourceLimits(loaded)[key],
+  );
+  assert.deepEqual(changed, ["retained_runs"]);
+});
 
 test("GC contract fixes internally consistent payload and resource ceilings", () => {
   assert.equal(loaded.workload_contract.sha256, GC_CONTRACT_SHA256);

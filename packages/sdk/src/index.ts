@@ -43,6 +43,7 @@ export type {
   RuntimeActivationEnvironment,
   RuntimeActivationErrorCode,
   RuntimeActivationOptions,
+  RuntimeResourceLimits,
   RuntimeActivationTargetKind,
   RuntimeActivationConflictReason,
   RuntimeChildDisposition,

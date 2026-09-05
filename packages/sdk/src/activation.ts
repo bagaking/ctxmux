@@ -84,6 +84,34 @@ export interface RuntimeChildDispositionOptions {
   readonly stderr?: "ignore" | "inherit" | "pipe";
 }
 
+/** Startup policy shared with ctxmuxd JSON. Bytes are positive safe integers;
+ * null population fields select resource-based admission. */
+export interface RuntimeResourceLimits {
+  readonly live_runs?: number | null;
+  readonly retained_runs?: number | null;
+  readonly hot_output_bytes?: number;
+  readonly live_event_bytes?: number;
+  readonly run_output_bytes?: number;
+  readonly metadata_bytes?: number;
+  readonly durable_replay_bytes?: number;
+  readonly durable_run_output_bytes?: number;
+  readonly database_bytes?: number;
+  readonly wal_checkpoint_bytes?: number;
+  readonly handoff_input_bytes?: number;
+  readonly handoff_diagnostic_bytes?: number;
+  readonly handoff_bytes?: number;
+  readonly control_state_bytes?: number;
+  readonly creation_workers?: number;
+  readonly input_workers?: number;
+  readonly cleanup_workers?: number;
+  readonly finalize_workers?: number;
+  readonly input_queue_commands?: number;
+  readonly input_queue_bytes?: number;
+  readonly input_result_entries?: number;
+  readonly input_result_bytes?: number;
+  readonly tmux_discovery_bytes?: number;
+}
+
 /** Inputs for connecting to or activating one local ctxmux Runtime. */
 export interface RuntimeActivationOptions {
   /** Explicit `ctxmuxd` executable path or command. */
@@ -92,6 +120,9 @@ export interface RuntimeActivationOptions {
   readonly socketPath: string;
   /** Optional dedicated ctxmux persistent state directory. */
   readonly stateDir?: string;
+  /** Applied when activation spawns a daemon. Selecting an existing Runtime
+   * uses that Runtime's established policy. CLI policy overrides the env overlay. */
+  readonly resourceLimits?: RuntimeResourceLimits;
   /** Spawn environment overlay; this object never mutates `process.env`. */
   readonly env?: RuntimeActivationEnvironment;
   /** Absolute epoch-millisecond deadline, Date, or small duration in ms. */
@@ -322,6 +353,7 @@ interface NormalizedOptions {
   readonly executable: string;
   readonly socketPath: string;
   readonly stateDir: string | undefined;
+  readonly resourceLimits: string | undefined;
   readonly env: NodeJS.ProcessEnv | undefined;
   readonly deadline: Deadline;
   readonly child: Required<RuntimeChildDispositionOptions>;
@@ -673,6 +705,7 @@ function normalizeOptions(
     executable: options.executable,
     socketPath: options.socketPath,
     stateDir: options.stateDir,
+    resourceLimits: normalizeResourceLimits(options.resourceLimits),
     env: normalizeEnvironment(options.env),
     deadline: normalizeDeadline(options.deadline, options.timeoutMs),
     child: normalizeChildDisposition(options.childDisposition),
@@ -683,6 +716,68 @@ function normalizeOptions(
     expectedBuildId: options.expectedBuildId,
     requiredCapabilities: { ...(options.requiredCapabilities ?? {}) },
   };
+}
+
+function normalizeResourceLimits(
+  policy: RuntimeResourceLimits | undefined,
+): string | undefined {
+  if (policy === undefined) return undefined;
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    throw new TypeError("resourceLimits must be a resource policy object");
+  }
+  const allowed = new Set([
+    "live_runs",
+    "retained_runs",
+    "hot_output_bytes",
+    "live_event_bytes",
+    "run_output_bytes",
+    "metadata_bytes",
+    "durable_replay_bytes",
+    "durable_run_output_bytes",
+    "database_bytes",
+    "wal_checkpoint_bytes",
+    "handoff_input_bytes",
+    "handoff_diagnostic_bytes",
+    "handoff_bytes",
+    "control_state_bytes",
+    "creation_workers",
+    "input_workers",
+    "cleanup_workers",
+    "finalize_workers",
+    "input_queue_commands",
+    "input_queue_bytes",
+    "input_result_entries",
+    "input_result_bytes",
+    "tmux_discovery_bytes",
+  ]);
+  const normalized: Record<string, number | null> = {};
+  for (const [name, value] of Object.entries(policy)) {
+    if (!allowed.has(name))
+      throw new TypeError(`unknown resource limit ${name}`);
+    if (value === null && (name === "live_runs" || name === "retained_runs")) {
+      normalized[name] = null;
+      continue;
+    }
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value <= 0
+    ) {
+      throw new TypeError(`${name} must be a positive safe integer`);
+    }
+    if (name === "database_bytes" && value % 4096 !== 0) {
+      throw new TypeError(
+        "database_bytes must fund whole SQLite pages (4096 bytes)",
+      );
+    }
+    if (name === "wal_checkpoint_bytes" && value < 32 + 24 + 4096) {
+      throw new TypeError(
+        "wal_checkpoint_bytes must fund a WAL header and page frame",
+      );
+    }
+    normalized[name] = value;
+  }
+  return JSON.stringify(normalized);
 }
 
 function normalizeEnvironment(
@@ -997,6 +1092,8 @@ function spawnDaemon(options: NormalizedOptions): ChildProcess {
   const args = ["--socket", options.socketPath];
   if (options.stateDir !== undefined)
     args.push("--state-dir", options.stateDir);
+  if (options.resourceLimits !== undefined)
+    args.push("--resource-limits", options.resourceLimits);
   args.push("--readiness-fd", "3");
   const stdio: SpawnOptions["stdio"] = [
     "ignore",

@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects. Optional `--state-dir` mode recovers historical Run state and committed replay after cold restart and preserves live PTY control across a planned exec-in-place `SIGHUP` upgrade. Existing attachments reconnect.                                                                                                                                                                                                                                                                                                                                                                                                            | Crash-time PTY adoption and host-reboot process continuity remain unsupported.                                                   |
 | Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Windows transport and multi-daemon discovery are open.                                                                           |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 15, including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 18, including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Multi-writer policy remains open.                                                                                                |
 | Input recovery   | A native operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. The cursor and complete settled ledger cross a planned exec-in-place upgrade with the preserved instance. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                                                                                                                                                                                                                                                                                   | Cold-restart exactly-once and semantic acknowledgement remain above or outside ctxmux.                                           |
 | Stop recovery    | One caller-retained operation joins or replays the complete-session Stop receipt across connection loss. A Runtime-global key binding and one per-Run record fence conflicts before mutation, survive planned exec, and end at exact Run collection.                                                                                                                                                                                                                                                                                                                                                                                                                     | Cold-restart exactly-once and recoverable Resize/Interrupt remain unsupported.                                                   |
@@ -131,8 +131,8 @@ while retaining its operation key for later confirmation; the process cleanup
 is never repeated. A descendant that creates a new session deliberately crosses
 this POSIX ownership boundary. In persistent mode a new daemon epoch converts prior `running` rows to `interrupted {
 daemon_restart }`, clears their PID, and exposes no live control. Terminal Runs
-remain retained until admission reaches the 128-record ceiling, then the
-Registry fences exact fully quiescent candidates; persistent COMMIT removes the
+remain retained under metadata funding and an optional operator record quota. At
+pressure the Registry fences exact fully quiescent candidates; persistent COMMIT removes the
 same Runs, replay, and byte-exact keys before publishing the successor.
 
 If native non-reaping status observation fails before yielding a child status, ctxmux does not
@@ -248,12 +248,12 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 3. `Request::Start` reaches the daemon-private creation owner. A fixed,
    asynchronously acquired key stripe serializes only possible key collisions;
    a retained matching mapping returns the original Run before launch.
-4. Only an unbound leader waits on a Tokio semaphore admitting at most eight
-   simultaneous physical launches. The 64 key stripes bound collision state;
+4. Only an unbound leader waits on the `creation_workers` Tokio semaphore
+   (default eight simultaneous physical launches). The 64 key stripes bound collision state;
    they are not a 64-thread launch limit. Cancellation while awaiting admission
    releases the key stripe and creates no flight or thread.
 5. An admitted leader claims a creation flight and reserves one of the same
-   eight private rollback-owner slots. In memory-only mode it also preallocates
+   configured private rollback-owner slots. In memory-only mode it also preallocates
    the new `RunId` and reserves one Registry publication; at capacity that
    reservation fences and compacts one exact quiescent terminal candidate or
    returns `run_capacity`. It then starts one named, short-lived OS thread that
@@ -266,9 +266,10 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    this path.
 6. The daemon validates the spec, opens a PTY, prepares every fallible reader
    and writer view, and only then spawns the child. It constructs one private
-   native-control facade and publication owner before starting the waiter and
-   blocking output-reader workers, then transfers the owned child handle to the
-   waiter behind one narrow stop-command channel.
+   native-control facade and publication owner, then registers the owned child
+   and nonblocking output reader with the single daemon-wide native owner.
+   Blocking cleanup and durable finalization use independent configured workers;
+   no permanent per-Run reader or waiter thread is required.
 7. Native creation therefore has no post-spawn, pre-owner fallible setup
    boundary. In persistent mode the single store actor commits the complete
    running row and byte-exact operation key in one transaction. Failure before
@@ -276,7 +277,7 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    handle. Child
    terminal-and-reaped is necessary but does not reopen the key: reader,
    waiter, control, input, and Run owners must also be quiescent. Otherwise one
-   daemon-private, globally eight-slot-bounded cleanup owner retains the
+   daemon-private cleanup owner bounded by configured creation slots retains the
    unpublished Run and an exact-key fence without retaining its random stripe
    or launch permit. The same transfer covers worker-setup failure and creation
    owner unwind. Successful `COMMIT` is the point of no return: even if a
@@ -289,7 +290,7 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
 ### Import a tmux-owned pane
 
 1. A public client selects one explicit tmux socket and discovers live panes.
-   Import first acquires the same eight-wide physical-publication flight and
+   Import first acquires the same configured physical-publication flight and
    cleanup owner used by native creation, then preallocates its `RunId` and
    reserves memory-only Registry capacity before starting a Control Mode child.
    A failed import releases the slot only after Control child, reader, waiter,
@@ -393,17 +394,22 @@ Only admission through `bytes_applied` belongs to the runtime kernel. Agent
 messages, delivery state, semantic acknowledgement, replies, task graphs, and
 UI timelines remain outside the daemon.
 
-Each Run admits at most 1,024 queued input commands and 4 MiB of queued input.
-Lazy blocking input drains share a daemon-wide eight-worker hard limit and
-yield after a bounded completed burst; there is no permanent third thread per
-Run. A blocking PTY write has no independent deadline, so eight stalled writes
-can delay input progress for other Runs until one owning PTY returns or closes.
+Each Run defaults to 1,024 queued input commands and 4 MiB of queued input;
+`input_queue_commands` and `input_queue_bytes` configure those independent bounds.
+Lazy blocking input drains share `input_workers` (default eight) and yield after
+a bounded completed burst; there is no permanent input thread per Run. A blocking
+PTY write has no independent deadline, so a full set of stalled input workers
+can delay unrelated input until one owning PTY returns or closes.
 Resize and stop do not enter the input queue, so that limitation does not hold a
 Tokio worker or consume their control lane. Zero dimensions fail before resize
 mutation. A blocking reader assigns each non-empty read one contiguous
 half-open cumulative byte range, stores it in the bounded log, then broadcasts it.
 
-The waiter waits for the child and allows the output reader up to one second to finish before publishing `Exited`. This is a bounded drain policy. It is not a proof that arbitrarily large or delayed final output always precedes exit.
+After child cleanup, the native owner drains readable or persistence-paused
+output before publishing `Exited`. Its one-second deadline bounds an idle
+surviving writer, rather than cutting off a finite readable tail; an idle cutoff
+records a source gap. Arbitrarily delayed future output remains outside this
+completion guarantee.
 
 ### Interactive CLI attach
 
@@ -471,8 +477,7 @@ The important guarantees are behavioral, not implied by lock types.
   append/finalize waits hold the transition gate but no public read-path lock.
   The initial append is queued before the binding becomes observable; during a
   durable finalize, status/list/attach continue to see `Running` until the
-  receipt returns. Native child cleanup is admitted by its own eight-slot
-  budget and releases that slot when child cleanup completes; durable
+  receipt returns. Native child cleanup is admitted by `cleanup_workers` (default eight) and releases that slot when child cleanup completes; durable
   terminal publication uses its own bounded finalizer budget instead of
   occupying a cleanup slot. Replay sync and SQLite commit still precede visible
   terminal state. Lifecycle removal may overtake queued appends after finalization;
@@ -491,10 +496,9 @@ The important guarantees are behavioral, not implied by lock types.
 - Start and Fork keys use fixed random-hashed async stripes. A leader resolves
   an existing match or conflict before dispatch, so duplicates occupy neither
   Tokio workers nor creation threads while the unique unbound request launches.
-  Unbound leaders then wait asynchronously for one of eight physical-launch
-  permits; these Tokio semaphore waiters are not a product-level actor or custom
+  Unbound leaders then wait asynchronously for one of the configured physical-launch permits; these Tokio semaphore waiters are not a product-level actor or custom
   queue. In memory-only mode an admitted leader then reserves one projected
-  Registry record before spawn. At the 128-record ceiling the same Registry
+  Registry record before spawn. At configured record or metadata pressure the same Registry
   write fences the earliest fully quiescent terminal candidate; a missing
   eligible candidate returns `run_capacity` before Backend mutation. A fresh
   Fork materializes its immutable parent input before this reservation and
@@ -588,18 +592,19 @@ promise that an unmodified tmux client can attach to ctxmux.
 
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
-Each Run retains at most 4 MiB of raw output by byte count, except that one oversized final chunk may exceed that target because the log always retains at least one chunk. Live delivery uses a bounded 256-event broadcast channel. Native input additionally has the per-Run queue and daemon-wide active-drain bounds above. Both memory-only and persistent modes admit at most 128 retained or projected Run records and replace only fenced, terminal, fully quiescent candidates. Persistent replacement removes the exact durable Run, replay, and byte-exact key in the same transaction before the Registry publishes its successor. Attachment admission and a total daemon RSS quota remain open.
+[Decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md)
+owns configurable resource policy. Live owners follow actual host descriptors
+and PTYs plus optional operator quota; retained records independently fund
+metadata and optional record quota. Both modes preserve exact candidate fencing,
+fully quiescent collection and persistent delete-plus-insert COMMIT ownership.
+Hot replay, live-event rings/payloads, control receipts, durable replay, database,
+WAL and handoff each have explicit owners. Hot caches may be smaller than disk
+history or empty; Attach pages available disk history through the public API.
+Valid state exceeding policy is resource pressure, and startup preserves history.
 
-[Decision 013](architecture/choices/013-retained-run-resource-governance.md)
-owns the shared 128-record Registry ceiling and ownership-safe collection
-contract. Persistent mode uses the same ticket and candidate SSOT, with a
-spill-disabled cache-resident page proof before launch and exact durable
-replacement at COMMIT. T-033 covers the ordinary reduced-capacity correctness
-matrix. The source-bound T-005 nightly qualification additionally exercises
-both production 128-record modes across three turnover windows, persistent
-restart, maximum replay pressure, the existing 1,800-second soak, and bounded
-private owner telemetry. This qualifies that declared workload; it does not
-add an attachment-admission or total-RSS product guarantee.
+The frozen 1/32/128 baseline and GC 128-record pressure/turnover contracts qualify
+those explicit workloads. Their historical evidence does not set production
+population limits or prove the revised implementation qualified at scale.
 
 `reliability-budgets.json` freezes daemon CPU, peak and steady RSS, retained
 bytes, and per-Run RSS/thread/fd slopes for idle and active 1/32/128 Run
@@ -628,7 +633,7 @@ other storage, replay, budget, integrity, and owner-invariant failure remains
 fail-stop for later durable mutations. Startup performs journal
 recovery and exact schema/application validation against the schema-5 format
 envelope, then uses bounded, restartable page-admitted transactions to
-reconcile old running rows, normalize retained history to 128, and finally
+reconcile old running rows, preserve valid retained history under the configured policy, and finally
 finish serving-epoch publication. Only after operational revalidation can the daemon
 publish its socket. Recovered exited or interrupted Runs support list, status, replay
 attach, and Level A fork; input, resize, stop, and recovered Level B fork fail
@@ -643,7 +648,7 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | ------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Rust and Tokio long-lived daemon      | accepted                                                       | [001](architecture/choices/001-rust-tokio-daemon.md)                |
 | `portable-pty` native Backend         | accepted                                                       | [002](architecture/choices/002-portable-pty-native-backend.md)      |
-| Unix socket and NDJSON protocol       | accepted for generation 15                                     | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
+| Unix socket and NDJSON protocol       | accepted for generation 18                                     | [003](architecture/choices/003-unix-socket-json-lines-protocol.md)  |
 | Run lifecycle concurrency             | accepted, incomplete policy                                    | [004](architecture/choices/004-run-lifecycle-concurrency.md)        |
 | Ordered bounded raw-output replay     | accepted                                                       | [005](architecture/choices/005-ordered-output-replay.md)            |
 | Rust schema and TypeScript codegen    | accepted                                                       | [006](architecture/choices/006-rust-schema-ts-codegen.md)           |
@@ -659,6 +664,8 @@ Status is explicit so a target document cannot masquerade as shipped architectur
 | Interrupted-Run derivation            | accepted                                                       | [016](architecture/choices/016-interrupted-run-derivation.md)       |
 | Recoverable native Stop               | accepted and implemented                                       | [017](architecture/choices/017-recoverable-stop-operations.md)      |
 | Remote endpoint over system OpenSSH   | accepted; vertical and client-side endpoint contract delivered | [018](architecture/choices/018-remote-endpoint-transport.md)        |
+
+| Explicit resource policy and honest qualification | accepted and implemented; scale qualification remains separate | [019](architecture/choices/019-resource-policy-and-honest-qualification.md) |
 
 ## Risk-to-fixture traceability
 
@@ -681,3 +688,5 @@ connects the storage, worker-admission, and public-completion failures, includin
 the R36 assumption invalidated by the Stop-then-List reproduction.
 
 The governing rule is compact: terminals are views, Runs are durable, and every stronger claim needs public-behavior evidence.
+
+Current resource policy and qualification objective: [decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md).

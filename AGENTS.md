@@ -86,6 +86,35 @@ slice needs them.
    requests must return explicit errors.
 7. Test public behavior and owner boundaries, not only private implementation
    shape.
+8. Artificial self-limitation and reward hacking are prohibited. Do not impose
+   an unnecessary workload, population, storage, or throughput ceiling to make
+   the system appear robust. Evaluate performance across correctness,
+   reliability, throughput, latency, resource use, capacity, recovery, and
+   usability; silently degrading any of these to improve a score is forbidden.
+9. A resource bound must protect a concrete owner or finite host resource, have
+   an evidence-backed rationale, and expose truthful pressure or truncation.
+   Qualification sizes and convenient constants are not product capacity
+   requirements. Make operational budgets configurable or resource-derived
+   when different legitimate workloads need different values; keep structural
+   integrity separate from current resource policy.
+10. Never obtain a passing result by reducing the accepted workload, loosening
+    its oracle or budget, skipping a failing case, hiding lost bytes, lowering
+    capability fidelity, or weakening durability. A necessary tradeoff must
+    state its user benefit, cost in every affected dimension, alternatives,
+    and behavioral evidence. Repair the causal owner and report genuine host
+    limits and unqualified behavior explicitly.
+11. Audit unexplained magic numbers explicitly. A behavior-affecting constant
+    needs its units, protected resource or semantic bound, derivation or source,
+    and consequences at legitimate scale. Replace unjustified numbers instead
+    of preserving them because existing tests encode them.
+12. Fixtures and auto-research objectives must follow user-visible contracts.
+    Distinguish semantic invariants, representative workloads, regression
+    examples, and historical implementation characterizations. A fixture must
+    not dictate production capacity merely to stay green. Preserve historical
+    evidence, qualify revised objectives explicitly, and test held-out
+    workloads and failure cases so optimizing one fixture cannot conceal a
+    regression in another performance dimension. Genuine improvements must
+    not fail an oracle merely for differing from an old implementation.
 
 ## Required Validation
 

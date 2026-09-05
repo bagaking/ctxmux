@@ -1,60 +1,8 @@
 #!/usr/bin/env bash
 
-# Render a pass/fail VERDICT on fleet-scale resource behaviour at thousands of
-# concurrent Runs. This is the acceptance harness the repository was missing.
-#
-# Every resource decision in this repository is qualified at N=128 (ADR 013).
-# The product runs thousands of concurrent Runs. Measurement scripts that emit
-# numbers at that scale exist and have run on the farm; none renders a verdict.
-# "The farm results" therefore do not exist as a pass/fail judgement. This
-# harness makes that judgement exist: it derives thresholds from farm-host
-# observations using the SAME derivation rules the darwin budget is pinned to
-# (imported from scripts/reliability-budget-contract.mjs, never edited), then
-# compares fresh measurements against them and exits nonzero when they are not
-# met.
-#
-# What it measures, per tier and for both idle and active Runs: fds_per_run,
-# idle cpu_core_percent, steady_rss_kib and rss_kib_per_run, per-Run and
-# aggregate lifetime output bytes, List latency and success, whether the census
-# daemon was still alive at the end, and admission behaviour at the descriptor
-# ceiling (which must refuse cleanly with run_capacity and never hit EMFILE).
-#
-# It does NOT measure retention. The retention budget bounds bytes the daemon is
-# still holding; the only per-Run byte counter on the wire is monotonic lifetime
-# output, so the fleet-wide 1 GiB cap has no proof here until retained_bytes is
-# exposed by the protocol.
-#
-# Tiers: 128, 512, 2048, 4000. The 128 tier is load-bearing. It overlaps the
-# existing darwin gate, so the harness cross-checks the farm's 128 numbers
-# against the darwin baseline on the platform-invariant per-Run costs. A
-# disagreement refuses either way, but the report names the direction, because
-# above the baseline means a regression or a measurement mismatch while below it
-# means the daemon got cheaper and the frozen baseline is stale. Only one of
-# those is a defect — this is stated in the output, not just here.
-#
-# WHAT THESE NUMBERS MAY NOT BE COMPARED AGAINST. The farm is Linux x86_64; the
-# darwin baseline is arm64 macOS. RSS and CPU legitimately differ by platform
-# and are bounded per-tier by ceilings derived ON THE FARM, not against darwin.
-# Only the structural per-Run costs (descriptors, threads), which are
-# platform-invariant by design, are cross-checked against darwin. A farm number
-# is never presented as a darwin one, and the thresholds file is bound to its
-# host class and refuses a receipt from another kernel.
-#
-# Stages are separable by profile. --self-test runs on ANY host in seconds
-# without a fleet, so the Mac gate can confirm the harness is not broken without
-# running the load; it proves the harness FAILS LOUDLY rather than reporting a
-# silent zero. --profile smoke exercises the drive and census path at a tiny
-# size on the local host, so a broken driver is caught before the farm is
-# engaged. --profile accept is the only profile that needs the farm.
-#
-# PROVISIONING. The repository must not leave this Mac: no clone, no copy of
-# repository code to the farm. So --profile accept runs ON the Mac and drives
-# the farm node named by CTXMUX_FLEET_HOST over ssh, keeping the verdict logic
-# here where it is reviewed. Only the daemon and client BINARIES are copied,
-# cross-compiled from THIS worktree with cargo-zigbuild, stripped, and verified
-# by SHA-256 on both ends before they are run — a truncated transfer produces a
-# bogus measurement that looks exactly like a real one, so the transfer is
-# checked, not trusted. Everything left on the farm is removed on exit.
+# Fleet observation and acceptance are separate operations. Observe proposes
+# a baseline without issuing a verdict. Accept reads a previously frozen file;
+# a candidate cannot derive its own limits. Smoke only validates the harness.
 
 set -euo pipefail
 
@@ -62,7 +10,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 ctxmux_fleet_usage() {
   cat >&2 <<'EOF'
-usage: scripts/check-fleet-scale.sh --profile <smoke|accept> [--json <path>]
+usage: scripts/check-fleet-scale.sh --profile <smoke|observe|accept> [--json <path>] [--thresholds <path>] [--baseline-ref <full commit>]
        scripts/check-fleet-scale.sh --self-test
 
 profiles:
@@ -74,8 +22,10 @@ profiles:
   accept  the real acceptance. Cross-builds the daemon and client from this
           worktree, ships the stripped binaries to the farm node (the ssh alias
           in CTXMUX_FLEET_HOST), verifies them by SHA-256 on both ends, runs
-          three observation rounds per tier, derives farm thresholds, and
-          renders the verdict. Requires the farm.
+          one receipt per tier against committed --thresholds at the predeclared
+          --baseline-ref. Requires the farm; cannot score its own source baseline.
+  observe three rounds per tier; writes proposed --thresholds without a verdict.
+          Review and freeze the file before evaluating a later candidate.
 
   --json <path>  also write the machine-readable verdict to this path
   --self-test    prove the harness fails loudly rather than rendering a false
@@ -91,6 +41,8 @@ EOF
 
 ctxmux_fleet_profile=
 ctxmux_fleet_json=
+ctxmux_fleet_baseline_ref=
+ctxmux_fleet_thresholds_arg=
 ctxmux_fleet_self_test=false
 
 while [[ $# -gt 0 ]]
@@ -104,6 +56,16 @@ do
       exit 2
     fi
     ctxmux_fleet_profile=$2
+    shift 2
+    ;;
+  --baseline-ref)
+    [[ $# -ge 2 ]] || { echo "--baseline-ref requires a full commit hash" >&2; exit 2; }
+    ctxmux_fleet_baseline_ref=$2
+    shift 2
+    ;;
+  --thresholds)
+    [[ $# -ge 2 ]] || { echo '--thresholds requires a path' >&2; exit 2; }
+    ctxmux_fleet_thresholds_arg=$2
     shift 2
     ;;
   --json)
@@ -139,22 +101,29 @@ done
 ctxmux_fleet_shell_self_test() {
   local failures=0
 
+  # Extract the producer's actual counter, so this test also catches changes
+  # to its empty-match guard. The sampler must observe a separate owner: its
+  # own command substitutions are children and are not fleet processes.
+  local counter
+  counter=$(sed -n '/^count_children() { /p' "${1:-${BASH_SOURCE[0]}}")
+  [[ -n $counter && $counter != *$'\n'* ]] || {
+    echo 'shell self-test requires exactly one production child counter' >&2
+    return 1
+  }
+
   # A drained fleet is the healthy outcome, and it is the one `pgrep` reports
   # by exiting 1. Run the real drain fragment against a pid that has no
   # children and require a cell-bearing exit. Before the guard this exited 1
   # with no output; the node fixtures could not see it, because a census that
   # aborts produces nothing to judge.
-  local drained_pid=$$ observed rc
+  local observed rc
   observed=$(
-    bash -euo pipefail -c '
-      count_children() { { pgrep -P "$1" 2>/dev/null || true; } | wc -l | tr -d " "; }
-      for _ in $(seq 1 3); do
-        n=$(count_children "$1")
-        if [[ ${n:-0} -eq 0 ]]; then break; fi
-        sleep 0.1
-      done
-      printf "%s" "${n:-missing}"
-    ' _ "$drained_pid" 2>/dev/null
+    bash -euo pipefail -c "$counter"$'\n''
+      sleep 30 & owner=$!
+      trap '\''kill "$owner" 2>/dev/null || true; wait "$owner" 2>/dev/null || true'\'' EXIT
+      n=$(count_children "$owner")
+      printf "%s" "$n"
+    ' 2>/dev/null
   ) && rc=0 || rc=$?
   if [[ $rc -eq 0 && $observed == 0 ]]; then
     echo "  ok    a fully drained fleet still emits a cell: cleanup_live_children=0"
@@ -169,16 +138,36 @@ ctxmux_fleet_shell_self_test() {
   # and every stranded child passes.
   local live_out live_rc
   live_out=$(
-    bash -euo pipefail -c '
-      count_children() { { pgrep -P "$1" 2>/dev/null || true; } | wc -l | tr -d " "; }
-      sleep 30 & sleep 30 &
-      n=$(count_children $$)
-      kill %1 %2 2>/dev/null || true
-      printf "%s" "$n"
-    ' 2>/dev/null
+    bash -euo pipefail -c "$counter"$'\n'"$(cat <<'LIVE_CASE'
+owner=
+directory=$(mktemp -d)
+trap 'if [[ -n $owner ]]; then kill "$owner" 2>/dev/null || true; wait "$owner" 2>/dev/null || true; fi; rm -f "$directory/ready"; rmdir "$directory"' EXIT
+mkfifo "$directory/ready"
+bash -euo pipefail > "$directory/ready" <<'CHILD_OWNER' &
+sleep 30 & left=$!
+sleep 30 & right=$!
+trap 'kill "$left" "$right" 2>/dev/null || true; wait "$left" 2>/dev/null || true; wait "$right" 2>/dev/null || true' EXIT
+trap 'exit 0' TERM INT
+printf '%s %s %s\n' "$$" "$left" "$right"
+wait
+CHILD_OWNER
+owner=$!
+read -r reported_owner left right < "$directory/ready"
+[[ $reported_owner == "$owner" ]]
+n=$(count_children "$owner")
+kill "$owner"
+wait "$owner"
+owner=
+if kill -0 "$left" 2>/dev/null || kill -0 "$right" 2>/dev/null; then
+  echo 'owned fixture child survived reaping' >&2
+  exit 1
+fi
+printf '%s' "$n"
+LIVE_CASE
+)" 2>/dev/null
   ) && live_rc=0 || live_rc=$?
-  if [[ $live_rc -eq 0 && ${live_out:-0} -ge 2 ]]; then
-    echo "  ok    live children are still counted, not flattened to zero: $live_out"
+  if [[ $live_rc -eq 0 && $live_out == 2 ]]; then
+    echo "  ok    exactly two owned live children are counted and reaped: $live_out"
   else
     echo "  FAIL  the child counter did not observe live children (rc=$live_rc, got '${live_out:-}')"
     failures=$((failures + 1))
@@ -220,13 +209,15 @@ then
 fi
 
 case $ctxmux_fleet_profile in
-smoke | accept) ;;
+smoke | observe | accept) ;;
 *)
   echo "error: unknown profile '$ctxmux_fleet_profile'" >&2
   ctxmux_fleet_usage
   exit 2
   ;;
 esac
+
+ctxmux_fleet_resource_policy=$(node scripts/fleet-scale-measure.mjs --mode resource-policy)
 
 # The census helper that runs where the daemon runs. It is a generated,
 # self-contained shell snippet, NOT repository code: the constraint is that the
@@ -249,6 +240,7 @@ ctxmuxd_bin=$3
 ctxmux_bin=$4
 run_program=$5
 work=$6
+resource_policy=$7
 
 sock="$work/ctxmux.sock"
 statedir="$work/state"
@@ -290,16 +282,141 @@ sample() {
   echo "$rss|$cpu|$threads|$fds"
 }
 
-"$ctxmuxd_bin" --socket "$sock" --state-dir "$statedir" >"$work/daemon.log" 2>&1 &
+"$ctxmuxd_bin" --socket "$sock" --state-dir "$statedir" --resource-limits "$resource_policy"  >"$work/daemon.log" 2>&1 &
 daemon_pid=$!
-# Kill whatever actually holds the socket, not merely the pid we launched, so
-# nothing outlives this census and taints the next round.
+# Every created Run belongs to this cell, including an unexpectedly successful
+# over-capacity probe. On an early failure, stop them through the public owner
+# before retiring the exact daemon and sampler; never kill by process-name.
+sampler_pid=""
+runs_stopped=false
 cleanup_daemon() {
-  kill "$daemon_pid" 2>/dev/null || true
-  wait "$daemon_pid" 2>/dev/null || true
-  pkill -f "ctxmuxd --socket $sock" 2>/dev/null || true
+  local original_status=$? cleanup_failed=0
+  trap - EXIT
+  set +e
+  touch "$work/sampler-stop"
+  if [[ -n $sampler_pid ]]; then
+    wait "$sampler_pid" || cleanup_failed=1
+  fi
+  if [[ $runs_stopped != true && -s "$work/run-ids" ]]; then
+    # One shared cleanup deadline, independent of population. GNU timeout owns
+    # this cleanup driver's process group and kills hung client descendants too.
+    # Expiry remains a failure; it never certifies a performance cell.
+    timeout --signal=KILL 10s bash -c '
+      failed=0
+      while read -r rid; do
+        PATH= "$1" --socket "$2" stop "$rid" || failed=1
+      done < "$3"
+      exit "$failed"
+    ' _ "$ctxmux_bin" "$sock" "$work/run-ids" >>"$work/failure-cleanup.log" 2>&1 || cleanup_failed=1
+  fi
+  kill -INT "$daemon_pid" 2>/dev/null
+  # Reuse the census's ten-second teardown observation window. SIGKILL is an
+  # explicit cleanup failure, not a passing leak measurement.
+  for _ in $(seq 1 100); do
+    [[ ! -e "$proc/$daemon_pid/stat" ]] && break
+    [[ $(awk '{print $3}' "$proc/$daemon_pid/stat" 2>/dev/null) == Z ]] && break
+    sleep 0.1
+  done
+  if [[ -e "$proc/$daemon_pid/stat" && $(awk '{print $3}' "$proc/$daemon_pid/stat" 2>/dev/null) != Z ]]; then
+    kill -KILL "$daemon_pid" 2>/dev/null
+    cleanup_failed=1
+  fi
+  wait "$daemon_pid" || cleanup_failed=1
+  printf 'original_exit=%s cleanup_failed=%s\n' "$original_status" "$cleanup_failed" >>"$work/failure-cleanup.log"
+  if [[ $original_status -ne 0 ]]; then exit "$original_status"; fi
+  exit "$cleanup_failed"
 }
 trap cleanup_daemon EXIT
+
+# CLI List is tab-separated. Compare complete fields: a space matcher misses
+# valid output; a substring matcher would incorrectly count head=11 as head=1.
+count_output_heads() {
+  awk -F '\t' -v expected="$1" '{
+    for (i=1; i<=NF; i++) if ($i == "head=" expected) {count++; break}
+  } END {print count+0}'
+}
+
+# ClientError::Protocol renders the semantic Rust code in parentheses. Match
+# that exact CLI boundary, not the wire spelling or a resource phrase in an
+# unrelated error. Unknown refusals never count as clean quota enforcement.
+is_run_capacity_error() {
+  [[ $1 == 'ctxmux: ctxmux request failed (RunCapacity): '* ]]
+}
+
+# This workload keeps native cat leaders alive. Historical rows and head
+# counters alone cannot prove live capacity. Require distinct Running PIDs,
+# actual non-zombie kernel processes, and the exact daemon as their parent.
+confirm_live_runs() {
+  local listing=$1 expected=$2 owner=$3 count=0 rid state pid_field rest pid stat tail parent
+  printf '%s\n' "$listing" | awk -F '\t' 'NF<3 || $2!="running" || seen[$3]++ {exit 1}' || return 1
+  while IFS=$'\t' read -r rid state pid_field rest; do
+    [[ $pid_field =~ ^pid=([1-9][0-9]*)$ ]] || return 1
+    pid=${BASH_REMATCH[1]}
+    IFS= read -r stat < "$proc/$pid/stat" || return 1
+    tail=${stat##*) }
+    read -r state parent rest <<< "$tail"
+    [[ $parent == "$owner" && $state != Z && $state != X && $state != x ]] || return 1
+    count=$((count+1))
+  done <<< "$listing"
+  [[ $count -eq $expected && $count -gt 0 ]] || return 1
+  printf '%s\n' "$count"
+}
+
+# Read the ready daemon, whose own FD funding may change inherited RLIMITs.
+# Kernel configuration, never PID/path names or live usage, binds comparisons.
+# A namespace root with cgroup.events is a non-root kernel cgroup: ancestors
+# are hidden. Such cells remain observations but cannot qualify comparisons.
+collect_execution_environment() {
+  local owner=$1 out=$2 group root mount candidate_root candidate_mount directory file value encoded complete=false
+  [[ -r $proc/$owner/limits && -r $proc/$owner/status && -r $proc/$owner/cgroup && -r $proc/self/mountinfo ]] || return 1
+  printf 'ctxmux.fleet-execution-environment.v1\n' > "$out" || return 1
+  value=$(awk 'NR>1 {$1=$1; print}' "$proc/$owner/limits") || return 1
+  [[ -n $value ]] || return 1
+  printf '%s\n' "$value" >> "$out" || return 1
+  value=$(awk '/^(Cpus_allowed_list|Mems_allowed_list):/ {$1=$1; print}' "$proc/$owner/status") || return 1
+  [[ $(printf '%s\n' "$value" | wc -l) -eq 2 ]] || return 1
+  printf '%s\n' "$value" >> "$out" || return 1
+  group=$(awk -F: '$1==0 && $2=="" {print substr($0,4)}' "$proc/$owner/cgroup") || return 1
+  if [[ -z $group ]]; then
+    printf 'cgroup=legacy; full hierarchy unavailable\n' >> "$out" || return 1
+  else
+    [[ $group == /* && $group != *$'\n'* && /$group/ != */../* ]] || return 1
+    root= mount=
+    while read -r candidate_root candidate_mount; do
+      printf -v candidate_root '%b' "$candidate_root"
+      printf -v candidate_mount '%b' "$candidate_mount"
+      if [[ $group == "$candidate_root" || $candidate_root == / || $group == "$candidate_root/"* ]]; then
+        if [[ -z $root || ${#candidate_root} -lt ${#root} ]]; then root=$candidate_root; mount=$candidate_mount; fi
+      fi
+    done < <(awk '$0 ~ / - cgroup2 / {print $4, $5}' "$proc/self/mountinfo")
+    [[ -n $mount && -r $mount/cgroup.controllers ]] || return 1
+    directory=$mount
+    if [[ $group != "$root" ]]; then value=${group#"$root"}; directory=$mount/${value#/}; fi
+    [[ -r $directory/cgroup.controllers ]] || return 1
+    if [[ $root == / && ! -e $mount/cgroup.events && $(wc -l < "$proc/$owner/cgroup") -eq 1 ]]; then complete=true; fi
+    while :; do
+      [[ -r $directory/cgroup.controllers ]] || return 1
+      printf 'cgroup-level\n' >> "$out" || return 1
+      for file in cgroup.controllers cgroup.subtree_control cpu.max cpu.max.burst cpu.weight cpu.idle cpu.uclamp.min cpu.uclamp.max cpuset.cpus.effective cpuset.mems.effective memory.min memory.low memory.high memory.max memory.swap.max pids.max io.max io.weight; do
+        if [[ -e $directory/$file ]]; then
+          [[ -r $directory/$file ]] || return 1
+          # Configuration order/whitespace do not change the resource envelope.
+          value=$(LC_ALL=C awk '{$1=$1; print}' "$directory/$file" | LC_ALL=C sort) || return 1
+        else
+          value=absent
+        fi
+        printf '%s=%s\n' "$file" "$value" >> "$out" || return 1
+      done
+      [[ $directory == "$mount" ]] && break
+      directory=${directory%/*}
+      [[ $directory == "$mount" || $directory == "$mount/"* ]] || return 1
+    done
+  fi
+  printf 'complete_cgroup_hierarchy=%s\n' "$complete" >> "$out" || return 1
+  value=$(sha256sum "$out") || return 1
+  encoded=$(base64 < "$out" | tr -d '\n') || return 1
+  printf '{"schema":"ctxmux.fleet-execution-environment.v1","sha256":"%s","complete_cgroup_hierarchy":%s,"canonical_text_base64":"%s"}\n' "${value%% *}" "$complete" "$encoded" || return 1
+}
 
 # Wait for readiness. A green ping alone is not proof that OUR daemon answered,
 # so the loop also requires our process to still be alive, and surfaces the
@@ -319,6 +436,7 @@ if [[ $ready != true ]] || ! kill -0 "$daemon_pid" 2>/dev/null; then
   exit 1
 fi
 
+execution_environment=$(collect_execution_environment "$daemon_pid" "$work/execution-environment-before.txt") || { echo 'execution environment unavailable' >&2; exit 1; }
 baseline_raw=$(sample "$daemon_pid")
 baseline_rss=${baseline_raw%%|*}
 rest=${baseline_raw#*|}
@@ -326,6 +444,26 @@ baseline_cpu_raw=${rest%%|*}
 rest=${rest#*|}
 baseline_threads=${rest%%|*}
 baseline_fds=${rest##*|}
+
+# 20 Hz external sampler, with timestamps and a graceful completion handshake.
+# Five missed periods invalidate peak coverage; this is a measurement-quality
+# boundary, independent of candidate memory costs.
+(while [[ ! -e "$work/sampler-stop" ]]; do
+   kill -0 "$daemon_pid" || exit 1
+   timestamp=$(date +%s.%N)
+   rss=$(awk '/VmRSS:/ {print $2}' "$proc/$daemon_pid/status")
+   [[ $rss -gt 0 ]] || exit 1
+   printf '%s %s\n' "$timestamp" "$rss" >> "$work/rss-samples"
+   sleep 0.05
+ done) &
+sampler_pid=$!
+for _ in $(seq 1 100); do
+  [[ -s "$work/rss-samples" ]] && break
+  kill -0 "$sampler_pid" || { echo 'RSS sampler failed before workload' >&2; exit 1; }
+  sleep 0.01
+done
+[[ -s "$work/rss-samples" ]] || exit 1
+measurement_start=$(date +%s.%N)
 
 # Create Runs and count how many the daemon actually admitted. A daemon whose
 # record cap is 128 refuses beyond it with run_capacity; the count of clean
@@ -336,14 +474,15 @@ refused_clean=0
 emfile=0
 admission_error=""
 for _ in $(seq 1 "$target"); do
-  if out=$(ctxmux --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
+  if out=$(ctxmux --socket "$sock" start -- /bin/sh -c 'stty -echo -icanon; printf R; exec "$1"' _ "$run_program" 2>"$work/start.err"); then
     admitted=$((admitted + 1))
+    printf "%s\n" "$out" >> "$work/run-ids"
   else
     err=$(cat "$work/start.err")
     if grep -qi "too many open files" <<<"$err"; then
       emfile=1
       admission_error=$err
-    elif grep -qi "run_capacity\|retained Run capacity" <<<"$err"; then
+    elif is_run_capacity_error "$err"; then
       refused_clean=$((refused_clean + 1))
       admission_error=$err
     else
@@ -355,25 +494,61 @@ done
 
 # If the fleet reached its target, probe one more admission to observe ceiling
 # behaviour explicitly rather than inferring it.
-if [[ $admitted -ge $target ]]; then
-  if out=$(ctxmux --socket "$sock" start -- "$run_program" 2>"$work/start.err"); then
-    :
+if [[ $admitted -eq 4000 ]]; then
+  if out=$(ctxmux --socket "$sock" start -- /bin/sh -c 'stty -echo -icanon; printf R; exec "$1"' _ "$run_program" 2>"$work/start.err"); then
+    printf "%s\n" "$out" >> "$work/run-ids"
+    echo "unexpected successful admission beyond the declared live Run quota" >&2
+    exit 1
   else
     err=$(cat "$work/start.err")
     if grep -qi "too many open files" <<<"$err"; then emfile=1; admission_error=$err
-    elif grep -qi "run_capacity\|retained Run capacity" <<<"$err"; then refused_clean=$((refused_clean + 1)); admission_error=$err
-    else admission_error=$err; fi
+    elif is_run_capacity_error "$err"; then refused_clean=$((refused_clean + 1)); admission_error=$err
+    else
+      admission_error=$err
+      printf 'unexpected admission refusal beyond the declared quota: %s\n' "$err" >&2
+      exit 1
+    fi
   fi
 fi
 
-# For active runs, drive input to each Run so retained output is non-trivial.
+# Fixed workload: one readiness byte, then raw byte-for-byte copy with no PTY
+# echo. Prove readiness before timing, and never swallow failed input.
+for _ in $(seq 1 300); do
+  listing=$(ctxmux --socket "$sock" list)
+  ready_runs=$(printf '%s\n' "$listing" | count_output_heads 1)
+  [[ $ready_runs -eq $admitted ]] && break
+  sleep 0.1
+done
+[[ $ready_runs -eq $admitted ]] || { echo 'child readiness incomplete' >&2; exit 1; }
+live_runs_confirmed=$(confirm_live_runs "$listing" "$admitted" "$daemon_pid") || { echo 'live workload PID ownership incomplete' >&2; exit 1; }
+cpu_ticks() { awk '{print $14 + $15}' "$proc/$1/stat"; }
+clock_ticks=$(getconf CLK_TCK)
+input_bytes=0
+expected_bytes=1
+active_start=$(date +%s.%N)
+active_start_ticks=$(cpu_ticks "$daemon_pid")
 if [[ $mode == active ]]; then
-  while IFS=$'\t' read -r rid _; do
-    ctxmux --socket "$sock" input "$rid" "aaaa" >/dev/null 2>&1 || true
-  done < <(ctxmux --socket "$sock" list 2>/dev/null)
+  input_bytes=4096
+  expected_bytes=4097
+  payload=$(printf '%4096s' '' | tr ' ' a)
+  export payload sock
+  export ctxmux_fleet_client=$client_dir/ctxmux
+  # Eight drivers is frozen workload concurrency, not daemon worker policy.
+  xargs -P 8 -I '{}' bash -c 'PATH= "$ctxmux_fleet_client" --socket "$sock" input "$1" "$payload" >/dev/null' _ '{}' < "$work/run-ids"
 fi
-
-sleep 1
+for _ in $(seq 1 300); do
+  listing=$(ctxmux --socket "$sock" list)
+  completed_runs=$(printf '%s\n' "$listing" | count_output_heads "$expected_bytes")
+  [[ $completed_runs -eq $admitted ]] && break
+  sleep 0.1
+done
+[[ $completed_runs -eq $admitted ]] || { echo 'output workload incomplete' >&2; exit 1; }
+active_end=$(date +%s.%N)
+active_end_ticks=$(cpu_ticks "$daemon_pid")
+cpu_tick_ms=$(awk "BEGIN{printf \"%.3f\", 1000/$clock_ticks}")
+active_cpu_ms=$(awk "BEGIN{printf \"%.3f\", ($active_end_ticks-$active_start_ticks)*1000/$clock_ticks}")
+active_wall_ms=$(awk "BEGIN{printf \"%.3f\", ($active_end-$active_start)*1000}")
+active_cpu_percent=$(awk "BEGIN{printf \"%.3f\", ($active_end_ticks-$active_start_ticks)/$clock_ticks/($active_end-$active_start)*100}")
 
 # List across the whole fleet, timing it and confirming it enumerated every Run.
 list_start=$(date +%s.%N)
@@ -447,10 +622,6 @@ steady_fds=${rest##*|}
 #
 # The stat file's fields 14 and 15 are utime and stime in clock ticks, which
 # is finer than a second, and the window is timed rather than assumed.
-cpu_ticks() {
-  awk '{print $14 + $15}' "$proc/$1/stat" 2>/dev/null || echo 0
-}
-clock_ticks=$(getconf CLK_TCK 2>/dev/null || echo 100)
 idle_window=5
 idle_start_ticks=$(cpu_ticks "$daemon_pid")
 idle_start=$(date +%s.%N)
@@ -476,7 +647,7 @@ if [[ $admitted -ge 1 ]]; then
   rss_per_run=$(divide "$steady_rss - $baseline_rss")
   fds_per_run=$(divide "$steady_fds - $baseline_fds")
   threads_per_run=$(divide "$steady_threads - $baseline_threads")
-  retained_per_run=$(divide "$aggregate_bytes")
+  retained_per_run=$(divide "$aggregate_retained_bytes")
 fi
 
 # Stop every Run, then sample what teardown actually released.
@@ -493,7 +664,8 @@ while IFS=$'\t' read -r rid _; do
   if ! ctxmux --socket "$sock" stop "$rid" >>"$work/stop.err" 2>&1; then
     stop_failures=$((stop_failures + 1))
   fi
-done < <(ctxmux --socket "$sock" list 2>/dev/null)
+done < "$work/run-ids"
+if [[ $stop_failures -eq 0 ]]; then runs_stopped=true; fi
 
 # Children are reaped asynchronously after stop returns, so poll for the drain
 # instead of assuming a fixed sleep is long enough. A fleet that never drains
@@ -518,7 +690,8 @@ done
 
 cleanup_raw=$(sample "$daemon_pid")
 cleanup_threads=$(printf '%s' "$cleanup_raw" | awk -F'|' '{print $3}')
-cleanup_attachments=$(printf '%s\n' "$(ctxmux --socket "$sock" list 2>/dev/null)" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
+cleanup_listing=$(ctxmux --socket "$sock" list)
+cleanup_attachments=$(printf '%s\n' "$cleanup_listing" | sed -n 's/.*attachments=\([0-9]*\).*/\1/p' | awk '{s+=$1} END{print s+0}')
 cleanup_children=$(count_children "$daemon_pid")
 
 # Everything sampled since the guard at the steady sample assumed the daemon was
@@ -535,15 +708,46 @@ cleanup_children=$(count_children "$daemon_pid")
 daemon_alive_after_census=true
 kill -0 "$daemon_pid" 2>/dev/null || daemon_alive_after_census=false
 
-peak_rss=$steady_rss
-if [[ $baseline_rss -gt $peak_rss ]]; then peak_rss=$baseline_rss; fi
+# Terminal attach has a finite replay. Digest all bytes from all Runs; head
+# counters or an aggregate cannot prove the workload was actually preserved.
+{ printf R; if [[ $mode == active ]]; then printf '%4096s' '' | tr ' ' a; fi; } > "$work/expected"
+expected_sha=$(sha256sum "$work/expected" | cut -d' ' -f1)
+replay_start=$(date +%s.%N)
+byte_exact_runs=0
+while read -r rid; do
+  ctxmux --socket "$sock" attach "$rid" > "$work/replay"
+  actual_sha=$(sha256sum "$work/replay" | cut -d' ' -f1)
+  [[ $actual_sha == "$expected_sha" ]] || { echo "wrong replay for $rid" >&2; exit 1; }
+  byte_exact_runs=$((byte_exact_runs+1))
+done < "$work/run-ids"
+replay_end=$(date +%s.%N)
+replay_wall_ms=$(awk "BEGIN{printf \"%.3f\", ($replay_end-$replay_start)*1000}")
+# Require a sample at the final boundary before asking the sampler to finish.
+sleep 0.06
+touch "$work/sampler-stop"
+wait "$sampler_pid" || { echo 'RSS sampler failed during workload' >&2; sampler_pid=""; exit 1; }
+sampler_pid=""
+read -r peak_rss sampling_count sampling_max_gap sampling_complete < <(
+  awk -v begin="$measurement_start" -v end="$replay_end" '
+    BEGIN{max=0; gap=0; count=0}
+    {if(count==0)first=$1; else if(($1-last)*1000>gap)gap=($1-last)*1000;
+     last=$1; count++; if($2>max)max=$2}
+    END{valid=(count>=2 && first<=begin && last>=end && gap<=250);
+        printf "%s %s %.3f %s\n",max,count,gap,valid?"true":"false"}' "$work/rss-samples")
+[[ $sampling_complete == true ]] || { printf 'RSS coverage incomplete: samples=%s max_gap_ms=%s (required >=2 samples, boundary coverage, max gap <=250 ms)\n' "$sampling_count" "$sampling_max_gap" >&2; exit 1; }
+execution_after=$(collect_execution_environment "$daemon_pid" "$work/execution-environment-after.txt") || { echo 'final execution environment unavailable' >&2; exit 1; }
+[[ $execution_environment == "$execution_after" ]] || { echo 'execution environment changed during measurement' >&2; exit 1; }
 
 printf '{'
+printf '"execution_environment":%s,' "$execution_environment"
+printf '"workload":{"input_bytes_per_run":%s,"expected_output_bytes_per_run":%s,"driver_concurrency":8,"live_runs_confirmed":%s,"completed_runs":%s,"byte_exact_runs":%s},' "$input_bytes" "$expected_bytes" "$live_runs_confirmed" "$completed_runs" "$byte_exact_runs"
+printf '"active_wall_ms":%s,"active_cpu_core_percent":%s,"active_cpu_ms":%s,"cpu_tick_ms":%s,"replay_wall_ms":%s,' "$active_wall_ms" "$active_cpu_percent" "$active_cpu_ms" "$cpu_tick_ms" "$replay_wall_ms"
+printf '"rss_sampling":{"complete":%s,"samples":%s,"max_gap_ms":%s},' "$sampling_complete" "$sampling_count" "$sampling_max_gap"
 printf '"admitted_runs":%s,' "$admitted"
 printf '"daemon_alive_after_census":%s,' "$daemon_alive_after_census"
 printf '"cpu_core_percent":%s,' "$cpu_core_percent"
 printf '"peak_rss_kib":%s,' "$peak_rss"
-printf '"output_bytes_lifetime_per_run":%s,' "$retained_per_run"
+printf '"retained_output_bytes_per_run":%s,' "$retained_per_run"
 printf '"rss_kib_per_run":%s,' "$rss_per_run"
 printf '"threads_per_run":%s,' "$threads_per_run"
 printf '"fds_per_run":%s,' "$fds_per_run"
@@ -628,7 +832,7 @@ ctxmux_fleet_run_census_remote() {
   local cell status
   cell=$(
     ctxmux_fleet_census_helper \
-      | ssh "$dest" "bash -s -- '$mode' '$target' '$ctxmuxd_bin' '$ctxmux_bin' '$run_program' '$remote_work'" \
+      | ssh "$dest" "bash -s -- '$mode' '$target' '$ctxmuxd_bin' '$ctxmux_bin' '$run_program' '$remote_work' '$ctxmux_fleet_resource_policy'" \
       | tail -1
     exit "${PIPESTATUS[1]}"
   )
@@ -640,7 +844,7 @@ ctxmux_fleet_run_census_local() {
   local cell status
   cell=$(
     ctxmux_fleet_census_helper \
-      | bash -s -- "$mode" "$target" "$ctxmuxd_bin" "$ctxmux_bin" "$run_program" "$local_work" \
+      | bash -s -- "$mode" "$target" "$ctxmuxd_bin" "$ctxmux_bin" "$run_program" "$local_work" "$ctxmux_fleet_resource_policy" \
       | tail -1
     exit "${PIPESTATUS[1]}"
   )
@@ -710,13 +914,27 @@ then
   exit 0
 fi
 
+if [[ -z $ctxmux_fleet_thresholds_arg ]]; then
+  echo 'observe/accept requires --thresholds; accept never generates a baseline' >&2
+  exit 2
+fi
+if [[ $ctxmux_fleet_profile == accept && ! -f $ctxmux_fleet_thresholds_arg ]]; then
+  echo 'frozen thresholds file does not exist' >&2; exit 2
+fi
+if [[ $ctxmux_fleet_profile == accept ]]; then
+  node scripts/fleet-scale-measure.mjs --mode verify-baseline --thresholds "$ctxmux_fleet_thresholds_arg" --baseline-ref "$ctxmux_fleet_baseline_ref"
+fi
+if [[ $ctxmux_fleet_profile == observe && -e $ctxmux_fleet_thresholds_arg ]]; then
+  echo 'observe refuses to overwrite a baseline' >&2; exit 2
+fi
+
 # ---- accept profile: the real fleet-scale acceptance on the farm ----
 # The destination is an ssh alias, overridable because farm placement is the
 # farm's policy and not this repo's: new validation is currently steered to the
 # canary workers so the CN farm server's existing development work is not
 # disturbed. Pinning one host here would silently outlive that policy.
 ctxmux_fleet_dest=${CTXMUX_FLEET_HOST:-cn4}
-echo "== fleet-scale accept: driving the farm node $ctxmux_fleet_dest over ssh =="
+echo "== fleet-scale $ctxmux_fleet_profile: driving the farm node $ctxmux_fleet_dest over ssh =="
 
 if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$ctxmux_fleet_dest" true 2>/dev/null
 then
@@ -733,7 +951,9 @@ then
   exit 3
 fi
 
+ctxmux_fleet_source_sha=$(node --input-type=module -e 'import {sourceIdentity} from "./scripts/fleet-scale-measure.mjs"; process.stdout.write(sourceIdentity());')
 ctxmux_fleet_cross_build
+[[ $(node --input-type=module -e 'import {sourceIdentity} from "./scripts/fleet-scale-measure.mjs"; process.stdout.write(sourceIdentity());') == "$ctxmux_fleet_source_sha" ]] || { echo 'source changed during build' >&2; exit 1; }
 
 ctxmux_fleet_local_ctxmuxd=$PWD/target/x86_64-unknown-linux-gnu/release/ctxmuxd
 ctxmux_fleet_local_ctxmux=$PWD/target/x86_64-unknown-linux-gnu/release/ctxmux
@@ -763,6 +983,13 @@ ctxmux_fleet_ship_verified "$ctxmux_fleet_local_ctxmux" "$ctxmux_fleet_remote_ct
 
 ctxmux_fleet_remote_uname_r=$(ssh "$ctxmux_fleet_dest" "uname -r")
 ctxmux_fleet_remote_cpus=$(ssh "$ctxmux_fleet_dest" "nproc")
+ctxmux_fleet_remote_host_id=$(
+  ssh "$ctxmux_fleet_dest" "cat /etc/machine-id" |
+    node --input-type=module -e 'import {readFileSync} from "node:fs"; import {machineIdentity} from "./scripts/fleet-scale-measure.mjs"; process.stdout.write(machineIdentity(readFileSync(0,"utf8")));'
+)
+ctxmux_fleet_daemon_sha=$(shasum -a 256 "$ctxmux_fleet_local_ctxmuxd" | cut -d' ' -f1)
+ctxmux_fleet_client_sha=$(shasum -a 256 "$ctxmux_fleet_local_ctxmux" | cut -d' ' -f1)
+
 ctxmux_fleet_run_program=/bin/cat
 
 work_root="${TMPDIR:-/tmp}"
@@ -771,16 +998,20 @@ trap 'ctxmux_fleet_cleanup_remote; rm -rf "$ctxmux_fleet_local_work"' EXIT
 
 ctxmux_fleet_obs="$ctxmux_fleet_local_work/observations.json"
 ctxmux_fleet_receipt="$ctxmux_fleet_local_work/receipt.json"
-ctxmux_fleet_thresholds="$ctxmux_fleet_local_work/thresholds.json"
+ctxmux_fleet_thresholds=$ctxmux_fleet_thresholds_arg
+ctxmux_fleet_check_source() {
+  [[ $(node --input-type=module -e 'import {sourceIdentity} from "./scripts/fleet-scale-measure.mjs"; process.stdout.write(sourceIdentity());') == "$ctxmux_fleet_source_sha" ]] || { echo 'source changed during measurement' >&2; exit 1; }
+}
 
+if [[ $ctxmux_fleet_profile == observe ]]; then
 # Three rounds per tier per mode become the observations that derive the
 # thresholds; a separate final round becomes the receipt judged against them.
 # Each census runs in its own remote working subdirectory so a daemon's state
 # never bleeds into the next round.
 echo "== running observation rounds on the farm ==" >&2
 {
-  printf '{"host":{"os":"linux","os_release":"%s","architecture":"x64","logical_cpus":%s},"modes":{' \
-    "$ctxmux_fleet_remote_uname_r" "$ctxmux_fleet_remote_cpus"
+  printf '{"host":{"os":"linux","os_release":"%s","architecture":"x64","logical_cpus":%s,"machine_id_sha256":"%s"},"provenance":{"daemon_sha256":"%s","client_sha256":"%s","source_sha256":"%s"},"resource_policy":%s,"modes":{' \
+    "$ctxmux_fleet_remote_uname_r" "$ctxmux_fleet_remote_cpus" "$ctxmux_fleet_remote_host_id" "$ctxmux_fleet_daemon_sha" "$ctxmux_fleet_client_sha" "$ctxmux_fleet_source_sha" "$ctxmux_fleet_resource_policy"
   first_mode=true
   for mode in idle active; do
     if [[ $first_mode == true ]]; then first_mode=false; else printf ','; fi
@@ -808,15 +1039,20 @@ echo "== running observation rounds on the farm ==" >&2
 } > "$ctxmux_fleet_obs"
 
 echo "== deriving farm thresholds ==" >&2
+ctxmux_fleet_check_source
 node scripts/fleet-scale-measure.mjs --mode derive \
   --observations "$ctxmux_fleet_obs" --out "$ctxmux_fleet_thresholds"
+
+echo "proposed baseline written; no acceptance verdict issued"
+exit 0
+fi
 
 # Build the receipt: one fresh census per tier/mode, judged against the derived
 # thresholds. Structurally the receipt is one round per cell.
 echo "== running the receipt round on the farm ==" >&2
 {
-  printf '{"host":{"os":"linux","os_release":"%s","architecture":"x64","logical_cpus":%s},"modes":{' \
-    "$ctxmux_fleet_remote_uname_r" "$ctxmux_fleet_remote_cpus"
+  printf '{"host":{"os":"linux","os_release":"%s","architecture":"x64","logical_cpus":%s,"machine_id_sha256":"%s"},"provenance":{"daemon_sha256":"%s","client_sha256":"%s","source_sha256":"%s"},"resource_policy":%s,"modes":{' \
+    "$ctxmux_fleet_remote_uname_r" "$ctxmux_fleet_remote_cpus" "$ctxmux_fleet_remote_host_id" "$ctxmux_fleet_daemon_sha" "$ctxmux_fleet_client_sha" "$ctxmux_fleet_source_sha" "$ctxmux_fleet_resource_policy"
   first_mode=true
   for mode in idle active; do
     if [[ $first_mode == true ]]; then first_mode=false; else printf ','; fi
@@ -838,7 +1074,9 @@ echo "== running the receipt round on the farm ==" >&2
 } > "$ctxmux_fleet_receipt"
 
 echo "== rendering the acceptance verdict ==" >&2
+ctxmux_fleet_check_source
 ctxmux_fleet_verdict_args=(--mode verdict
+  --baseline-ref "$ctxmux_fleet_baseline_ref"
   --thresholds "$ctxmux_fleet_thresholds"
   --observations "$ctxmux_fleet_receipt"
   --root "$PWD")
