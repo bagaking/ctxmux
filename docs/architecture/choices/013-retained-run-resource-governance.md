@@ -2,6 +2,15 @@
 
 - Status: accepted, implemented, and source-bound sustained qualification
   complete for the declared workload
+- Amended-by: the live retained-record count cap this decision introduced (128)
+  has been removed. The live-Run admission ceiling is now the descriptor-funded
+  `FD_BUDGET_LIVE_RUNS` (4000, `crates/ctxmux-daemon/src/fd_budget.rs`), clamped
+  per host to what `RLIMIT_NOFILE` funds; durable rows are bounded by
+  `RETAINED_RUN_RECORDS = FD_BUDGET_LIVE_RUNS`
+  (`crates/ctxmux-daemon/src/persistence.rs`) and retained memory by the
+  daemon-wide retained-byte budget (`crates/ctxmux-daemon/src/retention.rs`).
+  The concrete 128-record figures below and the 1/32/128 T-005 qualification
+  record are kept as the originally qualified policy, not the current ceiling.
 - Scope: global retained Run admission, operation-key lifetime, collection,
   persistence replacement, and sustained-churn qualification
 
@@ -34,11 +43,14 @@ uncommitted net release never becomes global slack. Concurrent reservations
 therefore cannot publish one Run past the ceiling. This is a retained-record
 bound, not a claim that no transient owner can coexist with those records.
 
-The value 128 preserves the already qualified 1/32/128 live-Run matrix while
-avoiding the false safety of reusing SQLite's historical 4,096-row format
-envelope. The existing 4 MiB per-Run retention contract therefore derives a
-512 MiB live memory-only `OutputLog` payload ceiling without another hot-path
-byte quota. Up to 128 live native Runs retain three descriptors each, all of
+The originally qualified value was 128, chosen to preserve the already
+qualified 1/32/128 live-Run matrix while avoiding the false safety of reusing
+SQLite's historical 4,096-row format envelope; at that capacity the existing
+4 MiB per-Run retention contract derived a 512 MiB live memory-only `OutputLog`
+payload ceiling without another hot-path byte quota. (Per the amendment above,
+the live ceiling is now `FD_BUDGET_LIVE_RUNS`; the 128 figures in this and the
+following paragraphs are that originally qualified policy, not the current
+bound.) Each live native Run retains three descriptors, all of
 them referring to the same PTY master: the master itself in the control owner,
 one reader dup owned by the daemon-wide output reactor, and one writer dup from
 `take_writer`. The three are deliberately distinct owned descriptors so each is
@@ -81,7 +93,9 @@ misrepresented as replay bytes.
 SQLite may accept a schema-4 store containing up to 4,096 structurally
 valid rows during fail-closed format validation. Bounded, restartable startup
 transactions reconcile prior running rows to interrupted, evict the canonical
-terminal prefix to 128, and finish serving-epoch publication before socket publication.
+terminal prefix to `RETAINED_RUN_RECORDS` (currently `FD_BUDGET_LIVE_RUNS`; 128
+in the originally qualified policy), and finish serving-epoch publication before
+socket publication.
 The 4,096 value is a legacy format-validation envelope, not a second live
 capacity promise. The existing 64 MiB metadata, 256 MiB replay, database, WAL,
 SHM, and state-directory limits remain unchanged.
@@ -332,7 +346,7 @@ including cascading replay, and inserts the new `Running` row with
 `pid = NULL`. The transaction remains uncommitted and the actor remains its sole
 owner. No child exists yet.
 
-The baseline replaces an earlier rule that checkpointed the WAL to *zero* here.
+The baseline replaces an earlier rule that checkpointed the WAL to _zero_ here.
 That rule was never a correctness requirement: it was an economy, letting a
 single comparison of the WAL's absolute length prove both ceilings at once. It
 was also expensive. Under a chatty fleet the output path deliberately lets the
@@ -370,7 +384,7 @@ the commit marker is carried by the final page frame. Clean/schema pages and
 allocator overhead only make the charge more conservative. At 4 KiB pages the
 8 MiB ceiling admits the WAL header plus at most 2,036 frames.
 
-The charge bounds the transaction's WAL *growth*, which is what makes it sound
+The charge bounds the transaction's WAL _growth_, which is what makes it sound
 off a non-zero baseline: a commit appends frames after the existing ones, and
 the frames it writes do not depend on how many were already there. This is
 proven against the pinned SQLite for baselines from zero to the checkpoint
@@ -473,8 +487,8 @@ limits, file ceilings, recovery class, and SQLite durability assumptions.
 
 Admission-triggered replacement reclaims a slot only under capacity pressure and
 only for a net-zero exchange, so a client with pinned or simply unwanted terminal
-history has no way to return a record to the 128 budget and no age or wall-clock
-expiration is promised. The `remove { id }` request closes that gap with client
+history has no way to return a record to the retained-record budget and no age or
+wall-clock expiration is promised. The `remove { id }` request closes that gap with client
 agency, not a new policy engine. It reuses the exact eligibility, fence, detach,
 and durable-delete machinery that replacement already proves; it adds no
 scheduler, lease, TTL, or background actor.
@@ -768,12 +782,13 @@ live only in the separately source-bound GC contract.
 
 ## Known constraints
 
-Collection is admission-triggered; history below 128 is retained and no age or
-wall-clock expiration is promised. Client `remove` is the only way to return a
+Collection is admission-triggered; history below the ceiling is retained and no
+age or wall-clock expiration is promised. Client `remove` is the only way to return a
 retained slot without capacity pressure electing it; it is caller-driven, not a
-timer or quota, so it changes no automatic-retention promise. The 128 ceiling
-bounds Registry records and
-their 512 MiB replay payload; the shared eight-slot overlap owner produces the
+timer or quota, so it changes no automatic-retention promise. The retained-record
+ceiling (currently `FD_BUDGET_LIVE_RUNS`; 128 in the originally qualified policy,
+which is the figure the payload arithmetic below assumes) bounds Registry records
+and their 512 MiB replay payload; the shared eight-slot overlap owner produces the
 separate 544 MiB retained-plus-overlap payload bound above. Neither value bounds
 descendant processes from legacy direct-child Stop semantics. Generation 9
 introduced complete POSIX-session Stop; a session-escaping
