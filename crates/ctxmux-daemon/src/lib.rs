@@ -495,9 +495,48 @@ fn apply_startup_fd_budget(manager: &RunManager) {
 fn arm_native_exit_relay(manager: &RunManager) -> Result<tokio::signal::unix::Signal, ServerError> {
     let sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())
         .map_err(|source| ServerError::io("<sigchld>", source))?;
+    become_child_subreaper();
     manager.native_runs.mark_signal_driven();
     manager.native_runs.owner_wake().wake();
     Ok(sigchld)
+}
+
+/// Claim orphaned descendants so a Run's session stays inside this daemon's
+/// process tree.
+///
+/// `NativeSession::members` proves a stopped Run's session empty by descending
+/// the leader's own subtree rather than walking every process on the host (see
+/// `native_session::session_candidates`). That is only equivalent to the host
+/// walk while every session member is reachable from this daemon. A descendant
+/// whose parent exits first would otherwise reparent to init -- leaving the
+/// subtree while *staying in the session*, which is precisely the case the walk
+/// still saw and the sweep would not. As a subreaper we inherit it instead, and
+/// the sweep's daemon-children level finds it.
+///
+/// Arming the bit also makes us responsible for reaping what we inherit --
+/// nothing else in this process will `wait` for an orphan, and an unreaped one
+/// still answers `getsid`. That duty is discharged by
+/// `native_session::reap_inherited_orphans`, called from the census that
+/// depends on it rather than from here.
+///
+/// Best-effort on purpose. `PR_SET_CHILD_SUBREAPER` is Linux 3.4+ and takes no
+/// permission, so a failure here means a kernel that also lacks the
+/// `/proc/<pid>/task/<tid>/children` file the sweep reads; on any other
+/// platform the sweep is not compiled in and this is a no-op. Failing startup
+/// over it would trade a rare, narrower emptiness proof for no daemon at all.
+fn become_child_subreaper() {
+    #[cfg(not(target_os = "macos"))]
+    {
+        // `set_child_subreaper` takes the pid to install, and `None` means 0 --
+        // which CLEARS the attribute. Naming ourselves is what sets it.
+        let me = rustix::process::getpid();
+        if let Err(error) = rustix::process::set_child_subreaper(Some(me)) {
+            eprintln!(
+                "ctxmuxd: failed to become a child subreaper ({error}); an orphaned \
+                 Run descendant may escape the session emptiness proof"
+            );
+        }
+    }
 }
 
 async fn serve_with_manager(
