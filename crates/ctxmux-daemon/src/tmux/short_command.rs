@@ -237,6 +237,36 @@ fn drain_stream<R: Read>(
     }
 }
 
+/// Reap descendants of the helper that outlived their own parent.
+///
+/// The helper's group gets a whole-group SIGKILL, but only the direct child has a
+/// `Child` handle to `wait` on. A grandchild whose parent exits first is
+/// orphaned, and because the daemon arms `PR_SET_CHILD_SUBREAPER` (so a Run's
+/// session stays inside its process tree) that orphan reparents to *us* rather
+/// than to init. Nothing else will ever wait for it, so without this it stays
+/// a zombie for the life of the daemon -- holding a PID slot, and still
+/// answering `kill(pid, 0)` as though it were alive.
+///
+/// Only processes in the helper's own group are reaped, which is exactly the
+/// set this function just killed: `run` puts the helper in a fresh group with
+/// `process_group(0)`, so nothing else in the daemon can be in it. `WNOHANG`
+/// keeps a still-running straggler from blocking teardown.
+#[cfg(not(target_os = "macos"))]
+fn reap_orphaned_group_members(process_group: Pid) {
+    use rustix::process::{WaitOptions, waitpgid};
+
+    // Blocking, not `NOHANG`: the orphan is reparented to us asynchronously, as
+    // its own parent exits, so a non-blocking drain returns `None` before the
+    // straggler has arrived and leaves the zombie behind. Every member has
+    // already been SIGKILLed, which no handler can catch or a stop can defer,
+    // so each wait resolves as fast as the kernel can deliver it; `ECHILD` ends
+    // the loop once the group is empty.
+    while matches!(waitpgid(process_group, WaitOptions::empty()), Ok(Some(_))) {}
+}
+
+#[cfg(target_os = "macos")]
+fn reap_orphaned_group_members(_process_group: Pid) {}
+
 fn terminate_and_reap(child: &mut Child, process_group: Pid) -> Result<(), String> {
     let mut failures = Vec::new();
     let initial_group_error = match kill_process_group(process_group, Signal::KILL) {
@@ -278,6 +308,9 @@ fn terminate_and_reap(child: &mut Child, process_group: Pid) -> Result<(), Strin
         }
     }
 
+    // The direct child is reaped above; its orphaned descendants are not, and
+    // as a subreaper we are now their parent.
+    reap_orphaned_group_members(process_group);
     if failures.is_empty() {
         Ok(())
     } else {

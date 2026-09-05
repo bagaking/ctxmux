@@ -321,9 +321,16 @@ impl NativeSession {
         }
     }
 
+    /// Every process still in this session, optionally including the leader.
+    ///
+    /// The census reaps before it counts, because otherwise its answer is
+    /// wrong: see [`reap_inherited_orphans`].
     fn members(&self, include_leader: bool) -> Result<Vec<Pid>, String> {
         self.require_waitable_anchor()?;
-        self.classify_members(process_ids()?, include_leader, |pid| getsid(Some(pid)))
+        let candidates = session_candidates(self.id)?;
+        #[cfg(not(target_os = "macos"))]
+        reap_inherited_orphans(self.id, &candidates);
+        self.classify_members(candidates, include_leader, |pid| getsid(Some(pid)))
     }
 
     fn classify_members(
@@ -539,12 +546,203 @@ fn exit_status_from_waitid(status: &WaitIdStatus) -> ExitStatus {
 }
 
 #[cfg(target_os = "macos")]
-fn process_ids() -> Result<Vec<u32>, String> {
+fn session_candidates(_leader: Pid) -> Result<Vec<u32>, String> {
     ctxmux_process_stats::process_ids()
         .map_err(|error| format!("failed to enumerate native session members: {error}"))
 }
 
-/// Enumerate PIDs only, by reading `/proc`'s numeric entries directly.
+/// Read the direct children of one thread into `out`.
+///
+/// `/proc/<pid>/task/<tid>/children` is a space-separated list of PIDs. It is
+/// per-thread, so a threaded process needs every `tid` visited -- our leaders
+/// are single-threaded shells, but nothing stops a Run from spawning something
+/// threaded, and missing a thread's children would under-report the session.
+///
+/// A vanished pid yields `ENOENT`, which is not an error here: the process
+/// exiting is exactly the outcome the caller is waiting for.
+#[cfg(not(target_os = "macos"))]
+fn push_children(pid: u32, out: &mut Vec<u32>) {
+    let Ok(threads) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return;
+    };
+    for thread in threads.flatten() {
+        let Some(tid) = thread
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(children) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
+        else {
+            continue;
+        };
+        out.extend(
+            children
+                .split_ascii_whitespace()
+                .filter_map(|entry| entry.parse::<u32>().ok()),
+        );
+    }
+}
+
+/// Enumerate the processes that could still belong to `leader`'s session, by
+/// descending `leader`'s own process tree instead of walking the whole host.
+///
+/// A child inherits its parent's session across `fork`, and the only way out is
+/// `setsid`, which puts the caller in a *new* session it leads. So every member
+/// of `leader`'s session is a descendant of `leader` -- the host walk was
+/// asking a question that only our own subtree can answer positively.
+///
+/// **The prune is what makes this scale.** Recursion stops at any child outside
+/// the session: that child left via `setsid`, so its entire subtree left with
+/// it. Without the prune the walk covers the daemon's whole tree, which grows
+/// with the fleet -- measured on a 64-core farm host at the 128-Run cap, the
+/// unpruned walk costs 0.786 ms against the host census's 1.139 ms, i.e. it
+/// gives back almost everything. Pruned, the same case is 0.061 ms, and the
+/// cost tracks *this Run's* descendants rather than the fleet or the host:
+///
+/// | fleet | host census | unpruned | pruned |
+/// |---|---|---|---|
+/// | 0 | 1.071 ms | 0.029 | **0.028** |
+/// | 16 | 1.089 ms | 0.191 | **0.052** |
+/// | 128 | 1.139 ms | 0.786 | **0.061** |
+///
+/// The returned list is a superset of the session, not the session itself: the
+/// caller still applies the `getsid` filter, which is what keeps the answer
+/// identical to the host walk's (see `classify_members`). Two things make the
+/// superset correct rather than merely cheap. The leader itself is included, so
+/// a session whose only remaining member is the leader is still observable. And
+/// the daemon is a child subreaper, so a descendant orphaned mid-teardown
+/// reparents to the *daemon* rather than to init -- it would otherwise leave
+/// this subtree while staying in the session, and the sweep would go blind
+/// exactly where the census still saw it. That is why the orphan's new parent
+/// is swept too.
+#[cfg(not(target_os = "macos"))]
+fn session_candidates(leader: Pid) -> Result<Vec<u32>, String> {
+    // The subtree answer is only equivalent to the host walk while orphaned
+    // descendants reparent to US. If this process is not a subreaper they
+    // reparent to init instead -- still in the session, no longer in our tree --
+    // and the sweep would silently return a narrower answer. Correctness must
+    // not depend on a process-wide flag some caller may not have set, so this
+    // falls back to the walk rather than quietly under-reporting. The daemon
+    // arms the bit at startup (`become_child_subreaper`), so the fast path is
+    // what production takes.
+    if !is_child_subreaper() {
+        return process_ids();
+    }
+    let leader = leader.as_raw_pid().unsigned_abs();
+    // Prune against the leader's ACTUAL session, not against its pid. The two
+    // coincide for a real Run -- portable-pty makes the child a session leader,
+    // so pid == sid -- but `from_child_pid` accepts any pid, and comparing to
+    // the pid would reject every member whenever they differ. `classify_members`
+    // applies the same session filter afterwards, so this only decides which
+    // subtrees are worth descending.
+    let Some(session) = Pid::from_raw(leader.cast_signed())
+        .and_then(|pid| getsid(Some(pid)).ok())
+        .map(|sid| sid.as_raw_pid().unsigned_abs())
+    else {
+        // The leader is gone, so nothing can still be attributed to it through
+        // a live session id. Fall back rather than return a narrower answer.
+        return process_ids();
+    };
+    let mut candidates = vec![leader];
+    // Orphans reparent to this process, not to the leader, so our own direct
+    // children are candidates too -- and once the leader dies, its surviving
+    // descendants are found ONLY here. Their subtrees are descended into only
+    // when they pass the session filter, so an unrelated Run's leader costs one
+    // `getsid`.
+    let mut frontier = Vec::with_capacity(16);
+    push_children(std::process::id(), &mut frontier);
+    let mut cursor = 0;
+    while cursor < candidates.len() {
+        let pid = candidates[cursor];
+        cursor += 1;
+        push_children(pid, &mut frontier);
+        // A child inherits the session; one that does not match has left via
+        // `setsid` and takes its subtree with it, so it is never expanded.
+        for child in frontier.drain(..) {
+            if child != leader && in_session(child, session) && !candidates.contains(&child) {
+                candidates.push(child);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+/// Reap descendants this process inherited as a subreaper, so the census that
+/// follows sees a session that has actually drained.
+///
+/// This is the other half of `PR_SET_CHILD_SUBREAPER`, not a separate feature.
+/// Arming the bit is what keeps an orphaned descendant inside our subtree, and
+/// it simultaneously transfers the reaping duty: before it was set, an orphan
+/// reparented to init and was reaped immediately; now nothing else in this
+/// process will ever `wait` for it. A zombie still answers `getsid`, so
+/// [`NativeSession::members`] would count it as a live member and `stop()`
+/// would poll to its deadline before reporting a session that is, in fact,
+/// empty. Measured on the farm host: two killed orphans report `state=Z`
+/// and their session id indefinitely, and the same census returns empty the
+/// instant they are reaped.
+///
+/// **What keeps this from stealing a status someone else owns.** The candidate
+/// list is the authority. `session_candidates` already proved every entry is
+/// both a descendant of this daemon and a member of *this* session, so the set
+/// is exactly this Run's own processes -- a `tmux` short command's orphan sits
+/// in the daemon's session under its own group and never appears, and neither
+/// does another Run's member. The leader is excluded by pid on top of that,
+/// leaving its status to the sequenced `reap_leader`, which stays the only
+/// place a Run's exit status is consumed. A candidate that is not our direct
+/// child answers `ECHILD`, which is ignored.
+///
+/// `WNOHANG` throughout: a still-running member is left alone rather than
+/// blocking the poll loop.
+#[cfg(not(target_os = "macos"))]
+fn reap_inherited_orphans(leader: Pid, candidates: &[u32]) {
+    use rustix::process::{WaitOptions, waitpid};
+
+    let raw_leader = leader.as_raw_pid().unsigned_abs();
+    for &candidate in candidates {
+        // The leader's status belongs to the sequenced `reap_leader`.
+        if candidate == raw_leader {
+            continue;
+        }
+        let Some(pid) = Pid::from_raw(candidate.cast_signed()) else {
+            continue;
+        };
+        let _ = waitpid(Some(pid), WaitOptions::NOHANG);
+    }
+}
+
+/// Whether this process inherits orphaned descendants.
+///
+/// `PR_GET_CHILD_SUBREAPER` reports the attribute set by
+/// `PR_SET_CHILD_SUBREAPER`. A failure here is read as "not a subreaper", which
+/// selects the conservative host walk.
+#[cfg(not(target_os = "macos"))]
+fn is_child_subreaper() -> bool {
+    rustix::process::child_subreaper().is_ok_and(|pid| pid.is_some())
+}
+
+/// Whether `pid` belongs to session `session`.
+///
+/// Only used to decide whether to *descend* into a subtree. A pid that exits
+/// between the `children` read and this call answers `false`, which is correct:
+/// it has no descendants left to find.
+#[cfg(not(target_os = "macos"))]
+fn in_session(pid: u32, session: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    Pid::from_raw(raw)
+        .and_then(|pid| getsid(Some(pid)).ok())
+        .is_some_and(|sid| sid.as_raw_pid() == session.cast_signed())
+}
+
+/// Enumerate every process on the host.
+///
+/// On Linux this is the fallback [`session_candidates`] takes when this process
+/// is not a child subreaper, so an orphan that reparented to init is still
+/// found; on macOS it is the only implementation, because
+/// `/proc/<pid>/task/<tid>/children` does not exist there.
 ///
 /// `members()` needs exactly one thing from each process: its session ID, which
 /// it obtains with `getsid`. It never reads a name, a command line, or memory
@@ -562,7 +760,17 @@ fn process_ids() -> Result<Vec<u32>, String> {
 ///
 /// Measured split of the two halves on the same host (694 processes):
 /// `readdir` 0.496 ms, 694 `getsid` calls 0.162 ms, total 0.657 ms. The
-/// enumeration was never the expensive part; the discarded harvest was.
+/// enumeration was never the expensive part; the discarded harvest was. Nor
+/// was it reducible: replacing `read_dir` with a raw `getdents64` over a
+/// 256 KiB buffer saved 0.090 ms of 1.056 (8.7%) at 886 processes, because the
+/// cost is the kernel materialising one dentry per process. Only asking a
+/// smaller question removes it.
+#[cfg(target_os = "macos")]
+fn process_ids() -> Result<Vec<u32>, String> {
+    ctxmux_process_stats::process_ids()
+        .map_err(|error| format!("failed to enumerate native session members: {error}"))
+}
+
 #[cfg(not(target_os = "macos"))]
 fn process_ids() -> Result<Vec<u32>, String> {
     let entries = std::fs::read_dir("/proc")
@@ -752,37 +960,63 @@ mod tests {
         let _ = unrelated.wait();
     }
 
-    /// The census must see a freshly spawned process, and must not be paying
-    /// for a per-process attribute harvest to do it.
+    /// The census must see a freshly spawned session member, must not see an
+    /// unrelated process, and must not be paying a host-wide walk to decide.
     ///
     /// The budget is the point of the test, not decoration. `members()` runs
-    /// once per 10 ms quiescence poll and again in `signal_members`, so a
-    /// census that costs tens of milliseconds turns every `Stop` into a
-    /// host-wide scan -- which is exactly the regression this replaced
-    /// (`Stop` measured `63.6 ms + 0.0775 ms * host_process_count`). Direct
-    /// `/proc` enumeration plus one `getsid` per entry measured 0.657 ms at
-    /// 694 processes; 50 ms is ~75x that, so this fails on a reintroduced
-    /// harvest and not on a loaded CI box.
+    /// once per 10 ms quiescence poll, so a census that costs tens of
+    /// milliseconds turns every `Stop` into a host-wide scan -- which is
+    /// exactly the regression this replaced (`Stop` measured
+    /// `63.6 ms + 0.0775 ms * host_process_count`).
+    ///
+    /// The *exclusion* is what pins the current contract. `session_candidates`
+    /// descends the leader's own subtree rather than enumerating every process
+    /// on the host, so an unrelated process must be absent from the candidate
+    /// list. Reintroducing a host walk would make this assertion fail even
+    /// though the cheap assertion above still passed.
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn process_census_sees_new_processes_without_a_per_process_harvest() {
+    fn process_census_sees_session_members_without_walking_the_host() {
+        // The subtree path is only taken by a subreaper; otherwise the census
+        // falls back to the host walk and the exclusion below cannot hold.
+        arm_subreaper_like_the_daemon();
+
         let mut sentinel = Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("spawn census sentinel");
         let sentinel_pid = sentinel.id();
 
+        // An unrelated session: spawned by us, but its own session leader, so
+        // it is outside the session under test and must be pruned away.
+        let mut unrelated = Command::new("setsid")
+            .args(["/bin/sleep", "30"])
+            .spawn()
+            .expect("spawn an unrelated session leader");
+        let unrelated_pid = unrelated.id();
+
+        let own_pid = std::process::id();
+
+        // `setsid` has not called setsid(2) at the moment `spawn` returns, so
+        // until it does the child is still legitimately in OUR session and the
+        // exclusion below would fail for the right reason at the wrong time.
+        // Wait for the kernel to make the split real before measuring.
+        await_session_leader(unrelated_pid);
+
         let started = Instant::now();
-        let pids = super::process_ids().expect("enumerate processes");
+        let pids = super::session_candidates(Pid::from_raw(own_pid.cast_signed()).unwrap())
+            .expect("enumerate session candidates");
         let elapsed = started.elapsed();
 
         assert!(
             pids.contains(&sentinel_pid),
-            "census missed a live process it must be able to signal"
+            "census missed a live session member it must be able to signal"
         );
+        assert!(pids.contains(&own_pid), "census missed its own process");
         assert!(
-            pids.contains(&std::process::id()),
-            "census missed its own process"
+            !pids.contains(&unrelated_pid),
+            "census returned process {unrelated_pid}, which leads its own \
+             session; the subtree prune is gone and the walk is host-wide again"
         );
         assert!(
             elapsed < Duration::from_millis(50),
@@ -791,6 +1025,8 @@ mod tests {
 
         let _ = sentinel.kill();
         let _ = sentinel.wait();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
     }
 
     #[test]
@@ -921,15 +1157,7 @@ mod tests {
 
         // Wait for the kernel to make the child its own session leader; until
         // then the census cannot attribute it to this session.
-        let ready = Instant::now();
-        while Instant::now() - ready < Duration::from_secs(5) {
-            if super::getsid(Pid::from_raw(pid as i32))
-                .is_ok_and(|sid| sid.as_raw_pid() as u32 == pid)
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        await_session_leader(pid);
 
         let mut session = NativeSession::from_child_pid(pid).unwrap();
         let mut adopted = AdoptedChild::from_pid(pid).unwrap();
@@ -991,15 +1219,7 @@ mod tests {
         let pid = child.id();
         std::mem::forget(child);
 
-        let ready = Instant::now();
-        while Instant::now() - ready < Duration::from_secs(5) {
-            if super::getsid(Pid::from_raw(pid as i32))
-                .is_ok_and(|sid| sid.as_raw_pid() as u32 == pid)
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        await_session_leader(pid);
 
         let mut session = NativeSession::from_child_pid(pid).unwrap();
 
@@ -1010,7 +1230,7 @@ mod tests {
             let members = session.members(false).unwrap_or_default();
             escapee = members.into_iter().find(|member| {
                 rustix::process::getpgid(Some(*member))
-                    .is_ok_and(|group| group.as_raw_pid() as u32 != pid)
+                    .is_ok_and(|group| group.as_raw_pid().unsigned_abs() != pid)
             });
             if escapee.is_some() {
                 break;
@@ -1027,7 +1247,7 @@ mod tests {
             .stop(
                 &mut adopted,
                 Duration::from_millis(500),
-                Duration::from_millis(2_000),
+                Duration::from_secs(2),
             )
             .expect("stop must drain the whole session, group escapees included");
 
@@ -1039,5 +1259,126 @@ mod tests {
              the straggler sweep in wait_quiescent is gone",
             escapee.as_raw_pid()
         );
+    }
+
+    /// A descendant orphaned mid-session must still be counted as a member.
+    ///
+    /// `session_candidates` answers "is this session empty?" from the leader's
+    /// own subtree instead of walking every process on the host. The two are
+    /// only equivalent while every session member is reachable from this
+    /// process. An orphan is the case that can break it: when its parent exits
+    /// first, it reparents away -- to init on a normal process, leaving the
+    /// subtree while *staying in the session*. The host walk still saw it; a
+    /// subtree sweep would not.
+    ///
+    /// What closes the gap is `PR_SET_CHILD_SUBREAPER` (armed by the daemon in
+    /// `become_child_subreaper`), which makes the orphan reparent to *us*, plus
+    /// the daemon-children level `session_candidates` sweeps for exactly this
+    /// reason. This test is the falsifier for both: drop either, and the
+    /// orphan stops being enumerable while still holding the session open.
+    ///
+    /// The test process stands in for the daemon, so it arms the subreaper bit
+    /// itself -- `cargo test` is not the daemon and never calls `serve`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_member_orphaned_by_its_parent_is_still_enumerated() {
+        arm_subreaper_like_the_daemon();
+
+        // The inner shell forks a sleep and exits immediately, orphaning it.
+        // `setsid --wait` gives us a session leader to adopt, as portable-pty
+        // does before exec; the leader stays alive so the session persists.
+        let child = Command::new("setsid")
+            .args([
+                "--wait",
+                "/bin/sh",
+                "-c",
+                "/bin/sh -c '/bin/sleep 600 & exit 0'; /bin/sleep 600",
+            ])
+            .spawn()
+            .expect("spawn a leader whose grandchild gets orphaned");
+        let pid = child.id();
+        std::mem::forget(child);
+
+        await_session_leader(pid);
+
+        let mut session = NativeSession::from_child_pid(pid).unwrap();
+
+        // The orphan: session-owned, but its parent is no longer the leader.
+        // Identified by ppid rather than by pgid, which is what separates this
+        // from the group-escapee case above.
+        let mut orphan = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let members = session.members(false).unwrap_or_default();
+            orphan = members.into_iter().find(|member| {
+                parent_of(member.as_raw_pid()).is_some_and(|parent| parent != pid.cast_signed())
+            });
+            if orphan.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let orphan = orphan.expect(
+            "the fixture must produce a session member whose parent is not the \
+             leader, or it is not exercising the gap this test covers",
+        );
+
+        let mut adopted = AdoptedChild::from_pid(pid).unwrap();
+        session
+            .stop(
+                &mut adopted,
+                Duration::from_millis(500),
+                Duration::from_secs(2),
+            )
+            .expect("stop must drain the whole session, orphans included");
+
+        assert!(
+            super::getsid(Some(orphan)).is_err(),
+            "process {} was orphaned out of the leader's subtree and survived \
+             the Stop; the session sweep no longer sees orphaned members",
+            orphan.as_raw_pid()
+        );
+    }
+
+    /// The parent pid of `pid`, read from `/proc/<pid>/stat`.
+    ///
+    /// The comm field can contain spaces and parentheses, so the fields after
+    /// it are located from the LAST `)` rather than by splitting the line.
+    #[cfg(not(target_os = "macos"))]
+    fn parent_of(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let tail = &stat[stat.rfind(')')? + 1..];
+        tail.split_ascii_whitespace().nth(1)?.parse().ok()
+    }
+
+    /// Block until `pid` leads its own session, or five seconds elapse.
+    ///
+    /// `setsid` has not called `setsid(2)` at the moment `spawn` returns, so a
+    /// fixture that measures immediately sees the child still in the test's own
+    /// session -- failing for the right reason at the wrong time. Returning on
+    /// timeout rather than panicking leaves the assertion that follows to say
+    /// what actually went wrong.
+    #[cfg(not(target_os = "macos"))]
+    fn await_session_leader(pid: u32) {
+        let ready = Instant::now();
+        while ready.elapsed() < Duration::from_secs(5) {
+            if super::getsid(Pid::from_raw(pid.cast_signed()))
+                .is_ok_and(|sid| sid.as_raw_pid().unsigned_abs() == pid)
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Put the test process in the same shape as a running daemon.
+    ///
+    /// `serve` arms this at startup; `cargo test` never calls `serve`, so a
+    /// test that wants the subtree census has to arm it itself. Naming our own
+    /// pid is what SETS the attribute -- `None` maps to 0, which clears it.
+    #[cfg(not(target_os = "macos"))]
+    fn arm_subreaper_like_the_daemon() {
+        rustix::process::set_child_subreaper(Some(rustix::process::getpid()))
+            .expect("arm the subreaper bit the subtree census depends on");
     }
 }
