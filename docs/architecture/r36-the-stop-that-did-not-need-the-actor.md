@@ -1,4 +1,4 @@
-# R29 — the Stop was waiting for something only `remove` wanted
+# R36 — the Stop was waiting for something only `remove` wanted
 
 **Fixed.** The defect filed in
 [`r26-the-finalize-that-blocks-a-stranger.md`](r26-the-finalize-that-blocks-a-stranger.md)
