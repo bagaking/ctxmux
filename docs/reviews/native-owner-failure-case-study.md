@@ -272,8 +272,18 @@ invocation passes 20 cases with strict lint and formatting. An earlier invocatio
 failed while waiting for input state; its cause is not established. The revised
 fixture explicitly observes the child's raw-mode readiness before admitting
 the same workload, and retains the original deadline and failure evidence.
-Full local stdin queues, unsent buffered input, blocking output sinks and
-activation handshakes remain separate client-owner qualification requirements.
+Broader CLI qualification then exposed another real race. When input and the
+detach prefix arrive together, the out-of-band terminal notification can
+overtake queued input. Eleven of sixteen real CLI departures succeeded with
+neither a confirmed byte nor an input-result warning. The candidate now reports
+exact locally unsubmitted bytes as `not_applied`, separately from attempted
+input whose result is unknown. All sixteen unchanged operations expose a result;
+omitting only local-unsent accounting reproduces the strict failure. The complete
+CLI group passes 21 cases, with final targeted tests, strict lint and formatting.
+The original twenty-case green remains a smaller proof, not evidence against
+this later defect. Full stdin queues, concurrent reader cancellation, error
+termination paths, blocking sinks and activation handshakes remain separate
+client-owner qualification requirements.
 
 A source-bound serialization candidate removes complete base64 and JSON copies,
 checks file admission before buffering, flushes before sync and preserves atomic
