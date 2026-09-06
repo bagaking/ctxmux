@@ -181,8 +181,7 @@ class Protocol:
         await writer.drain()
         return submitted
 
-    @staticmethod
-    async def read(reader):
+    async def read(self, reader):
         line = await reader.readline()
         if not line:
             raise EOFError("protocol disconnected")
@@ -190,6 +189,7 @@ class Protocol:
             raise ValueError("oversized server frame")
         frame = json.loads(line)
         if frame["type"] == "error":
+            await self.record("received", frame, error_boundary="framed_refusal")
             raise RuntimeError(json.dumps(frame))
         return frame
 
@@ -417,6 +417,8 @@ class Runtime:
 
     async def open(self):
         argv = [str(self.args.daemon), "--socket", str(self.socket)]
+        if getattr(self.args, "resource_limits", None) is not None:
+            argv += ["--resource-limits", json.dumps(self.args.resource_limits, separators=(",", ":"))]
         if self.mode == "persistent":
             argv += ["--state-dir", str(self.directory / "state")]
         self.stdout = (self.directory / f"daemon-{self.epoch}.stdout").open("wb")
@@ -730,9 +732,15 @@ async def fleet(runtime, population, soak=0):
             expected_by_run[run["id"]] = bytes(view.oracle.expected)
             await runtime.input(run, b"A " + command)
             await view.wait_bytes(arm_end)
-        results = await bounded_map(runtime.args.concurrency, list(enumerate(accepted)), arm)
+        async def observed_arm(item):
+            i, (run, _) = item
+            return await runtime.ledger.measure("arm_" + shape, arm(item), run=run["id"], selected_index=i)
+        results = await bounded_map(runtime.args.concurrency, list(enumerate(accepted)), observed_arm)
         if any(isinstance(x, BaseException) for x in results):
-            errors += [{"phase": shape, "error": repr(x)} for x in results if isinstance(x, BaseException)]
+            errors += [{"phase": shape, "run": accepted[i][0]["id"], "selected_index": i, "error": repr(x)}
+                       for i, x in enumerate(results) if isinstance(x, BaseException)]
+            save(runtime.directory / "phase-errors.private.json", {"population": population, "accepted": len(runtime.runs),
+                 "phase": shape, "attempted": len(results), "completed": len(results) - len(errors), "errors": errors})
             raise AssertionError("fleet could not arm all selected producers; workload was not reduced")
         released = time.monotonic()
         tickets = b"x" * len(phase_views)
@@ -1208,7 +1216,10 @@ def parse():
     parser.add_argument("--cli-samples", type=int, default=30)
     parser.add_argument("--sdk-module", type=Path)
     parser.add_argument("--frontier", type=int, default=8192)
+    parser.add_argument("--resource-limits", type=json.loads, help="explicit daemon operating policy as JSON; absent preserves defaults")
     args = parser.parse_args()
+    if args.resource_limits is not None and not isinstance(args.resource_limits, dict):
+        parser.error("resource-limits must be a JSON object")
     for name in ["daemon", "cli", "fixture", "source_dir", "output"]:
         setattr(args, name, getattr(args, name).resolve())
     if args.sdk_module:

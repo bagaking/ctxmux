@@ -51,3 +51,10 @@ byte value. When admission fails, the original requested population and all
 errors are retained, and an already accepted Run is probed for isolation.
 Unsafe cleanup stops further execution and gives each remaining planned cell
 an explicit blocked disposition; these cells never count as executed or passing.
+
+Record the default policy separately from explicitly funded policy arms.
+`--resource-limits` forwards a JSON object to the public daemon option and
+records the actual launch arguments. It does not modify any offered workload,
+byte oracle, timeout or durability assertion. Preserve the original default
+failures when a second arm funds more shared event memory. Per-Run arming
+results and framed refusals are retained before the cell-level failure.
