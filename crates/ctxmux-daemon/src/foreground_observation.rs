@@ -200,6 +200,7 @@ impl ForegroundObservationOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -330,7 +331,6 @@ mod tests {
             }).await.unwrap());
         }
         let state = tempfile::tempdir().unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let refusal = crate::prepare_exec_upgrade(state.path()).unwrap_err();
         let mut observations = Vec::new();
@@ -409,6 +409,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real two-Run test proves timeout and cancellation retain physical permits and owner identity"
+    )]
     async fn timed_out_or_closed_requester_keeps_physical_worker_permits() {
         let manager = Arc::new(crate::RunManager::with_instance_stats_and_resources(
             ctxmux_protocol::DaemonInstanceId::new(),

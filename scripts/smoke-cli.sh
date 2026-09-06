@@ -132,6 +132,7 @@ CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run"
     assert.notEqual(runtime.arch, "");
     assert.deepEqual(runtime.capabilities, {
       "native.execute_materialized_level_b": 1,
+      "native.foreground_observation": 1,
       "native.fork_level_a": 1,
       "native.recoverable_input": 1,
       "native.recoverable_stop": 1,

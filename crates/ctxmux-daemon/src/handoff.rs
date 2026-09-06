@@ -661,6 +661,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exact schema-shape oracle lists every field; splitting the list obscures drift review"
+    )]
     fn the_schema_string_is_pinned_to_the_manifest_shape() {
         // The lock that makes HANDOFF_SCHEMA mean "structure", not "version".
         //
