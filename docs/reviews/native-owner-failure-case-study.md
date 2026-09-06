@@ -222,16 +222,39 @@ release result.
 
 The qualified height release uses protocol 18, state schema 4 and handoff schema 4. The joined candidate uses protocol 20 and state/handoff schema 6. Its same-
 candidate upgrade tests do not establish continuity from the installed release.
-Unsupported handoff must refuse before extraction and leave the original Runs
-serving; restarting or using a new namespace cannot substitute for that proof.
+A real old-to-joined attempt refuses the unsupported handoff before extraction.
+The old executable remains mapped, both original child and Runtime identities
+survive, and both Runs still produce exact input/output, reconnect, resize and
+Ctrl+C results. This qualifies safe refusal only. Restarting or using a new
+namespace cannot substitute for successful live upgrade continuity.
 
 Geometry review also exposed a real mismatch: an alternate-buffer wide lead
 survives a narrower viewport in public terminal consumers, while the derived
-model displayed a blank. Restoring that lead requires correcting right-neighbor
-drawing and erase behavior as well. Held-out partial growth can discard its
-hidden continuation while keeping the lead; a complete visible wide pair is
-therefore not a universal resize invariant. The current single-resize seed does
-not yet prove continuation of that state. Its strict failures remain recorded.
+model displayed a blank. Right-neighbor drawing and erase corrections now
+preserve the lead and its attributes; all seventeen revised codec cases pass. Those objectives were
+independently adjudicated against public consumers while retaining the original
+failed source and oracles. Held-out partial growth can discard its hidden
+continuation while keeping the lead; a complete visible wide pair is therefore
+not a universal resize invariant. The current single-resize seed still fails
+continuation of that state. Four other held-out cases pass; that strict failure
+remains recorded, and a separate multi-stage prototype is not production proof.
+
+The resource audit distinguishes local seed policy from structural validity.
+Both clients can reject a valid seed above a hardcoded 32 MiB policy as a
+protocol violation; host allocation failure can be misclassified the same way.
+Export checks after allocation cannot protect that allocation, and queued seed
+copies lack one aggregate lease across cache, sender and recovery. These remain
+open owner repairs; increasing a fixture or queue limit would not resolve them.
+
+A source-bound serialization candidate removes complete base64 and JSON copies,
+checks file admission before buffering, flushes before sync and preserves atomic
+replacement. Three targeted cases and all five original real checkpoint owner
+cases pass. Exact binary JSON is preserved at padding and chunk boundaries, and
+one-byte-over-policy failure keeps the old file without abandoned temporaries.
+The first standard-buffer cost probe also exposes slower serialization and more
+file writes. A separate buffer comparison reduces that overhead, but host latency
+and full aggregate funding remain unqualified. Memory savings alone do not sign
+this candidate; fsync, byte fidelity and accepted workload are unchanged.
 
 Occasional startup deadline failures, allocation-before-budget paths, fixed
 history and checkpoint policies, complete resource costs and final AgentMux
