@@ -31,12 +31,14 @@ import type { ClientFrame } from "./generated/ClientFrame.js";
 import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 import type { DaemonInstanceId } from "./generated/DaemonInstanceId.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
+import type { RunForegroundObservation } from "./generated/RunForegroundObservation.js";
 import type { InputOperationKey } from "./generated/InputOperationKey.js";
 import {
   MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_INPUT_OPERATION_KEY_BYTES,
   PROTOCOL_VERSION,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+  RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
 } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
@@ -105,6 +107,9 @@ export interface CtxmuxClientOptions {
   readonly expectedRuntimeIdentity?: RuntimeIdentity;
   /** Exact Runtime capability versions required before business dispatch. */
   readonly requiredCapabilities?: RuntimeCapabilityRequirements;
+  /** Local read wait in milliseconds for this disposable observation wire.
+   * Defaults to 30 seconds. Expiry never cancels a Run or an issued OS job. */
+  readonly foregroundObservationTimeoutMs?: number;
 }
 
 /** Exact Runtime capability versions required before business dispatch. */
@@ -239,6 +244,7 @@ export class CtxmuxClient {
   readonly #attachmentViewResources: AttachmentViewResourcePolicy;
   readonly #expectedRuntimeIdentity: RuntimeIdentity | undefined;
   readonly #requiredCapabilities: ReadonlyMap<string, number>;
+  readonly #foregroundObservationTimeoutMs: number;
 
   public constructor(options: CtxmuxClientOptions) {
     if (options.socketPath.length === 0) {
@@ -257,6 +263,17 @@ export class CtxmuxClient {
     this.#requiredCapabilities = copyRequiredRuntimeCapabilities(
       options.requiredCapabilities,
     );
+    const observationWait = options.foregroundObservationTimeoutMs ?? 30_000;
+    if (
+      !Number.isSafeInteger(observationWait) ||
+      observationWait <= 0 ||
+      observationWait > 0x7fff_ffff
+    ) {
+      throw new TypeError(
+        "foregroundObservationTimeoutMs must fit a positive local timer",
+      );
+    }
+    this.#foregroundObservationTimeoutMs = observationWait;
   }
 
   public async ping(): Promise<void> {
@@ -406,6 +423,53 @@ export class CtxmuxClient {
       throw unexpected("status response", response.type);
     }
     return response.run;
+  }
+
+  /** One-shot physical facts from the SAME connection's Hello identity. */
+  public async observeForeground({
+    runId,
+  }: {
+    readonly runId: RunId;
+  }): Promise<{
+    readonly runtime: RuntimeIdentity;
+    readonly observation: RunForegroundObservation;
+  }> {
+    // This disposable observation wire has a bounded local read wait. Its
+    // abort never disposes a shared client, an attachment or the original Run.
+    const { wire, runtime } = await this.#connectForDispatch(
+      AbortSignal.timeout(this.#foregroundObservationTimeoutMs),
+    );
+    try {
+      if (
+        (runtime.capabilities[RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION] ?? 0) <
+        1
+      ) {
+        return {
+          runtime,
+          observation: {
+            outcome: "unsupported",
+            runId,
+            reason: "capability-missing",
+          },
+        };
+      }
+      await wire.send({
+        type: "request",
+        request: { type: "observe_foreground", runId },
+      } satisfies ClientFrame);
+      const frame = serverFrame(await wire.receive());
+      if (frame.type === "error") throw protocolError(frame.error);
+      if (
+        frame.type !== "response" ||
+        frame.response.type !== "foreground_observation" ||
+        frame.response.observation.runId !== runId
+      ) {
+        throw unexpected("exact Run foreground observation", frame.type);
+      }
+      return { runtime, observation: frame.response.observation };
+    } finally {
+      wire.close();
+    }
   }
 
   /**
@@ -818,11 +882,11 @@ export class CtxmuxClient {
     }
   }
 
-  async #connect(): Promise<{
+  async #connect(signal?: AbortSignal): Promise<{
     readonly wire: JsonLinesConnection;
     readonly runtime: RuntimeIdentity;
   }> {
-    const wire = await JsonLinesConnection.connect(this.#socketPath);
+    const wire = await JsonLinesConnection.connect(this.#socketPath, signal);
     try {
       await wire.send({
         type: "hello",
@@ -845,11 +909,11 @@ export class CtxmuxClient {
     }
   }
 
-  async #connectForDispatch(): Promise<{
+  async #connectForDispatch(signal?: AbortSignal): Promise<{
     readonly wire: JsonLinesConnection;
     readonly runtime: RuntimeIdentity;
   }> {
-    const connection = await this.#connect();
+    const connection = await this.#connect(signal);
     try {
       if (
         this.#expectedRuntimeIdentity !== undefined &&

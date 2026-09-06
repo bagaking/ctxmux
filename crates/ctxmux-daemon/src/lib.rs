@@ -27,6 +27,7 @@ mod attachment;
 mod creation;
 mod diagnostics;
 mod fd_budget;
+mod foreground_observation;
 mod handoff;
 mod native_control;
 mod native_output;
@@ -1288,6 +1289,7 @@ struct RunManager {
     terminal_publications: TerminalPublicationOwner,
     native_input_drains: InputDrainGate,
     native_runs: NativeRuntimeOwner,
+    foreground_observations: foreground_observation::ForegroundObservationOwner,
     qualification_stats: QualificationStats,
     retention_budget: RetentionBudget,
     resources: ResourceLimits,
@@ -1883,6 +1885,9 @@ impl RunManager {
             terminal_publications: TerminalPublicationOwner::default(),
             native_input_drains,
             native_runs: NativeRuntimeOwner::with_resources(resources),
+            foreground_observations: foreground_observation::ForegroundObservationOwner::new(
+                resources,
+            ),
             qualification_stats,
             retention_budget: RetentionBudget::with_resources(resources),
             resources,
@@ -1913,6 +1918,11 @@ impl RunManager {
             ),
             (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
         ]);
+        #[cfg(target_os = "macos")]
+        capabilities.insert(
+            ctxmux_protocol::RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION.to_owned(),
+            1,
+        );
         if persistent {
             capabilities.insert(RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1);
             capabilities.insert(
@@ -2001,6 +2011,9 @@ impl RunManager {
             terminal_publications,
             native_input_drains,
             native_runs: NativeRuntimeOwner::with_resources(resources),
+            foreground_observations: foreground_observation::ForegroundObservationOwner::new(
+                resources,
+            ),
             qualification_stats,
             retention_budget,
             resources,
@@ -2146,6 +2159,9 @@ impl RunManager {
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure,
             upgrade_requests: UpgradeRequestGate::default(),
+            foreground_observations: foreground_observation::ForegroundObservationOwner::new(
+                resources,
+            ),
             tmux_shutting_down: AtomicBool::new(false),
             tmux_operation_gate: RwLock::new(()),
             #[cfg(test)]
@@ -6969,7 +6985,12 @@ async fn handle_connection(
                     // sent: this is a one-shot request connection, so either way
                     // the client has a framed answer and the connection ends
                     // cleanly below.
-                    send_capped(&mut wire, &ServerFrame::Response { response }).await?;
+                    let frame = ServerFrame::Response {
+                        response: response.response,
+                    };
+                    send_capped(&mut wire, &frame).await?;
+                    drop(frame);
+                    drop(response.foreground_bytes);
                 }
                 Err(error) => send(&mut wire, &ServerFrame::Error { error }).await?,
             }
@@ -6979,13 +7000,20 @@ async fn handle_connection(
     Ok(())
 }
 
+// This is the original connected request's response, not another registry.
+// Only variable-sized foreground facts carry their original observation funds.
+struct ConnectedResponse {
+    response: Response,
+    foreground_bytes: Option<crate::resources::BytePermit>,
+}
+
 /// Only unadmitted controls are cancelled by socket EOF. Creation owners and
 /// recoverable Stop settlements retain their established daemon-owned boundary.
 async fn execute_connected_request(
     manager: &Arc<RunManager>,
     wire: &mut Framed<UnixStream, LinesCodec>,
     request: Request,
-) -> Result<Option<Result<Response, ProtocolError>>, ConnectionError> {
+) -> Result<Option<Result<ConnectedResponse, ProtocolError>>, ConnectionError> {
     let cancel_unadmitted = matches!(
         &request,
         Request::Input { .. }
@@ -6993,7 +7021,8 @@ async fn execute_connected_request(
             | Request::Resize { .. }
             | Request::Signal { .. }
     );
-    let execution = execute_request(manager, request);
+    let mut foreground_bytes = None;
+    let execution = execute_request(manager, request, &mut foreground_bytes);
     let response = if cancel_unadmitted {
         tokio::select! {
             response = execution => response,
@@ -7007,7 +7036,10 @@ async fn execute_connected_request(
     } else {
         execution.await
     };
-    Ok(Some(response))
+    Ok(Some(response.map(|response| ConnectedResponse {
+        response,
+        foreground_bytes,
+    })))
 }
 
 #[allow(
@@ -7017,8 +7049,19 @@ async fn execute_connected_request(
 async fn execute_request(
     manager: &Arc<RunManager>,
     request: Request,
+    foreground_bytes: &mut Option<crate::resources::BytePermit>,
 ) -> Result<Response, ProtocolError> {
     match request {
+        Request::ObserveForeground { run_id } => {
+            let run = manager.pin(run_id)?;
+            let (observation, permit) = manager
+                .foreground_observations
+                .observe(run)
+                .await
+                .into_parts();
+            *foreground_bytes = permit;
+            Ok(Response::ForegroundObservation { observation })
+        }
         Request::Diagnostics {} => Ok(Response::Diagnostics {
             diagnostics: diagnostics::snapshot(),
         }),

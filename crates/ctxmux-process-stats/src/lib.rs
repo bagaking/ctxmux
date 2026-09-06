@@ -7,6 +7,14 @@
 #![deny(unsafe_code)]
 
 #[cfg(target_os = "macos")]
+mod foreground;
+#[cfg(target_os = "macos")]
+pub use foreground::{
+    ForegroundProcess, execution_identity, foreground_group, foreground_minimum_bytes,
+    process_incarnation,
+};
+
+#[cfg(target_os = "macos")]
 mod macos {
     use std::{ffi::c_void, io, mem::MaybeUninit};
 

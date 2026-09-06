@@ -59,6 +59,9 @@ pub enum ClientError {
     /// The socket closed before the expected frame arrived.
     #[error("ctxmux daemon closed the connection")]
     Closed,
+    /// This observer's local wait expired; it says nothing about Run health.
+    #[error("foreground observation exceeded this client's local read wait")]
+    ForegroundObservationDeadline,
     /// The JSON-lines transport failed.
     #[error("ctxmux transport failed: {0}")]
     Transport(#[from] LinesCodecError),
@@ -201,6 +204,7 @@ impl ClientError {
             | Self::RuntimeIdentityMismatch { .. } => Some(CommandDisposition::NotApplied),
             Self::Connect { .. }
             | Self::Closed
+            | Self::ForegroundObservationDeadline
             | Self::Transport(_)
             | Self::Frame(_)
             | Self::Protocol { .. }
@@ -319,6 +323,7 @@ pub struct Client {
     terminal_seed_limits: TerminalSeedLimits,
     required_capabilities: RuntimeCapabilityRequirements,
     expected_runtime_identity: Option<RuntimeIdentity>,
+    foreground_observation_timeout: std::time::Duration,
 }
 
 impl Client {
@@ -331,6 +336,7 @@ impl Client {
             terminal_seed_limits: TerminalSeedLimits::default(),
             required_capabilities: BTreeMap::new(),
             expected_runtime_identity: None,
+            foreground_observation_timeout: std::time::Duration::from_secs(30),
         }
     }
 
@@ -345,6 +351,24 @@ impl Client {
     pub fn with_expected_runtime_identity(mut self, expected: RuntimeIdentity) -> Self {
         self.expected_runtime_identity = Some(expected);
         self
+    }
+
+    /// Set the local read wait for this disposable observation connection.
+    /// Expiry never cancels an attachment, a Run or an issued OS worker.
+    ///
+    /// # Errors
+    /// Rejects zero or unrepresentable host deadlines.
+    pub fn with_foreground_observation_timeout(
+        mut self,
+        timeout: std::time::Duration,
+    ) -> Result<Self, ClientError> {
+        if timeout.is_zero() || std::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(ClientError::UnexpectedFrame(
+                "invalid foreground observation deadline",
+            ));
+        }
+        self.foreground_observation_timeout = timeout;
+        Ok(self)
     }
 
     /// Require exact Runtime capability versions before every business
@@ -633,6 +657,67 @@ impl Client {
             Response::Status { run } => Ok(run),
             _ => Err(ClientError::UnexpectedFrame("expected status response")),
         }
+    }
+
+    /// Observe one original Run without input or lifecycle changes.
+    ///
+    /// # Errors
+    /// Returns a transport/protocol error without changing the Run.
+    pub async fn observe_foreground(
+        &self,
+        id: RunId,
+    ) -> Result<(RuntimeIdentity, ctxmux_protocol::RunForegroundObservation), ClientError> {
+        let dispatch = async {
+            let (mut wire, runtime) = self.connect_for_dispatch().await?;
+            if runtime
+                .capabilities
+                .get(ctxmux_protocol::RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION)
+                .copied()
+                .unwrap_or(0)
+                < 1
+            {
+                return Ok((
+                    runtime,
+                    ctxmux_protocol::RunForegroundObservation::Unsupported {
+                        run_id: id,
+                        reason: "capability-missing".to_owned(),
+                    },
+                ));
+            }
+            send(
+                &mut wire,
+                &ClientFrame::Request {
+                    request: Request::ObserveForeground { run_id: id },
+                },
+            )
+            .await?;
+            match receive(&mut wire).await? {
+                ServerFrame::Response {
+                    response: Response::ForegroundObservation { observation },
+                } => {
+                    let returned = match &observation {
+                        ctxmux_protocol::RunForegroundObservation::Observed { run_id, .. }
+                        | ctxmux_protocol::RunForegroundObservation::Unknown { run_id, .. }
+                        | ctxmux_protocol::RunForegroundObservation::Unsupported {
+                            run_id, ..
+                        } => *run_id,
+                    };
+                    if returned != id {
+                        return Err(ClientError::UnexpectedFrame(
+                            "foreground observation named another Run",
+                        ));
+                    }
+                    Ok((runtime, observation))
+                }
+                ServerFrame::Error { error } => Err(error.into()),
+                _ => Err(ClientError::UnexpectedFrame(
+                    "expected foreground observation response",
+                )),
+            }
+        };
+        tokio::time::timeout(self.foreground_observation_timeout, dispatch)
+            .await
+            .map_err(|_| ClientError::ForegroundObservationDeadline)?
     }
 
     /// Reclaim one already-terminal, unpinned Run so its retained record slot

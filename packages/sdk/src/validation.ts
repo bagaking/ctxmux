@@ -352,6 +352,10 @@ export function validateRunSpec(value: unknown, path = "$runSpec"): RunSpec {
 function response(value: unknown, path: string): void {
   const valueRecord = record(value, path);
   switch (discriminant(valueRecord, path)) {
+    case "foreground_observation":
+      exactFields(valueRecord, path, ["type", "observation"]);
+      foregroundObservation(valueRecord.observation, `${path}.observation`);
+      return;
     case "started":
     case "imported":
     case "forked":
@@ -399,6 +403,102 @@ function response(value: unknown, path: string): void {
       return;
     default:
       throw invalid(`${path}.type`, "a known response discriminant");
+  }
+}
+
+function foregroundObservation(value: unknown, path: string): void {
+  const item = record(value, path);
+  const outcome = string(item.outcome, `${path}.outcome`);
+  runId(item.runId, `${path}.runId`);
+  if (outcome === "unknown" || outcome === "unsupported") {
+    exactFields(item, path, ["outcome", "runId", "reason"]);
+    const reasons =
+      outcome === "unknown"
+        ? [
+            "budget-exhausted",
+            "owner-unavailable",
+            "observation-unavailable",
+            "deadline-exceeded",
+            "stale-scope",
+          ]
+        : [
+            "capability-missing",
+            "backend-unsupported",
+            "execution-evidence-unsupported",
+          ];
+    if (!reasons.includes(string(item.reason, `${path}.reason`)))
+      throw invalid(`${path}.reason`, "a known foreground observation reason");
+    return;
+  }
+  if (outcome !== "observed")
+    throw invalid(`${path}.outcome`, "observed, unknown or unsupported");
+  exactFields(item, path, [
+    "outcome",
+    "runId",
+    "startedAtMs",
+    "completedAtMs",
+    "rootPid",
+    "rootIncarnation",
+    "posixSessionId",
+    "foregroundPgid",
+    "processes",
+  ]);
+  safeUnsignedInteger(item.startedAtMs, `${path}.startedAtMs`);
+  safeUnsignedInteger(item.completedAtMs, `${path}.completedAtMs`);
+  if ((item.completedAtMs as number) < (item.startedAtMs as number))
+    throw invalid(path, "an ordered observation interval");
+  for (const field of ["rootPid", "posixSessionId", "foregroundPgid"])
+    unsignedInteger(item[field], `${path}.${field}`, 0xffffffff, 1);
+  if (item.rootPid !== item.posixSessionId)
+    throw invalid(path, "the original root SID");
+  if (
+    !/^[0-9a-f]{16}$/.test(
+      string(item.rootIncarnation, `${path}.rootIncarnation`),
+    )
+  )
+    throw invalid(path, "an opaque root incarnation");
+  const processes = array(item.processes, `${path}.processes`);
+  if (processes.length === 0)
+    throw invalid(path, "a complete nonempty foreground group");
+  const pids = new Set<number>();
+  for (const [index, process] of processes.entries()) {
+    const at = `${path}.processes[${index}]`;
+    const p = record(process, at);
+    exactFields(p, at, [
+      "pid",
+      "processIncarnation",
+      "executionGeneration",
+      "pgid",
+      "sid",
+      "executablePath",
+      "executableImage",
+    ]);
+    for (const field of ["pid", "pgid", "sid"])
+      unsignedInteger(p[field], `${at}.${field}`, 0xffffffff, 1);
+    if (
+      p.pgid !== item.foregroundPgid ||
+      p.sid !== item.posixSessionId ||
+      pids.has(p.pid as number)
+    )
+      throw invalid(at, "unique members of this original foreground scope");
+    pids.add(p.pid as number);
+    if (
+      !/^[0-9a-f]{16}$/.test(
+        string(p.processIncarnation, `${at}.processIncarnation`),
+      ) ||
+      !/^[0-9a-f]{8}$/.test(
+        string(p.executionGeneration, `${at}.executionGeneration`),
+      )
+    )
+      throw invalid(at, "opaque physical generations");
+    if (
+      !/^[0-9a-f]{32}$/.test(
+        string(p.executableImage, `${at}.executableImage`),
+      ) ||
+      p.executableImage === "00000000000000000000000000000000" ||
+      string(p.executablePath, `${at}.executablePath`).length === 0
+    )
+      throw invalid(at, "actual executable entity evidence");
   }
 }
 

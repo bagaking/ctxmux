@@ -93,6 +93,7 @@ export {
   RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
+  RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
@@ -133,6 +134,8 @@ export type { ReplayCapability } from "./generated/ReplayCapability.js";
 export type { Request } from "./generated/Request.js";
 export type { Response } from "./generated/Response.js";
 export type { RunBackend } from "./generated/RunBackend.js";
+export type { RunForegroundObservation } from "./generated/RunForegroundObservation.js";
+export type { ForegroundProcess } from "./generated/ForegroundProcess.js";
 export type { RunBackendKind } from "./generated/RunBackendKind.js";
 export type { RunCapabilities } from "./generated/RunCapabilities.js";
 export type { RunId } from "./generated/RunId.js";

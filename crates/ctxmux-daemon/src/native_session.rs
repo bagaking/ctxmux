@@ -54,6 +54,13 @@ impl std::fmt::Debug for NativeSession {
 }
 
 impl NativeSession {
+    /// Original waitable root/SID for read-only physical observation. This
+    /// accessor never runs cleanup, census or reaping.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn foreground_root_pid(&self) -> Option<u32> {
+        (!self.leader_reaped).then(|| self.id.as_raw_pid().cast_unsigned())
+    }
+
     pub(crate) fn from_child_pid(pid: u32) -> Result<Self, String> {
         let raw = i32::try_from(pid)
             .map_err(|_| format!("native child PID {pid} does not fit a POSIX process ID"))?;

@@ -48,7 +48,7 @@ use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::Hand
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v6";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v7";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -585,7 +585,7 @@ mod tests {
         );
 
         let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
-        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v6");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v7");
         assert_eq!(parsed.stop_operations, [operation]);
     }
 
@@ -729,6 +729,9 @@ mod tests {
             ".resources.diagnostic_queue_bytes:number",
             ".resources.diagnostic_record_bytes:number",
             ".resources.creation_workers:number",
+            ".resources.foreground_observation_workers:number",
+            ".resources.foreground_observation_bytes:number",
+            ".resources.foreground_observation_timeout_ms:number",
             ".resources.input_turn_commands:number",
             ".resources.input_turn_bytes:number",
             ".resources.stop_admission_timeout_ms:number",
@@ -840,7 +843,7 @@ mod tests {
     fn rejects_previous_shape_even_when_the_current_fields_are_present() {
         let mut manifest =
             HandoffManifest::new(DaemonInstanceId::new().to_string(), 100, 101, Vec::new());
-        manifest.schema = "ctxmux.daemon-handoff.v5".to_owned();
+        manifest.schema = "ctxmux.daemon-handoff.v6".to_owned();
         let error = read_fixture(&manifest).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(

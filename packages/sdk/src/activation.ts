@@ -104,6 +104,12 @@ export interface RuntimeResourceLimits {
   readonly diagnostic_queue_bytes?: number;
   readonly diagnostic_record_bytes?: number;
   readonly creation_workers?: number;
+  /** Concurrent read-only OS jobs; independent of Input/Stop capacity. */
+  readonly foreground_observation_workers?: number;
+  /** Aggregate admitted observation memory in bytes. */
+  readonly foreground_observation_bytes?: number;
+  /** Caller wait in milliseconds; issued OS jobs drain after expiry. */
+  readonly foreground_observation_timeout_ms?: number;
   readonly input_turn_commands?: number;
   readonly input_turn_bytes?: number;
   readonly stop_admission_timeout_ms?: number;
@@ -747,6 +753,9 @@ function normalizeResourceLimits(
     "diagnostic_queue_bytes",
     "diagnostic_record_bytes",
     "creation_workers",
+    "foreground_observation_workers",
+    "foreground_observation_bytes",
+    "foreground_observation_timeout_ms",
     "input_turn_commands",
     "input_turn_bytes",
     "stop_admission_timeout_ms",

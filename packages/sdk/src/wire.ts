@@ -57,12 +57,16 @@ export class JsonLinesConnection {
 
   public static async connect(
     socketPath: string,
+    signal?: AbortSignal,
   ): Promise<JsonLinesConnection> {
     if (socketPath.length === 0) {
       throw new TypeError("socketPath must not be empty");
     }
     return await new Promise((resolve, reject) => {
-      const socket = createConnection({ path: socketPath });
+      const socket = createConnection({
+        path: socketPath,
+        ...(signal === undefined ? {} : { signal }),
+      });
       const onError = (error: Error): void => reject(error);
       socket.once("error", onError);
       socket.once("connect", () => {

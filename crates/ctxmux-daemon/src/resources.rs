@@ -39,6 +39,12 @@ pub struct ResourceLimits {
     pub diagnostic_queue_bytes: u64,
     pub diagnostic_record_bytes: usize,
     pub creation_workers: usize,
+    /// Concurrent read-only OS observation jobs, independent of Input/Stop.
+    pub foreground_observation_workers: usize,
+    /// Temporary observation memory in bytes; permits survive caller timeout.
+    pub foreground_observation_bytes: u64,
+    /// Maximum caller wait in milliseconds; issued OS work still drains.
+    pub foreground_observation_timeout_ms: u64,
     /// Completed commands serviced for one Run before another gets its turn.
     pub input_turn_commands: usize,
     /// Maximum bytes written for one Run per poll turn, never a request cap.
@@ -56,7 +62,15 @@ pub struct ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> Self {
-        Self::DEFAULT
+        let mut limits = Self::DEFAULT;
+        // One read-only OS worker per four available logical CPUs. This is
+        // a conservative width heuristic, not a CPU reservation guarantee.
+        // Operators can override the real jobs/bytes/wait policy together.
+        limits.foreground_observation_workers =
+            std::thread::available_parallelism().map_or(1, |cpus| (cpus.get() / 4).max(1));
+        limits.foreground_observation_bytes =
+            limits.foreground_observation_workers as u64 * ctxmux_protocol::MAX_FRAME_BYTES as u64;
+        limits
     }
 }
 
@@ -83,6 +97,14 @@ impl ResourceLimits {
         diagnostic_queue_bytes: 64 * 1024 * 1024,
         diagnostic_record_bytes: ctxmux_protocol::MAX_FRAME_BYTES,
         creation_workers: 8,
+        // Static one-worker baseline. Default::default derives worker width
+        // from available host parallelism; each slot is funded in bytes, not
+        // by a qualification member count. Wire integrity is independent.
+        foreground_observation_workers: 1,
+        foreground_observation_bytes: ctxmux_protocol::MAX_FRAME_BYTES as u64,
+        // One-second interactive observation service objective; expiry is
+        // honest unknown, never cancellation or a healthy input failure.
+        foreground_observation_timeout_ms: 1000,
         input_turn_commands: 64,
         input_turn_bytes: 256 * 1024,
         stop_admission_timeout_ms: 250,
@@ -130,6 +152,10 @@ impl ResourceLimits {
             ),
             ("handoff_bytes", self.handoff_bytes),
             ("control_state_bytes", self.control_state_bytes),
+            (
+                "foreground_observation_bytes",
+                self.foreground_observation_bytes,
+            ),
             ("diagnostic_queue_bytes", self.diagnostic_queue_bytes),
             (
                 "diagnostic_record_bytes",
@@ -150,6 +176,10 @@ impl ResourceLimits {
         }
         for (name, count) in [
             ("creation_workers", self.creation_workers),
+            (
+                "foreground_observation_workers",
+                self.foreground_observation_workers,
+            ),
             ("input_turn_commands", self.input_turn_commands),
             ("input_turn_bytes", self.input_turn_bytes),
             ("cleanup_workers", self.cleanup_workers),
@@ -172,6 +202,17 @@ impl ResourceLimits {
                 .is_none()
         {
             return Err("stop_admission_timeout_ms must fit a positive host deadline".to_owned());
+        }
+        if self.foreground_observation_timeout_ms == 0
+            || std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(
+                    self.foreground_observation_timeout_ms,
+                ))
+                .is_none()
+        {
+            return Err(
+                "foreground_observation_timeout_ms must fit a positive host deadline".to_owned(),
+            );
         }
         crate::diagnostics::validate_limits(crate::diagnostics::DiagnosticLimits {
             queue_bytes: usize::try_from(self.diagnostic_queue_bytes)

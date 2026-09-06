@@ -17,6 +17,9 @@ pub const PROTOCOL_VERSION: u16 = 21;
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
 
+/// Read one complete native foreground group without changing its Run.
+pub const RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION: &str = "native.foreground_observation";
+
 /// Apply or recover one caller-keyed native Input operation.
 pub const RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT: &str = "native.recoverable_input";
 
@@ -1582,6 +1585,11 @@ pub enum AttachmentView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Read only the foreground facts of one original Run.
+    ObserveForeground {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+    },
     /// Observe the daemon-owned diagnostic sink without inferring Run health.
     Diagnostics {},
     /// Start a new daemon-owned Run.
@@ -1747,6 +1755,10 @@ pub enum ControlOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    /// One-shot facts only; never Agent or continuous working-state truth.
+    ForegroundObservation {
+        observation: RunForegroundObservation,
+    },
     /// Current diagnostic sink observations, independent of Run service facts.
     Diagnostics { diagnostics: DiagnosticsSnapshot },
     /// A Run was created.
@@ -1783,6 +1795,52 @@ pub enum Response {
     InputApplied {
         run: RunInfo,
         range: AppliedInputRange,
+    },
+}
+
+/// Opaque physical identity of one process in the original foreground group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ForegroundProcess {
+    pub pid: u32,
+    pub process_incarnation: String,
+    pub execution_generation: String,
+    pub pgid: u32,
+    pub sid: u32,
+    pub executable_path: String,
+    pub executable_image: String,
+}
+
+/// Complete revalidated physical scope or an honest local observation failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RunForegroundObservation {
+    Observed {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+        #[serde(rename = "startedAtMs")]
+        started_at_ms: u64,
+        #[serde(rename = "completedAtMs")]
+        completed_at_ms: u64,
+        #[serde(rename = "rootPid")]
+        root_pid: u32,
+        #[serde(rename = "rootIncarnation")]
+        root_incarnation: String,
+        #[serde(rename = "posixSessionId")]
+        posix_session_id: u32,
+        #[serde(rename = "foregroundPgid")]
+        foreground_pgid: u32,
+        processes: Vec<ForegroundProcess>,
+    },
+    Unknown {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+        reason: String,
+    },
+    Unsupported {
+        #[serde(rename = "runId")]
+        run_id: RunId,
+        reason: String,
     },
 }
 

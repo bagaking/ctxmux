@@ -85,7 +85,6 @@ impl AdoptedMasterPty {
 
     /// Foreground process group of the adopted tty, or `None` when the tty has
     /// no signalable foreground group.
-    #[cfg(not(target_os = "macos"))]
     pub(crate) fn foreground_process_group(&self) -> Option<u32> {
         rustix::termios::tcgetpgrp(&self.fd)
             .ok()

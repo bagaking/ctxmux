@@ -272,6 +272,8 @@ impl NativeRunRegistration {
         reader_guard: GaugeGuard,
         waiter_guard: GaugeGuard,
     ) -> Self {
+        #[cfg(target_os = "macos")]
+        control.bind_foreground_root(session.foreground_root_pid());
         Self {
             run: Arc::downgrade(run),
             reader: Some(reader),

@@ -1154,7 +1154,7 @@ impl Persistence {
         resources
             .validate()
             .map_err(PersistenceError::ResourcePressure)?;
-        Self::open_with_admission_limits(state_dir, resources.into(), hint)
+        Self::open_with_admission_limits(state_dir, &resources.into(), hint)
     }
 
     fn load_terminal_checkpoint(&self, id: RunId) -> Option<StoredCheckpoint> {
@@ -1237,7 +1237,7 @@ impl Persistence {
     pub(crate) fn open(
         state_dir: impl Into<PathBuf>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
-        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL, None)
+        Self::open_with_admission_limits(state_dir.into(), &AdmissionLimits::OPERATIONAL, None)
     }
 
     /// Incoming-image startup seam for exec-in-place: reuse the handed-off epoch,
@@ -1248,12 +1248,16 @@ impl Persistence {
         state_dir: impl Into<PathBuf>,
         hint: HandoffHint,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
-        Self::open_with_admission_limits(state_dir.into(), AdmissionLimits::OPERATIONAL, Some(hint))
+        Self::open_with_admission_limits(
+            state_dir.into(),
+            &AdmissionLimits::OPERATIONAL,
+            Some(hint),
+        )
     }
 
     fn open_with_admission_limits(
         state_dir: PathBuf,
-        admission_limits: AdmissionLimits,
+        admission_limits: &AdmissionLimits,
         handoff: Option<HandoffHint>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         #[cfg(test)]
@@ -1271,10 +1275,12 @@ impl Persistence {
 
     fn open_with_admission_limits_and_hooks(
         state_dir: PathBuf,
-        admission_limits: AdmissionLimits,
+        admission_limits: &AdmissionLimits,
         handoff: Option<HandoffHint>,
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
+        // The original actor still owns its complete immutable Copy policy.
+        let admission_limits = *admission_limits;
         let output_wake = Arc::new(Mutex::new(None));
         let actor_output_wake = Arc::clone(&output_wake);
         let output_wake_requested = Arc::new(AtomicBool::new(false));
@@ -1298,7 +1304,7 @@ impl Persistence {
             .spawn(move || {
                 actor_main(
                     &actor_state_dir,
-                    admission_limits,
+                    &admission_limits,
                     handoff,
                     &command_rx,
                     &lifecycle_rx,
@@ -1647,7 +1653,7 @@ impl Persistence {
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
         Self::open_with_admission_limits(
             state_dir,
-            AdmissionLimits {
+            &AdmissionLimits {
                 run_records,
                 metadata_bytes,
                 resources: ResourceLimits::DEFAULT,
@@ -1886,7 +1892,7 @@ fn idle_fold_wal(store: &StateStore, shutdown: &AtomicBool) -> bool {
 )]
 fn actor_main(
     state_dir: &Path,
-    admission_limits: AdmissionLimits,
+    admission_limits: &AdmissionLimits,
     handoff: Option<HandoffHint>,
     receiver: &mpsc::Receiver<Command>,
     lifecycle_rx: &mpsc::Receiver<Command>,
@@ -2742,7 +2748,7 @@ impl StateStore {
     #[allow(clippy::too_many_lines)]
     fn open(
         state_dir: &Path,
-        admission_limits: AdmissionLimits,
+        admission_limits: &AdmissionLimits,
         mut handoff: Option<HandoffHint>,
         #[cfg(test)] test_hooks: Arc<PersistenceTestHooks>,
     ) -> Result<(Self, Vec<RecoveredRun>), PersistenceError> {
@@ -2876,7 +2882,7 @@ impl StateStore {
             runtime_id,
             epoch,
             live_set,
-            admission_limits,
+            admission_limits: *admission_limits,
             compaction_pending,
             compaction_sources_pending: VecDeque::new(),
             compaction_cursor: i64::MIN,
@@ -7887,7 +7893,7 @@ mod tests {
         let before = raw_run_units(&state_dir);
         let Err(error) = StateStore::open(
             &state_dir,
-            EVICTION_TEST_LIMITS,
+            &EVICTION_TEST_LIMITS,
             None,
             Arc::new(PersistenceTestHooks::default()),
         ) else {
@@ -7903,7 +7909,7 @@ mod tests {
         hooks.startup_fail_after_commits.store(1, Ordering::Release);
         let Err(error) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         ) else {
@@ -8340,7 +8346,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -8419,7 +8425,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -8818,7 +8824,7 @@ mod tests {
             let state_dir = temp.path().join("state");
             let (mut store, _) = StateStore::open(
                 &state_dir,
-                AdmissionLimits::OPERATIONAL,
+                &AdmissionLimits::OPERATIONAL,
                 None,
                 Arc::new(PersistenceTestHooks::default()),
             )
@@ -8859,7 +8865,7 @@ mod tests {
             assert!(matches!(
                 StateStore::open(
                     &state_dir,
-                    AdmissionLimits::OPERATIONAL,
+                    &AdmissionLimits::OPERATIONAL,
                     None,
                     Arc::new(PersistenceTestHooks::default())
                 ),
@@ -8913,7 +8919,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (mut store, _) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -8938,7 +8944,7 @@ mod tests {
         drop(store);
         let (_, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -8972,7 +8978,7 @@ mod tests {
         let limits = AdmissionLimits::from(resources);
         let (mut store, _) = StateStore::open(
             &state_dir,
-            limits,
+            &limits,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9000,7 +9006,7 @@ mod tests {
         drop(store);
         let (mut store, _) = StateStore::open(
             &state_dir,
-            limits,
+            &limits,
             Some(super::HandoffHint {
                 epoch: uuid::Uuid::new_v4().to_string(),
                 live_set: HashSet::from([id]),
@@ -9027,7 +9033,7 @@ mod tests {
         drop(store);
         let (_, recovered) = StateStore::open(
             &state_dir,
-            limits,
+            &limits,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9080,7 +9086,7 @@ mod tests {
         drop(persistence);
         let (store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::from(resources),
+            &AdmissionLimits::from(resources),
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9109,7 +9115,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (mut store, _) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9182,7 +9188,7 @@ mod tests {
         drop(store);
         let (_, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9304,7 +9310,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (mut store, _) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9357,7 +9363,7 @@ mod tests {
         drop(connection);
         let (reopened, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9387,7 +9393,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (mut store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9453,7 +9459,7 @@ mod tests {
             let state_dir = temp.path().join(phase);
             let (mut store, recovered) = StateStore::open(
                 &state_dir,
-                AdmissionLimits::OPERATIONAL,
+                &AdmissionLimits::OPERATIONAL,
                 None,
                 Arc::new(PersistenceTestHooks::default()),
             )
@@ -9516,7 +9522,7 @@ mod tests {
 
             let (reopened, recovered) = StateStore::open(
                 &state_dir,
-                AdmissionLimits::OPERATIONAL,
+                &AdmissionLimits::OPERATIONAL,
                 None,
                 Arc::new(PersistenceTestHooks::default()),
             )
@@ -9551,7 +9557,7 @@ mod tests {
         let state_dir = PathBuf::from(state_dir);
         let (_store, _recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9565,7 +9571,7 @@ mod tests {
         let state_dir = temp.path().join("state");
         let (mut store, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9617,7 +9623,7 @@ mod tests {
 
         let (reopened, recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::new(PersistenceTestHooks::default()),
         )
@@ -9707,7 +9713,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, _recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -9821,7 +9827,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, _recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -9882,7 +9888,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, _recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -9981,7 +9987,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (mut store, _recovered) = StateStore::open(
             &state_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&hooks),
         )
@@ -10843,7 +10849,7 @@ mod tests {
             resources: ResourceLimits::DEFAULT,
         };
         let (persistence, recovered) =
-            Persistence::open_with_admission_limits(state_dir.clone(), limits, None)
+            Persistence::open_with_admission_limits(state_dir.clone(), &limits, None)
                 .expect("open small-capacity persistence actor");
         assert!(recovered.is_empty());
 
@@ -10914,7 +10920,7 @@ mod tests {
             resources: ResourceLimits::DEFAULT,
         };
         let (persistence, recovered) =
-            Persistence::open_with_admission_limits(state_dir.clone(), limits, None)
+            Persistence::open_with_admission_limits(state_dir.clone(), &limits, None)
                 .expect("open exact-candidate store");
         assert!(recovered.is_empty());
 
@@ -11190,7 +11196,7 @@ mod tests {
     fn seed_startup_overflow(state_dir: &Path) -> Vec<(RunId, CreateOperationKey)> {
         let (persistence, recovered) = Persistence::open_with_admission_limits(
             state_dir.to_path_buf(),
-            AdmissionLimits::FORMAT,
+            &AdmissionLimits::FORMAT,
             None,
         )
         .expect("open format-envelope persistence");
@@ -11467,7 +11473,7 @@ mod tests {
         let hooks = Arc::new(PersistenceTestHooks::default());
         let (store, recovered) = StateStore::open(
             &handed_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             Some(super::HandoffHint {
                 epoch: original_epoch.clone(),
                 live_set: HashSet::from([row_a]),
@@ -11509,7 +11515,7 @@ mod tests {
         let crash_hooks = Arc::new(PersistenceTestHooks::default());
         let (crash_store, _) = StateStore::open(
             &crashed_dir,
-            AdmissionLimits::OPERATIONAL,
+            &AdmissionLimits::OPERATIONAL,
             None,
             Arc::clone(&crash_hooks),
         )
@@ -11534,7 +11540,7 @@ mod tests {
         // A8 fixture used only two rows, so eviction never ran and the bug hid.
         let (persistence, recovered) = Persistence::open_with_admission_limits(
             state_dir.to_path_buf(),
-            AdmissionLimits::FORMAT,
+            &AdmissionLimits::FORMAT,
             None,
         )
         .expect("open format-envelope persistence");
@@ -11593,7 +11599,7 @@ mod tests {
         let before = raw_run_units(&state_dir);
         let Err(error) = StateStore::open(
             &state_dir,
-            EVICTION_TEST_LIMITS,
+            &EVICTION_TEST_LIMITS,
             Some(super::HandoffHint {
                 epoch: epoch.clone(),
                 live_set: HashSet::from([live_id]),

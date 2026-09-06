@@ -1034,8 +1034,14 @@ unrelated panic-hook behavior remains unchanged.
 
 ## Pre-stable format fence
 
-This candidate uses SQLite schema 6 and handoff schema 6. Valid schema-5 stores
+This candidate uses SQLite schema 6 and handoff schema 7. Valid schema-5 stores
 are explicitly unsupported, not corrupt. There is no implicit migration or
 fallback. A protocol-18 daemon and protocol-20 client cannot be mixed merely
 because their Run identifiers or executable names match. A deployment needs
 one exact source/binary/SDK contract and its declared recovery evidence.
+
+## Planned `observeForeground` read-only vertical
+
+This approved narrow design is not yet a shipped capability. The request selects only the existing `runId`. The response includes that exact Run reference and an `outcome` discriminant. `observed` carries the observation start/end interval, original root PID/incarnation and POSIX SID, foreground PGID, and the complete related processes with PID/incarnation/exec generation/SID/PGID/actual executable-entity evidence. Unknown reports a bounded cause; unsupported reports missing capability or unsupported backend/evidence. Partial data cannot be used as observed identity. Opaque physical generations are strings.
+
+The public client binds this result to Hello RuntimeIdentity from the same dispatch connection. Lack of observation support is local to this call; clients do not add it to their global required-capability gate. No argv, title, output, environment scan or Provider semantics is part of this protocol. Darwin is the first actual owner implementation; other backends are explicitly unsupported until independently qualified. Concurrent changes and resource pressure return unknown, without repeated retries or lifecycle actions.

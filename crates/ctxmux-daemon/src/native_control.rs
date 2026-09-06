@@ -315,6 +315,8 @@ pub(crate) struct NativeControlOwner {
 
 struct NativeControlInner {
     run_id: RunId,
+    #[cfg(target_os = "macos")]
+    foreground_root: OnceLock<Option<(u32, String)>>,
     pty: Mutex<Option<Box<dyn PtyControl>>>,
     writer: Mutex<Option<NativeInputWriter>>,
     service: OnceLock<NativeService>,
@@ -822,8 +824,9 @@ trait PtyControl: Send {
     fn master_raw_fd(&self) -> Option<std::os::fd::RawFd>;
     #[cfg(target_os = "macos")]
     fn interrupt_foreground(&self) -> io::Result<()>;
-    #[cfg(not(target_os = "macos"))]
-    fn foreground_process_group(&self) -> Option<u32>;
+    fn foreground_process_group(&self) -> Option<u32> {
+        None
+    }
 }
 
 struct PortablePtyControl(Box<dyn MasterPty + Send>);
@@ -850,7 +853,6 @@ impl PtyControl for PortablePtyControl {
         ctxmux_pty_signal::interrupt_foreground(raw_fd)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn foreground_process_group(&self) -> Option<u32> {
         self.0
             .process_group_leader()
@@ -882,13 +884,51 @@ impl PtyControl for AdoptedMasterPty {
         AdoptedMasterPty::interrupt_foreground(self)
     }
 
-    #[cfg(not(target_os = "macos"))]
     fn foreground_process_group(&self) -> Option<u32> {
         AdoptedMasterPty::foreground_process_group(self)
     }
 }
 
 impl NativeControlOwner {
+    /// Bound by the sole Native registration from its original `NativeSession`,
+    /// never guessed from a client `RunInfo`. Failure only disables observation.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn bind_foreground_root(&self, pid: Option<u32>) {
+        let root = pid.and_then(|pid| {
+            ctxmux_process_stats::process_incarnation(pid)
+                .ok()
+                .map(|identity| (pid, identity))
+        });
+        let _ = self.inner.foreground_root.set(root);
+    }
+
+    /// Read the current original-master scope without exporting a borrowed fd.
+    /// Called by the bounded read-only worker, never the shared Native turn.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn foreground_scope(&self) -> Option<(u32, String, u32)> {
+        if self.inner.entry_retired.load(Ordering::Acquire) {
+            return None;
+        }
+        let root = self.inner.foreground_root.get()?.as_ref()?;
+        if ctxmux_process_stats::process_incarnation(root.0)
+            .ok()?
+            .as_str()
+            != root.1
+        {
+            return None;
+        }
+        let state = self.inner.try_state()?;
+        if state.phase != ControlPhase::Open {
+            return None;
+        }
+        let pty = self.inner.pty.try_lock().ok()?;
+        let group = pty.as_ref()?.foreground_process_group()?;
+        if self.inner.entry_retired.load(Ordering::Acquire) {
+            return None;
+        }
+        Some((root.0, root.1.clone(), group))
+    }
+
     pub(crate) fn try_turn(&self) -> Option<NativeControlTurn<'_>> {
         self.inner
             .try_state()
@@ -1504,6 +1544,8 @@ impl NativeControlOwner {
                 admission_changed: Notify::new(),
                 owner_failure: OnceLock::new(),
                 entry_retired: AtomicBool::new(closed),
+                #[cfg(target_os = "macos")]
+                foreground_root: OnceLock::new(),
                 reap: Mutex::new(if closed {
                     ChildReapState::Reaped
                 } else {
