@@ -131,7 +131,7 @@ async fn hot_tail_finalize_fences_interleaved_real_run_prefixes() {
     assert_eq!(first.info().durable_output_bytes, Some(3));
     drop(first);
     drop(second);
-    drop(server);
+    server.abort_and_wait().await;
     drop(persistence);
     let (_reopened, recovered) =
         Persistence::open_with_resources(state_dir, resources, None).unwrap();

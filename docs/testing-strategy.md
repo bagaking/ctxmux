@@ -402,6 +402,15 @@ arithmetic and this pre-observation table:
 | Cleanup thread delta                  |          1 |        1 |       1 |       1 |
 | Cleanup live children and attachments |          1 |        0 |       0 |       1 |
 
+This table is the already-frozen historical regression policy, not an exact
+output oracle or a justified formula for a new baseline. In particular, the
+retained-byte margin cannot authorize missing, duplicated or unexpected bytes:
+deterministic byte workloads require independent exact byte accounting and
+ordered hashes regardless of whether the resource budget passes. Keep the old
+receipt and budget intact when auditing their rationale. A replacement policy
+needs a separately qualified objective and held-out workloads; changing a
+multiplier after observing a candidate would invalidate the original evidence.
+
 These budgets are leak probes and regression bounds, not the daemon's operating
 system capacity. Exceeding one is a qualification failure; it does not by
 itself mean the next Run will crash. Resource census waits for five consecutive
@@ -519,12 +528,19 @@ already-sent command and returns the actual reap receipt rather than unknown.
 
 ### Benchmarks and performance regression
 
-None of this is implemented yet; the repository has no `benches/` directory and
-no benchmark dependency. [External quality comparison](architecture/external-quality-comparison.md)
-records how comparable projects measure these dimensions, which of their
-practices transfer to a headless daemon, and which must be refused.
+Repository measurement scripts already cover fleet/resource qualification,
+remote transport cost and small-output persistence. Their historical results
+qualify their recorded sources and environments; they do not qualify a new
+commit or a different host. The [Run benchmark standard](benchmark-standard.md)
+owns multidimensional measurement and grounding; `scripts/bench/` adds a
+public-protocol workload with an independent binary-byte oracle, explicit
+attempt outcomes and receiver-driven Gap recovery. Its selected-cell results
+and limitations must accompany any capacity or performance claim.
+[External quality comparison](architecture/external-quality-comparison.md)
+records how comparable projects measure these dimensions and which practices
+transfer to a headless daemon.
 
-Create a repository-owned harness for:
+The complete measurement matrix must cover:
 
 - daemon cold start and Run start-to-accepted latency;
 - start-to-first-output and input-to-output latency;
@@ -532,6 +548,9 @@ Create a repository-owned harness for:
 - sustained input/output throughput;
 - fan-out throughput and tail latency for 1/8/32 attachments;
 - stop-to-exit and exit-drain latency;
+- recoverable native input and stop retry, result settlement and cold-incarnation
+  rejection latency, including exact applied prefixes and unknown outcomes;
+- planned exec interruption and cold replay recovery latency with identity checks;
 - CPU, RSS, fds, threads, and memory per idle/active Run;
 - future tmux adapter and Integration probe overhead.
 

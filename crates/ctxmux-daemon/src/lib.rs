@@ -9587,6 +9587,14 @@ mod tests {
             "durable barrier really waits under pressure"
         );
         if !after_barrier {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !temp.path().join("actual-storage-retry").exists() {
+                    assert!(child.0.try_wait().unwrap().is_none());
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the extracted output must reach the actual failing append owner");
             assert!(
                 temp.path().join("actual-storage-retry").exists(),
                 "actual accepted output reached the failing storage owner"
