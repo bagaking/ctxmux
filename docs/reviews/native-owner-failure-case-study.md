@@ -452,6 +452,49 @@ user Run changes follow from this source slice. Direct standalone strict VT
 lint retains the same twenty-nine upstream diagnostics; the changed owner
 methods introduce none. Complete terminal fidelity and P00 remain open.
 
+## Complete-parameter candidate and performance evidence
+
+A separate private candidate executes the formerly deduced large-coordinate
+and numeric-parameter regressions. Its nine contract tests pass, including
+complete spilled parameters, overflow classification, exact storage-pressure
+refusal and rejection of a partial rendition prefix. A real allocator returns
+NULL for the second allocation; the dispatch remains ignored and dropping the
+parser releases the already retained allocation. These results qualify finite
+owner contracts, not every parser control or aggregate memory funding.
+
+An ordinary iterator-inline annotation improves that candidate's unchanged
+normal SGR workload. Optimized libraries and callers are rebuilt for all three
+source arms, with actual artifact identities retained. The measured Screen
+median improves about three percent against the wider candidate, but remains
+about two percent slower than the original baseline. A separate same-path,
+same-compiler-argument removal/restoration control measures about seven percent
+improvement with identical Screen results and byte-identical restored artifacts.
+The original slower debug and library-only optimized results remain evidence;
+the new measurements neither replace them nor establish overall performance
+acceptance. Larger parser state, code size and actual process-memory observations
+remain costs to evaluate.
+
+The current twenty-three parser tests and seventeen codec tests pass. The same
+thirty-two streams also preserve complete source state across whole and
+single-byte writes. Both pinned consumers still report twenty-nine passing
+and the same three failing cases for source and seed; emitted model and seed
+bytes match the frozen predecessor. No expected output, workload, storage
+budget or failing case is weakened to obtain the measured improvement.
+
+A held-out empty-history case exposes another wider-geometry defect: save the
+last row and column in a 24-by-80 viewport, home the current cursor, shrink to
+5-by-10, grow back to 24-by-80 and restore. The private wider candidate restores
+row four instead of row twenty-three. Reflow clips its hidden saved register even when
+it adds no rows. Existing restore-while-small and retained-history tests exercise
+different contracts and do not cover this sequence. Both annotated and
+unannotated candidates fail; the annotation does not repair or introduce this
+geometry defect. This failure blocks integration of the wider candidate.
+
+The private annotation and wider source remain uninstalled and unintegrated.
+Remaining consumer failures, baseline regression, control-parser limits,
+resource funding and saved-register semantics must be resolved at their owners
+before broader terminal fidelity is advertised.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |
