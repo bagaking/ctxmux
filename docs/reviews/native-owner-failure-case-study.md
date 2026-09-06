@@ -418,6 +418,40 @@ continuous rendering, aggregate resource costs and the complete P00 boundary
 remain unqualified. This does not install or qualify the broader joined
 protocol and handoff changes.
 
+## Saved-cursor owner repair and fixture correction
+
+An independent minimal repair uses the exact registry `vt100` 0.15.2 source,
+retaining its upstream attribution. The original source fails nine of thirteen
+public-parser regressions in both debug and release builds. The repaired
+source passes all thirteen: restore bounds the active row to the current
+viewport, while a width change clips the saved column. The hidden saved row
+and height-only pending-wrap state remain intact.
+
+Review rejected two earlier repair assumptions. Clipping the saved column on
+a height-only resize overwrites a valid final character after restore.
+Permanently clipping the saved row makes shrink/grow lose the original hidden
+position. Both pinned public consumers instead retain that row. A new
+restore-while-small, grow, restore-again case proves that safely installing an
+active position does not overwrite its hidden register. The earlier
+clipped-row fixture and candidate results remain historical evidence; their
+expected position is not the production contract.
+
+Two public consumers agree on ten of thirteen complete visible projections.
+The three pre-existing saved pending-wrap disagreements remain explicit;
+the parser preserves its prior contract rather than claiming universal
+consumer equivalence. A preliminary text assertion also incorrectly inserted
+a newline into soft-wrapped plain-text export. Its original failure is retained;
+the corrected oracle still independently checks physical cells, cursor and
+wrap state, so losing the final character cannot pass.
+
+The real CLI controlling-PTY tests preserve input, output, detach, terminal
+attributes and the daemon-owned child identity. Main's CLI does not currently
+invoke parser resize; those tests prove dependency wiring and the client
+boundary, not Native failure containment. No protocol, installed artifact or
+user Run changes follow from this source slice. Direct standalone strict VT
+lint retains the same twenty-nine upstream diagnostics; the changed owner
+methods introduce none. Complete terminal fidelity and P00 remain open.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |

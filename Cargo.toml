@@ -68,3 +68,6 @@ pedantic = "deny"
 # the fix needs the `pre_exec` the dependency already owns.
 [patch.crates-io]
 portable-pty = { path = "third_party/portable-pty" }
+
+# Saved-cursor resize repair; see third_party/vt100/CTXMUX-PROVENANCE.json.
+vt100 = { path = "third_party/vt100" }

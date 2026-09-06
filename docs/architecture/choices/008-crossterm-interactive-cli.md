@@ -52,6 +52,26 @@ On `ObservationDiscontinuity`, it exits nonzero with a distinct diagnostic:
 byte replay cannot reconstruct the missing non-output semantics. The raw-mode
 guard still owns ordinary terminal restoration on that error path.
 
+### Saved-cursor resize safety
+
+The local `vt100` 0.15.2 patch bounds the active restored row to the current
+viewport, preserving the hidden saved row for later growth. Only a width change
+clips the saved column; height-only resize preserves a saved pending-wrap
+column. Public-parser tests cover normal and alternate buffers, shrink/grow,
+restore while small, origin mode, pen state and byte fragmentation.
+
+Two pinned public terminal consumers agree on ten of thirteen finite source
+projections. Three pre-existing saved pending-wrap differences remain explicit:
+the parser preserves the final character and wraps the next write, while these
+consumers overwrite that final character on restore. This patch preserves the
+existing parser contract; it does not qualify full terminal equivalence.
+
+The CLI currently creates a parser at the attachment size and does not call
+its resize API. Its real-PTY tests prove dependency wiring, raw I/O, detach,
+terminal restoration and child survival. They do not prove Native owner
+containment or the cause of the P0 incident. Dependency provenance and exact
+patch scope live in `third_party/vt100/CTXMUX-PROVENANCE.json`.
+
 ## Wrong-case corpus
 
 - `CLI-01` (`h01`, `h02`): raw mode is process-external state. A real macOS PTY fixture attempt restored stable settings but changed transient `PENDIN`; the case remains inactive until the project chooses a direct termios owner or a reviewed normalization policy. `SIGKILL` and abort still cannot be promised away by a drop guard.
