@@ -134,6 +134,14 @@ them in the active Feature Tracker task:
 - a public CLI or SDK smoke test for an end-to-end milestone;
 - documentation consistency when behavior or boundaries change.
 
+Bind executed artifacts to the selected source. Candidate and counterfactual
+source variants must use separate build-output directories. If existing shared
+outputs are reused, invalidate only the affected derived cache and prove an
+actual rebuild of the selected source plus the identity of the executed binary.
+Source hashes or a build tool's cached-success message alone do not prove this
+binding. Preserve failed runs caused by stale artifacts; do not relabel them as
+passing source validation or erase them after rebuilding.
+
 Do not claim attach, persistence, recovery, or fork support from type definitions
 or mocks alone. The child process must demonstrably survive the client boundary
 being tested.

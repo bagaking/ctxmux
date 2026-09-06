@@ -16,8 +16,8 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    CommandDisposition, ControlFailure, ErrorCode, NativeServiceFailure, ProtocolError, RunId,
-    RunState,
+    CommandDisposition, ControlFailure, ErrorCode, NativeOwnerIoStage, NativeServiceFailure,
+    ProtocolError, RunId, RunState,
 };
 use portable_pty::Child;
 use rustix::{
@@ -178,6 +178,8 @@ struct OwnerDiagnostics {
     lifecycle_probes: AtomicUsize,
     registrations: AtomicUsize,
     fail_next_worker_spawn: AtomicUsize,
+    #[cfg(test)]
+    poll_error: Mutex<Option<Errno>>,
 }
 
 #[cfg(test)]
@@ -223,6 +225,10 @@ enum OwnerCommand {
     Shutdown,
     #[cfg(test)]
     UnwindForTest,
+    #[cfg(test)]
+    ReplaceWakeReaderForTest {
+        reader: UnixStream,
+    },
     #[cfg(test)]
     ProbePendingStopForTest {
         run_id: RunId,
@@ -873,7 +879,7 @@ fn owner_main(
     let result = crate::diagnostics::catch_native_unwind(AssertUnwindSafe(|| {
         loop {
             if owner_woken {
-                if drain_commands(commands, &mut entries, diagnostics) {
+                if drain_commands(commands, &mut entries, diagnostics, &mut wake_reader) {
                     detach_active_workers(&mut active);
                     drain_completions(
                         &completion_rx,
@@ -882,7 +888,7 @@ fn owner_main(
                         &mut active_cleanups,
                         &mut active_finalizers,
                     );
-                    return;
+                    return NativeServiceFailure::OwnerStopped;
                 }
                 drain_completions(
                     &completion_rx,
@@ -958,15 +964,11 @@ fn owner_main(
                 &mut fair_start,
             ) {
                 Ok(woken) => woken,
-                Err(()) => return,
+                Err(reason) => return reason,
             };
         }
     }));
-    let reason = if result.is_err() {
-        NativeServiceFailure::OwnerUnwound
-    } else {
-        NativeServiceFailure::OwnerStopped
-    };
+    let reason = result.unwrap_or(NativeServiceFailure::OwnerUnwound);
     *mutex_lock(owner_completion) = Some(reason);
     // Remove the sole retained Sender before draining. Every producer borrowed
     // its own Sender without holding this mutex; blocked sends now finish as
@@ -998,6 +1000,8 @@ fn owner_main(
             OwnerCommand::Shutdown => {}
             #[cfg(test)]
             OwnerCommand::UnwindForTest => {}
+            #[cfg(test)]
+            OwnerCommand::ReplaceWakeReaderForTest { reader } => drop(reader),
             #[cfg(test)]
             OwnerCommand::ProbePendingStopForTest { respond, .. } => {
                 let _ = respond.send(false);
@@ -1036,6 +1040,7 @@ fn drain_commands(
     commands: &mpsc::Receiver<OwnerCommand>,
     entries: &mut Vec<NativeEntry>,
     diagnostics: &OwnerDiagnostics,
+    _wake_reader: &mut UnixStream,
 ) -> bool {
     loop {
         match commands.try_recv() {
@@ -1060,6 +1065,10 @@ fn drain_commands(
             Ok(OwnerCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => return true,
             #[cfg(test)]
             Ok(OwnerCommand::UnwindForTest) => panic!("Native owner completion probe"),
+            #[cfg(test)]
+            Ok(OwnerCommand::ReplaceWakeReaderForTest { reader }) => {
+                *_wake_reader = reader;
+            }
             #[cfg(test)]
             Ok(OwnerCommand::ProbePendingStopForTest { run_id, respond }) => {
                 let pending = entries.iter().any(|entry| {
@@ -1726,7 +1735,7 @@ fn poll_and_read_outputs(
     diagnostics: &OwnerDiagnostics,
     resources: crate::ResourceLimits,
     fair_start: &mut usize,
-) -> Result<bool, ()> {
+) -> Result<bool, NativeServiceFailure> {
     let deadline = poll_deadline(entries, signal_driven);
     let mut input_files = Vec::new();
     for (index, entry) in entries.iter_mut().enumerate() {
@@ -1769,6 +1778,12 @@ fn poll_and_read_outputs(
         Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
             .expect("native poll duration fits Timespec")
     });
+    // Poll errno injection is test-only; the shipped syscall has no override.
+    #[cfg(test)]
+    let injected = mutex_lock(&diagnostics.poll_error).take();
+    #[cfg(test)]
+    let poll_result = injected.map_or_else(|| poll(&mut poll_fds, timeout.as_ref()), Err);
+    #[cfg(not(test))]
     let poll_result = poll(&mut poll_fds, timeout.as_ref());
     diagnostics.poll_returns.fetch_add(1, Ordering::AcqRel);
     let mut ready = vec![(false, false); entries.len()];
@@ -1798,7 +1813,10 @@ fn poll_and_read_outputs(
             let _ = crate::diagnostics::record(format_args!(
                 "ctxmuxd daemon-wide native poll failed: {error}"
             ));
-            return Err(());
+            return Err(NativeServiceFailure::OwnerIoFailed {
+                stage: NativeOwnerIoStage::Poll,
+                os_error: Some(error.raw_os_error()),
+            });
         }
     };
     drop(poll_fds);
@@ -1807,7 +1825,12 @@ fn poll_and_read_outputs(
         let mut buffer = [0_u8; 64];
         loop {
             match wake_reader.read(&mut buffer) {
-                Ok(0) => return Err(()),
+                Ok(0) => {
+                    return Err(NativeServiceFailure::OwnerIoFailed {
+                        stage: NativeOwnerIoStage::WakeDrain,
+                        os_error: None,
+                    });
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -1815,7 +1838,10 @@ fn poll_and_read_outputs(
                     let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd native owner wake drain failed: {error}"
                     ));
-                    return Err(());
+                    return Err(NativeServiceFailure::OwnerIoFailed {
+                        stage: NativeOwnerIoStage::WakeDrain,
+                        os_error: error.raw_os_error(),
+                    });
                 }
             }
         }
@@ -4231,3 +4257,7 @@ mod tests {
         assert!(!physical_retirement_before_release);
     }
 }
+
+#[cfg(test)]
+#[path = "tests/native_owner_io.rs"]
+mod io_failure_tests;

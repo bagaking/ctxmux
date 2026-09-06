@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 20;
+pub const PROTOCOL_VERSION: u16 = 21;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -890,14 +890,33 @@ pub enum InterruptionReason {
     TmuxTargetChanged,
 }
 
-/// Why one native service lane cannot serve. This is not a child exit status.
+/// Actual shared-owner syscall boundary that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+pub enum NativeOwnerIoStage {
+    /// Readiness polling failed before any descriptor was processed.
+    Poll,
+    /// The wake reader failed or reached EOF.
+    WakeDrain,
+}
+
+/// Why one native service lane cannot serve. This is not a child exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeServiceFailure {
     /// The native owner returned normally.
     OwnerStopped,
     /// The native owner unwound.
     OwnerUnwound,
+    /// A shared-owner I/O boundary failed; no child exit is implied.
+    OwnerIoFailed {
+        /// Boundary where the failure was actually observed.
+        stage: NativeOwnerIoStage,
+        /// Raw positive OS errno from the serving host, or None for wake EOF
+        /// or an I/O error without an OS code. Never infer an earlier cause.
+        #[serde(deserialize_with = "deserialize_native_os_error")]
+        os_error: Option<i32>,
+    },
     /// Original PTY output could not be read.
     ReadFailed,
     /// Native input could not be written.
@@ -906,6 +925,17 @@ pub enum NativeServiceFailure {
     Historical,
     /// The native control receiver is closed.
     ControlClosed,
+}
+
+fn deserialize_native_os_error<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = deserialize_required_option(deserializer)?;
+    if value.is_some_and(|error| error <= 0) {
+        return Err(serde::de::Error::custom("OS errno must be a positive i32"));
+    }
+    Ok(value)
 }
 
 /// Actual native owner service, independent of child lifecycle.
@@ -2268,10 +2298,54 @@ mod tests {
     }
 
     #[test]
+    fn native_owner_io_failure_preserves_stage_errno_and_strict_fields() {
+        use super::{NativeOwnerIoStage, NativeServiceFailure};
+        for stage in [NativeOwnerIoStage::Poll, NativeOwnerIoStage::WakeDrain] {
+            for os_error in [None, Some(1), Some(i32::MAX)] {
+                let failure = NativeServiceFailure::OwnerIoFailed { stage, os_error };
+                let value = serde_json::to_value(failure).unwrap();
+                assert_eq!(
+                    value["owner_io_failed"]["os_error"],
+                    serde_json::json!(os_error)
+                );
+                assert_eq!(
+                    serde_json::from_value::<NativeServiceFailure>(value).unwrap(),
+                    failure
+                );
+            }
+        }
+        for value in [
+            serde_json::json!({"owner_io_failed":{"stage":"poll"}}),
+            serde_json::json!({"owner_io_failed":{"os_error":1}}),
+            serde_json::json!({"owner_io_failed":{"stage":"unknown","os_error":1}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":1,"healthy":true}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":1},"healthy":true}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":0}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":-1}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":2_147_483_648_u64}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":1.5}}),
+            serde_json::json!({"owner_io_failed":{"stage":"poll","os_error":"1"}}),
+        ] {
+            assert!(
+                serde_json::from_value::<NativeServiceFailure>(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(NativeServiceFailure::OwnerStopped).unwrap(),
+            "owner_stopped"
+        );
+        assert_eq!(
+            serde_json::to_value(NativeServiceFailure::OwnerUnwound).unwrap(),
+            "owner_unwound"
+        );
+    }
+
+    #[test]
     fn generation_20_service_facts_preserve_lifecycle_and_nullable_authority() {
         use super::{NativeInputPhase, NativeOwnerStatus, NativeServiceFailure};
 
-        assert_eq!(PROTOCOL_VERSION, 20);
+        assert_eq!(PROTOCOL_VERSION, 21);
         let mut run = sample_run_info();
         let service = run.native_service.as_mut().unwrap();
         service.revision = 7;
@@ -2499,7 +2573,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_20_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_21_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -2517,7 +2591,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 20,
+                    "protocolGeneration": 21,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {

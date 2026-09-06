@@ -785,17 +785,40 @@ function nativeServiceStatus(
     throw invalid(`${path}.type`, "a declared native service status");
   }
   exactFields(status, path, ["type", "reason"]);
+  nativeServiceFailure(status.reason, `${path}.reason`);
+}
+
+function nativeServiceFailure(value: unknown, path: string): void {
+  if (typeof value === "string") {
+    if (
+      ![
+        "owner_stopped",
+        "owner_unwound",
+        "read_failed",
+        "write_failed",
+        "historical",
+        "control_closed",
+      ].includes(value)
+    ) {
+      throw invalid(path, "a declared native service failure");
+    }
+    return;
+  }
+  const failure = record(value, path);
+  exactFields(failure, path, ["owner_io_failed"]);
+  const detailPath = `${path}.owner_io_failed`;
+  const detail = record(failure.owner_io_failed, detailPath);
+  exactFields(detail, detailPath, ["stage", "os_error"]);
   if (
-    ![
-      "owner_stopped",
-      "owner_unwound",
-      "read_failed",
-      "write_failed",
-      "historical",
-      "control_closed",
-    ].includes(string(status.reason, `${path}.reason`))
+    !["poll", "wake_drain"].includes(
+      string(detail.stage, `${detailPath}.stage`),
+    )
   ) {
-    throw invalid(`${path}.reason`, "a declared native service failure");
+    throw invalid(`${detailPath}.stage`, "a declared native owner I/O stage");
+  }
+  if (detail.os_error !== null) {
+    // The wire field is Rust's positive i32 raw OS errno, not a resource budget.
+    unsignedInteger(detail.os_error, `${detailPath}.os_error`, 0x7fff_ffff, 1);
   }
 }
 

@@ -547,8 +547,9 @@ Orca's independent I/O-failure and process-exit states reinforce preserving
 process authority until actual exit; ctxmux must additionally expose truthful
 input outcomes through its public contract. The joined source is now included
 in the Main development checkpoint but remains uninstalled; complete cleanup and recovery qualification stay
-open. Fatal poll and wake-drain failures still collapse into OwnerStopped, so
-their exact stage and system error need a separate observation-owner repair.
+open. At that checkpoint, fatal poll and wake-drain failures still collapsed
+into OwnerStopped. The independent observation-owner repair below preserves
+the exact stage and system error without assigning the original incident cause.
 
 ## Required completion
 
@@ -698,3 +699,43 @@ cost thresholds are preserved: accepting a new qualification
 envelope requires independent resource observations and an explicit review.
 Runtime and source-checkpoint proofs do not sign that envelope, and this
 checkpoint does not claim a passing complete repository or release gate.
+
+## Native owner syscall facts
+
+The fatal readiness-poll and wake-drain branches returned only an empty error.
+The enclosing unwind boundary therefore classified a normal Rust return as
+OwnerStopped, discarding the syscall stage and errno. The shared owner now
+returns its observed typed reason into the same completion cell used by Run
+service snapshots, attachment events and the input failure fence. Normal
+stopping, unwind and observed I/O failure remain distinct; no additional owner,
+heartbeat or fault registry is introduced.
+
+Protocol generation 21 adds an owner_io_failed reason with poll or wake_drain
+stage and a required nullable positive i32 OS error. The code comes from the
+actual failed syscall on the serving host. Wake EOF reports null; it cannot
+establish a prior wake-write cause. Interrupted and would-block handling is
+preserved. Both public decoders reject missing or extra fields, unknown stages
+and invalid OS error values. Existing service reason strings retain their
+shape.
+
+Two actual Runs and two public Clients verify wake EOF and a real descriptor
+read error. A separate test injects a poll errno into the same owner-loop branch
+and is explicitly synthetic. Each case retains original child identities and
+raw binary READY bytes, publishes the reason on attachments and status, rejects
+new input as NotApplied and preserves an already-admitted request's Unknown
+result with its exact confirmed prefix. Same-key recovery does not write again.
+Private children are retired through their actual retained authority even when
+a regression oracle fails.
+
+Reversing only the owner classifier makes all three public cases fail at the
+published reason. The first restored-source run also failed: a shared Cargo
+output directory had reused the counterfactual binary despite matching source
+hashes. That failed run is preserved as a validation failure. Scoped derived
+cache invalidation forced an observed candidate rebuild; a distinct test binary
+passed the unchanged three cases. Future source variants use separate build
+outputs, and reused outputs require actual rebuild and binary-identity evidence.
+This avoids judging a source change through another variant's executable.
+
+These observations do not qualify shared-owner recovery, complete cleanup or
+resource cost, and they do not establish the historical incident's exit trigger.
+The independent resource fingerprint and cost thresholds remain unchanged.

@@ -76,7 +76,9 @@ impl NativeService {
             if let NativeInputPhase::Unavailable { reason } = &input.phase
                 && matches!(
                     reason,
-                    NativeServiceFailure::OwnerStopped | NativeServiceFailure::OwnerUnwound
+                    NativeServiceFailure::OwnerStopped
+                        | NativeServiceFailure::OwnerUnwound
+                        | NativeServiceFailure::OwnerIoFailed { .. }
                 )
             {
                 snapshot.owner = NativeOwnerStatus::Stopped { reason: *reason };

@@ -1,4 +1,4 @@
-# Local Protocol Generation 20
+# Local Protocol Generation 21
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -822,7 +822,7 @@ resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
 preflighted before extraction. Known persistence failure rejects upgrade before
 target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellation
-and exec serialize through one final gate. Protocol generation 20 has no upgrade
+and exec serialize through one final gate. Protocol generation 21 has no upgrade
 wire operation.
 
 A valid store at its configured main-database page ceiling reclaims bounded oldest
@@ -941,6 +941,17 @@ it cannot invent child exit, PID replacement or a successful input result.
 Historical recovery reports no live input or PTY size. A local terminal failure
 reports its process/resize/export/recovery stage and original byte fence while
 raw transport and unrelated Runs retain their own service facts.
+
+Generation 21 retains the existing string service reasons and adds
+`{"owner_io_failed":{"stage":"poll"|"wake_drain","os_error":integer|null}}`.
+The sole Native owner latches the actual failure into its completion and the
+same owner/output/input service facts. `os_error` is required: a positive Rust
+i32 OS errno from the serving host, or null for wake EOF or an error without an
+OS code. It describes the observed syscall, not an inferred earlier wake-write
+cause. Normal stopping and unwind remain distinct. Interrupted polling and
+interrupted/would-block wake reads remain nonfatal. No process exit, retry or
+recovery success follows from an I/O service failure. Unknown stages, missing or
+extra fields and invalid errno values are rejected by both public SDKs.
 
 Every `ControlFailure` includes required nullable `confirmed_input_bytes`.
 A non-null value is a known applied prefix of that original input request,

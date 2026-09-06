@@ -160,6 +160,17 @@ which panics in debug and is invalid in release, without narrowing the census.
 
 ## Qualification objectives
 
+An execution receipt must bind the selected source to the actual executed
+artifact. Private candidate and counterfactual source variants use separate
+build-output directories. Reusing existing shared outputs requires scoped
+derived-cache invalidation, an observed rebuild of the selected source and
+executed-binary identity evidence. Source hashes and cached build success alone
+are insufficient: a Native owner reversal reused a counterfactual test binary
+after source restoration, producing the same three failures. The failed
+restoration remains evidence; an actual candidate rebuild and a distinct binary
+then passed those same three cases. This isolation costs build storage and
+recompilation time; it changes no runtime budget, workload or acceptance oracle.
+
 The old 1/32/128 baselines, GC 128 records plus eight overlap, 4 MiB pressure
 payloads, three turnovers and replay digests remain frozen historical workloads.
 GC supplies its record/byte policy explicitly on initial start and restart. Tests

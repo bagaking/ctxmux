@@ -119,6 +119,7 @@ export type { NativeInputPhase } from "./generated/NativeInputPhase.js";
 export type { NativeInputStatus } from "./generated/NativeInputStatus.js";
 export type { NativeOutputStatus } from "./generated/NativeOutputStatus.js";
 export type { NativeOwnerStatus } from "./generated/NativeOwnerStatus.js";
+export type { NativeOwnerIoStage } from "./generated/NativeOwnerIoStage.js";
 export type { NativeServiceFailure } from "./generated/NativeServiceFailure.js";
 export type { NativeServiceSnapshot } from "./generated/NativeServiceSnapshot.js";
 export type { NativeTerminalFault } from "./generated/NativeTerminalFault.js";

@@ -87,10 +87,13 @@ const failures: readonly NativeServiceFailure[] = [
   "write_failed",
   "historical",
   "control_closed",
+  { owner_io_failed: { stage: "poll", os_error: 9 } },
+  { owner_io_failed: { stage: "wake_drain", os_error: 9 } },
+  { owner_io_failed: { stage: "wake_drain", os_error: null } },
 ];
 
-test("generation 20 requires native service facts, including historical Runs", () => {
-  assert.equal(PROTOCOL_VERSION, 20);
+test("generation 21 requires native service facts, including historical Runs", () => {
+  assert.equal(PROTOCOL_VERSION, 21);
   const live = run();
   const missing: Partial<RunInfo> = { ...live };
   delete missing.native_service;
@@ -544,9 +547,41 @@ test("public SDK retains ordered service changes, output and separate child exit
   }
 });
 
-test("generation 19 Hello cannot dispatch a generation 20 business request", async (context) => {
+test("generation 19 Hello cannot dispatch a current-generation business request", async (context) => {
   const client = await fixture(context, null, [], 19);
   await assert.rejects(client.input(ID, "abcd"), /compatible hello/);
+});
+
+test("previous-generation Hello cannot dispatch a current-generation business request", async (context) => {
+  const client = await fixture(context, null, [], PROTOCOL_VERSION - 1);
+  await assert.rejects(client.input(ID, "abcd"), /compatible hello/);
+});
+
+test("owner syscall facts reject missing, extra, unknown and invalid errno fields", () => {
+  const bad: unknown[] = [
+    { owner_io_failed: { stage: "poll" } },
+    { owner_io_failed: { os_error: 1 } },
+    { owner_io_failed: { stage: "unknown", os_error: 1 } },
+    { owner_io_failed: { stage: "poll", os_error: 1, healthy: true } },
+    { owner_io_failed: { stage: "poll", os_error: 1 }, healthy: true },
+    ...[0, -1, 0x8000_0000, 1.5, "1", Number.NaN, Number.POSITIVE_INFINITY].map(
+      (os_error) => ({ owner_io_failed: { stage: "poll", os_error } }),
+    ),
+  ];
+  for (const reason of bad) {
+    for (const value of [
+      { ...service(), owner: { type: "stopped", reason } },
+      { ...service(), output: { type: "unavailable", reason } },
+      {
+        ...service(),
+        input: { ...service().input, phase: { type: "unavailable", reason } },
+      },
+    ])
+      assert.throws(
+        () => validateServerFrame(event(value)),
+        CtxmuxInvalidFrameError,
+      );
+  }
 });
 
 test("public SDK exposes confirmed failure prefix without retrying input", async (context) => {
