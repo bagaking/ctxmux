@@ -1040,6 +1040,11 @@ fallback. A protocol-18 daemon and protocol-20 client cannot be mixed merely
 because their Run identifiers or executable names match. A deployment needs
 one exact source/binary/SDK contract and its declared recovery evidence.
 
+An existing store's format is validated before querying current-format columns
+or opening a current replay generation. An older store without `replay_file`
+therefore reports `UnsupportedSchema`, preserves its database bytes, and does
+not publish a socket. This refusal does not migrate state or restore service.
+
 ## Planned `observeForeground` read-only vertical
 
 This approved narrow design is not yet a shipped capability. The request selects only the existing `runId`. The response includes that exact Run reference and an `outcome` discriminant. `observed` carries the observation start/end interval, original root PID/incarnation and POSIX SID, foreground PGID, and the complete related processes with PID/incarnation/exec generation/SID/PGID/actual executable-entity evidence. Unknown reports a bounded cause; unsupported reports missing capability or unsupported backend/evidence. Partial data cannot be used as observed identity. Opaque physical generations are strings.

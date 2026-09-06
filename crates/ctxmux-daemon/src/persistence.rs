@@ -2814,15 +2814,17 @@ impl StateStore {
         connection
             .execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=0;")
             .map_err(PersistenceError::database)?;
-        let replay_file = if database_existed {
-            read_replay_file_name(&connection)?
+        let (runtime_id, replay_file) = if database_existed {
+            // Fence the format before querying columns owned by that format.
+            // A valid older store is unsupported, not a missing-column failure.
+            let runtime_id = validate_existing_schema(&connection)?;
+            (runtime_id, read_replay_file_name(&connection)?)
         } else {
-            format!("replay-{}.bin", Uuid::new_v4())
-        };
-        let runtime_id = if database_existed {
-            validate_existing_schema(&connection)?
-        } else {
-            create_schema(&connection, &epoch, &replay_file)?
+            let replay_file = format!("replay-{}.bin", Uuid::new_v4());
+            (
+                create_schema(&connection, &epoch, &replay_file)?,
+                replay_file,
+            )
         };
         validate_replay_file_name(&replay_file)?;
         let replay_path = replay_dir.join(&replay_file);

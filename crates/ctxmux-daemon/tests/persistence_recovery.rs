@@ -668,6 +668,67 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prior_schema_without_replay_column_is_rejected_without_mutating_data() {
+    let _permit = daemon_spawn_permit().await;
+    let temp = TempDir::new().unwrap();
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir(&state_dir).unwrap();
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = state_dir.join("state.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA user_version=4;
+         CREATE TABLE runtime_meta (
+             singleton INTEGER PRIMARY KEY,
+             schema_version INTEGER NOT NULL,
+             runtime_id TEXT NOT NULL,
+             current_epoch TEXT NOT NULL
+         );
+         INSERT INTO runtime_meta VALUES
+         (1, 4, '00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002');
+         CREATE TABLE retained_evidence (bytes BLOB NOT NULL);
+         INSERT INTO retained_evidence VALUES (X'00FF1B5B313B3248');",
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let original = std::fs::read(&database).unwrap();
+    let socket = temp.path().join("ctxmux.sock");
+    let output = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .output()
+        .expect("run selected daemon against an older format");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("unsupported ctxmux state schema 4; expected 6"),
+        "{error}"
+    );
+    assert!(!error.contains("no such column"), "{error}");
+    assert!(
+        !socket.exists(),
+        "unsupported state must never publish service"
+    );
+    assert_eq!(
+        std::fs::read(&database).unwrap(),
+        original,
+        "refusal must preserve the exact database, including opaque retained bytes"
+    );
+    assert!(!state_dir.join("state.sqlite3-wal").exists());
+    assert!(
+        std::fs::read_dir(state_dir.join("replay"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "refusal must not create a current-format replay generation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn state_lock_and_unknown_schema_fail_before_socket_publication() {
     let temp = TempDir::new().expect("create state ownership fixture directory");
     let state_dir = temp.path().join("state");
