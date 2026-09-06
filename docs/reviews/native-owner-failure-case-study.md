@@ -158,6 +158,47 @@ original request and confirmed prefix, and demonstrate another original Run's
 input, output and Ctrl+C. Screen restoration or a replacement shell cannot
 stand in for original child continuity.
 
+## Qualified repairs and remaining failures
+
+A controlled upgrade failure exposed another causal owner boundary: loss of
+non-output observations closed an attachment while an admitted input was still
+partially written. That destroyed its unique response owner and released upgrade
+ownership before the actual result. The repair retains admitted results through
+send and flush, explicitly refuses unadmitted controls, and keeps view loss
+separate from child death. The original six upgrade cases pass on their bound
+candidate; that result does not reconstruct the first incident's missing stack.
+
+A fixed 256-event client queue could also turn view pressure into a protocol
+failure, destroying pending input results. The client repair uses separately
+configurable payload and envelope windows, preserves the original payload
+window, exposes local observation loss and keeps validated admitted results
+alive. Actual connected-client tests retain the input result and clean Detach;
+a wrongly correlated result still fails. This policy bounds retained view work,
+not total process RSS; its additional envelope allowance has a memory cost.
+
+The daemon's fixed command-first polling then starved observation delivery in
+the original thousand-input pipeline. Fair polling passes the unchanged byte,
+resize and Stop oracle; reinstating only the old priority produces a failure.
+Neither the daemon ring size nor its byte budget was increased for that proof.
+The ring's remaining population policy is a separate unresolved resource audit.
+
+The finite normal-height repair has macOS and Linux evidence. A clean normal
+artifact producer generates the release package. Its actual new daemon is
+independently checked by upgrading two original live Runs with two Clients:
+identities and child PIDs survive, exact bytes and six hundred colored rows
+remain, and shrink, growth, reattachment, Ctrl+C and the second Run's input and
+Stop pass both public terminal consumers. This does not qualify all alternate
+screen state, already damaged history, or old input pending across that height
+upgrade. The existing alternate-screen seed discrepancy remains recorded.
+
+The complete joined Native lifecycle invocation passes 52 of 55 cases. Two
+failures identify old fixtures that reject the current protocol generation or
+legal service events. The third is a genuine lifetime failure: under a loud
+persistent fleet, a successful Stop is followed by Remove refusal because
+collectable quiescence has not completed. Repair and same-workload revalidation
+remain required. Occasional startup deadline failures, allocation-before-budget
+paths, complete resource costs and final AgentMux usage also remain open.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |
@@ -193,6 +234,6 @@ capacity, fidelity and recovery. A green fixture proves only its actual oracle.
 The evidence does not establish deliberate reward hacking; the repair is to
 remove misleading objectives and strengthen causal ownership.
 
-Original incident trigger, proactive service observations, fair input and final
+Original incident trigger, complete service and input qualification, and final
 joined consumer acceptance remain open. Source review, a passing author slice,
 installation and complete product acceptance are separate facts.
