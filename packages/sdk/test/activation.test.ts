@@ -38,6 +38,12 @@ const execFile = promisify(execFileCallback);
 const repositoryRoot = resolve(import.meta.dirname, "../../..");
 const daemonBinary =
   process.env.CTXMUXD_BIN ?? join(repositoryRoot, "target/debug/ctxmuxd");
+const fixtureBinary = process.env.CTXMUX_FIXTURE_BIN;
+if (fixtureBinary === undefined) {
+  throw new Error(
+    "Run SDK process tests through the repository test:e2e command, which builds their fixture executable",
+  );
+}
 const testTimeScale = readTestTimeScale();
 
 /**
@@ -406,26 +412,21 @@ test(
 trap '' INT TERM
 sleep 30`,
     );
-    // Ordering, not budget, is what makes this test deterministic. The launcher
-    // records its pid and only then hangs; the assertions below need that pid to
-    // prove teardown reached the process. If the readiness deadline fires while
-    // the shell is still starting, activation correctly kills the group before
-    // the pid is ever written, and no later wait can recover it — the file is
-    // gone for good, so the test fails on a missing side effect rather than on
-    // the cleanup it means to check. Waiting for the pid *here*, before the
-    // budget can elapse, removes the race instead of widening it. The launcher
-    // ignores INT/TERM so it still never becomes ready, and the readiness
-    // timeout below is still the thing being asserted.
+    // Execute the existing build-owned fixture, then load this shell program
+    // as data. A freshly created shebang inode can remain in interpreter loading
+    // until activation legitimately kills it, before any PID marker exists.
+    // The marker proves the deliberately non-ready launcher actually entered
+    // its body; the original readiness and cleanup budgets remain unchanged.
     const pidWritten = waitForCondition(() => exists(pidFile));
-    // The budget must clear worst-case shell startup, measured at 104-709ms
-    // here, so the timeout is reached by a launcher that is genuinely up and
-    // refusing to signal readiness rather than by one still being spawned.
     await assert.rejects(
       activateRuntime({
-        executable: timeoutLauncher,
+        executable: fixtureBinary,
         socketPath: timeoutSocket,
         timeoutMs: scaled(3_000),
-        env: { CTXMUX_ACTIVATION_PID_FILE: pidFile },
+        env: {
+          CTXMUX_FIXTURE_TMUX_SCRIPT: timeoutLauncher,
+          CTXMUX_ACTIVATION_PID_FILE: pidFile,
+        },
       }),
       (error: unknown) =>
         error instanceof CtxmuxActivationReadinessError &&
@@ -453,7 +454,8 @@ sleep 30`,
     // is about which error the crash produces, never about who won the race.
     await assert.rejects(
       activateRuntime({
-        executable: crashLauncher,
+        executable: fixtureBinary,
+        env: { CTXMUX_FIXTURE_TMUX_SCRIPT: crashLauncher },
         socketPath: crashSocket,
         timeoutMs: scaled(10_000),
       }),
@@ -480,10 +482,13 @@ exec "$CTXMUXD_REAL" --socket "$socket"`,
     );
     await assert.rejects(
       activateRuntime({
-        executable: mismatchLauncher,
+        executable: fixtureBinary,
         socketPath: mismatchSocket,
         timeoutMs: scaled(5_000),
-        env: { CTXMUXD_REAL: daemonBinary },
+        env: {
+          CTXMUX_FIXTURE_TMUX_SCRIPT: mismatchLauncher,
+          CTXMUXD_REAL: daemonBinary,
+        },
       }),
       (error: unknown) =>
         error instanceof CtxmuxActivationReadinessError &&
@@ -526,7 +531,8 @@ test(
     const started = performance.now();
     await assert.rejects(
       activateRuntime({
-        executable: crashLauncher,
+        executable: fixtureBinary,
+        env: { CTXMUX_FIXTURE_TMUX_SCRIPT: crashLauncher },
         socketPath: join(directory, "deadline-crash.sock"),
         timeoutMs: generousBudget,
       }),
@@ -576,7 +582,8 @@ test(
     const started = performance.now();
     await assert.rejects(
       activateRuntime({
-        executable: crashLauncher,
+        executable: fixtureBinary,
+        env: { CTXMUX_FIXTURE_TMUX_SCRIPT: crashLauncher },
         socketPath,
         timeoutMs: generousBudget,
       }),
@@ -674,7 +681,6 @@ async function launcher(
 ): Promise<string> {
   const path = join(directory, name);
   await writeFile(path, `#!/bin/sh\nset -eu\n${body}\n`);
-  await chmod(path, 0o755);
   return path;
 }
 

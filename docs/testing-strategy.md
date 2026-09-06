@@ -232,6 +232,14 @@ Readiness uses protocol checkpoints or bounded state polling, never an
 unexplained sleep. Every fixture receives a private socket, directory, process
 namespace, fixed geometry, explicit environment, deadline, and failure trace.
 
+SDK activation launcher fixtures execute the Cargo-built test-support binary
+and load their shell programs as data. The repository `test:e2e` command builds
+and explicitly supplies this executable. A newly created shebang file can stall
+before its body runs; a missing PID marker then does not prove timeout cleanup
+of the intended hostile launcher. Keep the real process identity, launcher
+readiness marker, activation deadline, and cleanup assertions. Changing the
+fixture launch mechanism does not authorize increasing those budgets.
+
 The tmux public-boundary suite additionally requires:
 
 - mixed live/dead discovery where an unrelated dead pane cannot hide a live
