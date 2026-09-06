@@ -24,14 +24,66 @@ const TEXT_MODE_ITALIC: u8 = 0b0000_0010;
 const TEXT_MODE_UNDERLINE: u8 = 0b0000_0100;
 const TEXT_MODE_INVERSE: u8 = 0b0000_1000;
 
+// Four independent style bits leave two bits for each color's three semantic
+// variants (default, indexed, RGB). RGB payloads remain three full bytes each.
+// Together this is seven bytes, avoiding enum padding in every retained cell.
+const FOREGROUND_KIND_SHIFT: u8 = 4;
+const BACKGROUND_KIND_SHIFT: u8 = 6;
+const COLOR_KIND_MASK: u8 = 0b11;
+
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
-    pub fgcolor: Color,
-    pub bgcolor: Color,
-    pub mode: u8,
+    foreground: [u8; 3],
+    background: [u8; 3],
+    mode: u8,
 }
 
 impl Attrs {
+    fn decode_color(payload: [u8; 3], kind: u8) -> Color {
+        match kind {
+            0 => Color::Default,
+            1 => Color::Idx(payload[0]),
+            2 => Color::Rgb(payload[0], payload[1], payload[2]),
+            _ => unreachable!("only the three Color variants can be encoded"),
+        }
+    }
+
+    fn encode_color(color: Color) -> ([u8; 3], u8) {
+        match color {
+            Color::Default => ([0; 3], 0),
+            Color::Idx(index) => ([index, 0, 0], 1),
+            Color::Rgb(red, green, blue) => ([red, green, blue], 2),
+        }
+    }
+
+    pub fn fgcolor(&self) -> Color {
+        Self::decode_color(
+            self.foreground,
+            (self.mode >> FOREGROUND_KIND_SHIFT) & COLOR_KIND_MASK,
+        )
+    }
+
+    pub fn bgcolor(&self) -> Color {
+        Self::decode_color(
+            self.background,
+            (self.mode >> BACKGROUND_KIND_SHIFT) & COLOR_KIND_MASK,
+        )
+    }
+
+    pub fn set_fgcolor(&mut self, color: Color) {
+        let (payload, kind) = Self::encode_color(color);
+        self.foreground = payload;
+        self.mode = (self.mode & !(COLOR_KIND_MASK << FOREGROUND_KIND_SHIFT))
+            | (kind << FOREGROUND_KIND_SHIFT);
+    }
+
+    pub fn set_bgcolor(&mut self, color: Color) {
+        let (payload, kind) = Self::encode_color(color);
+        self.background = payload;
+        self.mode = (self.mode & !(COLOR_KIND_MASK << BACKGROUND_KIND_SHIFT))
+            | (kind << BACKGROUND_KIND_SHIFT);
+    }
+
     pub fn bold(&self) -> bool {
         self.mode & TEXT_MODE_BOLD != 0
     }
@@ -88,15 +140,15 @@ impl Attrs {
 
         let attrs = crate::term::Attrs::default();
 
-        let attrs = if self.fgcolor == other.fgcolor {
+        let attrs = if self.fgcolor() == other.fgcolor() {
             attrs
         } else {
-            attrs.fgcolor(self.fgcolor)
+            attrs.fgcolor(self.fgcolor())
         };
-        let attrs = if self.bgcolor == other.bgcolor {
+        let attrs = if self.bgcolor() == other.bgcolor() {
             attrs
         } else {
-            attrs.bgcolor(self.bgcolor)
+            attrs.bgcolor(self.bgcolor())
         };
         let attrs = if self.bold() == other.bold() {
             attrs

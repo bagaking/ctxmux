@@ -297,3 +297,49 @@ mod checkpoint_bytes {
             .map_err(D::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn public_sgr_preserves_all_indexed_colors_and_independent_styles() {
+        for index in 0..=u8::MAX {
+            for style in 0..16_u8 {
+                let mut sgr = vec!["0".to_owned()];
+                for (bit, code) in [(1, "1"), (2, "3"), (4, "4"), (8, "7")] {
+                    if style & bit != 0 {
+                        sgr.push(code.to_owned());
+                    }
+                }
+                let rgb = (index, u8::MAX - index, index.rotate_left(3));
+                let bytes = format!(
+                    "\x1b[{};38;5;{index};48;2;{};{};{}mX\x1b[39mY\x1b[49;22;23;24;27mZ",
+                    sgr.join(";"),
+                    rgb.0,
+                    rgb.1,
+                    rgb.2,
+                );
+                let mut parser = vt100::Parser::new(1, 3, 0);
+                parser.process(bytes.as_bytes());
+                for (column, foreground) in
+                    [(0, vt100::Color::Idx(index)), (1, vt100::Color::Default)]
+                {
+                    let cell = parser.screen().cell(0, column).unwrap();
+                    assert_eq!(cell.fgcolor(), foreground);
+                    assert_eq!(cell.bgcolor(), vt100::Color::Rgb(rgb.0, rgb.1, rgb.2));
+                    assert_eq!(
+                        [cell.bold(), cell.italic(), cell.underline(), cell.inverse()],
+                        [
+                            style & 1 != 0,
+                            style & 2 != 0,
+                            style & 4 != 0,
+                            style & 8 != 0
+                        ]
+                    );
+                }
+                let mut plain = vt100::Parser::new(1, 1, 0);
+                plain.process(b"Z");
+                assert_eq!(parser.screen().cell(0, 2), plain.screen().cell(0, 0));
+            }
+        }
+    }
+}

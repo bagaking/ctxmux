@@ -713,13 +713,13 @@ impl Screen {
     /// Returns the currently active foreground color.
     #[must_use]
     pub fn fgcolor(&self) -> crate::attrs::Color {
-        self.attrs.fgcolor
+        self.attrs.fgcolor()
     }
 
     /// Returns the currently active background color.
     #[must_use]
     pub fn bgcolor(&self) -> crate::attrs::Color {
-        self.attrs.bgcolor
+        self.attrs.bgcolor()
     }
 
     /// Returns whether newly drawn text should be rendered with the bold text
@@ -767,10 +767,9 @@ impl Screen {
     }
 
     fn erase_attrs(&self) -> crate::attrs::Attrs {
-        crate::attrs::Attrs {
-            bgcolor: self.attrs.bgcolor,
-            ..crate::attrs::Attrs::default()
-        }
+        let mut attrs = crate::attrs::Attrs::default();
+        attrs.set_bgcolor(self.attrs.bgcolor());
+        attrs
     }
     fn update_erase_attrs(&mut self) {
         let attrs = self.erase_attrs();
@@ -1418,23 +1417,29 @@ impl Screen {
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
                 &[n] if (30..=37).contains(&n) => {
-                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 30);
+                    self.attrs
+                        .set_fgcolor(crate::attrs::Color::Idx(to_u8!(n) - 30));
                 }
                 &[38, 2, r, g, b] => {
-                    self.attrs.fgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
+                    self.attrs.set_fgcolor(crate::attrs::Color::Rgb(
+                        to_u8!(r),
+                        to_u8!(g),
+                        to_u8!(b),
+                    ));
                 }
                 &[38, 5, i] => {
-                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(i));
+                    self.attrs.set_fgcolor(crate::attrs::Color::Idx(to_u8!(i)));
                 }
                 &[38] => match next_param!() {
                     &[2] => {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.fgcolor = crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.set_fgcolor(crate::attrs::Color::Rgb(r, g, b));
                     }
                     &[5] => {
-                        self.attrs.fgcolor = crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs
+                            .set_fgcolor(crate::attrs::Color::Idx(next_param_u8!()));
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1454,26 +1459,32 @@ impl Screen {
                     }
                 },
                 &[39] => {
-                    self.attrs.fgcolor = crate::attrs::Color::Default;
+                    self.attrs.set_fgcolor(crate::attrs::Color::Default);
                 }
                 &[n] if (40..=47).contains(&n) => {
-                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 40);
+                    self.attrs
+                        .set_bgcolor(crate::attrs::Color::Idx(to_u8!(n) - 40));
                 }
                 &[48, 2, r, g, b] => {
-                    self.attrs.bgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
+                    self.attrs.set_bgcolor(crate::attrs::Color::Rgb(
+                        to_u8!(r),
+                        to_u8!(g),
+                        to_u8!(b),
+                    ));
                 }
                 &[48, 5, i] => {
-                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(i));
+                    self.attrs.set_bgcolor(crate::attrs::Color::Idx(to_u8!(i)));
                 }
                 &[48] => match next_param!() {
                     &[2] => {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.bgcolor = crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.set_bgcolor(crate::attrs::Color::Rgb(r, g, b));
                     }
                     &[5] => {
-                        self.attrs.bgcolor = crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs
+                            .set_bgcolor(crate::attrs::Color::Idx(next_param_u8!()));
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1493,13 +1504,15 @@ impl Screen {
                     }
                 },
                 &[49] => {
-                    self.attrs.bgcolor = crate::attrs::Color::Default;
+                    self.attrs.set_bgcolor(crate::attrs::Color::Default);
                 }
                 &[n] if (90..=97).contains(&n) => {
-                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 82);
+                    self.attrs
+                        .set_fgcolor(crate::attrs::Color::Idx(to_u8!(n) - 82));
                 }
                 &[n] if (100..=107).contains(&n) => {
-                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 92);
+                    self.attrs
+                        .set_bgcolor(crate::attrs::Color::Idx(to_u8!(n) - 92));
                 }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {

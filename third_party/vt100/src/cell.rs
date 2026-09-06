@@ -115,13 +115,13 @@ impl Cell {
     /// Returns the foreground color of the cell.
     #[must_use]
     pub fn fgcolor(&self) -> crate::attrs::Color {
-        self.attrs.fgcolor
+        self.attrs.fgcolor()
     }
 
     /// Returns the background color of the cell.
     #[must_use]
     pub fn bgcolor(&self) -> crate::attrs::Color {
-        self.attrs.bgcolor
+        self.attrs.bgcolor()
     }
 
     /// Returns whether the cell should be rendered with the bold text

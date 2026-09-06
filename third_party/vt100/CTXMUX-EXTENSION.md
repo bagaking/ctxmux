@@ -99,3 +99,15 @@ retained content which the candidate preserves. Diagnostic working-history
 experiments do not turn these failures into original-contract passes.
 Daemon allocation funding and complete joined lifecycle/consumer acceptance
 are separate open work. This extension does not claim full xterm fidelity.
+
+## Cell rendition storage
+
+Rendition stores two complete three-byte color payloads and one byte containing
+four independent style bits and the two-bit tag of each Color variant. This
+seven-byte representation removes enum padding from each Cell. It preserves all
+256 indexed colors, full RGB colors, independent styles and default reset
+semantics. Grapheme payload, wide pairs, history rows and parser behavior retain
+their existing contracts; this is a storage representation change. Owning
+verification exercises public SGR color/style/reset behavior and the existing
+checkpoint, resize, Unicode and external xterm qualification suites. Whole-Run
+resource and latency effects require executed workload evidence.
