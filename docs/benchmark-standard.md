@@ -132,3 +132,10 @@ environment. Verify cleanup of owned children, daemon and clients. Keep private
 hostnames, user paths, credentials and timestamped operational receipts out of
 commits; repository reports use anonymous host labels and relative evidence
 references. Failure records remain available privately.
+
+## Recorded native scale baseline
+
+The [Run scale baseline and failure review](reviews/run-scale-baseline.md) records
+the executed default and separately funded arms, including the failed persistent
+soak, unexecuted frontier, resource cost and qualification gaps. Its failed
+results are evidence, not replacement acceptance criteria.
