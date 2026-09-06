@@ -850,6 +850,21 @@ replay window across cold daemon restart. On intentional `SIGHUP`, the daemon
 instead performs an exec-in-place upgrade: its PID, listener inode, state lock,
 live child and PTY masters, Runtime ID, daemon instance, input cursors and
 settled ledgers survive; attachments reconnect from their own output cursors.
+The serving daemon retains its executable route at startup, before a later
+replacement can make Linux report its running image as deleted. A verified
+absolute, relative or PATH symlink launch route selects the replacement at
+upgrade time; startup resolution failure refuses the upgrade before extraction
+and leaves the original Runs serving. Linux pins the native executable descriptor
+through probe and exec, closing it in the incoming image; atomic replacement or
+unlink of its install route during drain cannot redirect that attempt. A validated
+handoff retains the outgoing owner's selected install route for the next upgrade.
+This uses the kernel descriptor path in procfs, which must be available. It does
+not freeze external in-place writes to the same file, changes to an ELF loader, or
+host failures; those are outside this qualification. Other platforms continue
+using path preflight and do not gain this concurrent-install guarantee.
+Replacement routing and schema preflight
+are prerequisites, not proof of cross-generation compatibility.
+
 The incoming image reconstructs its build ID, `platform`, `arch`, and advertised
 capability record from the new image and active persistence mode; they are not
 handoff authority or attestation.

@@ -4498,6 +4498,266 @@ async fn a_silent_natural_exit_is_detected_by_the_signal_relay() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public two-Run fixture proves the selected replacement inode, live identity and both client boundaries"
+)]
+async fn qualify_replaced_upgrade_route(route: &str) {
+    let _permit = daemon_spawn_permit().await;
+    let directory = Arc::new(tempfile::tempdir().expect("create replacement fixture"));
+    let root = directory.path();
+    let current = root.join("current");
+    std::fs::create_dir(&current).unwrap();
+    let image = current.join("ctxmuxd");
+    std::fs::copy(env!("CARGO_BIN_EXE_ctxmuxd"), &image).unwrap();
+    let socket = root.join("ctxmux.sock");
+    let mut command = match route {
+        "absolute" | "unlink_during_probe" | "missing_image" => Command::new(&image),
+        "spoof_absolute" | "spoof_relative" => {
+            use std::os::unix::process::CommandExt as _;
+            let spoof = root.join("spoof");
+            std::fs::copy(&image, &spoof).unwrap();
+            let mut command = Command::new(&image);
+            command.arg0(if route == "spoof_absolute" {
+                spoof
+            } else {
+                PathBuf::from("./spoof")
+            });
+            command
+        }
+        "relative" => Command::new("./current/ctxmuxd"),
+        "path_symlink" => {
+            let bin = root.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            std::os::unix::fs::symlink(&image, bin.join("ctxmuxd")).unwrap();
+            let mut command = Command::new("ctxmuxd");
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            command.env("PATH", std::env::join_paths(paths).unwrap());
+            command
+        }
+        _ => panic!("unknown fixture route"),
+    };
+    let mut child = command
+        .current_dir(root)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--state-dir")
+        .arg(root.join("state"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the real selected daemon");
+    let stderr = TestDaemon::drain_stderr(&mut child);
+    let mut daemon =
+        TestDaemon::from_spawned_with_stderr(child, Arc::clone(&directory), &socket, Some(stderr))
+            .await;
+    let identity = daemon.client.runtime_info().await.unwrap();
+    let daemon_pid = daemon.child.id();
+    let socket_inode = std::fs::metadata(&socket).unwrap().ino();
+    let clients = [Client::new(&socket), Client::new(&socket)];
+    let mut survivors = Vec::new();
+    for (index, client) in clients.iter().enumerate() {
+        let run = client.start(interactive_shell()).await.unwrap();
+        let (mut view, snapshot) = client.attach(run.id, 0).await.unwrap();
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        wait_for_output(&mut view, &mut bytes, &mut cursor, b"READY").await;
+        let line = format!("before-{index}\n");
+        view.input(line.into_bytes()).await.unwrap();
+        wait_for_output(
+            &mut view,
+            &mut bytes,
+            &mut cursor,
+            format!("OUT:before-{index}").as_bytes(),
+        )
+        .await;
+        view.detach().await.unwrap();
+        survivors.push((run, cursor));
+    }
+    // Same executable bytes, a distinct file generation: Linux /proc proves
+    // which inode was actually exec'd, rather than inferring exec from Hello.
+    let incoming = root.join("incoming");
+    std::fs::create_dir(&incoming).unwrap();
+    let replacement = incoming.join("ctxmuxd");
+    std::fs::copy(env!("CARGO_BIN_EXE_ctxmuxd"), &replacement).unwrap();
+    match route {
+        "absolute" | "unlink_during_probe" | "spoof_absolute" | "spoof_relative" => {
+            std::fs::rename(&replacement, &image).unwrap();
+        }
+        "missing_image" => std::fs::remove_file(&image).unwrap(),
+        "relative" => {
+            let retired = root.join("retired");
+            std::fs::rename(&current, &retired).unwrap();
+            std::fs::remove_file(retired.join("ctxmuxd")).unwrap();
+            std::fs::create_dir(&current).unwrap();
+            std::fs::rename(&replacement, &image).unwrap();
+        }
+        "path_symlink" => {
+            let link = root.join("bin/next");
+            std::os::unix::fs::symlink(&replacement, &link).unwrap();
+            std::fs::rename(link, root.join("bin/ctxmuxd")).unwrap();
+        }
+        _ => unreachable!(),
+    }
+    let selected = if route == "path_symlink" {
+        &replacement
+    } else {
+        &image
+    };
+    let expected = if route == "missing_image" {
+        std::fs::metadata(format!("/proc/{daemon_pid}/exe")).unwrap()
+    } else {
+        std::fs::metadata(selected).unwrap()
+    };
+    let remover = (route == "unlink_during_probe")
+        .then(|| unlink_upgrade_route_on_probe(selected, daemon_pid));
+    daemon.sighup();
+    if let Some(remover) = remover {
+        remover.join().unwrap().unwrap();
+        assert!(
+            !selected.exists(),
+            "fixture must remove the pathname before resumed exec"
+        );
+    }
+    if route == "missing_image" {
+        let refusal = daemon
+            .wait_stderr_line(
+                "aborted before extract, continuing to serve",
+                10,
+                "missing image must refuse reversibly",
+            )
+            .await;
+        assert!(refusal.contains("upgrade executable handle"));
+    } else {
+        daemon.wait_resume_signal(10).await;
+    }
+    let executed = std::fs::metadata(format!("/proc/{daemon_pid}/exe")).unwrap();
+    assert_eq!(
+        (executed.dev(), executed.ino()),
+        (expected.dev(), expected.ino()),
+        "exec must select the replacement image through the startup route"
+    );
+    assert!(daemon.child.try_wait().unwrap().is_none());
+    assert_eq!(std::fs::metadata(&socket).unwrap().ino(), socket_inode);
+    let resumed = daemon.client.runtime_info().await.unwrap();
+    assert_eq!(resumed.runtime_id, identity.runtime_id);
+    assert_eq!(resumed.daemon_instance_id, identity.daemon_instance_id);
+    for (index, (run, cursor)) in survivors.into_iter().enumerate() {
+        let client = &clients[index];
+        let status = client.status(run.id).await.unwrap();
+        assert_eq!(status.pid, run.pid);
+        assert_eq!(status.spec, run.spec);
+        assert!(process_exists(run.pid.unwrap()));
+        let (mut view, snapshot) = client.attach(run.id, cursor).await.unwrap();
+        assert!(!snapshot.replay.truncated);
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut latest = cursor;
+        for chunk in &snapshot.replay.chunks {
+            assert_eq!(chunk.start_byte, latest);
+            latest = chunk.end_byte;
+        }
+        let line = format!("after-{index}\n");
+        view.input(line.into_bytes()).await.unwrap();
+        wait_for_output(
+            &mut view,
+            &mut bytes,
+            &mut latest,
+            format!("OUT:after-{index}").as_bytes(),
+        )
+        .await;
+        view.detach().await.unwrap();
+        stop_run(client, run.id).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_ignores_spoofed_absolute_argv0() {
+    qualify_replaced_upgrade_route("spoof_absolute").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_ignores_spoofed_relative_argv0() {
+    qualify_replaced_upgrade_route("spoof_relative").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_upgrade_image_refuses_before_extract_with_two_live_runs() {
+    qualify_replaced_upgrade_route("missing_image").await;
+}
+
+#[cfg(target_os = "linux")]
+fn unlink_upgrade_route_on_probe(
+    image: &std::path::Path,
+    daemon_pid: u32,
+) -> std::thread::JoinHandle<Result<(), String>> {
+    use rustix::fs::inotify;
+    let watcher = inotify::init(inotify::CreateFlags::NONBLOCK | inotify::CreateFlags::CLOEXEC)
+        .expect("create probe-open observer");
+    inotify::add_watch(&watcher, image, inotify::WatchFlags::OPEN).unwrap();
+    let image = image.to_owned();
+    std::thread::spawn(move || {
+        // Only a file OPEN event is needed; this scratch space follows the
+        // inotify reader example and is unrelated to a runtime resource policy.
+        let mut buffer = [std::mem::MaybeUninit::uninit(); 512];
+        let mut reader = inotify::Reader::new(watcher, &mut buffer);
+        let deadline = std::time::Instant::now() + scaled(Duration::from_secs(10));
+        loop {
+            match reader.next() {
+                Ok(event) if event.events().contains(inotify::ReadFlags::OPEN) => {
+                    let arguments = std::fs::read(format!("/proc/{daemon_pid}/cmdline"))
+                        .map_err(|error| error.to_string())?;
+                    if arguments
+                        .split(|byte| *byte == 0)
+                        .any(|arg| arg == b"--handoff-fd")
+                    {
+                        return Err("observer missed the outgoing-image window".to_owned());
+                    }
+                    std::fs::remove_file(image).map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                Ok(_) | Err(rustix::io::Errno::WOULDBLOCK) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("no native version-probe OPEN within the fixture window".to_owned());
+            }
+            std::thread::yield_now();
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_survives_selected_image_unlink_during_probe() {
+    qualify_replaced_upgrade_route("unlink_during_probe").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_selects_atomically_replaced_absolute_image() {
+    qualify_replaced_upgrade_route("absolute").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_selects_recreated_relative_image_after_directory_deletion() {
+    qualify_replaced_upgrade_route("relative").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upgrade_follows_retargeted_startup_path_symlink() {
+    qualify_replaced_upgrade_route("path_symlink").await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::too_many_lines,

@@ -332,7 +332,11 @@ mod tests {
         }
         let state = tempfile::tempdir().unwrap();
         std::fs::set_permissions(state.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let refusal = crate::prepare_exec_upgrade(state.path()).unwrap_err();
+        let refusal = crate::prepare_exec_upgrade(
+            state.path(),
+            &crate::launch_executable_path(false).map_err(|error| error.to_string()),
+        )
+        .unwrap_err();
         let mut observations = Vec::new();
         for (index, run) in runs.iter().enumerate() {
             let before = server.client.status(run.id).await.unwrap();

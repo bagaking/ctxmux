@@ -441,6 +441,12 @@ impl NativeControlTurn<'_> {
         }
         self.state.stop_pending = false;
         self.state.phase = ControlPhase::Stopping;
+        #[cfg(test)]
+        if let Some(observer) = self.state.stop_prefix_observer.take() {
+            observer
+                .send(input_status(&self.state).active_confirmed_bytes)
+                .expect("Stop fixture still receives the actual fenced prefix");
+        }
         let rejected = reject_queued_inputs(
             &mut self.state,
             &ProtocolError::new(
@@ -497,6 +503,8 @@ struct NativeControlState {
     child_open: bool,
     stop_pending: bool,
     child_commands: VecDeque<ChildCommand>,
+    #[cfg(test)]
+    stop_prefix_observer: Option<std::sync::mpsc::Sender<usize>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -946,6 +954,11 @@ impl NativeControlOwner {
     #[cfg(test)]
     pub(crate) fn input_service(&self) -> NativeInputStatus {
         input_status(&self.inner.lock_state())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_stop_prefix_for_test(&self, observer: std::sync::mpsc::Sender<usize>) {
+        self.inner.lock_state().stop_prefix_observer = Some(observer);
     }
 
     fn schedule_input(&self) {
@@ -1539,6 +1552,8 @@ impl NativeControlOwner {
                     child_open: !closed,
                     stop_pending: false,
                     child_commands: VecDeque::new(),
+                    #[cfg(test)]
+                    stop_prefix_observer: None,
                 }),
                 owner_deferred: AtomicBool::new(false),
                 admission_changed: Notify::new(),

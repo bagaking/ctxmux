@@ -180,6 +180,8 @@ struct OwnerDiagnostics {
     fail_next_worker_spawn: AtomicUsize,
     #[cfg(test)]
     poll_error: Mutex<Option<Errno>>,
+    #[cfg(test)]
+    before_completion: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[cfg(test)]
@@ -971,6 +973,10 @@ fn owner_main(
         }
     }));
     let reason = result.unwrap_or(NativeServiceFailure::OwnerUnwound);
+    #[cfg(test)]
+    if let Some(capture) = mutex_lock(&diagnostics.before_completion).take() {
+        capture();
+    }
     *mutex_lock(owner_completion) = Some(reason);
     // Remove the sole retained Sender before draining. Every producer borrowed
     // its own Sender without holding this mutex; blocked sends now finish as
@@ -2497,9 +2503,15 @@ mod tests {
             assert!(Instant::now() < deadline, "real PTY fills before Stop");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let confirmed = control.input_service().active_confirmed_bytes;
-        assert!(confirmed < data.len());
+        let earlier_confirmed = control.input_service().active_confirmed_bytes;
+        assert!(earlier_confirmed < data.len());
+        let (prefix_tx, prefix_rx) = std::sync::mpsc::channel();
+        // Stop admission queues work; the physical fence may follow another
+        // actual write. Observe the counter under that fence's owner lock.
+        control.observe_stop_prefix_for_test(prefix_tx);
         let stop = control.begin_stop().unwrap();
+        let confirmed = prefix_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(confirmed >= earlier_confirmed && confirmed < data.len());
         let failure = tokio::time::timeout(Duration::from_secs(3), first.resolve())
             .await
             .unwrap()
@@ -2583,7 +2595,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let confirmed = controls[1].input_service().active_confirmed_bytes;
+        let earlier_confirmed = controls[1].input_service().active_confirmed_bytes;
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let held = controls[0].clone();
@@ -2602,8 +2614,21 @@ mod tests {
             commands.clone()
         };
         owner.owner_wake().wake();
+        // The sampled EAGAIN prefix can grow before the owner retires.
+        // Read its exact final prefix on the physical completion boundary,
+        // before settlement clears active state, with no intervening I/O turn.
+        let (prefix_tx, prefix_rx) = mpsc::channel();
+        let input = controls[1].clone();
+        *crate::mutex_lock(&owner.inner.diagnostics.before_completion) =
+            Some(Box::new(move || {
+                prefix_tx
+                    .send(input.input_service().active_confirmed_bytes)
+                    .unwrap();
+            }));
         commands.send(super::OwnerCommand::UnwindForTest).unwrap();
         owner.owner_wake().wake();
+        let confirmed = prefix_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(confirmed >= earlier_confirmed);
         drop(commands);
         let completed_while_busy = tokio::time::timeout(Duration::from_secs(2), async {
             while !owner.inner.completion_finished.load(Ordering::Acquire) {
@@ -2755,7 +2780,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let confirmed = controls[1].input_service().active_confirmed_bytes;
+        let earlier_confirmed = controls[1].input_service().active_confirmed_bytes;
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let held = controls[0].clone();
@@ -2774,8 +2799,22 @@ mod tests {
             commands.clone()
         };
         owner.owner_wake().wake();
+        // The sampled EAGAIN prefix can grow before the owner retires.
+        // Read its exact final prefix on the physical completion boundary,
+        // before settlement clears active state, with no intervening I/O turn.
+        let (prefix_tx, prefix_rx) = mpsc::channel();
+        let input = controls[1].clone();
+        *crate::mutex_lock(&owner.inner.diagnostics.before_completion) =
+            Some(Box::new(move || {
+                prefix_tx
+                    .send(input.input_service().active_confirmed_bytes)
+                    .unwrap();
+            }));
         commands.send(super::OwnerCommand::UnwindForTest).unwrap();
         owner.owner_wake().wake();
+
+        let confirmed = prefix_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(confirmed >= earlier_confirmed);
 
         // A borrowed producer can be descheduled before its send or reply.
         // Existing Runs need real failure facts before that producer retires.

@@ -629,6 +629,12 @@ async fn serve_with_manager(
     handoff: Option<crate::handoff::HandoffManifest>,
     state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
+    // Keep the selected invocation route before an installer moves/unlinks the
+    // mapped image. Linux current_exe() then names the retired/deleted inode,
+    // which cannot select the replacement at the original installation path.
+    // Failure only disables this optional upgrade attempt, never Run serving.
+    let upgrade_target =
+        launch_executable_path(handoff.is_some()).map_err(|error| error.to_string());
     let listener = Arc::new(listener);
     let _socket_guard = SocketGuard::new(socket_path.clone())?;
     apply_startup_fd_budget(&manager);
@@ -718,7 +724,7 @@ async fn serve_with_manager(
                     continue;
                 };
                 let Some(result) = drive_exec_upgrade(
-                    socket_path.clone(), state_dir.to_path_buf(), Arc::clone(&listener), Arc::clone(&manager)
+                    socket_path.clone(), state_dir.to_path_buf(), Arc::clone(&listener), Arc::clone(&manager), upgrade_target.clone()
                 ).await? else { return Ok(()); };
                 match result {
                     Ok(()) => unreachable!(
@@ -782,6 +788,98 @@ fn snapshot_stop_operations_for_upgrade(
         .map_err(|failures| UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures }))
 }
 
+/// Retain the startup executable route before Linux can report a replaced
+/// process image as deleted. Preserve a caller route only when it identifies
+/// the image that actually booted, including a symlink selected through PATH.
+fn launch_executable_path(resuming: bool) -> std::io::Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let Some(argument) = std::env::args_os().next().map(PathBuf::from) else {
+        return Ok(executable);
+    };
+    if argument.is_absolute() {
+        return Ok(
+            if resuming || std::fs::canonicalize(&argument).ok().as_ref() == Some(&executable) {
+                argument
+            } else {
+                executable
+            },
+        );
+    }
+    let Ok(directory) = std::env::current_dir() else {
+        return Ok(executable);
+    };
+    if argument
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+    {
+        let candidate = directory.join(argument);
+        return Ok(
+            if std::fs::canonicalize(&candidate).ok().as_ref() == Some(&executable) {
+                candidate
+            } else {
+                executable
+            },
+        );
+    }
+    // Preserve a PATH symlink route when it identifies the image that booted.
+    // Resolve relative PATH entries against the startup directory once.
+    if let Some(path) = std::env::var_os("PATH") {
+        for entry in std::env::split_paths(&path) {
+            let candidate = directory.join(entry).join(&argument);
+            if std::fs::canonicalize(&candidate).ok().as_ref() == Some(&executable) {
+                return Ok(candidate);
+            }
+        }
+    }
+    Ok(executable)
+}
+
+/// Linux executes the exact native image that passed preflight even if its
+/// installation route is atomically replaced or unlinked during drain. The
+/// descriptor stays CLOEXEC and closes in the incoming image. Its original
+/// route remains argv[0], so a validated handoff can retain the install route.
+#[derive(Debug)]
+struct ExecUpgradeTarget {
+    route: PathBuf,
+    execution_path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _image: OwnedFd,
+}
+
+impl ExecUpgradeTarget {
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "the shared preflight interface returns Linux descriptor-acquisition errors; pathname platforms use the subsequent native probe"
+        )
+    )]
+    fn open(route: PathBuf) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            let image = rustix::fs::open(
+                &route,
+                rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?;
+            let execution_path = PathBuf::from(format!("/proc/self/fd/{}", image.as_raw_fd()));
+            Ok(Self {
+                route,
+                execution_path,
+                _image: image,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {
+                execution_path: route.clone(),
+                route,
+            })
+        }
+    }
+}
+
 /// Perform an exec-in-place upgrade: drain, extract the live native runs, write
 /// the handoff manifest, clear CLOEXEC on exactly the descriptors that must
 /// survive, and execve this binary. On success this replaces the process image
@@ -798,7 +896,8 @@ fn snapshot_stop_operations_for_upgrade(
 /// Returns the unlinked manifest file and the verified exec target.
 fn prepare_exec_upgrade(
     state_dir: &std::path::Path,
-) -> Result<(std::fs::File, PathBuf), UpgradeAbort> {
+    upgrade_target: &Result<PathBuf, String>,
+) -> Result<(std::fs::File, ExecUpgradeTarget), UpgradeAbort> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     persistence::validate_state_dir(state_dir)
@@ -823,8 +922,11 @@ fn prepare_exec_upgrade(
             std::io::Error::from(errno),
         ))
     })?;
-    let exe = std::env::current_exe()
-        .map_err(|source| UpgradeAbort::BeforeExtract(ServerError::io("<current_exe>", source)))?;
+    let exe = upgrade_target.clone().map_err(|error| {
+        UpgradeAbort::BeforeExtract(ServerError::Shutdown {
+            failures: format!("cannot determine the startup upgrade target: {error}"),
+        })
+    })?;
     // A libtest process cannot advertise the daemon CLI's schema. The signal
     // cancellation fixture supplies a probe target; verification still runs and
     // that fixture must cancel before exec is reachable.
@@ -837,7 +939,10 @@ fn prepare_exec_upgrade(
     // refuse anything, and the incoming image's exit closes the inherited pty
     // masters — killing every live Run at once. Here the same mismatch is a log
     // line and a daemon that keeps serving.
-    crate::handoff::verify_exec_target(&exe).map_err(|reason| {
+    let exe = ExecUpgradeTarget::open(exe).map_err(|source| {
+        UpgradeAbort::BeforeExtract(ServerError::io("<upgrade executable handle>", source))
+    })?;
+    crate::handoff::verify_exec_target(&exe.execution_path).map_err(|reason| {
         UpgradeAbort::BeforeExtract(ServerError::Shutdown {
             failures: format!("exec target rejected before any live Run was risked: {reason}"),
         })
@@ -892,6 +997,7 @@ async fn drive_exec_upgrade(
     state_dir: PathBuf,
     listener: Arc<UnixListener>,
     manager: Arc<RunManager>,
+    upgrade_target: Result<PathBuf, String>,
 ) -> Result<Option<Result<(), UpgradeAbort>>, ServerError> {
     let upgrade_manager = Arc::clone(&manager);
     let upgrade_socket = socket_path.clone();
@@ -904,6 +1010,7 @@ async fn drive_exec_upgrade(
             &listener,
             &upgrade_manager,
             &worker_cancellation,
+            &upgrade_target,
         )
     });
     // Storage retries stay user-cancellable while requests are quiesced.
@@ -956,6 +1063,7 @@ fn perform_exec_upgrade(
     listener: &UnixListener,
     manager: &RunManager,
     cancellation: &Arc<UpgradeCancellation>,
+    upgrade_target: &Result<PathBuf, String>,
 ) -> Result<(), UpgradeAbort> {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -974,7 +1082,7 @@ fn perform_exec_upgrade(
             failures: "durable state requires recovery; live ownership was preserved".to_owned(),
         }));
     }
-    let (handoff_file, exe) = prepare_exec_upgrade(state_dir)?;
+    let (handoff_file, exe) = prepare_exec_upgrade(state_dir, upgrade_target)?;
 
     // Fence new request mutations and wait until every already-admitted request
     // has written its response. The fence is RAII-reversible until extraction,
@@ -1159,7 +1267,8 @@ fn perform_exec_upgrade(
 
     // Re-exec this same binary with the inherited descriptors. exec() returns
     // ONLY on failure; on success the image is replaced here.
-    let mut command = std::process::Command::new(exe);
+    let mut command = std::process::Command::new(&exe.execution_path);
+    command.arg0(&exe.route);
     command
         .arg("--socket")
         .arg(socket_path)
@@ -9410,7 +9519,8 @@ mod tests {
                 &state_dir,
                 &listener,
                 &server.manager,
-                &Arc::new(super::UpgradeCancellation::default())
+                &Arc::new(super::UpgradeCancellation::default()),
+                &super::launch_executable_path(false).map_err(|error| error.to_string())
             ),
             Err(super::UpgradeAbort::BeforeExtract(super::ServerError::Shutdown { failures }))
                 if failures == "durable state requires recovery; live ownership was preserved"
@@ -9513,6 +9623,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one signal fixture keeps the extract barrier, actual storage retry, cancellation and retained child proof together"
+    )]
     async fn signal_upgrade_cancellation(after_barrier: bool) {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("extracted");

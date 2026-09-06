@@ -165,17 +165,35 @@ async fn public_failure(fault: Fault) {
     let Some(crate::RunControl::Native(control)) = &runs[1].1.incarnation_control else {
         panic!("actual Native control");
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !control.input_service().write_blocked
-            || control.input_service().active_confirmed_bytes == 0
-        {
-            tokio::task::yield_now().await;
+    let earlier_confirmed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            // Observe the public snapshot without repeatedly borrowing the
+            // physical input-owner lock that the reactor needs to progress.
+            let input = second
+                .status(runs[1].0.id)
+                .await
+                .unwrap()
+                .native_service
+                .unwrap()
+                .input;
+            if input.write_blocked && input.active_confirmed_bytes > 0 {
+                break input.active_confirmed_bytes;
+            }
         }
     })
     .await
     .unwrap();
-    let confirmed = control.input_service().active_confirmed_bytes;
-    assert!(confirmed < operation.data.len());
+    assert!(earlier_confirmed < operation.data.len());
+    let (prefix_tx, prefix_rx) = mpsc::channel();
+    let input = control.clone();
+    // Preserve the exact final physical prefix, not a possibly earlier EAGAIN
+    // sample whose value can increase before the injected I/O fault is handled.
+    *mutex_lock(&manager.native_runs.inner.diagnostics.before_completion) =
+        Some(Box::new(move || {
+            prefix_tx
+                .send(input.input_service().active_confirmed_bytes)
+                .unwrap();
+        }));
     let reason = inject(&manager.native_runs, server.directory.path(), fault);
     tokio::time::timeout(Duration::from_secs(2), async {
         while !manager
@@ -189,6 +207,8 @@ async fn public_failure(fault: Fault) {
     })
     .await
     .unwrap();
+    let confirmed = prefix_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(confirmed >= earlier_confirmed && confirmed < operation.data.len());
     // Preserve the original failed oracle while always retiring this fixture's
     // actual retained children. A source inverse must not leak private Runs.
     let outcome = AssertUnwindSafe(async {
