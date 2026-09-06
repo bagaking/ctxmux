@@ -301,6 +301,73 @@ usage remain open. A later successful startup does not erase the failed launch
 or establish its cause. The original shared owner's exit trigger is still not
 reconstructed from a retained stack.
 
+## Unicode and drawing-coordinate qualification
+
+A separate private model and formatter candidate repairs standalone zero-width
+glyph ownership, actual wide-pair cleanup, print affinity and deletion of a
+normal-buffer wide lead at a legal shrink boundary. The original seventeen
+codec tests pass. Complete source-state comparisons under whole and single-byte
+writes have no mismatches across the same thirty-two streams. These are finite
+source laws, not full terminal restoration acceptance.
+
+Both pinned public consumers still report twenty-nine passing and three failing
+comparisons. Same-byte, same-geometry consumer self-comparisons also expose
+write-callback dependence. Transport callbacks must not become semantic Run
+state to imitate that behavior. The source and formatter inverses reproduce
+their own failures, while the three remaining cases remain red. Some accepted
+private restore plans are wrong and must never be advertised as Known.
+
+Another held-out case exposes a structural coordinate defect: a legal
+65,535-column terminal receives exactly that many ASCII bytes, a style control
+and an independently printed combining mark. Both public consumers retain the
+last cell and advance their drawing cursor to 65,536; the private model's
+16-bit column saturates at 65,535. Physical cell indices and drawing coordinates
+are different domains. The repair must represent the legitimate cursor,
+checking conversion only at actual indexing or narrower external boundaries.
+Rejecting the window or clamping the cursor would conceal the defect. Wider
+source and public-cursor contracts, saved registers, both buffers, history and
+future growth require qualification together. The private Unicode candidate
+is not integrated; direct crate lint and full resource costs remain open.
+
+## Reversible upgrade refusal and startup budget
+
+An actual downstream installation attempt retained the old daemon image.
+Its existing stderr records that the canonical candidate's `--version` probe
+did not answer within two seconds, and that the upgrade aborted before
+descriptor extraction while continuing to serve. The old daemon's exact
+implementation obtains `current_exe`, verifies that target, and only then
+extracts Run descriptors and executes the replacement. An old mapped image in
+the installer's backup directory does not establish that execution selected
+that backup. Here, the explicit refusal supplies the observed failure stage.
+It is separate from the original shared output-owner loss.
+
+The existing probe starts its fixed two-second clock after child spawn,
+polls every ten milliseconds and terminates only its own probe on timeout.
+Fail-closed handoff verification protects live PTYs; the unexplained fixed
+startup budget is not a structural compatibility rule. A later independent
+probe of the same candidate bytes at the packaged path exits successfully
+in milliseconds. That observation neither reconstructs the failed canonical
+launch nor proves a cold launch or signing-cost cause.
+The retained stderr has no attempt correlation token; identifying the precise
+failed launch mechanism still requires the isolated reproduction.
+
+The installation owner must measure the exact candidate after the same signed
+bundle and atomic path transition in an isolated namespace, retaining first
+launch, exit status, output, file identity and original budget results.
+Warming a candidate may assist migration from the old daemon; it does not
+repair its startup policy or qualify a cold launch. A replacement candidate
+cannot change the timeout already compiled into the serving image.
+
+The runtime repair must separate compatibility from an evidence-backed,
+configurable operational wait, retain service progress and cancellation while
+probing, drain probe output under an explicit resource policy, check exit
+success as well as schema, and bind verification to the executable actually
+selected for handoff. Public failure and stage results must accompany
+preserved Run identities and byte cursors. Timeout alone cannot establish
+rollback, and cached lifecycle cannot establish availability. The current
+production diagnosis sent no signal and changed no executable or user Run;
+the failed installation and its separate UI recovery failure remain open.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |
