@@ -61,6 +61,17 @@ process RSS: allocator overhead, library/runtime state, kernel buffers and
 socket transport also require measured RSS/FD/CPU qualification. A lower cost
 only counts as improvement when the same work and truth guarantees pass.
 
+## Independent history owners and terminal settlement
+
+Hot replay and durable replay retain independent windows. A final replay can
+legitimately span a prefix storage has already committed and retired. Terminal
+settlement skips only that retired prefix, keeps strict equality verification
+of retained overlaps and commits the contiguous new suffix. It first drains
+the terminating Run's accepted queued prefix, without a timed collection wait
+or an unrelated global drain. Ordinary replay mutation and unknown COMMIT
+outcomes retain their existing fail-closed behavior. Qualification sizes and
+retention probe sizes do not change production budgets.
+
 ## Storage and recovery
 
 SQLite format arithmetic has a separate source: this store uses 4096-byte pages,

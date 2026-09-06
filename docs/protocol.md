@@ -636,6 +636,18 @@ state still commit before terminal publication. The collection window is not a
 durability latency guarantee: queued work, sync, checkpoints, and storage retries
 can make `durable_output_bytes` lag longer.
 
+Terminal settlement first commits that Run's already accepted output prefix;
+it gathers only that Run's queued appends, without waiting for a collection
+window or placing unrelated Runs behind a global drain. Its final replay then
+supplies the unaccepted tail. The hot and durable history floors are independent:
+final replay can span an older prefix already committed and retired by storage.
+Settlement omits that retired prefix, verifies every retained overlapping byte,
+and commits the contiguous new suffix together with the terminal state. Generic
+replay mutation, changed retained bytes, recoverable missing ranges, and unknown
+COMMIT outcomes still fail closed. A recovered exited Run preserves its original
+PID as historical identity; `native_service.owner = stopped { historical }` and
+closed input/output distinguish that identity from live ownership.
+
 Retained replay is not encoded into one potentially oversized JSON value. The
 initial `attached` frame carries replay cursors and `truncated` with no retained
 chunks; each retained chunk follows as one ordinary ordered `output` event.

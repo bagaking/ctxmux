@@ -2006,18 +2006,16 @@ fn actor_main(
                 }
             }
         };
-        // Lifecycle priority cannot cross bytes already accepted by this Run
-        // but evicted from its hot cache. Recover those exact queued prefixes
-        // before Finalize uses the surviving tail. Other Runs' appends remain
-        // pending; no replay clone, larger cache or global barrier is needed.
+        // Settle this Run's accepted prefix before its terminal commit. The
+        // final replay may still contain those bytes even after disk retention
+        // retires their old prefix; letting Finalize overtake the accepted
+        // appends would make them verify history the store itself has evicted.
+        // Only this Run's queued appends are selected. Other Runs retain their
+        // queue order, and Finalize supplies any tail not already accepted.
         if let Command::Finalize { id, replay, .. } = &command
             && mutex_lock(failure).is_none()
-            && read_run_head(&store.connection, *id).is_ok_and(|head| {
-                head < replay
-                    .chunks
-                    .first()
-                    .map_or(replay.latest_output_bytes, |chunk| chunk.start_byte)
-            })
+            && read_run_head(&store.connection, *id)
+                .is_ok_and(|head| head < replay.latest_output_bytes)
         {
             let required_id = *id;
             pending_lifecycle = Some(command);
@@ -2144,24 +2142,42 @@ fn actor_main(
                         pending_lifecycle = Some(command);
                         break;
                     }
-                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                        break;
-                    };
-                    // Collection owns no SQLite transaction or replay writer.
-                    // Lifecycle senders also enqueue a wake here, so their
-                    // receipts do not have to wait for the deadline to expire.
-                    let next = match pending.pop_front().map_or_else(|| receiver.try_recv(), Ok) {
-                        Ok(command) => Ok(command),
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            Err(mpsc::RecvTimeoutError::Disconnected)
+                    // A pending finalizer needs only its already accepted
+                    // prefix. Gather that Run without a timed wait or another
+                    // Run's backlog; a refused wake must not restart the batch
+                    // timer with lifecycle work already waiting.
+                    let next = if let Some(Command::Finalize { id, .. }) = &pending_lifecycle {
+                        if *id != batch[0].0 {
+                            break;
                         }
-                        Err(mpsc::TryRecvError::Empty) => {
-                            #[cfg(test)]
-                            if let Some(notify) = mutex_lock(&test_hooks.append_wait_started).take()
-                            {
-                                let _ = notify.send(());
+                        match take_required_append(*id, &mut pending, receiver) {
+                            Some(command) => Ok(command),
+                            None => break,
+                        }
+                    } else if pending_lifecycle.is_some() {
+                        break;
+                    } else {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            break;
+                        };
+                        // Collection owns no SQLite transaction or replay writer.
+                        // Lifecycle senders also enqueue a wake here, so their
+                        // receipts need not wait for the deadline to expire.
+                        match pending.pop_front().map_or_else(|| receiver.try_recv(), Ok) {
+                            Ok(command) => Ok(command),
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                Err(mpsc::RecvTimeoutError::Disconnected)
                             }
-                            receiver.recv_timeout(remaining)
+                            Err(mpsc::TryRecvError::Empty) => {
+                                #[cfg(test)]
+                                if let Some(notify) =
+                                    mutex_lock(&test_hooks.append_wait_started).take()
+                                {
+                                    let _ = notify.send(());
+                                }
+                                receiver.recv_timeout(remaining)
+                            }
                         }
                     };
                     match next {
@@ -4532,22 +4548,52 @@ impl StateStore {
         id: RunId,
         replay: &OutputReplay,
     ) -> Result<Vec<OutputChunk>, PersistenceError> {
-        let durable_head: i64 = self
+        let (durable_head, durable_floor): (i64, i64) = self
             .connection
             .query_row(
-                "SELECT durable_output_bytes FROM runs WHERE id = ?1",
+                "SELECT durable_output_bytes, durable_first_available_byte FROM runs WHERE id = ?1",
                 [id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(PersistenceError::database)?;
-        let durable_head = u64::try_from(durable_head)
-            .map_err(|_| PersistenceError::Corrupt("negative durable head".to_owned()))?;
-        Ok(replay
+        let durable_head = nonnegative_u64(durable_head, "durable head")?;
+        let durable_floor = nonnegative_u64(durable_floor, "durable floor")?;
+        if durable_floor > durable_head {
+            return Err(PersistenceError::Corrupt(
+                "durable floor exceeds head".to_owned(),
+            ));
+        }
+        replay
             .chunks
             .iter()
             .filter(|chunk| chunk.end_byte > durable_head)
-            .cloned()
-            .collect())
+            .map(|chunk| {
+                let bytes = u64::try_from(chunk.data.len()).map_err(|_| {
+                    PersistenceError::Mutation("output chunk is too large".to_owned())
+                })?;
+                if chunk.end_byte.checked_sub(chunk.start_byte) != Some(bytes) {
+                    return Err(PersistenceError::Mutation(format!(
+                        "Run {id} final replay range does not match its bytes"
+                    )));
+                }
+                // This finalizer owns the original hot replay. Its confirmed prefix
+                // may have been evicted by global disk retention while its suffix
+                // remains uncommitted. Do not ask storage to verify bytes it has
+                // already confirmed and intentionally retired. Keep the retained
+                // overlap: apply_replay_chunk still verifies those original bytes.
+                if chunk.start_byte >= durable_floor {
+                    return Ok(chunk.clone());
+                }
+                let skipped = usize::try_from(durable_floor - chunk.start_byte).map_err(|_| {
+                    PersistenceError::Mutation("final replay prefix exceeds memory".to_owned())
+                })?;
+                Ok(OutputChunk {
+                    start_byte: durable_floor,
+                    end_byte: chunk.end_byte,
+                    data: chunk.data[skipped..].to_vec(),
+                })
+            })
+            .collect()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7495,7 +7541,7 @@ mod tests {
         },
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread,
         time::{Duration, Instant},
@@ -10725,6 +10771,203 @@ mod tests {
             recovered_bytes, whole,
             "overtaking may reorder the commits, never drop the bytes"
         );
+        drop(reopened);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one minimal eviction/finalization regression joins unchanged-byte refusal, neighboring commit and exact cold recovery"
+    )]
+    fn finalization_preserves_a_fresh_suffix_after_global_prefix_eviction() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _) =
+            StateStore::open(&state_dir, &AdmissionLimits::OPERATIONAL, None, hooks).unwrap();
+        let first = RunId::new();
+        let neighbor = RunId::new();
+        let transaction = store.connection.transaction().unwrap();
+        for id in [first, neighbor] {
+            let metadata = insert_test_run(&transaction, id, "running", 1);
+            transaction
+                .execute(
+                    "UPDATE runs SET metadata_bytes = ?2 WHERE id = ?1",
+                    params![id.to_string(), metadata],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        let first_head = Arc::new(AtomicU64::new(0));
+        let neighbor_head = Arc::new(AtomicU64::new(0));
+        store
+            .append_batch(&[
+                (
+                    first,
+                    replay(vec![chunk(0, b"abcdef")]),
+                    Arc::clone(&first_head),
+                ),
+                (
+                    neighbor,
+                    replay(vec![chunk(0, b"NEIGHBOR")]),
+                    Arc::clone(&neighbor_head),
+                ),
+            ])
+            .unwrap();
+        // Byte-sized coordinates isolate the same real eviction/overlap as
+        // the fleet failure; eight bytes is a probe policy, not product capacity.
+        let transaction = store.connection.transaction().unwrap();
+        assert!(prune_global_replay_to(&transaction, 8).unwrap());
+        transaction.commit().unwrap();
+        let floor: i64 = store
+            .connection
+            .query_row(
+                "SELECT durable_first_available_byte FROM runs WHERE id = ?1",
+                [first.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(floor, 2);
+        assert_eq!(first_head.load(Ordering::Acquire), 6);
+        let metadata = Arc::new(AtomicU64::new(0));
+        let forged = replay(vec![chunk(0, b"abCdefgh")]);
+        assert!(matches!(
+            store.finalize_with_shutdown(
+                first,
+                42,
+                &forged,
+                &exited_state(),
+                &first_head,
+                &metadata,
+                None,
+                None
+            ),
+            Err(PersistenceError::Mutation(_))
+        ));
+        let original = replay(vec![chunk(0, b"abcdefgh")]);
+        store
+            .finalize_with_shutdown(
+                first,
+                42,
+                &original,
+                &exited_state(),
+                &first_head,
+                &metadata,
+                None,
+                None,
+            )
+            .expect("confirmed evicted prefix must not reject the original fresh suffix");
+        assert_eq!(first_head.load(Ordering::Acquire), 8);
+        store
+            .append_batch(&[(
+                neighbor,
+                replay(vec![chunk(8, b"-live")]),
+                Arc::clone(&neighbor_head),
+            )])
+            .expect("neighbor keeps committing after local finalization");
+        store
+            .finalize_with_shutdown(
+                neighbor,
+                43,
+                &replay(Vec::new()),
+                &exited_state(),
+                &neighbor_head,
+                &Arc::new(AtomicU64::new(0)),
+                None,
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let (reopened, recovered) = Persistence::open(state_dir).unwrap();
+        for (id, expected, head) in [
+            (first, b"cdefgh".as_slice(), 8),
+            (neighbor, b"HBOR-live".as_slice(), 13),
+        ] {
+            let saved = recovered.iter().find(|saved| saved.info.id == id).unwrap();
+            let bytes: Vec<u8> = saved
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(bytes, expected);
+            assert_eq!(saved.info.state, exited_state());
+            assert_eq!(saved.replay.latest_output_bytes, head);
+            assert!(saved.replay.truncated);
+        }
+        drop(reopened);
+    }
+
+    #[test]
+    fn queued_prefix_eviction_during_finalization_keeps_the_actor_available() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let resources = crate::ResourceLimits {
+            durable_run_output_bytes: 8,
+            ..crate::ResourceLimits::DEFAULT
+        };
+        let (persistence, _) =
+            Persistence::open_with_resources(state_dir.clone(), resources, None).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let (reached, release) = persistence.pause_next_append();
+        assert!(durable.append(info.id, replay(vec![chunk(0, &[b'a'; 64])])));
+        reached.recv().unwrap();
+        let mut whole = vec![b'a'; 64];
+        whole.extend([b'b'; 64]);
+        whole.extend([b'c'; 64]);
+        let (reply, completed) = std::sync::mpsc::sync_channel(1);
+        assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+            id: info.id,
+            actual_pid: 42,
+            replay: replay(vec![chunk(0, &whole)]),
+            state: exited_state(),
+            source_gap_after_byte: None,
+            durable_head: Arc::clone(&durable.durable_head),
+            metadata_bytes: Arc::clone(&durable.metadata_bytes),
+            reply,
+        }));
+        assert!(durable.append(info.id, replay(vec![chunk(64, &[b'b'; 64])])));
+        assert!(durable.append(info.id, replay(vec![chunk(128, &[b'c'; 64])])));
+        release.send(()).unwrap();
+        completed.recv().unwrap().unwrap();
+        persistence.barrier().unwrap();
+        assert_eq!(durable.durable_head(), 192);
+        assert!(
+            !persistence.is_failed(),
+            "accepted bytes covered by terminal settlement must not poison the shared actor"
+        );
+        let neighbor = running_info(RunId::new());
+        let neighbor_durable = persistence
+            .insert_start(&test_operation_key(neighbor.id), &neighbor)
+            .expect("neighbor can still start after prefix eviction");
+        assert!(neighbor_durable.append(neighbor.id, replay(vec![chunk(0, b"neighbor")])));
+        persistence.barrier().unwrap();
+        neighbor_durable.finalize(neighbor.id, 43, replay(Vec::new()), exited_state());
+        assert!(!persistence.is_failed());
+        drop(neighbor_durable);
+        drop(durable);
+        persistence.assert_exclusive_owner();
+        drop(persistence);
+        let (reopened, recovered) =
+            Persistence::open_with_resources(state_dir, resources, None).unwrap();
+        for (id, expected, head) in [
+            (info.id, b"cccccccc".as_slice(), 192),
+            (neighbor.id, b"neighbor".as_slice(), 8),
+        ] {
+            let saved = recovered.iter().find(|run| run.info.id == id).unwrap();
+            let bytes: Vec<u8> = saved
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(bytes, expected);
+            assert_eq!(saved.info.state, exited_state());
+            assert_eq!(saved.info.durable_output_bytes, Some(head));
+        }
         drop(reopened);
     }
 
