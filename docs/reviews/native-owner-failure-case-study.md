@@ -237,14 +237,43 @@ failed source and oracles. Held-out partial growth can discard its hidden
 continuation while keeping the lead; a complete visible wide pair is therefore
 not a universal resize invariant. The current single-resize seed still fails
 continuation of that state. Four other held-out cases pass; that strict failure
-remains recorded, and a separate multi-stage prototype is not production proof.
+remains recorded. A separate multi-stage prototype reproduces two simple cases
+in both public consumers, but broader held-out sequences reject it: accepted
+seeds lose normal history or restore a saved cursor to the wrong row. Other
+legal sequences remain unsupported. Independent sequences without a checkpoint
+also disagree on combining characters and normal-buffer return. These facts
+require separating parser, buffer-transition and restoration defects; a new
+seed protocol alone cannot establish fidelity. None of the prototype results
+qualifies production continuation.
 
 The resource audit distinguishes local seed policy from structural validity.
-Both clients can reject a valid seed above a hardcoded 32 MiB policy as a
-protocol violation; host allocation failure can be misclassified the same way.
-Export checks after allocation cannot protect that allocation, and queued seed
-copies lack one aggregate lease across cache, sender and recovery. These remain
-open owner repairs; increasing a fixture or queue limit would not resolve them.
+Both clients previously rejected a valid seed above a hardcoded 32 MiB policy
+as a protocol violation; host allocation failure could be misclassified the
+same way. The candidate separates structural validation from configurable
+per-seed receive policy and fallible allocation. Rust passes all 27 client
+cases and a real two-Run, two-Client local-refusal proof: the same children keep
+serving raw bytes, default terminal restoration and Ctrl+C. The SDK passes 129
+cases, including actual socket assembly across the historical size boundary.
+Identity, geometry, chunk and receipt checks remain strict; no Terminal request
+silently becomes Raw. These are per-seed consumer proofs. Export checks after
+allocation still cannot protect that allocation, and queued seed copies lack
+one aggregate lease across cache, sender and recovery. Increasing a fixture or
+queue limit would not resolve those remaining owners.
+
+Compiling the complete candidate also exposed a CLI ownership defect: an
+unsettled input future borrowed the attachment that detach attempted to move.
+The candidate separates the borrowed interactive loop from attachment release.
+When an input result is unresolved, leaving closes only the view and warns
+against automatic replay. A real controlling-PTY test keeps the blocked Run
+and its identity alive, restores local terminal mode, and requires CLI exit
+before public Stop releases the blocked write. Replacing only that close with
+clean detach fails the unchanged five-second deadline. A final complete CLI
+invocation passes 20 cases with strict lint and formatting. An earlier invocation
+failed while waiting for input state; its cause is not established. The revised
+fixture explicitly observes the child's raw-mode readiness before admitting
+the same workload, and retains the original deadline and failure evidence.
+Full local stdin queues, unsent buffered input, blocking output sinks and
+activation handshakes remain separate client-owner qualification requirements.
 
 A source-bound serialization candidate removes complete base64 and JSON copies,
 checks file admission before buffering, flushes before sync and preserves atomic
