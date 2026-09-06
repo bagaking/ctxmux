@@ -191,13 +191,53 @@ Stop pass both public terminal consumers. This does not qualify all alternate
 screen state, already damaged history, or old input pending across that height
 upgrade. The existing alternate-screen seed discrepancy remains recorded.
 
-The complete joined Native lifecycle invocation passes 52 of 55 cases. Two
-failures identify old fixtures that reject the current protocol generation or
-legal service events. The third is a genuine lifetime failure: under a loud
-persistent fleet, a successful Stop is followed by Remove refusal because
-collectable quiescence has not completed. Repair and same-workload revalidation
-remain required. Occasional startup deadline failures, allocation-before-budget
-paths, complete resource costs and final AgentMux usage also remain open.
+The first complete joined Native lifecycle invocation passed 52 of 55 cases.
+Two fixtures incorrectly rejected the candidate generation or legal service
+events. Their repairs retain the incompatible-generation rejection, byte and
+resize assertions. The third failure exposed a real lifetime race: Stop reported
+terminal publication before the Native Entry and its two control holders had
+actually retired, so immediate Remove correctly refused collection. Stop now
+waits for both publication and physical retirement, with the original deadline
+and all collection fences. Reinstating only the old success predicate makes all
+eight loud Run removals fail again. A fresh independent invocation then passes
+all 55 original lifecycle cases without reducing workload or skipping failures.
+
+The SDK passes 107 unit cases and an independent real-daemon qualification.
+Its original thousand-input pipeline retains the default payload and metadata
+windows without background event draining. The original saturated input fleet
+also passes: the non-reading PTY reports actual queued bytes and write blocking,
+while another original Run continues output and Ctrl+C. Unapplied and uncertain
+results retain their true dispositions and confirmed prefixes. Two Clients
+reconnect to the same children and verify exact output bytes. These observations
+do not qualify aggregate client heap cost or replace the failed frozen RSS gate.
+
+The normal release producer initially embedded private build paths in its actual
+binaries. Canonical compiler remapping corrects this owner while retaining source
+filenames, line numbers and panic context under relative labels. The new clean
+release package has no occurrences of the checked private paths or machine
+username, including the expanded SDK. Its new binary independently passes the
+same two-Run planned-exec and eight-stage public-consumer proof. Debug linker
+paths are separately unqualified; no compiled binary was stripped to obtain the
+release result.
+
+The qualified height release uses protocol 18, state schema 4 and handoff schema 4. The joined candidate uses protocol 20 and state/handoff schema 6. Its same-
+candidate upgrade tests do not establish continuity from the installed release.
+Unsupported handoff must refuse before extraction and leave the original Runs
+serving; restarting or using a new namespace cannot substitute for that proof.
+
+Geometry review also exposed a real mismatch: an alternate-buffer wide lead
+survives a narrower viewport in public terminal consumers, while the derived
+model displayed a blank. Restoring that lead requires correcting right-neighbor
+drawing and erase behavior as well. Held-out partial growth can discard its
+hidden continuation while keeping the lead; a complete visible wide pair is
+therefore not a universal resize invariant. The current single-resize seed does
+not yet prove continuation of that state. Its strict failures remain recorded.
+
+Occasional startup deadline failures, allocation-before-budget paths, fixed
+history and checkpoint policies, complete resource costs and final AgentMux
+usage remain open. A later successful startup does not erase the failed launch
+or establish its cause. The original shared owner's exit trigger is still not
+reconstructed from a retained stack.
 
 ## Required completion
 
