@@ -3,6 +3,12 @@
 - Status: accepted
 - Scope: runtime ownership and local concurrency host
 
+[Decision 019](019-resource-policy-and-honest-qualification.md) owns current
+configurable admission-worker and resource policy and supersedes the fixed population
+policy historically described here. [Decision 015](015-exec-in-place-upgrade-continuity.md)
+owns persistent planned-exec continuity. Neither amendment turns an earlier
+resource census into qualification of a different source or workload.
+
 ## Context
 
 A Run must survive the client that started or viewed it. An in-process library cannot provide that guarantee after its host exits, regardless of implementation language.
@@ -23,13 +29,14 @@ writer, so setting `O_NONBLOCK` on it would also change writer semantics.
 Readiness therefore precedes every read under one unique owner.
 
 Stop and direct-exit descendant cleanup may block. The native owner hands those
-jobs FIFO to at most eight transient cleanup threads, which return the reap or
+jobs FIFO to the configured transient cleanup-worker limit (default eight),
+which returns the reap or
 fail-stop result before terminal publication. Completion releases cleanup
 admission; terminal publication then uses its own bounded finalizer budget,
 independent of cleanup admission. Public Stop waits for its own terminal
 publication, with an explicit unknown result if the bounded visibility grace
 expires; that wait consumes no cleanup slot. Unique Run creation separately
-uses a maximum of eight admitted short-lived threads. Neither bound grows with
+uses its configured admitted short-lived worker limit (default eight). Neither bound grows with
 the number of ordinary live Runs.
 
 The protocol is the stable client boundary. Rust ABI, N-API, and editor-process lifetime are not product boundaries.
@@ -54,17 +61,20 @@ The protocol is the stable client boundary. Rust ABI, N-API, and editor-process 
 ## Known constraints
 
 Daemon shutdown remains abrupt for live native children: there is no graceful
-native Run policy, live restart handoff, separate active-Run quota, global
-attachment quota, total RSS quota, or panic isolation contract. The shared
-Registry does enforce a 128-record retained/projected Run ceiling with
-ownership-safe exact replacement. Optional persistence recovers declared
-historical metadata and replay, but not live PTY authority. One daemon-wide
+native Run policy, global attachment quota, total RSS quota, or general panic
+isolation contract. Persistent planned exec preserves live authority only under
+Decision 015's compatible preflight and inherited-owner contract; cold restart
+recovers historical state and does not reconstruct live PTY authority. Registry
+admission follows Decision 019's metadata and host funding plus optional
+operator quotas, with ownership-safe exact replacement. There is no default
+128-record ceiling. One daemon-wide
 owner thread is part of the fresh-daemon fixed census, so adding ordinary live
 Runs does not change the thread count; blocking cleanup can temporarily add at
-most eight bounded cleanup workers plus a separate bounded finalizer budget. A
+most the configured cleanup workers plus a separate finalizer budget. A
 stalled cleanup can retain one cleanup slot, while durable finalization cannot
 consume another cleanup slot.
-Creation admission independently limits concurrent launches to eight,
+Creation admission independently funds concurrent launches under its configured
+worker policy (the current creation and cleanup defaults are eight),
 while its bounded shutdown drain cannot hard-cancel a launch thread that
 exceeds the deadline. Native-owner shutdown is itself bounded: the owner loop
 wakes, detaches already-started blocking cleanup workers, and then quiesces;
@@ -91,13 +101,15 @@ panic isolation, or a general daemon resource quota.
   error in `lib.rs`.
 - Covered now: client disconnect and reconnect preserve the same child PID in `native_lifecycle.rs` and `client-parity.test.ts`.
 - Candidate: daemon signal, crash, and orphan behavior.
-- Covered now: frozen 1/32/128 idle and active resource censuses measure
-  per-Run CPU, RSS, thread, and descriptor slopes; ordinary native Runs add
-  zero permanent threads, while creation and cleanup admission are each
-  independently capped at eight.
-- Covered now: memory-only and persistent Registry admission enforce the shared
-  128-record retained/projected ceiling and ownership-safe exact replacement.
-  Sustained pressure and full resource-plateau qualification remain separate.
+- Historical baseline: frozen 1/32/128 idle and active resource censuses measure
+  per-Run CPU, RSS, thread, and descriptor slopes for their bound source and
+  workloads. These sizes do not define product capacity. Current ordinary
+  native Runs add no permanent threads; creation and cleanup have independent
+  configurable admission owners. Full resource qualification remains separate.
+- Current policy: memory-only and persistent Registry admission share funded
+  metadata and optional operator record quotas, with ownership-safe exact
+  replacement. Historical 128-record assertions are not the current default;
+  Decision 019 retains their original evidence and revised acceptance scope.
 
 ## Open questions
 
