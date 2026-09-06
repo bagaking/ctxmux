@@ -31,7 +31,8 @@ pub(crate) trait RetentionVictim: Send + Sync {
 
     /// Bytes this Run currently retains in memory. Best-effort: it may change
     /// between this read and a subsequent [`reclaim_output`](Self::reclaim_output).
-    fn retained_output_bytes(&self) -> usize;
+    /// None means its local owner is busy; it is not a zero-residency claim.
+    fn retained_output_bytes(&self) -> Option<usize>;
 
     /// Already offered history that can fund a subsequent actual read.
     fn reclaimable_output_bytes(&self) -> usize;
@@ -317,8 +318,8 @@ mod tests {
             self.id
         }
 
-        fn retained_output_bytes(&self) -> usize {
-            self.retained()
+        fn retained_output_bytes(&self) -> Option<usize> {
+            Some(self.retained())
         }
 
         fn reclaimable_output_bytes(&self) -> usize {

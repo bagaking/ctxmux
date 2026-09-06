@@ -1,8 +1,150 @@
 use super::*;
+use crate::ResourceLimits;
 use crate::creation::RunRegistry;
 use crate::native_control::InputDrainGate;
 use ctxmux_protocol::{ForkFidelity, RunId, RunInfo, RunLineage};
 use std::collections::{HashSet, VecDeque};
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real two-Run FIFO and cold-recovery proof keeps its causal queue interleaving explicit"
+)]
+async fn hot_tail_finalize_fences_interleaved_real_run_prefixes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let resources = ResourceLimits {
+        hot_output_bytes: 2,
+        run_output_bytes: 1,
+        durable_replay_bytes: 2,
+        durable_run_output_bytes: 1,
+        ..ResourceLimits::DEFAULT
+    };
+    let (persistence, recovered) =
+        Persistence::open_with_resources(state_dir.clone(), resources, None).unwrap();
+    let server = InProcessServer::start(Arc::new(RunManager::persistent(
+        persistence.clone(),
+        recovered,
+    )));
+    let mut runs = Vec::new();
+    for name in ["a", "b"] {
+        let ready = temp.path().join(name);
+        let spec = RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "stty -echo -icanon min 1 time 0; : > \"$1\"; ",
+                    "while IFS= read -r line; do printf '%s' \"$line\"; ",
+                    "[ \"$line\" != Z ] || exit 0; done"
+                )
+                .to_owned(),
+                "ctxmux-fifo-fixture".to_owned(),
+                ready.to_string_lossy().into_owned(),
+            ],
+            ..long_running_spec()
+        };
+        let run = server.client.start(spec).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runs.push(run);
+    }
+    persistence.barrier().unwrap();
+    let first = server.manager.get(runs[0].id).unwrap();
+    let second = server.manager.get(runs[1].id).unwrap();
+    let (view_a, _) = server.client.attach(runs[0].id, 0).await.unwrap();
+    let (view_b, _) = server.client.attach(runs[1].id, 0).await.unwrap();
+    let (paused, release) = persistence.pause_next_append();
+    server
+        .client
+        .input(runs[0].id, b"1\n".to_vec())
+        .await
+        .unwrap();
+    paused.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A1 is in the paused actor. A2, B1, A3, B2 are accepted in exactly
+    // this order. B2 exits, so lifecycle priority must find B1 through A2,
+    // without then allowing the batch collector to overtake A2 with A3.
+    for (run, bytes, head) in [
+        (&first, b"2\n", 2),
+        (&second, b"b\n", 1),
+        (&first, b"3\n", 3),
+        (&second, b"Z\n", 2),
+    ] {
+        server.client.input(run.id, bytes.to_vec()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if run.info().latest_output_bytes == head
+                    && run
+                        .lock_owner(&run.persistence)
+                        .active()
+                        .unwrap()
+                        .next_replay_start()
+                        == head
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(second.info().durable_output_bytes, Some(0));
+    release.send(()).unwrap();
+    wait_for_exit(&server.client, runs[1].id).await;
+    assert!(!persistence.is_failed());
+    assert_eq!(second.info().durable_output_bytes, Some(2));
+    for (view, expected) in [(&view_a, b"123".as_slice()), (&view_b, b"bZ".as_slice())] {
+        let mut bytes = Vec::new();
+        let mut cursor = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while bytes.len() < expected.len() {
+                match view.next_event().await.unwrap().unwrap() {
+                    RunEvent::Output { chunk } => {
+                        assert_eq!(chunk.start_byte, cursor);
+                        cursor = chunk.end_byte;
+                        bytes.extend(chunk.data);
+                    }
+                    RunEvent::ServiceChanged { .. } => {}
+                    event => panic!(
+                        "original bytes precede every terminal or pressure marker: {event:?}"
+                    ),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(cursor, expected.len() as u64);
+    }
+    view_a.detach().await.unwrap();
+    drop(view_b);
+    assert_eq!(first.info().pid, runs[0].pid);
+    assert_eq!(second.info().pid, runs[1].pid);
+    first.stop().await.unwrap();
+    wait_for_exit(&server.client, runs[0].id).await;
+    assert_eq!(first.info().durable_output_bytes, Some(3));
+    drop(first);
+    drop(second);
+    drop(server);
+    drop(persistence);
+    let (_reopened, recovered) =
+        Persistence::open_with_resources(state_dir, resources, None).unwrap();
+    for (id, head, tail) in [
+        (runs[0].id, 3, b"3".as_slice()),
+        (runs[1].id, 2, b"Z".as_slice()),
+    ] {
+        let run = recovered.iter().find(|run| run.info.id == id).unwrap();
+        assert_eq!(run.info.durable_output_bytes, Some(head));
+        assert!(!run.info.state.is_running());
+        assert_eq!(replay_bytes(&run.replay.chunks), tail);
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_shutdown_fences_and_drains_a_cancelled_creation_owner() {
@@ -1244,12 +1386,28 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .expect("independent Stop waiter remains live during the parked finalize")
         .expect("independent Stop returns after its terminal publication");
 
-    let terminal = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
-        .await
-        .expect("terminal event arrives after finalize")
-        .expect("read terminal event")
-        .event()
-        .into_owned();
+    let mut service_revision = 0;
+    let terminal = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let envelope = events.receiver.recv().await.expect("read terminal event");
+            match envelope.event().into_owned() {
+                RunEvent::ServiceChanged { service } => {
+                    assert!(
+                        service.revision > service_revision,
+                        "service snapshots stay ordered"
+                    );
+                    assert_eq!(
+                        service.owner,
+                        ctxmux_protocol::NativeOwnerStatus::Serving {}
+                    );
+                    service_revision = service.revision;
+                }
+                event => break event,
+            }
+        }
+    })
+    .await
+    .expect("terminal event arrives after finalize");
     assert!(matches!(terminal, RunEvent::Exited { .. }));
     let late = tokio::time::timeout(Duration::from_secs(5), events.receiver.recv())
         .await
@@ -3163,7 +3321,13 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
         vec![parent.id]
     );
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 1);
-    assert!(manager.get(parent.id).unwrap().has_continuation_authority());
+    assert!(
+        manager
+            .get(parent.id)
+            .unwrap()
+            .has_continuation_authority()
+            .expect("observe retained parent authority")
+    );
     assert!(process_exists(parent.pid.unwrap()));
     assert!(process_exists(sentinel.pid()));
     assert!(!persistence.is_failed());

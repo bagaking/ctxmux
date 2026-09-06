@@ -1,65 +1,65 @@
 use unicode_width::UnicodeWidthChar as _;
 
-const CODEPOINTS_IN_CELL: usize = 6;
+// Inline storage uses the same byte payload as a Vec descriptor: the
+// capacity word plus inline char slots. This is a layout optimization only;
+// SmallVec spills into owned storage without a grapheme-length ceiling.
+const INLINE_CODEPOINTS: usize =
+    (std::mem::size_of::<Vec<char>>() - std::mem::size_of::<usize>()) / std::mem::size_of::<char>();
 
 /// Represents a single terminal cell.
 #[derive(Clone, Debug, Default, Eq)]
 pub struct Cell {
-    contents: [char; CODEPOINTS_IN_CELL],
-    len: u8,
+    contents: smallvec::SmallVec<[char; INLINE_CODEPOINTS]>,
+    flags: u8,
     attrs: crate::attrs::Attrs,
 }
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
-        if self.len != other.len {
-            return false;
-        }
-        if self.attrs != other.attrs {
-            return false;
-        }
-        let len = self.len();
-        // self.len() always returns a valid value
-        self.contents[..len] == other.contents[..len]
+        self.flags == other.flags && self.attrs == other.attrs && self.contents == other.contents
     }
 }
 
 impl Cell {
-    #[inline]
-    fn len(&self) -> usize {
-        usize::from(self.len & 0x0f)
+    // Release uncommon overflow storage when the old glyph is replaced or
+    // erased. Ordinary inline cells keep their allocation-free fast path.
+    fn reset_contents(&mut self) {
+        if self.contents.spilled() {
+            self.contents = smallvec::SmallVec::new();
+        } else {
+            self.contents.clear();
+        }
     }
 
     pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
-        self.contents[0] = c;
-        self.len = 1;
-        // strings in this context should always be an arbitrary character
-        // followed by zero or more zero-width characters, so we should only
-        // have to look at the first character
+        self.reset_contents();
+        self.contents.push(c);
+        self.flags = 0;
         self.set_wide(c.width().unwrap_or(1) > 1);
         self.attrs = a;
     }
 
     pub(crate) fn append(&mut self, c: char) {
-        let len = self.len();
-        if len >= CODEPOINTS_IN_CELL {
-            return;
+        if self.contents.is_empty() {
+            self.contents.push(' ');
         }
-        if len == 0 {
-            // 0 is always less than 6
-            self.contents[0] = ' ';
-            self.len += 1;
-        }
-
-        let len = self.len();
-        // we already checked that len < CODEPOINTS_IN_CELL
-        self.contents[len] = c;
-        self.len += 1;
+        self.contents.push(c);
     }
 
     pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
-        self.len = 0;
+        self.reset_contents();
+        self.flags = 0;
         self.attrs = attrs;
+    }
+
+    /// Heap payload owned by this cell, excluding allocator bookkeeping.
+    #[must_use]
+    pub fn heap_payload_bytes(&self) -> usize {
+        if self.contents.spilled() {
+            self.contents.capacity() * std::mem::size_of::<char>()
+        } else {
+            0
+        }
     }
 
     /// Returns the text contents of the cell.
@@ -69,23 +69,19 @@ impl Cell {
     /// width.
     #[must_use]
     pub fn contents(&self) -> String {
-        let mut s = String::with_capacity(CODEPOINTS_IN_CELL * 4);
-        for c in self.contents.iter().take(self.len()) {
-            s.push(*c);
-        }
-        s
+        self.contents.iter().copied().collect()
     }
 
     /// Returns whether the cell contains any text data.
     #[must_use]
     pub fn has_contents(&self) -> bool {
-        self.len > 0
+        !self.contents.is_empty()
     }
 
     /// Returns whether the text data in the cell represents a wide character.
     #[must_use]
     pub fn is_wide(&self) -> bool {
-        self.len & 0x80 == 0x80
+        self.flags & 0x80 == 0x80
     }
 
     /// Returns whether the cell contains the second half of a wide character
@@ -93,22 +89,22 @@ impl Cell {
     /// character)
     #[must_use]
     pub fn is_wide_continuation(&self) -> bool {
-        self.len & 0x40 == 0x40
+        self.flags & 0x40 == 0x40
     }
 
     fn set_wide(&mut self, wide: bool) {
         if wide {
-            self.len |= 0x80;
+            self.flags |= 0x80;
         } else {
-            self.len &= 0x7f;
+            self.flags &= 0x7f;
         }
     }
 
     pub(crate) fn set_wide_continuation(&mut self, wide: bool) {
         if wide {
-            self.len |= 0x40;
+            self.flags |= 0x40;
         } else {
-            self.len &= 0xbf;
+            self.flags &= 0xbf;
         }
     }
 

@@ -1087,7 +1087,8 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
     ],
     [
       "changed worker policy",
-      (value) => (value.declared_limits.resource_limits.input_workers = 1),
+      (value) =>
+        (value.declared_limits.resource_limits.input_turn_commands = 1),
     ],
     [
       "changed GC workload policy",

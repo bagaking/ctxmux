@@ -41,14 +41,14 @@ use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::Hand
 ///
 /// The distinction is load-bearing because [`read_manifest`] compares this for
 /// exact equality on the far side of an `execve` that cannot be undone. A bump
-/// is therefore not a label: it is a declaration that the next hot upgrade must
-/// kill every live Run. History shows the two kinds of change were being
+/// is therefore not a label: the outgoing image must refuse an incompatible
+/// target before extracting any owner. History shows the two kinds of change were being
 /// conflated — v1→v2 and v2→v3 each added a required field (real breaks), while
 /// v3→v4 changed only byte budgets and moved no field at all, spending a fatal
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v5";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v6";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -222,21 +222,23 @@ impl HandoffManifest {
         }
     }
 
-    /// Total recoverable-Input request bytes across every retained Run. This is
-    /// the only payload in the manifest that scales with both Run count and a
-    /// 1 MiB per-Run cap, so it is the term the aggregate budget governs.
+    /// Total actual recoverable-Input request bytes across every retained Run.
+    /// The aggregate policy protects this owner independently of Run count.
     fn retained_input_request_bytes(&self) -> usize {
         self.input_states().fold(0, |sum, state| {
             sum.saturating_add(state.retained_request_bytes())
         })
     }
 
-    /// Total Stop-diagnostic bytes across every settled Stop result. Only an
-    /// Unknown outcome carries one (bounded per item), so this is normally zero.
-    fn stop_diagnostic_bytes(&self) -> usize {
+    /// All retained Input and Stop diagnostics share one manifest byte owner.
+    /// Per-Run validation cannot substitute for a daemon-wide aggregate bound.
+    fn diagnostic_bytes(&self) -> usize {
+        let input = self.input_states().fold(0_usize, |sum, state| {
+            sum.saturating_add(state.retained_diagnostic_bytes())
+        });
         self.stop_operations
             .iter()
-            .fold(0, |sum, op| sum.saturating_add(op.diagnostic_bytes()))
+            .fold(input, |sum, op| sum.saturating_add(op.diagnostic_bytes()))
     }
 
     fn input_states(&self) -> impl Iterator<Item = &HandoffInputState> {
@@ -296,12 +298,12 @@ impl HandoffManifest {
                 ),
             ));
         }
-        let stop_diagnostic_bytes = self.stop_diagnostic_bytes();
-        if stop_diagnostic_bytes > self.resources.handoff_diagnostic_bytes {
+        let diagnostic_bytes = self.diagnostic_bytes();
+        if diagnostic_bytes > self.resources.handoff_diagnostic_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "handoff retains {stop_diagnostic_bytes} native Stop diagnostic bytes; maximum is {}",
+                    "handoff retains {diagnostic_bytes} native control diagnostic bytes; maximum is {}",
                     self.resources.handoff_diagnostic_bytes
                 ),
             ));
@@ -583,13 +585,13 @@ mod tests {
         );
 
         let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
-        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v5");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v6");
         assert_eq!(parsed.stop_operations, [operation]);
     }
 
     #[test]
-    fn rejects_unbounded_input_diagnostics_before_owner_extraction() {
-        let manifest = HandoffManifest::new(
+    fn input_diagnostics_follow_the_configured_budget_before_owner_extraction() {
+        let mut manifest = HandoffManifest::new(
             DaemonInstanceId::new().to_string(),
             100,
             101,
@@ -602,7 +604,7 @@ mod tests {
                     input_failure: Some(ProtocolError::new(
                         ErrorCode::Io,
                         "x".repeat(
-                            super::super::native_control::HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES + 1,
+                            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1,
                         ),
                     )),
                     operations: Vec::new(),
@@ -610,10 +612,20 @@ mod tests {
             }],
         );
 
+        let original = manifest.runs.clone();
+        // The original complete diagnostic remains unchanged. This is an
+        // operator-policy boundary, not a permanent 4096-byte semantic limit.
+        manifest.resources.handoff_diagnostic_bytes =
+            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES;
         assert_eq!(
             manifest.validate(99).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
+        assert_eq!(manifest.runs, original);
+        manifest.resources.handoff_diagnostic_bytes =
+            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1;
+        manifest.validate(99).unwrap();
+        assert_eq!(read_fixture(&manifest).unwrap(), manifest);
     }
 
     /// Every `path:type` pair a value serializes to, array indices collapsed to
@@ -714,8 +726,12 @@ mod tests {
             ".resources.handoff_diagnostic_bytes:number",
             ".resources.handoff_bytes:number",
             ".resources.control_state_bytes:number",
+            ".resources.diagnostic_queue_bytes:number",
+            ".resources.diagnostic_record_bytes:number",
             ".resources.creation_workers:number",
-            ".resources.input_workers:number",
+            ".resources.input_turn_commands:number",
+            ".resources.input_turn_bytes:number",
+            ".resources.stop_admission_timeout_ms:number",
             ".resources.cleanup_workers:number",
             ".resources.finalize_workers:number",
             ".resources.input_queue_commands:number",
@@ -818,6 +834,74 @@ mod tests {
         let old: HandoffManifest = serde_json::from_value(value).unwrap();
         let error = read_fixture(&old).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn rejects_previous_shape_even_when_the_current_fields_are_present() {
+        let mut manifest =
+            HandoffManifest::new(DaemonInstanceId::new().to_string(), 100, 101, Vec::new());
+        manifest.schema = "ctxmux.daemon-handoff.v5".to_owned();
+        let error = read_fixture(&manifest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains("unknown handoff manifest schema")
+        );
+    }
+
+    #[test]
+    fn diagnostic_budget_covers_all_runs_and_stop_results_without_shedding() {
+        let run_a = RunId::new();
+        let run_b = RunId::new();
+        let diagnostic =
+            "x".repeat(crate::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1);
+        let runs = [(run_a, 4321, 102), (run_b, 4322, 103)]
+            .into_iter()
+            .map(|(run_id, child_pid, master_fd)| HandoffRun {
+                run_id,
+                child_pid,
+                master_fd,
+                input_state: HandoffInputState {
+                    applied_input_bytes: 0,
+                    input_failure: Some(ProtocolError::new(ErrorCode::Io, diagnostic.clone())),
+                    operations: Vec::new(),
+                },
+            })
+            .collect();
+        let operation = HandoffStopOperation {
+            run_id: run_a,
+            operation_key: StopOperationKey::new("complete-diagnostic").unwrap(),
+            outcome: HandoffStopOutcome::Unknown {
+                failure: ctxmux_protocol::ControlFailure {
+                    disposition: ctxmux_protocol::CommandDisposition::Unknown,
+                    confirmed_input_bytes: None,
+                    error: ProtocolError::new(ErrorCode::Io, diagnostic.clone()),
+                },
+            },
+        };
+        // The full failure is semantic truth. The reserved diagnostic allowance
+        // must not be mistaken for a maximum message length during restoration.
+        operation.validate().unwrap();
+        let mut manifest = HandoffManifest::new_with_stop_operations(
+            DaemonInstanceId::new().to_string(),
+            100,
+            101,
+            runs,
+            vec![operation],
+        );
+        let original = manifest.clone();
+        let complete = diagnostic.len() * 3;
+        assert_eq!(manifest.diagnostic_bytes(), complete);
+        manifest.resources.handoff_diagnostic_bytes = complete - 1;
+        let mut file = tempfile::tempfile().unwrap();
+        assert!(manifest.write_preflight(&mut file).is_err());
+        assert_eq!(manifest.runs, original.runs);
+        assert_eq!(manifest.stop_operations, original.stop_operations);
+        manifest.resources.handoff_diagnostic_bytes = complete;
+        manifest.write_preflight(&mut file).unwrap();
+        let restored = read_manifest(OwnedFd::from(file)).unwrap();
+        assert_eq!(restored, manifest);
     }
 
     #[test]
@@ -990,6 +1074,7 @@ mod tests {
             operation_key: StopOperationKey::new("stop-a").unwrap(),
             outcome: HandoffStopOutcome::Unknown {
                 failure: ctxmux_protocol::ControlFailure {
+                    confirmed_input_bytes: None,
                     error: ProtocolError::new(ErrorCode::Io, "diagnostic"),
                     disposition: ctxmux_protocol::CommandDisposition::Unknown,
                 },

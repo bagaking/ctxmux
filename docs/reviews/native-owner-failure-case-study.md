@@ -445,8 +445,8 @@ the corrected oracle still independently checks physical cells, cursor and
 wrap state, so losing the final character cannot pass.
 
 The real CLI controlling-PTY tests preserve input, output, detach, terminal
-attributes and the daemon-owned child identity. Main's CLI does not currently
-invoke parser resize; those tests prove dependency wiring and the client
+attributes and the daemon-owned child identity. That source checkpoint's CLI
+did not invoke parser resize; those tests proved dependency wiring and the client
 boundary, not Native failure containment. No protocol, installed artifact or
 user Run changes follow from this source slice. Direct standalone strict VT
 lint retains the same twenty-nine upstream diagnostics; the changed owner
@@ -545,8 +545,8 @@ a Darwin kernel mechanism or a shipping recovery owner after shared-owner loss.
 The temporary reader descriptor and worker belong only to the experiment.
 Orca's independent I/O-failure and process-exit states reinforce preserving
 process authority until actual exit; ctxmux must additionally expose truthful
-input outcomes through its public contract. The complete joined runtime remains
-outside Main and uninstalled; complete cleanup and recovery qualification stay
+input outcomes through its public contract. The joined source is now included
+in the Main development checkpoint but remains uninstalled; complete cleanup and recovery qualification stay
 open. Fatal poll and wake-drain failures still collapse into OwnerStopped, so
 their exact stage and system error need a separate observation-owner repair.
 
@@ -588,3 +588,113 @@ remove misleading objectives and strengthen causal ownership.
 Original incident trigger, complete service and input qualification, and final
 joined consumer acceptance remain open. Source review, a passing author slice,
 installation and complete product acceptance are separate facts.
+
+## Additional legal one-row incident
+
+A subsequent consumer trace supplied a distinct, reproducible cause. Its
+protocol-18 source generated 600 numbered rows with two color styles. Actual
+raw replay ended with `ROW599` and `LIVE1`, and both client cursors advanced
+from 4,852 to 4,859. The legal geometry sequence was 136 by 24, 136 by 1, then
+66 by 47. The restored consumer showed `LIVE17` and lost the final numbered
+rows even though the original PTY bytes, identity and input receipts survived.
+
+The old Grid resized its row vector by retaining the top and dropping the
+bottom, then clamped the cursor onto the wrong surviving row. The next real
+`LIVE1` write overwrote that row's prefix and left its old trailing `7`.
+The independent public xterm comparison reproduced lost rows and the malformed
+live line. The repair moves real normal rows into history on height reduction,
+pulls actual retained history on growth and tracks active/saved cursor positions.
+It retains legal one-row support; a minimum-height clamp would hide the cause.
+
+This trace establishes derived-state corruption, not a new explanation of the
+original unrecorded shared-thread exit. AgentMux owns its viewport/loading
+layout correction; ctxmux owns legal geometry behavior. Healthy user Runs are
+kept while isolated real-Run probes qualify the candidate.
+
+## Continued joined repair and evidence limits
+
+The joined candidate makes lock contention cooperative at public control
+admission, retains same-client frame order before queuing, and keeps actual
+short-write prefixes with the original command. Non-reading PTYs cannot occupy
+all input workers because the blocking input pool is removed. Status/List use
+short raw/service observations rather than waiting on terminal export.
+
+A diagnostic sink is separately byte-funded and has one writer. Full or closed
+stderr cannot block the sole Native reactor or its contained-panic reporting.
+Failures, dropped records and actual sink progress are public diagnostics;
+written logs are not a prerequisite for truthful Run-service events.
+
+Checkpoint restoration now declares actual versus restore geometry, prefix and
+final bytes, and temporary consumer-history policy. A source-width seed cannot
+express nonempty hidden cells to its right. Full small-history public xterm
+reflow also has retained-data-loss counterexamples: the owner must not discard
+real content merely to reproduce an old consumer bug. Those strict original
+failures remain evidence; diagnostic working-memory experiments do not become
+passing original-oracle results.
+
+Original fixture failures, revised semantic objectives and source reversals are
+retained separately. A no-listener event-cursor assertion was initially
+misidentified as publication evidence; actual publication deliberately elides
+work without subscribers. The corrected regression uses a real subscriber and
+checks its exact bytes. That initial failure is not a causal proof of missing
+public output.
+
+Terminal allocation/history/restore/resize-tail policy and complete joined
+macOS/Linux/AgentMux acceptance remain open. Local green probes or source-only
+Orca comparison do not close these outcomes or the unknown original exit trigger.
+
+## Main source integration and newly exposed owner defects
+
+The development checkpoint joins the Native runtime, protocol generation 20,
+state and handoff schema 6, public clients, diagnostics and terminal dependency
+as one source boundary. Main's later independent repairs and original thirteen
+saved-cursor assertions are retained. The first integration failed five of
+those assertions; repairing the saved-register owner restores the original
+contracts, including height-only pending wrap and hidden rows through growth.
+Plain alternate-buffer clearing now also preserves the saved origin register.
+This is a source integration, not installation or complete P00 acceptance.
+
+Broader integration exposed additional causal defects. A memory-only raw-output
+wrapper unnecessarily acquired the durable binding lock. ServiceChanged was
+counted as an unrecoverable observation despite its authoritative Run snapshot,
+so a two-slot event ring disconnected an otherwise recoverable byte stream.
+Shutdown also retained an already reaped, reader-free finalizing entry forever,
+leaving a successful Stop waiting for a physical retirement nobody could publish.
+The repairs remove that unnecessary lock, restore service state separately from
+irrecoverable tmux observations, and drop the actual safe entry before marking
+its physical retirement. Unreaped children and unread output retain their owners.
+
+A real six-byte child under a one-byte hot and durable replay policy exited
+successfully while only two bytes had committed. Lifecycle-first Finalize had
+overtaken accepted prefix appends and carried only the surviving hot tail. The
+actor now commits the missing accepted prefix of that Run before Finalize,
+using the actual retained chunk start rather than a synthetic replay floor.
+Buffered appends remain ahead of later same-Run appends during collection.
+The cache policy, exact bytes and deadlines are unchanged; no full-history
+clone or global durable barrier is introduced. Queue selection can defer other
+appends while satisfying this necessary dependency, with the existing bounded
+collection window and transaction work unit.
+
+Historical failures remain preserved. Tests that assumed the next event must
+be Output or Exited now validate ordered service snapshots before checking the
+same required data, terminal fact or failure. Registry Stop key binding is
+distinguished from the actual Native effect and its eventual settlement.
+The post-extract storage-cancellation fixture releases a real child tail only
+after checkpoint preparation succeeds, then proves an actual append retry and
+the uncommitted byte fence before sending the original SIGINT. Injecting pressure
+before the new preparation phase could never reach its intended extraction
+boundary; injecting pressure into an empty barrier would prove nothing.
+
+Wide geometry, complete checkpoint fidelity, aggregate memory and storage
+funding, historical owner-exit cause, complete owner-loss recovery and the
+joined installed AgentMux consumer remain open at their existing priority.
+
+The independent resource-policy fingerprint still rejects the joined
+qualification producer's new reactor and diagnostic operating-point fields.
+Two positive verifier fixtures therefore remain RED. A separate source-snapshot
+read failed in the first policy test run; its cause is not yet established, and
+that failed evidence is retained independently. The fingerprint and historical
+cost thresholds are preserved: accepting a new qualification
+envelope requires independent resource observations and an explicit review.
+Runtime and source-checkpoint proofs do not sign that envelope, and this
+checkpoint does not claim a passing complete repository or release gate.

@@ -22,7 +22,7 @@ use super::{
     control_unknown, read_lock, write_lock,
 };
 use crate::ResourceLimits;
-use crate::native_control::{ControlResult, DetachedNativeDescriptors, PendingStop};
+use crate::native_control::{ControlResult, DetachedNativeDescriptors};
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 
 const CREATION_STRIPES: usize = 64;
@@ -1269,7 +1269,7 @@ fn stop_receipt_charge(key: &StopOperationKey) -> usize {
     key.as_str().len() * 2
         + std::mem::size_of::<StopOperationRecord>()
         + std::mem::size_of::<StopOperationCell>()
-        + crate::native_control::HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
+        + crate::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES
 }
 
 /// Settled recoverable Stop truth carried only across a same-incarnation
@@ -1293,23 +1293,21 @@ impl HandoffStopOperation {
         self.operation_key
             .validate()
             .map_err(|error| format!("invalid handoff native Stop key: {error}"))?;
-        if let HandoffStopOutcome::Unknown { failure } = &self.outcome {
-            if failure.disposition != CommandDisposition::Unknown {
-                return Err("handoff native Stop failure has a non-unknown disposition".to_owned());
-            }
-            if failure.error.message.len()
-                > crate::native_control::HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
-            {
-                return Err("handoff native Stop diagnostic exceeds its bounded size".to_owned());
-            }
+        if let HandoffStopOutcome::Unknown { failure } = &self.outcome
+            && failure.disposition != CommandDisposition::Unknown
+        {
+            return Err("handoff native Stop failure has a non-unknown disposition".to_owned());
         }
         Ok(())
     }
 
-    /// Diagnostic bytes this settled Stop result carries in the manifest. Only an
-    /// Unknown outcome retains one (bounded per item); an Accepted outcome is 0.
+    /// Restored control ownership includes the complete retained diagnostic.
+    /// The per-operation reserve is not a maximum error-message length.
     pub(crate) fn control_memory_bytes(&self) -> u64 {
-        stop_receipt_charge(&self.operation_key) as u64
+        stop_receipt_charge(&self.operation_key).saturating_add(
+            self.diagnostic_bytes()
+                .saturating_sub(crate::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES),
+        ) as u64
     }
 
     pub(crate) fn diagnostic_bytes(&self) -> usize {
@@ -1348,16 +1346,16 @@ impl RecoverableStopFlight {
                 self.run
                     .await_reaped_publication(Instant::now() + TERMINAL_VISIBILITY_GRACE)
                     .await;
-                if self.run.info().state.is_running() {
+                if self.run.terminal_visibility_ready() {
+                    Ok(receipt)
+                } else {
                     Err(control_unknown(ProtocolError::new(
                         ErrorCode::Internal,
                         format!(
-                            "Run {} stopped but terminal publication is not yet visible",
+                            "Run {} stopped but terminal publication or Native entry retirement is not yet complete",
                             self.run.id
                         ),
                     )))
-                } else {
-                    Ok(receipt)
                 }
             }
             result => result,
@@ -1375,15 +1373,17 @@ pub(crate) struct RecoverableStopSettlement {
     id: RunId,
     key: StopOperationKey,
     cell: Arc<StopOperationCell>,
-    _run: Arc<Run>,
-    pending: Option<PendingStop>,
+    run: Arc<Run>,
+    waiting: bool,
 }
 
 impl RecoverableStopSettlement {
     pub(crate) async fn wait(&mut self) -> ControlResult {
-        self.pending
-            .take()
-            .expect("one recoverable Stop settlement waits once")
+        assert!(!self.waiting, "one recoverable Stop settlement waits once");
+        self.waiting = true;
+        self.run
+            .begin_stop_async()
+            .await?
             .resolve(STOP_ACK_TIMEOUT)
             .await
     }
@@ -1857,17 +1857,17 @@ impl RunRegistry {
                 )
             })?;
         for operation in stop_operations {
+            let charge = usize::try_from(operation.control_memory_bytes()).map_err(|_| {
+                invalid("handed-off Stop control charge does not fit host".to_owned())
+            })?;
             let HandoffStopOperation {
                 run_id: id,
                 operation_key: key,
                 outcome,
             } = operation;
-            let memory = state
-                .control_budget
-                .reserve(stop_receipt_charge(&key))
-                .ok_or_else(|| {
-                    invalid("handed-off Stop control state exceeds preserved policy".to_owned())
-                })?;
+            let memory = state.control_budget.reserve(charge).ok_or_else(|| {
+                invalid("handed-off Stop control state exceeds preserved policy".to_owned())
+            })?;
             let cell = Arc::new(StopOperationCell::from_settled(outcome.into_result()));
             state
                 .runs
@@ -2208,12 +2208,12 @@ impl RunRegistry {
     }
 
     /// Atomically bind or recover one native Stop operation while the exact
-    /// retained Run remains pinned. The Registry lock is the sole order
-    /// between the Runtime-global key index, the per-Run record, and native
-    /// Stop admission.
+    /// retained Run remains pinned. The Registry lock orders the funded key
+    /// index and receipt; the returned daemon settlement admits Native Stop
+    /// cooperatively after the Registry lock is released.
     #[allow(
         clippy::too_many_lines,
-        reason = "one Registry lock orders receipt funding, key binding and the first Stop side effect"
+        reason = "one Registry lock orders receipt funding and exact key binding before daemon-owned Stop admission"
     )]
     pub(crate) fn begin_recoverable_stop(
         &self,
@@ -2301,7 +2301,9 @@ impl RunRegistry {
             .runs
             .get_mut(&id)
             .expect("validated retained Run remains Registry-owned");
-        let pending = entry.run.begin_stop()?;
+        // Validate capability before binding. Actual cooperative admission is
+        // daemon-owned settlement work, outside the Registry write lock.
+        entry.run.native_control().map_err(control_not_applied)?;
         let cell = Arc::new(StopOperationCell::new());
         entry.stop_operation = Some(StopOperationRecord {
             key: key.clone(),
@@ -2320,8 +2322,8 @@ impl RunRegistry {
                 id,
                 key,
                 cell,
-                _run: run,
-                pending: Some(pending),
+                run,
+                waiting: false,
             },
         })
     }
@@ -2335,8 +2337,8 @@ impl RunRegistry {
             id,
             key,
             cell,
-            _run,
-            pending: _,
+            run: _,
+            waiting: _,
         } = settlement;
         let remove = matches!(
             &result,
@@ -2581,6 +2583,20 @@ impl RunRegistry {
             .filter(|entry| {
                 entry.residency == RegistryResidency::Retained
                     && matches!(&entry.run.incarnation_control, Some(RunControl::Tmux(_)))
+            })
+            .map(|entry| Arc::clone(&entry.run))
+            .collect()
+    }
+
+    /// Pin only live native owners whose derived state can cross a planned exec.
+    pub(crate) fn pin_native_for_checkpoint(&self) -> Vec<Arc<Run>> {
+        read_lock(&self.state)
+            .runs
+            .values()
+            .filter(|entry| {
+                entry.residency == RegistryResidency::Retained
+                    && matches!(&entry.run.incarnation_control, Some(RunControl::Native(_)))
+                    && crate::mutex_lock(&entry.run.state).is_running()
             })
             .map(|entry| Arc::clone(&entry.run))
             .collect()

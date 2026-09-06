@@ -366,10 +366,8 @@ impl BufWrite for MoveFromTo {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.to.row == self.from.row + 1 && self.to.col == 0 {
             crate::term::Crlf::default().write_buf(buf);
-        } else if self.from.row == self.to.row && self.from.col < self.to.col
-        {
-            crate::term::MoveRight::new(self.to.col - self.from.col)
-                .write_buf(buf);
+        } else if self.from.row == self.to.row && self.from.col < self.to.col {
+            crate::term::MoveRight::new(self.to.col - self.from.col).write_buf(buf);
         } else if self.to != self.from {
             crate::term::MoveTo::new(self.to).write_buf(buf);
         }
@@ -423,8 +421,7 @@ impl<'a> ChangeTitle<'a> {
 impl<'a> BufWrite for ChangeTitle<'a> {
     fn write_buf(&self, buf: &mut Vec<u8>) {
         if self.icon_name == self.title
-            && (self.icon_name != self.prev_icon_name
-                || self.title != self.prev_title)
+            && (self.icon_name != self.prev_icon_name || self.title != self.prev_title)
         {
             buf.extend_from_slice(b"\x1b]0;");
             buf.extend_from_slice(self.icon_name.as_bytes());
@@ -587,17 +584,15 @@ impl BufWrite for MouseProtocolEncoding {
         }
 
         match self.encoding {
-            crate::screen::MouseProtocolEncoding::Default => {
-                match self.prev {
-                    crate::screen::MouseProtocolEncoding::Default => {}
-                    crate::screen::MouseProtocolEncoding::Utf8 => {
-                        buf.extend_from_slice(b"\x1b[?1005l");
-                    }
-                    crate::screen::MouseProtocolEncoding::Sgr => {
-                        buf.extend_from_slice(b"\x1b[?1006l");
-                    }
+            crate::screen::MouseProtocolEncoding::Default => match self.prev {
+                crate::screen::MouseProtocolEncoding::Default => {}
+                crate::screen::MouseProtocolEncoding::Utf8 => {
+                    buf.extend_from_slice(b"\x1b[?1005l");
                 }
-            }
+                crate::screen::MouseProtocolEncoding::Sgr => {
+                    buf.extend_from_slice(b"\x1b[?1006l");
+                }
+            },
             crate::screen::MouseProtocolEncoding::Utf8 => {
                 buf.extend_from_slice(b"\x1b[?1005h");
             }

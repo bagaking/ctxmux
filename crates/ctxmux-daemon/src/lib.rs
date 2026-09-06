@@ -25,10 +25,13 @@ use std::{
 mod adopted_pty;
 mod attachment;
 mod creation;
+mod diagnostics;
 mod fd_budget;
 mod handoff;
 mod native_control;
+mod native_output;
 mod native_runtime;
+mod native_service;
 mod native_session;
 mod native_spawn_env;
 mod persistence;
@@ -37,6 +40,7 @@ pub mod resources;
 mod retention;
 pub use resources::ResourceLimits;
 mod run_spec;
+mod terminal_checkpoint;
 mod tmux;
 
 pub use persistence::PersistenceError;
@@ -52,18 +56,18 @@ pub fn handoff_version_token() -> String {
 }
 
 use ctxmux_protocol::{
-    AppliedInputRange, AttachedSnapshot, ClientFrame, CommandDisposition, ControlFailure,
-    CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason,
-    LIST_MAX_PAGE_RUNS, MAX_FRAME_BYTES, OutputChunk, OutputReplay, PROTOCOL_VERSION,
-    ProtocolError, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
+    AppliedInputRange, AttachedSnapshot, AttachmentView, ClientFrame, CommandDisposition,
+    ControlFailure, CreateOperationKey, DaemonInstanceId, ErrorCode, ForkFidelity, ForkPlan,
+    InterruptionReason, LIST_MAX_PAGE_RUNS, MAX_FRAME_BYTES, OutputChunk, OutputReplay,
+    PROTOCOL_VERSION, ProtocolError, RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B,
     RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
     RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP, RUNTIME_CAPABILITY_NATIVE_START,
     RUNTIME_CAPABILITY_PERSISTENT_STATE, RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
     RUNTIME_CAPABILITY_TMUX_DISCOVER, RUNTIME_CAPABILITY_TMUX_IMPORT, RecoverableInput,
     RecoverableStop, Request, Response, RunBackend, RunBackendKind, RunCapabilities, RunEvent,
     RunId, RunInfo, RunLineage, RunSpec, RunState, RunSummary, RuntimeBuildId, RuntimeId,
-    RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalSize, TmuxRunEvent, decode_frame,
-    encode_frame,
+    RuntimeIdPersistence, RuntimeIdentity, ServerFrame, TerminalCheckpointUnavailableReason,
+    TerminalContinuation, TerminalResize, TerminalSize, TmuxRunEvent, decode_frame, encode_frame,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{Child, ChildKiller, CommandBuilder, ExitStatus, native_pty_system};
@@ -98,6 +102,7 @@ use crate::persistence::{
 };
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 use crate::retention::{RetentionBudget, RetentionVictim};
+use crate::terminal_checkpoint::{StoredCheckpoint, TerminalModel, derive_terminal};
 use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
@@ -276,6 +281,9 @@ pub async fn serve_configured(
     resources
         .validate()
         .map_err(|error| ServerError::Adopt(format!("invalid resource policy: {error}")))?;
+    if state_dir.is_none() {
+        initialize_diagnostics(resources)?;
+    }
     let Some(state_dir) = state_dir else {
         return serve_with_persistence(
             socket_path,
@@ -293,6 +301,11 @@ pub async fn serve_configured(
         ),
         None => None,
     };
+    initialize_diagnostics(
+        handoff
+            .as_ref()
+            .map_or(resources, |manifest| manifest.resources),
+    )?;
     let manager = if let Some(manifest) = &handoff {
         // Incoming exec-in-place image: reuse the handed-off epoch, exclude
         // the still-live Run set from reconciliation, and adopt the inherited
@@ -353,6 +366,25 @@ pub async fn serve_configured(
         .await
 }
 
+/// Diagnostic sink failure is observable independently of Run availability.
+/// Its one-shot owner does not change an inherited descriptor's status flags.
+fn initialize_diagnostics(resources: ResourceLimits) -> Result<(), ServerError> {
+    let result = diagnostics::initialize(diagnostics::DiagnosticLimits {
+        queue_bytes: usize::try_from(resources.diagnostic_queue_bytes)
+            .expect("validated diagnostic policy fits the host"),
+        record_bytes: resources.diagnostic_record_bytes,
+    });
+    if let Err(error) = result {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            return Err(ServerError::Adopt(error.to_string()));
+        }
+        let _ = diagnostics::record(format_args!(
+            "ctxmuxd diagnostic initialization failed: {error}"
+        ));
+    }
+    Ok(())
+}
+
 async fn serve_with_persistence(
     socket_path: PathBuf,
     persistence: Option<(Persistence, Vec<RecoveredRun>)>,
@@ -360,6 +392,7 @@ async fn serve_with_persistence(
     readiness_fd: Option<OwnedFd>,
     resources: ResourceLimits,
 ) -> Result<(), ServerError> {
+    initialize_diagnostics(resources)?;
     let manager = if let Some((persistence, recovered)) = persistence {
         let stats = QualificationStats::from_optional_inherited_fd(
             qualification_stats_fd,
@@ -478,8 +511,7 @@ fn apply_startup_fd_budget(manager: &RunManager) {
     let describe =
         |limit: Option<u64>| limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
     if outcome.clamped {
-        let _ = writeln!(
-            io::stderr().lock(),
+        let _ = crate::diagnostics::record(format_args!(
             "ctxmuxd: RLIMIT_NOFILE soft {} hard {} funds only {} live Run(s); \
              effective Run ceiling clamped below the configured {} \
              (fd budget {} unavailable); excess Runs are refused with run_capacity",
@@ -488,16 +520,15 @@ fn apply_startup_fd_budget(manager: &RunManager) {
             outcome.run_ceiling,
             outcome.provisioned_runs,
             outcome.provisioned_fds,
-        );
+        ));
     } else if outcome.raised {
-        let _ = writeln!(
-            io::stderr().lock(),
+        let _ = crate::diagnostics::record(format_args!(
             "ctxmuxd: raised RLIMIT_NOFILE soft {} -> {} (hard {}); funds {} live Run(s)",
             describe(outcome.original_soft),
             describe(outcome.effective_soft),
             describe(outcome.hard),
             outcome.run_ceiling,
-        );
+        ));
     }
     manager.registry.clamp_live_capacity(outcome.run_ceiling);
 }
@@ -577,11 +608,10 @@ fn become_child_subreaper() {
         // which CLEARS the attribute. Naming ourselves is what sets it.
         let me = rustix::process::getpid();
         if let Err(error) = rustix::process::set_child_subreaper(Some(me)) {
-            let _ = writeln!(
-                io::stderr().lock(),
+            let _ = crate::diagnostics::record(format_args!(
                 "ctxmuxd: failed to become a child subreaper ({error}); an orphaned \
                  Run descendant may escape the session emptiness proof"
-            );
+            ));
         }
     }
 }
@@ -603,12 +633,11 @@ async fn serve_with_manager(
     apply_startup_fd_budget(&manager);
     if let Some(handoff) = &handoff {
         // A12 wires manifest.state_lock_fd into the incoming-image startup path.
-        let _ = writeln!(
-            io::stderr().lock(),
+        let _ = crate::diagnostics::record(format_args!(
             "ctxmuxd: adopted inherited listener for handoff (epoch {}, {} run(s))",
             handoff.epoch,
             handoff.runs.len()
-        );
+        ));
     }
     if let Some(readiness_fd) = readiness_fd {
         let mut readiness = fs::File::from(readiness_fd);
@@ -643,7 +672,7 @@ async fn serve_with_manager(
                         // Run we still own. Back off inside this arm — a bare retry
                         // spins at 100% CPU while the socket stays readable, and
                         // staying in this arm keeps SIGHUP/ctrl_c responsive.
-                        let _ = writeln!(io::stderr().lock(),"ctxmuxd: transient accept error, continuing to serve: {source}");
+                        let _ = crate::diagnostics::record(format_args!("ctxmuxd: transient accept error, continuing to serve: {source}"));
                         tokio::time::sleep(ACCEPT_BACKOFF).await;
                         continue;
                     }
@@ -651,7 +680,7 @@ async fn serve_with_manager(
                 let manager = Arc::clone(&manager);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, manager).await {
-                        let _ = writeln!(io::stderr().lock(),"ctxmuxd connection error: {error}");
+                        let _ = crate::diagnostics::record(format_args!("ctxmuxd connection error: {error}"));
                     }
                 });
             }
@@ -659,6 +688,7 @@ async fn serve_with_manager(
                 signal.map_err(|source| ServerError::io(&socket_path, source))?;
                 manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT)?;
                 manager.qualification_stats.finish();
+                let _ = diagnostics::shutdown();
                 return Ok(());
             }
             _ = sigchld.recv() => {
@@ -675,15 +705,15 @@ async fn serve_with_manager(
             }
             _ = sighup.recv() => {
                 if manager.persistence.is_none() {
-                    let _ = writeln!(io::stderr().lock(),
+                    let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd: SIGHUP ignored: upgrade continuity requires --state-dir"
-                    );
+                    ));
                     continue;
                 }
                 let Some(state_dir) = state_dir.as_deref() else {
-                    let _ = writeln!(io::stderr().lock(),
+                    let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd: SIGHUP ignored: no state directory recorded for re-exec"
-                    );
+                    ));
                     continue;
                 };
                 let Some(result) = drive_exec_upgrade(
@@ -697,9 +727,9 @@ async fn serve_with_manager(
                         // Reversible failure: nothing has been extracted, all
                         // controls are still owned. Abort the upgrade and keep
                         // serving by falling through to the next loop iteration.
-                        let _ = writeln!(io::stderr().lock(),
+                        let _ = crate::diagnostics::record(format_args!(
                             "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
-                        );
+                        ));
                     }
                     Err(UpgradeAbort::AfterExtract(error)) => {
                         // Point of no return passed: native children/controls were
@@ -993,6 +1023,35 @@ fn perform_exec_upgrade(
     // Snapshot, validate, and serialize under the same native owner turn that
     // extracts descriptors. Any preflight error returns before forgetting a
     // child or closing a reader, so the request fence restores service.
+    // Persist the derived continuation while ownership transfer is reversible.
+    // The owner preflight below still owns the point of no return.
+    for run in manager.registry.pin_native_for_checkpoint() {
+        run.prepare_terminal_checkpoint_for_upgrade()
+            .map_err(|failures| UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures }))?;
+    }
+    #[cfg(test)]
+    if let Some(directory) = std::env::var_os("CTXMUX_TEST_UPGRADE_LATE_TAIL") {
+        let directory = PathBuf::from(directory);
+        let run = manager
+            .registry
+            .pin_native_for_checkpoint()
+            .pop()
+            .expect("one private tail Run");
+        let before = run.info().latest_output_bytes;
+        manager
+            .persistence
+            .as_ref()
+            .unwrap()
+            .force_append_storage_full();
+        fs::write(directory.join("release-tail"), b"release").unwrap();
+        while run.info().latest_output_bytes < before + b"post-checkpoint-tail\r\n".len() as u64 {
+            cancellation.check().map_err(|failures| {
+                UpgradeAbort::BeforeExtract(ServerError::Shutdown { failures })
+            })?;
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(run.info().durable_output_bytes.unwrap() < run.info().latest_output_bytes);
+    }
     let live = manager
         .native_runs
         .extract_for_handoff_after_preflight(Box::new(move |live| {
@@ -1286,21 +1345,19 @@ impl RecoverableStopSettlementOwner {
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(error) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
+                    let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd recoverable Stop handoff readiness probe failed for Run {}: {error}",
                         self.run_id
-                    );
+                    ));
                     return;
                 }
             }
             let now = Instant::now();
             if now >= deadline {
-                let _ = writeln!(
-                    io::stderr().lock(),
+                let _ = crate::diagnostics::record(format_args!(
                     "ctxmuxd timed out waiting for Run {} Stop cleanup to reach a handoff boundary",
                     self.run_id
-                );
+                ));
                 return;
             }
             tokio::time::sleep(CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(now)))
@@ -1638,10 +1695,9 @@ impl Drop for PersistentPublicationOwner<'_> {
                 Ok(()) => self.phase = PersistentPublicationPhase::NotCommitted,
                 Err(failure) if failure.disposition() == StartDisposition::NotCommitted => {
                     self.phase = PersistentPublicationPhase::NotCommitted;
-                    let _ = writeln!(
-                        io::stderr().lock(),
+                    let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd failed to finish staged persistence rollback: {failure}"
-                    );
+                    ));
                 }
                 Err(failure) => self.retain_unknown(&failure.to_string()),
             }
@@ -2116,7 +2172,20 @@ impl RunManager {
         }
         self.unpublished_cleanups
             .resolve_fence(&operation_key, &request)?;
-        let materialized = self.materialize_creation(request)?;
+        let authority = if let CreationRequest::Fork {
+            parent,
+            plan: ForkPlan::LevelB { .. },
+        } = &request
+        {
+            Some(
+                self.pin(*parent)?
+                    .has_continuation_authority_async()
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let materialized = self.materialize_creation_with_authority(request, authority)?;
         let flight = self.begin_creation_flight().await?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
@@ -2375,10 +2444,26 @@ impl RunManager {
         self.create_unique(operation_key, materialized, cleanup_reservation, new_run_id)
     }
 
+    #[cfg(test)]
     fn materialize_creation(
         &self,
         request: CreationRequest,
     ) -> Result<MaterializedCreation, ProtocolError> {
+        self.materialize_creation_with_authority(request, None)
+    }
+
+    fn materialize_creation_with_authority(
+        &self,
+        request: CreationRequest,
+        authority: Option<bool>,
+    ) -> Result<MaterializedCreation, ProtocolError> {
+        if let CreationRequest::Fork {
+            plan: ForkPlan::LevelB { spec },
+            ..
+        } = &request
+        {
+            validate_run_spec(spec).map_err(invalid_run_spec)?;
+        }
         let (spec, lineage) = match &request {
             CreationRequest::Start { spec } => (spec.clone(), None),
             CreationRequest::Fork { parent, plan } => {
@@ -2394,7 +2479,7 @@ impl RunManager {
                         ForkFidelity::LevelA,
                     ),
                     ForkPlan::LevelB { spec } if parent_run.capabilities.fork_level_b => {
-                        if !parent_run.has_continuation_authority() {
+                        if !authority.map_or_else(|| parent_run.has_continuation_authority(), Ok)? {
                             return Err(ProtocolError::new(
                                 ErrorCode::InvalidRunState,
                                 format!(
@@ -2955,6 +3040,7 @@ impl MaterializedCreation {
             // owner exists, and what persistence restores is a Run with no
             // live terminal at all. Neither moment has a size to confirm.
             current_size: None,
+            native_service: None,
         }
     }
 }
@@ -3120,10 +3206,9 @@ impl Drop for PendingChild {
             return;
         };
         if let Err(error) = child.kill() {
-            let _ = writeln!(
-                io::stderr().lock(),
+            let _ = crate::diagnostics::record(format_args!(
                 "ctxmuxd failed to terminate rejected child: {error}"
-            );
+            ));
             if let Some(control) = &self.reap_control {
                 control.record_cleanup_error(format!(
                     "failed to terminate rejected unpublished child: {error}"
@@ -3137,10 +3222,9 @@ impl Drop for PendingChild {
                 }
             }
             Err(error) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
+                let _ = crate::diagnostics::record(format_args!(
                     "ctxmuxd failed to reap rejected child: {error}"
-                );
+                ));
                 if let Some(control) = &self.reap_control {
                     control.record_wait_error(format!(
                         "failed to reap rejected unpublished child: {error}"
@@ -3151,6 +3235,12 @@ impl Drop for PendingChild {
     }
 }
 
+enum ResizeWait {
+    Output,
+    Persistence,
+    Control,
+}
+
 struct Run {
     id: RunId,
     spec: Option<RunSpec>,
@@ -3159,19 +3249,26 @@ struct Run {
     capabilities: RunCapabilities,
     pid: Option<u32>,
     state: Mutex<RunState>,
-    output: Mutex<OutputLog>,
+    output: crate::native_output::OutputOwner,
     incarnation_control: Option<RunControl>,
     native_runs: Option<NativeRuntimeOwner>,
+    native_service: Option<native_service::NativeService>,
     persistence_mode: PersistenceMode,
+    owner_deferred: AtomicBool,
+    output_unlocked: Notify,
+    persistence_unlocked: Notify,
     persistence_transition: Mutex<()>,
     persistence: Mutex<PersistenceBinding>,
+    /// Shares the actor's actual COMMIT cursor after its one durable binding.
+    /// Observation must not wait for a persistence publication transition.
+    durable_output_head: OnceLock<Arc<AtomicU64>>,
     attachments: AtomicUsize,
     qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
     terminal_ordinal: OnceLock<TerminalOrdinal>,
     live_permit: Mutex<Option<creation::LiveResourcePermit>>,
-    /// Woken once terminal state is visible, so a Stop can report the state its
-    /// own receipt implies rather than the one that predates publication.
+    /// Woken on terminal publication and actual Native entry retirement, so a
+    /// Stop cannot report success while its original runtime holders remain.
     ///
     /// A `Notify` rather than a poll because the waiter is the request path:
     /// the common case must cost one wakeup, not a sleep.
@@ -3210,6 +3307,8 @@ struct LiveEventCursor {
     /// attachment. Counting them together would tear down an attachment that
     /// merely fell behind on window sizes.
     resize_revision: u64,
+    /// Service state has an authoritative snapshot, unlike tmux observations.
+    service_revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -3281,6 +3380,7 @@ impl LiveEventOwner {
                     observation_revision: 0,
                     terminal_revision: 0,
                     resize_revision: 0,
+                    service_revision: 0,
                 },
             }),
         }
@@ -3357,12 +3457,15 @@ impl LiveEventOwner {
                     .checked_add(1)
                     .expect("live observation revision remains representable");
             }
-            RunEvent::Resized { .. } => {
-                state.cursor.resize_revision = state
-                    .cursor
-                    .resize_revision
+            RunEvent::ServiceChanged { .. } | RunEvent::Resized { .. } => {
+                let revision = if matches!(&event, RunEvent::Resized { .. }) {
+                    &mut state.cursor.resize_revision
+                } else {
+                    &mut state.cursor.service_revision
+                };
+                *revision = revision
                     .checked_add(1)
-                    .expect("live resize revision remains representable");
+                    .expect("live recoverable snapshot revision remains representable");
             }
         }
         if let Some(sender) = state.sender.as_ref() {
@@ -3456,13 +3559,18 @@ impl RetentionVictim for Run {
         self.id
     }
 
-    fn retained_output_bytes(&self) -> usize {
-        mutex_lock(&self.output).retained_bytes()
+    fn retained_output_bytes(&self) -> Option<usize> {
+        self.try_owner(&self.output)
+            .map(|output| output.retained_bytes())
     }
 
     fn reclaimable_output_bytes(&self) -> usize {
-        let protected = self.output_protected_from();
-        let output = mutex_lock(&self.output);
+        let Some(protected) = self.try_output_protected_from() else {
+            return 0;
+        };
+        let Some(output) = self.try_owner(&self.output) else {
+            return 0;
+        };
         output.retained_bytes().min(
             usize::try_from(protected.saturating_sub(output.first_available_byte()))
                 .unwrap_or(usize::MAX),
@@ -3477,13 +3585,19 @@ impl RetentionVictim for Run {
         // Takes only this Run's own `output` lock, matching the trait's
         // one-lock-at-a-time contract so the daemon-wide reclaimer never holds
         // two `output` locks or the participants lock while trimming.
-        let protected = self.output_protected_from();
-        let mut output = mutex_lock(&self.output);
+        let Some(protected) = self.try_output_protected_from() else {
+            return 0;
+        };
+        let Some(mut output) = self.try_owner(&self.output) else {
+            return 0;
+        };
         let reclaimable = protected.saturating_sub(output.first_available_byte());
-        output.trim_front_bounded(
+        let freed = output.trim_front_bounded(
             drop_at_least,
             usize::try_from(reclaimable).unwrap_or(usize::MAX),
-        )
+        );
+        output.terminal_pressure(self.id);
+        freed
     }
 }
 
@@ -3772,11 +3886,18 @@ impl Run {
                 code: 0,
                 signal: None,
             }),
-            output: Mutex::new(OutputLog::new(retention_budget.clone())),
+            output: crate::native_output::OutputOwner::new(OutputLog::new(
+                retention_budget.clone(),
+            )),
             incarnation_control: None,
             native_runs: None,
+            native_service: Some(native_service::NativeService::new(true)),
             persistence_mode: PersistenceMode::PersistentCapable,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: QualificationStats::default(),
@@ -3996,10 +4117,13 @@ impl Run {
                 .map_err(|error| spawn_error("clone PTY reader", error))?,
         );
         setup(LaunchSetupStep::TakeWriter, None)?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| spawn_error("take PTY writer", error))?;
+        // dup shares the master open-file description, so O_NONBLOCK applies
+        // to every master view (including the reader). Never take_writer:
+        // portable-pty's writer Drop writes EOF bytes into the child's input.
+        let writer = fs::File::from(
+            ctxmux_inherited_fd::duplicate_nonblocking_cloexec(reader_fd)
+                .map_err(|error| spawn_error("clone nonblocking PTY writer", error))?,
+        );
         let child = pair
             .slave
             .spawn_command(config.command())
@@ -4081,6 +4205,11 @@ impl Run {
         pid: Option<u32>,
         native_control: NativeControlOwner,
     ) -> Arc<Self> {
+        let output = OutputLog::new_native(
+            id,
+            native_control.confirmed_size(),
+            config.retention_budget.clone(),
+        );
         let run = Arc::new(Self {
             id,
             spec: Some(config.spec),
@@ -4089,11 +4218,16 @@ impl Run {
             capabilities: RunCapabilities::NATIVE,
             pid,
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::new(config.retention_budget.clone())),
+            output: crate::native_output::OutputOwner::new(output),
             incarnation_control: Some(RunControl::Native(native_control)),
             native_runs: Some(config.native_runs),
+            native_service: Some(native_service::NativeService::new(false)),
             persistence_mode: config.persistence_mode,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(match config.persistence_mode {
                 PersistenceMode::MemoryOnly => PersistenceBinding::Disabled,
                 PersistenceMode::PersistentCapable => {
@@ -4121,10 +4255,20 @@ impl Run {
     /// `Weak` handle (see `retention`), so it never immortalizes the Run or
     /// disturbs collection's `strong_count == 1` eligibility.
     fn register_retention(run: Arc<Self>) -> Arc<Self> {
+        if let Some(durable) = run.lock_owner(&run.persistence).durable() {
+            run.bind_durable_output_head(durable);
+        }
+        if let Some(service) = &run.native_service {
+            service.bind(&run);
+            run.lock_owner(&run.output).bind_service(service.clone());
+            if let Some(RunControl::Native(control)) = &run.incarnation_control {
+                control.bind_service(service.clone());
+            }
+        }
         let victim: Arc<dyn RetentionVictim + Send + Sync> = run.clone();
         run.retention_budget.register(&victim);
         if let (Some(durable), Some(native)) =
-            (mutex_lock(&run.persistence).active(), &run.native_runs)
+            (run.lock_owner(&run.persistence).active(), &run.native_runs)
         {
             durable.register_output_wake(native.owner_wake());
         }
@@ -4171,7 +4315,7 @@ impl Run {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(target.pane_pid),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation(
+            output: crate::native_output::OutputOwner::new(OutputLog::with_initial_truncation(
                 config.retention_budget.clone(),
             )),
             incarnation_control: Some(RunControl::Tmux(TmuxRunControl {
@@ -4180,8 +4324,13 @@ impl Run {
                 completion: Mutex::new(TmuxCompletion::Pending(completion_rx)),
             })),
             native_runs: None,
+            native_service: None,
             persistence_mode: PersistenceMode::MemoryOnly,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: config.qualification_stats.clone(),
@@ -4340,6 +4489,8 @@ impl Run {
     ) -> Arc<Self> {
         let terminal_ordinal = OnceLock::new();
         terminal_publications.recover(&terminal_ordinal);
+        let native_service = matches!(&recovered.info.backend, RunBackend::Native)
+            .then(|| native_service::NativeService::new(true));
         let run = Arc::new(Self {
             id: recovered.info.id,
             spec: recovered.info.spec,
@@ -4348,15 +4499,23 @@ impl Run {
             capabilities: recovered.info.capabilities,
             pid: recovered.info.pid,
             state: Mutex::new(recovered.info.state),
-            output: Mutex::new(OutputLog::from_replay(
-                recovered.replay,
-                retention_budget.clone(),
-                recovered.source_gap_after_byte,
-            )),
+            output: crate::native_output::OutputOwner::new(
+                OutputLog::from_replay(
+                    recovered.replay,
+                    retention_budget.clone(),
+                    recovered.source_gap_after_byte,
+                )
+                .recover_terminal(recovered.info.id, &persistence, None),
+            ),
             incarnation_control: control,
             native_runs: None,
+            native_service,
             persistence_mode: PersistenceMode::PersistentCapable,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
             qualification_stats,
@@ -4415,10 +4574,12 @@ impl Run {
             ctxmux_inherited_fd::duplicate_cloexec(master_raw)
                 .map_err(|error| spawn_error("clone re-adopted PTY reader", error))?,
         );
-        let writer: Box<dyn Write + Send> = Box::new(fs::File::from(
-            ctxmux_inherited_fd::duplicate_cloexec(master_raw)
-                .map_err(|error| spawn_error("clone re-adopted PTY writer", error))?,
-        ));
+        // O_NONBLOCK belongs to the shared OFD, not just this fresh fd number.
+        // The recovered reader therefore also handles WouldBlock readiness races.
+        let writer = fs::File::from(
+            ctxmux_inherited_fd::duplicate_nonblocking_cloexec(master_raw)
+                .map_err(|error| spawn_error("clone nonblocking re-adopted PTY writer", error))?,
+        );
         let adopted = AdoptedMasterPty::from_owned_fd(master_fd);
 
         // The child already exists and crossed the exec, so it is adopted by
@@ -4469,15 +4630,27 @@ impl Run {
             capabilities: recovered.info.capabilities,
             pid: Some(child_pid),
             state: Mutex::new(recovered.info.state),
-            output: Mutex::new(OutputLog::from_replay(
-                recovered.replay,
-                retention_budget.clone(),
-                recovered.source_gap_after_byte,
-            )),
+            output: crate::native_output::OutputOwner::new(
+                OutputLog::from_replay(
+                    recovered.replay,
+                    retention_budget.clone(),
+                    recovered.source_gap_after_byte,
+                )
+                .recover_terminal(
+                    recovered.info.id,
+                    &persistence,
+                    native_control.confirmed_size(),
+                ),
+            ),
             incarnation_control: Some(RunControl::Native(native_control)),
             native_runs: Some(native_runs),
+            native_service: Some(native_service::NativeService::new(false)),
             persistence_mode: PersistenceMode::PersistentCapable,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
             qualification_stats,
@@ -4551,40 +4724,64 @@ impl Run {
         }
     }
 
-    fn info(&self) -> RunInfo {
+    /// Called after the sole Native runtime removes and drops this Run's entry.
+    /// Terminal publication alone is earlier than physical owner retirement.
+    fn native_entry_retired(&self) {
+        if let Some(RunControl::Native(control)) = &self.incarnation_control {
+            control.mark_entry_retired();
+        }
         self.release_closed_resources();
-        // Read the native control cursor BEFORE taking `output`. That was the
-        // one gratuitous edge here: `output -> native_control.state` exists
-        // nowhere else in the daemon and nothing in this method needs the log
-        // to read the input cursor.
-        //
-        // The other two pairs are deliberately kept, because they are the
-        // daemon's established order rather than an artifact of this method:
-        //   `output -> state`       also held by `record_output`, and by
-        //                           `publish_terminal`, which holds `output`
-        //                           across the terminal `state` write so that a
-        //                           caller cannot observe `Exited` beside an
-        //                           output count that predates the Run's final
-        //                           bytes.
-        //   `output -> persistence` also held by `record_output` and
-        //                           `activate_persistence_after_publication`.
-        //                           Hoisting the persistence read above
-        //                           `output` here would INVERT that and create
-        //                           the cycle it was meant to avoid.
-        let applied_input_bytes = match &self.incarnation_control {
-            Some(RunControl::Native(control)) => Some(control.applied_input_bytes()),
-            Some(RunControl::Tmux(_)) | None => None,
-        };
-        // Same ownership rule as the input cursor above, for the same reason: a
-        // size is reported only by an owner that can confirm one. A tmux pane is
-        // resized by tmux, and a recovered historical Run has no live PTY to
-        // ask -- both report `None` rather than replaying `spec.size`, which is
-        // the requested size and was never confirmed by anything.
-        let current_size = match &self.incarnation_control {
-            Some(RunControl::Native(control)) => control.confirmed_size(),
-            Some(RunControl::Tmux(_)) | None => None,
-        };
-        let output = mutex_lock(&self.output);
+        self.terminal_visible.notify_waiters();
+    }
+
+    fn native_owner_ready(&self) {
+        if let Some(service) = &self.native_service {
+            service.ready();
+        }
+    }
+
+    fn native_owner_draining(&self) {
+        if let Some(service) = &self.native_service {
+            service.draining();
+        }
+    }
+
+    fn native_owner_stopped(&self, reason: ctxmux_protocol::NativeServiceFailure) {
+        // Fan out availability independently of any held per-Run control lock.
+        // The runtime fences actual commands separately, with truthful settlement.
+        if let Some(service) = &self.native_service {
+            service.stopped(reason);
+        }
+    }
+
+    fn native_output_closed(&self, error: Option<&str>) {
+        if let Some(service) = &self.native_service {
+            service.update_output(if error.is_some() {
+                ctxmux_protocol::NativeOutputStatus::Unavailable {
+                    reason: ctxmux_protocol::NativeServiceFailure::ReadFailed,
+                }
+            } else {
+                ctxmux_protocol::NativeOutputStatus::Closed {}
+            });
+        }
+    }
+
+    fn native_output_pressure(&self, pressured: bool) {
+        if let Some(service) = &self.native_service {
+            service.update_output(if pressured {
+                ctxmux_protocol::NativeOutputStatus::Backpressured {}
+            } else {
+                ctxmux_protocol::NativeOutputStatus::Serving {}
+            });
+        }
+    }
+
+    fn info(&self) -> RunInfo {
+        let output = self.output.snapshot();
+        let service = self
+            .native_service
+            .as_ref()
+            .map(native_service::NativeService::snapshot);
         RunInfo {
             id: self.id,
             spec: self.spec.clone(),
@@ -4593,41 +4790,34 @@ impl Run {
             capabilities: self.capabilities,
             pid: self.pid,
             state: mutex_lock(&self.state).clone(),
-            latest_output_bytes: output.latest_output_bytes(),
-            durable_output_bytes: mutex_lock(&self.persistence)
-                .durable()
-                .map(PersistentRun::durable_head),
-            first_available_byte: output.first_available_byte(),
+            latest_output_bytes: output.latest_output_bytes,
+            durable_output_bytes: self
+                .durable_output_head
+                .get()
+                .map(|head| head.load(Ordering::Acquire)),
+            first_available_byte: output.first_available_byte,
             attachments: self.attachments.load(Ordering::Acquire),
-            applied_input_bytes,
-            current_size,
+            applied_input_bytes: service
+                .as_ref()
+                .and_then(|service| service.input.completed_input_bytes),
+            current_size: service
+                .as_ref()
+                .and_then(|service| service.input.current_size),
+            native_service: service,
         }
     }
 
-    /// Cheap enumeration-safe projection of this Run's public metadata.
-    ///
-    /// Distinct from [`Run::info`] on purpose: it reads only the fields a
-    /// [`RunSummary`] carries, so it takes just the `output` and `state` locks
-    /// and never touches the persistence binding or native-control cursor. That
-    /// keeps a full-fleet `List` walk from contending on every Run's persistence
-    /// mutex, and it drops the unbounded `RunSpec` clone that made an unpaged
-    /// `RunInfo` fleet overflow the wire frame.
+    /// Fleet enumeration uses only current short owner observations. A slow
+    /// terminal export does not consume every async request worker via List.
     fn summary(&self) -> RunSummary {
-        // One guard for both output fields. `output` is a plain non-reentrant
-        // mutex, so reading the retained count through the `RetentionVictim`
-        // impl (`Run::retained_output_bytes`) would take it a second time and
-        // deadlock the List walk. Bind it once and read both.
-        let output = mutex_lock(&self.output);
-        let latest_output_bytes = output.latest_output_bytes();
-        let retained_output_bytes = output.retained_bytes() as u64;
-        drop(output);
+        let output = self.output.snapshot();
         RunSummary {
             id: self.id,
             backend: RunBackendKind::from(&self.backend),
             pid: self.pid,
             state: mutex_lock(&self.state).clone(),
-            latest_output_bytes,
-            retained_output_bytes,
+            latest_output_bytes: output.latest_output_bytes,
+            retained_output_bytes: output.retained_bytes as u64,
             attachments: self.attachments.load(Ordering::Acquire),
         }
     }
@@ -4642,7 +4832,7 @@ impl Run {
     #[cfg(test)]
     fn persistence_terminal_is_pending(&self) -> bool {
         matches!(
-            &*mutex_lock(&self.persistence),
+            &*self.lock_owner(&self.persistence),
             PersistenceBinding::Pending { terminal: Some(_) }
                 | PersistenceBinding::CommittedPendingActivation {
                     terminal: Some(_),
@@ -4652,7 +4842,7 @@ impl Run {
     }
 
     async fn input(&self, data: Vec<u8>) -> ControlResult {
-        self.begin_input(data)?.resolve().await
+        self.begin_input(data).await?.resolve().await
     }
 
     async fn recoverable_input(
@@ -4661,211 +4851,218 @@ impl Run {
     ) -> Result<AppliedInputRange, ControlFailure> {
         self.native_control()
             .map_err(control_not_applied)?
-            .begin_recoverable_input(
+            .begin_recoverable_input_async(
                 operation.operation_key,
                 operation.expected_byte,
                 operation.data,
-            )?
+            )
+            .await?
             .resolve()
             .await
     }
 
     async fn signal(&self, signal: ctxmux_protocol::RunSignal) -> ControlResult {
-        self.begin_signal(signal)?.resolve().await
+        self.begin_signal(signal).await?.resolve().await
     }
 
-    fn begin_signal(
+    async fn begin_signal(
         &self,
         signal: ctxmux_protocol::RunSignal,
     ) -> Result<PendingSignal, ControlFailure> {
         self.native_control()
             .map_err(control_not_applied)?
-            .begin_signal(signal)
+            .begin_signal_async(signal)
+            .await
     }
 
-    fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
+    async fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
         self.native_control()
             .map_err(control_not_applied)?
-            .begin_input(data)
+            .begin_input_async(data)
+            .await
     }
 
+    async fn resize_async(&self, size: TerminalSize) -> ControlResult {
+        if let Err(error) = validate_terminal_size(size) {
+            return Err(control_not_applied(invalid_run_spec(error)));
+        }
+        let control = self.native_control().map_err(control_not_applied)?;
+        loop {
+            // Register both actual unlock notifications before attempting either
+            // owner. No OS mutex guard crosses an await, and a stopped owner
+            // wakes control waiters even while a client holds the VT model.
+            let output_changed = self.output_unlocked.notified();
+            let persistence_changed = self.persistence_unlocked.notified();
+            let control_changed = control.admission_changed().notified();
+            tokio::pin!(output_changed, persistence_changed, control_changed);
+            output_changed.as_mut().enable();
+            persistence_changed.as_mut().enable();
+            control_changed.as_mut().enable();
+            if self.native_service.as_ref().is_some_and(|service| {
+                matches!(
+                    service.snapshot().owner,
+                    ctxmux_protocol::NativeOwnerStatus::Stopped { .. }
+                )
+            }) {
+                return Err(control_not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "Native owner stopped before resize admission",
+                )));
+            }
+            match self.try_resize(size, control) {
+                Ok(result) => return result,
+                Err(ResizeWait::Control) => control_changed.await,
+                Err(ResizeWait::Output) => tokio::select! {
+                    () = &mut output_changed => {},
+                    () = &mut control_changed => {},
+                },
+                Err(ResizeWait::Persistence) => tokio::select! {
+                    () = &mut persistence_changed => {},
+                    () = &mut control_changed => {},
+                },
+            }
+        }
+    }
+
+    /// Acquire every derived-state owner before the physical ioctl. A busy
+    /// view postpones only this request; partial geometry is never published.
+    fn try_resize(
+        &self,
+        size: TerminalSize,
+        control: &NativeControlOwner,
+    ) -> Result<ControlResult, ResizeWait> {
+        let binding = self
+            .try_owner(&self.persistence)
+            .ok_or(ResizeWait::Persistence)?;
+        let mut output = self.try_owner(&self.output).ok_or(ResizeWait::Output)?;
+        let persistence = binding.active().cloned();
+        let result = control
+            .try_resize(size, |applied| {
+                let resize = output.resize_terminal(applied);
+                self.publish_event(RunEvent::Resized {
+                    size: applied,
+                    through_byte: resize.through_byte,
+                    resize_revision: resize.resize_revision,
+                });
+                if let Some(persistence) = persistence
+                    && let Some(saved) = output.take_stored_checkpoint()
+                {
+                    persistence.offer_terminal_checkpoint(saved);
+                }
+            })
+            .ok_or(ResizeWait::Control)?;
+        if result
+            .as_ref()
+            .is_err_and(|failure| failure.disposition == CommandDisposition::Unknown)
+        {
+            output.terminal = None;
+            output.terminal_absence = TerminalCheckpointUnavailableReason::InvalidCheckpoint;
+            output.note_terminal_fault(ctxmux_protocol::NativeTerminalFaultStage::Resize);
+        }
+        Ok(result)
+    }
+
+    #[cfg(test)]
     fn resize(&self, size: TerminalSize) -> ControlResult {
         if let Err(error) = validate_terminal_size(size) {
             return Err(control_not_applied(invalid_run_spec(error)));
         }
-        match self.native_control() {
-            // The owner publishes while holding its own state lock, so the
-            // confirmed size and the event announcing it cannot be reordered
-            // against a concurrent resize. `publish_event` takes only the
-            // live-event lock, which is never held while the native-control
-            // lock is acquired.
-            Ok(control) => control.resize(size, |applied| {
-                self.publish_event(RunEvent::Resized { size: applied });
-            }),
-            Err(error) => Err(control_not_applied(error)),
-        }
+        let control = self.native_control().map_err(control_not_applied)?;
+        self.try_resize(size, control).unwrap_or_else(|_| {
+            Err(control_not_applied(ProtocolError::new(
+                ErrorCode::ControlBackpressure,
+                "Native resize owner is busy before admission",
+            )))
+        })
     }
 
     #[cfg(test)]
     async fn stop(&self) -> ControlResult {
-        self.begin_stop()?.resolve(STOP_ACK_TIMEOUT).await
+        self.begin_stop_async()
+            .await?
+            .resolve(STOP_ACK_TIMEOUT)
+            .await
     }
 
-    fn begin_stop(&self) -> Result<PendingStop, ControlFailure> {
+    async fn begin_stop_async(&self) -> Result<PendingStop, ControlFailure> {
         self.native_control()
             .map_err(control_not_applied)?
-            .begin_stop()
-    }
-
-    fn output_protected_from(&self) -> u64 {
-        if self.persistence_mode == PersistenceMode::MemoryOnly {
-            return u64::MAX;
-        }
-        mutex_lock(&self.persistence).active().map_or(0, |durable| {
-            if durable.is_failed() {
-                u64::MAX
-            } else {
-                durable.next_replay_start()
-            }
-        })
-    }
-
-    /// Protect unoffered output and pause only this PTY when storage falls
-    /// behind. Queue-space wakeups re-offer debt even if the child goes quiet.
-    fn output_has_unoffered(&self) -> bool {
-        self.persistence_mode == PersistenceMode::PersistentCapable
-            && mutex_lock(&self.output).latest_output_bytes() > self.output_protected_from()
-    }
-
-    fn prepare_output_read(&self) -> usize {
-        if self.persistence_mode == PersistenceMode::PersistentCapable {
-            let _transition = mutex_lock(&self.persistence_transition);
-            let durable = mutex_lock(&self.persistence).active().cloned();
-            if let Some(durable) = durable
-                && !durable.is_failed()
-                && durable.queue_has_room()
-            {
-                let replay = {
-                    let output = mutex_lock(&self.output);
-                    let from = durable.next_replay_start();
-                    (output.latest_output_bytes() > from).then(|| output.offer_replay(from))
-                };
-                if let Some(replay) = replay {
-                    durable.request_output_wake();
-                    let _accepted = durable.append(self.id, replay);
-                }
-            }
-        }
-        // Fund a whole native read quantum, rather than reclaiming one byte
-        // per poll turn at the cache ceiling. Small operator budgets use their
-        // actual positive capacity. Unoffered durable bytes remain protected.
-        let wanted = 8192.min(self.retention_budget.per_run_limit());
-        let protected = self.output_protected_from();
-        let output = mutex_lock(&self.output);
-        let unoffered = output.latest_output_bytes().saturating_sub(protected);
-        let per_run_available = self
-            .retention_budget
-            .per_run_limit()
-            .saturating_sub(usize::try_from(unoffered).unwrap_or(usize::MAX));
-        let reclaimable = usize::try_from(protected.saturating_sub(output.first_available_byte()))
-            .unwrap_or(usize::MAX);
-        let reclaimable = reclaimable.min(output.retained_bytes());
-        drop(output);
-        self.retention_budget
-            .available_for_read(self.id, wanted, reclaimable)
-            .min(per_run_available)
+            .begin_stop_async()
+            .await
     }
 
     fn record_output(&self, data: Vec<u8>) {
         if data.is_empty() {
             return;
         }
-        let chunk = match self.persistence_mode {
-            PersistenceMode::MemoryOnly => mutex_lock(&self.output).push(data),
-            PersistenceMode::PersistentCapable => {
-                let _transition = mutex_lock(&self.persistence_transition);
-                let (chunk, replay, running, persistence) = {
-                    let mut output = mutex_lock(&self.output);
-                    let protected = mutex_lock(&self.persistence).active().map_or(0, |durable| {
-                        if durable.is_failed() {
-                            u64::MAX
-                        } else {
-                            durable.next_replay_start()
-                        }
-                    });
-                    if protected == u64::MAX && output.source_gap_after_byte.is_none() {
-                        output.mark_source_gap();
-                    }
-                    let chunk = output.push_protected(data, protected);
-                    let running = mutex_lock(&self.state).is_running();
-                    let persistence = mutex_lock(&self.persistence).active().cloned();
-                    // Skip the render entirely when the queue is already full.
-                    //
-                    // Rendering is the expensive half, and the send that would
-                    // reject it comes after. Under sustained overload that order
-                    // means the reactor thread builds a replay for every push and
-                    // throws every one of them away. Asking first costs one atomic
-                    // load and turns the overloaded path into no work at all.
-                    //
-                    // Nothing is lost by skipping: only an accepted append moves
-                    // the offered watermark, so the next push that does get
-                    // through renders from here and carries these bytes.
-                    let replay = match persistence.as_ref() {
-                        None => Some(output.replay(chunk.start_byte)),
-                        Some(durable) if !durable.is_failed() && durable.queue_has_room() => {
-                            // Render only what is actually outstanding: every
-                            // byte past the newest ACCEPTED append. Normally
-                            // that is this push alone, because the previous
-                            // append was accepted and the actor stitches queued
-                            // deltas together against its own pending watermark
-                            // — the queue does not have to have committed
-                            // anything for the chain to be contiguous.
-                            //
-                            // After a refusal or a skip the watermark has not
-                            // moved, so the replay carries the dropped bytes
-                            // too. That is what keeps a drop from becoming a
-                            // forward gap, which `append_replay` rejects and
-                            // `remember_failure` then latches daemon-wide.
-                            //
-                            // Catching up from the COMMITTED watermark instead
-                            // is what wedged the fleet: it re-sends bytes the
-                            // actor already holds, which both copies up to
-                            // `OUTPUT_RETENTION_BYTES` inline on this single
-                            // thread and overlaps the queued appends, defeating
-                            // the actor's coalescing so each one pays its own
-                            // fsync. Both effects deepen the queue that caused
-                            // them.
-                            Some(output.offer_replay(durable.next_replay_start()))
-                        }
-                        Some(_) => None,
-                    };
-                    (chunk, replay, running, persistence)
-                };
-                // A render that is discarded here (the Run left `running`
-                // between the render and this check) needs no repair: it never
-                // reached `append`, so the offered watermark never moved.
-                if let (true, Some(persistence), Some(replay)) = (running, persistence, replay) {
-                    // A refusal simply leaves the offered watermark where it
-                    // was, so the next push renders these bytes again.
-                    let _accepted = persistence.append(self.id, replay);
-                }
-                chunk
-            }
+        let transition = (self.persistence_mode == PersistenceMode::PersistentCapable)
+            .then(|| self.lock_owner(&self.persistence_transition));
+        let mut output = self.lock_owner(&self.output);
+        let persistence = if self.persistence_mode == PersistenceMode::PersistentCapable {
+            self.lock_owner(&self.persistence).active().cloned()
+        } else {
+            None
         };
-        // This push admitted new bytes into the daemon-wide total. Drive
-        // cross-Run reclamation now — the same event that admits bytes reclaims
-        // them, so no periodic sweep is needed and a quiet Run's pinned memory
-        // is freed by *this* Run's pressure. The `output` lock above is already
-        // released, so reclamation (which locks victims' `output` one at a time)
-        // cannot deadlock against it; `except = self.id` keeps a newcomer's own
-        // bytes as the last resort rather than the first casualty. The fast path
-        // is a single atomic load when under budget.
+        self.record_output_locked(data, &mut output, persistence.as_ref());
+        drop(output);
+        drop(transition);
         self.retention_budget.reclaim_excess(self.id);
-        self.publish_event(RunEvent::Output { chunk });
+    }
+
+    /// The Native caller already owns raw admission before its PTY read. Tmux
+    /// and tests use the blocking wrapper on their independently owned lane.
+    fn record_output_locked(
+        &self,
+        data: Vec<u8>,
+        output: &mut OutputLog,
+        persistence: Option<&PersistentRun>,
+    ) {
+        if data.is_empty() {
+            return;
+        }
+        let protected = if self.persistence_mode == PersistenceMode::MemoryOnly {
+            u64::MAX
+        } else {
+            persistence.map_or(0, |durable| {
+                if durable.is_failed() {
+                    u64::MAX
+                } else {
+                    durable.next_replay_start()
+                }
+            })
+        };
+        if self.persistence_mode == PersistenceMode::PersistentCapable
+            && protected == u64::MAX
+            && output.source_gap_after_byte.is_none()
+        {
+            output.mark_source_gap();
+        }
+        let chunk = output.push_protected(data, protected);
+        output.terminal_pressure(self.id);
+        // Raw and geometry publications share this admission lock. Both memory
+        // and persistent Runs publish the actual chunk, independently of a
+        // refused append or failed optional terminal derivation.
+        self.publish_event(RunEvent::Output {
+            chunk: chunk.clone(),
+        });
+        if let Some(durable) = persistence
+            && !durable.is_failed()
+            && durable.queue_has_room()
+            && mutex_lock(&self.state).is_running()
+        {
+            // The offered watermark advances only on acceptance. A refusal
+            // leaves all outstanding original bytes for the next funded offer.
+            let replay = output.offer_replay(durable.next_replay_start());
+            if durable.append(self.id, replay)
+                && let Some(saved) = output.take_stored_checkpoint()
+            {
+                durable.offer_terminal_checkpoint(saved);
+            }
+        }
     }
 
     fn mark_output_source_gap(&self) -> u64 {
-        mutex_lock(&self.output).mark_source_gap()
+        self.lock_owner(&self.output).mark_source_gap()
     }
 
     /// Offer every byte this Run has read but never handed to persistence, so a
@@ -4883,8 +5080,32 @@ impl Run {
     /// Safe to call when nothing is outstanding, which is the common case: the
     /// render is empty, `append_blocking` is never reached, and the barrier
     /// behaves exactly as before.
+    fn prepare_terminal_checkpoint_for_upgrade(&self) -> Result<(), String> {
+        let Some(persistence) = self.lock_owner(&self.persistence).active().cloned() else {
+            return Ok(());
+        };
+        let _transition = self.lock_owner(&self.persistence_transition);
+        let (replay, saved) = {
+            let mut output = self.lock_owner(&self.output);
+            let (scope, _) = output.terminal_snapshot(self.id);
+            let saved = if matches!(scope, TerminalContinuation::BasicVt { .. }) {
+                output.terminal.as_ref().and_then(TerminalModel::stored)
+            } else {
+                None
+            };
+            (output.replay(persistence.next_replay_start()), saved)
+        };
+        if !replay.chunks.is_empty() && !persistence.append_blocking(self.id, replay) {
+            return Err(format!(
+                "Run {} could not commit original output before its terminal checkpoint",
+                self.id
+            ));
+        }
+        persistence.save_terminal_checkpoint_for_handoff(self.id, saved)
+    }
+
     fn offer_outstanding_output_for_handoff(&self) -> Result<(), String> {
-        let Some(persistence) = mutex_lock(&self.persistence).active().cloned() else {
+        let Some(persistence) = self.lock_owner(&self.persistence).active().cloned() else {
             return Ok(());
         };
         loop {
@@ -4892,7 +5113,7 @@ impl Run {
                 return Err(format!("Run {} persistence requires recovery", self.id));
             }
             let replay = {
-                let output = mutex_lock(&self.output);
+                let output = self.lock_owner(&self.output);
                 let outstanding = persistence.next_replay_start();
                 if output.latest_output_bytes() <= outstanding {
                     return Ok(());
@@ -4960,12 +5181,45 @@ impl Run {
     async fn attachment_snapshot(
         &self,
         after_byte: u64,
+        view: AttachmentView,
     ) -> Result<AttachedSnapshot, persistence::PersistenceError> {
-        let replay = self.attachment_replay_page(after_byte, u64::MAX).await?;
+        // Metadata can acquire control locks; do not nest them under output.
         let mut run = self.info();
-        run.latest_output_bytes = replay.latest_output_bytes;
+        let (mut terminal, mut terminal_restore, resize_revision, head) = {
+            let mut output = self.lock_owner(&self.output);
+            let (terminal, restore) = match view {
+                AttachmentView::Terminal => output.terminal_snapshot(self.id),
+                AttachmentView::Raw => (TerminalContinuation::NotRequested, Vec::new()),
+            };
+            (
+                terminal,
+                restore,
+                output.resize_revision,
+                output.latest_output_bytes(),
+            )
+        };
+        let replay_start = match &terminal {
+            TerminalContinuation::BasicVt { checkpoint, .. } => checkpoint.through_byte,
+            _ => after_byte,
+        };
+        let replay = self.attachment_replay_page(replay_start, head).await?;
+        if matches!(terminal, TerminalContinuation::BasicVt { .. })
+            && replay.first_available_byte > replay_start
+        {
+            terminal = TerminalContinuation::Unavailable {
+                reason: TerminalCheckpointUnavailableReason::TailEvicted,
+            };
+            terminal_restore.clear();
+        }
+        run.latest_output_bytes = head;
         run.first_available_byte = replay.first_available_byte;
-        Ok(AttachedSnapshot { run, replay })
+        Ok(AttachedSnapshot {
+            run,
+            replay,
+            terminal,
+            terminal_restore,
+            resize_revision,
+        })
     }
 
     async fn attachment_replay_page(
@@ -4974,13 +5228,13 @@ impl Run {
         through: u64,
     ) -> Result<OutputReplay, persistence::PersistenceError> {
         let (floor, head) = {
-            let output = mutex_lock(&self.output);
+            let output = self.lock_owner(&self.output);
             (
                 output.first_available_byte(),
                 output.latest_output_bytes().min(through),
             )
         };
-        let durable = mutex_lock(&self.persistence).active().cloned();
+        let durable = self.lock_owner(&self.persistence).active().cloned();
         if after < floor
             && let Some(durable) = durable
         {
@@ -4992,7 +5246,7 @@ impl Run {
                 return Ok(page);
             }
         }
-        Ok(mutex_lock(&self.output).replay_page(after, head))
+        Ok(self.lock_owner(&self.output).replay_page(after, head))
     }
 
     fn publish_event(&self, event: RunEvent) {
@@ -5016,11 +5270,18 @@ impl Run {
         }
     }
 
-    fn has_continuation_authority(&self) -> bool {
-        matches!(
-            &self.incarnation_control,
-            Some(RunControl::Native(control)) if control.has_continuation_authority()
-        )
+    async fn has_continuation_authority_async(&self) -> Result<bool, ProtocolError> {
+        match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control.has_continuation_authority_async().await,
+            Some(RunControl::Tmux(_)) | None => Ok(false),
+        }
+    }
+
+    fn has_continuation_authority(&self) -> Result<bool, ProtocolError> {
+        match &self.incarnation_control {
+            Some(RunControl::Native(control)) => control.has_continuation_authority(),
+            Some(RunControl::Tmux(_)) | None => Ok(false),
+        }
     }
 
     fn write_tmux_command(&self, kind: TmuxCommandKind, command: &[u8]) -> io::Result<()> {
@@ -5132,7 +5393,7 @@ impl Run {
     }
 
     fn persistent_metadata_owner(&self) -> Option<Arc<AtomicU64>> {
-        mutex_lock(&self.persistence)
+        self.lock_owner(&self.persistence)
             .durable()
             .map(PersistentRun::metadata_bytes_owner)
     }
@@ -5147,8 +5408,8 @@ impl Run {
             PersistenceMode::PersistentCapable,
             "only persistence-capable Runs can bind durable state"
         );
-        let _transition = mutex_lock(&self.persistence_transition);
-        let mut binding = mutex_lock(&self.persistence);
+        let _transition = self.lock_owner(&self.persistence_transition);
+        let mut binding = self.lock_owner(&self.persistence);
         let terminal = match std::mem::replace(&mut *binding, PersistenceBinding::Disabled) {
             PersistenceBinding::Pending { terminal } => terminal,
             PersistenceBinding::Disabled
@@ -5160,18 +5421,28 @@ impl Run {
         if let Some(native) = &self.native_runs {
             persistence.register_output_wake(native.owner_wake());
         }
+        self.bind_durable_output_head(&persistence);
         *binding = PersistenceBinding::CommittedPendingActivation {
             durable: persistence,
             terminal,
         };
     }
 
+    fn bind_durable_output_head(&self, persistence: &PersistentRun) {
+        assert!(
+            self.durable_output_head
+                .set(persistence.durable_head_owner())
+                .is_ok(),
+            "one committed output owner per Run"
+        );
+    }
+
     /// Activate output durability only after the Run and exact key are public.
     fn activate_persistence_after_publication(&self) {
-        let _transition = mutex_lock(&self.persistence_transition);
-        let replay = mutex_lock(&self.output).durable_replay(0);
+        let _transition = self.lock_owner(&self.persistence_transition);
+        let replay = self.lock_owner(&self.output).durable_replay(0);
         let (persistence, terminal) = {
-            let mut binding = mutex_lock(&self.persistence);
+            let mut binding = self.lock_owner(&self.persistence);
             let (durable, terminal) =
                 match std::mem::replace(&mut *binding, PersistenceBinding::Disabled) {
                     PersistenceBinding::CommittedPendingActivation { durable, terminal } => {
@@ -5187,7 +5458,7 @@ impl Run {
             (durable, terminal)
         };
         if let Some(terminal) = terminal {
-            persistence.mark_source_gap(mutex_lock(&self.output).source_gap_after_byte);
+            persistence.mark_source_gap(self.lock_owner(&self.output).source_gap_after_byte);
             persistence.finalize(
                 self.id,
                 self.pid.expect("native Run has a child PID"),
@@ -5211,9 +5482,9 @@ impl Run {
             self.publish_event(RunEvent::Exited { state: terminal });
             return;
         }
-        let _transition = mutex_lock(&self.persistence_transition);
+        let _transition = self.lock_owner(&self.persistence_transition);
         let persistence = {
-            let mut binding = mutex_lock(&self.persistence);
+            let mut binding = self.lock_owner(&self.persistence);
             match &mut *binding {
                 PersistenceBinding::Pending { terminal: pending }
                 | PersistenceBinding::CommittedPendingActivation {
@@ -5230,7 +5501,7 @@ impl Run {
             }
         };
         let replay = {
-            let output = mutex_lock(&self.output);
+            let output = self.lock_owner(&self.output);
             persistence.mark_source_gap(output.source_gap_after_byte);
             output.durable_replay(0)
         };
@@ -5240,7 +5511,7 @@ impl Run {
             replay,
             terminal.clone(),
         );
-        let _output = mutex_lock(&self.output);
+        let _output = self.lock_owner(&self.output);
         self.publish_terminal_state(terminal.clone());
         self.publish_event(RunEvent::Exited { state: terminal });
     }
@@ -5260,7 +5531,23 @@ impl Run {
         self.terminal_visible.notify_waiters();
     }
 
-    /// Wait until a reaped Run's terminal state is visible, or until `deadline`.
+    /// A terminal Native Run has completed its original entry retirement.
+    /// This does not bypass Registry pins, attachments, control uniqueness, or
+    /// the descriptor/ledger quiescence checks required for collection.
+    ///
+    pub(crate) fn terminal_visibility_ready(&self) -> bool {
+        !self.is_running()
+            && self
+                .incarnation_control
+                .as_ref()
+                .is_none_or(|control| match control {
+                    RunControl::Native(control) => control.entry_retired(),
+                    RunControl::Tmux(_) => true,
+                })
+    }
+
+    /// Wait for a reaped Run's terminal publication and Native entry retirement
+    /// within the original visibility deadline.
     ///
     /// Publication runs on a `ctxmux-native-blocking` worker, and for a
     /// persistent Run it sits behind a durable finalize ordered after the
@@ -5276,7 +5563,11 @@ impl Run {
     pub(crate) async fn await_reaped_publication(&self, deadline: Instant) {
         loop {
             let notified = self.terminal_visible.notified();
-            if !self.is_running() || !self.child_reaped() {
+            tokio::pin!(notified);
+            // Register before checking both publication and actual entry Drop.
+            // Either edge can occur between the check and suspension.
+            notified.as_mut().enable();
+            if self.terminal_visibility_ready() || !self.child_reaped() {
                 return;
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -5921,9 +6212,30 @@ struct OutputLog {
     /// Daemon-wide budget this log's bytes count against. A cheap `Arc`-backed
     /// handle; every log shares the one `RunManager` budget.
     budget: RetentionBudget,
+    terminal: Option<TerminalModel>,
+    terminal_absence: TerminalCheckpointUnavailableReason,
+    resize_revision: u64,
+    checkpoint_dirty: bool,
+    terminal_fault: Option<ctxmux_protocol::NativeTerminalFault>,
+    service: Option<native_service::NativeService>,
+    facts: Option<Arc<Mutex<native_output::OutputFacts>>>,
 }
 
 impl OutputLog {
+    fn current_facts(&self) -> native_output::OutputFacts {
+        native_output::OutputFacts {
+            latest_output_bytes: self.latest_output_bytes,
+            first_available_byte: self.first_available_byte(),
+            retained_bytes: self.retained_bytes,
+        }
+    }
+
+    fn publish_facts(&self) {
+        if let Some(facts) = &self.facts {
+            *mutex_lock(facts) = self.current_facts();
+        }
+    }
+
     fn new(budget: RetentionBudget) -> Self {
         Self {
             chunks: VecDeque::new(),
@@ -5932,6 +6244,13 @@ impl OutputLog {
             latest_output_bytes: 0,
             source_gap_after_byte: None,
             budget,
+            terminal: None,
+            terminal_absence: TerminalCheckpointUnavailableReason::OriginUnknown,
+            resize_revision: 0,
+            checkpoint_dirty: false,
+            terminal_fault: None,
+            service: None,
+            facts: None,
         }
     }
 
@@ -5943,6 +6262,13 @@ impl OutputLog {
             latest_output_bytes: 0,
             source_gap_after_byte: Some(0),
             budget,
+            terminal: None,
+            terminal_absence: TerminalCheckpointUnavailableReason::OriginUnknown,
+            resize_revision: 0,
+            checkpoint_dirty: false,
+            terminal_fault: None,
+            service: None,
+            facts: None,
         }
     }
 
@@ -5961,14 +6287,166 @@ impl OutputLog {
                     .then_some(replay.latest_output_bytes)
             }),
             budget,
+            terminal: None,
+            terminal_absence: TerminalCheckpointUnavailableReason::OriginUnknown,
+            resize_revision: 0,
+            checkpoint_dirty: false,
+            terminal_fault: None,
+            service: None,
+            facts: None,
         }
     }
 
+    fn new_native(id: RunId, size: Option<TerminalSize>, budget: RetentionBudget) -> Self {
+        let mut output = Self::new(budget);
+        if let Some(size) = size {
+            output.terminal = derive_terminal(|| TerminalModel::new(id, size));
+            if output.terminal.is_none() {
+                output.terminal_absence = TerminalCheckpointUnavailableReason::InvalidCheckpoint;
+                output.note_terminal_fault(ctxmux_protocol::NativeTerminalFaultStage::Process);
+            }
+        }
+        output
+    }
+
+    fn recover_terminal(
+        mut self,
+        id: RunId,
+        persistence: &PersistentRun,
+        confirmed_size: Option<TerminalSize>,
+    ) -> Self {
+        if let Some(saved) = persistence.load_terminal_checkpoint(id) {
+            self.terminal =
+                derive_terminal(|| TerminalModel::recover(id, saved, &self.replay(0))).flatten();
+            if self
+                .terminal
+                .as_ref()
+                .is_some_and(|t| confirmed_size.is_some_and(|size| size != t.size()))
+            {
+                self.terminal = None;
+            }
+            if let Some(terminal) = &self.terminal {
+                self.resize_revision = terminal.resize_revision();
+            } else {
+                self.terminal_absence = TerminalCheckpointUnavailableReason::InvalidCheckpoint;
+                self.note_terminal_fault(ctxmux_protocol::NativeTerminalFaultStage::Recovery);
+            }
+        }
+        self
+    }
+
+    fn resize_terminal(&mut self, size: TerminalSize) -> TerminalResize {
+        self.resize_revision += 1;
+        let through_byte = self.latest_output_bytes;
+        let resize = self
+            .derive_terminal(
+                ctxmux_protocol::NativeTerminalFaultStage::Resize,
+                |terminal| terminal.resize(size, through_byte),
+            )
+            .unwrap_or(TerminalResize {
+                through_byte,
+                resize_revision: self.resize_revision,
+                size,
+            });
+        self.checkpoint_dirty = self.terminal.is_some();
+        resize
+    }
+
+    fn terminal_snapshot(&mut self, id: RunId) -> (TerminalContinuation, Vec<u8>) {
+        let first = self.first_available_byte();
+        let latest = self.latest_output_bytes;
+        self.derive_terminal(
+            ctxmux_protocol::NativeTerminalFaultStage::Export,
+            |terminal| terminal.continuation(id, first, latest),
+        )
+        .unwrap_or_else(|| {
+            let terminal = if self.terminal_absence
+                == TerminalCheckpointUnavailableReason::InvalidCheckpoint
+            {
+                TerminalContinuation::Unavailable {
+                    reason: self.terminal_absence.clone(),
+                }
+            } else {
+                TerminalContinuation::Unknown {
+                    reason: self.terminal_absence.clone(),
+                }
+            };
+            (terminal, Vec::new())
+        })
+    }
+
+    fn terminal_pressure(&mut self, id: RunId) {
+        let first = self.first_available_byte();
+        let latest = self.latest_output_bytes;
+        if self
+            .derive_terminal(
+                ctxmux_protocol::NativeTerminalFaultStage::Export,
+                |terminal| terminal.retention_cut(id, first, latest),
+            )
+            .unwrap_or(false)
+        {
+            self.checkpoint_dirty = true;
+        }
+    }
+
+    fn take_stored_checkpoint(&mut self) -> Option<StoredCheckpoint> {
+        if !self.checkpoint_dirty {
+            return None;
+        }
+        self.checkpoint_dirty = false;
+        self.derive_terminal(
+            ctxmux_protocol::NativeTerminalFaultStage::Export,
+            |terminal| terminal.stored(),
+        )
+        .flatten()
+    }
+
     fn mark_source_gap(&mut self) -> u64 {
+        self.terminal = None;
+        self.terminal_absence = TerminalCheckpointUnavailableReason::SourceGap;
         self.source_gap_after_byte = Some(self.latest_output_bytes);
         self.latest_output_bytes
     }
 
+    /// Discard a partially mutated VT model, never its authoritative raw log.
+    fn derive_terminal<T>(
+        &mut self,
+        stage: ctxmux_protocol::NativeTerminalFaultStage,
+        derive: impl FnOnce(&mut TerminalModel) -> T,
+    ) -> Option<T> {
+        let terminal = self.terminal.as_mut()?;
+        if let Some(value) = derive_terminal(|| derive(terminal)) {
+            Some(value)
+        } else {
+            self.terminal = None;
+            self.terminal_absence = TerminalCheckpointUnavailableReason::InvalidCheckpoint;
+            self.checkpoint_dirty = false;
+            self.note_terminal_fault(stage);
+            None
+        }
+    }
+
+    fn bind_service(&mut self, service: native_service::NativeService) {
+        if let Some(fault) = &self.terminal_fault {
+            service.terminal_fault(fault.clone());
+        }
+        self.service = Some(service);
+    }
+
+    fn note_terminal_fault(&mut self, stage: ctxmux_protocol::NativeTerminalFaultStage) {
+        if self.terminal_fault.is_none() {
+            let fault = ctxmux_protocol::NativeTerminalFault {
+                stage,
+                through_byte: self.latest_output_bytes,
+            };
+            if let Some(service) = &self.service {
+                service.terminal_fault(fault.clone());
+            }
+            self.terminal_fault = Some(fault);
+        }
+    }
+
+    #[cfg(test)]
     fn push(&mut self, data: Vec<u8>) -> OutputChunk {
         self.push_protected(data, u64::MAX)
     }
@@ -6007,6 +6485,12 @@ impl OutputLog {
                 });
             }
         }
+        self.publish_facts();
+        // The complete source chunk is admitted before optional derived work.
+        self.derive_terminal(
+            ctxmux_protocol::NativeTerminalFaultStage::Process,
+            |terminal| terminal.process(&chunk.data),
+        );
         let excess = self
             .retained_bytes
             .saturating_sub(self.budget.per_run_limit());
@@ -6038,6 +6522,7 @@ impl OutputLog {
             self.budget.sub(bytes);
             freed += bytes;
         }
+        self.publish_facts();
         freed
     }
 
@@ -6142,6 +6627,8 @@ impl Drop for OutputLog {
 
 pub(crate) const fn resident_run_owner_bytes() -> u64 {
     (std::mem::size_of::<Run>()
+        + native_service::resident_service_owner_bytes()
+        + native_output::resident_output_facts_bytes()
         + native_control::resident_control_owner_bytes()
         + native_runtime::resident_runtime_owner_bytes()
         + creation::registry_owner_bytes()) as u64
@@ -6329,6 +6816,7 @@ fn pty_open_error(error: &anyhow::Error) -> ProtocolError {
 
 fn control_not_applied(error: ProtocolError) -> ControlFailure {
     ControlFailure {
+        confirmed_input_bytes: None,
         error,
         disposition: CommandDisposition::NotApplied,
     }
@@ -6336,6 +6824,7 @@ fn control_not_applied(error: ProtocolError) -> ControlFailure {
 
 fn control_unknown(error: ProtocolError) -> ControlFailure {
     ControlFailure {
+        confirmed_input_bytes: None,
         error,
         disposition: CommandDisposition::Unknown,
     }
@@ -6370,6 +6859,7 @@ async fn handle_recoverable_stop_attachment(
             manager,
             run,
             after_byte,
+            AttachmentView::Raw,
             request_permit,
             Some(response),
         )
@@ -6441,8 +6931,12 @@ async fn handle_connection(
         UpgradeRequestAdmission::Sealed => return Ok(()),
     };
     match request {
-        Request::Attach { id, after_byte } => {
-            return attachment::handle(wire, manager, id, after_byte, request_permit).await;
+        Request::Attach {
+            id,
+            after_byte,
+            view,
+        } => {
+            return attachment::handle(wire, manager, id, after_byte, view, request_permit).await;
         }
         Request::AttachRecoverableStop {
             operation,
@@ -6458,7 +6952,10 @@ async fn handle_connection(
             .await;
         }
         request => {
-            let response = execute_request(&manager, request).await;
+            let Some(response) = execute_connected_request(&manager, &mut wire, request).await?
+            else {
+                return Ok(());
+            };
             match response {
                 // A successful response is the only frame here whose size grows
                 // with fleet or user-controlled data, so it goes through the
@@ -6482,6 +6979,37 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Only unadmitted controls are cancelled by socket EOF. Creation owners and
+/// recoverable Stop settlements retain their established daemon-owned boundary.
+async fn execute_connected_request(
+    manager: &Arc<RunManager>,
+    wire: &mut Framed<UnixStream, LinesCodec>,
+    request: Request,
+) -> Result<Option<Result<Response, ProtocolError>>, ConnectionError> {
+    let cancel_unadmitted = matches!(
+        &request,
+        Request::Input { .. }
+            | Request::RecoverableInput { .. }
+            | Request::Resize { .. }
+            | Request::Signal { .. }
+    );
+    let execution = execute_request(manager, request);
+    let response = if cancel_unadmitted {
+        tokio::select! {
+            response = execution => response,
+            next = receive(wire) => {
+                if next?.is_some() {
+                    send(wire, &invalid_request("one-shot request connection accepts exactly one request")).await?;
+                }
+                return Ok(None);
+            }
+        }
+    } else {
+        execution.await
+    };
+    Ok(Some(response))
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "one exhaustive protocol dispatch keeps every public request variant visibly total"
@@ -6491,6 +7019,9 @@ async fn execute_request(
     request: Request,
 ) -> Result<Response, ProtocolError> {
     match request {
+        Request::Diagnostics {} => Ok(Response::Diagnostics {
+            diagnostics: diagnostics::snapshot(),
+        }),
         Request::Start {
             operation_key,
             spec,
@@ -6565,7 +7096,7 @@ async fn execute_request(
                     });
                 }
             };
-            Ok(short_control_response(&run, run.resize(size)))
+            Ok(short_control_response(&run, run.resize_async(size).await))
         }
         Request::Signal { id, signal } => {
             let run = match manager.pin(id) {
@@ -6714,7 +7245,7 @@ async fn send(
 /// generic: *any* frame that grew past the cap — historically an enormous
 /// `RunInfo` in a `List` or an `Attached` header, or any future fat response —
 /// would encode to `FrameError::TooLarge`, propagate as `ConnectionError`, and
-/// reach the spawn task's `eprintln!`-and-return, closing the socket with no
+/// reach the spawn task's diagnostic-and-return, closing the socket with no
 /// frame. The client then saw a bare EOF it could not tell apart from a daemon
 /// crash. Here the daemon instead emits a small, always-framable error the caller
 /// can branch on (`ErrorCode::ResponseTooLarge`) and, for `List`, retry with a
@@ -6824,7 +7355,7 @@ mod tests {
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
 
-    async fn fresh_stop(client: &Client, id: RunId) -> RecoverableStop {
+    pub(super) async fn fresh_stop(client: &Client, id: RunId) -> RecoverableStop {
         client
             .prepare_stop(id)
             .await
@@ -6836,6 +7367,24 @@ mod tests {
             .await
             .expect("receive attachment event before timeout")
             .expect("read attachment event")
+    }
+
+    async fn next_non_service_event(
+        attachment: &Attachment,
+    ) -> Result<Option<RunEvent>, ClientError> {
+        let mut revision = 0;
+        loop {
+            match attachment.next_event().await? {
+                Some(RunEvent::ServiceChanged { service }) => {
+                    assert!(
+                        service.revision > revision,
+                        "service snapshots stay ordered"
+                    );
+                    revision = service.revision;
+                }
+                event => return Ok(event),
+            }
+        }
     }
     use crate::native_control::NativeControlOwner;
 
@@ -6871,6 +7420,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         }
     }
 
@@ -7273,6 +7823,7 @@ mod tests {
                 // A recovered row carries no confirmed size; re-adoption must
                 // take it from the PTY it inherits, not from this record.
                 current_size: None,
+                native_service: None,
             },
             // Committed durable bytes with none retained in memory: the honest
             // replay of a Run whose output crossed the exec on disk only.
@@ -7287,27 +7838,17 @@ mod tests {
 
         let native_runs = NativeRuntimeOwner::default();
 
-        // The two manager-shared values now flow in from the caller — matching
-        // the production spawn seam — instead of being fabricated inside
-        // `readopt`. Each is wired to a probe so the threading is load-bearing:
-        //
-        // * `input_drains` carries a probe `QualificationStats` sink. The spawn
-        //   path threads the DAEMON-WIDE gate so every run shares one input
-        //   concurrency budget; a re-adopted run must join THAT gate, not a
-        //   fresh one. Passing a DISTINCT no-sink `qualification_stats` param
-        //   below is the crux: the only way this probe sink can ever observe an
-        //   `InputDrains` gauge pulse is if `readopt` actually schedules input
-        //   through the gate we pass here. The pre-fix code discarded this gate
-        //   and rebuilt one from `qualification_stats`, leaving the probe silent.
-        let (input_drain_frames, input_drain_sink) =
-            UnixStream::pair().expect("open input-drain probe stats stream");
-        let input_drain_stats = crate::qualification_stats::QualificationStats::from_sink(
-            input_drain_sink.into(),
-            "readopt-input-drain-probe",
-        )
-        .expect("open input-drain probe stats");
-        let input_drains =
-            crate::native_control::InputDrainGate::with_stats(input_drain_stats.clone());
+        // The manager-shared gate now owns funded input state, not blocking
+        // worker slots. With the funding budget occupied, an eight-byte command
+        // must refuse before PTY mutation. The original command is accepted
+        // below after the reservation pressure is removed at its causal owner.
+        let shared_control_budget = crate::resources::ByteBudget::new(4096);
+        let budget_hold = shared_control_budget.reserve(4096).unwrap();
+        let input_drains = crate::native_control::InputDrainGate::with_stats_resources_and_budget(
+            crate::qualification_stats::QualificationStats::default(),
+            crate::ResourceLimits::DEFAULT,
+            shared_control_budget,
+        );
 
         // `wait_failure` carries a probe `IncarnationFailure` — the value the
         // serve loop's fail-stop arm watches — wired exactly as the manager
@@ -7355,44 +7896,24 @@ mod tests {
         })
         .expect("resize the re-adopted live master");
 
-        // The input path is live end to end: bytes reach the real pty master
-        // and the applied cursor advances by exactly the bytes written.
-        run.input(b"readopt\n".to_vec())
+        let refused = run.input(b"readopt\n".to_vec()).await.unwrap_err();
+        assert_eq!(refused.error.code, ErrorCode::ControlBackpressure);
+        assert_eq!(refused.disposition, CommandDisposition::NotApplied);
+        assert_eq!(run.info().applied_input_bytes, Some(0));
+        drop(budget_hold);
+        let receipt = run
+            .input(b"readopt\n".to_vec())
             .await
-            .expect("drive input through the re-adopted control");
-        assert_eq!(run.info().applied_input_bytes, Some(8));
-
-        // Defect 2 (resource governance) — the load-bearing proof of the fix.
-        // The re-adopted run scheduled its input through the manager-shared
-        // `InputDrainGate` we passed in, shown by the gauge pulse landing on
-        // THAT gate's probe stats sink. `begin_input` sets the `InputDrains`
-        // gauge synchronously before the `PendingInput` is returned, so the
-        // pulse is already recorded by the time the await above resolves. The
-        // pre-fix code discarded the passed gate and rebuilt a fresh one from
-        // the SEPARATE no-sink `qualification_stats` param, so this probe sink
-        // could never pulse — making the assertion below genuinely load-bearing
-        // against the old fabricated gate (it goes red without the fix).
-        input_drain_stats.finish();
-        let observed_input_drain_gauge = {
-            use std::io::BufRead;
-            std::io::BufReader::new(input_drain_frames)
-                .lines()
-                .map(|line| {
-                    serde_json::from_str::<serde_json::Value>(&line.expect("probe frame line"))
-                        .expect("probe frame parses")
-                })
-                .filter_map(|frame| {
-                    frame["high_water"][crate::qualification_stats::Gauge::InputDrains as usize]
-                        .as_u64()
-                })
-                .max()
-                .expect("probe stats emitted at least one frame")
-        };
-        assert!(
-            observed_input_drain_gauge >= 1,
-            "re-adopted input must schedule through the manager-shared gate we passed in, \
-             not a fresh gate rebuilt from the separate qualification_stats"
-        );
+            .expect("original request reaches the real adopted master after funding returns");
+        assert_eq!(receipt, ControlReceipt::Input { written_bytes: 8 });
+        let info = run.info();
+        assert_eq!(info.applied_input_bytes, Some(8));
+        assert_eq!(info.pid, Some(child_pid));
+        let service = info.native_service.unwrap();
+        assert_eq!(service.input.completed_input_bytes, Some(8));
+        assert_eq!(service.input.unsettled_commands, 0);
+        assert_eq!(service.input.unsettled_request_bytes, 0);
+        assert_eq!(service.input.active_confirmed_bytes, 0);
 
         // Defect 1 (reliability) guard. The strongest discriminator would be
         // observing a wait-authority-loss record land in this probe
@@ -7581,9 +8102,10 @@ mod tests {
             )
             .map_err(|error| error.into_parts().0)
             .expect("register production wait-authority fixture");
-        let event = tokio::time::timeout(Duration::from_secs(2), attachment.next_event())
-            .await
-            .expect("daemon failure closes the public attachment");
+        let event =
+            tokio::time::timeout(Duration::from_secs(2), next_non_service_event(&attachment))
+                .await
+                .expect("daemon failure closes the public attachment");
         assert!(
             matches!(event, Err(ClientError::Closed)),
             "pre-terminal daemon exit must not look like a clean terminal EOF: {event:?}"
@@ -7813,7 +8335,7 @@ mod tests {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(1),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation(
+            output: crate::native_output::OutputOwner::new(OutputLog::with_initial_truncation(
                 crate::retention::RetentionBudget::production(),
             )),
             incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
@@ -7822,8 +8344,13 @@ mod tests {
                 completion: Mutex::new(TmuxCompletion::Pending(completion)),
             })),
             native_runs: None,
+            native_service: None,
             persistence_mode: PersistenceMode::MemoryOnly,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: std::sync::atomic::AtomicUsize::new(0),
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
@@ -8385,15 +8912,15 @@ mod tests {
         }
     }
 
-    struct InProcessServer {
-        directory: tempfile::TempDir,
-        client: Client,
-        manager: Arc<RunManager>,
+    pub(super) struct InProcessServer {
+        pub(super) directory: tempfile::TempDir,
+        pub(super) client: Client,
+        pub(super) manager: Arc<RunManager>,
         task: tokio::task::JoinHandle<Result<(), ServerError>>,
     }
 
     impl InProcessServer {
-        fn start(manager: Arc<RunManager>) -> Self {
+        pub(super) fn start(manager: Arc<RunManager>) -> Self {
             let directory = tempfile::tempdir().expect("create in-process server directory");
             let socket = directory.path().join("ctxmux.sock");
             let listener =
@@ -8482,9 +9009,21 @@ mod tests {
             .registry
             .begin_recoverable_stop(run.id, operation.operation_key.clone())
             .expect("first Stop enters the owner");
-        let super::RecoverableStopAdmission::Owner { flight, settlement } = admission else {
+        let super::RecoverableStopAdmission::Owner {
+            flight,
+            mut settlement,
+        } = admission
+        else {
             panic!("first Stop admission must create one settlement owner");
         };
+
+        // Registry admission only binds the key. Exercise the real Native
+        // effect before dropping the task that owes registry settlement.
+        // Losing that publication still means Unknown on the same key.
+        settlement
+            .wait()
+            .await
+            .expect("real Stop reaches its child owner");
 
         drop(super::RecoverableStopSettlementOwner {
             manager: Arc::clone(&server.manager),
@@ -8597,11 +9136,12 @@ mod tests {
             .input(first.id, b"still-owned\n".to_vec())
             .await
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), attachment.next_event())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let event =
+            tokio::time::timeout(Duration::from_secs(5), next_non_service_event(&attachment))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
         assert!(matches!(event, RunEvent::Output { .. }));
         attachment.detach().await.unwrap();
         server.manager.get(first.id).unwrap().stop().await.unwrap();
@@ -8621,9 +9161,6 @@ mod tests {
             .block_on(async {
                 let (persistence, recovered) =
                     super::Persistence::open(directory.join("state")).unwrap();
-                if std::env::var_os("CTXMUX_TEST_UPGRADE_BEFORE_EXEC").is_none() {
-                    persistence.force_append_storage_full();
-                }
                 let manager = Arc::new(RunManager::persistent(persistence, recovered));
                 let socket = directory.join("sock");
                 let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -8650,14 +9187,38 @@ mod tests {
         signal_upgrade_cancellation(true).await;
     }
 
-    async fn signal_upgrade_cancellation(after_barrier: bool) {
-        struct ProcessGuard(std::process::Child);
-        impl Drop for ProcessGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+    fn upgrade_cancellation_spec(after_barrier: bool, directory: &std::path::Path) -> RunSpec {
+        if after_barrier {
+            long_running_spec()
+        } else {
+            RunSpec {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    concat!(
+                        "IFS= read -r line; printf '%s\\n' \"$line\"; ",
+                        "while [ ! -e \"$1/release-tail\" ]; do sleep 0.01; done; ",
+                        "printf 'post-checkpoint-tail\\n'; exec /bin/cat"
+                    )
+                    .to_owned(),
+                    "ctxmux-upgrade-tail".to_owned(),
+                    directory.to_string_lossy().into_owned(),
+                ],
+                ..long_running_spec()
             }
         }
+    }
+
+    struct UpgradeTestChild(std::process::Child);
+
+    impl Drop for UpgradeTestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    async fn signal_upgrade_cancellation(after_barrier: bool) {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("extracted");
         let before_exec = temp.path().join("before-exec");
@@ -8666,8 +9227,15 @@ mod tests {
         let mut command = Command::new(std::env::current_exe().unwrap());
         if after_barrier {
             command.env("CTXMUX_TEST_UPGRADE_BEFORE_EXEC", &before_exec);
+        } else {
+            command
+                .env("CTXMUX_TEST_UPGRADE_LATE_TAIL", temp.path())
+                .env(
+                    "CTXMUX_TEST_UPGRADE_RETRY_MARKER",
+                    temp.path().join("actual-storage-retry"),
+                );
         }
-        let mut child = ProcessGuard(
+        let mut child = UpgradeTestChild(
             command
                 .args([
                     "--exact",
@@ -8694,7 +9262,8 @@ mod tests {
         })
         .await
         .unwrap();
-        let run = client.start(long_running_spec()).await.unwrap();
+        let spec = upgrade_cancellation_spec(after_barrier, temp.path());
+        let run = client.start(spec).await.unwrap();
         client.input(run.id, b"pressure\n".to_vec()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while client.status(run.id).await.unwrap().latest_output_bytes == 0 {
@@ -8722,6 +9291,12 @@ mod tests {
             child.0.try_wait().unwrap().is_none(),
             "durable barrier really waits under pressure"
         );
+        if !after_barrier {
+            assert!(
+                temp.path().join("actual-storage-retry").exists(),
+                "actual accepted output reached the failing storage owner"
+            );
+        }
         rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
         let status = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -9130,6 +9705,423 @@ mod tests {
     }
 
     #[test]
+    fn failed_terminal_derivation_discards_only_the_partial_model() {
+        let id = RunId::new();
+        let mut output = OutputLog::new_native(
+            id,
+            Some(TerminalSize { rows: 4, cols: 12 }),
+            crate::retention::RetentionBudget::production(),
+        );
+        output.push(b"before".to_vec());
+        let failure: Option<()> = output.derive_terminal(
+            ctxmux_protocol::NativeTerminalFaultStage::Process,
+            |terminal| {
+                terminal.process(b"partial mutation");
+                panic!("owning terminal derivation failure");
+            },
+        );
+        assert_eq!(failure, None);
+        assert!(output.terminal.is_none());
+        output.push(b"after".to_vec());
+        assert_eq!(replay_bytes(&output.replay(0).chunks), b"beforeafter");
+        let (continuation, restore) = output.terminal_snapshot(id);
+        assert_eq!(
+            continuation,
+            ctxmux_protocol::TerminalContinuation::Unavailable {
+                reason: ctxmux_protocol::TerminalCheckpointUnavailableReason::InvalidCheckpoint
+            }
+        );
+        assert!(restore.is_empty());
+        assert!(output.take_stored_checkpoint().is_none());
+        let resize = output.resize_terminal(TerminalSize { rows: 5, cols: 14 });
+        assert_eq!(resize.through_byte, 11);
+        assert_eq!(resize.resize_revision, 1);
+        assert_eq!(resize.size, TerminalSize { rows: 5, cols: 14 });
+        output.terminal_pressure(id);
+        assert_eq!(replay_bytes(&output.replay(0).chunks), b"beforeafter");
+    }
+
+    async fn expect_original_raw(client: &Client, original: &RunInfo, expected: &[u8]) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (view, snapshot) = client.attach(original.id, 0).await.unwrap();
+                assert_eq!(snapshot.run.id, original.id);
+                assert_eq!(snapshot.run.pid, original.pid);
+                assert_eq!(snapshot.replay.first_available_byte, 0);
+                let mut next = 0;
+                for chunk in &snapshot.replay.chunks {
+                    assert_eq!(chunk.start_byte, next);
+                    next += chunk.data.len() as u64;
+                    assert_eq!(chunk.end_byte, next);
+                }
+                let bytes = replay_bytes(&snapshot.replay.chunks);
+                assert!(expected.starts_with(&bytes), "original bytes changed");
+                view.detach().await.unwrap();
+                if bytes == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("real PTY bytes arrive within original owning budget");
+    }
+
+    struct HeldPublicOwner {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for HeldPublicOwner {
+        fn drop(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
+
+    async fn expect_unadmitted_socket_eof_refund(server: &InProcessServer, id: RunId) {
+        use futures_util::{SinkExt as _, StreamExt as _};
+        let budget = server.manager.native_input_drains.control_budget();
+        let before = budget.used();
+        let socket = tokio::net::UnixStream::connect(server.directory.path().join("ctxmux.sock"))
+            .await
+            .unwrap();
+        let mut wire = tokio_util::codec::Framed::new(socket, super::codec());
+        wire.send(
+            ctxmux_protocol::encode_frame(&ctxmux_protocol::ClientFrame::Hello {
+                hello: ctxmux_protocol::ClientHello {
+                    protocol: ctxmux_protocol::PROTOCOL_VERSION,
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let hello = wire.next().await.unwrap().unwrap();
+        assert!(matches!(
+            ctxmux_protocol::decode_frame::<ctxmux_protocol::ServerFrame>(&hello).unwrap(),
+            ctxmux_protocol::ServerFrame::Hello { .. }
+        ));
+        wire.send(
+            ctxmux_protocol::encode_frame(&ctxmux_protocol::ClientFrame::Request {
+                request: ctxmux_protocol::Request::Input {
+                    id,
+                    data: b"cancel-before-admission".to_vec(),
+                },
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while budget.used() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual one-shot input reached funded pending admission");
+        drop(wire);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while budget.used() != before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actual socket EOF cancels and refunds unadmitted payload");
+    }
+
+    async fn expect_public_busy_owners(
+        server: &InProcessServer,
+        clients: &[Client; 2],
+        runs: &[RunInfo],
+    ) {
+        let run = server.manager.pin(runs[0].id).unwrap();
+        let (ready, reached) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let held = HeldPublicOwner {
+            release: Some(release),
+            worker: Some(std::thread::spawn(move || {
+                run.native_control().unwrap().with_metadata(|_, _| {
+                    let _output = run.lock_owner(&run.output);
+                    let _persistence = run.lock_owner(&run.persistence);
+                    ready.send(()).unwrap();
+                    blocked.recv().unwrap();
+                });
+            })),
+        };
+        reached.recv().unwrap();
+        expect_unadmitted_socket_eof_refund(server, runs[0].id).await;
+        let operation = ctxmux_protocol::RecoverableInput {
+            daemon_instance: clients[0].daemon_instance().await.unwrap(),
+            operation_key: ctxmux_protocol::InputOperationKey::new("held-public-owner").unwrap(),
+            id: runs[0].id,
+            expected_byte: 0,
+            data: b"not-replayed".to_vec(),
+        };
+        let input_client = clients[0].clone();
+        let resize_client = clients[1].clone();
+        let id = runs[0].id;
+        let input =
+            tokio::spawn(async move { input_client.input(id, b"not-applied".to_vec()).await });
+        let resize = tokio::spawn(async move {
+            resize_client
+                .resize(id, TerminalSize { rows: 5, cols: 14 })
+                .await
+        });
+        let (status, listing, healthy) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                clients[0].status(runs[0].id),
+                clients[1].list(),
+                clients[0].input(runs[1].id, b"h".to_vec()),
+            )
+        })
+        .await
+        .expect("busy Run owners cannot occupy both public request workers");
+        assert!(
+            !input.is_finished(),
+            "ordinary input awaits actual owner unlock"
+        );
+        assert!(!resize.is_finished(), "resize awaits actual owner unlock");
+        let status = status.unwrap();
+        assert_eq!(status.pid, runs[0].pid);
+        assert_eq!(status.applied_input_bytes, Some(0));
+        assert_eq!(
+            status.current_size,
+            Some(TerminalSize { rows: 4, cols: 12 })
+        );
+        assert_eq!(status.latest_output_bytes, b"A:READY\n".len() as u64);
+        let list = listing.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(
+            list.iter()
+                .any(|row| row.id == runs[0].id && row.pid == runs[0].pid)
+        );
+        assert_eq!(healthy.unwrap().receipt.written_bytes, 1);
+        expect_original_raw(&clients[1], &runs[1], b"B:READY\nB:h\n").await;
+        drop(held);
+        let (input, resize) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(input, resize)
+        })
+        .await
+        .expect("same original requests resume after the actual unlock");
+        assert_eq!(input.unwrap().unwrap().receipt.written_bytes, 11);
+        resize.unwrap().unwrap();
+        let mut expected = b"A:READY\n".to_vec();
+        for byte in b"not-applied" {
+            expected.extend_from_slice(&[b'A', b':', *byte, b'\n']);
+        }
+        expect_original_raw(&clients[0], &runs[0], &expected).await;
+        let mut operation = operation;
+        operation.expected_byte = 11;
+        let first = clients[1]
+            .recoverable_input(operation.clone())
+            .await
+            .unwrap();
+        let repeated = clients[0].recoverable_input(operation).await.unwrap();
+        assert_eq!(first.receipt, repeated.receipt);
+        for byte in b"not-replayed" {
+            expected.extend_from_slice(&[b'A', b':', *byte, b'\n']);
+        }
+        expect_original_raw(&clients[0], &runs[0], &expected).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_busy_owners_wait_without_stalling_unrelated_run() {
+        let server = InProcessServer::start(Arc::new(RunManager::default()));
+        let clients = [
+            server.client.clone(),
+            Client::new(server.directory.path().join("ctxmux.sock")),
+        ];
+        let mut runs = Vec::new();
+        for (name, client) in ["A", "B"].into_iter().zip(&clients) {
+            let script = format!(
+                "import os,signal,termios\na=termios.tcgetattr(0);a[3]&=~(termios.ICANON|termios.ECHO);a[3]|=termios.ISIG\na[1]&=~termios.ONLCR;a[6][termios.VMIN]=1;a[6][termios.VTIME]=0\ntermios.tcsetattr(0,termios.TCSANOW,a)\nname={name:?}.encode()\nsignal.signal(signal.SIGINT,lambda s,f:exit(0))\nos.write(1,name+b':READY\\n')\nwhile True:\n b=os.read(0,1)\n if not b:break\n os.write(1,name+b':'+b+b'\\n')\n"
+            );
+            let run = client
+                .start(RunSpec {
+                    program: "/usr/bin/python3".into(),
+                    args: vec!["-u".into(), "-c".into(), script],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    initial_size: TerminalSize { rows: 4, cols: 12 },
+                    declared_inputs: Vec::new(),
+                })
+                .await
+                .unwrap();
+            expect_original_raw(client, &run, format!("{name}:READY\n").as_bytes()).await;
+            runs.push(run);
+        }
+        expect_public_busy_owners(&server, &clients, &runs).await;
+        for (client, run) in clients.iter().zip(&runs) {
+            assert_eq!(client.status(run.id).await.unwrap().pid, run.pid);
+            client.input(run.id, vec![3]).await.unwrap();
+            wait_for_exit(client, run.id).await;
+            assert!(!process_exists(run.pid.unwrap()));
+        }
+    }
+
+    async fn expect_local_derivation_fault(
+        live: &ctxmux_client::Attachment,
+        before_service: &ctxmux_protocol::NativeServiceSnapshot,
+    ) -> ctxmux_protocol::NativeServiceSnapshot {
+        let reported = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut revision = before_service.revision;
+            loop {
+                if let Some(RunEvent::ServiceChanged { service }) = live.next_event().await.unwrap()
+                {
+                    assert!(
+                        service.revision > revision,
+                        "service events never overwrite a newer snapshot"
+                    );
+                    revision = service.revision;
+                    if service.terminal_fault.is_some() {
+                        break service;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("actual local derivation failure reaches an existing public observer");
+        assert!(matches!(
+            reported.owner,
+            ctxmux_protocol::NativeOwnerStatus::Serving {}
+        ));
+        assert!(matches!(
+            reported.output,
+            ctxmux_protocol::NativeOutputStatus::Serving {}
+        ));
+        assert!(matches!(
+            reported.input.phase,
+            ctxmux_protocol::NativeInputPhase::Open {}
+        ));
+        assert_eq!(
+            reported.terminal_fault,
+            Some(ctxmux_protocol::NativeTerminalFault {
+                stage: ctxmux_protocol::NativeTerminalFaultStage::Process,
+                through_byte: b"A:READY\nA:!\n".len() as u64,
+            })
+        );
+        reported
+    }
+
+    async fn start_derivation_fault_runs(clients: &[Client; 2]) -> Vec<RunInfo> {
+        let mut runs = Vec::new();
+        for (name, client) in ["A", "B"].into_iter().zip(clients) {
+            let script = format!(
+                "import os,signal,termios\n\
+                 a=termios.tcgetattr(0);a[3]&=~(termios.ICANON|termios.ECHO);a[3]|=termios.ISIG\n\
+                 a[1]&=~termios.ONLCR;a[6][termios.VMIN]=1;a[6][termios.VTIME]=0\n\
+                 termios.tcsetattr(0,termios.TCSANOW,a)\n\
+                 name={name:?}.encode()\n\
+                 def interrupt(s,f):\n os.write(1,name+b':CTRL_C\\n');raise SystemExit(0)\n\
+                 signal.signal(signal.SIGINT,interrupt)\n\
+                 os.write(1,name+b':READY\\n')\n\
+                 while True:\n b=os.read(0,1)\n if not b:break\n os.write(1,name+b':'+b+b'\\n')\n"
+            );
+            let run = client
+                .start(RunSpec {
+                    program: "/usr/bin/python3".to_owned(),
+                    args: vec!["-u".to_owned(), "-c".to_owned(), script],
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    initial_size: TerminalSize { rows: 4, cols: 12 },
+                    declared_inputs: Vec::new(),
+                })
+                .await
+                .unwrap();
+            expect_original_raw(client, &run, format!("{name}:READY\n").as_bytes()).await;
+            runs.push(run);
+        }
+        runs
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_derivation_failure_keeps_two_real_runs_and_clients_serving() {
+        let server = InProcessServer::start(Arc::new(RunManager::default()));
+        let identity = server.client.runtime_info().await.unwrap();
+        let clients = [
+            server
+                .client
+                .clone()
+                .with_expected_runtime_identity(identity.clone()),
+            Client::new(server.directory.path().join("ctxmux.sock"))
+                .with_expected_runtime_identity(identity),
+        ];
+        let runs = start_derivation_fault_runs(&clients).await;
+        assert_ne!(runs[0].id, runs[1].id);
+        assert_ne!(runs[0].pid, runs[1].pid);
+        let (live, before_fault) = clients[1].attach(runs[0].id, 0).await.unwrap();
+        let before_service = before_fault.run.native_service.unwrap();
+        assert!(matches!(
+            before_service.owner,
+            ctxmux_protocol::NativeOwnerStatus::Serving {}
+        ));
+        assert!(before_service.terminal_fault.is_none());
+        let run = server.manager.pin(runs[0].id).unwrap();
+        run.lock_owner(&run.output)
+            .terminal
+            .as_mut()
+            .unwrap()
+            .fail_next_process_for_test();
+        let accepted = clients[0].input(runs[0].id, b"!".to_vec()).await.unwrap();
+        assert_eq!(accepted.receipt.written_bytes, 1);
+        expect_original_raw(&clients[0], &runs[0], b"A:READY\nA:!\n").await;
+        let reported = expect_local_derivation_fault(&live, &before_service).await;
+        live.detach().await.unwrap();
+        let (failed_view, snapshot) = clients[1].attach_terminal(runs[0].id, 0).await.unwrap();
+        assert_eq!(
+            snapshot.terminal,
+            ctxmux_protocol::TerminalContinuation::Unavailable {
+                reason: ctxmux_protocol::TerminalCheckpointUnavailableReason::InvalidCheckpoint,
+            }
+        );
+        assert!(snapshot.terminal_restore.is_empty());
+        assert_eq!(
+            snapshot.run.native_service.unwrap().terminal_fault,
+            reported.terminal_fault
+        );
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"A:READY\nA:!\n");
+        failed_view.detach().await.unwrap();
+        clients[1].input(runs[1].id, b"b".to_vec()).await.unwrap();
+        expect_original_raw(&clients[1], &runs[1], b"B:READY\nB:b\n").await;
+        let (healthy_view, _) = clients[0].attach_terminal(runs[1].id, 0).await.unwrap();
+        healthy_view
+            .resize(TerminalSize { rows: 3, cols: 9 })
+            .await
+            .unwrap();
+        healthy_view.detach().await.unwrap();
+        clients[1].input(runs[0].id, b"z".to_vec()).await.unwrap();
+        expect_original_raw(&clients[1], &runs[0], b"A:READY\nA:!\nA:z\n").await;
+        assert_eq!(
+            clients[0]
+                .status(runs[0].id)
+                .await
+                .unwrap()
+                .applied_input_bytes,
+            Some(2)
+        );
+        for (index, name) in ["A", "B"].into_iter().enumerate() {
+            let status = clients[index].status(runs[index].id).await.unwrap();
+            assert_eq!(status.pid, runs[index].pid);
+            assert!(status.state.is_running());
+            clients[index].input(runs[index].id, vec![3]).await.unwrap();
+            let expected: &[u8] = if name == "A" {
+                b"A:READY\nA:!\nA:z\nA:CTRL_C\n"
+            } else {
+                b"B:READY\nB:b\nB:CTRL_C\n"
+            };
+            expect_original_raw(&clients[index], &runs[index], expected).await;
+            wait_for_exit(&clients[index], runs[index].id).await;
+            assert!(
+                !process_exists(runs[index].pid.unwrap()),
+                "natural exit is reaped"
+            );
+        }
+    }
+    #[test]
     fn the_two_wire_byte_counters_diverge_once_trimming_starts() {
         // The reason `retained_output_bytes` exists as a separate wire field.
         // Both counters agree while nothing has been evicted, and an external
@@ -9186,7 +10178,7 @@ mod tests {
         }
 
         let summary = run.summary();
-        let held = mutex_lock(&run.output).retained_bytes() as u64;
+        let held = run.lock_owner(&run.output).retained_bytes() as u64;
 
         assert_eq!(
             summary.retained_output_bytes, held,
@@ -9248,6 +10240,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         };
         let operation_key =
             CreateOperationKey::new("dropped-append").expect("valid dropped-append key");
@@ -9279,8 +10272,22 @@ mod tests {
 
         // Hold the actor inside its first append so everything behind it is
         // dropped rather than queued.
+        let (attachment_guard, mut live) = run.subscribe();
         let (reached, release) = persistence.pause_next_append();
         run.record_output(b"alpha".to_vec());
+        assert_eq!(
+            run.events.cursor().output_bytes,
+            5,
+            "persistent raw admission must also advance the public event owner"
+        );
+        let envelope = live
+            .receiver
+            .try_recv()
+            .expect("subscribed raw event is published");
+        assert!(
+            matches!(envelope.event().as_ref(), RunEvent::Output { chunk }
+            if chunk.start_byte == 0 && chunk.end_byte == 5 && chunk.data == b"alpha")
+        );
         reached
             .recv()
             .expect("the actor reaches the append barrier");
@@ -9302,10 +10309,10 @@ mod tests {
         // `Run::recover` already claimed this Run's terminal ordinal, and the
         // point under test is the durable byte stream, not terminal publication.
         let (expected, catch_up) = {
-            let output = mutex_lock(&run.output);
+            let output = run.lock_owner(&run.output);
             (output.latest_output_bytes(), output.replay(0))
         };
-        mutex_lock(&run.persistence)
+        run.lock_owner(&run.persistence)
             .active()
             .expect("a recovered Run has active persistence")
             .finalize(
@@ -9324,6 +10331,8 @@ mod tests {
              would kill durability for every Run in the fleet"
         );
 
+        drop(live);
+        drop(attachment_guard);
         drop(run);
         persistence.assert_exclusive_owner();
         drop(persistence);
@@ -9396,6 +10405,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         };
         let operation_key =
             CreateOperationKey::new("steady-append").expect("valid steady-append key");
@@ -9477,9 +10487,9 @@ mod tests {
 
         // The actor is parked, so this is genuinely un-committed: a catch-up
         // from the durable head would copy all of it on every single push.
-        let before_final_push = mutex_lock(&run.output).latest_output_bytes();
+        let before_final_push = run.lock_owner(&run.output).latest_output_bytes();
         assert_eq!(
-            mutex_lock(&run.persistence)
+            run.lock_owner(&run.persistence)
                 .active()
                 .expect("a recovered Run has active persistence")
                 .durable_head(),
@@ -9553,6 +10563,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         };
         let operation_key = CreateOperationKey::new("overloaded").expect("valid overloaded key");
         let durable = persistence
@@ -9602,7 +10613,7 @@ mod tests {
         // The bytes are not lost — the skip owes a catch-up exactly as a refusal
         // does, so what the Run holds still covers everything written.
         assert!(
-            mutex_lock(&run.output).latest_output_bytes() > 0,
+            run.lock_owner(&run.output).latest_output_bytes() > 0,
             "the skip must not drop the Run's own retained bytes"
         );
     }
@@ -9656,6 +10667,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         };
         let operation_key = CreateOperationKey::new("mid-push").expect("valid mid-push key");
         let durable = persistence
@@ -9699,7 +10711,8 @@ mod tests {
         // offer must carry the discarded bytes, which means starting at the
         // durable head rather than at this chunk's own offset.
         *mutex_lock(&run.state) = RunState::Running;
-        let durable_head = mutex_lock(&run.persistence)
+        let durable_head = run
+            .lock_owner(&run.persistence)
             .active()
             .expect("the Run is still persistent")
             .durable_head();
@@ -9725,7 +10738,7 @@ mod tests {
         //
         //     RunSummary {
         //         state: mutex_lock(&self.state).clone(),
-        //         latest_output_bytes: mutex_lock(&self.output).latest_output_bytes(),
+        //         latest_output_bytes: self.lock_owner(&self.output).latest_output_bytes(),
         //     }
         //
         // Struct-literal fields evaluate in source order and their temporaries
@@ -9756,7 +10769,7 @@ mod tests {
         );
         run.record_output(vec![0_u8; 4096]);
 
-        let output_guard = mutex_lock(&run.output);
+        let output_guard = run.lock_owner(&run.output);
 
         let summarising = Arc::clone(&run);
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
@@ -9830,7 +10843,7 @@ mod tests {
         for _ in 0..64 {
             quiet_run.record_output(vec![0_u8; 64 * 1024]);
         }
-        let filled = mutex_lock(&quiet_run.output).retained_bytes();
+        let filled = quiet_run.lock_owner(&quiet_run.output).retained_bytes();
         assert!(
             filled >= 3 * 1024 * 1024,
             "quiet Run should be near its cap"
@@ -9851,7 +10864,7 @@ mod tests {
             busy_run.record_output(vec![0_u8; 64 * 1024]);
         }
 
-        let after = mutex_lock(&quiet_run.output).retained_bytes();
+        let after = quiet_run.lock_owner(&quiet_run.output).retained_bytes();
         assert!(
             after < filled,
             "the quiet Run pinned {after} bytes; aggregate pressure must trim it (was {filled})"
@@ -10087,6 +11100,8 @@ mod tests {
         mutex_lock(&owner.state).sender = Some(sender);
         owner.publish(RunEvent::Resized {
             size: TerminalSize::default(),
+            through_byte: 0,
+            resize_revision: 1,
         });
         let held = receiver.recv().await.unwrap();
         assert!(matches!(
@@ -10096,6 +11111,8 @@ mod tests {
         for _ in 0..3 {
             owner.publish(RunEvent::Resized {
                 size: TerminalSize::default(),
+                through_byte: 0,
+                resize_revision: 1,
             });
             let marker = receiver.recv().await.unwrap();
             assert!(matches!(
@@ -10168,7 +11185,7 @@ mod tests {
             capabilities: RunCapabilities::TMUX_READ_ONLY,
             pid: Some(pane_pid),
             state: Mutex::new(RunState::Running),
-            output: Mutex::new(OutputLog::with_initial_truncation(
+            output: crate::native_output::OutputOwner::new(OutputLog::with_initial_truncation(
                 crate::retention::RetentionBudget::production(),
             )),
             incarnation_control: Some(super::RunControl::Tmux(TmuxRunControl {
@@ -10177,8 +11194,13 @@ mod tests {
                 completion: Mutex::new(TmuxCompletion::Pending(completion)),
             })),
             native_runs: None,
+            native_service: None,
             persistence_mode: PersistenceMode::MemoryOnly,
+            owner_deferred: AtomicBool::new(false),
+            output_unlocked: Notify::new(),
+            persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
+            durable_output_head: std::sync::OnceLock::new(),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
@@ -10620,7 +11642,8 @@ mod tests {
         let recorded_run = manager.get(run.id).expect("Gap Run remains manager-owned");
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let recorded_bytes = mutex_lock(&recorded_run.output)
+                let recorded_bytes = recorded_run
+                    .lock_owner(&recorded_run.output)
                     .replay(caller_cursor)
                     .chunks
                     .iter()

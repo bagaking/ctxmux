@@ -1,10 +1,11 @@
-//! Daemon-wide ownership of native PTY output and child lifecycle work.
+//! Daemon-wide ownership of native PTY input, output and child lifecycle work.
 
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{self, Read, Write},
     os::unix::net::UnixStream,
+    panic::AssertUnwindSafe,
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -15,7 +16,8 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    CommandDisposition, ControlFailure, ErrorCode, ProtocolError, RunId, RunState,
+    CommandDisposition, ControlFailure, ErrorCode, NativeServiceFailure, ProtocolError, RunId,
+    RunState,
 };
 use portable_pty::Child;
 use rustix::{
@@ -35,7 +37,7 @@ use crate::{
 // separate bounded handoff budget so blocked publication cannot consume native
 // cleanup admission; the two limits describe different resources.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
-const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
+pub(crate) const OUTPUT_READ_BUFFER_BYTES: usize = 8192;
 
 type AfterWait = Box<dyn FnOnce() + Send + 'static>;
 
@@ -75,10 +77,9 @@ impl OwnerWake {
                 *writer_owner = None;
             }
             Err(error) => {
-                let _ = writeln!(
-                    io::stderr().lock(),
+                let _ = crate::diagnostics::record(format_args!(
                     "ctxmuxd native owner wake failed: {error}"
-                );
+                ));
                 writer.shutdown(std::net::Shutdown::Both).ok();
                 *writer_owner = None;
             }
@@ -150,7 +151,10 @@ pub(crate) struct NativeRunOwner {
 }
 
 struct OwnerInner {
-    state: Mutex<OwnerState>,
+    state: Arc<Mutex<OwnerState>>,
+    completion: Arc<Mutex<Option<NativeServiceFailure>>>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    completion_finished: Arc<AtomicBool>,
     wake: OwnerWake,
     // Set once by `serve` when it attaches the process-wide SIGCHLD relay that
     // wakes this owner on child exits. While false, the owner arms a timed
@@ -217,6 +221,13 @@ enum OwnerCommand {
         respond: mpsc::Sender<Result<Vec<LiveDescriptors>, String>>,
     },
     Shutdown,
+    #[cfg(test)]
+    UnwindForTest,
+    #[cfg(test)]
+    ProbePendingStopForTest {
+        run_id: RunId,
+        respond: mpsc::Sender<bool>,
+    },
 }
 
 pub(crate) struct NativeRunRegistration {
@@ -274,10 +285,13 @@ impl NativeRunRegistration {
             .take()
             .expect("native registration owns one child")
             .into_child();
+        let child = NativeChildAuthority(Arc::new(Mutex::new(Some(child))));
         let control = self.control.clone();
         NativeEntry {
             run_id: control.run_id(),
             run: self.run.clone(),
+            control: control.clone(),
+            _child_authority: child.clone(),
             output: Some(OutputOwner {
                 paused: false,
                 pending_offer: false,
@@ -334,9 +348,11 @@ impl NativeRunOwner {
             Err(error) => {
                 return Self {
                     inner: Arc::new(OwnerInner {
-                        state: Mutex::new(OwnerState::Failed(format!(
+                        state: Arc::new(Mutex::new(OwnerState::Failed(format!(
                             "failed to create daemon-wide native owner wake pipe: {error}"
-                        ))),
+                        )))),
+                        completion: Arc::new(Mutex::new(Some(NativeServiceFailure::OwnerStopped))),
+                        completion_finished: Arc::new(AtomicBool::new(true)),
                         wake: OwnerWake::unavailable(),
                         signal_driven: Arc::new(AtomicBool::new(false)),
                         cleanup_admission: CleanupAdmission::new(
@@ -359,9 +375,21 @@ impl NativeRunOwner {
         let owner_cleanup = cleanup_admission.clone();
         let owner_diagnostics = Arc::clone(&diagnostics);
         let owner_signal_driven = Arc::clone(&signal_driven);
-        let state = match thread::Builder::new()
+        let completion = Arc::new(Mutex::new(None));
+        let owner_completion = Arc::clone(&completion);
+        let completion_finished = Arc::new(AtomicBool::new(false));
+        let owner_finished = Arc::clone(&completion_finished);
+        let state = Arc::new(Mutex::new(OwnerState::Failed(
+            "native owner starting".to_owned(),
+        )));
+        let owner_state = Arc::clone(&state);
+        let (started_tx, started_rx) = mpsc::channel();
+        let initial_state = match thread::Builder::new()
             .name("ctxmux-native-owner".to_owned())
             .spawn(move || {
+                if started_rx.recv().is_err() {
+                    return;
+                }
                 owner_main(
                     &receiver,
                     wake_reader,
@@ -370,6 +398,9 @@ impl NativeRunOwner {
                     &owner_diagnostics,
                     &owner_signal_driven,
                     resources,
+                    &owner_completion,
+                    &owner_state,
+                    &owner_finished,
                 );
             }) {
             Ok(thread) => OwnerState::Running { commands, thread },
@@ -377,9 +408,13 @@ impl NativeRunOwner {
                 OwnerState::Failed(format!("failed to start daemon-wide native owner: {error}"))
             }
         };
+        *mutex_lock(&state) = initial_state;
+        let _ = started_tx.send(());
         Self {
             inner: Arc::new(OwnerInner {
-                state: Mutex::new(state),
+                state,
+                completion,
+                completion_finished,
                 wake,
                 signal_driven,
                 cleanup_admission,
@@ -390,9 +425,12 @@ impl NativeRunOwner {
 }
 
 impl NativeRunOwner {
-    /// Observe the existing thread at a lifecycle entry point. Independent
-    /// input workers retain their own admission and completion authority.
+    /// Completion is independent of command admission and its state mutex.
+    /// No blocked producer can prevent the owner from publishing its failure.
     pub(crate) fn ensure_running(&self) -> Result<(), String> {
+        if let Some(reason) = &*mutex_lock(&self.inner.completion) {
+            return Err(format!("daemon-wide native owner stopped: {reason:?}"));
+        }
         let mut state = mutex_lock(&self.inner.state);
         if matches!(&*state, OwnerState::Running { thread, .. } if thread.is_finished()) {
             *state = OwnerState::Failed("daemon-wide native owner stopped".to_owned());
@@ -432,28 +470,30 @@ impl NativeRunOwner {
                 registration: Box::new(registration),
             });
         }
-        let state = mutex_lock(&self.inner.state);
-        match &*state {
-            OwnerState::Running { commands, .. } => {
-                let result = commands.send(OwnerCommand::Register(registration));
-                self.inner.wake.wake();
-                result.map_err(|error| NativeRegistrationError {
-                    message: "daemon-wide native owner stopped before registration".to_owned(),
-                    registration: Box::new(match error.0 {
-                        OwnerCommand::Register(registration) => registration,
-                        OwnerCommand::HandoffReady { .. }
-                        | OwnerCommand::ExtractForHandoff { .. }
-                        | OwnerCommand::Shutdown => {
-                            unreachable!("registration send returns its registration")
-                        }
-                    }),
-                })
+        let commands = {
+            let state = mutex_lock(&self.inner.state);
+            match &*state {
+                OwnerState::Running { commands, .. } => commands.clone(),
+                OwnerState::Failed(message) => {
+                    return Err(NativeRegistrationError {
+                        message: message.clone(),
+                        registration: Box::new(registration),
+                    });
+                }
             }
-            OwnerState::Failed(message) => Err(NativeRegistrationError {
-                message: message.clone(),
-                registration: Box::new(registration),
+        };
+        // Wake before a potentially blocking channel send: a full command
+        // queue must not leave its only consumer asleep in poll.
+        self.inner.wake.wake();
+        let result = commands.send(OwnerCommand::Register(registration));
+        self.inner.wake.wake();
+        result.map_err(|error| NativeRegistrationError {
+            message: "daemon-wide native owner stopped before registration".to_owned(),
+            registration: Box::new(match error.0 {
+                OwnerCommand::Register(registration) => registration,
+                _ => unreachable!("registration send returns its registration"),
             }),
-        }
+        })
     }
 
     /// Return the live pty master fd and child pid for every watched native
@@ -479,6 +519,7 @@ impl NativeRunOwner {
             }
         };
         let (tx, rx) = mpsc::channel();
+        self.inner.wake.wake();
         if commands
             .send(OwnerCommand::ExtractForHandoff {
                 preflight,
@@ -489,6 +530,7 @@ impl NativeRunOwner {
             return Err("daemon-wide native owner stopped before handoff extraction".to_owned());
         }
         self.inner.wake.wake();
+        drop(commands);
         rx.recv().map_err(|_| {
             "daemon-wide native owner stopped without a handoff extraction result".to_owned()
         })?
@@ -504,6 +546,7 @@ impl NativeRunOwner {
             }
         };
         let (tx, rx) = mpsc::channel();
+        self.inner.wake.wake();
         commands
             .send(OwnerCommand::HandoffReady {
                 run_id,
@@ -511,6 +554,7 @@ impl NativeRunOwner {
             })
             .map_err(|_| "daemon-wide native owner stopped before handoff probe".to_owned())?;
         self.inner.wake.wake();
+        drop(commands);
         rx.recv()
             .map_err(|_| "daemon-wide native owner dropped the handoff probe".to_owned())
     }
@@ -566,33 +610,25 @@ impl NativeRunOwner {
 
     #[cfg(test)]
     pub(crate) fn shutdown(&self, deadline: Instant) -> Result<(), String> {
-        let mut state = mutex_lock(&self.inner.state);
-        let OwnerState::Running {
-            commands, thread, ..
-        } = &*state
-        else {
-            return Ok(());
+        let commands = {
+            let state = mutex_lock(&self.inner.state);
+            let OwnerState::Running { commands, .. } = &*state else {
+                return Ok(());
+            };
+            commands.clone()
         };
+        self.inner.wake.wake();
         let _ = commands.send(OwnerCommand::Shutdown);
         self.inner.wake.wake();
-        while !thread.is_finished() && Instant::now() < deadline {
+        drop(commands);
+        while !self.inner.completion_finished.load(Ordering::Acquire) && Instant::now() < deadline {
             thread::sleep(
                 Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())),
             );
         }
-        let finished = thread.is_finished();
-        let previous = std::mem::replace(
-            &mut *state,
-            OwnerState::Failed("native owner stopped".to_owned()),
-        );
-        let OwnerState::Running { thread, .. } = previous else {
-            unreachable!("native owner state was checked under the same lock")
-        };
-        if finished {
-            let _ = thread.join();
+        if self.inner.completion_finished.load(Ordering::Acquire) {
             Ok(())
         } else {
-            drop(thread);
             Err("timed out waiting for daemon-wide native owner shutdown".to_owned())
         }
     }
@@ -622,15 +658,17 @@ impl NativeRunOwner {
 
 impl Drop for OwnerInner {
     fn drop(&mut self) {
-        let state = self
-            .state
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let OwnerState::Running { commands, thread } =
-            std::mem::replace(state, OwnerState::Failed("native owner stopped".to_owned()))
-        else {
+        let previous = {
+            let mut state = mutex_lock(&self.state);
+            std::mem::replace(
+                &mut *state,
+                OwnerState::Failed("native owner stopped".to_owned()),
+            )
+        };
+        let OwnerState::Running { commands, thread } = previous else {
             return;
         };
+        self.wake.wake();
         let _ = commands.send(OwnerCommand::Shutdown);
         self.wake.wake();
         drop(commands);
@@ -643,12 +681,20 @@ impl Drop for OwnerInner {
 }
 
 pub(crate) const fn resident_runtime_owner_bytes() -> usize {
+    // Known heap payload of the shared child authority plus Arc's strong and
+    // weak reference counters, in bytes. Opaque child/allocator costs are
+    // separately qualified as host RSS, never hidden by this static charge.
     std::mem::size_of::<NativeEntry>()
+        + std::mem::size_of::<Mutex<Option<Box<dyn Child + Send + Sync>>>>()
+        + std::mem::size_of::<[AtomicUsize; 2]>()
 }
 
 struct NativeEntry {
     run_id: RunId,
     run: Weak<Run>,
+    control: NativeControlOwner,
+    // Remains outside the owner unwind scope even while lifecycle work moves.
+    _child_authority: NativeChildAuthority,
     output: Option<OutputOwner>,
     lifecycle: Lifecycle,
     after_wait: Option<AfterWait>,
@@ -674,8 +720,32 @@ enum Lifecycle {
     Done,
 }
 
+/// The Entry and a transient lifecycle/cleanup job share the actual child
+/// holder. Moving Watching cannot make an unwind call portable `Child::drop`.
+#[derive(Clone)]
+struct NativeChildAuthority(Arc<Mutex<Option<Box<dyn Child + Send + Sync>>>>);
+
+impl NativeChildAuthority {
+    fn process_id(&self) -> Option<u32> {
+        mutex_lock(&self.0)
+            .as_ref()
+            .and_then(|child| child.process_id())
+    }
+
+    fn with_mut<R>(&self, operation: impl FnOnce(&mut (dyn Child + Send + Sync)) -> R) -> R {
+        let mut child = mutex_lock(&self.0);
+        operation(child.as_mut().expect("one owned Native child").as_mut())
+    }
+
+    fn into_child(self) -> Box<dyn Child + Send + Sync> {
+        mutex_lock(&self.0)
+            .take()
+            .expect("Native child authority transferred once")
+    }
+}
+
 struct Watching {
-    child: Box<dyn Child + Send + Sync>,
+    child: NativeChildAuthority,
     pending_stop: Option<PendingStopAdmission>,
     session: NativeSession,
     control: NativeControlOwner,
@@ -758,9 +828,15 @@ fn stop_admission_failure(run_id: RunId, detail: &str) -> ControlFailure {
             format!("Run {run_id} cannot stop: {detail}"),
         ),
         disposition: CommandDisposition::NotApplied,
+        confirmed_input_bytes: None,
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one owner loop keeps actual authority, completion watch, and panic containment in the same auditable scope"
+)]
 fn owner_main(
     commands: &mpsc::Receiver<OwnerCommand>,
     mut wake_reader: UnixStream,
@@ -769,6 +845,9 @@ fn owner_main(
     diagnostics: &OwnerDiagnostics,
     signal_driven: &AtomicBool,
     resources: crate::ResourceLimits,
+    owner_completion: &Mutex<Option<NativeServiceFailure>>,
+    owner_state: &Mutex<OwnerState>,
+    owner_finished: &AtomicBool,
 ) {
     let (completion_tx, completion_rx) = mpsc::channel();
     let mut entries = Vec::<NativeEntry>::new();
@@ -787,11 +866,24 @@ fn owner_main(
     // which is the whole point of replacing the timed `waitid` sweep with SIGCHLD
     // readiness.
     let mut owner_woken = true;
+    let mut fair_start = 0_usize;
 
-    loop {
-        if owner_woken {
-            if drain_commands(commands, &mut entries, diagnostics) {
-                detach_active_workers(&mut active);
+    // Entries and admitted cleanup jobs stay outside the unwind scope. A
+    // failed derived operation must not drop a child or its PTY authority.
+    let result = crate::diagnostics::catch_native_unwind(AssertUnwindSafe(|| {
+        loop {
+            if owner_woken {
+                if drain_commands(commands, &mut entries, diagnostics) {
+                    detach_active_workers(&mut active);
+                    drain_completions(
+                        &completion_rx,
+                        &mut entries,
+                        &mut active,
+                        &mut active_cleanups,
+                        &mut active_finalizers,
+                    );
+                    return;
+                }
                 drain_completions(
                     &completion_rx,
                     &mut entries,
@@ -799,64 +891,145 @@ fn owner_main(
                     &mut active_cleanups,
                     &mut active_finalizers,
                 );
-                preserve_shutdown_authority(&mut entries, &mut queued);
-                return;
+                // Peek every watched leader on each edge. SIGCHLD is process-wide and
+                // carries no pid we consult, so an exit signal means only "some
+                // watched child may now be terminal" — hence the whole set is
+                // re-peeked. Coalescing a burst of exits into one edge is therefore
+                // correct, not a bug: the single sweep observes every leader that
+                // turned terminal. The peek is a non-reaping `waitid(WNOWAIT)` (see
+                // `leader_is_terminal`), so running it on a command or completion edge
+                // too is idempotent and never consumes an exit status ahead of the
+                // sequenced `reap_leader`.
+                diagnostics.lifecycle_probes.fetch_add(1, Ordering::AcqRel);
+                drive_lifecycle(&mut entries, &mut queued, cleanup_admission);
             }
-            drain_completions(
-                &completion_rx,
-                &mut entries,
+            start_worker_jobs(
+                &mut queued,
                 &mut active,
                 &mut active_cleanups,
                 &mut active_finalizers,
+                &completion_tx,
+                wake,
+                diagnostics,
+                &mut entries,
+                &mut next_job_id,
+                resources,
             );
-            // Peek every watched leader on each edge. SIGCHLD is process-wide and
-            // carries no pid we consult, so an exit signal means only "some
-            // watched child may now be terminal" — hence the whole set is
-            // re-peeked. Coalescing a burst of exits into one edge is therefore
-            // correct, not a bug: the single sweep observes every leader that
-            // turned terminal. The peek is a non-reaping `waitid(WNOWAIT)` (see
-            // `leader_is_terminal`), so running it on a command or completion edge
-            // too is idempotent and never consumes an exit status ahead of the
-            // sequenced `reap_leader`.
-            diagnostics.lifecycle_probes.fetch_add(1, Ordering::AcqRel);
-            drive_lifecycle(&mut entries, &mut queued, cleanup_admission);
+            queue_ready_terminals(&mut entries, &mut queued);
+            start_worker_jobs(
+                &mut queued,
+                &mut active,
+                &mut active_cleanups,
+                &mut active_finalizers,
+                &completion_tx,
+                wake,
+                diagnostics,
+                &mut entries,
+                &mut next_job_id,
+                resources,
+            );
+            let mut closed_runs = Vec::new();
+            entries.retain(|entry| {
+                let retained = entry.output.is_some()
+                    || !matches!(
+                        entry.lifecycle,
+                        Lifecycle::Done | Lifecycle::AuthorityLost(_)
+                    )
+                    || entry.terminal.is_some();
+                if !retained {
+                    closed_runs.push(entry.run.clone());
+                }
+                retained
+            });
+            // Entry Drop releases the actual reader/control holders first.
+            // Cleanup cannot pass the strong-count fence before that boundary,
+            // and public metadata reads must not be its implicit retry lane.
+            for weak in closed_runs {
+                if let Some(run) = weak.upgrade() {
+                    run.native_entry_retired();
+                }
+            }
+            owner_woken = match poll_and_read_outputs(
+                &mut entries,
+                &mut wake_reader,
+                signal_driven,
+                diagnostics,
+                resources,
+                &mut fair_start,
+            ) {
+                Ok(woken) => woken,
+                Err(()) => return,
+            };
         }
-        start_worker_jobs(
-            &mut queued,
-            &mut active,
-            &mut active_cleanups,
-            &mut active_finalizers,
-            &completion_tx,
-            wake,
-            diagnostics,
-            &mut entries,
-            &mut next_job_id,
-            resources,
-        );
-        queue_ready_terminals(&mut entries, &mut queued);
-        start_worker_jobs(
-            &mut queued,
-            &mut active,
-            &mut active_cleanups,
-            &mut active_finalizers,
-            &completion_tx,
-            wake,
-            diagnostics,
-            &mut entries,
-            &mut next_job_id,
-            resources,
-        );
-        entries.retain(|entry| {
-            entry.output.is_some()
-                || !matches!(
-                    entry.lifecycle,
-                    Lifecycle::Done | Lifecycle::AuthorityLost(_)
-                )
-                || entry.terminal.is_some()
-        });
-        owner_woken =
-            poll_and_read_outputs(&mut entries, &mut wake_reader, signal_driven, diagnostics);
+    }));
+    let reason = if result.is_err() {
+        NativeServiceFailure::OwnerUnwound
+    } else {
+        NativeServiceFailure::OwnerStopped
+    };
+    *mutex_lock(owner_completion) = Some(reason);
+    // Remove the sole retained Sender before draining. Every producer borrowed
+    // its own Sender without holding this mutex; blocked sends now finish as
+    // we drain, and disconnect proves no accepted Register can still race Drop.
+    *mutex_lock(owner_state) =
+        OwnerState::Failed(format!("daemon-wide native owner stopped: {reason:?}"));
+    // Producer lifetime is not service lifetime. Publish the retained failure
+    // and settle commands before waiting for borrowed senders to retire.
+    for entry in &mut entries {
+        complete_stopped_entry(entry, reason);
     }
+    // Accepted registrations retain authority even if their producer sent only
+    // after completion. Fence each arrival before waiting for another command.
+    while let Ok(command) = commands.recv() {
+        match command {
+            OwnerCommand::Register(registration) => {
+                let mut entry = registration.into_entry();
+                complete_stopped_entry(&mut entry, reason);
+                entries.push(entry);
+            }
+            OwnerCommand::HandoffReady { respond, .. } => {
+                drop(respond);
+            }
+            OwnerCommand::ExtractForHandoff { respond, .. } => {
+                let _ = respond.send(Err(
+                    "native owner stopped before handoff extraction".to_owned()
+                ));
+            }
+            OwnerCommand::Shutdown => {}
+            #[cfg(test)]
+            OwnerCommand::UnwindForTest => {}
+            #[cfg(test)]
+            OwnerCommand::ProbePendingStopForTest { respond, .. } => {
+                let _ = respond.send(false);
+            }
+        }
+    }
+    preserve_shutdown_authority(&mut entries, &mut queued);
+    owner_finished.store(true, Ordering::Release);
+}
+
+fn complete_stopped_entry(entry: &mut NativeEntry, reason: NativeServiceFailure) {
+    if let Lifecycle::Watching(watching) = &mut entry.lifecycle
+        && let Some(pending) = watching.pending_stop.take()
+    {
+        let _ = pending
+            .reply
+            .send(StopOwnerResult::Rejected(ControlFailure {
+                error: ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    format!(
+                        "Run {} Native owner stopped before Stop admission",
+                        entry.run_id
+                    ),
+                ),
+                disposition: CommandDisposition::NotApplied,
+                confirmed_input_bytes: None,
+            }));
+    }
+    if let Some(run) = entry.run.upgrade() {
+        run.native_owner_stopped(reason);
+    }
+    entry.control.fence_owner_loss(reason);
 }
 
 fn drain_commands(
@@ -867,7 +1040,11 @@ fn drain_commands(
     loop {
         match commands.try_recv() {
             Ok(OwnerCommand::Register(registration)) => {
-                entries.push(registration.into_entry());
+                let entry = registration.into_entry();
+                if let Some(run) = entry.run.upgrade() {
+                    run.native_owner_ready();
+                }
+                entries.push(entry);
                 diagnostics.registrations.fetch_add(1, Ordering::AcqRel);
             }
             Ok(OwnerCommand::HandoffReady { run_id, respond }) => {
@@ -881,6 +1058,17 @@ fn drain_commands(
                 let _ = respond.send(extract_live_descriptors(entries, preflight));
             }
             Ok(OwnerCommand::Shutdown) | Err(mpsc::TryRecvError::Disconnected) => return true,
+            #[cfg(test)]
+            Ok(OwnerCommand::UnwindForTest) => panic!("Native owner completion probe"),
+            #[cfg(test)]
+            Ok(OwnerCommand::ProbePendingStopForTest { run_id, respond }) => {
+                let pending = entries.iter().any(|entry| {
+                    entry.run_id == run_id
+                        && matches!(&entry.lifecycle, Lifecycle::Watching(watching)
+                        if watching.pending_stop.is_some())
+                });
+                let _ = respond.send(pending);
+            }
             Err(mpsc::TryRecvError::Empty) => return false,
         }
     }
@@ -927,6 +1115,9 @@ fn extract_live_descriptors(
 
     preflight(&descriptors)?;
     for entry in entries {
+        if let Some(run) = entry.run.upgrade() {
+            run.native_owner_draining();
+        }
         let Lifecycle::Watching(watching) =
             std::mem::replace(&mut entry.lifecycle, Lifecycle::Done)
         else {
@@ -1003,8 +1194,13 @@ fn drive_lifecycle(
             }
         };
         let run_id = watching.control.run_id();
+        let control = watching.control.clone();
+        let Some(mut turn) = control.try_turn() else {
+            entry.lifecycle = Lifecycle::Watching(watching);
+            continue;
+        };
         let mut cleanup = None::<(CleanupKind, CleanupPermit)>;
-        for command in watching.control.drain_child_commands() {
+        for command in turn.drain_child_commands() {
             match command {
                 #[cfg(not(target_os = "macos"))]
                 ChildCommand::Signal {
@@ -1059,12 +1255,12 @@ fn drive_lifecycle(
                 .pending_stop
                 .take()
                 .expect("expired pending Stop remains present");
-            watching.control.reject_pending_stop();
+            turn.reject_pending_stop();
             let _ = pending
                 .reply
                 .send(StopOwnerResult::Rejected(stop_admission_failure(
                     run_id,
-                    "all eight native cleanup owners remained occupied through Stop admission",
+                    "native Stop admission deadline elapsed before an owner turn could commit Stop",
                 )));
         }
         if watching.pending_stop.is_some()
@@ -1074,7 +1270,7 @@ fn drive_lifecycle(
                 .pending_stop
                 .take()
                 .expect("pending Stop remains present before commit");
-            match watching.control.commit_pending_stop() {
+            match turn.commit_pending_stop() {
                 Ok(()) => {
                     queued.push_back(WorkerJob::Cleanup(CleanupJob {
                         run_id,
@@ -1096,14 +1292,22 @@ fn drive_lifecycle(
         // makes this observe a fresh exit, but a command/completion edge peeks
         // just as safely (idempotent WNOWAIT). The pass-wide gate skips the
         // syscall entirely when the kernel says no child has exited at all.
+        // Child observation owns no control mutation. Release the admission
+        // guard before the kernel probe; commands accepted across this edge
+        // are fenced below before the actual child is transferred to cleanup.
+        drop(turn);
         match watching.session.leader_is_terminal_gated(any_child_exited) {
             Ok(false) => entry.lifecycle = Lifecycle::Watching(watching),
             Ok(true) => {
+                let Some(mut turn) = control.try_turn() else {
+                    entry.lifecycle = Lifecycle::Watching(watching);
+                    continue;
+                };
                 let Some(permit) = cleanup_admission.try_acquire() else {
                     entry.lifecycle = Lifecycle::Watching(watching);
                     continue;
                 };
-                let pending = watching.control.fence_child_commands();
+                let pending = turn.fence_child_commands();
                 let mut stop = watching.pending_stop.take().map(|pending| pending.reply);
                 for command in pending {
                     match command {
@@ -1137,7 +1341,7 @@ fn drive_lifecycle(
             Err(error) => {
                 watching
                     .control
-                    .mark_wait_authority_lost(error.clone(), watching.child);
+                    .mark_wait_authority_lost(error.clone(), watching.child.into_child());
                 watching.wait_failure.record(run_id, &error);
                 entry.after_wait.take();
                 entry.lifecycle = Lifecycle::AuthorityLost(watching.control);
@@ -1244,21 +1448,18 @@ fn start_worker_jobs(
 }
 
 fn execute_cleanup(mut job: CleanupJob) -> CleanupOutcome {
-    let result = match &mut job.kind {
-        CleanupKind::Stop(_) | CleanupKind::Unpublished => job.watching.session.stop(
-            job.watching.child.as_mut(),
-            STOP_GRACEFUL_TIMEOUT,
-            STOP_FORCED_TIMEOUT,
-        ),
+    let result = job.watching.child.with_mut(|child| match &mut job.kind {
+        CleanupKind::Stop(_) | CleanupKind::Unpublished => {
+            job.watching
+                .session
+                .stop(child, STOP_GRACEFUL_TIMEOUT, STOP_FORCED_TIMEOUT)
+        }
         CleanupKind::Natural { .. } => job
             .watching
             .session
-            .finish_after_direct_exit(
-                job.watching.child.as_mut(),
-                Instant::now() + STOP_FORCED_TIMEOUT,
-            )
+            .finish_after_direct_exit(child, Instant::now() + STOP_FORCED_TIMEOUT)
             .map(|(status, disposition)| (disposition, status)),
-    };
+    });
 
     match result {
         Ok((disposition, status)) => {
@@ -1289,7 +1490,7 @@ fn execute_cleanup(mut job: CleanupJob) -> CleanupOutcome {
                 }
                 job.watching
                     .control
-                    .mark_wait_authority_lost(error.clone(), job.watching.child);
+                    .mark_wait_authority_lost(error.clone(), job.watching.child.into_child());
                 job.watching.wait_failure.record(job.run_id, &error);
                 CleanupOutcome::AuthorityLost {
                     control: job.watching.control,
@@ -1330,7 +1531,7 @@ fn fail_cleanup_spawn(mut job: CleanupJob, error: &io::Error) -> CleanupOutcome 
     }
     job.watching
         .control
-        .mark_wait_authority_lost(message.clone(), job.watching.child);
+        .mark_wait_authority_lost(message.clone(), job.watching.child.into_child());
     job.watching.wait_failure.record(job.run_id, &message);
     job.after_wait.take();
     CleanupOutcome::AuthorityLost {
@@ -1366,13 +1567,6 @@ fn drain_completions(
                 apply_cleanup_outcome(entries, completion.run_id, outcome);
             }
             WorkerOutcome::Finalized => {
-                if let Some(run) = entries
-                    .iter()
-                    .find(|entry| entry.run_id == completion.run_id)
-                    .and_then(|entry| entry.run.upgrade())
-                {
-                    run.release_closed_resources();
-                }
                 set_lifecycle(entries, completion.run_id, Lifecycle::Done);
             }
         }
@@ -1427,22 +1621,29 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
             let mut readiness = [PollFd::new(&output.reader, PollFlags::IN)];
             let ready_now =
                 poll(&mut readiness, Some(&Timespec::default())).is_ok_and(|count| count > 0);
-            let durable_paused = entry
-                .run
-                .upgrade()
-                .is_some_and(|run| run.prepare_output_read() == 0);
+            let Some(run) = entry.run.upgrade() else {
+                continue;
+            };
+            let Some(mut turn) = run.try_output_turn() else {
+                // Busy is not source loss. Only its actual guard release can
+                // wake this reader; do not publish Gap or drop unread bytes.
+                if let Some(terminal) = entry.terminal.as_mut() {
+                    terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
+                }
+                continue;
+            };
+            let durable_paused = turn.capacity() == 0;
             if ready_now || durable_paused {
                 if let Some(terminal) = entry.terminal.as_mut() {
                     terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
                 }
                 continue;
             }
-            if let Some(run) = entry.run.upgrade() {
-                let latest_output_bytes = run.mark_output_source_gap();
-                run.publish_event(crate::RunEvent::Gap {
-                    latest_output_bytes,
-                });
-            }
+            let latest_output_bytes = turn.mark_source_gap();
+            run.publish_event(crate::RunEvent::Gap {
+                latest_output_bytes,
+            });
+            drop(turn);
             entry.output = None;
         }
         let Some(terminal) = entry.terminal.take() else {
@@ -1523,24 +1724,46 @@ fn poll_and_read_outputs(
     wake_reader: &mut UnixStream,
     signal_driven: &AtomicBool,
     diagnostics: &OwnerDiagnostics,
-) -> bool {
+    resources: crate::ResourceLimits,
+    fair_start: &mut usize,
+) -> Result<bool, ()> {
     let deadline = poll_deadline(entries, signal_driven);
+    let mut input_files = Vec::new();
+    for (index, entry) in entries.iter_mut().enumerate() {
+        entry
+            .control
+            .progress_empty_input(resources.input_turn_commands);
+        if let Some(file) = entry.control.input_poll_file() {
+            input_files.push((index, file));
+        }
+        if let Some(output) = &mut entry.output
+            && (output.paused || output.pending_offer)
+            && let Some(run) = entry.run.upgrade()
+        {
+            if let Some(mut turn) = run.try_output_turn() {
+                output.paused = turn.capacity() == 0;
+                output.pending_offer = turn.has_unoffered();
+            } else {
+                output.paused = true;
+            }
+            run.native_output_pressure(output.paused);
+        }
+    }
+    // Each descriptor is a borrow of an existing owned FD. Input and output
+    // may share an OFD, so every syscall handles WouldBlock as readiness loss.
     let mut poll_fds = vec![PollFd::new(&*wake_reader, PollFlags::IN)];
     let mut indices = Vec::new();
-    for (index, entry) in entries.iter_mut().enumerate() {
-        if let Some(output) = &mut entry.output {
-            if (output.paused || output.pending_offer)
-                && let Some(run) = entry.run.upgrade()
-            {
-                output.paused = run.prepare_output_read() == 0;
-                output.pending_offer = run.output_has_unoffered();
-            }
-            if output.paused {
-                continue;
-            }
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(output) = &entry.output
+            && !output.paused
+        {
             poll_fds.push(PollFd::new(&output.reader, PollFlags::IN));
-            indices.push(index);
+            indices.push((index, false));
         }
+    }
+    for (index, file) in &input_files {
+        poll_fds.push(PollFd::new(&**file, PollFlags::OUT));
+        indices.push((*index, true));
     }
     let timeout = deadline.map(|deadline| {
         Timespec::try_from(deadline.saturating_duration_since(Instant::now()))
@@ -1548,68 +1771,85 @@ fn poll_and_read_outputs(
     });
     let poll_result = poll(&mut poll_fds, timeout.as_ref());
     diagnostics.poll_returns.fetch_add(1, Ordering::AcqRel);
-    let mut owner_woken = false;
-    // `poll` returns the count of ready descriptors; `Ok(0)` is a timeout, which
-    // only happens when a deadline was armed. Treat it as an owner wake so the
-    // next loop pass runs `drive_lifecycle`/`queue_ready_terminals` to service
-    // the elapsed deadline — the timed obligation the SIGCHLD relay cannot
-    // express. With no deadline armed the timeout is `None` and `poll` blocks, so
-    // a spurious `Ok(0)` cannot arise.
-    let ready = match poll_result {
-        Ok(ready_count) => {
-            owner_woken = ready_count == 0
+    let mut ready = vec![(false, false); entries.len()];
+    let owner_woken = match poll_result {
+        Ok(count) => {
+            let woken = count == 0
                 || poll_fds[0]
                     .revents()
                     .intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL);
-            poll_fds
-                .iter()
-                .skip(1)
-                .zip(indices)
-                .filter_map(|(fd, index)| {
-                    fd.revents()
-                        .intersects(
-                            PollFlags::IN | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL,
-                        )
-                        .then_some(index)
-                })
-                .collect::<Vec<_>>()
+            for (fd, (index, input)) in poll_fds.iter().skip(1).zip(indices) {
+                let expected = if input { PollFlags::OUT } else { PollFlags::IN };
+                if fd
+                    .revents()
+                    .intersects(expected | PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+                {
+                    if input {
+                        ready[index].1 = true;
+                    } else {
+                        ready[index].0 = true;
+                    }
+                }
+            }
+            woken
         }
-        Err(Errno::INTR) => Vec::new(),
+        Err(Errno::INTR) => false,
         Err(error) => {
-            let _ = writeln!(
-                io::stderr().lock(),
-                "ctxmuxd daemon-wide native output poll failed: {error}"
-            );
-            Vec::new()
+            let _ = crate::diagnostics::record(format_args!(
+                "ctxmuxd daemon-wide native poll failed: {error}"
+            ));
+            return Err(());
         }
     };
     drop(poll_fds);
-
+    drop(input_files);
     if owner_woken {
         let mut buffer = [0_u8; 64];
         loop {
             match wake_reader.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => return Err(()),
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    let _ = writeln!(
-                        io::stderr().lock(),
+                    let _ = crate::diagnostics::record(format_args!(
                         "ctxmuxd native owner wake drain failed: {error}"
-                    );
-                    break;
+                    ));
+                    return Err(());
                 }
             }
         }
     }
-
-    for index in ready {
-        let capacity = entries[index]
-            .run
-            .upgrade()
-            .map_or(0, |run| run.prepare_output_read())
-            .min(OUTPUT_READ_BUFFER_BYTES);
+    let count = entries.len();
+    let start = if count == 0 { 0 } else { *fair_start % count };
+    for offset in 0..count {
+        let index = (start + offset) % count;
+        let (output_ready, input_ready) = ready[index];
+        // One configurable quantum per ready Run; a large request remains
+        // admitted and keeps its full byte charge through all later turns.
+        if input_ready {
+            entries[index]
+                .control
+                .progress_input(resources.input_turn_commands, resources.input_turn_bytes);
+        }
+        if !output_ready {
+            continue;
+        }
+        let Some(run) = entries[index].run.upgrade() else {
+            entries[index].output = None;
+            continue;
+        };
+        // Acquire the complete output admission turn before touching the PTY.
+        // A slow export or persistence transition stays local to this Run.
+        let Some(mut turn) = run.try_output_turn() else {
+            if let Some(output) = &mut entries[index].output {
+                output.paused = true;
+            }
+            run.native_output_pressure(true);
+            continue;
+        };
+        let capacity = turn.capacity().min(OUTPUT_READ_BUFFER_BYTES);
+        run.native_output_pressure(capacity == 0);
         if capacity == 0 {
             if let Some(output) = &mut entries[index].output {
                 output.paused = true;
@@ -1621,72 +1861,91 @@ fn poll_and_read_outputs(
         };
         let mut buffer = [0_u8; OUTPUT_READ_BUFFER_BYTES];
         match output.reader.read(&mut buffer[..capacity]) {
-            Ok(0) => entries[index].output = None,
+            Ok(0) => {
+                run.native_output_closed(None);
+                entries[index].output = None;
+            }
             Ok(read) => {
-                if let Some(run) = entries[index].run.upgrade() {
-                    run.record_output(buffer[..read].to_vec());
-                    output.pending_offer = run.output_has_unoffered();
-                    if let Some(terminal) = entries[index].terminal.as_mut() {
-                        terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
-                    }
-                } else {
-                    entries[index].output = None;
+                output.pending_offer = turn.record(buffer[..read].to_vec());
+                if let Some(terminal) = entries[index].terminal.as_mut() {
+                    terminal.deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                ) => {}
             Err(error) if error.raw_os_error() == Some(Errno::IO.raw_os_error()) => {
+                run.native_output_closed(None);
                 entries[index].output = None;
             }
             Err(error) => {
-                if let Some(run) = entries[index].run.upgrade() {
-                    let _ = writeln!(
-                        io::stderr().lock(),
-                        "ctxmuxd PTY read failed for {}: {error}",
-                        run.id
-                    );
-                }
+                run.native_output_closed(Some(&error.to_string()));
+                let _ = crate::diagnostics::record(format_args!(
+                    "ctxmuxd PTY read failed for {}: {error}",
+                    run.id
+                ));
                 entries[index].output = None;
             }
         }
     }
-    owner_woken
+    if count > 0 {
+        *fair_start = (start + 1) % count;
+    }
+    Ok(owner_woken)
 }
 
 fn detach_active_workers(active: &mut HashMap<u64, thread::JoinHandle<()>>) {
     active.clear();
 }
 
-fn preserve_shutdown_authority(entries: &mut [NativeEntry], queued: &mut VecDeque<WorkerJob>) {
-    let message = "daemon-wide native owner stopped before child wait completed".to_owned();
+fn preserve_shutdown_authority(entries: &mut Vec<NativeEntry>, queued: &mut VecDeque<WorkerJob>) {
+    // Owner completion is not evidence of waitid failure or child exit. Keep
+    // the actual holders (including unread PTY bytes) alive until process exit;
+    // publishing unavailable above is the only completion claim we can make.
+    // This retained cost is real and is not silently reclaimed as a reaped Run.
     for job in queued.drain(..) {
         if let WorkerJob::Cleanup(job) = job {
-            retain_unwaited_child(job.watching, &message);
+            job.watching
+                .control
+                .retain_owner_stopped_child(job.watching.child.into_child());
+            std::mem::forget(job.watching.control);
         }
     }
-    for entry in entries {
+    for mut entry in entries.drain(..) {
+        if entry.output.is_none()
+            && entry.terminal.is_none()
+            && matches!(entry.lifecycle, Lifecycle::Finalizing)
+        {
+            // Cleanup already reaped the child and drained the reader before
+            // Finalizing. The detached worker owns only terminal publication;
+            // release this actual entry before announcing physical retirement.
+            let run = entry.run.clone();
+            drop(entry);
+            if let Some(run) = run.upgrade() {
+                run.native_entry_retired();
+            }
+            continue;
+        }
         let lifecycle = std::mem::replace(&mut entry.lifecycle, Lifecycle::Done);
         match lifecycle {
-            Lifecycle::Watching(watching) => retain_unwaited_child(watching, &message),
+            Lifecycle::Watching(watching) => {
+                watching
+                    .control
+                    .retain_owner_stopped_child(watching.child.into_child());
+            }
             Lifecycle::WaitingCleanup(waiting) => {
-                retain_unwaited_child(waiting.watching, &message);
+                waiting
+                    .watching
+                    .control
+                    .retain_owner_stopped_child(waiting.watching.child.into_child());
             }
             Lifecycle::AuthorityLost(control) => std::mem::forget(control),
-            Lifecycle::Queued | Lifecycle::Cleaning | Lifecycle::Finalizing | Lifecycle::Done => {}
+            _ => {}
         }
+        std::mem::forget(entry);
     }
-}
-
-fn retain_unwaited_child(watching: Watching, message: &str) {
-    watching
-        .control
-        .mark_wait_authority_lost(message.to_owned(), watching.child);
-    watching
-        .wait_failure
-        .record(watching.control.run_id(), message);
-    // Daemon shutdown intentionally has no native Stop policy. Retain the
-    // fail-stop owner until process exit instead of letting `Child::drop`
-    // masquerade as wait/reap proof.
-    std::mem::forget(watching.control);
 }
 
 #[cfg(test)]
@@ -1702,7 +1961,9 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use ctxmux_protocol::{CommandDisposition, ErrorCode, InputOperationKey, RunId, TerminalSize};
+    use ctxmux_protocol::{
+        CommandDisposition, ErrorCode, InputOperationKey, RunId, RunState, TerminalSize,
+    };
     use portable_pty::{Child, ChildKiller, ExitStatus};
 
     use super::NativeRunOwner;
@@ -1726,6 +1987,7 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::yield_now();
         }
+        *crate::mutex_lock(&owner.inner.completion) = None;
         *crate::mutex_lock(&owner.inner.state) = super::OwnerState::Running { commands, thread };
         (owner, receiver)
     }
@@ -1914,6 +2176,1021 @@ mod tests {
         })
         .await
         .expect("spawn failure transfers child authority fail-stop");
+    }
+
+    fn spawn_actual_service_run(
+        owner: &NativeRunOwner,
+        script: &str,
+        failure: NativeWaitFailure,
+    ) -> Arc<Run> {
+        Run::spawn_with_hooks(
+            crate::NativeSpawnConfig {
+                id: RunId::new(),
+                spec: ctxmux_protocol::RunSpec {
+                    program: "/bin/sh".to_owned(),
+                    args: vec!["-c".to_owned(), script.to_owned()],
+                    cwd: None,
+                    env: std::collections::BTreeMap::default(),
+                    initial_size: TerminalSize::default(),
+                    declared_inputs: Vec::new(),
+                },
+                lineage: None,
+                persistence_mode: crate::PersistenceMode::MemoryOnly,
+                live_event_capacity: crate::LIVE_EVENT_CAPACITY,
+                input_drains: crate::native_control::InputDrainGate::default(),
+                native_runs: owner.clone(),
+                terminal_publications: crate::TerminalPublicationOwner::default(),
+                wait_failure: failure,
+                qualification_stats: crate::qualification_stats::QualificationStats::default(),
+                retention_budget: crate::RetentionBudget::production(),
+            },
+            |run| run,
+            |_, _| Ok(()),
+            || {},
+        )
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn normal_exit_releases_native_descriptors_without_metadata_polling() {
+        let owner = NativeRunOwner::default();
+        let run =
+            spawn_actual_service_run(&owner, "printf READY; exit 0", NativeWaitFailure::default());
+        let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+            panic!("Native control");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.master_raw_fd().is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "actual Entry Drop must release closed master"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(matches!(run.info().state, RunState::Exited { .. }));
+        let bytes = run
+            .lock_owner(&run.output)
+            .replay(0)
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, b"READY");
+        assert!(control.closed_quiescence_result().is_ok());
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one held-owner fixture proves the original Run waits, a second real Run serves, actual unlock wakes, and funded disconnect cancellation"
+    )]
+    async fn held_control_metadata_does_not_block_another_real_run_or_busy_poll() {
+        let owner = NativeRunOwner::default();
+        let slow = spawn_actual_service_run(
+            &owner,
+            "stty raw -echo; printf READY; exec /bin/cat",
+            NativeWaitFailure::default(),
+        );
+        let healthy = spawn_actual_service_run(
+            &owner,
+            "stty raw -echo; printf READY; exec /bin/cat",
+            NativeWaitFailure::default(),
+        );
+        let Some(crate::RunControl::Native(slow_control)) = &slow.incarnation_control else {
+            panic!("Native control");
+        };
+        let Some(crate::RunControl::Native(healthy_control)) = &healthy.incarnation_control else {
+            panic!("Native control");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while slow.info().latest_output_bytes < 5 || healthy.info().latest_output_bytes < 5 {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // No relay backstop may mask a missed cooperative unlock wake.
+        owner.mark_signal_driven();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held_control = slow_control.clone();
+        let holder = std::thread::spawn(move || {
+            held_control.with_metadata(|_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        owner.owner_wake().wake();
+        // All commands below target the genuinely held Run, before effects.
+        // They must return without consuming either Tokio worker or modifying
+        // the queued bytes/geometry. A recoverable key cannot be declared new
+        // until the owner has inspected its ledger.
+        for failure in [
+            slow_control
+                .begin_input(b"must-not-apply".to_vec())
+                .err()
+                .unwrap(),
+            slow_control.begin_stop().err().unwrap(),
+            slow_control
+                .begin_signal(ctxmux_protocol::RunSignal::Interrupt)
+                .err()
+                .unwrap(),
+            slow_control
+                .resize(ctxmux_protocol::TerminalSize { cols: 91, rows: 31 }, |_| {
+                    panic!("busy resize must not publish or apply")
+                })
+                .err()
+                .unwrap(),
+        ] {
+            assert_eq!(failure.error.code, ErrorCode::ControlBackpressure);
+            assert_eq!(failure.disposition, CommandDisposition::NotApplied);
+            assert_eq!(failure.confirmed_input_bytes, None);
+        }
+        let unresolved = slow_control
+            .begin_recoverable_input(
+                InputOperationKey::new("held-peer-unknown-key").unwrap(),
+                0,
+                b"never-replayed-while-busy".to_vec(),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(unresolved.error.code, ErrorCode::ControlBackpressure);
+        assert_eq!(unresolved.disposition, CommandDisposition::Unknown);
+        assert_eq!(unresolved.confirmed_input_bytes, None);
+        let waiting_control = slow_control.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_control
+                .begin_recoverable_input_async(
+                    InputOperationKey::new("held-peer-actual-unlock").unwrap(),
+                    0,
+                    b"slow-after-actual-unlock".to_vec(),
+                )
+                .await
+                .unwrap()
+                .resolve()
+                .await
+        });
+        let cancelled_control = slow_control.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_control
+                .begin_input_async(b"cancelled-before-admission".to_vec())
+                .await
+        });
+        tokio::task::yield_now().await;
+        let data = b"healthy-under-control-pressure";
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            healthy_control
+                .begin_recoverable_input(
+                    InputOperationKey::new("healthy-with-held-peer").unwrap(),
+                    0,
+                    data.to_vec(),
+                )
+                .unwrap()
+                .resolve(),
+        )
+        .await;
+        // Always release the real held control before asserting, even on RED,
+        // so a regression cannot leave an unjoinable owner or test child.
+        if outcome.is_err() {
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            panic!("one held Run control blocked healthy Run input");
+        }
+        outcome.unwrap().unwrap();
+        while healthy.info().latest_output_bytes < 5 + data.len() as u64 {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let bytes = healthy
+            .lock_owner(&healthy.output)
+            .replay(0)
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+        assert_eq!(&bytes[5..], data);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let stable = owner.diagnostic_snapshot();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            owner.diagnostic_snapshot().poll_returns,
+            stable.poll_returns,
+            "a held state mutex must not introduce timer or ready-fd busy polling"
+        );
+        assert!(
+            !waiting.is_finished(),
+            "same-Run request waits, without being rejected"
+        );
+        assert!(
+            !cancelled.is_finished(),
+            "unadmitted future remains cancellable"
+        );
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        while owner.diagnostic_snapshot().lifecycle_probes <= stable.lifecycle_probes {
+            assert!(
+                Instant::now() < deadline,
+                "actual unlock must wake the deferred owner without another request"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let receipt = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.start_byte, 0);
+        assert_eq!(receipt.end_byte, b"slow-after-actual-unlock".len() as u64);
+        while slow.info().latest_output_bytes < 5 + receipt.end_byte {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let bytes = slow
+            .lock_owner(&slow.output)
+            .replay(0)
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+        assert_eq!(bytes, b"READYslow-after-actual-unlock");
+        for control in [slow_control, healthy_control] {
+            control
+                .begin_stop()
+                .unwrap()
+                .resolve(Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_partial_input_stop_fences_exact_prefix_and_never_reports_whole_success() {
+        let owner = NativeRunOwner::default();
+        let run = spawn_actual_service_run(
+            &owner,
+            "stty raw -echo; printf READY; exec /bin/sleep 30",
+            NativeWaitFailure::default(),
+        );
+        let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+            panic!("Native control");
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while run.info().latest_output_bytes < 5 {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let data = vec![0x61; 128 * 1024 + 3];
+        let first = control
+            .begin_recoverable_input(
+                InputOperationKey::new("partial-before-stop").unwrap(),
+                0,
+                data.clone(),
+            )
+            .unwrap();
+        let second = control
+            .begin_recoverable_input(
+                InputOperationKey::new("unattempted-after-partial").unwrap(),
+                data.len() as u64,
+                vec![0x62; 17],
+            )
+            .unwrap();
+        while !control.input_service().write_blocked
+            || control.input_service().active_confirmed_bytes == 0
+        {
+            assert!(Instant::now() < deadline, "real PTY fills before Stop");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let confirmed = control.input_service().active_confirmed_bytes;
+        assert!(confirmed < data.len());
+        let stop = control.begin_stop().unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(3), first.resolve())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.disposition, CommandDisposition::Unknown);
+        assert_eq!(failure.confirmed_input_bytes, Some(confirmed));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), second.resolve())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .disposition,
+            CommandDisposition::NotApplied
+        );
+        assert_eq!(control.input_service().completed_input_bytes, Some(0));
+        assert_eq!(control.input_service().unsettled_request_bytes, 0);
+        let retained = control
+            .begin_recoverable_input(
+                InputOperationKey::new("partial-before-stop").unwrap(),
+                0,
+                data,
+            )
+            .unwrap()
+            .resolve()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            retained, failure,
+            "duplicate never replays a written prefix or guesses suffix delivery"
+        );
+        stop.resolve(Duration::from_secs(5)).await.unwrap();
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one causal owner-unwind fixture keeps both original child identities, unavailable service facts, exact input uncertainty, and retained authority together"
+    )]
+    async fn real_owner_unwind_publishes_unavailable_and_retains_both_actual_children() {
+        use ctxmux_protocol::{
+            NativeInputPhase, NativeOutputStatus, NativeOwnerStatus, NativeServiceFailure,
+        };
+        let owner = NativeRunOwner::default();
+        let failure = NativeWaitFailure::default();
+        let runs = (0..2)
+            .map(|_| {
+                spawn_actual_service_run(
+                    &owner,
+                    "stty raw -echo; printf READY; exec /bin/sleep 30",
+                    failure.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runs.iter().any(|run| run.info().latest_output_bytes < 5) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let ids = runs
+            .iter()
+            .map(|run| (run.id, run.info().pid.unwrap()))
+            .collect::<Vec<_>>();
+        assert_ne!(ids[0], ids[1]);
+        let controls = runs
+            .iter()
+            .map(|run| match &run.incarnation_control {
+                Some(crate::RunControl::Native(control)) => control.clone(),
+                _ => panic!("Native control"),
+            })
+            .collect::<Vec<_>>();
+        let data = vec![0x61; 128 * 1024 + 3];
+        let pending = controls[1]
+            .begin_recoverable_input(InputOperationKey::new("unwind-partial").unwrap(), 0, data)
+            .unwrap();
+        while !controls[1].input_service().write_blocked
+            || controls[1].input_service().active_confirmed_bytes == 0
+        {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let confirmed = controls[1].input_service().active_confirmed_bytes;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held = controls[0].clone();
+        let holder = std::thread::spawn(move || {
+            held.with_metadata(|_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let commands = {
+            let state = crate::mutex_lock(&owner.inner.state);
+            let super::OwnerState::Running { commands, .. } = &*state else {
+                panic!("live owner");
+            };
+            commands.clone()
+        };
+        owner.owner_wake().wake();
+        commands.send(super::OwnerCommand::UnwindForTest).unwrap();
+        owner.owner_wake().wake();
+        drop(commands);
+        let completed_while_busy = tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.inner.completion_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        // Completion and public failure facts must be independent of one held
+        // control. Release this test holder before a RED assertion as cleanup.
+        if completed_while_busy.is_err() {
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            panic!("held peer control blocked owner completion and other Run faults");
+        }
+        for run in &runs {
+            let service = run.native_service.as_ref().unwrap().snapshot();
+            assert_eq!(
+                service.owner,
+                NativeOwnerStatus::Stopped {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.input.phase,
+                NativeInputPhase::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+        }
+        assert!(controls[0].begin_input(b"not-sent".to_vec()).is_err());
+        assert!(controls[0].begin_stop().is_err());
+        let busy_recoverable = controls[0]
+            .begin_recoverable_input(
+                InputOperationKey::new("busy-unknown-ledger").unwrap(),
+                0,
+                vec![1],
+            )
+            .unwrap_err();
+        assert_eq!(busy_recoverable.disposition, CommandDisposition::Unknown);
+        assert_eq!(busy_recoverable.confirmed_input_bytes, None);
+        let unsettled = tokio::time::timeout(Duration::from_secs(2), pending.resolve())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(unsettled.disposition, CommandDisposition::Unknown);
+        assert_eq!(unsettled.confirmed_input_bytes, Some(confirmed));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            *crate::mutex_lock(&owner.inner.completion),
+            Some(NativeServiceFailure::OwnerUnwound)
+        );
+        assert!(owner.ensure_running().is_err());
+        assert!(
+            failure.incarnation_failure.message().is_none(),
+            "owner unwind is not a fabricated waitid failure"
+        );
+        for (index, run) in runs.iter().enumerate() {
+            let info = run.info();
+            assert_eq!((info.id, info.pid.unwrap()), ids[index]);
+            assert!(
+                info.state.is_running(),
+                "no child lifecycle event is invented"
+            );
+            let service = info.native_service.unwrap();
+            assert_eq!(
+                service.owner,
+                NativeOwnerStatus::Stopped {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.output,
+                NativeOutputStatus::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.input.phase,
+                NativeInputPhase::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+                panic!("Native control");
+            };
+            assert!(control.retains_failed_child());
+            assert!(control.wait_authority_failure().is_none());
+            assert!(control.begin_input(b"not-sent".to_vec()).is_err());
+            assert!(control.begin_stop().is_err());
+            assert!(owner.handoff_ready(info.id).is_err());
+            let mut session = NativeSession::from_child_pid(ids[index].1).unwrap();
+            assert!(
+                !session.leader_is_terminal().unwrap(),
+                "actual child survives owner unwind"
+            );
+            // Explicit cleanup of test-created children only, using their actual
+            // retained holder; production completion above performs no Stop.
+            control
+                .cleanup_retained_owner_child_for_test(&mut session)
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one causal owner-unwind fixture keeps both original child identities, unavailable service facts, exact input uncertainty, and retained authority together"
+    )]
+    async fn real_owner_completion_publishes_before_producer_release() {
+        use ctxmux_protocol::{
+            NativeInputPhase, NativeOutputStatus, NativeOwnerStatus, NativeServiceFailure,
+        };
+        let owner = NativeRunOwner::default();
+        let failure = NativeWaitFailure::default();
+        let runs = (0..2)
+            .map(|_| {
+                spawn_actual_service_run(
+                    &owner,
+                    "stty raw -echo; printf READY; exec /bin/sleep 30",
+                    failure.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runs.iter().any(|run| run.info().latest_output_bytes < 5) {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let ids = runs
+            .iter()
+            .map(|run| (run.id, run.info().pid.unwrap()))
+            .collect::<Vec<_>>();
+        assert_ne!(ids[0], ids[1]);
+        let controls = runs
+            .iter()
+            .map(|run| match &run.incarnation_control {
+                Some(crate::RunControl::Native(control)) => control.clone(),
+                _ => panic!("Native control"),
+            })
+            .collect::<Vec<_>>();
+        let data = vec![0x61; 128 * 1024 + 3];
+        let pending = controls[1]
+            .begin_recoverable_input(InputOperationKey::new("unwind-partial").unwrap(), 0, data)
+            .unwrap();
+        while !controls[1].input_service().write_blocked
+            || controls[1].input_service().active_confirmed_bytes == 0
+        {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let confirmed = controls[1].input_service().active_confirmed_bytes;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let held = controls[0].clone();
+        let holder = std::thread::spawn(move || {
+            held.with_metadata(|_, _| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let commands = {
+            let state = crate::mutex_lock(&owner.inner.state);
+            let super::OwnerState::Running { commands, .. } = &*state else {
+                panic!("live owner");
+            };
+            commands.clone()
+        };
+        owner.owner_wake().wake();
+        commands.send(super::OwnerCommand::UnwindForTest).unwrap();
+        owner.owner_wake().wake();
+
+        // A borrowed producer can be descheduled before its send or reply.
+        // Existing Runs need real failure facts before that producer retires.
+        let before_release = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let facts = runs
+                    .iter()
+                    .map(|run| run.native_service.as_ref().unwrap().snapshot())
+                    .collect::<Vec<_>>();
+                if facts
+                    .iter()
+                    .all(|fact| matches!(fact.owner, NativeOwnerStatus::Stopped { .. }))
+                {
+                    return facts;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        let captured_before_release = runs
+            .iter()
+            .map(|run| run.native_service.as_ref().unwrap().snapshot())
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::json!({
+                "completion_before_release": *crate::mutex_lock(&owner.inner.completion),
+                "service_before_release": captured_before_release,
+                "service_progress_before_release": before_release.is_ok()
+            })
+        );
+        let mut pending_result = Box::pin(pending.resolve());
+        let settled_before_release =
+            tokio::time::timeout(Duration::from_secs(2), &mut pending_result).await;
+        let refused_before_release = controls[1].begin_input(b"must-refuse".to_vec()).is_err();
+        println!(
+            "{}",
+            serde_json::json!({
+                "input_settled_before_release": settled_before_release.is_ok(),
+                "new_input_refused_before_release": refused_before_release
+            })
+        );
+        // Release the producer and finish exact fixture cleanup before asserting
+        // RED; an assertion must never abandon either private child.
+        drop(commands);
+        let completed_while_busy = tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.inner.completion_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        if completed_while_busy.is_err() {
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+            panic!("held peer control blocked owner completion and other Run faults");
+        }
+        for run in &runs {
+            let service = run.native_service.as_ref().unwrap().snapshot();
+            assert_eq!(
+                service.owner,
+                NativeOwnerStatus::Stopped {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.input.phase,
+                NativeInputPhase::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+        }
+        assert!(controls[0].begin_input(b"not-sent".to_vec()).is_err());
+        assert!(controls[0].begin_stop().is_err());
+        let busy_recoverable = controls[0]
+            .begin_recoverable_input(
+                InputOperationKey::new("busy-unknown-ledger").unwrap(),
+                0,
+                vec![1],
+            )
+            .unwrap_err();
+        assert_eq!(busy_recoverable.disposition, CommandDisposition::Unknown);
+        assert_eq!(busy_recoverable.confirmed_input_bytes, None);
+        let was_settled_before_release = settled_before_release.is_ok();
+        let unsettled = match settled_before_release {
+            Ok(result) => result.unwrap_err(),
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), pending_result)
+                .await
+                .unwrap()
+                .unwrap_err(),
+        };
+        assert_eq!(unsettled.disposition, CommandDisposition::Unknown);
+        assert_eq!(unsettled.confirmed_input_bytes, Some(confirmed));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            *crate::mutex_lock(&owner.inner.completion),
+            Some(NativeServiceFailure::OwnerUnwound)
+        );
+        assert!(owner.ensure_running().is_err());
+        assert!(
+            failure.incarnation_failure.message().is_none(),
+            "owner unwind is not a fabricated waitid failure"
+        );
+        for (index, run) in runs.iter().enumerate() {
+            let info = run.info();
+            assert_eq!((info.id, info.pid.unwrap()), ids[index]);
+            assert!(
+                info.state.is_running(),
+                "no child lifecycle event is invented"
+            );
+            let service = info.native_service.unwrap();
+            assert_eq!(
+                service.owner,
+                NativeOwnerStatus::Stopped {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.output,
+                NativeOutputStatus::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                service.input.phase,
+                NativeInputPhase::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+                panic!("Native control");
+            };
+            assert!(control.retains_failed_child());
+            assert!(control.wait_authority_failure().is_none());
+            assert!(control.begin_input(b"not-sent".to_vec()).is_err());
+            assert!(control.begin_stop().is_err());
+            assert!(owner.handoff_ready(info.id).is_err());
+            let mut session = NativeSession::from_child_pid(ids[index].1).unwrap();
+            assert!(
+                !session.leader_is_terminal().unwrap(),
+                "actual child survives owner unwind"
+            );
+            // Explicit cleanup of test-created children only, using their actual
+            // retained holder; production completion above performs no Stop.
+            control
+                .cleanup_retained_owner_child_for_test(&mut session)
+                .unwrap();
+        }
+        println!(
+            "{}",
+            serde_json::json!({"actual_private_children_cleaned": 2,
+            "confirmed_prefix": confirmed, "retained_failure": unsettled})
+        );
+        assert!(
+            before_release.is_ok(),
+            "existing public service facts waited for a borrowed producer to retire"
+        );
+        assert!(
+            was_settled_before_release,
+            "original partial result waited for producer release"
+        );
+        assert!(
+            refused_before_release,
+            "failed owner still admitted input before producer release"
+        );
+        for facts in captured_before_release {
+            assert_eq!(
+                facts.owner,
+                NativeOwnerStatus::Stopped {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                facts.output,
+                NativeOutputStatus::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+            assert_eq!(
+                facts.input.phase,
+                NativeInputPhase::Unavailable {
+                    reason: NativeServiceFailure::OwnerUnwound
+                }
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real ten-Run fixture preserves every original blocked input and validates healthy input, output, CtrlC, FIFO completion, and funded recovery"
+    )]
+    async fn real_blocked_ptys_preserve_fifo_and_serve_another_run_without_input_workers() {
+        use crate::{
+            NativeSpawnConfig, PersistenceMode, RetentionBudget, TerminalPublicationOwner,
+            native_control::InputDrainGate, qualification_stats::QualificationStats,
+        };
+        use ctxmux_protocol::{AppliedInputRange, RunSpec};
+
+        // Nine blocked PTYs exceed the old eight blocking-worker slots. These
+        // are a held-out regression population, not a product Run ceiling.
+        const BLOCKED_RUNS: usize = 9;
+        const FIRST_BYTES: usize = 128 * 1024 + 3;
+        const SECOND_BYTES: usize = 257;
+        let directory = tempfile::tempdir().unwrap();
+        let owner = NativeRunOwner::default();
+        let gate = InputDrainGate::default();
+        let stats = QualificationStats::default();
+        let retention_budget = RetentionBudget::production();
+        let mut fixtures = Vec::new();
+        for index in 0..=BLOCKED_RUNS {
+            let fifo = directory.path().join(format!("read-gate-{index}"));
+            let args = if index < BLOCKED_RUNS {
+                assert!(
+                    std::process::Command::new("mkfifo")
+                        .arg(&fifo)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                vec!["-c".to_owned(),
+                    r#"stty raw -echo; printf READY; IFS= read -r gate < "$1"; dd bs=1 count="$2" 2>/dev/null"#.to_owned(),
+                    "read-gated-pty".to_owned(), fifo.to_string_lossy().into_owned(),
+                    (FIRST_BYTES + SECOND_BYTES).to_string()]
+            } else {
+                vec![
+                    "-c".to_owned(),
+                    "stty -echo; printf READY; exec /bin/cat".to_owned(),
+                ]
+            };
+            let run = Run::spawn_with_hooks(
+                NativeSpawnConfig {
+                    id: RunId::new(),
+                    spec: RunSpec {
+                        program: "/bin/sh".to_owned(),
+                        args,
+                        cwd: None,
+                        env: std::collections::BTreeMap::default(),
+                        initial_size: TerminalSize::default(),
+                        declared_inputs: Vec::new(),
+                    },
+                    lineage: None,
+                    persistence_mode: PersistenceMode::MemoryOnly,
+                    live_event_capacity: crate::LIVE_EVENT_CAPACITY,
+                    input_drains: gate.clone(),
+                    native_runs: owner.clone(),
+                    terminal_publications: TerminalPublicationOwner::default(),
+                    wait_failure: NativeWaitFailure::default(),
+                    qualification_stats: stats.clone(),
+                    retention_budget: retention_budget.clone(),
+                },
+                |run| run,
+                |_, _| Ok(()),
+                || {},
+            )
+            .unwrap();
+            let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+                panic!("actual Native control");
+            };
+            let control = control.clone();
+            assert!(run.info().pid.is_some());
+            fixtures.push((run, control, fifo));
+        }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while fixtures
+            .iter()
+            .any(|(run, ..)| run.info().latest_output_bytes < 5)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "real children complete terminal setup"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let first = (0..FIRST_BYTES)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<_>>();
+        let second = vec![0xfa; SECOND_BYTES];
+        let mut pending = Vec::new();
+        for (_, control, ..) in fixtures.iter().take(BLOCKED_RUNS) {
+            let one = control
+                .begin_recoverable_input_async(
+                    InputOperationKey::new("blocked-first").unwrap(),
+                    0,
+                    first.clone(),
+                )
+                .await
+                .unwrap();
+            let two = control
+                .begin_recoverable_input_async(
+                    InputOperationKey::new("blocked-second").unwrap(),
+                    FIRST_BYTES as u64,
+                    second.clone(),
+                )
+                .await
+                .unwrap();
+            pending.push((one, two));
+        }
+        while fixtures.iter().take(BLOCKED_RUNS).any(|(_, control, ..)| {
+            let input = control.input_service();
+            !input.write_blocked || input.active_confirmed_bytes == 0
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "each actual non-reading PTY reaches kernel write pressure"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        for (_, control, ..) in fixtures.iter().take(BLOCKED_RUNS) {
+            let input = control.input_service();
+            assert_eq!(input.unsettled_commands, 2);
+            assert_eq!(input.unsettled_request_bytes, FIRST_BYTES + SECOND_BYTES);
+            assert_eq!(input.completed_input_bytes, Some(0));
+            assert!(input.active_confirmed_bytes < FIRST_BYTES);
+            assert!(
+                control.handoff_input_state().is_err(),
+                "partial input cannot be handed off as completed"
+            );
+        }
+        let (healthy, healthy_control, ..) = &fixtures[BLOCKED_RUNS];
+        let healthy_data = b"healthy-input\n";
+        let range = tokio::time::timeout(Duration::from_secs(3), async {
+            healthy_control
+                .begin_recoverable_input_async(
+                    InputOperationKey::new("healthy-input").unwrap(),
+                    0,
+                    healthy_data.to_vec(),
+                )
+                .await
+                .unwrap()
+                .resolve()
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            range,
+            AppliedInputRange {
+                start_byte: 0,
+                end_byte: healthy_data.len() as u64
+            }
+        );
+        while healthy.info().latest_output_bytes < 5 + b"healthy-input\r\n".len() as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "healthy Run output continues under unrelated PTY pressure"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let healthy_output = healthy
+            .lock_owner(&healthy.output)
+            .replay(0)
+            .chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.data)
+            .collect::<Vec<_>>();
+        assert_eq!(healthy_output, b"READYhealthy-input\r\n");
+        let ctrlc = tokio::time::timeout(Duration::from_secs(3), async {
+            healthy_control
+                .begin_recoverable_input_async(
+                    InputOperationKey::new("healthy-ctrl-c").unwrap(),
+                    healthy_data.len() as u64,
+                    vec![3],
+                )
+                .await
+                .unwrap()
+                .resolve()
+                .await
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ctrlc.start_byte, healthy_data.len() as u64);
+        assert_eq!(ctrlc.end_byte, healthy_data.len() as u64 + 1);
+        while healthy.info().state.is_running() {
+            assert!(
+                Instant::now() < deadline,
+                "actual terminal Ctrl+C reaches healthy child"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Release every original blocked child. No request is dropped or
+        // reduced to obtain fairness; verify both completion ranges and bytes.
+        for (_, _, fifo) in fixtures.iter().take(BLOCKED_RUNS) {
+            std::fs::write(fifo, b"read-now\n").unwrap();
+        }
+        let mut expected = b"READY".to_vec();
+        expected.extend_from_slice(&first);
+        expected.extend_from_slice(&second);
+        for (index, (one, two)) in pending.into_iter().enumerate() {
+            let one = tokio::time::timeout(Duration::from_secs(15), one.resolve())
+                .await
+                .unwrap()
+                .unwrap();
+            let two = tokio::time::timeout(Duration::from_secs(15), two.resolve())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                one,
+                AppliedInputRange {
+                    start_byte: 0,
+                    end_byte: FIRST_BYTES as u64
+                }
+            );
+            assert_eq!(
+                two,
+                AppliedInputRange {
+                    start_byte: FIRST_BYTES as u64,
+                    end_byte: (FIRST_BYTES + SECOND_BYTES) as u64
+                }
+            );
+            let (run, control, ..) = &fixtures[index];
+            let output_deadline = Instant::now() + Duration::from_secs(15);
+            while run.info().latest_output_bytes < expected.len() as u64
+                || run.info().state.is_running()
+            {
+                assert!(
+                    Instant::now() < output_deadline,
+                    "released child completes original exact byte workload"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let actual = run
+                .lock_owner(&run.output)
+                .replay(0)
+                .chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.data)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected,
+                "PTY bytes preserve FIFO and binary contents"
+            );
+            assert_eq!(
+                control.input_service().completed_input_bytes,
+                Some((FIRST_BYTES + SECOND_BYTES) as u64)
+            );
+            assert_eq!(control.input_service().unsettled_request_bytes, 0);
+        }
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
@@ -2175,6 +3452,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one real two-child handoff fixture verifies original identities and live descriptor ownership before and after extract"
+    )]
     fn extract_for_handoff_returns_live_descriptors_and_leaves_children_running() {
         use std::{collections::HashSet, process::Command};
 
@@ -2200,7 +3481,12 @@ mod tests {
                     pixel_height: 0,
                 })
                 .expect("open real pty for handoff fixture");
-            let writer = pair.master.take_writer().expect("take real pty writer");
+            let writer = std::fs::File::from(
+                ctxmux_inherited_fd::duplicate_nonblocking_cloexec(
+                    pair.master.as_raw_fd().expect("master fd"),
+                )
+                .expect("duplicate unbuffered PTY input"),
+            );
             let mut command = CommandBuilder::new("/bin/sleep");
             command.arg("30");
             let child = pair
@@ -2362,7 +3648,7 @@ mod tests {
                     release: Arc::clone(&release),
                 })
             };
-            let control = NativeControlOwner::new(
+            let control = NativeControlOwner::new_opaque_for_owner_test(
                 id,
                 pair.master,
                 writer,
@@ -2443,5 +3729,505 @@ mod tests {
         owner
             .shutdown(Instant::now() + Duration::from_secs(2))
             .expect("stop owner after successful extraction");
+    }
+    async fn start_public_echo_run(
+        client: &ctxmux_client::Client,
+        marker: &[u8],
+    ) -> (ctxmux_protocol::RunInfo, ctxmux_client::Attachment) {
+        use ctxmux_client::replay_bytes;
+        use ctxmux_protocol::RunSpec;
+        let info = client
+            .start(RunSpec {
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    "stty raw -echo; printf READY; exec /bin/cat".to_owned(),
+                ],
+                cwd: None,
+                env: std::collections::BTreeMap::new(),
+                initial_size: TerminalSize::default(),
+                declared_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.status(info.id).await.unwrap().latest_output_bytes < 5 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let receipt = client.input(info.id, marker.to_vec()).await.unwrap();
+        assert_eq!(
+            usize::try_from(receipt.receipt.written_bytes).unwrap(),
+            marker.len()
+        );
+        let expected = [b"READY".as_slice(), marker].concat();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.status(info.id).await.unwrap().latest_output_bytes
+                < u64::try_from(expected.len()).unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (attachment, snapshot) = client.attach(info.id, 0).await.unwrap();
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), expected);
+        assert_eq!((snapshot.run.id, snapshot.run.pid), (info.id, info.pid));
+        (info, attachment)
+    }
+
+    fn borrow_owner_commands(owner: &NativeRunOwner) -> mpsc::SyncSender<super::OwnerCommand> {
+        let state = crate::mutex_lock(&owner.inner.state);
+        let super::OwnerState::Running { commands, .. } = &*state else {
+            panic!("live owner")
+        };
+        commands.clone()
+    }
+
+    async fn await_owner_retirement(owner: &NativeRunOwner) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.inner.completion_finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn read_private_retained_output(
+        run: &Arc<Run>,
+        reader: &mut std::fs::File,
+        bytes: &mut Vec<u8>,
+        calls: &mut usize,
+    ) -> bool {
+        use std::io::Read;
+        let mut buffer = [0_u8; super::OUTPUT_READ_BUFFER_BYTES];
+        loop {
+            *calls += 1;
+            match reader.read(&mut buffer) {
+                Ok(0) => return true,
+                Ok(read) => {
+                    bytes.extend_from_slice(&buffer[..read]);
+                    run.record_output(buffer[..read].to_vec());
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return false,
+                Err(error)
+                    if error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) =>
+                {
+                    return true;
+                }
+                Err(error) => panic!("actual retained PTY read failed: {error}"),
+            }
+        }
+    }
+
+    fn await_private_output_tail(
+        run: &Arc<Run>,
+        reader: &mut std::fs::File,
+        bytes: &mut Vec<u8>,
+        calls: &mut usize,
+    ) {
+        let deadline = Instant::now() + super::OUTPUT_DRAIN_TIMEOUT;
+        while !read_private_retained_output(run, reader, bytes, calls) {
+            assert!(
+                Instant::now() < deadline,
+                "private reaped child left an unsettled output tail"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn cleanup_with_actual_retained_reader(
+        run: &Arc<Run>,
+        control: &NativeControlOwner,
+        mut session: NativeSession,
+        reader: &mut std::fs::File,
+        read_enabled: bool,
+        expected_raw: Option<&[u8]>,
+    ) -> (Result<(), String>, NativeSession) {
+        let before = ctxmux_client::replay_bytes(&run.lock_owner(&run.output).replay(0).chunks);
+        let actual_control = control.clone();
+        let cleanup_worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = actual_control.cleanup_retained_owner_child_for_test(&mut session);
+            (result, session, started.elapsed())
+        });
+        let mut bytes = Vec::new();
+        let mut calls = 0;
+        while !cleanup_worker.is_finished() {
+            if read_enabled {
+                read_private_retained_output(run, reader, &mut bytes, &mut calls);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (result, mut session, elapsed) = cleanup_worker.join().unwrap();
+        println!(
+            "{}",
+            serde_json::json!({"first_cleanup_result": result,
+            "first_cleanup_elapsed_us": elapsed.as_micros(),
+            "read_enabled": read_enabled, "read_calls_before_first_result": calls,
+            "exact_bytes_before_first_result": bytes, "private_extra_threads": 1,
+            "private_extra_reader_fds": 1})
+        );
+        // A first success still joins the entire actual output tail. A failed
+        // inverse can clean its private child, but retains its first failure.
+        let deadline = Instant::now() + super::OUTPUT_DRAIN_TIMEOUT;
+        while !read_private_retained_output(run, reader, &mut bytes, &mut calls) {
+            if result.is_err() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "successful Stop left an unsettled output tail"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if result.is_err() {
+            let retry = control.cleanup_retained_owner_child_for_test(&mut session);
+            println!(
+                "{}",
+                serde_json::json!({"private_inverse_cleanup_retry": retry})
+            );
+            if retry.is_ok() {
+                await_private_output_tail(run, reader, &mut bytes, &mut calls);
+            }
+        }
+        let replay = ctxmux_client::replay_bytes(&run.lock_owner(&run.output).replay(0).chunks);
+        println!(
+            "{}",
+            serde_json::json!({"retained_real_raw_replay": replay,
+            "all_actual_private_read_bytes": bytes, "all_read_calls": calls,
+            "first_cleanup_result_retained": result})
+        );
+        assert_eq!(
+            replay,
+            [before, bytes].concat(),
+            "every actual byte is admitted once and in order"
+        );
+        if let Some(expected) = expected_raw {
+            assert_eq!(replay, expected);
+        }
+        (result, session)
+    }
+
+    fn cleanup_actual_retained_child(run: &Arc<Run>, expected_raw: Option<&[u8]>) {
+        let info = run.info();
+        let Some(crate::RunControl::Native(control)) = &run.incarnation_control else {
+            panic!("Native control")
+        };
+        let session = NativeSession::from_child_pid(info.pid.unwrap()).unwrap();
+        assert!(!session.leader_is_terminal().unwrap());
+        let mut reader = control.retained_pty_reader_for_test().unwrap();
+        let (first_result, _) = cleanup_with_actual_retained_reader(
+            run,
+            control,
+            session,
+            &mut reader,
+            true,
+            expected_raw,
+        );
+        first_result.expect(
+            "actual first private cleanup with its output reader and unchanged Stop budgets",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_clients_observe_owner_loss_before_producer_release() {
+        use ctxmux_client::Client;
+        use ctxmux_protocol::{NativeOwnerStatus, NativeServiceFailure, RunEvent};
+
+        let manager = Arc::new(crate::RunManager::default());
+        let server = crate::tests::InProcessServer::start(Arc::clone(&manager));
+        let second_client = Client::new(server.directory.path().join("ctxmux.sock"));
+        let runtime = server.client.runtime_info().await.unwrap();
+        assert_eq!(runtime, second_client.runtime_info().await.unwrap());
+        let mut infos = Vec::new();
+        let mut attachments = Vec::new();
+        for (client, marker) in [
+            (&server.client, b"FIRST\n".as_slice()),
+            (&second_client, b"SECOND\n".as_slice()),
+        ] {
+            let (info, attachment) = start_public_echo_run(client, marker).await;
+            attachments.push(attachment);
+            infos.push(info);
+        }
+        assert_ne!(infos[0].id, infos[1].id);
+        assert_ne!(infos[0].pid, infos[1].pid);
+        let owner = &manager.native_runs;
+        let commands = borrow_owner_commands(owner);
+        commands.send(super::OwnerCommand::UnwindForTest).unwrap();
+        owner.owner_wake().wake();
+        let observed = tokio::time::timeout(Duration::from_secs(2), async {
+            for (client, info, attachment) in [
+                (&server.client, &infos[0], &attachments[0]),
+                (&second_client, &infos[1], &attachments[1]),
+            ] {
+                loop {
+                    if let Some(RunEvent::ServiceChanged { service }) =
+                        attachment.next_event().await.unwrap()
+                        && matches!(
+                            service.owner,
+                            NativeOwnerStatus::Stopped {
+                                reason: NativeServiceFailure::OwnerUnwound
+                            }
+                        )
+                    {
+                        break;
+                    }
+                }
+                let status = client.status(info.id).await.unwrap();
+                assert_eq!((status.id, status.pid), (info.id, info.pid));
+                assert!(status.state.is_running());
+                assert_eq!(
+                    status.native_service.unwrap().owner,
+                    NativeOwnerStatus::Stopped {
+                        reason: NativeServiceFailure::OwnerUnwound
+                    }
+                );
+            }
+        })
+        .await;
+        let physically_finished_before_release =
+            owner.inner.completion_finished.load(Ordering::Acquire);
+        drop(commands);
+        await_owner_retirement(owner).await;
+        for ((info, attachment), marker) in infos
+            .iter()
+            .zip(attachments)
+            .zip([b"FIRST\n".as_slice(), b"SECOND\n".as_slice()])
+        {
+            attachment.detach().await.unwrap();
+            let (_, replay) = second_client.attach(info.id, 0).await.unwrap();
+            assert_eq!((replay.run.id, replay.run.pid), (info.id, info.pid));
+            let run = manager.get(info.id).unwrap();
+            let expected = [b"READY".as_slice(), marker].concat();
+            cleanup_actual_retained_child(&run, Some(&expected));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "public_clients": 2, "actual_runs": 2, "ordered_peer_echo_bytes": [11, 12],
+                "public_events_status_before_release": observed.is_ok(),
+                "physical_retirement_before_release": physically_finished_before_release,
+                "actual_private_children_cleaned": 2
+            })
+        );
+        assert!(
+            observed.is_ok(),
+            "public events and Status waited for producer release"
+        );
+        assert!(
+            !physically_finished_before_release,
+            "pending producer lifetime was hidden"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extracted_stop_settles_before_producer_release() {
+        let owner = NativeRunOwner::default();
+        let admission = owner.cleanup_admission();
+        let permits = (0..crate::ResourceLimits::DEFAULT.cleanup_workers)
+            .map(|_| admission.try_acquire().unwrap())
+            .collect::<Vec<_>>();
+        assert!(admission.try_acquire().is_none());
+        let run = spawn_actual_service_run(
+            &owner,
+            "stty raw -echo; printf READY; exec /bin/cat",
+            NativeWaitFailure::default(),
+        );
+        let control = match &run.incarnation_control {
+            Some(crate::RunControl::Native(control)) => control.clone(),
+            _ => panic!("Native control"),
+        };
+        let stop = control.begin_stop().unwrap();
+        let commands = borrow_owner_commands(&owner);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (tx, rx) = mpsc::channel();
+            commands
+                .send(super::OwnerCommand::ProbePendingStopForTest {
+                    run_id: run.id,
+                    respond: tx,
+                })
+                .unwrap();
+            owner.owner_wake().wake();
+            if rx.recv_timeout(Duration::from_secs(1)).unwrap() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real Stop did not enter Watching.pending_stop"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        commands.send(super::OwnerCommand::UnwindForTest).unwrap();
+        owner.owner_wake().wake();
+        let mut result = Box::pin(stop.resolve(Duration::from_secs(5)));
+        let before_release = tokio::time::timeout(Duration::from_secs(2), &mut result).await;
+        let settled_before_release = before_release.is_ok();
+        drop(commands);
+        await_owner_retirement(&owner).await;
+        let failure = match before_release {
+            Ok(result) => result.unwrap_err(),
+            Err(_) => result.await.unwrap_err(),
+        };
+        let info = run.info();
+        assert!(info.state.is_running());
+        let mut session = NativeSession::from_child_pid(info.pid.unwrap()).unwrap();
+        assert!(!session.leader_is_terminal().unwrap());
+        println!(
+            "{}",
+            serde_json::json!({"private_stop_cleanup_start": info.pid,
+            "stop_settled_before_release": settled_before_release, "failure": failure,
+            "original_stop_admission_budget_ms": crate::ResourceLimits::DEFAULT.stop_admission_timeout_ms})
+        );
+        let mut reader = control.retained_pty_reader_for_test().unwrap();
+        let (cleanup, returned_session) =
+            cleanup_with_actual_retained_reader(&run, &control, session, &mut reader, true, None);
+        session = returned_session;
+        println!(
+            "{}",
+            serde_json::json!({"private_stop_cleanup_result": cleanup,
+            "private_pid": info.pid, "leader_terminal_after_cleanup": session.leader_is_terminal()})
+        );
+        drop(permits);
+        println!(
+            "{}",
+            serde_json::json!({"actual_extracted_pending_stop": true,
+            "stop_settled_before_release": settled_before_release, "failure": failure,
+            "original_child_alive_before_cleanup": true, "actual_private_children_cleaned": usize::from(cleanup.is_ok()),
+            "original_stop_admission_budget_ms": crate::ResourceLimits::DEFAULT.stop_admission_timeout_ms})
+        );
+        assert!(
+            settled_before_release,
+            "extracted Stop result waited for producer release"
+        );
+        assert_eq!(failure.disposition, CommandDisposition::NotApplied);
+        assert_eq!(failure.error.code, ErrorCode::BackendUnavailable);
+        assert_eq!(failure.confirmed_input_bytes, None);
+        cleanup.expect("actual private child cleanup with unchanged Stop budgets");
+    }
+    fn capture_actual_registration(
+        owner: &NativeRunOwner,
+        commands: &mpsc::SyncSender<super::OwnerCommand>,
+    ) -> (Arc<Run>, super::NativeRunRegistration) {
+        // Capture an actual spawn registration at the producer's accepted-send
+        // boundary, while its real owner thread and channel remain alive.
+        let (capture, registrations) =
+            mpsc::sync_channel(crate::ResourceLimits::DEFAULT.creation_workers);
+        {
+            let mut state = crate::mutex_lock(&owner.inner.state);
+            let super::OwnerState::Running { commands, .. } = &mut *state else {
+                panic!("live owner")
+            };
+            *commands = capture;
+        }
+        let late = spawn_actual_service_run(
+            owner,
+            "stty raw -echo; printf READY; exec /bin/cat",
+            NativeWaitFailure::default(),
+        );
+        let super::OwnerCommand::Register(registration) = registrations.recv().unwrap() else {
+            panic!("real registration")
+        };
+        {
+            let mut state = crate::mutex_lock(&owner.inner.state);
+            let super::OwnerState::Running {
+                commands: retained, ..
+            } = &mut *state
+            else {
+                panic!("live owner")
+            };
+            *retained = commands.clone();
+        }
+        (late, registration)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn accepted_late_registration_is_fenced_before_producer_release() {
+        use ctxmux_protocol::{NativeOwnerStatus, NativeServiceFailure};
+        let owner = NativeRunOwner::default();
+        let first = spawn_actual_service_run(
+            &owner,
+            "stty raw -echo; printf READY; exec /bin/cat",
+            NativeWaitFailure::default(),
+        );
+        let commands = borrow_owner_commands(&owner);
+        let (late, registration) = capture_actual_registration(&owner, &commands);
+        commands.send(super::OwnerCommand::UnwindForTest).unwrap();
+        owner.owner_wake().wake();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while crate::mutex_lock(&owner.inner.completion).is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        commands
+            .send(super::OwnerCommand::Register(registration))
+            .unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        commands
+            .send(super::OwnerCommand::HandoffReady {
+                run_id: late.id,
+                respond: ready_tx,
+            })
+            .unwrap();
+        let preflight_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&preflight_calls);
+        let (extract_tx, extract_rx) = mpsc::channel();
+        commands
+            .send(super::OwnerCommand::ExtractForHandoff {
+                preflight: Box::new(move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                }),
+                respond: extract_tx,
+            })
+            .unwrap();
+        let extract = extract_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            extract
+                .unwrap_err()
+                .contains("stopped before handoff extraction")
+        );
+        assert!(matches!(
+            ready_rx.recv_timeout(Duration::from_secs(2)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        assert_eq!(preflight_calls.load(Ordering::Acquire), 0);
+        let service_before_release = late.native_service.as_ref().unwrap().snapshot();
+        let Some(crate::RunControl::Native(control)) = &late.incarnation_control else {
+            panic!("Native control")
+        };
+        let new_input_refused = control.begin_input(b"must-refuse".to_vec()).is_err();
+        let physical_retirement_before_release =
+            owner.inner.completion_finished.load(Ordering::Acquire);
+        let ids = [first.info(), late.info()];
+        assert_ne!(ids[0].id, ids[1].id);
+        assert_ne!(ids[0].pid, ids[1].pid);
+        drop(commands);
+        await_owner_retirement(&owner).await;
+        cleanup_actual_retained_child(&first, None);
+        cleanup_actual_retained_child(&late, None);
+        println!(
+            "{}",
+            serde_json::json!({"actual_late_registration": true,
+            "service_before_release": service_before_release,
+            "new_input_refused_before_release": new_input_refused,
+            "physical_retirement_before_release": physical_retirement_before_release,
+            "handoff_preflight_calls": 0, "actual_private_children_cleaned": 2})
+        );
+        assert_eq!(
+            service_before_release.owner,
+            NativeOwnerStatus::Stopped {
+                reason: NativeServiceFailure::OwnerUnwound
+            }
+        );
+        assert!(new_input_refused);
+        assert!(!physical_retirement_before_release);
     }
 }

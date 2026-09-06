@@ -1178,7 +1178,10 @@ async fn wait_for_output(
             {
                 RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
                 RunEvent::Tmux { .. } => {}
-                RunEvent::Resized { size } => {
+                RunEvent::ServiceChanged { service } => {
+                    panic!("tmux Run cannot publish Native service transitions: {service:?}")
+                }
+                RunEvent::Resized { size, .. } => {
                     panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
                 }
                 RunEvent::ObservationDiscontinuity => {
@@ -1214,7 +1217,10 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                 RunEvent::ObservationDiscontinuity => {
                     panic!("observation continuity was lost while waiting for {expected:?}")
                 }
-                RunEvent::Resized { size } => {
+                RunEvent::ServiceChanged { service } => {
+                    panic!("tmux Run cannot publish Native service transitions: {service:?}")
+                }
+                RunEvent::Resized { size, .. } => {
                     panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
                 }
                 RunEvent::Output { .. } => {}
@@ -1533,7 +1539,10 @@ async fn collect_exact_output_with_gap_replay(
                         break;
                     }
                     RunEvent::Tmux { .. } => {}
-                    RunEvent::Resized { size } => {
+                    RunEvent::ServiceChanged { service } => {
+                        panic!("tmux Run cannot publish Native service transitions: {service:?}")
+                    }
+                    RunEvent::Resized { size, .. } => {
                         panic!("tmux pane resize is not ctxmux's to observe or publish: {size:?}")
                     }
                     RunEvent::Exited { state } => {

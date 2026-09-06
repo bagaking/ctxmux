@@ -41,10 +41,30 @@ async fn detached_paced_output_commits_during_silence_and_recovers_after_crash()
     let mut ready = replay_bytes(&snapshot.replay.chunks);
     timeout(scaled(Duration::from_secs(5)), async {
         while ready.len() < 5 {
-            let RunEvent::Output { chunk } = attachment.next_event().await.unwrap().unwrap() else {
-                panic!("expected ready output");
-            };
-            ready.extend_from_slice(&chunk.data);
+            match attachment.next_event().await.unwrap().unwrap() {
+                RunEvent::Output { chunk } => ready.extend_from_slice(&chunk.data),
+                RunEvent::ServiceChanged { service } => {
+                    assert_live_ready_service(
+                        &service,
+                        run.spec
+                            .as_ref()
+                            .expect("newly started Native Run has its specification")
+                            .initial_size,
+                    );
+                }
+                RunEvent::Resized { size, .. } => panic!("no resize precedes READY: {size:?}"),
+                RunEvent::Gap {
+                    latest_output_bytes,
+                } => {
+                    panic!("READY bytes were lost at {latest_output_bytes}");
+                }
+                RunEvent::ObservationDiscontinuity => panic!("READY observation was lost"),
+                RunEvent::Tmux { event } => panic!("Native READY received tmux event: {event:?}"),
+                RunEvent::Exited { state } => panic!("Native child exited before READY: {state:?}"),
+                RunEvent::Interrupted { reason } => {
+                    panic!("Native child was interrupted before READY: {reason:?}");
+                }
+            }
         }
     })
     .await
@@ -273,6 +293,51 @@ async fn wait_terminal_within(client: &Client, id: RunId, budget: Duration) -> R
     .expect("Run reaches terminal state")
 }
 
+fn assert_live_ready_service(
+    service: &ctxmux_protocol::NativeServiceSnapshot,
+    initial_size: TerminalSize,
+) {
+    assert!(
+        service.revision > 0,
+        "live service events report an actual transition"
+    );
+    assert!(
+        matches!(
+            service.owner,
+            ctxmux_protocol::NativeOwnerStatus::Starting {}
+                | ctxmux_protocol::NativeOwnerStatus::Serving {}
+        ),
+        "the original Native owner must initialize or serve before READY: {service:?}",
+    );
+    assert!(
+        matches!(
+            service.output,
+            ctxmux_protocol::NativeOutputStatus::Pending {}
+                | ctxmux_protocol::NativeOutputStatus::Serving {}
+                | ctxmux_protocol::NativeOutputStatus::Backpressured {}
+        ),
+        "the original READY output remains available: {service:?}",
+    );
+    assert!(matches!(
+        service.input.phase,
+        ctxmux_protocol::NativeInputPhase::Open {}
+    ));
+    assert_eq!(
+        service.input.completed_input_bytes,
+        Some(0),
+        "no input precedes READY"
+    );
+    assert_eq!(service.input.current_size, Some(initial_size));
+    assert_eq!(service.input.unsettled_commands, 0);
+    assert_eq!(service.input.unsettled_request_bytes, 0);
+    assert_eq!(service.input.active_confirmed_bytes, 0);
+    assert!(!service.input.write_blocked);
+    assert!(
+        service.terminal_fault.is_none(),
+        "READY derivation must not fail: {service:?}"
+    );
+}
+
 async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
     timeout(scaled(Duration::from_secs(5)), async {
         loop {
@@ -284,11 +349,14 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
             {
                 event @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => return event,
                 RunEvent::Output { .. } => {}
+                RunEvent::ServiceChanged { service } => {
+                    panic!("recovered historical Run cannot publish live Native service transitions: {service:?}")
+                }
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected recovered gap at {latest_output_bytes}"),
                 RunEvent::Tmux { event } => panic!("unexpected recovered tmux event: {event:?}"),
-                RunEvent::Resized { size } => {
+                RunEvent::Resized { size, .. } => {
                     panic!("a recovered Run has no live PTY to confirm a resize: {size:?}")
                 }
                 RunEvent::ObservationDiscontinuity => {

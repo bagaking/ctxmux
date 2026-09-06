@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 
-import { Attachment } from "./attachment.js";
+import {
+  Attachment,
+  attachmentViewResourcePolicy,
+  type AttachmentViewResources,
+  type AttachmentViewResourcePolicy,
+} from "./attachment.js";
 import {
   asError,
   bytes,
@@ -39,6 +44,7 @@ import type { RunId } from "./generated/RunId.js";
 import type { RunInfo } from "./generated/RunInfo.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { RunSummary } from "./generated/RunSummary.js";
+import type { DiagnosticsSnapshot } from "./generated/DiagnosticsSnapshot.js";
 import type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
@@ -56,8 +62,45 @@ import {
   stopOperationKey,
 } from "./stop-operation.js";
 
+/** Per-seed assembly policy; not an aggregate retained heap or RSS limit. */
+export interface TerminalSeedLimits {
+  /** Maximum decoded synthetic seed bytes; defaults to the historical 32 MiB receive policy. */
+  readonly restoreBytes?: number;
+}
+
+/** A structurally valid terminal seed exceeds this consumer's resources. */
+export class CtxmuxTerminalSeedResourceError extends Error {
+  public readonly runId: RunId;
+  public readonly reason: "restore_limit" | "allocation";
+  public readonly requestedBytes: number;
+  public readonly limitBytes: number;
+  public readonly recovery = "attach_raw_or_review_local_resources";
+
+  public constructor(
+    runId: RunId,
+    reason: "restore_limit" | "allocation",
+    requestedBytes: number,
+    limitBytes: number,
+    cause?: unknown,
+  ) {
+    super(
+      `terminal seed for Run ${runId} is unavailable to this consumer: ${reason}; requested ${String(requestedBytes)} bytes, receive limit ${String(limitBytes)} bytes`,
+      { cause },
+    );
+    this.name = "CtxmuxTerminalSeedResourceError";
+    this.runId = runId;
+    this.reason = reason;
+    this.requestedBytes = requestedBytes;
+    this.limitBytes = limitBytes;
+  }
+}
+
 export interface CtxmuxClientOptions {
   readonly socketPath: string;
+  /** Local synthetic seed assembly policy; independent of live view budgets. */
+  readonly terminalSeedLimits?: TerminalSeedLimits;
+  /** Retained view payload/metadata policy; not a process heap limit. */
+  readonly attachmentViewResources?: AttachmentViewResources;
   /** Exact Runtime identity required before business dispatch. */
   readonly expectedRuntimeIdentity?: RuntimeIdentity;
   /** Exact Runtime capability versions required before business dispatch. */
@@ -192,6 +235,8 @@ function isWellFormedUtf16(value: string): boolean {
 /** Stateless connector to one local ctxmux daemon. */
 export class CtxmuxClient {
   readonly #socketPath: string;
+  readonly #terminalSeedRestoreBytes: number;
+  readonly #attachmentViewResources: AttachmentViewResourcePolicy;
   readonly #expectedRuntimeIdentity: RuntimeIdentity | undefined;
   readonly #requiredCapabilities: ReadonlyMap<string, number>;
 
@@ -199,6 +244,12 @@ export class CtxmuxClient {
     if (options.socketPath.length === 0) {
       throw new TypeError("socketPath must not be empty");
     }
+    this.#terminalSeedRestoreBytes = terminalSeedRestoreBytes(
+      options.terminalSeedLimits,
+    );
+    this.#attachmentViewResources = attachmentViewResourcePolicy(
+      options.attachmentViewResources,
+    );
     this.#socketPath = options.socketPath;
     this.#expectedRuntimeIdentity = copyExpectedRuntimeIdentity(
       options.expectedRuntimeIdentity,
@@ -221,6 +272,15 @@ export class CtxmuxClient {
     const { wire, runtime } = await this.#connect();
     wire.close();
     return runtime;
+  }
+
+  /** Observe the daemon sink; these facts do not determine Run availability. */
+  public async diagnostics(): Promise<DiagnosticsSnapshot> {
+    const response = await this.#request({ type: "diagnostics" });
+    if (response.type !== "diagnostics") {
+      throw unexpected("diagnostics response", response.type);
+    }
+    return response.diagnostics;
   }
 
   public async start(
@@ -495,12 +555,25 @@ export class CtxmuxClient {
   }
 
   public async attach(id: RunId, afterByte = 0): Promise<Attachment> {
+    return await this.#attach(id, afterByte, "raw");
+  }
+
+  /** Restore a terminal from the daemon's basic state and only its original tail. */
+  public async attachTerminal(id: RunId, afterByte = 0): Promise<Attachment> {
+    return await this.#attach(id, afterByte, "terminal");
+  }
+
+  async #attach(
+    id: RunId,
+    afterByte: number,
+    view: "raw" | "terminal",
+  ): Promise<Attachment> {
     validateCursor(afterByte, "afterByte");
     const { wire } = await this.#connectForDispatch();
     try {
       await wire.send({
         type: "request",
-        request: { type: "attach", id, after_byte: afterByte },
+        request: { type: "attach", id, after_byte: afterByte, view },
       } satisfies ClientFrame);
       const frame = serverFrame(await wire.receive());
       if (frame.type === "error") {
@@ -509,8 +582,22 @@ export class CtxmuxClient {
       if (frame.type !== "attached") {
         throw unexpected("attached snapshot", frame.type);
       }
-      const snapshot = await receiveReplay(wire, afterByte, frame.snapshot);
-      return new Attachment(wire, snapshot);
+      if (
+        frame.snapshot.run.id !== id ||
+        (frame.snapshot.terminal.type === "not_requested") !== (view === "raw")
+      ) {
+        throw unexpected(
+          `exact Run ${view} attachment`,
+          frame.snapshot.terminal.type,
+        );
+      }
+      const snapshot = await receiveReplay(
+        wire,
+        afterByte,
+        frame.snapshot,
+        this.#terminalSeedRestoreBytes,
+      );
+      return new Attachment(wire, snapshot, this.#attachmentViewResources);
     } catch (error) {
       wire.close();
       throw error;
@@ -585,7 +672,19 @@ export class CtxmuxClient {
         );
       }
 
-      const snapshot = await receiveReplay(wire, afterByte, first.snapshot);
+      if (first.snapshot.terminal.type !== "not_requested") {
+        throw unexpected(
+          "raw recoverable Stop attachment",
+          first.snapshot.terminal.type,
+        );
+      }
+
+      const snapshot = await receiveReplay(
+        wire,
+        afterByte,
+        first.snapshot,
+        this.#terminalSeedRestoreBytes,
+      );
       const result = serverFrame(await wire.receive());
       if (result.type === "error") {
         throw new CtxmuxCommandError(
@@ -620,7 +719,11 @@ export class CtxmuxClient {
         );
       }
       return {
-        attachment: new Attachment(wire, snapshot),
+        attachment: new Attachment(
+          wire,
+          snapshot,
+          this.#attachmentViewResources,
+        ),
         stop,
       };
     } catch (error) {
@@ -838,17 +941,82 @@ function isDispatchPreconditionError(
   );
 }
 
+function terminalSeedRestoreBytes(
+  limits: TerminalSeedLimits | undefined,
+): number {
+  if (limits === undefined) return 32 * 1024 * 1024;
+  if (limits === null || typeof limits !== "object" || Array.isArray(limits)) {
+    throw new TypeError("terminalSeedLimits must be an object");
+  }
+  if (Object.keys(limits).some((key) => key !== "restoreBytes")) {
+    throw new TypeError("terminalSeedLimits contains an unknown limit");
+  }
+  const value =
+    limits.restoreBytes === undefined ? 32 * 1024 * 1024 : limits.restoreBytes;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new TypeError(
+      "terminalSeedLimits.restoreBytes must be a nonnegative safe integer byte count",
+    );
+  }
+  return value;
+}
+
 async function receiveReplay(
   wire: JsonLinesConnection,
   afterByte: number,
   header: Extract<ServerFrame, { readonly type: "attached" }>["snapshot"],
+  restoreByteLimit: number,
 ): Promise<AttachedSnapshot> {
   let replay = { ...header.replay };
   let run = { ...header.run };
+  let terminalRestore = new Uint8Array(0);
+  if (header.terminal.type === "basic_vt") {
+    const checkpoint = header.terminal.checkpoint;
+    if (checkpoint.restore_bytes > restoreByteLimit) {
+      throw new CtxmuxTerminalSeedResourceError(
+        header.run.id,
+        "restore_limit",
+        checkpoint.restore_bytes,
+        restoreByteLimit,
+      );
+    }
+    // Only allocation errors belong to local resources. Frame validation and
+    // ordered byte assembly below retain their existing protocol semantics.
+    try {
+      terminalRestore = new Uint8Array(checkpoint.restore_bytes);
+    } catch (cause) {
+      throw new CtxmuxTerminalSeedResourceError(
+        header.run.id,
+        "allocation",
+        checkpoint.restore_bytes,
+        restoreByteLimit,
+        cause,
+      );
+    }
+    let offset = 0;
+    while (offset < terminalRestore.length) {
+      const frame = serverFrame(await wire.receive());
+      if (frame.type === "error") throw protocolError(frame.error);
+      if (
+        frame.type !== "terminal_checkpoint_chunk" ||
+        frame.offset !== offset ||
+        frame.data.length === 0 ||
+        frame.data.length > terminalRestore.length - offset
+      ) {
+        throw unexpected("ordered synthetic terminal seed", frame.type);
+      }
+      terminalRestore.set(frame.data, offset);
+      offset += frame.data.length;
+    }
+    afterByte = checkpoint.through_byte;
+  }
   const chunks: AttachedSnapshot["replay"]["chunks"] = [];
   if (afterByte >= header.replay.latest_output_bytes) {
     return {
       run: header.run,
+      terminal: header.terminal,
+      terminal_restore: terminalRestore,
+      resize_revision: header.resize_revision,
       replay: { ...header.replay, chunks },
     };
   }
@@ -868,6 +1036,12 @@ async function receiveReplay(
           "a strictly newer replay floor through the advertised head",
           frame.type,
         );
+      if (header.terminal.type === "basic_vt") {
+        throw unexpected(
+          "complete terminal checkpoint original tail",
+          frame.type,
+        );
+      }
       chunks.length = 0;
       expectedByte = frame.first_available_byte;
       replay = {
@@ -891,6 +1065,9 @@ async function receiveReplay(
   }
   return {
     run,
+    terminal: header.terminal,
+    terminal_restore: terminalRestore,
+    resize_revision: header.resize_revision,
     replay: { ...replay, chunks },
   };
 }

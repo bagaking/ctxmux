@@ -2511,10 +2511,9 @@ function parseOptions(): QualificationOptions {
     optionValue("--resource-start-concurrency") ??
       String(QUALIFICATION_POLICY.resource_start_concurrency),
   );
-  assert.ok(
-    resourceStartConcurrency <= 128,
-    "--resource-start-concurrency must be at most 128",
-  );
+  // Custom observations use the requested representable concurrency. Canonical
+  // profiles below keep their frozen workload; a historical 128-Run tier is
+  // not an owner-resource derivation for limiting independent observations.
   if (profile === "nightly" || profile === "release") {
     assert.equal(
       stage,

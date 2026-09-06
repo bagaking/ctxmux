@@ -3,6 +3,7 @@ use crate::term::BufWrite as _;
 #[derive(Clone, Debug)]
 pub struct Row {
     cells: Vec<crate::cell::Cell>,
+    retained: Option<Vec<crate::cell::Cell>>,
     wrapped: bool,
 }
 
@@ -10,6 +11,7 @@ impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
             cells: vec![crate::cell::Cell::default(); usize::from(cols)],
+            retained: None,
             wrapped: false,
         }
     }
@@ -23,6 +25,9 @@ impl Row {
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
+        if let Some(last) = self.cols().checked_sub(1) {
+            self.clear_wide(last, attrs);
+        }
         for cell in &mut self.cells {
             cell.clear(attrs);
         }
@@ -33,6 +38,23 @@ impl Row {
         self.cells.iter()
     }
 
+    pub fn retained_cols(&self) -> u16 {
+        self.retained
+            .as_ref()
+            .map_or(self.cols(), |cells| u16::try_from(cells.len()).unwrap())
+    }
+
+    pub fn into_cells(self) -> Vec<crate::cell::Cell> {
+        self.cells
+    }
+
+    pub fn content_length(&self) -> usize {
+        self.cells
+            .iter()
+            .rposition(|cell| cell.has_contents() || cell.is_wide_continuation())
+            .map_or(0, |index| index + 1)
+    }
+
     pub fn get(&self, col: u16) -> Option<&crate::cell::Cell> {
         self.cells.get(usize::from(col))
     }
@@ -41,38 +63,86 @@ impl Row {
         self.cells.get_mut(usize::from(col))
     }
 
-    pub fn insert(&mut self, i: u16, cell: crate::cell::Cell) {
-        self.cells.insert(usize::from(i), cell);
-        self.wrapped = false;
-    }
-
-    pub fn remove(&mut self, i: u16) {
-        self.clear_wide(i);
-        self.cells.remove(usize::from(i));
-        self.wrapped = false;
-    }
-
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
-        let wide = self.cells[usize::from(i)].is_wide();
-        self.clear_wide(i);
+        self.clear_wide(i, attrs);
         self.cells[usize::from(i)].clear(attrs);
-        if i == self.cols() - if wide { 2 } else { 1 } {
-            self.wrapped = false;
-        }
-    }
-
-    pub fn truncate(&mut self, len: u16) {
-        self.cells.truncate(usize::from(len));
-        self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
-        if last_cell.is_wide() {
-            last_cell.clear(*last_cell.attrs());
-        }
+        // Erasing cells does not undo the already observed automatic line
+        // continuation. Public xterm retains that relationship after ECH.
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
+        self.retained = None;
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
+        // A clipped wide pair cannot leave a leading half at the right edge:
+        // every drawing/erase/formatter consumer relies on its next cell.
+        if let Some(last_cell) = self.cells.last_mut() {
+            if last_cell.is_wide() {
+                last_cell.clear(*last_cell.attrs());
+            }
+        }
+    }
+
+    /// Retain alternate-buffer cells hidden by a narrower viewport. Drawing
+    /// sees the real wide lead at the right edge even when its continuation is
+    /// outside the viewport. Growing exposes an untouched retained pair again.
+    pub fn resize_retaining(&mut self, cols: u16) {
+        let mut retained = self.retained.take().unwrap_or_default();
+        retained.resize(
+            retained.len().max(self.cells.len()),
+            crate::cell::Cell::default(),
+        );
+        for (index, cell) in self.cells.iter().enumerate() {
+            retained[index] = cell.clone();
+        }
+        // A real growth resizes the alternate physical lines to the requested
+        // width. It consumes retained cells within that width and crops any
+        // still farther cells, matching the public emulator's resize contract.
+        if cols > self.cols() {
+            // Actual physical growth can crop a farther continuation while
+            // retaining its right-edge lead. The public alternate buffer keeps
+            // that lead; later growth fills the discarded partner with blank.
+            retained.truncate(usize::from(cols));
+        }
+        retained.resize(
+            retained.len().max(usize::from(cols)),
+            crate::cell::Cell::default(),
+        );
+        self.cells = retained[..usize::from(cols)].to_vec();
+        if retained.len() > usize::from(cols) {
+            self.retained = Some(retained);
+        }
+    }
+
+    /// ICH/DCH shift the complete retained physical line in one pass; count is
+    /// clipped to that finite line, independent of the current view width.
+    pub fn edit_cells(&mut self, col: u16, count: u16, attrs: crate::attrs::Attrs, insert: bool) {
+        let visible = self.cols();
+        let physical = self.retained_cols();
+        self.resize_retaining(physical);
+        let start = usize::from(col);
+        let count = usize::from(count).min(self.cells.len().saturating_sub(start));
+        let length = self.cells.len();
+        let mut fill = crate::cell::Cell::default();
+        fill.clear(attrs);
+        if insert {
+            self.cells
+                .splice(start..start, std::iter::repeat_n(fill.clone(), count));
+            self.cells.truncate(length);
+        } else {
+            self.cells.drain(start..start + count);
+            self.cells.resize(length, fill);
+        }
+        for i in 0..self.cells.len() {
+            if (self.cells[i].is_wide()
+                && (i + 1 == self.cells.len() || !self.cells[i + 1].is_wide_continuation()))
+                || (self.cells[i].is_wide_continuation()
+                    && (i == 0 || !self.cells[i - 1].is_wide()))
+            {
+                self.cells[i].clear(attrs);
+            }
+        }
+        self.resize_retaining(visible);
     }
 
     pub fn wrap(&mut self, wrap: bool) {
@@ -83,25 +153,34 @@ impl Row {
         self.wrapped
     }
 
-    pub fn clear_wide(&mut self, col: u16) {
-        let cell = &self.cells[usize::from(col)];
+    /// The alternate viewport may end on a wide lead whose continuation is
+    /// retained off-right. Pair cleanup must reach that real physical cell,
+    /// without making ordinary drawing positions extend beyond the viewport.
+    pub fn wide_partner_mut(&mut self, col: u16) -> Option<&mut crate::cell::Cell> {
+        let cell = self.cells.get(usize::from(col))?;
         let other = if cell.is_wide() {
-            &mut self.cells[usize::from(col + 1)]
+            usize::from(col) + 1
         } else if cell.is_wide_continuation() {
-            &mut self.cells[usize::from(col - 1)]
+            usize::from(col).checked_sub(1)?
         } else {
-            return;
+            return None;
         };
-        other.clear(*other.attrs());
+        if other < self.cells.len() {
+            self.cells.get_mut(other)
+        } else {
+            self.retained
+                .as_mut()
+                .and_then(|cells| cells.get_mut(other))
+        }
     }
 
-    pub fn write_contents(
-        &self,
-        contents: &mut String,
-        start: u16,
-        width: u16,
-        wrapping: bool,
-    ) {
+    pub fn clear_wide(&mut self, col: u16, attrs: crate::attrs::Attrs) {
+        if let Some(other) = self.wide_partner_mut(col) {
+            other.clear(attrs);
+        }
+    }
+
+    pub fn write_contents(&self, contents: &mut String, start: u16, width: u16, wrapping: bool) {
         let mut prev_was_wide = false;
 
         let mut prev_col = start;
@@ -192,31 +271,22 @@ impl Row {
             if let Some((prev_col, attrs)) = erase {
                 if cell.has_contents() || cell.attrs() != attrs {
                     let new_pos = crate::grid::Pos { row, col: prev_col };
-                    if wrapping
-                        && prev_pos.row + 1 == new_pos.row
-                        && prev_pos.col >= self.cols()
-                    {
+                    if wrapping && prev_pos.row + 1 == new_pos.row && prev_pos.col >= self.cols() {
                         if new_pos.col > 0 {
-                            contents.extend(
-                                " ".repeat(usize::from(new_pos.col))
-                                    .as_bytes(),
-                            );
+                            contents.extend(" ".repeat(usize::from(new_pos.col)).as_bytes());
                         } else {
                             contents.extend(b" ");
-                            crate::term::Backspace::default()
-                                .write_buf(contents);
+                            crate::term::Backspace::default().write_buf(contents);
                         }
                     } else {
-                        crate::term::MoveFromTo::new(prev_pos, new_pos)
-                            .write_buf(contents);
+                        crate::term::MoveFromTo::new(prev_pos, new_pos).write_buf(contents);
                     }
                     prev_pos = new_pos;
                     if &prev_attrs != attrs {
                         attrs.write_escape_code_diff(contents, &prev_attrs);
                         prev_attrs = *attrs;
                     }
-                    crate::term::EraseChar::new(pos.col - prev_col)
-                        .write_buf(contents);
+                    crate::term::EraseChar::new(pos.col - prev_col).write_buf(contents);
                     erase = None;
                 }
             }
@@ -227,12 +297,10 @@ impl Row {
                     if pos != prev_pos {
                         if !wrapping
                             || prev_pos.row + 1 != pos.row
-                            || prev_pos.col
-                                < self.cols() - u16::from(cell.is_wide())
+                            || prev_pos.col < self.cols() - u16::from(cell.is_wide())
                             || pos.col != 0
                         {
-                            crate::term::MoveFromTo::new(prev_pos, pos)
-                                .write_buf(contents);
+                            crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                         }
                         prev_pos = pos;
                     }
@@ -252,21 +320,15 @@ impl Row {
         }
         if let Some((prev_col, attrs)) = erase {
             let new_pos = crate::grid::Pos { row, col: prev_col };
-            if wrapping
-                && prev_pos.row + 1 == new_pos.row
-                && prev_pos.col >= self.cols()
-            {
+            if wrapping && prev_pos.row + 1 == new_pos.row && prev_pos.col >= self.cols() {
                 if new_pos.col > 0 {
-                    contents.extend(
-                        " ".repeat(usize::from(new_pos.col)).as_bytes(),
-                    );
+                    contents.extend(" ".repeat(usize::from(new_pos.col)).as_bytes());
                 } else {
                     contents.extend(b" ");
                     crate::term::Backspace::default().write_buf(contents);
                 }
             } else {
-                crate::term::MoveFromTo::new(prev_pos, new_pos)
-                    .write_buf(contents);
+                crate::term::MoveFromTo::new(prev_pos, new_pos).write_buf(contents);
             }
             prev_pos = new_pos;
             if &prev_attrs != attrs {
@@ -302,13 +364,11 @@ impl Row {
             && !prev_wrapping
             && first_cell == prev_first_cell
             && prev_pos.row + 1 == row
-            && prev_pos.col
-                >= self.cols() - u16::from(prev_first_cell.is_wide())
+            && prev_pos.col >= self.cols() - u16::from(prev_first_cell.is_wide())
         {
             let first_cell_attrs = first_cell.attrs();
             if &prev_attrs != first_cell_attrs {
-                first_cell_attrs
-                    .write_escape_code_diff(contents, &prev_attrs);
+                first_cell_attrs.write_escape_code_diff(contents, &prev_attrs);
                 prev_attrs = *first_cell_attrs;
             }
             let mut cell_contents = prev_first_cell.contents();
@@ -350,31 +410,22 @@ impl Row {
             if let Some((prev_col, attrs)) = erase {
                 if cell.has_contents() || cell.attrs() != attrs {
                     let new_pos = crate::grid::Pos { row, col: prev_col };
-                    if wrapping
-                        && prev_pos.row + 1 == new_pos.row
-                        && prev_pos.col >= self.cols()
-                    {
+                    if wrapping && prev_pos.row + 1 == new_pos.row && prev_pos.col >= self.cols() {
                         if new_pos.col > 0 {
-                            contents.extend(
-                                " ".repeat(usize::from(new_pos.col))
-                                    .as_bytes(),
-                            );
+                            contents.extend(" ".repeat(usize::from(new_pos.col)).as_bytes());
                         } else {
                             contents.extend(b" ");
-                            crate::term::Backspace::default()
-                                .write_buf(contents);
+                            crate::term::Backspace::default().write_buf(contents);
                         }
                     } else {
-                        crate::term::MoveFromTo::new(prev_pos, new_pos)
-                            .write_buf(contents);
+                        crate::term::MoveFromTo::new(prev_pos, new_pos).write_buf(contents);
                     }
                     prev_pos = new_pos;
                     if &prev_attrs != attrs {
                         attrs.write_escape_code_diff(contents, &prev_attrs);
                         prev_attrs = *attrs;
                     }
-                    crate::term::EraseChar::new(pos.col - prev_col)
-                        .write_buf(contents);
+                    crate::term::EraseChar::new(pos.col - prev_col).write_buf(contents);
                     erase = None;
                 }
             }
@@ -385,12 +436,10 @@ impl Row {
                     if pos != prev_pos {
                         if !wrapping
                             || prev_pos.row + 1 != pos.row
-                            || prev_pos.col
-                                < self.cols() - u16::from(cell.is_wide())
+                            || prev_pos.col < self.cols() - u16::from(cell.is_wide())
                             || pos.col != 0
                         {
-                            crate::term::MoveFromTo::new(prev_pos, pos)
-                                .write_buf(contents);
+                            crate::term::MoveFromTo::new(prev_pos, pos).write_buf(contents);
                         }
                         prev_pos = pos;
                     }
@@ -409,21 +458,15 @@ impl Row {
         }
         if let Some((prev_col, attrs)) = erase {
             let new_pos = crate::grid::Pos { row, col: prev_col };
-            if wrapping
-                && prev_pos.row + 1 == new_pos.row
-                && prev_pos.col >= self.cols()
-            {
+            if wrapping && prev_pos.row + 1 == new_pos.row && prev_pos.col >= self.cols() {
                 if new_pos.col > 0 {
-                    contents.extend(
-                        " ".repeat(usize::from(new_pos.col)).as_bytes(),
-                    );
+                    contents.extend(" ".repeat(usize::from(new_pos.col)).as_bytes());
                 } else {
                     contents.extend(b" ");
                     crate::term::Backspace::default().write_buf(contents);
                 }
             } else {
-                crate::term::MoveFromTo::new(prev_pos, new_pos)
-                    .write_buf(contents);
+                crate::term::MoveFromTo::new(prev_pos, new_pos).write_buf(contents);
             }
             prev_pos = new_pos;
             if &prev_attrs != attrs {
@@ -438,11 +481,8 @@ impl Row {
         // wrapped, we need to redraw the last character without erasing it to
         // position the cursor after the end of the line correctly so that
         // drawing the next line can just start writing and be wrapped.
-        if (!self.wrapped && prev.wrapped) || (!prev.wrapped && self.wrapped)
-        {
-            let end_pos = if self.cells[usize::from(self.cols() - 1)]
-                .is_wide_continuation()
-            {
+        if (!self.wrapped && prev.wrapped) || (!prev.wrapped && self.wrapped) {
+            let end_pos = if self.cells[usize::from(self.cols() - 1)].is_wide_continuation() {
                 crate::grid::Pos {
                     row,
                     col: self.cols() - 2,
@@ -453,8 +493,7 @@ impl Row {
                     col: self.cols() - 1,
                 }
             };
-            crate::term::MoveFromTo::new(prev_pos, end_pos)
-                .write_buf(contents);
+            crate::term::MoveFromTo::new(prev_pos, end_pos).write_buf(contents);
             prev_pos = end_pos;
             if !self.wrapped {
                 crate::term::EraseChar::new(1).write_buf(contents);

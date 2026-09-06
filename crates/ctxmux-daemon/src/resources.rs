@@ -36,8 +36,15 @@ pub struct ResourceLimits {
     pub handoff_diagnostic_bytes: usize,
     pub handoff_bytes: u64,
     pub control_state_bytes: u64,
+    pub diagnostic_queue_bytes: u64,
+    pub diagnostic_record_bytes: usize,
     pub creation_workers: usize,
-    pub input_workers: usize,
+    /// Completed commands serviced for one Run before another gets its turn.
+    pub input_turn_commands: usize,
+    /// Maximum bytes written for one Run per poll turn, never a request cap.
+    pub input_turn_bytes: usize,
+    /// Milliseconds to acquire cleanup capacity before a Stop has any side effect.
+    pub stop_admission_timeout_ms: u64,
     pub cleanup_workers: usize,
     pub finalize_workers: usize,
     pub input_queue_commands: usize,
@@ -73,8 +80,12 @@ impl ResourceLimits {
         handoff_diagnostic_bytes: 16 * 1024 * 1024,
         handoff_bytes: 256 * 1024 * 1024,
         control_state_bytes: 128 * 1024 * 1024,
+        diagnostic_queue_bytes: 64 * 1024 * 1024,
+        diagnostic_record_bytes: ctxmux_protocol::MAX_FRAME_BYTES,
         creation_workers: 8,
-        input_workers: 8,
+        input_turn_commands: 64,
+        input_turn_bytes: 256 * 1024,
+        stop_admission_timeout_ms: 250,
         cleanup_workers: 8,
         finalize_workers: 8,
         input_queue_commands: 1024,
@@ -119,6 +130,11 @@ impl ResourceLimits {
             ),
             ("handoff_bytes", self.handoff_bytes),
             ("control_state_bytes", self.control_state_bytes),
+            ("diagnostic_queue_bytes", self.diagnostic_queue_bytes),
+            (
+                "diagnostic_record_bytes",
+                self.diagnostic_record_bytes as u64,
+            ),
         ] {
             if bytes == 0 || bytes > i64::MAX as u64 || usize::try_from(bytes).is_err() {
                 return Err(format!("{name} must fit a positive host/SQLite byte count"));
@@ -134,7 +150,8 @@ impl ResourceLimits {
         }
         for (name, count) in [
             ("creation_workers", self.creation_workers),
-            ("input_workers", self.input_workers),
+            ("input_turn_commands", self.input_turn_commands),
+            ("input_turn_bytes", self.input_turn_bytes),
             ("cleanup_workers", self.cleanup_workers),
             ("finalize_workers", self.finalize_workers),
             ("input_queue_commands", self.input_queue_commands),
@@ -147,6 +164,21 @@ impl ResourceLimits {
                 return Err(format!("{name} must fit a positive owner count"));
             }
         }
+        if self.stop_admission_timeout_ms == 0
+            || std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(
+                    self.stop_admission_timeout_ms,
+                ))
+                .is_none()
+        {
+            return Err("stop_admission_timeout_ms must fit a positive host deadline".to_owned());
+        }
+        crate::diagnostics::validate_limits(crate::diagnostics::DiagnosticLimits {
+            queue_bytes: usize::try_from(self.diagnostic_queue_bytes)
+                .map_err(|_| "diagnostic_queue_bytes must fit the host")?,
+            record_bytes: self.diagnostic_record_bytes,
+        })
+        .map_err(|error| error.to_string())?;
         self.state_file_bytes()
             .ok_or("combined storage budgets overflow")?;
         Ok(())
@@ -206,6 +238,11 @@ impl ByteBudget {
             used: std::sync::atomic::AtomicU64::new(0),
         }))
     }
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> u64 {
+        self.0.used.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub(crate) fn reserve(&self, bytes: usize) -> Option<BytePermit> {
         use std::sync::atomic::Ordering;
         let bytes = bytes as u64;

@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects. Optional `--state-dir` mode recovers historical Run state and committed replay after cold restart and preserves live PTY control across a planned exec-in-place `SIGHUP` upgrade. Existing attachments reconnect.                                                                                                                                                                                                                                                                                                                                                                                                            | Crash-time PTY adoption and host-reboot process continuity remain unsupported.                                                   |
 | Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Windows transport and multi-daemon discovery are open.                                                                           |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 18, including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 20, including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Multi-writer policy remains open.                                                                                                |
 | Input recovery   | A native operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. The cursor and complete settled ledger cross a planned exec-in-place upgrade with the preserved instance. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                                                                                                                                                                                                                                                                                   | Cold-restart exactly-once and semantic acknowledgement remain above or outside ctxmux.                                           |
 | Stop recovery    | One caller-retained operation joins or replays the complete-session Stop receipt across connection loss. A Runtime-global key binding and one per-Run record fence conflicts before mutation, survive planned exec, and end at exact Run collection.                                                                                                                                                                                                                                                                                                                                                                                                                     | Cold-restart exactly-once and recoverable Resize/Interrupt remain unsupported.                                                   |
@@ -41,7 +41,7 @@ CLI                  TypeScript host              future editor / automation
  |                         |                                  |
  +----------- public versioned protocol / SDK ----------------+
                               |
-                    Unix domain socket (v13)
+                    Unix domain socket (v20)
                               |
                     long-lived ctxmux daemon
                     - RunManager / RunRegistry / Run identity
@@ -396,14 +396,21 @@ UI timelines remain outside the daemon.
 
 Each Run defaults to 1,024 queued input commands and 4 MiB of queued input;
 `input_queue_commands` and `input_queue_bytes` configure those independent bounds.
-Lazy blocking input drains share `input_workers` (default eight) and yield after
-a bounded completed burst; there is no permanent input thread per Run. A blocking
-PTY write has no independent deadline, so a full set of stalled input workers
-can delay unrelated input until one owning PTY returns or closes.
-Resize and stop do not enter the input queue, so that limitation does not hold a
-Tokio worker or consume their control lane. Zero dimensions fail before resize
-mutation. A blocking reader assigns each non-empty read one contiguous
-half-open cumulative byte range, stores it in the bounded log, then broadcasts it.
+One Native reactor owns nonblocking PTY reads and writes. Per-Run FIFO input
+queues are byte-funded before admission; `input_turn_commands` and
+`input_turn_bytes` limit a fair turn, not a request or lifetime workload.
+Actual writability resumes a blocked Run while other Runs keep progressing.
+There is no shared blocking input-worker pool or permanent per-Run input thread.
+Confirmed short writes remain attached to the original command and receipt.
+
+Public admission waits on actual lock-release notifications and owner-loss
+facts. It holds no OS mutex across await. Attached commands preserve frame
+admission order while receipts and output continue independently. Resize
+acquires its derived-state owners before the physical ioctl; busy geometry
+postpones only that request. Zero dimensions still fail before mutation.
+The output turn obtains raw-admission ownership before reading a PTY, and
+skips a busy Run until its actual owner unlocks. Metadata reads short raw/service
+facts without acquiring a VT-export or PTY-control lock.
 
 After child cleanup, the native owner drains readable or persistence-paused
 output before publishing `Exited`. Its one-second deadline bounds an idle
@@ -471,13 +478,18 @@ of this contract. Any unavoidable pressure or unsupported recovery class is
 reported explicitly. Both fault scope and resource cost require two real Runs
 and public clients before a shared-owner change is qualified.
 
-The current entry guard checks the Native owner's actual thread completion
-before PTY creation and at registration and handoff. A finished owner rejects
-Start with `backend_unavailable` before physical launch. If completion races
-an already-spawned child, the existing registration rollback terminates and
-reaps that unpublished child. These checks leave independently owned input
-service intact. They are passive entry checks; proactive service observations,
-exit-cause retention and complete derived-fault containment remain open.
+The entry guard checks actual Native owner completion before PTY creation,
+registration and handoff. A finished owner rejects Start before launch.
+Completion retains its stopped/unwound cause and publishes truthful per-Run
+service facts independently of busy view/control locks. Child lifecycle remains
+owned by actual wait authority. Local derived failures discard only that model;
+raw admission precedes derivation. Shared diagnostics use one separately funded
+writer and cannot block the reactor while reporting a failure.
+
+These contracts are implemented in the joined development candidate. Its
+complete same-candidate two-client recovery, resource-cost and AgentMux
+acceptance is still required; narrower source and real-Run receipts must not be
+reported as full qualification.
 
 Long-lived daemon diagnostics use fallible stderr writes: a closed diagnostic
 receiver cannot panic an owner or its caller. This contains diagnostic I/O
@@ -674,7 +686,7 @@ exact command at the head of the queue and retries after a short delay; later
 durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
 other storage, replay, budget, integrity, and owner-invariant failure remains
 fail-stop for later durable mutations. Startup performs journal
-recovery and exact schema/application validation against the schema-5 format
+recovery and exact schema/application validation against the schema-6 format
 envelope, then uses bounded, restartable page-admitted transactions to
 reconcile old running rows, preserve valid retained history under the configured policy, and finally
 finish serving-epoch publication. Only after operational revalidation can the daemon

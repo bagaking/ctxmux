@@ -1,0 +1,150 @@
+{
+  "baselineCommit": "ec637607946718c8bdec0a215b47a72f4a1692da",
+  "command": [
+    "cargo",
+    "test",
+    "-p",
+    "ctxmux-daemon",
+    "--test",
+    "native_terminal_checkpoint_codec",
+    "--",
+    "--nocapture"
+  ],
+  "controlSourceSha256": {
+    "third_party/vt100/src/grid.rs": "ca49c1e579e7702ebb7c9b838e781ee2a65a2e5f0b9d218e207f34b9c0c7fa92",
+    "third_party/vt100/src/row.rs": "7045c61d9356b24371ef6df6d5a9dbc72db77669147eb2616909535290c25c55",
+    "third_party/vt100/src/screen.rs": "496685800865547c9a47261e062d14518827aae9d62f2bf7de4ad92950cb2cea"
+  },
+  "owningTestSha256": "6358b0df11a0419f263b9000912a35577056ea91d734caf9b5f1415d159b49a7",
+  "runs": [
+    {
+      "name": "exact-ec-counterexample",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "clipped_saved_cursor_stays_clipped_when_grid_grows_again",
+        "one_column_ignores_unrenderable_wide_chars_and_continues_narrow_drawing",
+        "one_row_wrap_retains_the_actual_history_row_and_checkpoint_continues",
+        "resize_removes_a_cut_wide_lead_preserving_rendition_and_complete_pairs"
+      ],
+      "assertionRed": true,
+      "logSha256": "a56ff8346a0f6ade2d575661900197c2c7e75f527f540499aff9ba5465f16a0e",
+      "log": ".tmp/vt100-resize-invariants/exact-ec-counterexample.log"
+    },
+    {
+      "name": "control-before",
+      "exitCode": 0,
+      "collected": 16,
+      "expectedFailingTests": [],
+      "assertionRed": false,
+      "logSha256": "dd10f923b5e6e71bd6c2208ff47547a6e98160151206fb4586cd1a0e284e1913",
+      "log": ".tmp/vt100-resize-invariants/control-before.log"
+    },
+    {
+      "name": "restore-old-saved-coordinates",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "clipped_saved_cursor_stays_clipped_when_grid_grows_again"
+      ],
+      "assertionRed": true,
+      "logSha256": "ff3ccc978b7b9e44a35283fabafba2d1e15b40102528d0f02a6553855447e66a",
+      "log": ".tmp/vt100-resize-invariants/restore-old-saved-coordinates.log"
+    },
+    {
+      "name": "clip-saved-pending-wrap-on-same-size",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "same_size_save_restore_preserves_existing_pending_wrap"
+      ],
+      "assertionRed": true,
+      "logSha256": "dfef289b4350bd81913661034149a96e10f48c64a39157e9b4c01290b8c3d4ce",
+      "log": ".tmp/vt100-resize-invariants/clip-saved-pending-wrap-on-same-size.log"
+    },
+    {
+      "name": "retain-clipped-wide-lead",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "resize_removes_a_cut_wide_lead_preserving_rendition_and_complete_pairs"
+      ],
+      "assertionRed": true,
+      "logSha256": "414eab0ee0b776a4ca8cf331e72364ce02a5cbcd14552d8190a1c57d6afc1715",
+      "log": ".tmp/vt100-resize-invariants/retain-clipped-wide-lead.log"
+    },
+    {
+      "name": "remove-too-wide-drawing-boundary",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "one_column_ignores_unrenderable_wide_chars_and_continues_narrow_drawing"
+      ],
+      "assertionRed": true,
+      "logSha256": "a962bad22a4fa234faac4cc8d17d3c3de77dfbdbcd9b2b38ec54a4b436add6f7",
+      "log": ".tmp/vt100-resize-invariants/remove-too-wide-drawing-boundary.log"
+    },
+    {
+      "name": "mark-old-row-after-scroll",
+      "exitCode": 101,
+      "collected": 16,
+      "expectedFailingTests": [
+        "one_row_wrap_retains_the_actual_history_row_and_checkpoint_continues"
+      ],
+      "assertionRed": true,
+      "logSha256": "4cb89908c1c29d611e7aae22598fd7d3c0db751a9a872bec98be0ec1cd554e9c",
+      "log": ".tmp/vt100-resize-invariants/mark-old-row-after-scroll.log"
+    },
+    {
+      "name": "control-restored",
+      "exitCode": 0,
+      "collected": 16,
+      "expectedFailingTests": [],
+      "assertionRed": false,
+      "logSha256": "32b70bb4442d350678c969b25ec2c0501dc89184f5ede321c3612e1239ac8580",
+      "log": ".tmp/vt100-resize-invariants/control-restored.log"
+    }
+  ],
+  "owningTest": "crates/ctxmux-daemon/tests/native_terminal_checkpoint_codec.rs",
+  "productCallersExcludingDefinitionsAndTests": [
+    "35:    pub(crate) fn process(&mut self, data: &[u8]) { self.parser.process(data); }",
+    "43:        self.parser.set_size(size.rows, size.cols);",
+    "55:        let Some(seed) = self.parser.basic_checkpoint() else { return false; };",
+    "103:        model.parser.process(&saved.restore);",
+    "115:                    model.parser.set_size(resize.size.rows, resize.size.cols);",
+    "123:                model.parser.process(chunk.data.get(a..b)?);",
+    "130:            model.parser.set_size(resize.size.rows, resize.size.cols);"
+  ],
+  "formatting": {
+    "owningTestCommand": "rustfmt --check --edition 2024 crates/ctxmux-daemon/tests/native_terminal_checkpoint_codec.rs",
+    "owningTestPassed": true,
+    "vendoredSourceDelta": [
+      {
+        "file": "third_party/vt100/src/grid.rs",
+        "newOrChangedLines": 12,
+        "unchangedVendoredFormattingHunks": 10,
+        "formatterChangesOverlapTaskLines": false
+      },
+      {
+        "file": "third_party/vt100/src/row.rs",
+        "newOrChangedLines": 7,
+        "unchangedVendoredFormattingHunks": 25,
+        "formatterChangesOverlapTaskLines": false
+      },
+      {
+        "file": "third_party/vt100/src/screen.rs",
+        "newOrChangedLines": 6,
+        "unchangedVendoredFormattingHunks": 32,
+        "formatterChangesOverlapTaskLines": false
+      }
+    ],
+    "wholeVendoredRustfmt": "Existing upstream/default-format differences retained; no new or changed line overlaps a formatter difference."
+  },
+  "staticCheck": "cargo check -p vt100",
+  "boundaries": [
+    "Positive rows and columns only; zero-geometry policy is unchanged.",
+    "One-column wide text is ignored only by derived VT rendering; original Run bytes remain owned by Native.",
+    "One-column behavior is not claimed equivalent to xterm, which requires at least two columns.",
+    "No reflow, saved charset, extension stacks, full xterm continuation, Native owner isolation, live user Run or GUI acceptance is claimed by this library proof."
+  ]
+}

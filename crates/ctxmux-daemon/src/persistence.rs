@@ -28,9 +28,13 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{resources::ResourceLimits, run_spec::validate_run_spec};
+use crate::{
+    resources::ResourceLimits,
+    run_spec::validate_run_spec,
+    terminal_checkpoint::{MAX_RESTORE_BYTES, StoredCheckpoint},
+};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const DATABASE_FILE: &str = "state.sqlite3";
 const LOCK_FILE: &str = "state.lock";
 const REPLAY_DIR: &str = "replay";
@@ -402,6 +406,7 @@ struct PersistenceInner {
     lifecycle_space: Arc<tokio::sync::Notify>,
     output_wake: Arc<Mutex<Option<crate::native_runtime::OwnerWake>>>,
     output_wake_requested: Arc<AtomicBool>,
+    state_dir: PathBuf,
     sender: mpsc::SyncSender<Command>,
     /// Lifecycle commands, kept off `sender` so they do not queue behind the
     /// append backlog.
@@ -773,8 +778,51 @@ impl PersistentRun {
     pub(crate) fn is_failed(&self) -> bool {
         self.persistence.is_failed()
     }
+    pub(crate) fn load_terminal_checkpoint(&self, id: RunId) -> Option<StoredCheckpoint> {
+        self.persistence.load_terminal_checkpoint(id)
+    }
+
+    /// Rare derived checkpoint shares the existing ordered actor; raw output is not copied.
+    pub(crate) fn offer_terminal_checkpoint(&self, saved: StoredCheckpoint) -> bool {
+        self.persistence
+            .inner
+            .sender
+            .try_send(Command::TerminalCheckpoint {
+                id: saved.checkpoint.run_id,
+                saved: Some(saved),
+                durable_head: Arc::clone(&self.durable_head),
+                reply: None,
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn save_terminal_checkpoint_for_handoff(
+        &self,
+        id: RunId,
+        saved: Option<StoredCheckpoint>,
+    ) -> Result<(), String> {
+        let (tx, rx) = mpsc::sync_channel(0);
+        self.persistence
+            .inner
+            .sender
+            .send(Command::TerminalCheckpoint {
+                id,
+                saved,
+                durable_head: Arc::clone(&self.durable_head),
+                reply: Some(tx),
+            })
+            .map_err(|_| "terminal persistence actor stopped".to_owned())?;
+        rx.recv()
+            .map_err(|_| "terminal checkpoint receipt lost".to_owned())?
+    }
+
+    #[cfg(test)]
     pub(crate) fn durable_head(&self) -> u64 {
         self.durable_head.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn durable_head_owner(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.durable_head)
     }
 
     /// The byte offset the next replay must start at.
@@ -1109,6 +1157,32 @@ impl Persistence {
         Self::open_with_admission_limits(state_dir, resources.into(), hint)
     }
 
+    fn load_terminal_checkpoint(&self, id: RunId) -> Option<StoredCheckpoint> {
+        use std::io::Read as _;
+        let path = terminal_checkpoint_path(&self.inner.state_dir, id);
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits().cast_signed())
+            .open(path)
+            .ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_FILE_BYTES as u64 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(MAX_CHECKPOINT_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > MAX_CHECKPOINT_FILE_BYTES {
+            return None;
+        }
+        let saved: PersistedTerminalCheckpoint = serde_json::from_slice(&bytes).ok()?;
+        if saved.epoch != self.inner.epoch {
+            return None;
+        }
+        saved.state
+    }
+
     pub(crate) fn runtime_id(&self) -> RuntimeId {
         self.inner.runtime_id
     }
@@ -1218,11 +1292,12 @@ impl Persistence {
         let actor_shutdown = Arc::clone(&shutdown);
         #[cfg(test)]
         let actor_test_hooks = Arc::clone(&test_hooks);
+        let actor_state_dir = state_dir.clone();
         let join = thread::Builder::new()
             .name("ctxmux-persistence".to_owned())
             .spawn(move || {
                 actor_main(
-                    &state_dir,
+                    &actor_state_dir,
                     admission_limits,
                     handoff,
                     &command_rx,
@@ -1256,6 +1331,7 @@ impl Persistence {
                 lifecycle_space,
                 output_wake,
                 output_wake_requested,
+                state_dir,
                 sender: command_tx,
                 lifecycle: lifecycle_tx,
                 queue_depth,
@@ -1718,6 +1794,12 @@ enum Command {
         through: u64,
         reply: tokio::sync::oneshot::Sender<Result<OutputReplay, PersistenceError>>,
     },
+    TerminalCheckpoint {
+        id: RunId,
+        saved: Option<StoredCheckpoint>,
+        durable_head: Arc<AtomicU64>,
+        reply: Option<mpsc::SyncSender<Result<(), String>>>,
+    },
     StageStart(Box<StageRequest>),
     RemoveTerminal {
         candidate: PersistentCandidate,
@@ -1855,7 +1937,7 @@ fn actor_main(
         // the lifecycle-vs-lifecycle edge that a `StageStart` must not cross —
         // it may not overtake the `Finalize` of a candidate it evicts — is
         // preserved by the single channel's own ordering.
-        let command = match pending_lifecycle
+        let mut command = match pending_lifecycle
             .take()
             .or_else(|| lifecycle_rx.try_recv().ok())
         {
@@ -1918,6 +2000,28 @@ fn actor_main(
                 }
             }
         };
+        // Lifecycle priority cannot cross bytes already accepted by this Run
+        // but evicted from its hot cache. Recover those exact queued prefixes
+        // before Finalize uses the surviving tail. Other Runs' appends remain
+        // pending; no replay clone, larger cache or global barrier is needed.
+        if let Command::Finalize { id, replay, .. } = &command
+            && mutex_lock(failure).is_none()
+            && read_run_head(&store.connection, *id).is_ok_and(|head| {
+                head < replay
+                    .chunks
+                    .first()
+                    .map_or(replay.latest_output_bytes, |chunk| chunk.start_byte)
+            })
+        {
+            let required_id = *id;
+            pending_lifecycle = Some(command);
+            command =
+                take_required_append(required_id, &mut pending, receiver).unwrap_or_else(|| {
+                    pending_lifecycle
+                        .take()
+                        .expect("pending Finalize is retained")
+                });
+        }
         if output_wake_requested.swap(false, Ordering::AcqRel)
             && let Some(wake) = &*mutex_lock(output_wake)
         {
@@ -1973,6 +2077,16 @@ fn actor_main(
                     return;
                 };
                 handle_staged_start_result(&request, result, failure);
+                for candidate in &request.candidates {
+                    if store.connection.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
+                        [candidate.id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    ) == Ok(false)
+                    {
+                        let _ = fs::remove_file(terminal_checkpoint_path(state_dir, candidate.id));
+                    }
+                }
             }
             Command::RemoveTerminal { candidate, reply } => {
                 // Fail closed before touching the store, mirroring StageStart: a
@@ -1990,6 +2104,9 @@ fn actor_main(
                         None => return,
                     }
                 };
+                if matches!(&disposition, RemovalDisposition::Removed) {
+                    let _ = fs::remove_file(terminal_checkpoint_path(state_dir, candidate.id));
+                }
                 let _ = reply.send(disposition);
             }
             Command::Append {
@@ -2015,7 +2132,9 @@ fn actor_main(
                     // draining that queue cannot turn into a timed wait with a
                     // lifecycle receipt already pending. Preserve this command
                     // ahead of newer lifecycle commands on the next actor turn.
-                    if let Ok(command) = lifecycle_rx.try_recv() {
+                    if pending_lifecycle.is_none()
+                        && let Ok(command) = lifecycle_rx.try_recv()
+                    {
                         pending_lifecycle = Some(command);
                         break;
                     }
@@ -2025,7 +2144,7 @@ fn actor_main(
                     // Collection owns no SQLite transaction or replay writer.
                     // Lifecycle senders also enqueue a wake here, so their
                     // receipts do not have to wait for the deadline to expire.
-                    let next = match receiver.try_recv() {
+                    let next = match pending.pop_front().map_or_else(|| receiver.try_recv(), Ok) {
                         Ok(command) => Ok(command),
                         Err(mpsc::TryRecvError::Disconnected) => {
                             Err(mpsc::RecvTimeoutError::Disconnected)
@@ -2052,7 +2171,7 @@ fn actor_main(
                             batch.push((id, replay, durable_head));
                         }
                         Ok(command) => {
-                            pending.push_back(command);
+                            pending.push_front(command);
                             break;
                         }
                         Err(
@@ -2132,6 +2251,47 @@ fn actor_main(
                 }
                 let _ = reply.send(result);
             }
+            Command::TerminalCheckpoint {
+                id,
+                saved,
+                durable_head,
+                reply,
+            } => {
+                let exists = store
+                    .connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
+                        [id.to_string()],
+                        |row| row.get::<_, bool>(0),
+                    )
+                    .unwrap_or(false);
+                let latest_fence = saved.as_ref().map_or(0, |s| {
+                    s.resizes
+                        .last()
+                        .map_or(s.checkpoint.through_byte, |r| r.through_byte)
+                });
+                let result = if !exists || latest_fence > durable_head.load(Ordering::Acquire) {
+                    Err("checkpoint does not have a committed original-output fence".to_owned())
+                } else {
+                    write_terminal_checkpoint(
+                        state_dir,
+                        id,
+                        &PersistedTerminalCheckpoint {
+                            epoch: store.epoch.clone(),
+                            state: saved,
+                        },
+                    )
+                    .map_err(|error| error.to_string())
+                };
+                if let Err(error) = &result {
+                    let _ = crate::diagnostics::record(format_args!(
+                        "ctxmux terminal checkpoint for Run {id} was not saved: {error}"
+                    ));
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
             Command::Barrier { reply } => {
                 // No store work: FIFO ordering means every prior Append was
                 // already committed by append_batch before this command was
@@ -2147,6 +2307,26 @@ fn actor_main(
             wake.wake();
         }
     }
+}
+
+fn take_required_append(
+    required_id: RunId,
+    pending: &mut VecDeque<Command>,
+    receiver: &mpsc::Receiver<Command>,
+) -> Option<Command> {
+    if let Some(index) = pending
+        .iter()
+        .position(|command| matches!(command, Command::Append { id, .. } if *id == required_id))
+    {
+        return pending.remove(index);
+    }
+    while let Ok(command) = receiver.try_recv() {
+        if matches!(&command, Command::Append { id, .. } if *id == required_id) {
+            return Some(command);
+        }
+        pending.push_back(command);
+    }
+    None
 }
 
 fn retry_transient_storage(
@@ -2286,6 +2466,10 @@ fn pause_before_append(test_hooks: &PersistenceTestHooks) {
 #[cfg(test)]
 fn injected_append_failure(test_hooks: &PersistenceTestHooks) -> Option<PersistenceError> {
     if test_hooks.force_append_storage_full.load(Ordering::Acquire) {
+        if let Some(marker) = std::env::var_os("CTXMUX_TEST_UPGRADE_RETRY_MARKER") {
+            fs::write(marker, b"actual accepted append retry")
+                .expect("record actual private storage retry");
+        }
         return Some(PersistenceError::injected_disk_full());
     }
     if test_hooks
@@ -2525,10 +2709,9 @@ impl StateLockGuard {
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
         if let Err(error) = File::unlock(&self.0) {
-            let _ = writeln!(
-                io::stderr().lock(),
+            let _ = crate::diagnostics::record(format_args!(
                 "ctxmuxd failed to release its state lock: {error}"
-            );
+            ));
         }
     }
 }
@@ -6088,6 +6271,7 @@ fn decode_recovered_row(
             // above. The stored `spec.size` is the size once requested, not one
             // any terminal is confirming now.
             current_size: None,
+            native_service: None,
         },
         replay: OutputReplay {
             chunks: load_replay_chunks_range(
@@ -11164,6 +11348,7 @@ mod tests {
             attachments: 0,
             applied_input_bytes: Some(0),
             current_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            native_service: None,
         }
     }
 
@@ -11814,5 +11999,217 @@ mod tests {
             "re-offered durable bytes are verified, never appended twice"
         );
         drop(reopened);
+    }
+}
+
+// Derived terminal state uses its own private atomic Run-keyed file, without a SQL schema change.
+const MAX_CHECKPOINT_FILE_BYTES: usize = MAX_RESTORE_BYTES * 2;
+// One sequential checkpoint writer's buffer, not an accepted-checkpoint ceiling.
+// Source-extracted 1/8/32 MiB probes compared 8/64/256 KiB buffers. At 32 MiB,
+// 256 KiB reduces file writes from 5,462 to 171 and removes the default buffer's
+// measured instruction overhead while avoiding both complete encoded copies.
+// Final host latency and aggregate allocation qualification remain separate.
+const CHECKPOINT_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+fn terminal_checkpoint_path(state_dir: &Path, id: RunId) -> PathBuf {
+    state_dir
+        .join("terminal-checkpoints")
+        .join(format!("{id}.json"))
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedTerminalCheckpoint {
+    epoch: String,
+    state: Option<StoredCheckpoint>,
+}
+fn write_terminal_checkpoint(
+    state_dir: &Path,
+    id: RunId,
+    saved: &PersistedTerminalCheckpoint,
+) -> io::Result<()> {
+    write_terminal_checkpoint_bounded(state_dir, id, saved, MAX_CHECKPOINT_FILE_BYTES)
+}
+
+fn write_terminal_checkpoint_bounded(
+    state_dir: &Path,
+    id: RunId,
+    saved: &PersistedTerminalCheckpoint,
+    max_file_bytes: usize,
+) -> io::Result<()> {
+    if saved
+        .state
+        .as_ref()
+        .is_some_and(|s| s.restore.len() > MAX_RESTORE_BYTES)
+    {
+        return Err(io::Error::other("checkpoint exceeds bound"));
+    }
+    let directory = state_dir.join("terminal-checkpoints");
+    prepare_state_dir(&directory).map_err(io::Error::other)?;
+    let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        {
+            // Keep serializer chunks buffered instead of issuing a file write for
+            // every escaped string fragment. Admission precedes buffering; no
+            // complete encoded checkpoint or JSON copy is allocated here.
+            let mut output = CheckpointWriter {
+                writer: io::BufWriter::with_capacity(
+                    CHECKPOINT_WRITE_BUFFER_BYTES.min(max_file_bytes),
+                    &mut file,
+                ),
+                remaining: max_file_bytes,
+            };
+            serde_json::to_writer(&mut output, saved).map_err(io::Error::other)?;
+            output.flush()?;
+        }
+        file.sync_all()?;
+        fs::rename(&temporary, terminal_checkpoint_path(state_dir, id))?;
+        File::open(directory)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+/// Count serialized bytes before they enter the bounded file buffer. The existing
+/// file policy is separate from JSON/base64 validity and is unchanged here.
+struct CheckpointWriter<W> {
+    writer: W,
+    remaining: usize,
+}
+
+impl<W: Write> Write for CheckpointWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::other("checkpoint file exceeds bound"));
+        }
+        let written = self.writer.write(bytes)?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_stream_tests {
+    use super::{
+        CheckpointWriter, MAX_CHECKPOINT_FILE_BYTES, PersistedTerminalCheckpoint,
+        terminal_checkpoint_path, write_terminal_checkpoint, write_terminal_checkpoint_bounded,
+    };
+    use ctxmux_protocol::RunId;
+    use std::{
+        fs,
+        io::{self, Write},
+        os::unix::fs::PermissionsExt,
+    };
+
+    #[test]
+    fn checkpoint_stream_preserves_binary_format_and_roundtrip() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use ctxmux_protocol::TerminalSize;
+
+        // Padding, encoder chunk boundaries, and multi-chunk opaque PTY bytes.
+        for len in [0, 1, 2, 3, 766, 767, 768, 769, 1023, 1024, 4097] {
+            let bytes: Vec<u8> = (0_u8..=255).cycle().take(len).collect();
+            let model = crate::terminal_checkpoint::TerminalModel::new(
+                RunId::new(),
+                TerminalSize { rows: 2, cols: 4 },
+            );
+            let mut state = model.stored().expect("checkpoint");
+            state.restore.clone_from(&bytes);
+            state.checkpoint.restore_bytes = u64::try_from(len).expect("length");
+            let saved = PersistedTerminalCheckpoint {
+                epoch: "non-ASCII 雪 \n\t\"\\".to_owned(),
+                state: Some(state),
+            };
+            let encoded = serde_json::to_vec(&saved).expect("serialize");
+            let value: serde_json::Value = serde_json::from_slice(&encoded).expect("JSON");
+            assert_eq!(value["state"]["restore"], STANDARD.encode(&bytes));
+            let recovered: PersistedTerminalCheckpoint =
+                serde_json::from_slice(&encoded).expect("recover");
+            assert_eq!(recovered.epoch, saved.epoch);
+            assert_eq!(recovered.state.expect("state").restore, bytes);
+        }
+    }
+
+    #[test]
+    fn checkpoint_stream_failure_preserves_old_file_and_cleans_temporary() {
+        let directory = tempfile::tempdir().expect("state directory");
+        let id = RunId::new();
+        let old = PersistedTerminalCheckpoint {
+            epoch: "old".to_owned(),
+            state: None,
+        };
+        write_terminal_checkpoint(directory.path(), id, &old).expect("write old");
+        let path = terminal_checkpoint_path(directory.path(), id);
+        let original = fs::read(&path).expect("old bytes");
+        let replacement = PersistedTerminalCheckpoint {
+            epoch: "雪\n\"\\".repeat(4097),
+            state: None,
+        };
+        let expected = serde_json::to_vec(&replacement).expect("reference JSON");
+        assert!(expected.len() < MAX_CHECKPOINT_FILE_BYTES);
+        let error = write_terminal_checkpoint_bounded(
+            directory.path(),
+            id,
+            &replacement,
+            expected.len() - 1,
+        )
+        .expect_err("reject one-byte-over-policy streaming file");
+        assert!(error.to_string().contains("checkpoint file exceeds bound"));
+        assert_eq!(fs::read(&path).expect("still old bytes"), original);
+        assert_eq!(
+            fs::read_dir(path.parent().expect("checkpoint directory"))
+                .expect("entries")
+                .count(),
+            1,
+            "no abandoned temporary checkpoint"
+        );
+        write_terminal_checkpoint_bounded(directory.path(), id, &replacement, expected.len())
+            .expect("exact boundary succeeds after pressure");
+        assert_eq!(fs::read(&path).expect("new bytes"), expected);
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn checkpoint_stream_counts_actual_short_writes_and_preserves_io_error() {
+        struct ShortWriter(Vec<u8>);
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let written = bytes.len().min(2);
+                self.0.extend_from_slice(&bytes[..written]);
+                Ok(written)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            }
+        }
+        let mut writer = CheckpointWriter {
+            writer: ShortWriter(Vec::new()),
+            remaining: 5,
+        };
+        writer.write_all(b"abcde").expect("short writes complete");
+        assert_eq!(writer.writer.0, b"abcde");
+        assert_eq!(writer.remaining, 0);
+        writer
+            .write_all(b"x")
+            .expect_err("over-bound byte rejected");
+        assert_eq!(writer.writer.0, b"abcde");
+        assert_eq!(
+            writer
+                .flush()
+                .expect_err("flush failure stays truthful")
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
     }
 }

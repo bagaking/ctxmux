@@ -264,7 +264,7 @@ function observedMaximaForTier(rounds, tier, mode) {
 /// for a cost that legitimately depends on the host (memory, CPU, descriptors)
 /// and wrong for a leak: a teardown that stranded N children would have its
 /// ceiling derived as N and ratify itself. That is not hypothetical — the
-/// 2026-09-06 farm run derived cleanup_live_children ceilings of 129/513/2049
+/// recorded farm run derived cleanup_live_children ceilings of 129/513/2049
 /// at the 128/512/2048 tiers, one per Run leaked, and passed every one. The
 /// darwin baseline records 0 here, which is what a working teardown produces.
 ///
@@ -383,8 +383,12 @@ const FLEET_RESOURCE_POLICY = Object.freeze({
   handoff_diagnostic_bytes: 16777216,
   handoff_bytes: 268435456,
   control_state_bytes: 134217728,
+  diagnostic_queue_bytes: 67108864,
+  diagnostic_record_bytes: 1048576,
   creation_workers: 8,
-  input_workers: 8,
+  input_turn_commands: 64,
+  input_turn_bytes: 256 * 1024,
+  stop_admission_timeout_ms: 250,
   cleanup_workers: 8,
   finalize_workers: 8,
   input_queue_commands: 1024,
@@ -808,7 +812,7 @@ function overlapCrossCheck(root, receipt, mode) {
 ///
 /// A tier verdict is the conjunction of its ceiling checks, its List verdict
 /// and its admission verdict, so `!pass` alone does not say which. This used
-/// to report "exceeded a derived ceiling" unconditionally: the 2026-09-06 farm
+/// to report "exceeded a derived ceiling" unconditionally: the recorded farm
 /// run refused with that sentence while every one of its ceiling checks
 /// passed, and the real cause was the admission predicate. A wrong reason is
 /// worse than no reason — it sends the reader looking for a regression that
@@ -2247,7 +2251,7 @@ ssh() { [[ $2 == 'cat /etc/machine-id' ]] || return 99; printf '%s' "$CTXMUX_TES
 
   // The leak fields are pinned to 0 and no observation may raise them. Before
   // this, deriveBudgetCeiling turned an observed leak into its own ceiling:
-  // the 2026-09-06 farm run derived 129/513/2049 stranded children at the
+  // the recorded farm run derived 129/513/2049 stranded children at the
   // 128/512/2048 tiers and passed all three.
   expectSuccess("leak ceilings are zero, not derived from the leak", () => {
     const leakyRound = goodCell({

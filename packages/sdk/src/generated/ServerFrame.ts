@@ -19,6 +19,17 @@ export type ServerFrame =
       first_available_byte: number;
       latest_output_bytes: number;
     }
+  | {
+      type: "terminal_checkpoint_chunk";
+      /**
+       * Seed-local byte offset.
+       */
+      offset: number;
+      /**
+       * Bounded seed bytes, encoded exactly like output bytes.
+       */
+      data: Uint8Array;
+    }
   | { type: "event"; event: RunEvent }
   | {
       type: "command_result";

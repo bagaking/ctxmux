@@ -83,15 +83,12 @@ pub struct Screen {
 }
 
 impl Screen {
-    pub(crate) fn new(
-        size: crate::grid::Size,
-        scrollback_len: usize,
-    ) -> Self {
-        let mut grid = crate::grid::Grid::new(size, scrollback_len);
+    pub(crate) fn new(size: crate::grid::Size, scrollback_len: usize) -> Self {
+        let mut grid = crate::grid::Grid::new(size, scrollback_len, true);
         grid.allocate_rows();
         Self {
             grid,
-            alternate_grid: crate::grid::Grid::new(size, 0),
+            alternate_grid: crate::grid::Grid::new(size, 0, false),
 
             attrs: crate::attrs::Attrs::default(),
             saved_attrs: crate::attrs::Attrs::default(),
@@ -114,6 +111,37 @@ impl Screen {
         self.grid.set_size(crate::grid::Size { rows, cols });
         self.alternate_grid
             .set_size(crate::grid::Size { rows, cols });
+    }
+
+    pub(crate) fn normal_scrollback_limit(&self) -> usize {
+        self.grid.scrollback_len()
+    }
+
+    pub(crate) fn set_scrollback_limit(&mut self, limit: usize) -> usize {
+        self.grid.set_scrollback_limit(limit)
+    }
+
+    pub(crate) fn restore_scrollback_budget(&self) -> Option<usize> {
+        self.grid.restore_scrollback_budget()
+    }
+
+    pub(crate) fn restore_geometry(&self) -> std::borrow::Cow<'_, Self> {
+        let (rows, cols) = self.size();
+        let restore_cols = if self.alternate_screen() {
+            self.alternate_grid.retained_cols().max(cols)
+        } else {
+            cols
+        };
+        if restore_cols == cols {
+            // The normal/common path can serialize the owner directly. Cloning
+            // all retained history would add work and transient memory without
+            // changing any geometry or the resulting bytes.
+            std::borrow::Cow::Borrowed(self)
+        } else {
+            let mut restored = self.clone();
+            restored.set_size(rows, restore_cols);
+            std::borrow::Cow::Owned(restored)
+        }
     }
 
     /// Returns the current size of the terminal.
@@ -160,11 +188,7 @@ impl Screen {
     /// text format.
     ///
     /// Newlines will not be included.
-    pub fn rows(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = String> + '_ {
+    pub fn rows(&self, start: u16, width: u16) -> impl Iterator<Item = String> + '_ {
         self.grid().visible_rows().map(move |row| {
             let mut contents = String::new();
             row.write_contents(&mut contents, start, width, false);
@@ -198,12 +222,7 @@ impl Screen {
                     .take(usize::from(end_row) - usize::from(start_row) + 1)
                 {
                     if i == usize::from(start_row) {
-                        row.write_contents(
-                            &mut contents,
-                            start_col,
-                            cols - start_col,
-                            false,
-                        );
+                        row.write_contents(&mut contents, start_col, cols - start_col, false);
                         if !row.wrapped() {
                             contents.push('\n');
                         }
@@ -240,6 +259,44 @@ impl Screen {
         self.write_contents_formatted(&mut contents);
         self.write_input_mode_formatted(&mut contents);
         self.write_title_formatted(&mut contents);
+        contents
+    }
+
+    /// Restore supported basic VT state on a fresh terminal at `size()`.
+    /// Unlike a visible-frame formatter this includes real normal history and
+    /// the inactive normal screen while alternate is active. Unsupported
+    /// extension stacks and saved charset/rendition precision are not promised.
+    #[must_use]
+    pub fn basic_restore_formatted(&self) -> Vec<u8> {
+        let mut contents = b"\x1bc".to_vec();
+        self.grid.write_full_contents_formatted(&mut contents);
+        self.grid
+            .write_saved_cursor_formatted(&mut contents, self.saved_attrs);
+        self.grid.write_drawing_state_formatted(&mut contents);
+        if self.alternate_screen() {
+            // 47 selects the other grid without overwriting the original
+            // normal saved cursor. A later real 1049l can restore it.
+            contents.extend_from_slice(b"\x1b[?47h\x1b[?6l\x1b[r");
+            self.alternate_grid
+                .write_full_contents_formatted(&mut contents);
+            self.alternate_grid
+                .write_drawing_state_formatted(&mut contents);
+        }
+        self.write_attributes_formatted(&mut contents);
+        crate::term::HideCursor::new(self.hide_cursor()).write_buf(&mut contents);
+        self.write_input_mode_formatted(&mut contents);
+        self.write_title_formatted(&mut contents);
+        contents
+    }
+
+    pub(crate) fn basic_final_restore_formatted(&self) -> Vec<u8> {
+        let mut contents = Vec::new();
+        self.grid()
+            .write_saved_cursor_formatted(&mut contents, self.saved_attrs);
+        self.grid().write_drawing_state_formatted(&mut contents);
+        self.write_attributes_formatted(&mut contents);
+        crate::term::HideCursor::new(self.hide_cursor()).write_buf(&mut contents);
+        self.write_input_mode_formatted(&mut contents);
         contents
     }
 
@@ -287,26 +344,14 @@ impl Screen {
     /// unspecified.
     // the unwraps in this method shouldn't be reachable
     #[allow(clippy::missing_panics_doc)]
-    pub fn rows_formatted(
-        &self,
-        start: u16,
-        width: u16,
-    ) -> impl Iterator<Item = Vec<u8>> + '_ {
+    pub fn rows_formatted(&self, start: u16, width: u16) -> impl Iterator<Item = Vec<u8>> + '_ {
         let mut wrapping = false;
         self.grid().visible_rows().enumerate().map(move |(i, row)| {
             // number of rows in a grid is stored in a u16 (see Size), so
             // visible_rows can never return enough rows to overflow here
             let i = i.try_into().unwrap();
             let mut contents = vec![];
-            row.write_contents_formatted(
-                &mut contents,
-                start,
-                width,
-                i,
-                wrapping,
-                None,
-                None,
-            );
+            row.write_contents_formatted(&mut contents, start, width, i, wrapping, None, None);
             if start == 0 && width == self.grid.size().cols {
                 wrapping = row.wrapped();
             }
@@ -333,14 +378,11 @@ impl Screen {
 
     fn write_contents_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
         if self.hide_cursor() != prev.hide_cursor() {
-            crate::term::HideCursor::new(self.hide_cursor())
-                .write_buf(contents);
+            crate::term::HideCursor::new(self.hide_cursor()).write_buf(contents);
         }
-        let prev_attrs = self.grid().write_contents_diff(
-            contents,
-            prev.grid(),
-            prev.attrs,
-        );
+        let prev_attrs = self
+            .grid()
+            .write_contents_diff(contents, prev.grid(), prev.attrs);
         self.attrs.write_escape_code_diff(contents, &prev_attrs);
     }
 
@@ -400,21 +442,11 @@ impl Screen {
     }
 
     fn write_input_mode_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ApplicationKeypad::new(
-            self.mode(MODE_APPLICATION_KEYPAD),
-        )
-        .write_buf(contents);
-        crate::term::ApplicationCursor::new(
-            self.mode(MODE_APPLICATION_CURSOR),
-        )
-        .write_buf(contents);
-        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD)).write_buf(contents);
+        crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR)).write_buf(contents);
+        crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, MouseProtocolMode::None)
             .write_buf(contents);
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            MouseProtocolMode::None,
-        )
-        .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             MouseProtocolEncoding::Default,
@@ -433,32 +465,19 @@ impl Screen {
     }
 
     fn write_input_mode_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        if self.mode(MODE_APPLICATION_KEYPAD)
-            != prev.mode(MODE_APPLICATION_KEYPAD)
-        {
-            crate::term::ApplicationKeypad::new(
-                self.mode(MODE_APPLICATION_KEYPAD),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_APPLICATION_CURSOR)
-            != prev.mode(MODE_APPLICATION_CURSOR)
-        {
-            crate::term::ApplicationCursor::new(
-                self.mode(MODE_APPLICATION_CURSOR),
-            )
-            .write_buf(contents);
-        }
-        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE)
-        {
-            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE))
+        if self.mode(MODE_APPLICATION_KEYPAD) != prev.mode(MODE_APPLICATION_KEYPAD) {
+            crate::term::ApplicationKeypad::new(self.mode(MODE_APPLICATION_KEYPAD))
                 .write_buf(contents);
         }
-        crate::term::MouseProtocolMode::new(
-            self.mouse_protocol_mode,
-            prev.mouse_protocol_mode,
-        )
-        .write_buf(contents);
+        if self.mode(MODE_APPLICATION_CURSOR) != prev.mode(MODE_APPLICATION_CURSOR) {
+            crate::term::ApplicationCursor::new(self.mode(MODE_APPLICATION_CURSOR))
+                .write_buf(contents);
+        }
+        if self.mode(MODE_BRACKETED_PASTE) != prev.mode(MODE_BRACKETED_PASTE) {
+            crate::term::BracketedPaste::new(self.mode(MODE_BRACKETED_PASTE)).write_buf(contents);
+        }
+        crate::term::MouseProtocolMode::new(self.mouse_protocol_mode, prev.mouse_protocol_mode)
+            .write_buf(contents);
         crate::term::MouseProtocolEncoding::new(
             self.mouse_protocol_encoding,
             prev.mouse_protocol_encoding,
@@ -476,8 +495,7 @@ impl Screen {
     }
 
     fn write_title_formatted(&self, contents: &mut Vec<u8>) {
-        crate::term::ChangeTitle::new(&self.icon_name, &self.title, "", "")
-            .write_buf(contents);
+        crate::term::ChangeTitle::new(&self.icon_name, &self.title, "", "").write_buf(contents);
     }
 
     /// Returns terminal escape sequences sufficient to change the previous
@@ -491,13 +509,8 @@ impl Screen {
     }
 
     fn write_title_diff(&self, contents: &mut Vec<u8>, prev: &Self) {
-        crate::term::ChangeTitle::new(
-            &self.icon_name,
-            &self.title,
-            &prev.icon_name,
-            &prev.title,
-        )
-        .write_buf(contents);
+        crate::term::ChangeTitle::new(&self.icon_name, &self.title, &prev.icon_name, &prev.title)
+            .write_buf(contents);
     }
 
     /// Returns terminal escape sequences sufficient to cause audible and
@@ -544,10 +557,8 @@ impl Screen {
 
     fn write_attributes_formatted(&self, contents: &mut Vec<u8>) {
         crate::term::ClearAttrs::default().write_buf(contents);
-        self.attrs.write_escape_code_diff(
-            contents,
-            &crate::attrs::Attrs::default(),
-        );
+        self.attrs
+            .write_escape_code_diff(contents, &crate::attrs::Attrs::default());
     }
 
     /// Returns the current cursor position of the terminal.
@@ -755,13 +766,34 @@ impl Screen {
         }
     }
 
+    fn erase_attrs(&self) -> crate::attrs::Attrs {
+        crate::attrs::Attrs {
+            bgcolor: self.attrs.bgcolor,
+            ..crate::attrs::Attrs::default()
+        }
+    }
+    fn update_erase_attrs(&mut self) {
+        let attrs = self.erase_attrs();
+        self.grid_mut().set_erase_attrs(attrs);
+    }
+
     fn enter_alternate_grid(&mut self) {
+        if self.alternate_screen() {
+            return;
+        }
         self.grid_mut().set_scrollback(0);
         self.set_mode(MODE_ALTERNATE_SCREEN);
+        self.alternate_grid.set_erase_attrs(self.erase_attrs());
         self.alternate_grid.allocate_rows();
+        self.alternate_grid.inherit_cursor(&self.grid);
     }
 
     fn exit_alternate_grid(&mut self) {
+        if !self.alternate_screen() {
+            return;
+        }
+        self.grid.inherit_cursor(&self.alternate_grid);
+        self.alternate_grid.clear_contents();
         self.clear_mode(MODE_ALTERNATE_SCREEN);
     }
 
@@ -810,6 +842,7 @@ impl Screen {
 
 impl Screen {
     fn text(&mut self, c: char) {
+        self.update_erase_attrs();
         let pos = self.grid().pos();
         let size = self.grid().size();
         let attrs = self.attrs;
@@ -819,35 +852,23 @@ impl Screen {
             // don't even try to draw control characters
             return;
         }
-        let width = width
+        let width: u16 = width
             .unwrap_or(1)
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+        // No complete cell pair can represent this character on a one-column
+        // grid. Leave the cursor and cells alone; later narrow text still draws.
+        if width > size.cols {
+            return;
+        }
 
-        // it doesn't make any sense to wrap if the last column in a row
-        // didn't already have contents. don't try to handle the case where a
-        // character wraps because there was only one column left in the
-        // previous row - literally everything handles this case differently,
-        // and this is tmux behavior (and also the simplest). i'm open to
-        // reconsidering this behavior, but only with a really good reason
-        // (xterm handles this by introducing the concept of triple width
-        // cells, which i really don't want to do).
-        let mut wrap = false;
-        if pos.col > size.cols - width {
-            let last_cell = self
-                .grid()
-                .drawing_cell(crate::grid::Pos {
-                    row: pos.row,
-                    col: size.cols - 1,
-                })
-                // pos.row is valid, since it comes directly from
-                // self.grid().pos() which we assume to always have a valid
-                // row value. size.cols - 1 is also always a valid column.
-                .unwrap();
-            if last_cell.has_contents() || last_cell.is_wide_continuation() {
-                wrap = true;
-            }
+        // Automatic overflow joins the actual logical line, including a wide
+        // character that leaves one unoccupied column at the previous edge.
+        // Preserve the current pen on that gap; it is visible retained state.
+        let wrap = pos.col > size.cols - width;
+        if width == 2 && pos.col == size.cols - 1 {
+            self.grid_mut().current_row_mut().erase(pos.col, attrs);
         }
         self.grid_mut().col_wrap(width, wrap);
         let pos = self.grid().pos();
@@ -961,21 +982,17 @@ impl Screen {
                 .unwrap()
                 .is_wide()
             {
-                let next_cell = self
+                if let Some(next_cell) = self
                     .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col + 1,
-                    })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col + 1 is valid because the cell at pos.col is a
-                    // wide character, so it must have the second half of the
-                    // wide character after it.
-                    .unwrap();
-                next_cell.set(' ', attrs);
+                    .drawing_row_mut(pos.row)
+                    // The current cursor always identifies a real row.
+                    .unwrap()
+                    .get_mut(pos.col + 1)
+                {
+                    // Print only updates the visible neighbor. An alternate
+                    // continuation already off-right remains retained.
+                    next_cell.set(' ', attrs);
+                }
             }
 
             let cell = self
@@ -1007,21 +1024,14 @@ impl Screen {
                         row: pos.row,
                         col: pos.col + 1,
                     };
-                    let next_next_cell = self
+                    if let Some(next_next_cell) = self
                         .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                        // pos.row is valid because we assume
-                        // self.grid().pos() to always have a valid row value.
-                        // pos.col is valid because we called col_wrap()
-                        // earlier, which ensures that self.grid().pos().col
-                        // has a valid value. this is true even though we just
-                        // called col_inc, because this branch only happens if
-                        // width > 1, and col_wrap takes width into account.
-                        // pos.col + 1 is valid because the cell at pos.col is
-                        // wide, and so it must have the second half of the
-                        // wide character after it.
-                        .unwrap();
-                    next_next_cell.clear(attrs);
+                        .drawing_row_mut(pos.row)
+                        .unwrap()
+                        .get_mut(next_next_pos.col)
+                    {
+                        next_next_cell.clear(attrs);
+                    }
                     if next_next_pos.col == size.cols - 1 {
                         self.grid_mut()
                             .drawing_row_mut(pos.row)
@@ -1041,7 +1051,7 @@ impl Screen {
                     // only happens if width > 1, and col_wrap takes width
                     // into account.
                     .unwrap();
-                next_cell.clear(crate::attrs::Attrs::default());
+                next_cell.clear(attrs);
                 next_cell.set_wide_continuation(true);
                 self.grid_mut().col_inc(1);
             }
@@ -1169,7 +1179,7 @@ impl Screen {
 
     // CSI J
     fn ed(&mut self, mode: u16) {
-        let attrs = self.attrs;
+        let attrs = self.erase_attrs();
         match mode {
             0 => self.grid_mut().erase_all_forward(attrs),
             1 => self.grid_mut().erase_all_backward(attrs),
@@ -1187,7 +1197,7 @@ impl Screen {
 
     // CSI K
     fn el(&mut self, mode: u16) {
-        let attrs = self.attrs;
+        let attrs = self.erase_attrs();
         match mode {
             0 => self.grid_mut().erase_row_forward(attrs),
             1 => self.grid_mut().erase_row_backward(attrs),
@@ -1230,7 +1240,7 @@ impl Screen {
 
     // CSI X
     fn ech(&mut self, count: u16) {
-        let attrs = self.attrs;
+        let attrs = self.erase_attrs();
         self.grid_mut().erase_cells(count, attrs);
     }
 
@@ -1272,6 +1282,7 @@ impl Screen {
                 }
                 &[1049] => {
                     self.decsc();
+                    self.alternate_grid.set_erase_attrs(self.erase_attrs());
                     self.alternate_grid.clear();
                     self.enter_alternate_grid();
                 }
@@ -1407,15 +1418,10 @@ impl Screen {
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),
                 &[n] if (30..=37).contains(&n) => {
-                    self.attrs.fgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 30);
+                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 30);
                 }
                 &[38, 2, r, g, b] => {
-                    self.attrs.fgcolor = crate::attrs::Color::Rgb(
-                        to_u8!(r),
-                        to_u8!(g),
-                        to_u8!(b),
-                    );
+                    self.attrs.fgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
                 }
                 &[38, 5, i] => {
                     self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(i));
@@ -1425,12 +1431,10 @@ impl Screen {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.fgcolor =
-                            crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.fgcolor = crate::attrs::Color::Rgb(r, g, b);
                     }
                     &[5] => {
-                        self.attrs.fgcolor =
-                            crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs.fgcolor = crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1453,15 +1457,10 @@ impl Screen {
                     self.attrs.fgcolor = crate::attrs::Color::Default;
                 }
                 &[n] if (40..=47).contains(&n) => {
-                    self.attrs.bgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 40);
+                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 40);
                 }
                 &[48, 2, r, g, b] => {
-                    self.attrs.bgcolor = crate::attrs::Color::Rgb(
-                        to_u8!(r),
-                        to_u8!(g),
-                        to_u8!(b),
-                    );
+                    self.attrs.bgcolor = crate::attrs::Color::Rgb(to_u8!(r), to_u8!(g), to_u8!(b));
                 }
                 &[48, 5, i] => {
                     self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(i));
@@ -1471,12 +1470,10 @@ impl Screen {
                         let r = next_param_u8!();
                         let g = next_param_u8!();
                         let b = next_param_u8!();
-                        self.attrs.bgcolor =
-                            crate::attrs::Color::Rgb(r, g, b);
+                        self.attrs.bgcolor = crate::attrs::Color::Rgb(r, g, b);
                     }
                     &[5] => {
-                        self.attrs.bgcolor =
-                            crate::attrs::Color::Idx(next_param_u8!());
+                        self.attrs.bgcolor = crate::attrs::Color::Idx(next_param_u8!());
                     }
                     ns => {
                         if log::log_enabled!(log::Level::Debug) {
@@ -1499,12 +1496,10 @@ impl Screen {
                     self.attrs.bgcolor = crate::attrs::Color::Default;
                 }
                 &[n] if (90..=97).contains(&n) => {
-                    self.attrs.fgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 82);
+                    self.attrs.fgcolor = crate::attrs::Color::Idx(to_u8!(n) - 82);
                 }
                 &[n] if (100..=107).contains(&n) => {
-                    self.attrs.bgcolor =
-                        crate::attrs::Color::Idx(to_u8!(n) - 92);
+                    self.attrs.bgcolor = crate::attrs::Color::Idx(to_u8!(n) - 92);
                 }
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
@@ -1559,6 +1554,7 @@ impl vte::Perform for Screen {
     }
 
     fn execute(&mut self, b: u8) {
+        self.update_erase_attrs();
         match b {
             7 => self.bel(),
             8 => self.bs(),
@@ -1578,6 +1574,7 @@ impl vte::Perform for Screen {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, b: u8) {
+        self.update_erase_attrs();
         intermediates.first().map_or_else(
             || match b {
                 b'7' => self.decsc(),
@@ -1597,13 +1594,8 @@ impl vte::Perform for Screen {
         );
     }
 
-    fn csi_dispatch(
-        &mut self,
-        params: &vte::Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        c: char,
-    ) {
+    fn csi_dispatch(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, c: char) {
+        self.update_erase_attrs();
         match intermediates.first() {
             None => match c {
                 '@' => self.ich(canonicalize_params_1(params, 1)),
@@ -1625,17 +1617,10 @@ impl vte::Perform for Screen {
                 'h' => self.sm(params),
                 'l' => self.rm(params),
                 'm' => self.sgr(params),
-                'r' => self.decstbm(canonicalize_params_decstbm(
-                    params,
-                    self.grid().size(),
-                )),
+                'r' => self.decstbm(canonicalize_params_decstbm(params, self.grid().size())),
                 _ => {
                     if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI {} {}",
-                            param_str(params),
-                            c
-                        );
+                        log::debug!("unhandled csi sequence: CSI {} {}", param_str(params), c);
                     }
                 }
             },
@@ -1646,11 +1631,7 @@ impl vte::Perform for Screen {
                 'l' => self.decrst(params),
                 _ => {
                     if log::log_enabled!(log::Level::Debug) {
-                        log::debug!(
-                            "unhandled csi sequence: CSI ? {} {}",
-                            param_str(params),
-                            c
-                        );
+                        log::debug!("unhandled csi sequence: CSI ? {} {}", param_str(params), c);
                     }
                 }
             },
@@ -1674,22 +1655,13 @@ impl vte::Perform for Screen {
             (Some(&b"2"), Some(s)) => self.osc2(s),
             _ => {
                 if log::log_enabled!(log::Level::Debug) {
-                    log::debug!(
-                        "unhandled osc sequence: OSC {}",
-                        osc_param_str(params),
-                    );
+                    log::debug!("unhandled osc sequence: OSC {}", osc_param_str(params),);
                 }
             }
         }
     }
 
-    fn hook(
-        &mut self,
-        params: &vte::Params,
-        intermediates: &[u8],
-        _ignore: bool,
-        action: char,
-    ) {
+    fn hook(&mut self, params: &vte::Params, intermediates: &[u8], _ignore: bool, action: char) {
         if log::log_enabled!(log::Level::Debug) {
             intermediates.first().map_or_else(
                 || {
@@ -1721,11 +1693,7 @@ fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {
     }
 }
 
-fn canonicalize_params_2(
-    params: &vte::Params,
-    default1: u16,
-    default2: u16,
-) -> (u16, u16) {
+fn canonicalize_params_2(params: &vte::Params, default1: u16, default2: u16) -> (u16, u16) {
     let mut iter = params.iter();
     let first = iter.next().map_or(0, |x| *x.first().unwrap_or(&0));
     let first = if first == 0 { default1 } else { first };
@@ -1736,10 +1704,7 @@ fn canonicalize_params_2(
     (first, second)
 }
 
-fn canonicalize_params_decstbm(
-    params: &vte::Params,
-    size: crate::grid::Size,
-) -> (u16, u16) {
+fn canonicalize_params_decstbm(params: &vte::Params, size: crate::grid::Size) -> (u16, u16) {
     let mut iter = params.iter();
     let top = iter.next().map_or(0, |x| *x.first().unwrap_or(&0));
     let top = if top == 0 { 1 } else { top };

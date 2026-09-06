@@ -14,4 +14,10 @@ export type ControlFailure = {
    * Whether the failed command is known not to have been applied.
    */
   disposition: CommandDisposition;
+  /**
+   * Exact confirmed PTY prefix of this input command, when known. `None`
+   * denotes no prefix authority (including transport result loss), not zero
+   * applied bytes. This never authorizes automatic replay of the suffix.
+   */
+  confirmed_input_bytes: number | null;
 };

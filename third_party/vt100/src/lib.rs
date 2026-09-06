@@ -56,5 +56,5 @@ mod term;
 
 pub use attrs::Color;
 pub use cell::Cell;
-pub use parser::Parser;
+pub use parser::{BasicCheckpoint, BasicRestoreGeometryCheckpoint, Parser};
 pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};

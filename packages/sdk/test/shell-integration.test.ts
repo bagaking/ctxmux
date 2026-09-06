@@ -109,6 +109,21 @@ test("shell Integration rejects Level B before a raw fork request", async () => 
     attachments: 0,
     applied_input_bytes: 0,
     current_size: { cols: 80, rows: 24 },
+    native_service: {
+      revision: 0,
+      owner: { type: "serving" as const },
+      output: { type: "serving" as const },
+      input: {
+        phase: { type: "open" as const },
+        unsettled_commands: 0,
+        unsettled_request_bytes: 0,
+        write_blocked: false,
+        completed_input_bytes: 0,
+        current_size: { cols: 80, rows: 24 },
+        active_confirmed_bytes: 0,
+      },
+      terminal_fault: null,
+    },
   };
 
   await assert.rejects(

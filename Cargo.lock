@@ -157,6 +157,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "vt100",
 ]
 
 [[package]]
@@ -1030,6 +1031,7 @@ version = "0.15.2"
 dependencies = [
  "itoa",
  "log",
+ "smallvec",
  "unicode-width",
  "vte",
 ]
@@ -1037,8 +1039,6 @@ dependencies = [
 [[package]]
 name = "vte"
 version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5022b5fbf9407086c180e9557be968742d839e68346af7792b8592489732197"
 dependencies = [
  "arrayvec",
  "utf8parse",

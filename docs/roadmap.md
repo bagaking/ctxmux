@@ -308,7 +308,7 @@ Acceptance:
 
 Implemented: replay capacity past the frozen 384 MiB main-database payload
 ceiling.
-Production evidence on 2026-09-21 showed 42% of that ceiling spent on row
+A recorded production sample showed 42% of that ceiling spent on row
 headers and indexes rather than output (762,048 rows, median 82 B). Replay
 payloads now live in append-only generation files; SQLite retains only the
 contiguous window index and cursors. Startup truncates abandoned tails and
@@ -472,3 +472,18 @@ are not part of this Feature.
   beyond existing parent and fidelity lineage; that work requires a separate
   reviewed Feature rather than sharing the Remote transport owner;
 - broad Integration coverage beyond the one proven Level B path.
+
+## Native shared-owner reliability continuation
+
+Feature `f-22vcz84zn` retains the P0 incident, exact owner/consumer counterexamples
+and causal reversals. The joined protocol-20/schema-6 candidate implements
+revisioned Native service facts, nonblocking fair input, cooperative admission,
+local VT fault containment and independent diagnostic delivery. A separate
+protocol-18 height slice addresses legal one-row loss for the existing consumer.
+Neither slice changes a healthy user Run to manufacture recovery.
+
+Final acceptance remains open: same-candidate two Runs/two Clients, exact bytes
+and identities, Ctrl+C, disconnect/reconnect, healthy planned exec, cold
+historical recovery, terminal allocation/encoding pressure, macOS/Linux resource
+costs and AgentMux consumption. Original failing or unqualified resource receipts
+remain visible. No reduced workload or relaxed budget closes this milestone.

@@ -69,5 +69,7 @@ pedantic = "deny"
 [patch.crates-io]
 portable-pty = { path = "third_party/portable-pty" }
 
-# Saved-cursor resize repair; see third_party/vt100/CTXMUX-PROVENANCE.json.
+# Pinned native VT owner extensions; provenance/licenses and the narrow delta
+# are kept with the source. Global Cargo registry packages remain untouched.
 vt100 = { path = "third_party/vt100" }
+vte = { path = "third_party/vte" }

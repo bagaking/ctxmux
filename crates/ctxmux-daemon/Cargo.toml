@@ -42,6 +42,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+vt100.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ctxmux-process-stats = { path = "../ctxmux-process-stats" }

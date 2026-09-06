@@ -7,9 +7,10 @@ use std::{
 };
 
 use ctxmux_protocol::{
-    AttachedSnapshot, ClientFrame, MAX_CREATE_OPERATION_KEY_BYTES, MAX_FRAME_BYTES,
-    MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_BUILD_ID_BYTES, MAX_RUNTIME_CAPABILITY_VERSION,
-    MAX_STOP_OPERATION_KEY_BYTES, PROTOCOL_VERSION, REMOTE_ENDPOINT_CONTRACT_VERSION,
+    AttachedSnapshot, ClientFrame, DiagnosticsSnapshot, MAX_CREATE_OPERATION_KEY_BYTES,
+    MAX_FRAME_BYTES, MAX_INPUT_OPERATION_KEY_BYTES, MAX_RUNTIME_BUILD_ID_BYTES,
+    MAX_RUNTIME_CAPABILITY_VERSION, MAX_STOP_OPERATION_KEY_BYTES, NativeServiceSnapshot,
+    PROTOCOL_VERSION, REMOTE_ENDPOINT_CONTRACT_VERSION,
     RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
     RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
     RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
@@ -41,6 +42,8 @@ fn export(output: &Path) -> Result<(), Box<dyn Error>> {
     AttachedSnapshot::export_all(&config)?;
     RunSignal::export_all(&config)?;
     StopDisposition::export_all(&config)?;
+    NativeServiceSnapshot::export_all(&config)?;
+    DiagnosticsSnapshot::export_all(&config)?;
     fs::write(
         output.join("constants.ts"),
         format!(

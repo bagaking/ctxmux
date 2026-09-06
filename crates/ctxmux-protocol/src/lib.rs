@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 20;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -890,6 +890,154 @@ pub enum InterruptionReason {
     TmuxTargetChanged,
 }
 
+/// Why one native service lane cannot serve. This is not a child exit status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeServiceFailure {
+    /// The native owner returned normally.
+    OwnerStopped,
+    /// The native owner unwound.
+    OwnerUnwound,
+    /// Original PTY output could not be read.
+    ReadFailed,
+    /// Native input could not be written.
+    WriteFailed,
+    /// This incarnation retains history without a live native owner.
+    Historical,
+    /// The native control receiver is closed.
+    ControlClosed,
+}
+
+/// Actual native owner service, independent of child lifecycle.
+// Empty struct variants are intentional: serde's internally tagged unit
+// variants ignore extra fields even with deny_unknown_fields. Service facts
+// must reject undeclared fields rather than accept an apparent health claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeOwnerStatus {
+    /// Ownership is being established.
+    Starting {},
+    /// The owner is serving its Run.
+    Serving {},
+    /// The owner is completing admitted work.
+    Draining {},
+    /// The owner no longer serves this Run.
+    Stopped {
+        /// Observed service failure or historical absence.
+        reason: NativeServiceFailure,
+    },
+}
+
+/// Original-output service, separate from a derived terminal view.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeOutputStatus {
+    /// Original-output ownership is not yet ready.
+    Pending {},
+    /// Original-output ownership is available.
+    Serving {},
+    /// Original-output admission is under explicit resource pressure.
+    Backpressured {},
+    /// The original-output stream has closed.
+    Closed {},
+    /// The original-output service failed or has no live owner.
+    Unavailable {
+        /// Observed reason.
+        reason: NativeServiceFailure,
+    },
+}
+
+/// Input admission, independent of child lifecycle and output availability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeInputPhase {
+    /// The input lane admits work.
+    Open {},
+    /// The input lane has closed admission.
+    Closed {},
+    /// The input lane cannot serve work.
+    Unavailable {
+        /// Observed reason.
+        reason: NativeServiceFailure,
+    },
+}
+
+/// Actual native input progress and outstanding request ownership.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct NativeInputStatus {
+    /// Admission state of the input lane.
+    pub phase: NativeInputPhase,
+    /// Commands admitted but not yet settled.
+    pub unsettled_commands: usize,
+    /// Whole request bytes still owned by unsettled commands.
+    pub unsettled_request_bytes: usize,
+    /// Whether the current PTY write awaits writable readiness.
+    pub write_blocked: bool,
+    /// Bytes confirmed across completed native input commands, or `None`
+    /// without current-incarnation input cursor authority.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub completed_input_bytes: Option<u64>,
+    /// Last geometry confirmed by this native input owner; absent for history.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub current_size: Option<TerminalSize>,
+    /// Confirmed prefix of the currently active input command.
+    pub active_confirmed_bytes: usize,
+}
+
+/// Derived terminal operation that failed without replacing original bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalFaultStage {
+    /// Processing original output into a derived view.
+    Process,
+    /// Applying confirmed geometry to a derived view.
+    Resize,
+    /// Exporting a derived checkpoint.
+    Export,
+    /// Recovering a derived checkpoint.
+    Recovery,
+}
+
+/// One Run-local derived terminal failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct NativeTerminalFault {
+    /// Failed derived operation.
+    pub stage: NativeTerminalFaultStage,
+    /// Original-output byte fence at the failed operation.
+    pub through_byte: u64,
+}
+
+/// Coherent native service facts at one Run-local revision.
+///
+/// These observations do not imply child exit, application readiness, or that
+/// an application consumed confirmed PTY input. Historical native Runs retain
+/// an explicit snapshot; non-native Runs expose no native service snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct NativeServiceSnapshot {
+    /// Run-local service observation revision.
+    pub revision: u64,
+    /// Actual native owner service.
+    pub owner: NativeOwnerStatus,
+    /// Original-output availability.
+    pub output: NativeOutputStatus,
+    /// Input admission and exact progress facts.
+    pub input: NativeInputStatus,
+    /// Run-local derived view failure, if any.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub terminal_fault: Option<NativeTerminalFault>,
+}
+
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// Current public metadata for one Run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct RunInfo {
@@ -907,6 +1055,11 @@ pub struct RunInfo {
     pub pid: Option<u32>,
     /// Current lifecycle state.
     pub state: RunState,
+    /// Current native service facts, including explicit historical absence of
+    /// an owner. Non-native Runs report `None`. The field is required on wire;
+    /// an omitted generation-20 observation must not become inferred health.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub native_service: Option<NativeServiceSnapshot>,
     /// Total output bytes allocated so far.
     pub latest_output_bytes: u64,
     /// Total output bytes committed by the persistence actor, or `None`
@@ -1149,6 +1302,72 @@ pub struct OutputReplayHeader {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticsSinkState {
+    NotInitialized,
+    Starting,
+    Idle,
+    Writing,
+    Failed,
+    Stopped,
+}
+
+/// Cumulative sink observations, independent of child or Native service health.
+/// Fields are sampled independently while the writer progresses; this is not an
+/// atomic ledger. Unknown full source lengths are never reported as zero bytes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct DiagnosticsSnapshot {
+    pub queue_budget_bytes: usize,
+    pub record_limit_bytes: usize,
+    /// Includes maximum temporary format funding until actual capacity is known.
+    pub funded_bytes: usize,
+    pub formatting_records: usize,
+    pub queued_records: usize,
+    pub active_record_bytes: usize,
+    pub admitted_records: u64,
+    pub written_records: u64,
+    /// Confirmed bytes across ordinary records and recovered-loss notices.
+    pub written_bytes: u64,
+    pub notice_written_bytes: u64,
+    /// No complete encoding exists; the dropped message length is unknown.
+    pub dropped_before_encoding_records: u64,
+    /// Fully encoded records rejected or abandoned before any sink write.
+    pub dropped_encoded_records: u64,
+    /// Known discarded encoded bytes, including failed-write suffixes. This is
+    /// not the total byte length of unformatted or oversized source messages.
+    pub discarded_encoded_bytes: u64,
+    /// Whole over-limit messages are dropped; their complete length is unknown.
+    pub oversized_records: u64,
+    pub format_failed_records: u64,
+    pub sink_write_failures: u64,
+    /// Failed duplication or writer creation; a failed sink does not stop Runs.
+    pub initialization_failures: u64,
+    pub partially_written_records: u64,
+    pub scoped_panics: u64,
+    pub sink: DiagnosticsSinkState,
+    #[serde(deserialize_with = "deserialize_sink_errno")]
+    pub last_sink_errno: Option<i32>,
+    pub writer_alive: bool,
+    pub shutdown_requested: bool,
+    /// Saturation preserves a lower bound; no counter silently wraps.
+    pub counters_saturated: bool,
+}
+
+fn deserialize_sink_errno<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<i32> = deserialize_required_option(deserializer)?;
+    if value.is_some_and(|errno| errno <= 0) {
+        return Err(D::Error::custom(
+            "diagnostic sink errno must be positive or null",
+        ));
+    }
+    Ok(value)
+}
+
 /// Persistence class of one logical Runtime identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -1319,10 +1538,22 @@ pub struct ClientHello {
     pub protocol: u16,
 }
 
+/// The two existing attachment consumers request their actual intended data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentView {
+    /// Original raw bytes after the caller's cursor.
+    Raw,
+    /// Derived basic terminal seed plus only its original ordered tail.
+    Terminal,
+}
+
 /// Initial request sent after one successful connection handshake.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Observe the daemon-owned diagnostic sink without inferring Run health.
+    Diagnostics {},
     /// Start a new daemon-owned Run.
     Start {
         operation_key: CreateOperationKey,
@@ -1393,6 +1624,8 @@ pub enum Request {
     /// Attach to retained output and future lifecycle events.
     Attach {
         id: RunId,
+        /// Explicit raw replay or terminal continuation intent.
+        view: AttachmentView,
         /// Cumulative number of output bytes already observed by the client.
         #[serde(default)]
         after_byte: u64,
@@ -1463,6 +1696,11 @@ pub struct ControlFailure {
     pub error: ProtocolError,
     /// Whether the failed command is known not to have been applied.
     pub disposition: CommandDisposition,
+    /// Exact confirmed PTY prefix of this input command, when known. `None`
+    /// denotes no prefix authority (including transport result loss), not zero
+    /// applied bytes. This never authorizes automatic replay of the suffix.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub confirmed_input_bytes: Option<usize>,
 }
 
 /// Correlated result of one attachment control command.
@@ -1479,6 +1717,8 @@ pub enum ControlOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    /// Current diagnostic sink observations, independent of Run service facts.
+    Diagnostics { diagnostics: DiagnosticsSnapshot },
     /// A Run was created.
     Started { run: RunInfo },
     /// Existing panes discovered through the tmux executable.
@@ -1516,6 +1756,79 @@ pub enum Response {
     },
 }
 
+/// Complete-boundary basic VT state, distinct from original Run output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct TerminalCheckpointHeader {
+    /// Exact source Run.
+    pub run_id: RunId,
+    /// Exclusive raw-output fence represented by the seed.
+    pub through_byte: u64,
+    /// Last acknowledged geometry revision represented by the seed.
+    pub resize_revision: u64,
+    /// Confirmed grid at the checkpoint fence, applied between seed sections.
+    pub size: TerminalSize,
+    /// Initial grid used while restoring the historical-content prefix.
+    pub restore_size: TerminalSize,
+    /// Temporary consumer scrollback capacity required by the historical seed,
+    /// or no policy override. Apply before prefix, geometry resize and suffix.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub restore_scrollback_rows: Option<u64>,
+    /// Seed prefix length after which size is applied before the final section.
+    pub resize_after_restore_bytes: u64,
+    /// Total synthetic seed bytes streamed in separate checkpoint frames.
+    pub restore_bytes: u64,
+}
+
+/// One acknowledged resize ordered against original output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+pub struct TerminalResize {
+    /// Output fence preceding this resize.
+    pub through_byte: u64,
+    /// Strictly increasing, including two resizes at the same byte fence.
+    pub resize_revision: u64,
+    /// Confirmed PTY geometry.
+    pub size: TerminalSize,
+}
+
+/// Why terminal state cannot be authoritatively continued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCheckpointUnavailableReason {
+    /// This owner did not observe the Run from its first output byte.
+    OriginUnknown,
+    /// Original output was discontinuous at its source.
+    SourceGap,
+    /// Original bytes needed after the last complete checkpoint were evicted.
+    TailEvicted,
+    /// The state export exceeded its bounded payload.
+    CheckpointTooLarge,
+    /// Geometry ordering or a saved checkpoint could not be verified.
+    InvalidCheckpoint,
+}
+
+/// Basic VT continuation capability, never a claim of full extension fidelity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TerminalContinuation {
+    /// Caller explicitly requested original raw bytes, not terminal restoration.
+    NotRequested,
+    /// Both real buffers, normal history and supported input modes at one fence.
+    BasicVt {
+        /// Complete parser-boundary seed metadata.
+        checkpoint: TerminalCheckpointHeader,
+        /// Original acknowledged geometry events after this seed.
+        resizes: Vec<TerminalResize>,
+    },
+    /// Originating state was not observed; no mode is guessed from a suffix.
+    Unknown {
+        reason: TerminalCheckpointUnavailableReason,
+    },
+    /// The owner exists, but its bounded continuation cannot currently be read.
+    Unavailable {
+        reason: TerminalCheckpointUnavailableReason,
+    },
+}
+
 /// Snapshot delivered when attachment begins.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct AttachedSnapshot {
@@ -1523,6 +1836,14 @@ pub struct AttachedSnapshot {
     pub run: RunInfo,
     /// Retained output after the requested cursor.
     pub replay: OutputReplay,
+    /// Authoritative continuation scope or explicit absence.
+    pub terminal: TerminalContinuation,
+    /// Synthetic seed, never PTY output or an output cursor acknowledgement.
+    #[serde(with = "output_chunk_bytes")]
+    #[ts(type = "Uint8Array")]
+    pub terminal_restore: Vec<u8>,
+    /// Latest acknowledged geometry at this snapshot.
+    pub resize_revision: u64,
 }
 
 /// Metadata-only first frame for an attachment.
@@ -1532,6 +1853,10 @@ pub struct AttachedHeader {
     pub run: RunInfo,
     /// Replay bounds whose chunks follow as ordered output-event frames.
     pub replay: OutputReplayHeader,
+    /// Seed metadata; its bounded chunks precede original replay.
+    pub terminal: TerminalContinuation,
+    /// Latest acknowledged geometry at this snapshot.
+    pub resize_revision: u64,
 }
 
 /// Event delivered after an attachment snapshot.
@@ -1540,6 +1865,11 @@ pub struct AttachedHeader {
 pub enum RunEvent {
     /// New ordered PTY output.
     Output { chunk: OutputChunk },
+    /// Coherent changed service facts; this does not change child lifecycle.
+    ServiceChanged {
+        /// Current Run-local native service observation.
+        service: NativeServiceSnapshot,
+    },
     /// The owning PTY confirmed new live dimensions.
     ///
     /// Published once per *applied* resize, carrying the size read back from
@@ -1553,7 +1883,14 @@ pub enum RunEvent {
     /// lock, so concurrent resizes are ordered and the last event an attachment
     /// receives always matches the Run's `current_size`. A tmux-backed Run never
     /// publishes it — ctxmux does not resize that pane.
-    Resized { size: TerminalSize },
+    Resized {
+        /// Confirmed PTY dimensions.
+        size: TerminalSize,
+        /// Original output fence before this resize.
+        through_byte: u64,
+        /// Acknowledged geometry revision, including same-byte resizes.
+        resize_revision: u64,
+    },
     /// Terminal lifecycle state.
     Exited { state: RunState },
     /// Historical terminal state produced by restart reconciliation.
@@ -1679,6 +2016,15 @@ pub enum ServerFrame {
     ReplayWindow {
         first_available_byte: u64,
         latest_output_bytes: u64,
+    },
+    /// Synthetic restore payload; its cursor is seed-local, never raw output.
+    TerminalCheckpointChunk {
+        /// Seed-local byte offset.
+        offset: u64,
+        /// Bounded seed bytes, encoded exactly like output bytes.
+        #[serde(with = "output_chunk_bytes")]
+        #[ts(type = "Uint8Array")]
+        data: Vec<u8>,
     },
     /// Live attachment event.
     Event { event: RunEvent },
@@ -1862,6 +2208,24 @@ mod tests {
             capabilities: RunCapabilities::NATIVE,
             pid: Some(42),
             state: RunState::Running,
+            native_service: Some(super::NativeServiceSnapshot {
+                revision: 0,
+                owner: super::NativeOwnerStatus::Serving {},
+                output: super::NativeOutputStatus::Serving {},
+                input: super::NativeInputStatus {
+                    phase: super::NativeInputPhase::Open {},
+                    unsettled_commands: 0,
+                    unsettled_request_bytes: 0,
+                    write_blocked: false,
+                    completed_input_bytes: Some(0),
+                    current_size: Some(TerminalSize {
+                        cols: 200,
+                        rows: 87,
+                    }),
+                    active_confirmed_bytes: 0,
+                },
+                terminal_fault: None,
+            }),
             latest_output_bytes: 0,
             durable_output_bytes: None,
             first_available_byte: 0,
@@ -1901,6 +2265,198 @@ mod tests {
                 (RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1),
             ]),
         }
+    }
+
+    #[test]
+    fn generation_20_service_facts_preserve_lifecycle_and_nullable_authority() {
+        use super::{NativeInputPhase, NativeOwnerStatus, NativeServiceFailure};
+
+        assert_eq!(PROTOCOL_VERSION, 20);
+        let mut run = sample_run_info();
+        let service = run.native_service.as_mut().unwrap();
+        service.revision = 7;
+        service.owner = NativeOwnerStatus::Stopped {
+            reason: NativeServiceFailure::OwnerUnwound,
+        };
+        service.input.phase = NativeInputPhase::Unavailable {
+            reason: NativeServiceFailure::ControlClosed,
+        };
+        service.input.completed_input_bytes = None;
+        service.input.current_size = None;
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!(value["state"], serde_json::json!({ "type": "running" }));
+        assert_eq!(
+            value["native_service"]["owner"],
+            serde_json::json!({
+                "type": "stopped", "reason": "owner_unwound"
+            })
+        );
+        assert!(value["native_service"]["input"]["completed_input_bytes"].is_null());
+        assert_eq!(
+            serde_json::from_value::<RunInfo>(value.clone()).unwrap(),
+            run
+        );
+        let event = RunEvent::ServiceChanged {
+            service: run.native_service.unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            serde_json::json!({
+                "type": "service_changed", "service": value["native_service"]
+            })
+        );
+        assert_eq!(
+            decode_frame::<RunEvent>(&encode_frame(&event).unwrap()).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn generation_20_service_observations_cannot_omit_required_nullable_facts() {
+        let value = serde_json::to_value(sample_run_info()).unwrap();
+        let mut missing_service = value.clone();
+        missing_service
+            .as_object_mut()
+            .unwrap()
+            .remove("native_service");
+        assert!(serde_json::from_value::<RunInfo>(missing_service).is_err());
+        for field in [
+            "terminal_fault",
+            "input.completed_input_bytes",
+            "input.current_size",
+        ] {
+            let mut missing = value.clone();
+            let service = missing["native_service"].as_object_mut().unwrap();
+            if field == "terminal_fault" {
+                service.remove(field);
+            } else {
+                service["input"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field.strip_prefix("input.").unwrap());
+            }
+            assert!(
+                serde_json::from_value::<RunInfo>(missing).is_err(),
+                "{field}"
+            );
+        }
+        let mut extra = value;
+        extra["native_service"]["owner"]["healthy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RunInfo>(extra).is_err());
+        let service = serde_json::to_value(sample_run_info()).unwrap()["native_service"].clone();
+        for (lane, status) in [
+            ("owner", "starting"),
+            ("owner", "serving"),
+            ("owner", "draining"),
+            ("output", "pending"),
+            ("output", "serving"),
+            ("output", "backpressured"),
+            ("output", "closed"),
+            ("input", "open"),
+            ("input", "closed"),
+        ] {
+            let mut extra = service.clone();
+            let status_value = serde_json::json!({ "type": status, "healthy": true });
+            if lane == "input" {
+                extra[lane]["phase"] = status_value;
+            } else {
+                extra[lane] = status_value;
+            }
+            assert!(
+                serde_json::from_value::<super::NativeServiceSnapshot>(extra).is_err(),
+                "{lane}:{status}"
+            );
+        }
+        let missing_prefix = serde_json::json!({
+            "error": { "code": "io", "message": "transport result lost" },
+            "disposition": "unknown"
+        });
+        assert!(serde_json::from_value::<ControlFailure>(missing_prefix).is_err());
+    }
+
+    #[test]
+    fn terminal_restore_scrollback_policy_is_required_and_nullable() {
+        let mut value = serde_json::json!({
+            "run_id": sample_run_info().id, "through_byte": 100,
+            "resize_revision": 2, "size": { "rows": 4, "cols": 12 },
+            "restore_size": { "rows": 8, "cols": 12 },
+            "restore_scrollback_rows": null,
+            "resize_after_restore_bytes": 5, "restore_bytes": 9
+        });
+        let null_policy: super::TerminalCheckpointHeader =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(null_policy.restore_scrollback_rows, None);
+        assert_eq!(
+            decode_frame::<super::TerminalCheckpointHeader>(&encode_frame(&null_policy).unwrap())
+                .unwrap(),
+            null_policy
+        );
+        // One history row beyond this example's initial eight-row viewport;
+        // the explicit policy is independent of the visible grid size.
+        value["restore_scrollback_rows"] = serde_json::json!(9);
+        let historical: super::TerminalCheckpointHeader =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(historical.restore_scrollback_rows, Some(9));
+        let mut missing = value.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_scrollback_rows");
+        assert!(serde_json::from_value::<super::TerminalCheckpointHeader>(missing).is_err());
+        for invalid in [serde_json::json!(-1), serde_json::json!(0.1)] {
+            value["restore_scrollback_rows"] = invalid;
+            assert!(
+                serde_json::from_value::<super::TerminalCheckpointHeader>(value.clone()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_wire_requires_sink_errno_and_rejects_foreign_fields() {
+        let mut facts = serde_json::json!({
+            "queue_budget_bytes": 4096, "record_limit_bytes": 1024,
+            "funded_bytes": 0, "formatting_records": 0, "queued_records": 0,
+            "active_record_bytes": 0, "admitted_records": 0,
+            "written_records": 0, "written_bytes": 0, "notice_written_bytes": 0,
+            "dropped_before_encoding_records": 0, "dropped_encoded_records": 0,
+            "discarded_encoded_bytes": 0, "oversized_records": 0,
+            "format_failed_records": 0, "sink_write_failures": 0,
+            "initialization_failures": 1, "partially_written_records": 0,
+            "scoped_panics": 0, "sink": "failed", "last_sink_errno": null,
+            "writer_alive": false, "shutdown_requested": false,
+            "counters_saturated": false
+        });
+        let snapshot: super::DiagnosticsSnapshot = serde_json::from_value(facts.clone()).unwrap();
+        let frame = Response::Diagnostics {
+            diagnostics: snapshot,
+        };
+        assert_eq!(
+            decode_frame::<Response>(&encode_frame(&frame).unwrap()).unwrap(),
+            frame
+        );
+        assert_eq!(
+            encode_frame(&Request::Diagnostics {}).unwrap(),
+            "{\"type\":\"diagnostics\"}"
+        );
+        for key in facts.as_object().unwrap().keys() {
+            let mut missing = facts.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<super::DiagnosticsSnapshot>(missing).is_err(),
+                "{key}"
+            );
+        }
+        for errno in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(0.1),
+        ] {
+            let mut invalid = facts.clone();
+            invalid["last_sink_errno"] = errno;
+            assert!(serde_json::from_value::<super::DiagnosticsSnapshot>(invalid).is_err());
+        }
+        facts["healthy"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<super::DiagnosticsSnapshot>(facts).is_err());
     }
 
     fn malformed_protocol_frames() -> Vec<(String, Vec<u8>)> {
@@ -1943,7 +2499,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_18_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_20_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -1961,7 +2517,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 18,
+                    "protocolGeneration": 20,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {
@@ -2672,6 +3228,7 @@ mod tests {
                         "input capacity is full",
                     ),
                     disposition: CommandDisposition::NotApplied,
+                    confirmed_input_bytes: Some(0),
                 },
             },
         };
@@ -2691,7 +3248,8 @@ mod tests {
                             "code": "control_backpressure",
                             "message": "input capacity is full"
                         },
-                        "disposition": "not_applied"
+                        "disposition": "not_applied",
+                        "confirmed_input_bytes": 0
                     }
                 }
             })
@@ -2719,6 +3277,7 @@ mod tests {
             failure: ControlFailure {
                 error: ProtocolError::new(ErrorCode::Io, "PTY write outcome is unknown"),
                 disposition: CommandDisposition::Unknown,
+                confirmed_input_bytes: None,
             },
         };
         assert_eq!(
@@ -2734,7 +3293,8 @@ mod tests {
                         "code": "io",
                         "message": "PTY write outcome is unknown"
                     },
-                    "disposition": "unknown"
+                    "disposition": "unknown",
+                    "confirmed_input_bytes": null
                 }
             })
         );

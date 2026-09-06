@@ -37,8 +37,43 @@ type WireStream = SplitStream<Wire>;
 const MAX_PENDING_COMMANDS: usize = 64;
 const MAX_PENDING_INPUT_COMMANDS: usize = 32;
 const MAX_PENDING_INPUT_BYTES: usize = 1024 * 1024;
-const MAX_QUEUED_EVENTS: usize = 256;
-const MAX_QUEUED_EVENT_BYTES: usize = 1024 * 1024;
+const MAX_QUEUED_EVENT_BYTES: usize = ctxmux_protocol::MAX_FRAME_BYTES;
+
+/// Per-view operating policy. Payload and envelope allocations have separate
+/// owners, so accounting envelopes does not shrink the accepted payload window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachmentEventLimits {
+    /// Retained Output and tmux-name payload, preserving the existing window.
+    pub payload_bytes: usize,
+    /// Inbox state, actual event-slot capacity, allocation slack and signal text.
+    pub envelope_bytes: usize,
+}
+
+impl Default for AttachmentEventLimits {
+    fn default() -> Self {
+        Self {
+            payload_bytes: MAX_QUEUED_EVENT_BYTES,
+            // One peer-frame-sized envelope operating point, allocated lazily;
+            // this is configurable policy, not an event-population ceiling.
+            envelope_bytes: ctxmux_protocol::MAX_FRAME_BYTES,
+        }
+    }
+}
+
+impl AttachmentEventLimits {
+    pub(super) fn validate(self) -> Result<(), ClientError> {
+        if self.payload_bytes == 0
+            || self.envelope_bytes < std::mem::size_of::<EventInbox>()
+            || self
+                .payload_bytes
+                .checked_add(self.envelope_bytes)
+                .is_none_or(|n| n > isize::MAX as usize)
+        {
+            return Err(ClientError::InvalidAttachmentEventLimits);
+        }
+        Ok(())
+    }
+}
 
 /// Live attachment to one daemon-owned Run.
 pub struct Attachment {
@@ -47,9 +82,14 @@ pub struct Attachment {
 }
 
 impl Attachment {
+    #[cfg(test)]
     pub(super) fn from_wire(wire: Wire) -> Self {
+        Self::from_wire_with_event_limits(wire, AttachmentEventLimits::default())
+    }
+
+    pub(super) fn from_wire_with_event_limits(wire: Wire, limits: AttachmentEventLimits) -> Self {
         let (sink, stream) = wire.split();
-        let shared = Arc::new(AttachmentShared::new());
+        let shared = Arc::new(AttachmentShared::with_event_limits(limits));
         let (writer_tx, writer_rx) = mpsc::channel(MAX_PENDING_COMMANDS);
 
         let reader_shared = Arc::clone(&shared);
@@ -371,12 +411,17 @@ struct AttachmentShared {
 }
 
 impl AttachmentShared {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_event_limits(AttachmentEventLimits::default())
+    }
+
+    fn with_event_limits(limits: AttachmentEventLimits) -> Self {
         Self {
             state: Mutex::new(AttachmentState::default()),
             issue_lock: AsyncMutex::new(()),
             state_changed: Notify::new(),
-            events: EventInbox::new(),
+            events: EventInbox::with_limits(limits),
             reader_abort: OnceLock::new(),
             writer_abort: OnceLock::new(),
         }
@@ -396,6 +441,11 @@ impl AttachmentShared {
         }
         if let Some(reason) = state.fence {
             return Err(ClientError::AttachmentUnavailable { reason });
+        }
+        if self.events.observation_unavailable.load(Ordering::Acquire) {
+            return Err(ClientError::AttachmentUnavailable {
+                reason: AttachmentUnavailableReason::ObservationUnavailable,
+            });
         }
         if state.pending.len() == MAX_PENDING_COMMANDS {
             return Err(ClientError::AttachmentBackpressure {
@@ -451,6 +501,17 @@ impl AttachmentShared {
                 }
                 ControlOutcome::Rejected { failure } => {
                     validate_control_failure(&failure)?;
+                    if let Some(confirmed) = failure.confirmed_input_bytes {
+                        match pending.kind {
+                            PendingKind::Input { expected_bytes }
+                                if confirmed <= expected_bytes => {}
+                            _ => {
+                                return Err(
+                                    "confirmed input prefix exceeds its original input request",
+                                );
+                            }
+                        }
+                    }
                     PendingResolution::Rejected(failure)
                 }
             };
@@ -580,12 +641,23 @@ struct EventInbox {
     state: Mutex<EventInboxState>,
     ready: Notify,
     consumer_active: AtomicBool,
+    limits: AttachmentEventLimits,
+    observation_unavailable: AtomicBool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocalObservationState {
+    Available,
+    LostMarkerPending,
+    LostMarkerDelivered,
 }
 
 struct EventInboxState {
     queue: VecDeque<RunEvent>,
     queued_bytes: usize,
+    envelope_payload_bytes: usize,
     pending_gap: Option<u64>,
+    local_observation: LocalObservationState,
     terminal: Option<RunEvent>,
     saw_terminal: bool,
     saw_observation_discontinuity: bool,
@@ -594,12 +666,19 @@ struct EventInboxState {
 }
 
 impl EventInbox {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_limits(AttachmentEventLimits::default())
+    }
+
+    fn with_limits(limits: AttachmentEventLimits) -> Self {
         Self {
             state: Mutex::new(EventInboxState {
                 queue: VecDeque::new(),
                 queued_bytes: 0,
+                envelope_payload_bytes: 0,
                 pending_gap: None,
+                local_observation: LocalObservationState::Available,
                 terminal: None,
                 saw_terminal: false,
                 saw_observation_discontinuity: false,
@@ -608,12 +687,72 @@ impl EventInbox {
             }),
             ready: Notify::new(),
             consumer_active: AtomicBool::new(false),
+            limits,
+            observation_unavailable: AtomicBool::new(false),
         }
+    }
+
+    fn mark_observation_loss(&self, state: &mut EventInboxState) {
+        state.local_observation = LocalObservationState::LostMarkerPending;
+        state.closed = true;
+        state.error = Some(ClientError::AttachmentObservationUnavailable {
+            payload_bytes: self.limits.payload_bytes,
+            envelope_bytes: self.limits.envelope_bytes,
+        });
+        self.observation_unavailable.store(true, Ordering::Release);
+    }
+
+    fn reserve_slots(
+        &self,
+        state: &mut EventInboxState,
+        additional: usize,
+        payload: usize,
+    ) -> bool {
+        let Some(required) = state.queue.len().checked_add(additional) else {
+            return false;
+        };
+        let Some(extra) = state.envelope_payload_bytes.checked_add(payload) else {
+            return false;
+        };
+        let Some(available) = self
+            .limits
+            .envelope_bytes
+            .checked_sub(std::mem::size_of::<Self>())
+            .and_then(|n| n.checked_sub(extra))
+        else {
+            return false;
+        };
+        let maximum = available / std::mem::size_of::<RunEvent>();
+        if required > maximum || state.queue.capacity() > maximum {
+            return false;
+        }
+        if required > state.queue.capacity() {
+            // Fund amortized requested backing before allocation; when doubling
+            // cannot fit, fund the exact necessary capacity rather than refuse
+            // an otherwise legitimate event. Allocator overhead is measured RSS.
+            let target = state
+                .queue
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(maximum);
+            if state
+                .queue
+                .try_reserve_exact(target - state.queue.len())
+                .is_err()
+            {
+                return false;
+            }
+            if state.queue.capacity() > maximum {
+                return false;
+            }
+        }
+        true
     }
 
     fn push(&self, event: RunEvent) -> Result<(), &'static str> {
         let mut state = lock(&self.state);
-        if state.closed {
+        if state.closed && state.local_observation == LocalObservationState::Available {
             return Err("daemon sent an event after attachment termination");
         }
         if state.saw_terminal {
@@ -628,22 +767,34 @@ impl EventInbox {
             return Err("daemon sent a non-terminal event after observation discontinuity");
         }
 
+        if state.local_observation != LocalObservationState::Available {
+            // Keep validating lifecycle even when this view cannot retain its
+            // observations. Local pressure never makes malformed wire valid.
+            match event {
+                RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => state.saw_terminal = true,
+                RunEvent::ObservationDiscontinuity => state.saw_observation_discontinuity = true,
+                _ => {}
+            }
+            return Ok(());
+        }
+
         match event {
             RunEvent::Output { chunk } => {
                 let latest_output_bytes = chunk.end_byte;
                 let event = RunEvent::Output { chunk };
                 let bytes = event_bytes(&event);
                 if state.pending_gap.is_some()
-                    || state.queue.len() == MAX_QUEUED_EVENTS
                     || state
                         .queued_bytes
                         .checked_add(bytes)
-                        .is_none_or(|total| total > MAX_QUEUED_EVENT_BYTES)
+                        .is_none_or(|total| total > self.limits.payload_bytes)
+                    || !self.reserve_slots(&mut state, 1, event_envelope_payload_bytes(&event))
                 {
                     state.pending_gap =
                         Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
                 } else {
                     state.queued_bytes += bytes;
+                    state.envelope_payload_bytes += event_envelope_payload_bytes(&event);
                     state.queue.push_back(event);
                 }
             }
@@ -653,17 +804,10 @@ impl EventInbox {
                 state.pending_gap = Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
             }
             terminal @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => {
-                state.saw_terminal = true;
-                if state.queue.len() < MAX_QUEUED_EVENTS
-                    && state.pending_gap.is_none()
-                    && state.terminal.is_none()
-                {
-                    state.queue.push_back(terminal);
-                } else if state.terminal.replace(terminal).is_some() {
-                    return Err("daemon sent more than one terminal lifecycle event");
-                }
+                self.retain_terminal(&mut state, terminal);
             }
-            event @ (RunEvent::Tmux { .. }
+            event @ (RunEvent::ServiceChanged { .. }
+            | RunEvent::Tmux { .. }
             | RunEvent::ObservationDiscontinuity
             | RunEvent::Resized { .. }) => {
                 if matches!(&event, RunEvent::ObservationDiscontinuity) {
@@ -671,13 +815,20 @@ impl EventInbox {
                 }
                 let bytes = event_bytes(&event);
                 let required_slots = 1 + usize::from(state.pending_gap.is_some());
-                if state.queue.len().saturating_add(required_slots) > MAX_QUEUED_EVENTS
-                    || state
-                        .queued_bytes
-                        .checked_add(bytes)
-                        .is_none_or(|total| total > MAX_QUEUED_EVENT_BYTES)
+                if state
+                    .queued_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > self.limits.payload_bytes)
+                    || !self.reserve_slots(
+                        &mut state,
+                        required_slots,
+                        event_envelope_payload_bytes(&event),
+                    )
                 {
-                    return Err("bounded event inbox cannot represent a non-output event loss");
+                    self.mark_observation_loss(&mut state);
+                    drop(state);
+                    self.ready.notify_one();
+                    return Ok(());
                 }
                 if let Some(latest_output_bytes) = state.pending_gap.take() {
                     state.queue.push_back(RunEvent::Gap {
@@ -685,12 +836,38 @@ impl EventInbox {
                     });
                 }
                 state.queued_bytes += bytes;
+                state.envelope_payload_bytes += event_envelope_payload_bytes(&event);
                 state.queue.push_back(event);
             }
         }
         drop(state);
         self.ready.notify_one();
         Ok(())
+    }
+
+    fn retain_terminal(&self, state: &mut EventInboxState, terminal: RunEvent) {
+        state.saw_terminal = true;
+        let envelope = event_envelope_payload_bytes(&terminal);
+        if state.pending_gap.is_none()
+            && state.terminal.is_none()
+            && self.reserve_slots(state, 1, envelope)
+        {
+            state.envelope_payload_bytes += envelope;
+            state.queue.push_back(terminal);
+        } else {
+            let backing = state.queue.capacity() * std::mem::size_of::<RunEvent>();
+            let funded = std::mem::size_of::<Self>()
+                .checked_add(backing)
+                .and_then(|n| n.checked_add(state.envelope_payload_bytes))
+                .and_then(|n| n.checked_add(envelope))
+                .is_some_and(|n| n <= self.limits.envelope_bytes);
+            if funded {
+                state.envelope_payload_bytes += envelope;
+                state.terminal = Some(terminal);
+            } else {
+                self.mark_observation_loss(state);
+            }
+        }
     }
 
     fn accepts_clean_eof(&self) -> bool {
@@ -719,6 +896,7 @@ impl EventInbox {
                 let mut state = lock(&self.state);
                 if let Some(event) = state.queue.pop_front() {
                     state.queued_bytes -= event_bytes(&event);
+                    state.envelope_payload_bytes -= event_envelope_payload_bytes(&event);
                     return Ok(Some(event));
                 }
                 if let Some(latest_output_bytes) = state.pending_gap.take() {
@@ -726,7 +904,12 @@ impl EventInbox {
                         latest_output_bytes,
                     }));
                 }
+                if state.local_observation == LocalObservationState::LostMarkerPending {
+                    state.local_observation = LocalObservationState::LostMarkerDelivered;
+                    return Ok(Some(RunEvent::ObservationDiscontinuity));
+                }
                 if let Some(event) = state.terminal.take() {
+                    state.envelope_payload_bytes -= event_envelope_payload_bytes(&event);
                     return Ok(Some(event));
                 }
                 if let Some(error) = state.error.take() {
@@ -758,6 +941,23 @@ impl Drop for EventConsumerGuard<'_> {
     }
 }
 
+fn event_envelope_payload_bytes(event: &RunEvent) -> usize {
+    match event {
+        RunEvent::Output { chunk } => chunk.data.capacity() - chunk.data.len(),
+        RunEvent::Tmux {
+            event: ctxmux_protocol::TmuxRunEvent::SessionRenamed { name },
+        } => name.capacity() - name.len(),
+        RunEvent::Exited {
+            state:
+                ctxmux_protocol::RunState::Exited {
+                    signal: Some(signal),
+                    ..
+                },
+        } => signal.capacity(),
+        _ => 0,
+    }
+}
+
 fn event_bytes(event: &RunEvent) -> usize {
     match event {
         RunEvent::Output { chunk } => chunk.data.len(),
@@ -767,6 +967,7 @@ fn event_bytes(event: &RunEvent) -> usize {
         RunEvent::Exited { .. }
         | RunEvent::Interrupted { .. }
         | RunEvent::Tmux { .. }
+        | RunEvent::ServiceChanged { .. }
         | RunEvent::ObservationDiscontinuity
         | RunEvent::Resized { .. }
         | RunEvent::Gap { .. } => 0,
@@ -836,7 +1037,8 @@ async fn reader_loop(mut stream: WireStream, shared: Arc<AttachmentShared>) {
             ServerFrame::ReplayWindow { .. }
             | ServerFrame::Hello { .. }
             | ServerFrame::Response { .. }
-            | ServerFrame::Attached { .. } => {
+            | ServerFrame::Attached { .. }
+            | ServerFrame::TerminalCheckpointChunk { .. } => {
                 Err("daemon sent a non-attachment frame after attach")
             }
         };
@@ -1007,6 +1209,7 @@ mod tests {
                 command_id,
                 ControlOutcome::Rejected {
                     failure: ControlFailure {
+                        confirmed_input_bytes: None,
                         error: ctxmux_protocol::ProtocolError::new(
                             ctxmux_protocol::ErrorCode::ControlBackpressure,
                             "invalid fixture",
@@ -1025,6 +1228,8 @@ mod tests {
             ))
         ));
     }
+
+    const HISTORICAL_EVENT_COUNT: usize = 256;
 
     #[tokio::test]
     async fn output_overflow_gap_precedes_later_tmux_event() {
@@ -1092,25 +1297,76 @@ mod tests {
         );
 
         let observations = EventInbox::new();
-        for _ in 0..MAX_QUEUED_EVENTS {
+        for _ in 0..=HISTORICAL_EVENT_COUNT {
             observations
                 .push(RunEvent::Tmux {
                     event: TmuxRunEvent::Paused,
                 })
-                .expect("retain bounded non-output observation");
+                .expect("the historical population ceiling is not a capacity contract");
+        }
+        for _ in 0..=HISTORICAL_EVENT_COUNT {
+            assert_eq!(
+                observations.next().await.unwrap(),
+                Some(RunEvent::Tmux {
+                    event: TmuxRunEvent::Paused
+                })
+            );
+        }
+
+        let pressured = EventInbox::with_limits(AttachmentEventLimits {
+            envelope_bytes: std::mem::size_of::<EventInbox>()
+                + HISTORICAL_EVENT_COUNT * std::mem::size_of::<RunEvent>(),
+            ..AttachmentEventLimits::default()
+        });
+        for _ in 0..=HISTORICAL_EVENT_COUNT {
+            pressured
+                .push(RunEvent::Tmux {
+                    event: TmuxRunEvent::Paused,
+                })
+                .unwrap();
+        }
+        assert!(pressured.observation_unavailable.load(Ordering::Acquire));
+        for _ in 0..HISTORICAL_EVENT_COUNT {
+            assert_eq!(
+                pressured.next().await.unwrap(),
+                Some(RunEvent::Tmux {
+                    event: TmuxRunEvent::Paused
+                })
+            );
         }
         assert_eq!(
-            observations.push(RunEvent::Tmux {
-                event: TmuxRunEvent::Paused,
+            pressured.next().await.unwrap(),
+            Some(RunEvent::ObservationDiscontinuity)
+        );
+        assert!(matches!(
+            pressured.next().await,
+            Err(ClientError::AttachmentObservationUnavailable { .. })
+        ));
+        pressured
+            .push(RunEvent::Exited {
+                state: ctxmux_protocol::RunState::Exited {
+                    code: 0,
+                    signal: None,
+                },
+            })
+            .unwrap();
+        assert!(pressured.accepts_clean_eof());
+        assert_eq!(
+            pressured.push(RunEvent::Tmux {
+                event: TmuxRunEvent::Paused
             }),
-            Err("bounded event inbox cannot represent a non-output event loss")
+            Err("daemon sent an event after terminal lifecycle")
         );
     }
 
     #[tokio::test]
     async fn terminal_event_survives_full_output_inbox() {
-        let inbox = EventInbox::new();
-        for start_byte in 0..MAX_QUEUED_EVENTS as u64 {
+        let inbox = EventInbox::with_limits(AttachmentEventLimits {
+            envelope_bytes: std::mem::size_of::<EventInbox>()
+                + HISTORICAL_EVENT_COUNT * std::mem::size_of::<RunEvent>(),
+            ..AttachmentEventLimits::default()
+        });
+        for start_byte in 0..HISTORICAL_EVENT_COUNT as u64 {
             inbox
                 .push(RunEvent::Output {
                     chunk: OutputChunk {
@@ -1119,13 +1375,13 @@ mod tests {
                         data: vec![b'x'],
                     },
                 })
-                .expect("fill event-count bound");
+                .expect("fill explicitly configured backing budget");
         }
         inbox
             .push(RunEvent::Output {
                 chunk: OutputChunk {
-                    start_byte: MAX_QUEUED_EVENTS as u64,
-                    end_byte: MAX_QUEUED_EVENTS as u64 + 1,
+                    start_byte: HISTORICAL_EVENT_COUNT as u64,
+                    end_byte: HISTORICAL_EVENT_COUNT as u64 + 1,
                     data: vec![b'y'],
                 },
             })
@@ -1140,7 +1396,7 @@ mod tests {
             .push(exited.clone())
             .expect("retain terminal event outside the full queue");
 
-        for _ in 0..MAX_QUEUED_EVENTS {
+        for _ in 0..HISTORICAL_EVENT_COUNT {
             assert!(matches!(
                 inbox.next().await.unwrap(),
                 Some(RunEvent::Output { .. })
@@ -1149,7 +1405,7 @@ mod tests {
         assert_eq!(
             inbox.next().await.unwrap(),
             Some(RunEvent::Gap {
-                latest_output_bytes: MAX_QUEUED_EVENTS as u64 + 1
+                latest_output_bytes: HISTORICAL_EVENT_COUNT as u64 + 1
             })
         );
         assert_eq!(inbox.next().await.unwrap(), Some(exited));
@@ -1170,6 +1426,155 @@ mod tests {
         ));
         inbox.close(None);
         assert!(matches!(first.await, Ok(Ok(None))));
+    }
+
+    async fn serve_pressure_input(mut server: Wire, invalid_id: bool) {
+        let line = server.next().await.unwrap().unwrap();
+        let ClientFrame::Input { command_id, data } = decode_frame::<ClientFrame>(&line).unwrap()
+        else {
+            panic!("original command must be Input");
+        };
+        assert_eq!(data, b"abc");
+        for _ in 0..2 {
+            server
+                .send(
+                    encode_frame(&ServerFrame::Event {
+                        event: RunEvent::Tmux {
+                            event: TmuxRunEvent::Paused,
+                        },
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        server
+            .send(
+                encode_frame(&ServerFrame::CommandResult {
+                    command_id: if invalid_id {
+                        AttachmentCommandId::new(command_id.get() + 1).unwrap()
+                    } else {
+                        command_id
+                    },
+                    outcome: ControlOutcome::Accepted {
+                        receipt: ControlReceipt::Input { written_bytes: 3 },
+                    },
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        if !invalid_id {
+            let line = server.next().await.unwrap().unwrap();
+            assert!(matches!(
+                decode_frame::<ClientFrame>(&line).unwrap(),
+                ClientFrame::Detach
+            ));
+            server
+                .send(encode_frame(&ServerFrame::Detached).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn view_pressure_keeps_sent_input_result_and_detach_owner() {
+        for invalid_id in [false, true] {
+            let (client_stream, server_stream) = UnixStream::pair().unwrap();
+            let limits = AttachmentEventLimits {
+                envelope_bytes: std::mem::size_of::<EventInbox>() + std::mem::size_of::<RunEvent>(),
+                ..AttachmentEventLimits::default()
+            };
+            let attachment = Attachment::from_wire_with_event_limits(
+                Framed::new(
+                    client_stream,
+                    LinesCodec::new_with_max_length(ctxmux_protocol::MAX_FRAME_BYTES),
+                ),
+                limits,
+            );
+            let server = Framed::new(
+                server_stream,
+                LinesCodec::new_with_max_length(ctxmux_protocol::MAX_FRAME_BYTES),
+            );
+            let server_task = tokio::spawn(serve_pressure_input(server, invalid_id));
+            let result = timeout(Duration::from_secs(1), attachment.input(b"abc".to_vec()))
+                .await
+                .unwrap();
+            if invalid_id {
+                assert!(matches!(
+                    result,
+                    Err(ClientError::AttachmentCommandUnknown {
+                        reason: AttachmentUnknownReason::ProtocolViolation,
+                        ..
+                    })
+                ));
+            } else {
+                let accepted =
+                    result.expect("view pressure must not destroy a validated sent-input ACK");
+                assert_eq!(accepted.command_id.get(), 1);
+                assert_eq!(accepted.receipt.written_bytes, 3);
+                assert_eq!(
+                    attachment.next_event().await.unwrap(),
+                    Some(RunEvent::Tmux {
+                        event: TmuxRunEvent::Paused
+                    })
+                );
+                assert_eq!(
+                    attachment.next_event().await.unwrap(),
+                    Some(RunEvent::ObservationDiscontinuity)
+                );
+                assert!(matches!(
+                    attachment.next_event().await,
+                    Err(ClientError::AttachmentObservationUnavailable { .. })
+                ));
+                let rejected = attachment
+                    .resize(TerminalSize { rows: 30, cols: 90 })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    rejected,
+                    ClientError::AttachmentUnavailable {
+                        reason: AttachmentUnavailableReason::ObservationUnavailable
+                    }
+                ));
+                assert_eq!(
+                    rejected.control_disposition(),
+                    Some(CommandDisposition::NotApplied)
+                );
+                timeout(Duration::from_secs(1), attachment.detach())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            server_task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unfunded_terminal_signal_exposes_view_loss_without_retaining_heap() {
+        let inbox = EventInbox::with_limits(AttachmentEventLimits {
+            envelope_bytes: std::mem::size_of::<EventInbox>(),
+            ..AttachmentEventLimits::default()
+        });
+        inbox
+            .push(RunEvent::Exited {
+                state: ctxmux_protocol::RunState::Exited {
+                    code: 1,
+                    signal: Some(String::from("SIGTERM")),
+                },
+            })
+            .unwrap();
+        assert!(inbox.accepts_clean_eof());
+        assert_eq!(lock(&inbox.state).envelope_payload_bytes, 0);
+        assert!(lock(&inbox.state).terminal.is_none());
+        assert_eq!(
+            inbox.next().await.unwrap(),
+            Some(RunEvent::ObservationDiscontinuity)
+        );
+        assert!(matches!(
+            inbox.next().await,
+            Err(ClientError::AttachmentObservationUnavailable { .. })
+        ));
     }
 
     #[tokio::test]

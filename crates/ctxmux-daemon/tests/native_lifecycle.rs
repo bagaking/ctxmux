@@ -698,7 +698,10 @@ impl Drop for UnrelatedProcess {
     }
 }
 
-async fn send_request_without_reading_response(client: &Client, request: Request) {
+async fn request_with_unread_response(
+    client: &Client,
+    request: Request,
+) -> Framed<UnixStream, LinesCodec> {
     let stream = UnixStream::connect(client.socket_path())
         .await
         .expect("connect response-loss client");
@@ -726,7 +729,28 @@ async fn send_request_without_reading_response(client: &Client, request: Request
     wire.send(encode_frame(&ClientFrame::Request { request }).expect("encode abandoned request"))
         .await
         .expect("send abandoned request completely");
-    drop(wire);
+    wire
+}
+
+async fn send_request_without_reading_response(client: &Client, request: Request) {
+    drop(request_with_unread_response(client, request).await);
+}
+
+async fn wait_for_applied_input(client: &Client, id: RunId, expected_byte: u64) {
+    timeout(scaled(Duration::from_secs(5)), async {
+        loop {
+            if client
+                .status(id)
+                .await
+                .is_ok_and(|status| status.applied_input_bytes == Some(expected_byte))
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("original Input settles before dropping its unread response connection");
 }
 
 async fn receive_server_frame(
@@ -770,6 +794,35 @@ fn fork_inputs() -> Vec<RunInputReference> {
     .collect()
 }
 
+fn assert_native_service_progress(service: &ctxmux_protocol::NativeServiceSnapshot) {
+    assert!(
+        service.revision > 0,
+        "service events report a real transition"
+    );
+    assert!(
+        !matches!(
+            service.owner,
+            ctxmux_protocol::NativeOwnerStatus::Stopped { .. }
+        ),
+        "shared Native owner must serve this lifecycle: {service:?}"
+    );
+    assert!(
+        !matches!(
+            service.output,
+            ctxmux_protocol::NativeOutputStatus::Unavailable { .. }
+        ),
+        "original output must remain available: {service:?}"
+    );
+    assert!(
+        service.terminal_fault.is_none(),
+        "derived view failed: {service:?}"
+    );
+    assert!(
+        service.input.active_confirmed_bytes <= service.input.unsettled_request_bytes,
+        "a confirmed prefix belongs to actual outstanding input: {service:?}"
+    );
+}
+
 async fn wait_for_output(
     attachment: &mut Attachment,
     observed: &mut Vec<u8>,
@@ -803,6 +856,7 @@ async fn wait_for_output(
                 // a failure -- only the tests that assert a Run is never
                 // resized treat it as one.
                 RunEvent::Resized { .. } => {}
+                RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Interrupted { reason } => {
                     panic!("Run was interrupted before expected output: {reason:?}")
                 }
@@ -830,6 +884,7 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                 // Shared with tests that resize; a confirmed resize is no
                 // more a reason to fail here than an output chunk is.
                 RunEvent::Output { .. } | RunEvent::Resized { .. } => {}
+                RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
@@ -1484,6 +1539,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
                         RunEvent::Gap { latest_output_bytes } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
                         RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                         RunEvent::Resized { .. } => {}
+                        RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                         RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
                         RunEvent::ObservationDiscontinuity => panic!("unexpected non-output observation discontinuity"),
                     }
@@ -1602,6 +1658,7 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
                 // Shared with tests that resize; a confirmed resize is no
                 // more a reason to fail here than an output chunk is.
                 RunEvent::Output { .. } | RunEvent::Resized { .. } => {}
+                RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Gap {
                     latest_output_bytes,
                 } => panic!("unexpected saturation gap at {latest_output_bytes}"),
@@ -1677,6 +1734,7 @@ async fn backward_attachment_command_id_is_fatal_before_input_mutation() {
             request: Request::Attach {
                 id: run.id,
                 after_byte: 0,
+                view: ctxmux_protocol::AttachmentView::Raw,
             },
         })
         .expect("encode raw attach"),
@@ -2606,7 +2664,7 @@ async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
     }
 
     let first_key = InputOperationKey::new("lost-response-input").unwrap();
-    send_request_without_reading_response(
+    let unread_response = request_with_unread_response(
         &daemon.client,
         Request::RecoverableInput {
             operation: RecoverableInput {
@@ -2619,6 +2677,11 @@ async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
         },
     )
     .await;
+    // Keep the original response unread until a second public connection proves
+    // its input completed. Immediate EOF would exercise cancellation, not loss
+    // of an admitted operation's response.
+    wait_for_applied_input(&daemon.client, run.id, 1).await;
+    drop(unread_response);
     let recovered = daemon
         .client
         .recoverable_input(RecoverableInput {
@@ -2714,7 +2777,7 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
     let replay_cursor = last_seq;
 
     let key = InputOperationKey::new("upgrade-lost-response-input").unwrap();
-    send_request_without_reading_response(
+    let unread_response = request_with_unread_response(
         &daemon.client,
         Request::RecoverableInput {
             operation: RecoverableInput {
@@ -2727,21 +2790,11 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         },
     )
     .await;
-    timeout(scaled(Duration::from_secs(5)), async {
-        loop {
-            if daemon
-                .client
-                .status(run.id)
-                .await
-                .is_ok_and(|status| status.applied_input_bytes == Some(1))
-            {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("abandoned Input settles before upgrade");
+    // A sent frame alone does not prove admission: EOF may cancel an unadmitted
+    // control. The second public connection proves the original write completed
+    // while this connection never consumed its response; only then lose it.
+    wait_for_applied_input(&daemon.client, run.id, 1).await;
+    drop(unread_response);
     drop(attachment);
 
     daemon.sighup();
@@ -3032,9 +3085,9 @@ async fn same_epoch_exited_run_has_no_fresh_level_b_authority() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_rejects_generation_12_before_request_dispatch() {
-    assert_eq!(
-        PROTOCOL_VERSION, 18,
-        "fixture must name the current generation"
+    assert_ne!(
+        PROTOCOL_VERSION, 12,
+        "the previous-generation regression must remain incompatible"
     );
     let daemon = TestDaemon::start().await;
     let mut stream = UnixStream::connect(daemon.client.socket_path())
@@ -4551,6 +4604,9 @@ async fn upgrade_preserves_live_run() {
                     assert_eq!(chunk.start_byte, last_seq);
                     last_seq = chunk.end_byte;
                 }
+                Ok(Some(RunEvent::ServiceChanged { service })) => {
+                    assert_native_service_progress(&service);
+                }
                 Ok(Some(RunEvent::Gap {
                     latest_output_bytes,
                 })) => panic!("old attachment observed an output gap at {latest_output_bytes}"),
@@ -5301,7 +5357,8 @@ async fn next_resized_event(
                 .expect("read event while awaiting a resize")
                 .expect("attachment remains live")
             {
-                RunEvent::Resized { size } => return size,
+                RunEvent::Resized { size, .. } => return size,
+                RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Output { chunk } => {
                     assert_eq!(chunk.start_byte, *last_seq);
                     *last_seq = chunk.end_byte;

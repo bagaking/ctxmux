@@ -5,10 +5,16 @@ export {
   CtxmuxInvalidFrameError,
   CtxmuxProtocolError,
   CtxmuxRuntimeIdentityMismatchError,
+  CtxmuxTerminalSeedResourceError,
   CtxmuxUnsupportedCapabilityError,
   createOperationKey,
   inputOperationKey,
 } from "./client.js";
+export { CtxmuxAttachmentObservationUnavailableError } from "./attachment.js";
+export type {
+  AttachmentViewResources,
+  AttachmentViewResourcePolicy,
+} from "./attachment.js";
 export { stopOperationKey } from "./stop-operation.js";
 export type {
   AttachmentControlAccepted,
@@ -21,6 +27,7 @@ export type {
   ResizeReceipt,
   RunPage,
   RuntimeCapabilityRequirements,
+  TerminalSeedLimits,
   SignalReceipt,
   StopReceipt,
 } from "./client.js";
@@ -108,6 +115,14 @@ export type { ForkFidelity } from "./generated/ForkFidelity.js";
 export type { ForkPlan } from "./generated/ForkPlan.js";
 export type { InterruptionReason } from "./generated/InterruptionReason.js";
 export type { InputOperationKey } from "./generated/InputOperationKey.js";
+export type { NativeInputPhase } from "./generated/NativeInputPhase.js";
+export type { NativeInputStatus } from "./generated/NativeInputStatus.js";
+export type { NativeOutputStatus } from "./generated/NativeOutputStatus.js";
+export type { NativeOwnerStatus } from "./generated/NativeOwnerStatus.js";
+export type { NativeServiceFailure } from "./generated/NativeServiceFailure.js";
+export type { NativeServiceSnapshot } from "./generated/NativeServiceSnapshot.js";
+export type { NativeTerminalFault } from "./generated/NativeTerminalFault.js";
+export type { NativeTerminalFaultStage } from "./generated/NativeTerminalFaultStage.js";
 export type { OutputChunk } from "./generated/OutputChunk.js";
 export type { OutputReplay } from "./generated/OutputReplay.js";
 export type { OutputReplayHeader } from "./generated/OutputReplayHeader.js";
@@ -184,3 +199,12 @@ export function defineRun(
     declared_inputs: [...(options.declaredInputs ?? [])],
   };
 }
+
+export type { TerminalContinuation } from "./generated/TerminalContinuation.js";
+export type { TerminalCheckpointHeader } from "./generated/TerminalCheckpointHeader.js";
+export type { TerminalResize } from "./generated/TerminalResize.js";
+export type { AttachmentView } from "./generated/AttachmentView.js";
+export type { TerminalCheckpointUnavailableReason } from "./generated/TerminalCheckpointUnavailableReason.js";
+
+export type { DiagnosticsSnapshot } from "./generated/DiagnosticsSnapshot.js";
+export type { DiagnosticsSinkState } from "./generated/DiagnosticsSinkState.js";

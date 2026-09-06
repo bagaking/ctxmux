@@ -24,7 +24,10 @@ import {
   type RuntimeIdentity,
   type ServerFrame,
 } from "../src/index.ts";
-import { runEventSource } from "../src/attachment.ts";
+import {
+  CtxmuxAttachmentObservationUnavailableError,
+  runEventSource,
+} from "../src/attachment.ts";
 import { validateServerFrame } from "../src/validation.ts";
 import {
   JsonLinesConnection,
@@ -119,6 +122,7 @@ test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
         type: "attach",
         id: RUN_ID,
         after_byte: Number.MAX_SAFE_INTEGER,
+        view: "raw",
       },
     });
     peer.send({
@@ -541,11 +545,12 @@ test("SC-02 rejects malformed nested runtime frames", () => {
           type: "control_rejected",
           failure: {
             error: { code: "control_backpressure", message: "full" },
-            disposition: "unknown",
+            disposition: "not_applied",
+            confirmed_input_bytes: 1,
           },
         },
       },
-      "$frame.response.failure.disposition",
+      "$frame.response.failure.confirmed_input_bytes",
     ],
     [
       {
@@ -918,6 +923,7 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
         failure: {
           error: { code: "control_backpressure", message: "full" },
           disposition: "not_applied",
+          confirmed_input_bytes: null,
         },
       },
     },
@@ -976,6 +982,7 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
         failure: {
           error: { code: "invalid_run_state", message: "terminal" },
           disposition: "not_applied",
+          confirmed_input_bytes: null,
         },
       },
     },
@@ -1285,6 +1292,21 @@ test("SC-02 rejects surplus keys on every closed wire shape", () => {
           run: {
             ...native,
             current_size: { ...native.current_size, ...surplus },
+            native_service: {
+              revision: 0,
+              owner: { type: "serving" as const },
+              output: { type: "serving" as const },
+              input: {
+                phase: { type: "open" as const },
+                unsettled_commands: 0,
+                unsettled_request_bytes: 0,
+                write_blocked: false,
+                completed_input_bytes: 0,
+                current_size: { cols: 200, rows: 87 },
+                active_confirmed_bytes: 0,
+              },
+              terminal_fault: null,
+            },
           },
         },
       },
@@ -1466,7 +1488,7 @@ test("initial replay discards stale assembly when the retained floor advances", 
       await peer.handshake();
       assert.deepEqual(await peer.receive(), {
         type: "request",
-        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+        request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
       });
       peer.send({
         type: "attached",
@@ -1553,7 +1575,7 @@ test("initial replay refuses a stale floor or a changed captured head", async (c
       await peer.handshake();
       assert.deepEqual(await peer.receive(), {
         type: "request",
-        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+        request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
       });
       peer.send({
         type: "attached",
@@ -1596,7 +1618,7 @@ test("LP-02 reassembles retained replay streamed across bounded frames", async (
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_byte: 0 },
+      request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
     });
     peer.send({
       type: "attached",
@@ -1703,7 +1725,7 @@ test("LP-02 settles a truncated empty replay without inventing a byte range", as
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_byte: 0 },
+      request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
     });
     peer.send({
       type: "attached",
@@ -1733,7 +1755,7 @@ test("LP-02 resumes after a retained source gap from the caller cursor", async (
     await peer.handshake();
     assert.deepEqual(await peer.receive(), {
       type: "request",
-      request: { type: "attach", id: RUN_ID, after_byte: 2 },
+      request: { type: "attach", id: RUN_ID, after_byte: 2, view: "raw" },
     });
     peer.send({
       type: "attached",
@@ -1838,6 +1860,7 @@ test("T-013 correlates out-of-order attachment controls with typed receipts", as
         failure: {
           error: { code: "io", message: "owner result lost" },
           disposition: "unknown",
+          confirmed_input_bytes: null,
         },
       },
     });
@@ -2181,6 +2204,7 @@ test("T-013 preserves short-control receipts, rejections, and lost-response disp
           failure: {
             error: { code: "invalid_run_state", message: "terminal" },
             disposition: "not_applied",
+            confirmed_input_bytes: null,
           },
         },
       });
@@ -2265,6 +2289,7 @@ test("recoverable Stop sends the exact retained operation and exposes conflicts"
               message: "key retained for another Run",
             },
             disposition: "not_applied",
+            confirmed_input_bytes: null,
           },
         },
       });
@@ -2333,6 +2358,8 @@ test("recoverable Stop composite carries intent before terminal attachment EOF",
       peer.send({
         type: "attached",
         snapshot: {
+          terminal: { type: "not_requested" },
+          resize_revision: 0,
           run: terminalRun,
           replay: {
             first_available_byte: 0,
@@ -2365,6 +2392,7 @@ test("recoverable Stop composite carries intent before terminal attachment EOF",
               message: "operation belongs to another daemon",
             },
             disposition: "not_applied",
+            confirmed_input_bytes: null,
           },
         },
       });
@@ -2372,6 +2400,8 @@ test("recoverable Stop composite carries intent before terminal attachment EOF",
       peer.send({
         type: "attached",
         snapshot: {
+          terminal: { type: "not_requested" },
+          resize_revision: 0,
           run: terminalRun,
           replay: {
             first_available_byte: 0,
@@ -2390,6 +2420,7 @@ test("recoverable Stop composite carries intent before terminal attachment EOF",
               message: "already terminal",
             },
             disposition: "not_applied",
+            confirmed_input_bytes: null,
           },
         },
       });
@@ -2473,7 +2504,7 @@ test(
       await peer.handshake();
       assert.deepEqual(await peer.receive(), {
         type: "request",
-        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+        request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
       });
       peer.send({ type: "attached", snapshot: attachedHeader() });
       assert.deepEqual(await peer.receive(), { type: "detach" });
@@ -2594,6 +2625,7 @@ test(
 
     const attachment = await new CtxmuxClient({
       socketPath: daemon.socketPath,
+      attachmentViewResources: { payloadBytes: 256 },
     }).attach(RUN_ID);
     assert.deepEqual(await attachment.stop(stopOperation()), {
       commandId: 1,
@@ -2670,7 +2702,7 @@ test(
       await peer.handshake();
       assert.deepEqual(await peer.receive(), {
         type: "request",
-        request: { type: "attach", id: RUN_ID, after_byte: 0 },
+        request: { type: "attach", id: RUN_ID, after_byte: 0, view: "raw" },
       });
       peer.send({ type: "attached", snapshot: attachedHeader() });
       await peer.sendWithBackpressure(firstFrame);
@@ -2703,7 +2735,7 @@ test(
   },
 );
 
-test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturation", async (context) => {
+test("SDK-02 preserves Gap, tmux, later output, and terminal order across saturation", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
     await peer.handshake();
@@ -2753,6 +2785,7 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
 
   const attachment = await new CtxmuxClient({
     socketPath: daemon.socketPath,
+    attachmentViewResources: { payloadBytes: 256 },
   }).attach(RUN_ID);
   await delay(50);
   assert.equal((await attachment.nextEvent())?.type, "output");
@@ -2777,8 +2810,8 @@ test("SDK-02 preserves Gap, tmux, later Gap, and terminal order across saturatio
     event: { type: "paused" },
   });
   assert.deepEqual(await attachment.nextEvent(), {
-    type: "gap",
-    latest_output_bytes: 258,
+    type: "output",
+    chunk: { start_byte: 257, end_byte: 258, data: new Uint8Array([66]) },
   });
   assert.deepEqual(await attachment.nextEvent(), {
     type: "exited",
@@ -2870,15 +2903,23 @@ test(
           },
         },
       });
+      assert.deepEqual(await peer.receive(), stopFrame(1));
+      peer.send({
+        type: "command_result",
+        command_id: 1,
+        outcome: {
+          type: "accepted",
+          receipt: { type: "stop", disposition: "graceful" },
+        },
+      });
     });
 
     const attachment = await new CtxmuxClient({
       socketPath: daemon.socketPath,
     }).attach(RUN_ID);
-    await assert.rejects(
-      settleWithin(attachment.stop(stopOperation()), 2_000),
-      (error: unknown) =>
-        error instanceof CtxmuxCommandError && error.disposition === "unknown",
+    assert.equal(
+      (await settleWithin(attachment.stop(stopOperation()), 2_000)).commandId,
+      1,
     );
     for (let index = 0; index < 2; index += 1) {
       const event = await attachment.nextEvent();
@@ -2893,13 +2934,15 @@ test(
     await assert.rejects(
       attachment.nextEvent(),
       (error: unknown) =>
-        error instanceof CtxmuxInvalidFrameError &&
-        error.path === "$frame.event",
+        error instanceof CtxmuxAttachmentObservationUnavailableError &&
+        error.resource === "payload_bytes" &&
+        error.lostEvents === 1,
     );
+    attachment.close();
   },
 );
 
-test("SDK-02 fails closed rather than dropping saturated non-output events", async (context) => {
+test("SDK-02 reports configured metadata pressure without pretending a wire violation", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
     await peer.handshake();
@@ -2915,6 +2958,13 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
 
   const attachment = await new CtxmuxClient({
     socketPath: daemon.socketPath,
+    attachmentViewResources: {
+      envelopeBytes:
+        256 *
+        Buffer.byteLength(
+          JSON.stringify({ type: "tmux", event: { type: "paused" } }),
+        ),
+    },
   }).attach(RUN_ID);
   await delay(50);
   for (let expected = 1; expected <= 256; expected += 1) {
@@ -2926,8 +2976,10 @@ test("SDK-02 fails closed rather than dropping saturated non-output events", asy
   await assert.rejects(
     attachment.nextEvent(),
     (error: unknown) =>
-      error instanceof CtxmuxInvalidFrameError && error.path === "$frame.event",
+      error instanceof CtxmuxAttachmentObservationUnavailableError &&
+      error.lostEvents === 1,
   );
+  attachment.close();
 });
 
 test("SDK-02 treats observation discontinuity EOF as a clean attachment end", async (context) => {
@@ -2952,24 +3004,34 @@ test("SDK-02 treats observation discontinuity EOF as a clean attachment end", as
   assert.equal(await attachment.nextEvent(), undefined);
 });
 
-test("SDK-02 surfaces a confirmed resize and keeps it out of the byte budget", async (context) => {
+test("SDK-02 funds confirmed resize metadata separately from binary payload", async (context) => {
   const daemon = await mockDaemon(context, async (socket) => {
     const peer = new MockPeer(socket);
     await peer.handshake();
     await peer.receive();
     peer.send({ type: "attached", snapshot: attachedHeader() });
-    // A resize carries dimensions, not payload, so it weighs zero against the
-    // byte budget: a full queue's worth must fit where even one large output
-    // chunk would not.
+    // Resize dimensions consume the independent logical envelope window,
+    // without displacing the accepted binary payload window. 256 is retained
+    // here as a historical workload example, not a production event ceiling.
     for (let sequence = 1; sequence <= 256; sequence += 1) {
       peer.send({
         type: "event",
-        event: { type: "resized", size: { cols: 100 + sequence, rows: 87 } },
+        event: {
+          type: "resized",
+          size: { cols: 100 + sequence, rows: 87 },
+          through_byte: 0,
+          resize_revision: sequence,
+        },
       });
     }
     peer.send({
       type: "event",
-      event: { type: "resized", size: { cols: 0, rows: 87 } },
+      event: {
+        type: "resized",
+        size: { cols: 0, rows: 87 },
+        through_byte: 0,
+        resize_revision: 257,
+      },
     });
   });
 
@@ -2981,6 +3043,8 @@ test("SDK-02 surfaces a confirmed resize and keeps it out of the byte budget", a
     assert.deepEqual(await attachment.nextEvent(), {
       type: "resized",
       size: { cols: 100 + sequence, rows: 87 },
+      through_byte: 0,
+      resize_revision: sequence,
     });
   }
   // The owner never publishes a zero read-back, so a zero on the wire is a
@@ -3037,6 +3101,263 @@ async function testRequestClose(
   }).status(RUN_ID);
   await assert.rejects(settleWithin(operation, 1_000), WireClosedError);
 }
+
+// Held-out metadata workload: the old 256 population cap was an implementation
+// characterization. Logical envelopes, including empty events, now own a budget.
+test("SDK view retains more than 256 ServiceChanged, resize and empty events", async (context) => {
+  const count = 1000;
+  const events: ServerFrame[] = [];
+  for (let revision = 1; revision <= count; revision += 1) {
+    events.push({
+      type: "event",
+      event: {
+        type: "service_changed",
+        service: { ...runInfo().native_service, revision },
+      },
+    });
+    events.push({
+      type: "event",
+      event: {
+        type: "resized",
+        size: { cols: 80, rows: 24 },
+        through_byte: 0,
+        resize_revision: revision,
+      },
+    });
+    events.push({
+      type: "event",
+      event: { type: "tmux", event: { type: "paused" } },
+    });
+  }
+  const envelopeBytes = events.reduce(
+    (sum, frame) =>
+      sum +
+      (frame.type === "event"
+        ? Buffer.byteLength(JSON.stringify(frame.event))
+        : 0),
+    0,
+  );
+  assert.ok(envelopeBytes < MAX_FRAME_BYTES);
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), {
+      type: "input",
+      command_id: 1,
+      data: [65],
+    });
+    for (const frame of events) await peer.sendWithBackpressure(frame);
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "input", written_bytes: 1 },
+      },
+    });
+    assert.deepEqual(await peer.receive(), { type: "detach" });
+    peer.send({ type: "detached" });
+  });
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+  }).attach(RUN_ID);
+  assert.equal((await attachment.input("A")).receipt.written_bytes, 1);
+  for (const frame of events) {
+    if (frame.type !== "event") throw new Error("fixture frame must be event");
+    const event = await attachment.nextEvent();
+    assert.deepEqual(event, frame.event);
+    assert.equal(
+      event === undefined ? undefined : runEventSource(event),
+      RUN_ID,
+    );
+  }
+  await attachment.detach();
+  assert.equal(await attachment.nextEvent(), undefined);
+});
+
+test("SDK view pressure preserves admitted ACKs, rejects new effects, and permits Detach", async (context) => {
+  const service = {
+    type: "service_changed" as const,
+    service: { ...runInfo().native_service, revision: 1 },
+  };
+  const budget = Buffer.byteLength(JSON.stringify(service));
+  const daemon = await mockDaemon(context, async (socket) => {
+    const peer = new MockPeer(socket);
+    await peer.handshake();
+    await peer.receive();
+    peer.send({ type: "attached", snapshot: attachedHeader() });
+    assert.deepEqual(await peer.receive(), {
+      type: "input",
+      command_id: 1,
+      data: [65, 66],
+    });
+    assert.deepEqual(await peer.receive(), {
+      type: "resize",
+      command_id: 2,
+      size: { cols: 90, rows: 25 },
+    });
+    peer.send({ type: "event", event: service });
+    peer.send({
+      type: "event",
+      event: { ...service, service: { ...service.service, revision: 2 } },
+    });
+    peer.send({
+      type: "event",
+      event: {
+        type: "output",
+        chunk: { start_byte: 0, end_byte: 3, data: new Uint8Array([1, 2, 3]) },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 2,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "resize", applied_size: { cols: 90, rows: 25 } },
+      },
+    });
+    peer.send({
+      type: "command_result",
+      command_id: 1,
+      outcome: {
+        type: "accepted",
+        receipt: { type: "input", written_bytes: 2 },
+      },
+    });
+    // Any erroneously sent new control makes this exact wire assertion fail.
+    assert.deepEqual(await peer.receive(), { type: "detach" });
+    peer.send({ type: "detached" });
+  });
+  const attachment = await new CtxmuxClient({
+    socketPath: daemon.socketPath,
+    attachmentViewResources: { envelopeBytes: budget },
+  }).attach(RUN_ID);
+  const input = attachment.input("AB");
+  const resize = attachment.resize({ cols: 90, rows: 25 });
+  assert.equal((await resize).commandId, 2);
+  assert.equal((await input).receipt.written_bytes, 2);
+  assert.deepEqual(await attachment.nextEvent(), service);
+  let marker: CtxmuxAttachmentObservationUnavailableError | undefined;
+  await assert.rejects(attachment.nextEvent(), (error) => {
+    if (!(error instanceof CtxmuxAttachmentObservationUnavailableError))
+      return false;
+    marker = error;
+    assert.equal(error.runId, RUN_ID);
+    assert.equal(error.resource, "envelope_bytes");
+    assert.equal(error.retainedEnvelopeBytes, budget);
+    assert.equal(error.retainedPayloadBytes, 0);
+    assert.equal(error.lostEvents, 2);
+    assert.equal(error.lostOutputBytes, 3);
+    assert.equal(error.lossCountersSaturated, false);
+    assert.equal(error.recovery, "detach_and_reattach");
+    return true;
+  });
+  for (const command of [
+    attachment.input([256] as unknown as Uint8Array),
+    attachment.resize({ cols: 80, rows: 24 }),
+    attachment.interrupt(),
+    attachment.stop(stopOperation()),
+  ]) {
+    await assert.rejects(
+      command,
+      (error) =>
+        error instanceof CtxmuxCommandError &&
+        error.code === "control_backpressure" &&
+        error.disposition === "not_applied" &&
+        error.commandId === undefined,
+    );
+  }
+  await attachment.detach();
+  await assert.rejects(
+    attachment.resize({ cols: 80, rows: 24 }),
+    (error) =>
+      error instanceof CtxmuxCommandError &&
+      error.disposition === "not_applied",
+  );
+  await assert.rejects(attachment.nextEvent(), (error) => error === marker);
+});
+
+for (const violation of [
+  "unknown_id",
+  "wrong_receipt",
+  "malformed_event",
+] as const) {
+  test(`SDK keeps strict ${violation} validation after local view pressure`, async (context) => {
+    const daemon = await mockDaemon(context, async (socket) => {
+      const peer = new MockPeer(socket);
+      await peer.handshake();
+      await peer.receive();
+      peer.send({ type: "attached", snapshot: attachedHeader() });
+      await peer.receive();
+      peer.send({
+        type: "event",
+        event: { type: "tmux", event: { type: "paused" } },
+      });
+      if (violation === "malformed_event") {
+        peer.sendRaw(
+          Buffer.from(
+            JSON.stringify({
+              type: "event",
+              event: {
+                type: "resized",
+                size: { cols: 0, rows: 24 },
+                through_byte: 0,
+                resize_revision: 1,
+              },
+            }) + "\n",
+          ),
+        );
+      } else {
+        peer.send({
+          type: "command_result",
+          command_id: violation === "unknown_id" ? 2 : 1,
+          outcome: {
+            type: "accepted",
+            receipt: { type: "signal", signal: "interrupt" },
+          },
+        });
+      }
+    });
+    const attachment = await new CtxmuxClient({
+      socketPath: daemon.socketPath,
+      attachmentViewResources: { envelopeBytes: 0 },
+    }).attach(RUN_ID);
+    await assert.rejects(
+      attachment.input("A"),
+      (error) =>
+        error instanceof CtxmuxCommandError && error.disposition === "unknown",
+    );
+    await assert.rejects(
+      attachment.nextEvent(),
+      (error) => error instanceof CtxmuxInvalidFrameError,
+    );
+    attachment.close();
+  });
+}
+
+test("SDK validates configurable logical view policies", () => {
+  for (const value of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1]) {
+    for (const field of ["payloadBytes", "envelopeBytes"]) {
+      assert.throws(
+        () =>
+          new CtxmuxClient({
+            socketPath: "fixture.sock",
+            attachmentViewResources: { [field]: value },
+          }),
+        TypeError,
+      );
+    }
+  }
+  assert.doesNotThrow(
+    () =>
+      new CtxmuxClient({
+        socketPath: "fixture.sock",
+        attachmentViewResources: { payloadBytes: 0, envelopeBytes: 0 },
+      }),
+  );
+});
 
 class MockPeer {
   readonly #socket: Socket;
@@ -3176,6 +3497,21 @@ function runInfo() {
     // fixture that echoed the spec would accept a client that read the wrong
     // one.
     current_size: { cols: 200, rows: 87 },
+    native_service: {
+      revision: 0,
+      owner: { type: "serving" as const },
+      output: { type: "serving" as const },
+      input: {
+        phase: { type: "open" as const },
+        unsettled_commands: 0,
+        unsettled_request_bytes: 0,
+        write_blocked: false,
+        completed_input_bytes: 0,
+        current_size: { cols: 200, rows: 87 },
+        active_confirmed_bytes: 0,
+      },
+      terminal_fault: null,
+    },
   };
 }
 
@@ -3235,11 +3571,14 @@ function tmuxRunInfo() {
     pid: pane.pane_pid,
     applied_input_bytes: null,
     current_size: null,
+    native_service: null,
   };
 }
 
 function attachedHeader(headSequence = 0) {
   return {
+    terminal: { type: "not_requested" as const },
+    resize_revision: 0,
     run: {
       ...runInfo(),
       latest_output_bytes: headSequence,

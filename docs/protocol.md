@@ -1,4 +1,4 @@
-# Local Protocol Generation 18
+# Local Protocol Generation 20
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -656,13 +656,40 @@ source itself could not provide a continuous raw stream.
 `ObservationDiscontinuity` is a separate, cursor-free fail-closed marker: one
 or more non-output observations did not reach this attachment, and byte replay
 cannot reconstruct their meaning. The daemon's private live-event stamp
-distinguishes output-only broadcast lag from lag that crossed tmux observations;
-it is delivery metadata, not a durable journal or a public event sequence. The
-daemon ends that attachment after the marker (or after one authoritative
-terminal event when the Run is already terminal). A new attachment establishes
-a new observation boundary; it does not claim to recover prior tmux events.
-First-party clients retain this marker as a non-output event and close rather
-than silently dropping it when their bounded local queue cannot represent it.
+distinguishes output-only broadcast lag from lag that crossed Native service or
+tmux observations; it is delivery metadata, not a durable journal or a public
+event sequence. The marker ends live observation delivery. It does not cancel
+an admitted command or release its upgrade ownership: the connection retains
+its pending command results through their real send and flush before closing.
+Unadmitted commands are cancelled with explicit effect dispositions and their
+funding is retained through refusal delivery, then released. An unexamined
+recoverable Stop remains unknown because its key may already name an operation.
+Further controls on that view explicitly require reattachment; they do not
+claim that the Run or Backend died. An authoritative terminal event also waits
+for pending command results. EOF or Detach retains its existing transport and
+admitted-owner semantics. A new attachment establishes a new observation
+boundary; it does not claim to recover prior non-output observations.
+Local client view pressure is separate from malformed protocol and transport
+failure. The Rust client drains its retained ordered observations, then exposes
+a local discontinuity and `AttachmentObservationUnavailable`. It keeps the
+reader and already sent command results alive, validates every later receipt
+and lifecycle frame, and allows clean Detach. New controls fail locally with
+`ObservationUnavailable` and `NotApplied`; reattachment establishes a fresh
+observation boundary. A local pressure marker does not assert a daemon failure,
+child exit, or recovery of the lost non-output observations. Output-only
+pressure still reports an exact `Gap` rather than hiding bytes.
+
+Rust `Client::with_attachment_event_limits` configures independent
+`AttachmentEventLimits.payload_bytes` and `envelope_bytes` for each attachment.
+Both default to one protocol-frame-sized operating window (1 MiB), allocated
+lazily. Envelope accounting covers inbox state, retained event-slot capacity,
+allocation slack and signal text. Its separate budget preserves the previously
+accepted 1 MiB payload window; it does increase the maximum funded view backing
+relative to the old 256-event envelope ceiling. Multiple attachments multiply
+that possible cost. Allocator headers, initial snapshots, transport parsing,
+application-owned returned events, and total process RSS need separate funding
+or measurement; these limits do not claim a whole-process memory bound. The
+historical 256-event count is a regression workload, not production capacity.
 
 Imported tmux replay begins at the Control Mode import boundary. The initial
 replay is therefore `truncated` even when no retained chunk has been evicted.
@@ -790,12 +817,12 @@ write, while later attachment commands receive an explicit retryable
 `backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
-fail-stop. The schema-v5 handoff manifest carries the complete established
+fail-stop. The schema-v6 handoff manifest carries the complete established
 resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
 preflighted before extraction. Known persistence failure rejects upgrade before
 target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellation
-and exec serialize through one final gate. Protocol generation 18 has no upgrade
+and exec serialize through one final gate. Protocol generation 20 has no upgrade
 wire operation.
 
 A valid store at its configured main-database page ceiling reclaims bounded oldest
@@ -838,8 +865,8 @@ same-owner `0600` database/WAL/SHM/lock/replay files, and a process-lifetime
 exclusive state lock. Exact schema version, SQLite integrity, typed JSON, a
 required native `RunSpec` satisfying the live-start semantic rules, lifecycle,
 lineage, cursor, contiguous chunk and byte-accounting invariants are
-validated against the schema-5 format envelope before the socket is published.
-Schema 5 stores the Runtime UUID and active replay generation in `runtime_meta`;
+validated against the schema-6 format envelope before the socket is published.
+Schema 6 stores the Runtime UUID and active replay generation in `runtime_meta`;
 bounded, restartable startup transactions reconcile prior running rows, preserve
 valid retained history under the configured policy, remove
 orphan replay generations, truncate uncommitted tails, and finish
@@ -894,3 +921,110 @@ suffix. A window emptied through the head completes initial replay immediately.
 Live `Gap.latest_output_bytes` retains its existing meaning and is never used
 as an initial replay floor. Both Rust and TypeScript clients implement this
 generation; older clients fail the Hello version fence.
+
+## Native service facts and uncertain input
+
+Generation 20 joins durable replay pagination with Basic VT continuation and
+real Native owner observations. Every `RunInfo` has required nullable
+`native_service`: imported tmux Runs report null; Native and historical Runs
+report a revisioned owner/output/input/terminal-fault snapshot. `running` remains
+child lifecycle. It is not evidence that input, output or the derived view can
+serve an operation. Existing attachments receive `service_changed` with strictly
+increasing revisions beyond their initial snapshot.
+
+The snapshot names starting/serving/draining/stopped ownership, pending/serving/
+backpressured/closed/unavailable output, and open/closed/unavailable input.
+Input observations retain whole-command completed bytes, the active command's
+confirmed prefix, unsettled command/payload counts, actual write blocking and
+confirmed geometry. Owner loss immediately invalidates service availability;
+it cannot invent child exit, PID replacement or a successful input result.
+Historical recovery reports no live input or PTY size. A local terminal failure
+reports its process/resize/export/recovery stage and original byte fence while
+raw transport and unrelated Runs retain their own service facts.
+
+Every `ControlFailure` includes required nullable `confirmed_input_bytes`.
+A non-null value is a known applied prefix of that original input request,
+including zero; it never turns an uncertain result into success or permission
+to replay the suffix. `not_applied` cannot report a positive prefix. An unknown
+recoverable-ledger lookup may carry `control_backpressure`; error code alone
+never determines effect disposition. Same-key recovery still compares the exact
+original request and daemon instance.
+
+Public control admission waits for actual owner unlock without blocking Tokio
+workers. Disconnect cancels an unadmitted input/resize/signal; an operation
+already admitted remains owned by the daemon. On one attachment, frame order
+orders admission; receipts may complete independently. Recoverable Stop binds
+its funded key before its daemon-owned admission and settlement, outside the
+Registry lock. Temporary lock contention is not a successful operation or a
+population ceiling.
+
+## Basic VT restore geometry
+
+A Terminal attachment streams synthetic checkpoint bytes separately from raw
+output. The required header binds Run, original byte fence, revision, total seed
+length, actual `size`, initial `restore_size`, prefix split
+`resize_after_restore_bytes`, and nullable `restore_scrollback_rows`.
+The prefix may require a temporary emulator-history policy to express a real
+retained incoming-wrap relation after its predecessor was evicted. This policy
+is restore metadata, not a permanent reduction in user history capacity.
+
+A compatible fresh virtual emulator applies initial restore geometry and the
+optional temporary policy, writes the prefix through its completion callback,
+restores its original history policy, resizes to the actual source geometry,
+then writes the final suffix. Only then may it consume original live bytes and
+ordered resize fences. Synthetic bytes never advance raw byte cursors.
+Checkpoint frames must fit the actual JSON envelope, largest legal offset and
+padded base64 string: each complete group of three payload bytes needs four
+encoded bytes. The largest whole padded group that fits the remaining envelope
+sets one frame's payload; it does not impose a total checkpoint capacity.
+
+Client receive policy is separate from checkpoint validity. Rust
+`TerminalSeedLimits.restore_bytes` and SDK `terminalSeedLimits.restoreBytes`
+select a per-seed decoded assembly allowance; the default preserves the former
+32 MiB receive window. A valid larger seed is local resource pressure under that
+policy, not a daemon protocol violation. Callers may configure another allowance
+without changing the wire format. Wrong Run, byte fences, geometry, revisions,
+chunk offsets and exact total length remain structural errors. Host length or
+allocation failures are separate local resource errors. There is no extra
+1,024-entry resize syntax ceiling; the actual header frame remains bounded.
+
+The allowance limits one assembly's advertised decoded payload. Returned
+snapshots are caller-owned, and concurrent requests, copies, allocator overhead,
+V8 heap and total process RSS are not aggregate-funded by this option. No
+Terminal request silently downgrades to Raw on refusal. The daemon's own export,
+retention and recovery policy still requires independent resource qualification.
+
+The physical CLI uses Basic VT only when it can express the declared geometry
+and policy. Otherwise it explicitly opens a public Raw view and reports that
+prior terminal state is unverified. It does not resize the user's physical
+terminal or present an unsupported reconstruction as faithful restoration.
+Full xterm extension fidelity and unfinished parser carry remain unsupported.
+Private owner and consumer receipts qualify particular sequences; the complete
+joined recovery/resource/AgentMux acceptance remains open.
+
+## Diagnostic sink observations
+
+`diagnostics {}` returns a typed process-owned `DiagnosticsSnapshot`, also
+available through the Rust client, SDK and CLI. It reports configured byte
+budgets, actual funded/queued/formatting/active work, admissions, written and
+refused records, discarded encoded bytes, incomplete records, scoped panics,
+writer state, initialization/write failures, optional errno and counter
+saturation. Concurrent counters are observations, not an atomic accounting
+transaction or Run-health proof.
+
+One diagnostic writer owns a close-on-exec duplicate of stderr above standard
+stdio descriptors. Producers format only funded work and never wait for the
+sink. The writer retains a partially written record's suffix and funding;
+WouldBlock waits on that writer's readiness path without changing inherited
+file flags. A hard sink failure is observable and does not retire the PTY
+owner. Shutdown never joins a blocked diagnostic writer. Caught owner unwinds
+use a scoped hook so reporting the failure cannot itself block on full stderr;
+unrelated panic-hook behavior remains unchanged.
+
+## Pre-stable format fence
+
+This candidate uses SQLite schema 6 and handoff schema 6. Valid schema-5 stores
+are explicitly unsupported, not corrupt. There is no implicit migration or
+fallback. A protocol-18 daemon and protocol-20 client cannot be mixed merely
+because their Run identifiers or executable names match. A deployment needs
+one exact source/binary/SDK contract and its declared recovery evidence.

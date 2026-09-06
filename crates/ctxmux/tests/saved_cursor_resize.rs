@@ -165,3 +165,14 @@ fn restore_bounds_the_absolute_saved_row_without_adding_origin_twice() {
     assert_eq!(parser.screen().cursor_position(), (4, 3));
     assert_eq!(parser.screen().cell(4, 2).unwrap().contents(), "Y");
 }
+
+#[test]
+fn plain_alternate_switch_preserves_saved_origin_register() {
+    let mut parser = Parser::new(24, 80, 0);
+    parser.process(
+        b"\x1b[?47h\x1b[2;4r\x1b[?6h\x1b7\x1b[?6l\x1b[?47l\x1b[?47h\x1b[2;4r\x1b8\x1b[1;1HX",
+    );
+    assert_eq!(parser.screen().cursor_position(), (1, 1));
+    assert_eq!(parser.screen().cell(1, 0).unwrap().contents(), "X");
+    assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "");
+}

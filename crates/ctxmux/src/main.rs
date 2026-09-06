@@ -2,8 +2,10 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    future::Future,
     io::{self, IsTerminal, Read, Write},
     path::PathBuf,
+    pin::Pin,
     process::ExitCode,
     str::FromStr,
     thread,
@@ -14,15 +16,14 @@ use ctxmux_client::{Client, replay_bytes};
 use ctxmux_protocol::{
     CreateOperationKey, DaemonInstanceId, ForkFidelity, ForkPlan, PROTOCOL_VERSION,
     RecoverableStop, RunBackendKind, RunEvent, RunId, RunInfo, RunSpec, RunState, RunSummary,
-    StopDisposition, StopOperationKey, TerminalSize,
+    StopDisposition, StopOperationKey, TerminalContinuation, TerminalSize,
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
-    sync::mpsc,
+    sync::{mpsc, oneshot},
 };
 
 mod daemon;
-mod screen;
 
 fn usage() -> &'static str {
     "ctxmux — context-aware local Run multiplexer
@@ -31,6 +32,7 @@ usage:
   ctxmux --version
   ctxmux [--socket <path>] ping
   ctxmux [--socket <path>] runtime
+  ctxmux [--socket <path>] diagnostics
   ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux [--socket <path>] tmux-list <tmux-socket>
   ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
@@ -82,6 +84,7 @@ async fn run() -> Result<(), String> {
         command.as_str(),
         "ping"
             | "runtime"
+            | "diagnostics"
             | "start"
             | "tmux-list"
             | "tmux-import"
@@ -99,7 +102,15 @@ async fn run() -> Result<(), String> {
     }
     daemon::ensure_listening(&socket).await?;
     let client = Client::new(socket);
-    match command.as_str() {
+    dispatch_command(&client, &command, args).await
+}
+
+async fn dispatch_command(
+    client: &Client,
+    command: &str,
+    mut args: Vec<OsString>,
+) -> Result<(), String> {
+    match command {
         "ping" => {
             ensure_empty(&args)?;
             client.ping().await.map_err(|error| error.to_string())?;
@@ -117,10 +128,22 @@ async fn run() -> Result<(), String> {
                     .map_err(|error| format!("failed to encode Runtime identity: {error}"))?
             ))?;
         }
-        "start" => start(&client, args).await?,
-        "tmux-list" => tmux_list(&client, args).await?,
-        "tmux-import" => tmux_import(&client, args).await?,
-        "fork" => fork(&client, args).await?,
+        "diagnostics" => {
+            ensure_empty(&args)?;
+            let diagnostics = client
+                .diagnostics()
+                .await
+                .map_err(|error| error.to_string())?;
+            print_stdout(format_args!(
+                "{}",
+                serde_json::to_string(&diagnostics)
+                    .map_err(|error| format!("failed to encode diagnostics: {error}"))?
+            ))?;
+        }
+        "start" => start(client, args).await?,
+        "tmux-list" => tmux_list(client, args).await?,
+        "tmux-import" => tmux_import(client, args).await?,
+        "fork" => fork(client, args).await?,
         "list" => {
             ensure_empty(&args)?;
             // The client pages internally, so the CLI keeps its whole-fleet
@@ -143,8 +166,8 @@ async fn run() -> Result<(), String> {
             client.remove(id).await.map_err(|error| error.to_string())?;
             print_stdout(format_args!("{id}\tremoved"))?;
         }
-        "input" => input(&client, args).await?,
-        "resize" => resize(&client, args).await?,
+        "input" => input(client, args).await?,
+        "resize" => resize(client, args).await?,
         "interrupt" => {
             let id = take_run_id(&mut args)?;
             ensure_empty(&args)?;
@@ -154,8 +177,8 @@ async fn run() -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             print_run(&accepted.run)?;
         }
-        "attach" => attach(&client, args).await?,
-        "stop" => stop(&client, args).await?,
+        "attach" => attach(client, args).await?,
+        "stop" => stop(client, args).await?,
         _ => unreachable!("known commands are enumerated before connect-or-spawn"),
     }
     Ok(())
@@ -405,21 +428,16 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         take_number(&mut args, "output byte cursor")?
     };
     ensure_empty(&args)?;
-    let (attachment, snapshot) = client
-        .attach(id, after_byte)
-        .await
-        .map_err(|error| error.to_string())?;
-    if snapshot.replay.truncated {
-        let _ = writeln!(
-            io::stderr().lock(),
-            "ctxmux: output before byte {} is no longer retained",
-            snapshot.replay.first_available_byte
-        );
-    }
-    let mut stdout = io::stdout().lock();
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
+    let (attachment, snapshot) = attach_view(client, id, after_byte, interactive).await?;
+    let mut stdout = io::stdout().lock();
     let replay = replay_bytes(&snapshot.replay.chunks);
     if !interactive || !snapshot.run.state.is_running() {
+        if interactive {
+            stdout
+                .write_all(&snapshot.terminal_restore)
+                .map_err(|error| format!("failed to write terminal state: {error}"))?;
+        }
         stdout
             .write_all(&replay)
             .and_then(|()| stdout.flush())
@@ -430,22 +448,165 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         return follow_output(&attachment, &mut stdout).await;
     }
 
-    let size = snapshot
-        .run
-        .spec
-        .as_ref()
-        .map_or_else(TerminalSize::default, |spec| spec.initial_size);
     let _raw_mode = RawModeGuard::enable()?;
     stdout
-        .write_all(&screen::reconstruct(&replay, size))
+        .write_all(&snapshot.terminal_restore)
+        .and_then(|()| stdout.write_all(&replay))
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("failed to write output: {error}"))?;
-    let input_enabled = snapshot.run.capabilities.input;
-    let mut applied_size = apply_initial_terminal_size(&attachment, &snapshot.run).await?;
+    match follow_terminal(&attachment, &snapshot.run, &mut stdout).await? {
+        TerminalExit::Detach => attachment.detach().await.map_err(|error| error.to_string()),
+        TerminalExit::Ended => Ok(()),
+        TerminalExit::InputUnsettled {
+            may_have_been_sent,
+            not_sent_bytes,
+        } => {
+            attachment.close();
+            let mut stderr = io::stderr().lock();
+            if may_have_been_sent {
+                writeln!(stderr,
+                    "ctxmux: closed view with an unconfirmed input result; do not replay it automatically")
+                    .map_err(|error| format!("failed to report unconfirmed input: {error}"))?;
+            }
+            if not_sent_bytes > 0 {
+                writeln!(stderr,
+                    "ctxmux: {not_sent_bytes} locally buffered input bytes were not sent (not_applied)")
+                    .map_err(|error| format!("failed to report unsent input: {error}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn attach_view(
+    client: &Client,
+    id: RunId,
+    after_byte: u64,
+    interactive: bool,
+) -> Result<(ctxmux_client::Attachment, ctxmux_protocol::AttachedSnapshot), String> {
+    let (mut attachment, mut snapshot) = if interactive {
+        client.attach_terminal(id, after_byte).await
+    } else {
+        client.attach(id, after_byte).await
+    }
+    .map_err(|error| error.to_string())?;
+    let mut terminal_view_requested = interactive;
+    if interactive
+        && let TerminalContinuation::BasicVt {
+            checkpoint,
+            resizes,
+        } = &snapshot.terminal
+    {
+        let host_size = current_terminal_size(checkpoint.size)?;
+        if host_size != checkpoint.size
+            || checkpoint.restore_size != checkpoint.size
+            || checkpoint.restore_scrollback_rows.is_some()
+            || !resizes.is_empty()
+        {
+            eprintln!(
+                "ctxmux: this physical terminal cannot restore the declared historical geometry; opening a raw view without verified prior terminal state"
+            );
+            attachment
+                .detach()
+                .await
+                .map_err(|error| error.to_string())?;
+            (attachment, snapshot) = client
+                .attach(id, after_byte)
+                .await
+                .map_err(|error| error.to_string())?;
+            terminal_view_requested = false;
+        }
+    }
+    if snapshot.replay.truncated {
+        let _ = writeln!(
+            io::stderr().lock(),
+            "ctxmux: output before byte {} is no longer retained",
+            snapshot.replay.first_available_byte
+        );
+    }
+    if interactive {
+        match &snapshot.terminal {
+            TerminalContinuation::BasicVt {
+                checkpoint,
+                resizes,
+            } => {
+                debug_assert_eq!(checkpoint.restore_size, checkpoint.size);
+                debug_assert!(resizes.is_empty());
+            }
+            TerminalContinuation::Unknown { reason }
+            | TerminalContinuation::Unavailable { reason } => {
+                eprintln!(
+                    "ctxmux: terminal continuation is {reason:?}; displaying retained raw output without verified prior terminal state"
+                );
+            }
+            TerminalContinuation::NotRequested => {
+                if terminal_view_requested {
+                    return Err("terminal attachment returned raw-only state".to_owned());
+                }
+            }
+        }
+    }
+    Ok((attachment, snapshot))
+}
+
+enum TerminalExit {
+    Detach,
+    Ended,
+    InputUnsettled {
+        may_have_been_sent: bool,
+        not_sent_bytes: usize,
+    },
+}
+
+type PendingInput<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+
+struct PendingTerminalInput<'a> {
+    future: PendingInput<'a>,
+    bytes: usize,
+    attempted: bool,
+}
+
+fn finish_terminal_input(
+    pending: Option<&PendingTerminalInput<'_>>,
+    receiver: &mut mpsc::Receiver<TerminalInput>,
+    empty: TerminalExit,
+) -> TerminalExit {
+    receiver.close();
+    let may_have_been_sent = pending.is_some_and(|input| input.attempted);
+    let mut not_sent_bytes = pending
+        .filter(|input| !input.attempted)
+        .map_or(0, |input| input.bytes);
+    while let Ok(input) = receiver.try_recv() {
+        if let TerminalInput::Data(bytes) = input {
+            not_sent_bytes += bytes.len();
+        }
+    }
+    if may_have_been_sent || not_sent_bytes > 0 {
+        TerminalExit::InputUnsettled {
+            may_have_been_sent,
+            not_sent_bytes,
+        }
+    } else {
+        empty
+    }
+}
+
+async fn follow_terminal(
+    attachment: &ctxmux_client::Attachment,
+    run: &RunInfo,
+    stdout: &mut io::StdoutLock<'_>,
+) -> Result<TerminalExit, String> {
+    let input_enabled = run.capabilities.input;
+    let mut applied_size = apply_initial_terminal_size(attachment, run).await?;
+    // Sixteen local read chunks plus one in-flight request backpressure stdin.
+    // Each read is at most 1024 bytes plus a possible held prefix byte; this
+    // queue does not change the daemon's accepted Run workload.
     let (input_tx, mut input_rx) = mpsc::channel(16);
+    let (terminal_tx, mut terminal_rx) = oneshot::channel();
+    let mut pending_input: Option<PendingTerminalInput<'_>> = None;
     thread::Builder::new()
         .name("ctxmux-terminal-input".to_owned())
-        .spawn(move || read_terminal_input(&input_tx))
+        .spawn(move || read_terminal_input(&input_tx, terminal_tx))
         .map_err(|error| format!("failed to start terminal input: {error}"))?;
     let mut resize_signal = applied_size
         .map(|_| signal(SignalKind::window_change()))
@@ -456,23 +617,50 @@ async fn attach(client: &Client, mut args: Vec<OsString>) -> Result<(), String> 
         tokio::select! {
             event = attachment.next_event() => {
                 let Some(event) = event.map_err(|error| error.to_string())? else {
-                    return Ok(());
+                    return Ok(finish_terminal_input(
+                        pending_input.as_ref(), &mut input_rx, TerminalExit::Ended,
+                    ));
                 };
-                if !write_event(event, &mut stdout)? {
-                    return Ok(());
+                if !write_event(event, stdout)? {
+                    return Ok(finish_terminal_input(
+                        pending_input.as_ref(), &mut input_rx, TerminalExit::Ended,
+                    ));
                 }
             }
-            input = input_rx.recv() => {
+            settled = async {
+                match &mut pending_input {
+                    Some(input) => {
+                        input.attempted = true;
+                        input.future.as_mut().await
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                pending_input = None;
+                settled?;
+            }
+            terminal = &mut terminal_rx => {
+                if let Ok(TerminalInput::Error(error)) = terminal {
+                    return Err(error);
+                }
+                return Ok(finish_terminal_input(
+                    pending_input.as_ref(), &mut input_rx, TerminalExit::Detach,
+                ));
+            }
+            input = input_rx.recv(), if pending_input.is_none() => {
                 match input {
                     Some(TerminalInput::Data(data)) if input_enabled => {
-                        attachment
-                            .input(data)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        pending_input = Some(PendingTerminalInput {
+                            bytes: data.len(),
+                            attempted: false,
+                            future: Box::pin(async move {
+                                attachment.input(data).await.map(|_| ()).map_err(|error| error.to_string())
+                            }),
+                        });
                     }
                     Some(TerminalInput::Data(_)) => {}
                     Some(TerminalInput::Detach | TerminalInput::Closed) | None => {
-                        return attachment.detach().await.map_err(|error| error.to_string());
+                        return Ok(TerminalExit::Detach);
                     }
                     Some(TerminalInput::Error(error)) => return Err(error),
                 }
@@ -544,11 +732,28 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
             Ok(true)
         }
         RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => Ok(false),
-        // This stream is the Run's raw PTY bytes. The local terminal already
-        // resized itself -- that is what produced the resize we are being told
-        // about -- so printing a notice here would only inject text the
-        // attached program never emitted.
-        RunEvent::Tmux { .. } | RunEvent::Resized { .. } => Ok(true),
+        RunEvent::ServiceChanged { service } => {
+            // Diagnostics stay off the byte-exact PTY output stream. Lifecycle
+            // remains independent: unavailable I/O does not manufacture Exited.
+            if matches!(service.owner, ctxmux_protocol::NativeOwnerStatus::Stopped { .. })
+                || matches!(service.output, ctxmux_protocol::NativeOutputStatus::Unavailable { .. })
+                || matches!(service.input.phase, ctxmux_protocol::NativeInputPhase::Unavailable { .. })
+                || service.terminal_fault.is_some()
+            {
+                let _ = writeln!(io::stderr().lock(), "ctxmux: native service {}",
+                    serde_json::to_string(&service).map_err(|error| error.to_string())?);
+            }
+            Ok(true)
+        }
+        RunEvent::Resized { size, .. } => {
+            // Another Client may have resized this Run. A physical terminal is
+            // not a daemon-owned emulator and cannot recreate that geometry.
+            if io::stdout().is_terminal() && current_terminal_size(size)? != size {
+                let _ = writeln!(io::stderr().lock(), "ctxmux: Run geometry is {}x{}; local terminal geometry differs", size.cols, size.rows);
+            }
+            Ok(true)
+        }
+        RunEvent::Tmux { .. } => Ok(true),
         RunEvent::ObservationDiscontinuity => Err(
             "attachment lost one or more non-output observations; output replay cannot reconstruct their semantics"
                 .to_owned(),
@@ -582,7 +787,10 @@ enum TerminalInput {
     Error(String),
 }
 
-fn read_terminal_input(sender: &mpsc::Sender<TerminalInput>) {
+fn read_terminal_input(
+    sender: &mpsc::Sender<TerminalInput>,
+    terminal: oneshot::Sender<TerminalInput>,
+) {
     let mut stdin = io::stdin().lock();
     let mut buffer = [0; 1024];
     let mut router = PrefixRouter::default();
@@ -594,7 +802,7 @@ fn read_terminal_input(sender: &mpsc::Sender<TerminalInput>) {
                 {
                     return;
                 }
-                let _ = sender.blocking_send(TerminalInput::Closed);
+                let _ = terminal.send(TerminalInput::Closed);
                 return;
             }
             Ok(read) => {
@@ -603,13 +811,13 @@ fn read_terminal_input(sender: &mpsc::Sender<TerminalInput>) {
                     return;
                 }
                 if detach {
-                    let _ = sender.blocking_send(TerminalInput::Detach);
+                    let _ = terminal.send(TerminalInput::Detach);
                     return;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
-                let _ = sender.blocking_send(TerminalInput::Error(format!(
+                let _ = terminal.send(TerminalInput::Error(format!(
                     "failed to read terminal input: {error}"
                 )));
                 return;
@@ -776,7 +984,7 @@ fn print_run(run: &RunInfo) -> Result<bool, String> {
         ctxmux_protocol::RunBackend::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
     };
     print_stdout(format_args!(
-        "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}\tsize={}",
+        "{}\t{}\tpid={}\tbackend={}\tlineage={}\tattachments={}\thead={}\tdurable_head={}\tsize={}\tnative_service={}",
         run.id,
         state,
         run.pid
@@ -791,7 +999,8 @@ fn print_run(run: &RunInfo) -> Result<bool, String> {
         // resized to 200x87 reports 200x87 here. "unknown" is a real answer --
         // no owner can confirm a tmux pane or a recovered Run -- so it is not
         // filled in from the spec.
-        format_current_size(run.current_size)
+        format_current_size(run.current_size),
+        serde_json::to_string(&run.native_service).map_err(|error| error.to_string())?
     ))
 }
 

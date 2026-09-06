@@ -9,10 +9,12 @@ The CLI is both a real client and the simplest proof of tmux-like attach and det
 
 ## Decision
 
-When stdin and stdout are terminals, `ctxmux attach` reconstructs the current
-visible screen from retained raw bytes, paints that still frame under
-synchronized output (`CSI ? 2026`), applies terminal size, enables raw mode
-with a drop guard, reads input on one blocking thread, observes `SIGWINCH`,
+When stdin and stdout are terminals, `ctxmux attach` requests the public
+daemon-owned terminal checkpoint and its ordered original byte/resize tail.
+The CLI restores that seed only when the physical terminal can represent the
+declared source and restore geometry. Otherwise it opens a raw view with an
+explicit warning that prior terminal state is unverified. The CLI enables raw
+mode with a drop guard, reads input on one blocking thread, observes `SIGWINCH`,
 and selects between input, resize, and live Run events. `Ctrl-b d` detaches.
 Other `Ctrl-b` combinations are forwarded byte-for-byte. Live output after the
 initial paint remains raw passthrough.
@@ -31,8 +33,11 @@ writes retained raw bytes and never reconstructs a screen.
 ## Alternatives
 
 - Cooked-mode input cannot faithfully drive shells and TUIs.
-- Putting a terminal emulator in the daemon would replace raw replay with a
-  screen oracle. The CLI reconstructs a view; `OutputLog` stays raw bytes.
+- The original CLI-local emulator reconstructed an evicted byte suffix without
+  source-state provenance and duplicated the runtime's derived-state owner.
+  The optional daemon checkpoint now owns that provenance. `OutputLog` still
+  retains original bytes; a failed derived view cannot replace raw replay or
+  claim that those bytes were lost.
 - Reusing tmux for the native path would avoid proving ctxmux's own client boundary.
 
 ## Known constraints
@@ -66,8 +71,9 @@ the parser preserves the final character and wraps the next write, while these
 consumers overwrite that final character on restore. This patch preserves the
 existing parser contract; it does not qualify full terminal equivalence.
 
-The CLI currently creates a parser at the attachment size and does not call
-its resize API. Its real-PTY tests prove dependency wiring, raw I/O, detach,
+The CLI consumes the daemon checkpoint through the same public client API as
+other consumers. The parser regressions exercise the library's owning geometry
+contract; real-PTY CLI tests prove raw I/O, detach, checkpoint consumption,
 terminal restoration and child survival. They do not prove Native owner
 containment or the cause of the P0 incident. Dependency provenance and exact
 patch scope live in `third_party/vt100/CTXMUX-PROVENANCE.json`.
@@ -102,7 +108,8 @@ patch scope live in `third_party/vt100/CTXMUX-PROVENANCE.json`.
 ## Repository evidence
 
 - `crates/ctxmux/src/main.rs`: `attach`, `PrefixRouter`, `RawModeGuard`
-- `crates/ctxmux/src/screen.rs`: interactive current-screen reconstruction
+- `crates/ctxmux-client/src/terminal_seed.rs`: public terminal-seed consumption
+- `crates/ctxmux-daemon/src/terminal_checkpoint.rs`: optional derived-state owner
 - `crates/ctxmux/tests/interactive_attach.rs`
 - `crates/ctxmux-client/src/lib.rs`: `Attachment::detach`
 - `Cargo.toml`: `crossterm`, `vt100`

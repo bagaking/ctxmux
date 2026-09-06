@@ -3,34 +3,44 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
+    fs::File,
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Condvar, Mutex, Weak},
-    thread,
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+use std::{sync::Weak, thread};
+
 use ctxmux_protocol::{
     AppliedInputRange, CommandDisposition, ControlFailure, ControlReceipt, ErrorCode,
-    InputOperationKey, ProtocolError, RunId, RunSignal, StopDisposition, TerminalSize,
+    InputOperationKey, NativeInputPhase, NativeInputStatus, NativeServiceFailure, ProtocolError,
+    RunId, RunSignal, StopDisposition, TerminalSize,
 };
 use portable_pty::{Child, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{Notify, oneshot, watch};
 
 use crate::adopted_pty::AdoptedMasterPty;
 use crate::native_runtime::OwnerWake;
-use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
+use crate::native_service::NativeService;
+#[cfg(test)]
+use crate::qualification_stats::Gauge as QualificationGauge;
+use crate::qualification_stats::QualificationStats;
 
+#[cfg(test)]
 const INPUT_DRAIN_MAX_ACTIVE: usize = 8;
-const INPUT_BURST_MAX_COMMANDS: usize = 64;
-const INPUT_BURST_MAX_BYTES: usize = 256 * 1024;
 #[cfg(test)]
 const INPUT_RESULT_MAX_ENTRIES: usize = 256;
 #[cfg(test)]
 const INPUT_RESULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
-pub(crate) const HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES: usize = 4 * 1024;
-const STOP_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+// Historical per-result diagnostic reservation, not an aggregate handoff cap.
+// Known allocation and opaque heap-cost qualification remains a separate task.
+pub(crate) const INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES: usize = 4 * 1024;
 
 pub(crate) type ControlResult = Result<ControlReceipt, ControlFailure>;
 
@@ -86,12 +96,10 @@ pub(crate) enum ChildCommand {
     CleanupUnpublished,
 }
 
-/// Daemon-wide admission for lazy blocking PTY input drains.
-///
-/// A Run owns no permanent input thread. At most eight burst workers exist for
-/// one daemon, and each worker yields after a bounded completed burst. One
-/// blocking PTY write has no independent deadline, so stalled writers may hold
-/// those bounded slots until the PTY owner returns or closes.
+/// Funded Native input queue and retained-operation admission.
+/// Production writes belong only to the readiness-driven Native Run owner.
+/// The opaque-writer burst scheduler below is compiled only for historical
+/// unit probes; production never takes a blocking input-worker lease.
 #[derive(Clone)]
 pub(crate) struct InputDrainGate {
     inner: Arc<InputDrainGateInner>,
@@ -100,13 +108,19 @@ pub(crate) struct InputDrainGate {
 struct InputDrainGateInner {
     control_budget: crate::resources::ByteBudget,
     resources: crate::ResourceLimits,
+    #[cfg(test)]
     state: Mutex<InputDrainGateState>,
+    #[cfg(test)]
     max_active: usize,
+    #[cfg(test)]
     burst_max_commands: usize,
+    #[cfg(test)]
     burst_max_bytes: usize,
+    #[cfg(test)]
     qualification_stats: QualificationStats,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct InputDrainGateState {
     active: usize,
@@ -115,16 +129,26 @@ struct InputDrainGateState {
 
 impl Default for InputDrainGate {
     fn default() -> Self {
-        Self::with_limits(
-            INPUT_DRAIN_MAX_ACTIVE,
-            INPUT_BURST_MAX_COMMANDS,
-            INPUT_BURST_MAX_BYTES,
+        Self::with_stats_and_resources(
+            QualificationStats::default(),
+            crate::ResourceLimits::DEFAULT,
         )
     }
 }
 
+// Arc's known reference counters and payload include ABI alignment padding.
+// The allocator's private bookkeeping is measured separately as host RSS.
+#[repr(C)]
+struct ArcFileCharge {
+    counters: [std::sync::atomic::AtomicUsize; 2],
+    file: File,
+}
+
 pub(crate) const fn resident_control_owner_bytes() -> usize {
-    std::mem::size_of::<NativeControlInner>()
+    // Production owns one Arc<File> heap payload and Arc reference counters,
+    // in addition to the control cell. Opaque PTY/library allocations remain
+    // separately qualified as host RSS.
+    std::mem::size_of::<NativeControlInner>() + std::mem::size_of::<ArcFileCharge>()
 }
 
 impl InputDrainGate {
@@ -144,29 +168,31 @@ impl InputDrainGate {
         resources: crate::ResourceLimits,
         budget: crate::resources::ByteBudget,
     ) -> Self {
-        let mut gate = Self::with_stats(stats);
-        Arc::get_mut(&mut gate.inner)
-            .expect("new input gate has one owner")
-            .control_budget = budget;
-        let inner = Arc::get_mut(&mut gate.inner).expect("new gate has one owner");
-        inner.resources = resources;
-        inner.max_active = resources.input_workers;
-        gate
+        #[cfg(not(test))]
+        drop(stats);
+        Self {
+            inner: Arc::new(InputDrainGateInner {
+                control_budget: budget,
+                resources,
+                #[cfg(test)]
+                state: Mutex::new(InputDrainGateState::default()),
+                #[cfg(test)]
+                max_active: INPUT_DRAIN_MAX_ACTIVE,
+                #[cfg(test)]
+                burst_max_commands: resources.input_turn_commands,
+                #[cfg(test)]
+                burst_max_bytes: resources.input_turn_bytes,
+                #[cfg(test)]
+                qualification_stats: stats,
+            }),
+        }
     }
 
     pub(crate) fn control_budget(&self) -> crate::resources::ByteBudget {
         self.inner.control_budget.clone()
     }
 
-    pub(crate) fn with_stats(qualification_stats: QualificationStats) -> Self {
-        Self::with_limits_and_stats(
-            INPUT_DRAIN_MAX_ACTIVE,
-            INPUT_BURST_MAX_COMMANDS,
-            INPUT_BURST_MAX_BYTES,
-            qualification_stats,
-        )
-    }
-
+    #[cfg(test)]
     fn with_limits(max_active: usize, burst_max_commands: usize, burst_max_bytes: usize) -> Self {
         Self::with_limits_and_stats(
             max_active,
@@ -176,6 +202,7 @@ impl InputDrainGate {
         )
     }
 
+    #[cfg(test)]
     fn with_limits_and_stats(
         max_active: usize,
         burst_max_commands: usize,
@@ -200,6 +227,7 @@ impl InputDrainGate {
         }
     }
 
+    #[cfg(test)]
     fn schedule(&self, owner: Arc<NativeControlInner>) {
         let start = {
             let mut state = mutex_lock(&self.inner.state);
@@ -219,6 +247,7 @@ impl InputDrainGate {
         }
     }
 
+    #[cfg(test)]
     fn spawn(&self, mut owner: Arc<NativeControlInner>) {
         loop {
             let gate = self.clone();
@@ -239,6 +268,7 @@ impl InputDrainGate {
         }
     }
 
+    #[cfg(test)]
     fn run_worker(&self, mut owner: Arc<NativeControlInner>) {
         loop {
             let has_more =
@@ -250,6 +280,7 @@ impl InputDrainGate {
         }
     }
 
+    #[cfg(test)]
     fn handoff_after_burst(
         &self,
         requeue: bool,
@@ -285,12 +316,21 @@ pub(crate) struct NativeControlOwner {
 struct NativeControlInner {
     run_id: RunId,
     pty: Mutex<Option<Box<dyn PtyControl>>>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
+    writer: Mutex<Option<NativeInputWriter>>,
+    service: OnceLock<NativeService>,
     state: Mutex<NativeControlState>,
+    owner_deferred: AtomicBool,
+    admission_changed: Notify,
+    owner_failure: OnceLock<NativeServiceFailure>,
+    // Set only after the sole Native entry and its physical holders are dropped.
+    // Historical closed controls never register an entry.
+    entry_retired: AtomicBool,
     reap: Mutex<ChildReapState>,
     reap_changed: Condvar,
     input_drains: InputDrainGate,
     owner_wake: OwnerWake,
+    // Actual restored diagnostics beyond the original keyed error reserves.
+    _adopted_diagnostic_memory: Option<crate::resources::BytePermit>,
 }
 
 /// Descriptor handles detached from a closed native incarnation after the
@@ -299,7 +339,7 @@ struct NativeControlInner {
 #[must_use = "detached native descriptors must be dropped outside owner locks"]
 pub(crate) struct DetachedNativeDescriptors {
     pty: Option<Box<dyn PtyControl>>,
-    writer: Option<Box<dyn Write + Send>>,
+    writer: Option<NativeInputWriter>,
 }
 
 impl fmt::Debug for DetachedNativeDescriptors {
@@ -312,10 +352,22 @@ impl fmt::Debug for DetachedNativeDescriptors {
     }
 }
 
+enum NativeInputWriter {
+    /// An unbuffered nonblocking PTY descriptor. Drop only closes this FD;
+    /// portable-pty's writer injects EOF bytes on Drop and is never used here.
+    File(Arc<File>),
+    #[cfg(test)]
+    Opaque(Box<dyn Write + Send>),
+}
+
 enum ChildReapState {
     Pending {
         cleanup_error: Option<String>,
         wait_error: Option<String>,
+    },
+    OwnerStopped {
+        cleanup_error: Option<String>,
+        _child: Box<dyn Child + Send + Sync>,
     },
     WaitAuthorityLost {
         cleanup_error: Option<String>,
@@ -325,6 +377,97 @@ enum ChildReapState {
     Reaped,
 }
 
+struct ControlStateGuard<'a> {
+    state: Option<MutexGuard<'a, NativeControlState>>,
+    inner: &'a NativeControlInner,
+}
+
+impl std::ops::Deref for ControlStateGuard<'_> {
+    type Target = NativeControlState;
+    fn deref(&self) -> &Self::Target {
+        self.state.as_ref().unwrap()
+    }
+}
+impl std::ops::DerefMut for ControlStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.state.as_mut().unwrap()
+    }
+}
+impl Drop for ControlStateGuard<'_> {
+    fn drop(&mut self) {
+        let (rejected, commands) = if let Some(state) = self.state.as_mut() {
+            self.inner.settle_owner_loss(state)
+        } else {
+            (Vec::new(), VecDeque::new())
+        };
+        drop(self.state.take());
+        self.inner.admission_changed.notify_waiters();
+        send_rejections(rejected);
+        reject_child_commands(
+            commands,
+            "native owner stopped before control admission",
+            ErrorCode::BackendUnavailable,
+        );
+        if self.inner.owner_deferred.swap(false, Ordering::AcqRel) {
+            self.inner.owner_wake.wake();
+        }
+    }
+}
+
+pub(crate) struct NativeControlTurn<'a> {
+    state: ControlStateGuard<'a>,
+}
+impl NativeControlTurn<'_> {
+    pub(crate) fn drain_child_commands(&mut self) -> VecDeque<ChildCommand> {
+        std::mem::take(&mut self.state.child_commands)
+    }
+    pub(crate) fn reject_pending_stop(&mut self) {
+        self.state.stop_pending = false;
+    }
+    pub(crate) fn commit_pending_stop(&mut self) -> Result<(), ControlFailure> {
+        let run_id = self.state.inner.run_id;
+        if self.state.phase != ControlPhase::Open
+            || !self.state.stop_pending
+            || !self.state.child_open
+        {
+            self.state.stop_pending = false;
+            return Err(not_applied(invalid_phase_error(
+                run_id,
+                self.state.phase,
+                "stop",
+            )));
+        }
+        self.state.stop_pending = false;
+        self.state.phase = ControlPhase::Stopping;
+        let rejected = reject_queued_inputs(
+            &mut self.state,
+            &ProtocolError::new(
+                ErrorCode::InvalidRunState,
+                format!("cannot write to stopping Run {run_id}"),
+            ),
+        );
+        self.state.inner.publish_input(&self.state);
+        send_rejections(rejected);
+        Ok(())
+    }
+    pub(crate) fn fence_child_commands(&mut self) -> VecDeque<ChildCommand> {
+        if self.state.phase != ControlPhase::Failed {
+            self.state.phase = ControlPhase::Closed;
+        }
+        self.state.child_open = false;
+        self.state.stop_pending = false;
+        let error = invalid_phase_error(self.state.inner.run_id, self.state.phase, "write to");
+        let rejected = reject_queued_inputs(&mut self.state, &error);
+        self.state.inner.publish_input(&self.state);
+        send_rejections(rejected);
+        std::mem::take(&mut self.state.child_commands)
+    }
+}
+
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "child liveness, Stop admission and PTY readiness are independent observed facts"
+)]
 struct NativeControlState {
     phase: ControlPhase,
     /// Live PTY dimensions last read back from the owning terminal.
@@ -341,6 +484,8 @@ struct NativeControlState {
     input_commands: usize,
     input_bytes: usize,
     input_scheduled: bool,
+    input_blocked: bool,
+    owner_failure: Option<NativeServiceFailure>,
     applied_input_bytes: u64,
     input_operations: HashMap<InputOperationKey, InputOperationEntry>,
     completed_input_operations: VecDeque<InputOperationKey>,
@@ -363,6 +508,7 @@ enum ControlPhase {
 struct InputCommand {
     _memory: Option<crate::resources::BytePermit>,
     data: Arc<[u8]>,
+    confirmed: usize,
     reply: InputReply,
 }
 
@@ -392,7 +538,7 @@ fn input_receipt_charge(key: &InputOperationKey, data: &[u8]) -> usize {
     data.len()
         + key.as_str().len() * 2
         + std::mem::size_of::<InputOperationEntry>()
-        + HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES
+        + INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES
 }
 
 enum InputOperationEntry {
@@ -438,6 +584,22 @@ pub(crate) enum HandoffInputOperation {
         data: Vec<u8>,
         failure: ControlFailure,
     },
+}
+
+fn validate_handoff_unknown_prefix(
+    data_bytes: usize,
+    failure: &ControlFailure,
+) -> Result<(), String> {
+    if failure
+        .confirmed_input_bytes
+        .is_some_and(|prefix| prefix > data_bytes)
+    {
+        return Err("handoff unknown native Input prefix exceeds its request bytes".to_owned());
+    }
+    if failure.disposition != CommandDisposition::Unknown {
+        return Err("handoff unknown native Input has a non-unknown disposition".to_owned());
+    }
+    Ok(())
 }
 
 impl HandoffInputState {
@@ -505,11 +667,7 @@ impl HandoffInputState {
                     diagnostic_bytes = diagnostic_bytes
                         .checked_add(failure.error.message.len())
                         .ok_or("handoff native Input diagnostic size overflows")?;
-                    if failure.disposition != CommandDisposition::Unknown {
-                        return Err(
-                            "handoff unknown native Input has a non-unknown disposition".to_owned()
-                        );
-                    }
+                    validate_handoff_unknown_prefix(data.len(), failure)?;
                     if *expected_byte != self.applied_input_bytes {
                         return Err(
                             "handoff unknown native Input does not fence the current cursor"
@@ -550,27 +708,56 @@ impl HandoffInputState {
                 "handoff native Input ledger contains multiple unknown operations".to_owned(),
             );
         }
-        validate_handoff_diagnostic_bytes(diagnostic_bytes)
+        validate_handoff_diagnostic_bytes(diagnostic_bytes, resources.handoff_diagnostic_bytes)
     }
 
-    /// Recoverable-Input request bytes this Run carries across a handoff. The
-    /// per-Run cap is [`INPUT_RESULT_MAX_REQUEST_BYTES`] (1 MiB); the manifest
-    /// bounds the daemon-wide sum of these rather than multiplying the cap by the
-    /// Run count.
+    /// Original recoverable-Input payload bytes this Run carries across handoff.
+    /// The manifest funds the actual daemon-wide sum; Run-local retention uses
+    /// its configured policy, rather than a test population or fixed multiplier.
     pub(crate) fn retained_request_bytes(&self) -> usize {
         self.operations
             .iter()
             .fold(0, |sum, op| sum.saturating_add(op.request_len()))
     }
 
+    pub(crate) fn retained_diagnostic_bytes(&self) -> usize {
+        self.operations.iter().fold(
+            self.input_failure
+                .as_ref()
+                .map_or(0, |error| error.message.len()),
+            |total, operation| {
+                total.saturating_add(match operation {
+                    HandoffInputOperation::Unknown { failure, .. } => failure.error.message.len(),
+                    HandoffInputOperation::Completed { .. } => 0,
+                })
+            },
+        )
+    }
+
+    fn additional_diagnostic_memory_bytes(&self) -> usize {
+        // Completed keys' spare error reserves must not subsidize the poisoned
+        // lane: completed keys can be independently evicted from the ledger.
+        let keyed_reserve = self
+            .operations
+            .iter()
+            .filter(|operation| matches!(operation, HandoffInputOperation::Unknown { .. }))
+            .count()
+            .saturating_mul(INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES);
+        self.retained_diagnostic_bytes()
+            .saturating_sub(keyed_reserve)
+    }
+
     pub(crate) fn control_memory_bytes(&self) -> u64 {
-        self.operations.iter().fold(0_u64, |total, operation| {
-            let (key, data) = match operation {
-                HandoffInputOperation::Completed { key, data, .. }
-                | HandoffInputOperation::Unknown { key, data, .. } => (key, data),
-            };
-            total.saturating_add(input_receipt_charge(key, data) as u64)
-        })
+        self.operations.iter().fold(
+            self.additional_diagnostic_memory_bytes() as u64,
+            |total, operation| {
+                let (key, data) = match operation {
+                    HandoffInputOperation::Completed { key, data, .. }
+                    | HandoffInputOperation::Unknown { key, data, .. } => (key, data),
+                };
+                total.saturating_add(input_receipt_charge(key, data) as u64)
+            },
+        )
     }
 }
 
@@ -584,10 +771,13 @@ impl HandoffInputOperation {
     }
 }
 
-fn validate_handoff_diagnostic_bytes(diagnostic_bytes: usize) -> Result<(), String> {
-    if diagnostic_bytes > HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES {
+fn validate_handoff_diagnostic_bytes(
+    diagnostic_bytes: usize,
+    maximum_bytes: usize,
+) -> Result<(), String> {
+    if diagnostic_bytes > maximum_bytes {
         return Err(format!(
-            "handoff native Input diagnostics retain {diagnostic_bytes} bytes; maximum is {HANDOFF_INPUT_DIAGNOSTIC_MAX_BYTES}"
+            "handoff native Input diagnostics retain {diagnostic_bytes} bytes; maximum is {maximum_bytes}"
         ));
     }
     Ok(())
@@ -699,6 +889,269 @@ impl PtyControl for AdoptedMasterPty {
 }
 
 impl NativeControlOwner {
+    pub(crate) fn try_turn(&self) -> Option<NativeControlTurn<'_>> {
+        self.inner
+            .try_state()
+            .map(|state| NativeControlTurn { state })
+    }
+
+    pub(crate) fn bind_service(&self, service: NativeService) {
+        assert!(
+            self.inner.service.set(service).is_ok(),
+            "one Native control service binding"
+        );
+        self.inner.publish_input(&self.inner.lock_state());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn input_service(&self) -> NativeInputStatus {
+        input_status(&self.inner.lock_state())
+    }
+
+    fn schedule_input(&self) {
+        #[cfg(test)]
+        if matches!(
+            &*mutex_lock(&self.inner.writer),
+            Some(NativeInputWriter::Opaque(_))
+        ) {
+            self.inner.input_drains.schedule(Arc::clone(&self.inner));
+            return;
+        }
+        self.inner.owner_wake.wake();
+    }
+
+    /// Borrow one already-owned unbuffered FD through an Arc, never dup a new
+    /// descriptor and never retain the writer mutex across blocking poll.
+    pub(crate) fn input_poll_file(&self) -> Option<Arc<File>> {
+        let state = self.inner.try_state()?;
+        if state.phase != ControlPhase::Open
+            || state.input_failure.is_some()
+            || self.inner.owner_failure.get().is_some()
+            || state.input_queue.is_empty()
+        {
+            return None;
+        }
+        match &*mutex_lock(&self.inner.writer) {
+            Some(NativeInputWriter::File(file)) => Some(Arc::clone(file)),
+            #[cfg(test)]
+            Some(NativeInputWriter::Opaque(_)) => None,
+            None => None,
+        }
+    }
+
+    pub(crate) fn progress_empty_input(&self, max_commands: usize) {
+        for _ in 0..max_commands {
+            let empty = {
+                let Some(state) = self.inner.try_state() else {
+                    return;
+                };
+                state
+                    .input_queue
+                    .front()
+                    .is_some_and(|command| command.data.is_empty())
+                    && matches!(
+                        &*mutex_lock(&self.inner.writer),
+                        Some(NativeInputWriter::File(_))
+                    )
+            };
+            if !empty {
+                break;
+            }
+            self.progress_input(1, 1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_opaque_for_owner_test(
+        run_id: RunId,
+        master: Box<dyn MasterPty + Send>,
+        writer: Box<dyn Write + Send>,
+        input_drains: InputDrainGate,
+        owner_wake: OwnerWake,
+    ) -> Self {
+        let resources = input_drains.inner.resources;
+        Self::new_with_components(
+            run_id,
+            Some(Box::new(PortablePtyControl(master))),
+            Some(NativeInputWriter::Opaque(writer)),
+            input_drains,
+            owner_wake,
+            resources.input_result_entries,
+            resources.input_result_bytes,
+            HandoffInputState::empty(),
+            false,
+        )
+    }
+
+    /// The readiness-driven owner spends at most one configured turn per Run.
+    /// The state lock fences Stop/close with short nonblocking write syscalls;
+    /// no command can interleave its bytes with the next accepted command.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one physical input turn keeps confirmed prefix, whole-command cursor and funded ledger transitions auditable"
+    )]
+    pub(crate) fn progress_input(&self, max_commands: usize, max_bytes: usize) {
+        let mut commands = 0;
+        let mut bytes = 0;
+        while commands < max_commands && bytes < max_bytes {
+            let Some(mut state) = self.inner.try_state() else {
+                return;
+            };
+            if state.phase != ControlPhase::Open
+                || state.input_failure.is_some()
+                || self.inner.owner_failure.get().is_some()
+            {
+                return;
+            }
+            let Some(front) = state.input_queue.front() else {
+                state.input_scheduled = false;
+                state.input_blocked = false;
+                self.inner.publish_input(&state);
+                return;
+            };
+            let data = Arc::clone(&front.data);
+            let offset = front.confirmed;
+            let expected = match &front.reply {
+                InputReply::Legacy(_) => state.applied_input_bytes,
+                InputReply::Recoverable { key, .. } => {
+                    state
+                        .input_operations
+                        .get(key)
+                        .expect("queued Input retains its funded ledger entry")
+                        .request()
+                        .expected_byte
+                }
+            };
+            let end = state.applied_input_bytes.checked_add(data.len() as u64);
+            if expected != state.applied_input_bytes || end.is_none() {
+                debug_assert_eq!(offset, 0, "cursor checks precede every physical attempt");
+                let command = state.input_queue.pop_front().unwrap();
+                release_input_capacity(&mut state, data.len());
+                if let InputReply::Recoverable { key, .. } = &command.reply {
+                    remove_input_operation(&mut state, key);
+                }
+                let failure = not_applied(ProtocolError::new(
+                    ErrorCode::InputCursorMismatch,
+                    format!(
+                        "Run {} applied-input cursor is {}, not expected {expected}, or exhausted",
+                        self.inner.run_id, state.applied_input_bytes
+                    ),
+                ));
+                self.inner.publish_input(&state);
+                drop(state);
+                resolve_input_reply(command.reply, Err(failure));
+                commands += 1;
+                continue;
+            }
+            let length = (data.len() - offset).min(max_bytes - bytes);
+            let result = if length == 0 {
+                Ok(Ok(0))
+            } else {
+                catch_unwind(AssertUnwindSafe(|| {
+                    let writer = mutex_lock(&self.inner.writer);
+                    match &*writer {
+                        Some(NativeInputWriter::File(file)) => {
+                            (&**file).write(&data[offset..offset + length])
+                        }
+                        #[cfg(test)]
+                        Some(NativeInputWriter::Opaque(_)) => {
+                            unreachable!("opaque fixture writer has its own test-only owner")
+                        }
+                        None => Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "PTY input descriptor is closed",
+                        )),
+                    }
+                }))
+            };
+            match result {
+                Ok(Ok(written)) if written > 0 || data.is_empty() => {
+                    debug_assert!(written <= length);
+                    state.input_blocked = false;
+                    bytes += written;
+                    let front = state.input_queue.front_mut().unwrap();
+                    front.confirmed += written;
+                    if front.confirmed != data.len() {
+                        self.inner.publish_input(&state);
+                        continue;
+                    }
+                    let command = state.input_queue.pop_front().unwrap();
+                    let range = AppliedInputRange {
+                        start_byte: state.applied_input_bytes,
+                        end_byte: end.unwrap(),
+                    };
+                    state.applied_input_bytes = range.end_byte;
+                    release_input_capacity(&mut state, data.len());
+                    if let InputReply::Recoverable { key, .. } = &command.reply {
+                        let entry = state.input_operations.get_mut(key).unwrap();
+                        let request = entry.request().clone();
+                        *entry = InputOperationEntry::Completed { request, range };
+                        state.completed_input_operations.push_back(key.clone());
+                    }
+                    state.input_scheduled = !state.input_queue.is_empty();
+                    self.inner.publish_input(&state);
+                    drop(state);
+                    resolve_input_reply(command.reply, Ok(range));
+                    commands += 1;
+                }
+                Ok(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                    state.input_blocked = true;
+                    self.inner.publish_input(&state);
+                    return;
+                }
+                Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    self.inner.publish_input(&state);
+                    return;
+                }
+                result => {
+                    let (code, detail) = match result {
+                        Ok(Ok(_)) => (ErrorCode::Io, "PTY input write returned zero".to_owned()),
+                        Ok(Err(error)) => {
+                            (ErrorCode::Io, format!("PTY input I/O failure: {error}"))
+                        }
+                        Err(_) => (
+                            ErrorCode::Internal,
+                            "PTY input writer unwound before confirming its attempt".to_owned(),
+                        ),
+                    };
+                    let command = state.input_queue.pop_front().unwrap();
+                    release_input_capacity(&mut state, command.data.len());
+                    let error = input_failure(&mut state, self.inner.run_id, code, &detail);
+                    let mut failure = unknown(error.clone());
+                    failure.confirmed_input_bytes = Some(command.confirmed);
+                    retain_unknown_input_operation(&mut state, &command.reply, &failure);
+                    let rejected = reject_queued_inputs(&mut state, &error);
+                    self.inner.publish_input(&state);
+                    drop(state);
+                    resolve_input_reply(command.reply, Err(failure));
+                    send_rejections(rejected);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Completion of the unique owner fences future attempts before settling
+    /// queued work. Child/session identity and lifecycle are not rewritten.
+    pub(crate) fn fence_owner_loss(&self, reason: NativeServiceFailure) {
+        let _ = self.inner.owner_failure.set(reason);
+        self.inner.admission_changed.notify_waiters();
+        // Busy control owners retain their actual unresolved commands. Their
+        // guard settles on real release; no stopped poll thread or timer is
+        // required, and completion continues fencing every other Run now.
+        if let Some(state) = self.inner.try_state() {
+            drop(state);
+        }
+    }
+
+    /// Project control metadata under the same fence as input and resize.
+    /// The callback may take output/service locks, never reenter controls.
+    #[cfg(test)]
+    pub(crate) fn with_metadata<R>(&self, read: impl FnOnce(u64, Option<TerminalSize>) -> R) -> R {
+        let state = self.inner.lock_state();
+        read(state.applied_input_bytes, state.confirmed_size)
+    }
+
     pub(crate) fn run_id(&self) -> RunId {
         self.inner.run_id
     }
@@ -715,16 +1168,21 @@ impl NativeControlOwner {
     pub(crate) fn new(
         run_id: RunId,
         master: Box<dyn MasterPty + Send>,
-        writer: Box<dyn Write + Send>,
+        writer: File,
         input_drains: InputDrainGate,
         owner_wake: OwnerWake,
     ) -> Self {
-        Self::new_with_pty(
+        let limits = input_drains.inner.resources;
+        Self::new_with_components(
             run_id,
-            Box::new(PortablePtyControl(master)),
-            writer,
+            Some(Box::new(PortablePtyControl(master))),
+            Some(NativeInputWriter::File(Arc::new(writer))),
             input_drains,
             owner_wake,
+            limits.input_result_entries,
+            limits.input_result_bytes,
+            HandoffInputState::empty(),
+            false,
         )
     }
 
@@ -739,21 +1197,22 @@ impl NativeControlOwner {
     pub(crate) fn new_adopted(
         run_id: RunId,
         adopted: AdoptedMasterPty,
-        writer: Box<dyn Write + Send>,
+        writer: File,
         input_drains: InputDrainGate,
         owner_wake: OwnerWake,
         input_state: HandoffInputState,
     ) -> Self {
         let limits = input_drains.inner.resources;
-        Self::new_with_pty_and_input_state(
+        Self::new_with_components(
             run_id,
-            Box::new(adopted),
-            writer,
+            Some(Box::new(adopted)),
+            Some(NativeInputWriter::File(Arc::new(writer))),
             input_drains,
             owner_wake,
             limits.input_result_entries,
             limits.input_result_bytes,
             input_state,
+            false,
         )
     }
 
@@ -795,20 +1254,50 @@ impl NativeControlOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn retained_pty_reader_for_test(&self) -> io::Result<File> {
+        let writer = mutex_lock(&self.inner.writer);
+        match writer.as_ref() {
+            Some(NativeInputWriter::File(file)) => file.try_clone(),
+            _ => Err(io::Error::other("test requires an actual retained PTY")),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_retained_owner_child_for_test(
+        &self,
+        session: &mut crate::native_session::NativeSession,
+    ) -> Result<(), String> {
+        let mut reap = mutex_lock(&self.inner.reap);
+        let ChildReapState::OwnerStopped { _child: child, .. } = &mut *reap else {
+            return Err("test requires actual retained child".to_owned());
+        };
+        session.stop(
+            child.as_mut(),
+            crate::STOP_GRACEFUL_TIMEOUT,
+            crate::STOP_FORCED_TIMEOUT,
+        )?;
+        *reap = ChildReapState::Reaped;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn retains_failed_child(&self) -> bool {
         matches!(
             &*mutex_lock(&self.inner.reap),
-            ChildReapState::WaitAuthorityLost { .. }
+            ChildReapState::WaitAuthorityLost { .. } | ChildReapState::OwnerStopped { .. }
         )
     }
 
     pub(crate) fn wait_authority_failure(&self) -> Option<String> {
         match &*mutex_lock(&self.inner.reap) {
             ChildReapState::WaitAuthorityLost { wait_error, .. } => Some(wait_error.clone()),
-            ChildReapState::Pending { .. } | ChildReapState::Reaped => None,
+            ChildReapState::Pending { .. }
+            | ChildReapState::OwnerStopped { .. }
+            | ChildReapState::Reaped => None,
         }
     }
 
+    #[cfg(test)]
     fn new_with_pty(
         run_id: RunId,
         pty: Box<dyn PtyControl>,
@@ -828,6 +1317,7 @@ impl NativeControlOwner {
         )
     }
 
+    #[cfg(test)]
     fn new_with_pty_and_input_results(
         run_id: RunId,
         pty: Box<dyn PtyControl>,
@@ -850,6 +1340,7 @@ impl NativeControlOwner {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn new_with_pty_and_input_state(
         run_id: RunId,
         pty: Box<dyn PtyControl>,
@@ -863,7 +1354,7 @@ impl NativeControlOwner {
         Self::new_with_components(
             run_id,
             Some(pty),
-            Some(writer),
+            Some(NativeInputWriter::Opaque(writer)),
             input_drains,
             owner_wake,
             input_result_max_entries,
@@ -893,11 +1384,15 @@ impl NativeControlOwner {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "one constructor validates and funds the complete adopted input ledger before exposing its owner"
+    )]
     fn new_with_components(
         run_id: RunId,
         pty: Option<Box<dyn PtyControl>>,
-        writer: Option<Box<dyn Write + Send>>,
+        writer: Option<NativeInputWriter>,
         input_drains: InputDrainGate,
         owner_wake: OwnerWake,
         input_result_max_entries: usize,
@@ -914,6 +1409,11 @@ impl NativeControlOwner {
         input_state
             .validate_with_resources(input_drains.inner.resources)
             .expect("re-adopted native Input state is validated before construction");
+        let diagnostic_memory_bytes = input_state.additional_diagnostic_memory_bytes();
+        let adopted_diagnostic_memory = (diagnostic_memory_bytes > 0).then(|| {
+            input_drains.inner.control_budget.reserve(diagnostic_memory_bytes)
+                .expect("handed-off aggregate diagnostics were admitted by the preserved control policy")
+        });
         let retained_input_request_bytes = input_state
             .operations
             .iter()
@@ -970,6 +1470,7 @@ impl NativeControlOwner {
                 run_id,
                 pty: Mutex::new(pty),
                 writer: Mutex::new(writer),
+                service: OnceLock::new(),
                 state: Mutex::new(NativeControlState {
                     phase: if closed {
                         ControlPhase::Closed
@@ -987,6 +1488,8 @@ impl NativeControlOwner {
                     input_commands: 0,
                     input_bytes: 0,
                     input_scheduled: false,
+                    input_blocked: false,
+                    owner_failure: None,
                     applied_input_bytes: input_state.applied_input_bytes,
                     input_operations,
                     completed_input_operations,
@@ -997,6 +1500,10 @@ impl NativeControlOwner {
                     stop_pending: false,
                     child_commands: VecDeque::new(),
                 }),
+                owner_deferred: AtomicBool::new(false),
+                admission_changed: Notify::new(),
+                owner_failure: OnceLock::new(),
+                entry_retired: AtomicBool::new(closed),
                 reap: Mutex::new(if closed {
                     ChildReapState::Reaped
                 } else {
@@ -1008,18 +1515,93 @@ impl NativeControlOwner {
                 reap_changed: Condvar::new(),
                 input_drains,
                 owner_wake,
+                _adopted_diagnostic_memory: adopted_diagnostic_memory,
             }),
         }
     }
 
+    pub(crate) fn admission_changed(&self) -> &Notify {
+        &self.inner.admission_changed
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin_input(&self, data: Vec<u8>) -> Result<PendingInput, ControlFailure> {
+        self.begin_input_locked(Arc::from(data), self.inner.try_admission_state()?, None)
+    }
+
+    pub(crate) async fn begin_input_async(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<PendingInput, ControlFailure> {
+        if self.inner.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Native owner stopped before command admission",
+            )));
+        }
+        let data: Arc<[u8]> = Arc::from(data);
+        if let Some(state) = self.inner.try_state() {
+            return self.begin_input_locked(data, state, None);
+        }
+        let memory = self
+            .inner
+            .input_drains
+            .inner
+            .control_budget
+            .reserve(data.len() + std::mem::size_of::<InputCommand>())
+            .ok_or_else(|| {
+                not_applied(ProtocolError::new(
+                    ErrorCode::ControlBackpressure,
+                    "daemon input waiting-payload byte budget is full",
+                ))
+            })?;
+        let state = self.inner.wait_admission_state(false).await?;
+        self.begin_input_locked(data, state, Some(memory))
+    }
+
+    pub(crate) fn reserve_control_memory(
+        &self,
+        bytes: usize,
+    ) -> Option<crate::resources::BytePermit> {
+        self.inner.input_drains.inner.control_budget.reserve(bytes)
+    }
+
+    pub(crate) fn reserve_input_payload(
+        &self,
+        bytes: usize,
+    ) -> Option<crate::resources::BytePermit> {
+        self.reserve_control_memory(bytes.checked_add(std::mem::size_of::<InputCommand>())?)
+    }
+
+    pub(crate) async fn begin_input_async_funded(
+        &self,
+        data: Vec<u8>,
+        memory: crate::resources::BytePermit,
+    ) -> Result<PendingInput, ControlFailure> {
+        let data = Arc::from(data);
+        let state = self.inner.wait_admission_state(false).await?;
+        self.begin_input_locked(data, state, Some(memory))
+    }
+
+    fn begin_input_locked(
+        &self,
+        data: Arc<[u8]>,
+        state: ControlStateGuard<'_>,
+        memory: Option<crate::resources::BytePermit>,
+    ) -> Result<PendingInput, ControlFailure> {
         let (reply, schedule) = {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = state;
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
                     self.inner.run_id,
                     state.phase,
                     "write to",
+                )));
+            }
+            if self.inner.owner_failure.get().is_some() {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "daemon-wide Native input owner stopped",
                 )));
             }
             if let Some(error) = &state.input_failure {
@@ -1038,18 +1620,22 @@ impl NativeControlOwner {
                 return Err(not_applied(ProtocolError::new(
                     ErrorCode::ControlBackpressure,
                     format!(
-                        "Run {} PTY input queue exceeds its 1024-command or 4-MiB bound",
-                        self.inner.run_id
+                        "Run {} PTY input queue exceeds its {}-command or {}-byte budget",
+                        self.inner.run_id,
+                        self.inner.input_drains.inner.resources.input_queue_commands,
+                        self.inner.input_drains.inner.resources.input_queue_bytes
                     ),
                 )));
             }
 
-            let memory = self
-                .inner
-                .input_drains
-                .inner
-                .control_budget
-                .reserve(data.len() + std::mem::size_of::<InputCommand>())
+            let memory = memory
+                .or_else(|| {
+                    self.inner
+                        .input_drains
+                        .inner
+                        .control_budget
+                        .reserve(data.len() + std::mem::size_of::<InputCommand>())
+                })
                 .ok_or_else(|| {
                     not_applied(ProtocolError::new(
                         ErrorCode::ControlBackpressure,
@@ -1061,17 +1647,19 @@ impl NativeControlOwner {
             state.input_bytes += data.len();
             state.input_queue.push_back(InputCommand {
                 _memory: Some(memory),
-                data: Arc::from(data),
+                data,
+                confirmed: 0,
                 reply: InputReply::Legacy(reply_tx),
             });
             let schedule = !state.input_scheduled;
             if schedule {
                 state.input_scheduled = true;
             }
+            self.inner.publish_input(&state);
             (reply_rx, schedule)
         };
         if schedule {
-            self.inner.input_drains.schedule(Arc::clone(&self.inner));
+            self.schedule_input();
         }
 
         Ok(PendingInput {
@@ -1080,16 +1668,11 @@ impl NativeControlOwner {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "duplicate resolution and funded admission precede all PTY effects"
-    )]
-    pub(crate) fn begin_recoverable_input(
-        &self,
-        key: InputOperationKey,
+    fn input_request(
+        key: &InputOperationKey,
         expected_byte: u64,
         data: Vec<u8>,
-    ) -> Result<PendingRecoverableInput, ControlFailure> {
+    ) -> Result<InputOperationRequest, ControlFailure> {
         key.validate().map_err(|error| {
             not_applied(ProtocolError::new(
                 ErrorCode::InvalidRequest,
@@ -1102,13 +1685,67 @@ impl NativeControlOwner {
                 "recoverable native Input must not be empty",
             )));
         }
-        let mut request = InputOperationRequest {
+        Ok(InputOperationRequest {
             memory: None,
             expected_byte,
             data: Arc::from(data),
-        };
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_recoverable_input(
+        &self,
+        key: InputOperationKey,
+        expected_byte: u64,
+        data: Vec<u8>,
+    ) -> Result<PendingRecoverableInput, ControlFailure> {
+        let request = Self::input_request(&key, expected_byte, data)?;
+        let state = self.inner.try_state().ok_or_else(|| {
+            unknown(ProtocolError::new(
+                if self.inner.owner_failure.get().is_some() {
+                    ErrorCode::BackendUnavailable
+                } else {
+                    ErrorCode::ControlBackpressure
+                },
+                "Native input result owner is busy; application status is unknown",
+            ))
+        })?;
+        self.begin_recoverable_input_locked(key, request, state)
+    }
+
+    pub(crate) async fn begin_recoverable_input_async(
+        &self,
+        key: InputOperationKey,
+        expected_byte: u64,
+        data: Vec<u8>,
+    ) -> Result<PendingRecoverableInput, ControlFailure> {
+        let mut request = Self::input_request(&key, expected_byte, data)?;
+        // Inspect the retained key before requesting any additional budget.
+        if let Some(state) = self.inner.try_state() {
+            return self.begin_recoverable_input_locked(key, request, state);
+        }
+        request.memory = Some(Arc::new(self.inner.input_drains.inner.control_budget
+            .reserve(input_receipt_charge(&key, &request.data))
+            .ok_or_else(|| unknown(ProtocolError::new(
+                ErrorCode::ControlBackpressure,
+                "Native result ledger is busy and waiting-payload budget is full; application status is unknown",
+            )))?));
+        let state = self.inner.wait_admission_state(true).await?;
+        self.begin_recoverable_input_locked(key, request, state)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "duplicate resolution and funded admission precede all PTY effects"
+    )]
+    fn begin_recoverable_input_locked(
+        &self,
+        key: InputOperationKey,
+        mut request: InputOperationRequest,
+        state: ControlStateGuard<'_>,
+    ) -> Result<PendingRecoverableInput, ControlFailure> {
         let (pending, schedule) = {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = state;
             if let Some(retained) =
                 retained_input_result(&state, &key, &request, self.inner.run_id)?
             {
@@ -1119,6 +1756,12 @@ impl NativeControlOwner {
                     self.inner.run_id,
                     state.phase,
                     "write to",
+                )));
+            }
+            if self.inner.owner_failure.get().is_some() {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "daemon-wide Native input owner stopped",
                 )));
             }
             if let Some(error) = &state.input_failure {
@@ -1150,19 +1793,21 @@ impl NativeControlOwner {
                 )));
             }
 
-            request.memory = Some(Arc::new(
-                self.inner
-                    .input_drains
-                    .inner
-                    .control_budget
-                    .reserve(input_receipt_charge(&key, &request.data))
-                    .ok_or_else(|| {
-                        not_applied(ProtocolError::new(
-                            ErrorCode::ControlBackpressure,
-                            "daemon control-state byte budget is full",
-                        ))
-                    })?,
-            ));
+            if request.memory.is_none() {
+                request.memory = Some(Arc::new(
+                    self.inner
+                        .input_drains
+                        .inner
+                        .control_budget
+                        .reserve(input_receipt_charge(&key, &request.data))
+                        .ok_or_else(|| {
+                            not_applied(ProtocolError::new(
+                                ErrorCode::ControlBackpressure,
+                                "daemon control-state byte budget is full",
+                            ))
+                        })?,
+                ));
+            }
             let (completion, result) = watch::channel(None);
             state.input_commands += 1;
             state.input_bytes += request.data.len();
@@ -1177,12 +1822,14 @@ impl NativeControlOwner {
             state.input_queue.push_back(InputCommand {
                 _memory: None,
                 data: Arc::clone(&request.data),
+                confirmed: 0,
                 reply: InputReply::Recoverable { key, completion },
             });
             let schedule = !state.input_scheduled;
             if schedule {
                 state.input_scheduled = true;
             }
+            self.inner.publish_input(&state);
             (
                 PendingRecoverableInput::Pending {
                     run_id: self.inner.run_id,
@@ -1192,13 +1839,14 @@ impl NativeControlOwner {
             )
         };
         if schedule {
-            self.inner.input_drains.schedule(Arc::clone(&self.inner));
+            self.schedule_input();
         }
         Ok(pending)
     }
 
+    #[cfg(test)]
     pub(crate) fn applied_input_bytes(&self) -> u64 {
-        mutex_lock(&self.inner.state).applied_input_bytes
+        self.inner.lock_state().applied_input_bytes
     }
 
     /// Snapshot the complete bounded recoverable-Input contract after the
@@ -1206,7 +1854,10 @@ impl NativeControlOwner {
     /// serialization: a pending input/child command makes extraction fail
     /// before any ownership is relinquished.
     pub(crate) fn handoff_input_state(&self) -> Result<HandoffInputState, String> {
-        let state = mutex_lock(&self.inner.state);
+        let state = self
+            .inner
+            .try_state()
+            .ok_or("Native control is busy; handoff not admitted")?;
         if !matches!(state.phase, ControlPhase::Open | ControlPhase::Closed)
             || state.stop_pending
             || !state.child_commands.is_empty()
@@ -1289,14 +1940,37 @@ impl NativeControlOwner {
         Ok(snapshot)
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_stop(&self) -> Result<PendingStop, ControlFailure> {
+        if self.inner.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "daemon-wide Native owner stopped before control admission",
+            )));
+        }
         Ok(PendingStop {
             run_id: self.inner.run_id,
             reply: self.begin_stop_inner()?,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn begin_signal(&self, signal: RunSignal) -> Result<PendingSignal, ControlFailure> {
+        self.begin_signal_locked(signal, self.inner.try_admission_state()?)
+    }
+
+    pub(crate) async fn begin_signal_async(
+        &self,
+        signal: RunSignal,
+    ) -> Result<PendingSignal, ControlFailure> {
+        self.begin_signal_locked(signal, self.inner.wait_admission_state(false).await?)
+    }
+
+    fn begin_signal_locked(
+        &self,
+        signal: RunSignal,
+        state: ControlStateGuard<'_>,
+    ) -> Result<PendingSignal, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
             // The non-macOS arm below pushes onto `state.child_commands`, so the
@@ -1305,7 +1979,13 @@ impl NativeControlOwner {
             // build never catches a missing `mut`. Bind `mut` unconditionally and
             // silence the macOS-only `unused_mut` rather than duplicate the line.
             #[cfg_attr(target_os = "macos", allow(unused_mut))]
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = state;
+            if self.inner.owner_failure.get().is_some() {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "daemon-wide Native owner stopped before control admission",
+                )));
+            }
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
                     self.inner.run_id,
@@ -1363,7 +2043,10 @@ impl NativeControlOwner {
     /// publication. Completion remains a separate cleanup-owned reap receipt.
     pub(crate) fn cleanup_unpublished(&self) -> Result<(), String> {
         let rejected = {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = self.inner.lock_state();
+            if self.inner.owner_failure.get().is_some() {
+                return Err("Native owner unavailable before unpublished cleanup".to_owned());
+            }
             match state.phase {
                 ControlPhase::Open => state.phase = ControlPhase::Stopping,
                 ControlPhase::Stopping => return Ok(()),
@@ -1387,6 +2070,7 @@ impl NativeControlOwner {
             state
                 .child_commands
                 .push_back(ChildCommand::CleanupUnpublished);
+            self.inner.publish_input(&state);
             rejected
         };
         send_rejections(rejected);
@@ -1394,10 +2078,32 @@ impl NativeControlOwner {
         Ok(())
     }
 
+    pub(crate) async fn begin_stop_async(&self) -> Result<PendingStop, ControlFailure> {
+        let state = self.inner.wait_admission_state(false).await?;
+        Ok(PendingStop {
+            run_id: self.inner.run_id,
+            reply: self.begin_stop_locked(state)?,
+        })
+    }
+
+    #[cfg(test)]
     fn begin_stop_inner(&self) -> Result<oneshot::Receiver<StopOwnerResult>, ControlFailure> {
+        self.begin_stop_locked(self.inner.try_admission_state()?)
+    }
+
+    fn begin_stop_locked(
+        &self,
+        state: ControlStateGuard<'_>,
+    ) -> Result<oneshot::Receiver<StopOwnerResult>, ControlFailure> {
         let (reply_tx, reply_rx) = oneshot::channel();
         {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = state;
+            if self.inner.owner_failure.get().is_some() {
+                return Err(not_applied(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "daemon-wide Native owner stopped before control admission",
+                )));
+            }
             if state.phase != ControlPhase::Open {
                 return Err(not_applied(invalid_phase_error(
                     self.inner.run_id,
@@ -1424,50 +2130,33 @@ impl NativeControlOwner {
             state.stop_pending = true;
             state.child_commands.push_back(ChildCommand::Stop {
                 reply: reply_tx,
-                deadline: Instant::now() + STOP_ADMISSION_TIMEOUT,
+                deadline: Instant::now()
+                    + Duration::from_millis(
+                        self.inner
+                            .input_drains
+                            .inner
+                            .resources
+                            .stop_admission_timeout_ms,
+                    ),
             });
         }
         self.inner.owner_wake.wake();
         Ok(reply_rx)
     }
 
+    #[cfg(test)]
     pub(crate) fn commit_pending_stop(&self) -> Result<(), ControlFailure> {
-        let rejected = {
-            let mut state = mutex_lock(&self.inner.state);
-            if state.phase != ControlPhase::Open || !state.stop_pending || !state.child_open {
-                state.stop_pending = false;
-                return Err(not_applied(invalid_phase_error(
-                    self.inner.run_id,
-                    state.phase,
-                    "stop",
-                )));
-            }
-            state.stop_pending = false;
-            state.phase = ControlPhase::Stopping;
-            reject_queued_inputs(
-                &mut state,
-                &ProtocolError::new(
-                    ErrorCode::InvalidRunState,
-                    format!("cannot write to stopping Run {}", self.inner.run_id),
-                ),
-            )
-        };
-        send_rejections(rejected);
-        Ok(())
-    }
-
-    pub(crate) fn reject_pending_stop(&self) {
-        let mut state = mutex_lock(&self.inner.state);
-        if state.phase == ControlPhase::Open {
-            state.stop_pending = false;
+        NativeControlTurn {
+            state: self.inner.lock_state(),
         }
+        .commit_pending_stop()
     }
 
     /// Fence all future live control as soon as the waiter loses child
     /// authority, before terminal `RunState` publication can lag behind it.
     pub(crate) fn mark_closed(&self) {
         let (rejected, commands) = {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = self.inner.lock_state();
             if state.phase != ControlPhase::Failed {
                 state.phase = ControlPhase::Closed;
             }
@@ -1478,33 +2167,40 @@ impl NativeControlOwner {
                 &mut state,
                 &invalid_phase_error(self.inner.run_id, phase, "write to"),
             );
+            self.inner.publish_input(&state);
             (rejected, std::mem::take(&mut state.child_commands))
         };
         send_rejections(rejected);
-        reject_child_commands(commands, "native child owner is closed");
+        reject_child_commands(
+            commands,
+            "native child owner is closed",
+            ErrorCode::InvalidRunState,
+        );
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_child_commands(&self) -> VecDeque<ChildCommand> {
-        std::mem::take(&mut mutex_lock(&self.inner.state).child_commands)
+        NativeControlTurn {
+            state: self.inner.lock_state(),
+        }
+        .drain_child_commands()
     }
 
-    pub(crate) fn fence_child_commands(&self) -> VecDeque<ChildCommand> {
-        let (rejected, commands) = {
-            let mut state = mutex_lock(&self.inner.state);
-            if state.phase != ControlPhase::Failed {
-                state.phase = ControlPhase::Closed;
-            }
-            state.child_open = false;
-            state.stop_pending = false;
-            let phase = state.phase;
-            let rejected = reject_queued_inputs(
-                &mut state,
-                &invalid_phase_error(self.inner.run_id, phase, "write to"),
-            );
-            (rejected, std::mem::take(&mut state.child_commands))
-        };
-        send_rejections(rejected);
-        commands
+    /// Retain an actual child handle when its owner stops, without fabricating
+    /// a waitid error. Only the stopped owner transfers this unreaped holder.
+    pub(crate) fn retain_owner_stopped_child(&self, child: Box<dyn Child + Send + Sync>) {
+        let mut reap = mutex_lock(&self.inner.reap);
+        if let ChildReapState::Pending { cleanup_error, .. } = &mut *reap {
+            *reap = ChildReapState::OwnerStopped {
+                cleanup_error: cleanup_error.take(),
+                _child: child,
+            };
+            self.inner.reap_changed.notify_all();
+        } else {
+            // No Drop-based cleanup may masquerade as reap if an interrupted
+            // owner transition left a more specific authority fact behind.
+            std::mem::forget(child);
+        }
     }
 
     /// Irreversibly fence live control after the child waiter can no longer
@@ -1528,7 +2224,7 @@ impl NativeControlOwner {
             }
         }
         let (rejected, commands) = {
-            let mut state = mutex_lock(&self.inner.state);
+            let mut state = self.inner.lock_state();
             state.phase = ControlPhase::Failed;
             state.child_open = false;
             state.stop_pending = false;
@@ -1536,14 +2232,34 @@ impl NativeControlOwner {
                 &mut state,
                 &ProtocolError::new(ErrorCode::BackendUnavailable, error),
             );
+            self.inner.publish_input(&state);
             (rejected, std::mem::take(&mut state.child_commands))
         };
         send_rejections(rejected);
-        reject_child_commands(commands, "native child wait authority was lost");
+        reject_child_commands(
+            commands,
+            "native child wait authority was lost",
+            ErrorCode::BackendUnavailable,
+        );
     }
 
-    pub(crate) fn has_continuation_authority(&self) -> bool {
-        mutex_lock(&self.inner.state).phase == ControlPhase::Open
+    pub(crate) fn has_continuation_authority(&self) -> Result<bool, ProtocolError> {
+        let state = self.inner.try_state().ok_or_else(|| {
+            ProtocolError::new(
+                ErrorCode::ControlBackpressure,
+                "Native continuation authority owner is busy; authority is not yet confirmed",
+            )
+        })?;
+        Ok(state.phase == ControlPhase::Open && self.inner.owner_failure.get().is_none())
+    }
+
+    pub(crate) async fn has_continuation_authority_async(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .inner
+            .wait_admission_state(false)
+            .await
+            .map_err(|failure| failure.error)?;
+        Ok(state.phase == ControlPhase::Open && self.inner.owner_failure.get().is_none())
     }
 
     /// Record the only successful terminal-and-reaped proof: the waiter kept
@@ -1562,7 +2278,8 @@ impl NativeControlOwner {
         let mut reap = mutex_lock(&self.inner.reap);
         match &mut *reap {
             ChildReapState::Pending { cleanup_error, .. }
-            | ChildReapState::WaitAuthorityLost { cleanup_error, .. } => {
+            | ChildReapState::WaitAuthorityLost { cleanup_error, .. }
+            | ChildReapState::OwnerStopped { cleanup_error, .. } => {
                 cleanup_error.get_or_insert(error);
                 self.inner.reap_changed.notify_all();
             }
@@ -1583,7 +2300,7 @@ impl NativeControlOwner {
         loop {
             match &*reap {
                 ChildReapState::Reaped => return Ok(()),
-                ChildReapState::WaitAuthorityLost { .. } => {
+                ChildReapState::WaitAuthorityLost { .. } | ChildReapState::OwnerStopped { .. } => {
                     drop(reap);
                     return self.reap_result();
                 }
@@ -1625,6 +2342,10 @@ impl NativeControlOwner {
                     combined
                 }))
             }
+            ChildReapState::OwnerStopped { .. } => Err(format!(
+                "Run {} retains its unreaped child after Native owner stopped",
+                self.inner.run_id
+            )),
             ChildReapState::WaitAuthorityLost {
                 cleanup_error,
                 wait_error,
@@ -1648,12 +2369,26 @@ impl NativeControlOwner {
         }
     }
 
+    /// Whether the original sole Native runtime entry has actually retired.
+    pub(crate) fn entry_retired(&self) -> bool {
+        self.inner.entry_retired.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_entry_retired(&self) {
+        self.inner.entry_retired.store(true, Ordering::Release);
+    }
+
     /// Prove that a closed native owner retains no child, control, or input
     /// worker. This is only the Backend-local part of collection eligibility;
     /// the Registry must separately fence Run lookup pins and terminal state.
     pub(crate) fn closed_quiescence_result(&self) -> Result<(), String> {
         self.reap_result()?;
-        let state = mutex_lock(&self.inner.state);
+        let state = self.inner.try_state().ok_or_else(|| {
+            format!(
+                "Run {} native control cleanup owner is busy",
+                self.inner.run_id
+            )
+        })?;
         if state.phase != ControlPhase::Closed
             || state.child_open
             || state.stop_pending
@@ -1778,7 +2513,7 @@ impl PendingSignal {
 impl NativeControlOwner {
     /// Last size the owning PTY confirmed, or `None` when none is confirmed.
     pub(crate) fn confirmed_size(&self) -> Option<TerminalSize> {
-        mutex_lock(&self.inner.state).confirmed_size
+        self.inner.lock_state().confirmed_size
     }
 
     /// Apply one resize, then confirm and publish the size the PTY reports.
@@ -1791,20 +2526,64 @@ impl NativeControlOwner {
     /// would let 80x24 and 200x87 be confirmed in one order and published in
     /// the other, and an observer would watch the size go backwards.
     ///
-    /// The callback therefore must not resize, read this Run's size, or take
-    /// the Run's `output`/`state` locks. Its one production caller hands it
-    /// straight to the live-event owner, whose `events.state` lock is never
-    /// held while this owner's lock is taken -- so the reverse edge does not
-    /// exist and this pair cannot cycle.
+    /// The callback must not resize or reacquire this control's state. Its
+    /// production caller orders derived terminal geometry and publication under
+    /// pre-acquired Run output lock. Public admission tries control only while
+    /// holding that output guard, releases it on busy, then awaits actual unlock;
+    /// it never waits for one owner while holding the other. Metadata is a short
+    /// factual projection and does not take this control or the VT lock.
+    #[cfg(test)]
     pub(crate) fn resize(
         &self,
         size: TerminalSize,
         publish: impl FnOnce(TerminalSize),
     ) -> ControlResult {
+        self.try_resize(size, publish).unwrap_or_else(|| {
+            Err(not_applied(ProtocolError::new(
+                ErrorCode::ControlBackpressure,
+                "Native control owner is busy before resize admission",
+            )))
+        })
+    }
+
+    /// None means no ioctl, readback, geometry or publication was attempted.
+    pub(crate) fn try_resize(
+        &self,
+        size: TerminalSize,
+        publish: impl FnOnce(TerminalSize),
+    ) -> Option<ControlResult> {
+        if self.inner.owner_failure.get().is_some() {
+            return Some(Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Native owner stopped before resize admission",
+            ))));
+        }
+        let state = self.inner.try_state()?;
+        Some(self.resize_locked(size, publish, state))
+    }
+
+    fn resize_locked(
+        &self,
+        size: TerminalSize,
+        publish: impl FnOnce(TerminalSize),
+        state: ControlStateGuard<'_>,
+    ) -> ControlResult {
+        if self.inner.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "daemon-wide Native owner stopped before control admission",
+            )));
+        }
         // The phase lock makes stop/exit a fence for new resize operations.
         // portable-pty resize/get_size are short ioctl calls; no lock crosses
         // an await or the broader Run metadata path.
-        let mut state = mutex_lock(&self.inner.state);
+        let mut state = state;
+        if self.inner.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "daemon-wide Native owner stopped before resize admission",
+            )));
+        }
         if state.phase != ControlPhase::Open {
             return Err(not_applied(invalid_phase_error(
                 self.inner.run_id,
@@ -1848,6 +2627,7 @@ impl NativeControlOwner {
             )));
         };
         state.confirmed_size = Some(applied);
+        self.inner.publish_input(&state);
         publish(applied);
         drop(state);
         Ok(ControlReceipt::Resize {
@@ -1856,12 +2636,152 @@ impl NativeControlOwner {
     }
 }
 
+fn input_status(state: &NativeControlState) -> NativeInputStatus {
+    NativeInputStatus {
+        phase: if let Some(reason) = &state.owner_failure {
+            NativeInputPhase::Unavailable { reason: *reason }
+        } else if state.phase != ControlPhase::Open {
+            NativeInputPhase::Closed {}
+        } else if state.input_failure.is_some() {
+            NativeInputPhase::Unavailable {
+                reason: NativeServiceFailure::WriteFailed,
+            }
+        } else {
+            NativeInputPhase::Open {}
+        },
+        unsettled_commands: state.input_commands,
+        unsettled_request_bytes: state.input_bytes,
+        write_blocked: state.input_blocked,
+        completed_input_bytes: Some(state.applied_input_bytes),
+        current_size: state.confirmed_size,
+        active_confirmed_bytes: state
+            .input_queue
+            .front()
+            .map_or(0, |command| command.confirmed),
+    }
+}
+
 impl NativeControlInner {
+    fn settle_owner_loss(
+        &self,
+        state: &mut NativeControlState,
+    ) -> (Vec<(InputReply, ControlFailure)>, VecDeque<ChildCommand>) {
+        let Some(reason) = self.owner_failure.get().copied() else {
+            return (Vec::new(), VecDeque::new());
+        };
+        if state.owner_failure.is_some() {
+            return (Vec::new(), VecDeque::new());
+        }
+        state.owner_failure = Some(reason);
+        state.stop_pending = false;
+        let rejected = reject_queued_inputs(
+            state,
+            &ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "daemon-wide Native input owner stopped",
+            ),
+        );
+        self.publish_input(state);
+        (rejected, std::mem::take(&mut state.child_commands))
+    }
+
+    async fn wait_admission_state(
+        &self,
+        recoverable: bool,
+    ) -> Result<ControlStateGuard<'_>, ControlFailure> {
+        if !recoverable && self.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Native owner stopped before command admission",
+            )));
+        }
+        loop {
+            let changed = self.admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if let Some(state) = self.try_state() {
+                return Ok(state);
+            }
+            if self.owner_failure.get().is_some() {
+                let error = ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "Native owner stopped while control admission was waiting",
+                );
+                return Err(if recoverable {
+                    unknown(error)
+                } else {
+                    not_applied(error)
+                });
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn try_admission_state(&self) -> Result<ControlStateGuard<'_>, ControlFailure> {
+        if self.owner_failure.get().is_some() {
+            return Err(not_applied(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Native owner stopped before command admission",
+            )));
+        }
+        self.try_state().ok_or_else(|| {
+            not_applied(ProtocolError::new(
+                ErrorCode::ControlBackpressure,
+                "Native control owner is busy before command admission",
+            ))
+        })
+    }
+
+    fn lock_state(&self) -> ControlStateGuard<'_> {
+        ControlStateGuard {
+            state: Some(mutex_lock(&self.state)),
+            inner: self,
+        }
+    }
+    fn try_state(&self) -> Option<ControlStateGuard<'_>> {
+        match self.state.try_lock() {
+            Ok(state) => Some(ControlStateGuard {
+                state: Some(state),
+                inner: self,
+            }),
+            Err(TryLockError::Poisoned(error)) => Some(ControlStateGuard {
+                state: Some(error.into_inner()),
+                inner: self,
+            }),
+            Err(TryLockError::WouldBlock) => {
+                self.owner_deferred.store(true, Ordering::Release);
+                // The first holder may have unlocked before the flag store.
+                // A second try either obtains the lock or leaves a live holder
+                // responsible for the wake after its actual release.
+                match self.state.try_lock() {
+                    Ok(state) => Some(ControlStateGuard {
+                        state: Some(state),
+                        inner: self,
+                    }),
+                    Err(TryLockError::Poisoned(error)) => Some(ControlStateGuard {
+                        state: Some(error.into_inner()),
+                        inner: self,
+                    }),
+                    Err(TryLockError::WouldBlock) => None,
+                }
+            }
+        }
+    }
+
+    fn publish_input(&self, state: &NativeControlState) {
+        if let Some(service) = self.service.get() {
+            service.update_input(input_status(state));
+        }
+    }
+
+    #[cfg(test)]
     fn has_scheduled_input(&self) -> bool {
-        let state = mutex_lock(&self.state);
+        let state = self.lock_state();
         state.input_scheduled && !state.input_queue.is_empty()
     }
 
+    #[cfg(test)]
     fn drain_burst(&self, max_commands: usize, max_bytes: usize) -> bool {
         let mut commands = 0;
         let mut bytes = 0;
@@ -1870,7 +2790,7 @@ impl NativeControlInner {
                 return self.has_more_or_unschedule();
             }
             let command = {
-                let mut state = mutex_lock(&self.state);
+                let mut state = self.lock_state();
                 if let Some(command) = state.input_queue.pop_front() {
                     command
                 } else {
@@ -1887,12 +2807,13 @@ impl NativeControlInner {
     }
 
     /// Returns true when the lane failed and this worker must stop.
+    #[cfg(test)]
     fn execute_input(&self, command: InputCommand) -> bool {
         let written_bytes = command.data.len();
         let expected_cursor = match &command.reply {
             InputReply::Legacy(_) => None,
             InputReply::Recoverable { key, .. } => {
-                let mut state = mutex_lock(&self.state);
+                let mut state = self.lock_state();
                 let expected = state
                     .input_operations
                     .get(key)
@@ -1919,11 +2840,12 @@ impl NativeControlInner {
                 Some(expected)
             }
         };
-        let Some(end_byte) = mutex_lock(&self.state)
+        let Some(end_byte) = self
+            .lock_state()
             .applied_input_bytes
             .checked_add(u64::try_from(written_bytes).expect("bounded frame length fits u64"))
         else {
-            let mut state = mutex_lock(&self.state);
+            let mut state = self.lock_state();
             release_input_capacity(&mut state, written_bytes);
             let failure = not_applied(ProtocolError::new(
                 ErrorCode::InputCursorMismatch,
@@ -1941,9 +2863,14 @@ impl NativeControlInner {
             let writer = writer.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::BrokenPipe, "PTY input writer is closed")
             })?;
-            writer
-                .write_all(&command.data)
-                .and_then(|()| writer.flush())
+            match writer {
+                NativeInputWriter::Opaque(writer) => writer
+                    .write_all(&command.data)
+                    .and_then(|()| writer.flush()),
+                NativeInputWriter::File(_) => {
+                    unreachable!("real FD input belongs to the Native poll owner")
+                }
+            }
         }));
 
         let (receipt, rejected, failed) = self.finish_input(
@@ -1958,6 +2885,7 @@ impl NativeControlInner {
         failed
     }
 
+    #[cfg(test)]
     fn finish_input(
         &self,
         reply: &InputReply,
@@ -1970,7 +2898,7 @@ impl NativeControlInner {
         Vec<(InputReply, ControlFailure)>,
         bool,
     ) {
-        let mut state = mutex_lock(&self.state);
+        let mut state = self.lock_state();
         release_input_capacity(&mut state, written_bytes);
         match result {
             Ok(Ok(())) => {
@@ -2009,8 +2937,9 @@ impl NativeControlInner {
         }
     }
 
+    #[cfg(test)]
     fn has_more_or_unschedule(&self) -> bool {
-        let mut state = mutex_lock(&self.state);
+        let mut state = self.lock_state();
         if state.input_queue.is_empty() {
             state.input_scheduled = false;
             false
@@ -2019,9 +2948,10 @@ impl NativeControlInner {
         }
     }
 
+    #[cfg(test)]
     fn fail_scheduled(&self, message: String) {
         let rejected = {
-            let mut state = mutex_lock(&self.state);
+            let mut state = self.lock_state();
             state.input_scheduled = false;
             reject_queued_inputs(
                 &mut state,
@@ -2049,6 +2979,7 @@ fn input_failure(
     current
 }
 
+#[cfg(test)]
 fn finish_failed_input(
     state: &mut NativeControlState,
     run_id: RunId,
@@ -2076,13 +3007,25 @@ fn reject_queued_inputs(
     error: &ProtocolError,
 ) -> Vec<(InputReply, ControlFailure)> {
     state.input_scheduled = false;
+    state.input_blocked = false;
     let mut rejected = Vec::with_capacity(state.input_queue.len());
     while let Some(command) = state.input_queue.pop_front() {
         release_input_capacity(state, command.data.len());
-        if let InputReply::Recoverable { key, .. } = &command.reply {
-            remove_input_operation(state, key);
-        }
-        rejected.push((command.reply, not_applied(error.clone())));
+        let failure = if command.confirmed == 0 {
+            if let InputReply::Recoverable { key, .. } = &command.reply {
+                remove_input_operation(state, key);
+            }
+            not_applied(error.clone())
+        } else {
+            // A confirmed prefix is not a whole-command receipt, and is not
+            // permission to replay a suffix after Stop or owner loss.
+            state.input_failure = Some(error.clone());
+            let mut failure = unknown(error.clone());
+            failure.confirmed_input_bytes = Some(command.confirmed);
+            retain_unknown_input_operation(state, &command.reply, &failure);
+            failure
+        };
+        rejected.push((command.reply, failure));
     }
     rejected
 }
@@ -2104,7 +3047,7 @@ fn send_rejections(rejected: Vec<(InputReply, ControlFailure)>) {
     }
 }
 
-fn reject_child_commands(commands: VecDeque<ChildCommand>, reason: &str) {
+fn reject_child_commands(commands: VecDeque<ChildCommand>, reason: &str, code: ErrorCode) {
     for command in commands {
         match command {
             #[cfg(not(target_os = "macos"))]
@@ -2113,8 +3056,7 @@ fn reject_child_commands(commands: VecDeque<ChildCommand>, reason: &str) {
             }
             ChildCommand::Stop { reply, deadline: _ } => {
                 let _ = reply.send(StopOwnerResult::Rejected(not_applied(ProtocolError::new(
-                    ErrorCode::InvalidRunState,
-                    reason,
+                    code, reason,
                 ))));
             }
             ChildCommand::CleanupUnpublished => {}
@@ -2234,6 +3176,7 @@ fn not_applied(error: ProtocolError) -> ControlFailure {
     ControlFailure {
         error,
         disposition: CommandDisposition::NotApplied,
+        confirmed_input_bytes: None,
     }
 }
 
@@ -2241,6 +3184,7 @@ fn unknown(error: ProtocolError) -> ControlFailure {
     ControlFailure {
         error,
         disposition: CommandDisposition::Unknown,
+        confirmed_input_bytes: None,
     }
 }
 
@@ -2299,6 +3243,72 @@ mod tests {
         PortablePtyControl, PtyControl, StopOwnerResult, mutex_lock,
     };
     use crate::native_runtime::NativeRunOwner;
+
+    #[test]
+    fn handoff_input_diagnostics_follow_the_configured_aggregate_budget() {
+        // Preserve the former 4 KiB characterization as a boundary example,
+        // not the configurable aggregate handoff resource owner's capacity.
+        let message = "e".repeat(super::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1);
+        let error = ctxmux_protocol::ProtocolError::new(ErrorCode::Io, message.clone());
+        let original = HandoffInputState {
+            applied_input_bytes: 0,
+            input_failure: Some(error.clone()),
+            operations: vec![HandoffInputOperation::Unknown {
+                key: InputOperationKey::new("handoff-diagnostics-original").unwrap(),
+                expected_byte: 0,
+                data: vec![1, 2, 3],
+                failure: ctxmux_protocol::ControlFailure {
+                    error,
+                    disposition: CommandDisposition::Unknown,
+                    confirmed_input_bytes: Some(1),
+                },
+            }],
+        };
+        let resources = crate::ResourceLimits::DEFAULT;
+        original
+            .validate_with_resources(resources)
+            .expect("configured aggregate budget admits the complete original diagnostics");
+        let encoded = serde_json::to_vec(&original).unwrap();
+        let restored: HandoffInputState = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            restored, original,
+            "recovery preserves full error facts, original bytes and exact unknown prefix"
+        );
+        let aggregate_bytes = 2 * message.len();
+        assert_eq!(original.retained_diagnostic_bytes(), aggregate_bytes);
+        let gate = InputDrainGate::with_stats_and_resources(
+            crate::qualification_stats::QualificationStats::default(),
+            resources,
+        );
+        let budget = gate.control_budget();
+        let runtime = NativeRunOwner::default();
+        let owner = NativeControlOwner::closed_with_input_state(
+            RunId::new(),
+            restored,
+            gate,
+            runtime.owner_wake(),
+        );
+        assert_eq!(
+            budget.used(),
+            original.control_memory_bytes(),
+            "rehydration funds the full restored diagnostics beyond the keyed reserve"
+        );
+        assert_eq!(owner.handoff_input_state().unwrap(), original);
+        drop(owner);
+        assert_eq!(
+            budget.used(),
+            0,
+            "the real diagnostic lease follows its actual control owner"
+        );
+        let mut exact = resources;
+        exact.handoff_diagnostic_bytes = aggregate_bytes;
+        original.validate_with_resources(exact).unwrap();
+        exact.handoff_diagnostic_bytes -= 1;
+        assert!(
+            original.validate_with_resources(exact).is_err(),
+            "a real configured aggregate byte refusal does not truncate or weaken the ledger"
+        );
+    }
 
     async fn wait_for_handoff_input_state(owner: &NativeControlOwner) -> HandoffInputState {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -2702,6 +3712,68 @@ mod tests {
     }
 
     #[test]
+    fn input_service_size_tracks_confirmed_readback() {
+        let (owner, _commands) = owner(
+            Box::new(io::sink()),
+            Box::new(FakePty::new(1)),
+            InputDrainGate::default(),
+        );
+        let service = crate::native_service::NativeService::new(false);
+        owner.bind_service(service.clone());
+        let receipt = owner
+            .resize(
+                TerminalSize {
+                    rows: 40,
+                    cols: 132,
+                },
+                |_| {},
+            )
+            .unwrap();
+        let ControlReceipt::Resize { applied_size } = receipt else {
+            panic!("resize receipt")
+        };
+        assert_eq!(
+            applied_size,
+            TerminalSize {
+                rows: 41,
+                cols: 132
+            }
+        );
+        assert_eq!(service.snapshot().input.current_size, Some(applied_size));
+    }
+
+    #[test]
+    fn handoff_rejects_a_confirmed_prefix_beyond_original_request() {
+        let error = ctxmux_protocol::ProtocolError::new(ErrorCode::Io, "original write failure");
+        let mut state = HandoffInputState {
+            applied_input_bytes: 0,
+            input_failure: Some(error.clone()),
+            operations: vec![HandoffInputOperation::Unknown {
+                key: InputOperationKey::new("unknown-prefix-range").unwrap(),
+                expected_byte: 0,
+                data: vec![1, 2, 3],
+                failure: ctxmux_protocol::ControlFailure {
+                    error,
+                    disposition: CommandDisposition::Unknown,
+                    confirmed_input_bytes: Some(4),
+                },
+            }],
+        };
+        assert!(
+            state
+                .validate_with_resources(crate::ResourceLimits::DEFAULT)
+                .is_err()
+        );
+        let HandoffInputOperation::Unknown { failure, .. } = &mut state.operations[0] else {
+            unreachable!()
+        };
+        failure.confirmed_input_bytes = Some(3);
+        state
+            .validate_with_resources(crate::ResourceLimits::DEFAULT)
+            .unwrap();
+    }
+
+    #[test]
     fn an_unusable_zero_read_back_publishes_nothing_and_keeps_the_last_confirmed_size() {
         // The master reports zero columns after a resize whose ioctl succeeded.
         // The mutation did cross the boundary, so the caller must be told
@@ -2925,7 +3997,10 @@ mod tests {
                 _ => paste_end.to_vec(),
             };
             expected.extend_from_slice(&data);
-            pending.push((data.len(), owner.begin_input(data).expect("admit input")));
+            pending.push((
+                data.len(),
+                owner.begin_input_async(data).await.expect("admit input"),
+            ));
         }
 
         for (expected_bytes, pending) in pending {
@@ -3662,34 +4737,41 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("first resize reaches its publish callback");
 
+        let second_size = TerminalSize {
+            rows: 87,
+            cols: 200,
+        };
         let second = {
             let owner = owner.clone();
             let published = Arc::clone(&published);
             std::thread::spawn(move || {
-                owner
-                    .resize(
-                        TerminalSize {
-                            rows: 87,
-                            cols: 200,
-                        },
-                        |size| {
-                            mutex_lock(&published).push(size);
-                        },
-                    )
-                    .expect("second resize applies");
+                owner.resize(second_size, |size| mutex_lock(&published).push(size))
             })
         };
 
-        // Long enough for the second resize to finish if nothing holds it back.
+        // The original held-callback workload and observation budget remain.
+        // Public callers receive truthful before-effect pressure instead of
+        // blocking a Tokio worker while this owner is held.
         std::thread::sleep(Duration::from_millis(200));
         assert!(
             mutex_lock(&published).is_empty(),
             "a second resize must not publish while the first holds the owner"
         );
+        let failure = second
+            .join()
+            .expect("busy second resize returns")
+            .unwrap_err();
+        assert_eq!(failure.error.code, ErrorCode::ControlBackpressure);
+        assert_eq!(failure.disposition, CommandDisposition::NotApplied);
+        assert_eq!(failure.confirmed_input_bytes, None);
 
         release_tx.send(()).expect("release the gated publish");
         first.join().expect("first resize thread finishes");
-        second.join().expect("second resize thread finishes");
+        // Explicitly reissue the identical unaccepted request after the actual
+        // owner release. Both accepted resizes still apply and publish exactly.
+        owner
+            .resize(second_size, |size| mutex_lock(&published).push(size))
+            .expect("second resize applies after the real owner release");
 
         let published = mutex_lock(&published).clone();
         assert_eq!(

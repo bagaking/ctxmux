@@ -1,0 +1,20 @@
+{
+  "crate": "vte",
+  "version": "0.11.1",
+  "registryChecksum": "f5022b5fbf9407086c180e9557be968742d839e68346af7792b8592489732197",
+  "repository": "https://github.com/alacritty/vte",
+  "license": "Apache-2.0 OR MIT",
+  "originalInputs": {
+    "Cargo.toml": "6941bb40686e00cea50c30951ff3df1b962634cf74a175b18105ed89ca731b4a",
+    "LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+    "README.md": "ff6200be737dfb4275b2cfbcd7742a7d7031f159908dd7799925733782341995",
+    "Cargo.toml.orig": "03cbe58d2614ad38fb2947a176e96bcccca86bf7384a3c06a57a038051675256",
+    "LICENSE-MIT": "e4c9b06fa850cb9b540a5e400e9f6394cf15efcf4098144de477d1d3dae10150",
+    "tests/demo.vte": "1ac4e7fe28999e2aa632cd80f85d4f5dae776499164ffe0fa792151614ef80fe",
+    "src/definitions.rs": "c99f830c4ad27631c8b2e055ffef5c920fd8652ed2144c2999799ecf3fea8a30",
+    "src/lib.rs": "c32a92ae8989d37456ffca7e6d723f2957c15c429096aeeb8122de4ed88f321e",
+    "src/params.rs": "fb79b5a035261378e0338f35e822d20640b37d057fb7f75d42e698a49befb545",
+    "src/ansi.rs": "c99470854c3b7bea14a97e9e8c366fa475a117654729ae28600994500b7ce134",
+    "src/table.rs": "e8a343a1015e0683cc1f081717fdf5d518daae75667400fc42a405f6592a4a35"
+  }
+}

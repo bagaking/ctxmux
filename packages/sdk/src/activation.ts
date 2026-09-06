@@ -101,8 +101,12 @@ export interface RuntimeResourceLimits {
   readonly handoff_diagnostic_bytes?: number;
   readonly handoff_bytes?: number;
   readonly control_state_bytes?: number;
+  readonly diagnostic_queue_bytes?: number;
+  readonly diagnostic_record_bytes?: number;
   readonly creation_workers?: number;
-  readonly input_workers?: number;
+  readonly input_turn_commands?: number;
+  readonly input_turn_bytes?: number;
+  readonly stop_admission_timeout_ms?: number;
   readonly cleanup_workers?: number;
   readonly finalize_workers?: number;
   readonly input_queue_commands?: number;
@@ -740,8 +744,12 @@ function normalizeResourceLimits(
     "handoff_diagnostic_bytes",
     "handoff_bytes",
     "control_state_bytes",
+    "diagnostic_queue_bytes",
+    "diagnostic_record_bytes",
     "creation_workers",
-    "input_workers",
+    "input_turn_commands",
+    "input_turn_bytes",
+    "stop_admission_timeout_ms",
     "cleanup_workers",
     "finalize_workers",
     "input_queue_commands",

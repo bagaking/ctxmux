@@ -22,31 +22,35 @@ Policy applies when a daemon starts; connecting to an existing Runtime does not
 reconfigure it. Planned exec preserves the complete established policy in its
 versioned handoff manifest and explicit incoming CLI arguments.
 
-| Field                      | Default | Owner and consequence                                                                                                          |
-| -------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `live_runs`                | null    | Optional operator live-owner quota; host FD/PTY funding still applies                                                          |
-| `retained_runs`            | null    | Optional retained/projected record quota; exact quiescent replacement at pressure                                              |
-| `metadata_bytes`           | 64 MiB  | Registry serialized metadata, actual String/Vec capacities, conservatively funded BTreeMap nodes and fixed owner/index costs   |
-| `hot_output_bytes`         | 1 GiB   | Aggregate hot replay payload; reclaim offered history and backpressure only unoffered persistent bytes                         |
-| `run_output_bytes`         | 4 MiB   | Per-Run hot replay; may be smaller than durable replay, may become empty                                                       |
-| `live_event_bytes`         | 64 MiB  | Shared broadcast backing and one leased payload across receivers; attach refusal, Gap or observation discontinuity at pressure |
-| `durable_replay_bytes`     | 256 MiB | Aggregate disk replay history, independently of hot cache                                                                      |
-| `durable_run_output_bytes` | 4 MiB   | Per-Run disk history; actor-owned prefix trimming, monotone lifetime head                                                      |
-| `database_bytes`           | 384 MiB | SQLite page funding, not a Run-count format limit                                                                              |
-| `wal_checkpoint_bytes`     | 8 MiB   | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
-| `control_state_bytes`      | 128 MiB | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
-| `handoff_input_bytes`      | 128 MiB | Input receipt payload carried intact across exec                                                                               |
-| `handoff_diagnostic_bytes` | 16 MiB  | Aggregate handoff diagnostics                                                                                                  |
-| `handoff_bytes`            | 256 MiB | Serialized manifest admission before relinquishing native ownership                                                            |
-| `creation_workers`         | 8       | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
-| `input_workers`            | 8       | Lazy blocking PTY input drains, independent of Run population                                                                  |
-| `cleanup_workers`          | 8       | Blocking session cleanup workers                                                                                               |
-| `finalize_workers`         | 8       | Blocking durable terminal publication workers                                                                                  |
-| `input_queue_commands`     | 1024    | Per-Run pending input commands, additionally byte-funded                                                                       |
-| `input_queue_bytes`        | 4 MiB   | Per-Run pending input payload                                                                                                  |
-| `input_result_entries`     | 256     | Retained duplicate-result ledger window                                                                                        |
-| `input_result_bytes`       | 1 MiB   | Per-Run retained input request payload, additionally globally funded                                                           |
-| `tmux_discovery_bytes`     | 128 KiB | Bounded discovery subprocess output; explicit configurable rejection                                                           |
+| Field                       | Default | Owner and consequence                                                                                                          |
+| --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `live_runs`                 | null    | Optional operator live-owner quota; host FD/PTY funding still applies                                                          |
+| `retained_runs`             | null    | Optional retained/projected record quota; exact quiescent replacement at pressure                                              |
+| `metadata_bytes`            | 64 MiB  | Registry serialized metadata, actual String/Vec capacities, conservatively funded BTreeMap nodes and fixed owner/index costs   |
+| `hot_output_bytes`          | 1 GiB   | Aggregate hot replay payload; reclaim offered history and backpressure only unoffered persistent bytes                         |
+| `run_output_bytes`          | 4 MiB   | Per-Run hot replay; may be smaller than durable replay, may become empty                                                       |
+| `live_event_bytes`          | 64 MiB  | Shared broadcast backing and one leased payload across receivers; attach refusal, Gap or observation discontinuity at pressure |
+| `durable_replay_bytes`      | 256 MiB | Aggregate disk replay history, independently of hot cache                                                                      |
+| `durable_run_output_bytes`  | 4 MiB   | Per-Run disk history; actor-owned prefix trimming, monotone lifetime head                                                      |
+| `database_bytes`            | 384 MiB | SQLite page funding, not a Run-count format limit                                                                              |
+| `wal_checkpoint_bytes`      | 8 MiB   | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
+| `control_state_bytes`       | 128 MiB | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
+| `handoff_input_bytes`       | 128 MiB | Input receipt payload carried intact across exec                                                                               |
+| `handoff_diagnostic_bytes`  | 16 MiB  | Aggregate handoff diagnostics                                                                                                  |
+| `handoff_bytes`             | 256 MiB | Serialized manifest admission before relinquishing native ownership                                                            |
+| `creation_workers`          | 8       | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
+| `input_turn_commands`       | 64      | Completed commands before yielding a reactor turn; pending original commands remain owned                                      |
+| `input_turn_bytes`          | 256 KiB | Written bytes before yielding a reactor turn; not a payload limit                                                              |
+| `stop_admission_timeout_ms` | 250 ms  | Cleanup-slot acquisition before a Stop side effect; explicit refusal on unavailable capacity                                   |
+| `diagnostic_queue_bytes`    | 64 MiB  | Shared formatting, queued and active diagnostic allocations; producers never wait for stderr                                   |
+| `diagnostic_record_bytes`   | 1 MiB   | One diagnostic record's configurable format budget; whole-record refusal is observable                                         |
+| `cleanup_workers`           | 8       | Blocking session cleanup workers                                                                                               |
+| `finalize_workers`          | 8       | Blocking durable terminal publication workers                                                                                  |
+| `input_queue_commands`      | 1024    | Per-Run pending input commands, additionally byte-funded                                                                       |
+| `input_queue_bytes`         | 4 MiB   | Per-Run pending input payload                                                                                                  |
+| `input_result_entries`      | 256     | Retained duplicate-result ledger window                                                                                        |
+| `input_result_bytes`        | 1 MiB   | Per-Run retained input request payload, additionally globally funded                                                           |
+| `tmux_discovery_bytes`      | 128 KiB | Bounded discovery subprocess output; explicit configurable rejection                                                           |
 
 These defaults are operating points carried forward from the repository's
 existing resource qualification, not universal optima or auto-research goals.
@@ -110,7 +114,7 @@ cursor. Source-gap facts are retained with the private durable lifecycle JSON
 envelope at atomic terminal publication; the public RunState remains a lifecycle
 enum. Source facts are validated before any recovery mutation. Retention clips
 exact prefixes inside extents; allocation and fairness work units must not discard
-otherwise funded bytes. Existing schema-5 rows and their format identity remain unchanged.
+otherwise funded bytes. The joined protocol-20 Native observation contract uses schema 6; valid schema-5 stores are explicitly unsupported. No migration or corruption relabeling is implied.
 
 ## Numeric audit rules
 
@@ -120,7 +124,7 @@ The remaining numbers have distinct jobs:
 - Protocol frame/key/cursor ranges (1 MiB frame, 128-byte operation keys, JSON safe integer range) bound one peer message or identity; paged List/replay remove fleet-size coupling.
 - 8 KiB PTY reads, 64 KiB cache/replay/coalescing blocks, 1 MiB storage work units and 128-row startup batches bound transient work. Adaptive reduction must handle a smaller configured page budget.
 - 64 creation lock stripes distribute key contention; they neither allocate one worker per stripe nor limit distinct Runs.
-- 64-command/256 KiB input bursts yield workers only after completed blocking writes; queued operations remain owned after a yield. These work units do not bound one write or establish fairness when a child stops reading. Blocked writes can occupy every input worker and starve unrelated Runs. Feature `f-22vcz84zn` owns readiness-driven progression and its real blocked-Run acceptance; raising the worker count is not that repair.
+- Configurable 64-command/256 KiB input bursts yield the sole nonblocking reactor for fairness; queued operations remain owned after a yield.
 - FD baseline 16 and attachment headroom 64 provision ordinary service descriptors; three descriptors per native live owner and creation overlap come from actual owners. These are headroom, not an attachment or Run population promise.
 - Control/cleanup/upgrade deadlines bound acknowledgement or owner transitions; they do not convert unknown effects into not-applied results. The one-second terminal-output deadline applies to an idle surviving writer: readable or pressure-paused finite output continues draining, and an idle cutoff reports a source gap.
 - Bounded retry/backoff numbers apply to typed transient conflicts; unknown commit is never retried.
@@ -309,3 +313,21 @@ These tests live in `crates/ctxmux-daemon/src/persistence.rs`,
 `crates/ctxmux-daemon/src/lib.rs` and `packages/sdk/test/activation.test.ts`.
 The Feature-local verification links their final command receipts; no historical
 benchmark receipt becomes evidence for this revised scale objective.
+
+## Open terminal-state resource qualification
+
+The joined Basic VT candidate removes the silent six-codepoint cell ceiling and
+preserves legal one-row geometry and retained content through resize. Dynamic
+combining storage has a measured base-cell cost and overflow allocations; it is
+not free or an unlimited-host promise. The remaining 10,000 history rows,
+32 MiB restore allowance, 1,024 resize fences and doubled checkpoint-file bound
+still need explicit configurable owner funding and failure evidence. They do
+not define product capacity and are not qualified by old fixture literals.
+Full terminal-memory, encoding/reflow work and disk-checkpoint accounting remain
+open acceptance work. A raw transport pass cannot close this resource boundary.
+
+Custom reliability observations no longer have an unrelated 128-concurrent
+request cap. Integer representation still applies; canonical profiles retain
+their original frozen concurrency and complete workload. This changes neither
+Run admission nor a passing cost threshold. Host/kernel or actual daemon policy
+refusals remain observed failures with the original requested work recorded.

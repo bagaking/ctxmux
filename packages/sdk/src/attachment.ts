@@ -12,6 +12,7 @@ import {
   type SignalReceipt,
   type StopReceipt,
 } from "./control.js";
+import { MAX_FRAME_BYTES } from "./generated/constants.js";
 import type { AttachedSnapshot } from "./generated/AttachedSnapshot.js";
 import type { AttachmentCommandId } from "./generated/AttachmentCommandId.js";
 import type { ClientFrame } from "./generated/ClientFrame.js";
@@ -37,8 +38,87 @@ const MAX_ATTACHMENT_COMMAND_ID = 0xffff_ffff;
 const MAX_PENDING_COMMANDS = 64;
 const MAX_PENDING_INPUT_COMMANDS = 32;
 const MAX_PENDING_INPUT_BYTES = 1024 * 1024;
-const MAX_QUEUED_EVENTS = 256;
-const MAX_QUEUED_EVENT_BYTES = 1024 * 1024;
+/** Per-attachment retained logical representation, not V8 heap/RSS. Binary
+ * payload and UTF-8 JSON metadata have independent windows. Defaults derive
+ * from the admitted protocol payload unit, not an event population requirement.
+ * Transient decoding, engine headers/backing stores, and caller-owned returned
+ * events are outside this accounting and require independent cost measurement.
+ */
+export interface AttachmentViewResources {
+  readonly payloadBytes?: number;
+  readonly envelopeBytes?: number;
+}
+export interface AttachmentViewResourcePolicy {
+  readonly payloadBytes: number;
+  readonly envelopeBytes: number;
+}
+/** @internal Validate and snapshot the caller's operating policy. */
+export function attachmentViewResourcePolicy(
+  resources: AttachmentViewResources = {},
+): AttachmentViewResourcePolicy {
+  const payloadBytes = resources.payloadBytes ?? MAX_FRAME_BYTES;
+  const envelopeBytes = resources.envelopeBytes ?? MAX_FRAME_BYTES;
+  for (const [name, value] of Object.entries({ payloadBytes, envelopeBytes })) {
+    if (!Number.isSafeInteger(value) || value < 0)
+      throw new TypeError(`${name} must be a nonnegative safe integer`);
+  }
+  return Object.freeze({ payloadBytes, envelopeBytes });
+}
+/** Local view loss; the Run and admitted results remain live. Drain the retained
+ * prefix, detach and reattach for a fresh view. Missing metadata is not replayable.
+ * One bounded out-of-budget error cell reports an exhausted view budget.
+ */
+export class CtxmuxAttachmentObservationUnavailableError extends Error {
+  public readonly recovery = "detach_and_reattach";
+  #lostEvents = 0;
+  #lostOutputBytes = 0;
+  #lossCountersSaturated = false;
+  public readonly runId: RunId;
+  public readonly resource: "envelope_bytes" | "payload_bytes";
+  public readonly budgets: AttachmentViewResourcePolicy;
+  public readonly retainedPayloadBytes: number;
+  public readonly retainedEnvelopeBytes: number;
+  public constructor(
+    runId: RunId,
+    resource: "envelope_bytes" | "payload_bytes",
+    budgets: AttachmentViewResourcePolicy,
+    retainedPayloadBytes: number,
+    retainedEnvelopeBytes: number,
+  ) {
+    super(
+      `attachment observation unavailable: local ${resource} budget exhausted; detach and reattach`,
+    );
+    this.name = "CtxmuxAttachmentObservationUnavailableError";
+    this.runId = runId;
+    this.resource = resource;
+    this.budgets = budgets;
+    this.retainedPayloadBytes = retainedPayloadBytes;
+    this.retainedEnvelopeBytes = retainedEnvelopeBytes;
+  }
+  public get lostEvents(): number {
+    return this.#lostEvents;
+  }
+  public get lostOutputBytes(): number {
+    return this.#lostOutputBytes;
+  }
+  public get lossCountersSaturated(): boolean {
+    return this.#lossCountersSaturated;
+  }
+  /** @internal Counts known discarded decoded bytes; saturation stays explicit. */
+  public recordDrop(event: RunEvent): void {
+    const n = event.type === "output" ? event.chunk.data.length : 0;
+    if (
+      this.#lostEvents === Number.MAX_SAFE_INTEGER ||
+      n > Number.MAX_SAFE_INTEGER - this.#lostOutputBytes
+    )
+      this.#lossCountersSaturated = true;
+    this.#lostEvents = Math.min(Number.MAX_SAFE_INTEGER, this.#lostEvents + 1);
+    this.#lostOutputBytes = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      this.#lostOutputBytes + n,
+    );
+  }
+}
 
 interface AttachmentWire {
   send(value: unknown): Promise<void>;
@@ -69,15 +149,19 @@ export function runEventSource(event: RunEvent): RunId | undefined {
 export class Attachment {
   readonly #wire: AttachmentWire;
   readonly #pending = new Map<AttachmentCommandId, PendingCommand>();
-  readonly #events: QueuedEvent[] = [];
+  readonly #events: (QueuedEvent | undefined)[] = [];
+  #eventHead = 0;
+  readonly #viewResources: AttachmentViewResourcePolicy;
+  #viewError: CtxmuxAttachmentObservationUnavailableError | undefined;
+  #queuedEnvelopeBytes = 0;
   #state: AttachmentState = "open";
   #nextCommandId: AttachmentCommandId | undefined = 1;
   #pendingInputCommands = 0;
   #pendingInputBytes = 0;
   #queuedEventBytes = 0;
   #eventWaiter: EventWaiter | undefined;
-  #pendingOutputGap: Extract<RunEvent, { readonly type: "gap" }> | undefined;
-  #terminalEvent: RunEvent | undefined;
+  #pendingOutputGap: QueuedEvent | undefined;
+  #terminalEvent: QueuedEvent | undefined;
   #terminalSeen = false;
   #observationDiscontinuitySeen = false;
   #eventStreamEnded = false;
@@ -88,7 +172,12 @@ export class Attachment {
   #detachPromise: Promise<void> | undefined;
   public readonly snapshot: AttachedSnapshot;
 
-  public constructor(wire: AttachmentWire, snapshot: AttachedSnapshot) {
+  public constructor(
+    wire: AttachmentWire,
+    snapshot: AttachedSnapshot,
+    resources: AttachmentViewResources = {},
+  ) {
+    this.#viewResources = attachmentViewResourcePolicy(resources);
     this.#wire = wire;
     this.snapshot = snapshot;
     for (const chunk of snapshot.replay.chunks) {
@@ -100,6 +189,8 @@ export class Attachment {
   public input(
     data: ByteInput,
   ): Promise<AttachmentControlAccepted<InputReceipt>> {
+    if (this.#viewError !== undefined)
+      return Promise.reject(this.#viewControlError());
     let payload: number[];
     try {
       payload = bytes(data);
@@ -165,25 +256,36 @@ export class Attachment {
   }
 
   public async nextEvent(): Promise<RunEvent | undefined> {
-    const queued = this.#events.shift();
+    const queued = this.#events[this.#eventHead];
     if (queued !== undefined) {
-      this.#queuedEventBytes -= queued.bytes;
+      this.#events[this.#eventHead++] = undefined;
+      // Amortized work proportional to consumed entries, without a slot cap.
+      if (this.#eventHead >= this.#events.length - this.#eventHead) {
+        this.#events.splice(0, this.#eventHead);
+        this.#eventHead = 0;
+      }
+    }
+    if (queued !== undefined) {
+      this.#releaseEvent(queued);
       return queued.event;
     }
     if (this.#pendingOutputGap !== undefined) {
       const gap = this.#pendingOutputGap;
       this.#pendingOutputGap = undefined;
-      return gap;
+      this.#releaseEvent(gap);
+      return gap.event;
     }
     if (this.#terminalEvent !== undefined) {
       const terminal = this.#terminalEvent;
       this.#terminalEvent = undefined;
       this.#eventStreamEnded = true;
-      return terminal;
+      this.#releaseEvent(terminal);
+      return terminal.event;
     }
     if (this.#eventError !== undefined) {
       throw this.#eventError;
     }
+    if (this.#viewError !== undefined) throw this.#viewError;
     if (this.#eventStreamEnded || this.#state === "closed") {
       return undefined;
     }
@@ -236,6 +338,8 @@ export class Attachment {
     inputBytes: number,
     frame: (commandId: AttachmentCommandId) => ClientFrame,
   ): Promise<AttachmentControlAccepted<R>> {
+    if (this.#viewError !== undefined)
+      return Promise.reject(this.#viewControlError());
     if (this.#state !== "open") {
       return Promise.reject(
         new Error(
@@ -440,29 +544,7 @@ export class Attachment {
 
   #offerEvent(event: RunEvent): boolean {
     rememberRunEventSource(event, this.snapshot.run.id);
-    if (event.type === "exited" || event.type === "interrupted") {
-      if (this.#terminalSeen) {
-        this.#protocolViolation(
-          "attachment delivered more than one terminal event",
-          "$frame.event",
-        );
-        return false;
-      }
-      this.#terminalSeen = true;
-      if (
-        this.#events.length === 0 &&
-        this.#pendingOutputGap === undefined &&
-        this.#eventWaiter !== undefined
-      ) {
-        const waiter = this.#eventWaiter;
-        this.#eventWaiter = undefined;
-        this.#eventStreamEnded = true;
-        waiter.resolve(event);
-      } else {
-        this.#terminalEvent = event;
-      }
-      return true;
-    }
+    const terminal = event.type === "exited" || event.type === "interrupted";
     if (this.#terminalSeen) {
       this.#protocolViolation(
         "attachment delivered an event after terminal state",
@@ -470,88 +552,128 @@ export class Attachment {
       );
       return false;
     }
-    if (this.#observationDiscontinuitySeen) {
+    if (!terminal && this.#observationDiscontinuitySeen) {
       this.#protocolViolation(
         "attachment delivered a non-terminal event after observation discontinuity",
         "$frame.event",
       );
       return false;
     }
-    if (event.type === "observation_discontinuity") {
+    if (terminal) this.#terminalSeen = true;
+    if (event.type === "observation_discontinuity")
       this.#observationDiscontinuitySeen = true;
+    // A local view failure never stops strict validation or the wire/ACK owner.
+    if (this.#viewError !== undefined) {
+      this.#viewError.recordDrop(event);
+      return true;
     }
-    if (this.#events.length === 0 && this.#eventWaiter !== undefined) {
+    if (
+      this.#queueEmpty() &&
+      this.#pendingOutputGap === undefined &&
+      this.#eventWaiter !== undefined
+    ) {
       const waiter = this.#eventWaiter;
       this.#eventWaiter = undefined;
+      if (terminal) this.#eventStreamEnded = true;
       waiter.resolve(event);
       return true;
     }
-
     if (event.type === "gap") {
-      this.#extendPendingOutputGap(event.latest_output_bytes);
+      this.#extendPendingOutputGap(event.latest_output_bytes, event);
       return true;
     }
-
-    const eventWeight = eventBytes(event);
-    if (event.type === "output" && this.#pendingOutputGap !== undefined) {
-      if (this.#eventCapacity(eventWeight, 2)) {
-        this.#enqueueEvent({ event: this.#pendingOutputGap, bytes: 0 });
-        this.#pendingOutputGap = undefined;
-        this.#enqueueEvent({ event, bytes: eventWeight });
-      } else {
-        this.#extendPendingOutputGap(event.chunk.end_byte);
-      }
-      return true;
-    }
-    if (event.type !== "output" && this.#pendingOutputGap !== undefined) {
-      if (!this.#eventCapacity(eventWeight, 2)) {
-        this.#protocolViolation(
-          "attachment event queue cannot retain an output gap before a non-output event",
-          "$frame.event",
-        );
-        return false;
-      }
-      this.#enqueueEvent({ event: this.#pendingOutputGap, bytes: 0 });
-      this.#pendingOutputGap = undefined;
-      this.#enqueueEvent({ event, bytes: eventWeight });
-      return true;
-    }
-    if (this.#eventCapacity(eventWeight, 1)) {
-      this.#enqueueEvent({ event, bytes: eventWeight });
-      return true;
-    }
-    if (event.type === "output") {
-      this.#extendPendingOutputGap(event.chunk.end_byte);
-      return true;
-    }
-    this.#protocolViolation(
-      "attachment event queue cannot retain a non-output event",
-      "$frame.event",
-    );
-    return false;
-  }
-
-  #eventCapacity(bytes: number, additionalEvents: number): boolean {
-    return (
-      this.#events.length + additionalEvents <= MAX_QUEUED_EVENTS &&
-      bytes <= MAX_QUEUED_EVENT_BYTES - this.#queuedEventBytes
-    );
-  }
-
-  #enqueueEvent(event: QueuedEvent): void {
-    this.#events.push(event);
-    this.#queuedEventBytes += event.bytes;
-  }
-
-  #extendPendingOutputGap(latestOutputBytes: number): void {
-    this.#pendingOutputGap = {
-      type: "gap",
-      latest_output_bytes: Math.max(
-        this.#pendingOutputGap?.latest_output_bytes ?? 0,
-        latestOutputBytes,
-      ),
+    const retained: QueuedEvent = {
+      event,
+      bytes: eventBytes(event),
+      envelopeBytes: eventEnvelopeBytes(event),
     };
-    rememberRunEventSource(this.#pendingOutputGap, this.snapshot.run.id);
+    if (!this.#eventCapacity(retained)) {
+      if (event.type === "output")
+        this.#extendPendingOutputGap(event.chunk.end_byte, event);
+      else
+        this.#loseObservation(
+          event,
+          retained.bytes >
+            this.#viewResources.payloadBytes - this.#queuedEventBytes
+            ? "payload_bytes"
+            : "envelope_bytes",
+        );
+      return true;
+    }
+    if (terminal) {
+      this.#terminalEvent = retained;
+      this.#chargeEvent(retained);
+      return true;
+    }
+    if (this.#pendingOutputGap !== undefined) {
+      // Transfer funded gap ownership without reserving it a second time.
+      this.#events.push(this.#pendingOutputGap);
+      this.#pendingOutputGap = undefined;
+    }
+    this.#events.push(retained);
+    this.#chargeEvent(retained);
+    return true;
+  }
+  #queueEmpty(): boolean {
+    return this.#eventHead === this.#events.length;
+  }
+  #eventCapacity(event: QueuedEvent): boolean {
+    return (
+      event.bytes <=
+        this.#viewResources.payloadBytes - this.#queuedEventBytes &&
+      event.envelopeBytes <=
+        this.#viewResources.envelopeBytes - this.#queuedEnvelopeBytes
+    );
+  }
+  #chargeEvent(event: QueuedEvent): void {
+    this.#queuedEventBytes += event.bytes;
+    this.#queuedEnvelopeBytes += event.envelopeBytes;
+  }
+  #releaseEvent(event: QueuedEvent): void {
+    this.#queuedEventBytes -= event.bytes;
+    this.#queuedEnvelopeBytes -= event.envelopeBytes;
+  }
+  #extendPendingOutputGap(latestOutputBytes: number, dropped: RunEvent): void {
+    const previous = this.#pendingOutputGap;
+    const head =
+      previous?.event.type === "gap" ? previous.event.latest_output_bytes : 0;
+    const event: RunEvent = {
+      type: "gap",
+      latest_output_bytes: Math.max(head, latestOutputBytes),
+    };
+    const envelopeBytes = eventEnvelopeBytes(event);
+    const additional = envelopeBytes - (previous?.envelopeBytes ?? 0);
+    if (
+      additional >
+      this.#viewResources.envelopeBytes - this.#queuedEnvelopeBytes
+    ) {
+      this.#loseObservation(dropped);
+      return;
+    }
+    rememberRunEventSource(event, this.snapshot.run.id);
+    this.#queuedEnvelopeBytes += additional;
+    this.#pendingOutputGap = { event, bytes: 0, envelopeBytes };
+  }
+  #loseObservation(
+    event: RunEvent,
+    resource: "envelope_bytes" | "payload_bytes" = "envelope_bytes",
+  ): void {
+    this.#viewError ??= new CtxmuxAttachmentObservationUnavailableError(
+      this.snapshot.run.id,
+      resource,
+      this.#viewResources,
+      this.#queuedEventBytes,
+      this.#queuedEnvelopeBytes,
+    );
+    this.#viewError.recordDrop(event);
+    this.#finishEvents();
+  }
+  #viewControlError(): CtxmuxCommandError {
+    return new CtxmuxCommandError(
+      "control_backpressure",
+      "attachment observation unavailable locally; detach and reattach before new control",
+      "not_applied",
+    );
   }
 
   #protocolViolation(message: string, path: string): void {
@@ -588,20 +710,20 @@ export class Attachment {
 
   #finishEvents(): void {
     if (
-      this.#events.length === 0 &&
+      this.#queueEmpty() &&
       this.#pendingOutputGap === undefined &&
       this.#terminalEvent === undefined &&
       this.#eventWaiter !== undefined
     ) {
       const waiter = this.#eventWaiter;
       this.#eventWaiter = undefined;
-      if (this.#eventError === undefined) {
+      if (this.#eventError === undefined && this.#viewError === undefined) {
         waiter.resolve(undefined);
       } else {
-        waiter.reject(this.#eventError);
+        waiter.reject(this.#eventError ?? this.#viewError!);
       }
     }
-    if (this.#eventError === undefined) {
+    if (this.#eventError === undefined && this.#viewError === undefined) {
       this.#eventStreamEnded = true;
     }
   }
@@ -633,6 +755,7 @@ interface PendingCommand {
 interface QueuedEvent {
   readonly event: RunEvent;
   readonly bytes: number;
+  readonly envelopeBytes: number;
 }
 
 interface EventWaiter {
@@ -648,4 +771,15 @@ function eventBytes(event: RunEvent): number {
     return event.event.name.length;
   }
   return 0;
+}
+
+// UTF-8 JSON metadata excludes binary payload; no exact JS heap claim is made.
+function eventEnvelopeBytes(event: RunEvent): number {
+  const metadata =
+    event.type === "output"
+      ? { ...event, chunk: { ...event.chunk, data: "" } }
+      : event.type === "tmux" && event.event.type === "session_renamed"
+        ? { ...event, event: { ...event.event, name: [] } }
+        : event;
+  return Buffer.byteLength(JSON.stringify(metadata), "utf8");
 }

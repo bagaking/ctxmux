@@ -47,18 +47,25 @@ export class CtxmuxCommandError extends CtxmuxProtocolError {
   public readonly failure: ControlFailure;
   public readonly disposition: CommandDisposition;
   public readonly commandId: AttachmentCommandId | undefined;
+  public readonly confirmedInputBytes: number | null;
 
   public constructor(
     code: ErrorCode,
     message: string,
     disposition: CommandDisposition,
     commandId?: AttachmentCommandId,
+    confirmedInputBytes: number | null = null,
   ) {
     super(code, message);
     this.name = "CtxmuxCommandError";
     this.disposition = disposition;
     this.commandId = commandId;
-    this.failure = { error: { code, message }, disposition };
+    this.confirmedInputBytes = confirmedInputBytes;
+    this.failure = {
+      error: { code, message },
+      disposition,
+      confirmed_input_bytes: confirmedInputBytes,
+    };
   }
 }
 
@@ -165,6 +172,7 @@ export function commandError(
     failure.error.message,
     failure.disposition,
     commandId,
+    failure.confirmed_input_bytes,
   );
 }
 

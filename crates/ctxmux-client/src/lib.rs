@@ -4,8 +4,10 @@
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
 mod attachment;
+mod terminal_seed;
 
-pub use attachment::Attachment;
+pub use attachment::{Attachment, AttachmentEventLimits};
+pub use terminal_seed::{TerminalSeedLimits, TerminalSeedResourceError};
 
 use std::{
     collections::BTreeMap,
@@ -152,6 +154,24 @@ pub enum ClientError {
         /// Why the client cannot prove the command result.
         reason: AttachmentUnknownReason,
     },
+    /// Invalid event-owner resource policy, rejected before attachment.
+    #[error("attachment event limits cannot fund inbox state or host byte arithmetic")]
+    InvalidAttachmentEventLimits,
+    /// This view lost non-output observations under its resource policy.
+    /// Sent command results retain their independent transport owner.
+    #[error(
+        "attachment observation memory pressure (payload {payload_bytes}, envelope {envelope_bytes} bytes); reattach for a new observation boundary"
+    )]
+    AttachmentObservationUnavailable {
+        /// Configured retained payload window.
+        payload_bytes: usize,
+        /// Configured envelope allocation window.
+        envelope_bytes: usize,
+    },
+    /// A valid terminal seed could not be retained under local resource policy
+    /// or host allocation capacity. This does not blame the serving daemon.
+    #[error(transparent)]
+    TerminalSeedResource(#[from] TerminalSeedResourceError),
     /// More than one caller tried to await the same attachment event stream.
     #[error("only one Attachment::next_event call may be active at a time")]
     ConcurrentEventRead,
@@ -186,6 +206,9 @@ impl ClientError {
             | Self::Protocol { .. }
             | Self::InvalidCapabilityRequirement { .. }
             | Self::ConcurrentEventRead
+            | Self::InvalidAttachmentEventLimits
+            | Self::AttachmentObservationUnavailable { .. }
+            | Self::TerminalSeedResource(_)
             | Self::ProtocolContractViolation(_)
             | Self::UnexpectedFrame(_) => None,
         }
@@ -195,6 +218,9 @@ impl ClientError {
 /// Why an Attachment no longer admits commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AttachmentUnavailableReason {
+    /// Local observation pressure fenced new controls; admitted results drain.
+    #[error("observation is unavailable; detach and reattach for a new boundary")]
+    ObservationUnavailable,
     /// A clean detach has started.
     #[error("clean detach is in progress")]
     Detaching,
@@ -289,6 +315,8 @@ impl From<ProtocolError> for ClientError {
 #[derive(Debug, Clone)]
 pub struct Client {
     socket_path: PathBuf,
+    attachment_event_limits: AttachmentEventLimits,
+    terminal_seed_limits: TerminalSeedLimits,
     required_capabilities: RuntimeCapabilityRequirements,
     expected_runtime_identity: Option<RuntimeIdentity>,
 }
@@ -299,6 +327,8 @@ impl Client {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            attachment_event_limits: AttachmentEventLimits::default(),
+            terminal_seed_limits: TerminalSeedLimits::default(),
             required_capabilities: BTreeMap::new(),
             expected_runtime_identity: None,
         }
@@ -338,6 +368,33 @@ impl Client {
         Ok(self)
     }
 
+    /// Configure independent payload and envelope windows of each live view.
+    /// A slow view reports pressure without cancelling sent command results.
+    ///
+    /// # Errors
+    /// Rejects unrepresentable windows or insufficient inbox-state funding.
+    pub fn with_attachment_event_limits(
+        mut self,
+        limits: AttachmentEventLimits,
+    ) -> Result<Self, ClientError> {
+        limits.validate()?;
+        self.attachment_event_limits = limits;
+        Ok(self)
+    }
+
+    /// Configure this client's per-seed assembly buffer policy, independently
+    /// of live attachment events. A refused Terminal view remains an explicit
+    /// local error; the client never silently opens a Raw view instead.
+    ///
+    /// This protects in-flight seed assembly only. Snapshots become caller-owned
+    /// on return; concurrent attachments and caller clones are not a total heap
+    /// or aggregate budget. Host allocation remains fallible.
+    #[must_use]
+    pub fn with_terminal_seed_limits(mut self, limits: TerminalSeedLimits) -> Self {
+        self.terminal_seed_limits = limits;
+        self
+    }
+
     /// Socket path used by this connector.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
@@ -362,6 +419,19 @@ impl Client {
     /// an incompatible protocol generation.
     pub async fn runtime_info(&self) -> Result<RuntimeIdentity, ClientError> {
         self.connect().await.map(|(_, runtime)| runtime)
+    }
+
+    /// Observe the daemon-owned diagnostic sink without inferring Run health.
+    ///
+    /// # Errors
+    /// Returns a transport or framing error when the real observation is unavailable.
+    pub async fn diagnostics(&self) -> Result<ctxmux_protocol::DiagnosticsSnapshot, ClientError> {
+        match self.request(Request::Diagnostics {}).await? {
+            Response::Diagnostics { diagnostics } => Ok(diagnostics),
+            _ => Err(ClientError::UnexpectedFrame(
+                "expected Diagnostics response",
+            )),
+        }
     }
 
     /// Return the identity of the currently reachable daemon incarnation.
@@ -810,19 +880,58 @@ impl Client {
         id: RunId,
         after_byte: u64,
     ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
+        self.attach_with_view(id, after_byte, ctxmux_protocol::AttachmentView::Raw)
+            .await
+    }
+
+    /// Attach a terminal using one authoritative basic seed and its original tail.
+    /// # Errors
+    /// Returns a transport or protocol error; unknown terminal state remains typed data.
+    pub async fn attach_terminal(
+        &self,
+        id: RunId,
+        after_byte: u64,
+    ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
+        self.attach_with_view(id, after_byte, ctxmux_protocol::AttachmentView::Terminal)
+            .await
+    }
+
+    async fn attach_with_view(
+        &self,
+        id: RunId,
+        after_byte: u64,
+        view: ctxmux_protocol::AttachmentView,
+    ) -> Result<(Attachment, AttachedSnapshot), ClientError> {
         let (mut wire, _) = self.connect_for_dispatch().await?;
         send(
             &mut wire,
             &ClientFrame::Request {
-                request: Request::Attach { id, after_byte },
+                request: Request::Attach {
+                    id,
+                    after_byte,
+                    view,
+                },
             },
         )
         .await?;
 
         match receive(&mut wire).await? {
             ServerFrame::Attached { snapshot: header } => {
+                if header.run.id != id
+                    || matches!(
+                        header.terminal,
+                        ctxmux_protocol::TerminalContinuation::NotRequested
+                    ) != (view == ctxmux_protocol::AttachmentView::Raw)
+                {
+                    return Err(ClientError::UnexpectedFrame(
+                        "attachment Run or view differs from request",
+                    ));
+                }
                 let mut snapshot = AttachedSnapshot {
                     run: header.run,
+                    terminal: header.terminal,
+                    terminal_restore: Vec::new(),
+                    resize_revision: header.resize_revision,
                     replay: OutputReplay {
                         chunks: Vec::new(),
                         first_available_byte: header.replay.first_available_byte,
@@ -830,8 +939,17 @@ impl Client {
                         truncated: header.replay.truncated,
                     },
                 };
-                receive_replay(&mut wire, after_byte, &mut snapshot).await?;
-                Ok((Attachment::from_wire(wire), snapshot))
+                receive_replay(
+                    &mut wire,
+                    after_byte,
+                    &mut snapshot,
+                    self.terminal_seed_limits,
+                )
+                .await?;
+                Ok((
+                    Attachment::from_wire_with_event_limits(wire, self.attachment_event_limits),
+                    snapshot,
+                ))
             }
             ServerFrame::Error { error } => Err(error.into()),
             _ => Err(ClientError::UnexpectedFrame("expected attached snapshot")),
@@ -884,8 +1002,19 @@ impl Client {
                 Err(error)
             }
             ServerFrame::Attached { snapshot: header } => {
+                if !matches!(
+                    header.terminal,
+                    ctxmux_protocol::TerminalContinuation::NotRequested
+                ) {
+                    return Err(control_request_unknown(ClientError::UnexpectedFrame(
+                        "recoverable Stop requires a raw attachment",
+                    )));
+                }
                 let mut snapshot = AttachedSnapshot {
                     run: header.run,
+                    terminal: header.terminal,
+                    terminal_restore: Vec::new(),
+                    resize_revision: header.resize_revision,
                     replay: OutputReplay {
                         chunks: Vec::new(),
                         first_available_byte: header.replay.first_available_byte,
@@ -893,9 +1022,14 @@ impl Client {
                         truncated: header.replay.truncated,
                     },
                 };
-                receive_replay(&mut wire, after_byte, &mut snapshot)
-                    .await
-                    .map_err(control_request_unknown)?;
+                receive_replay(
+                    &mut wire,
+                    after_byte,
+                    &mut snapshot,
+                    self.terminal_seed_limits,
+                )
+                .await
+                .map_err(control_request_unknown)?;
                 let response = match receive(&mut wire).await.map_err(control_request_unknown)? {
                     ServerFrame::Response { response } => response,
                     ServerFrame::Error { error } => {
@@ -916,7 +1050,10 @@ impl Client {
                     ));
                 }
                 Ok(RecoverableStopAttachment {
-                    attachment: Attachment::from_wire(wire),
+                    attachment: Attachment::from_wire_with_event_limits(
+                        wire,
+                        self.attachment_event_limits,
+                    ),
                     snapshot,
                     stop,
                 })
@@ -1110,6 +1247,11 @@ fn control_not_applied(source: ClientError) -> ClientError {
 }
 
 fn validate_control_failure(failure: &ControlFailure) -> Result<(), &'static str> {
+    if failure.disposition == CommandDisposition::NotApplied
+        && failure.confirmed_input_bytes.is_some_and(|bytes| bytes > 0)
+    {
+        return Err("not_applied input cannot have a positive confirmed prefix");
+    }
     if failure.error.code == ctxmux_protocol::ErrorCode::ControlBackpressure
         && failure.disposition != CommandDisposition::NotApplied
     {
@@ -1193,14 +1335,103 @@ fn decode_signal_receipt(
     }
 }
 
+async fn receive_terminal_seed<S>(
+    wire: &mut S,
+    after_byte: u64,
+    snapshot: &mut AttachedSnapshot,
+    limits: TerminalSeedLimits,
+) -> Result<u64, ClientError>
+where
+    S: futures_util::Stream<Item = Result<String, LinesCodecError>> + Unpin,
+{
+    let replay_start = if let ctxmux_protocol::TerminalContinuation::BasicVt {
+        checkpoint,
+        resizes,
+    } = &snapshot.terminal
+    {
+        if checkpoint.run_id != snapshot.run.id
+            || checkpoint.through_byte > snapshot.replay.latest_output_bytes
+            || checkpoint.through_byte < snapshot.replay.first_available_byte
+            || checkpoint.restore_bytes == 0
+            || checkpoint.size.rows == 0
+            || checkpoint.size.cols == 0
+            || checkpoint.restore_size.rows == 0
+            || checkpoint.restore_size.cols == 0
+            || checkpoint.resize_after_restore_bytes > checkpoint.restore_bytes
+        {
+            return Err(ClientError::ProtocolContractViolation(
+                "invalid terminal checkpoint fence",
+            ));
+        }
+        let mut revision = checkpoint.resize_revision;
+        let mut position = checkpoint.through_byte;
+        for resize in resizes {
+            if Some(resize.resize_revision) != revision.checked_add(1)
+                || resize.through_byte < position
+                || resize.through_byte > snapshot.replay.latest_output_bytes
+                || resize.size.rows == 0
+                || resize.size.cols == 0
+            {
+                return Err(ClientError::ProtocolContractViolation(
+                    "invalid terminal geometry tail",
+                ));
+            }
+            revision = resize.resize_revision;
+            position = resize.through_byte;
+        }
+        if revision != snapshot.resize_revision {
+            return Err(ClientError::ProtocolContractViolation(
+                "incomplete terminal geometry tail",
+            ));
+        }
+        if let Some(rows) = checkpoint.restore_scrollback_rows {
+            usize::try_from(rows).map_err(|_| {
+                TerminalSeedResourceError::HostScrollbackCapacity {
+                    requested_rows: rows,
+                }
+            })?;
+        }
+        terminal_seed::reserve_restore(
+            &mut snapshot.terminal_restore,
+            checkpoint.restore_bytes,
+            limits,
+        )?;
+        while (snapshot.terminal_restore.len() as u64) < checkpoint.restore_bytes {
+            match receive_optional(wire).await?.ok_or(ClientError::Closed)? {
+                ServerFrame::TerminalCheckpointChunk { offset, data }
+                    if offset == snapshot.terminal_restore.len() as u64
+                        && !data.is_empty()
+                        && offset
+                            .checked_add(data.len() as u64)
+                            .is_some_and(|end| end <= checkpoint.restore_bytes) =>
+                {
+                    snapshot.terminal_restore.extend(data);
+                }
+                ServerFrame::Error { error } => return Err(error.into()),
+                _ => {
+                    return Err(ClientError::UnexpectedFrame(
+                        "expected ordered synthetic terminal seed",
+                    ));
+                }
+            }
+        }
+        checkpoint.through_byte
+    } else {
+        after_byte
+    };
+    Ok(replay_start)
+}
+
 async fn receive_replay<S>(
     wire: &mut S,
     after_byte: u64,
     snapshot: &mut AttachedSnapshot,
+    limits: TerminalSeedLimits,
 ) -> Result<(), ClientError>
 where
     S: futures_util::Stream<Item = Result<String, LinesCodecError>> + Unpin,
 {
+    let after_byte = receive_terminal_seed(wire, after_byte, snapshot, limits).await?;
     if snapshot
         .replay
         .chunks
@@ -1241,6 +1472,14 @@ where
                 && first_available_byte > expected_byte
                 && first_available_byte <= latest_output_bytes =>
             {
+                if matches!(
+                    snapshot.terminal,
+                    ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+                ) {
+                    return Err(ClientError::ProtocolContractViolation(
+                        "terminal checkpoint original tail was evicted during replay",
+                    ));
+                }
                 snapshot.replay.chunks.clear();
                 snapshot.replay.first_available_byte = first_available_byte;
                 snapshot.run.first_available_byte = first_available_byte;
@@ -1334,6 +1573,7 @@ mod runtime_tests {
     fn recoverable_stop_attachment_rejects_a_late_control_rejection_as_unknown() {
         let error = super::decode_recoverable_stop_attachment_response(Response::ControlRejected {
             failure: ControlFailure {
+                confirmed_input_bytes: None,
                 error: ProtocolError::new(ErrorCode::InvalidRunState, "already terminal"),
                 disposition: CommandDisposition::NotApplied,
             },
@@ -1377,6 +1617,171 @@ mod replay_tests {
     use super::{ClientError, receive_replay};
 
     #[tokio::test]
+    async fn terminal_seed_rejects_tail_eviction_at_any_replay_boundary() {
+        for delivered in [0, 1] {
+            let mut snapshot = snapshot(2);
+            snapshot.terminal = ctxmux_protocol::TerminalContinuation::BasicVt {
+                checkpoint: ctxmux_protocol::TerminalCheckpointHeader {
+                    run_id: snapshot.run.id,
+                    through_byte: 0,
+                    resize_revision: 0,
+                    size: ctxmux_protocol::TerminalSize::default(),
+                    restore_size: ctxmux_protocol::TerminalSize::default(),
+                    restore_scrollback_rows: None,
+                    resize_after_restore_bytes: 0,
+                    restore_bytes: 2,
+                },
+                resizes: Vec::new(),
+            };
+            let mut frames = vec![Ok(encode_frame(&ServerFrame::TerminalCheckpointChunk {
+                offset: 0,
+                data: b"\x1bc".to_vec(),
+            })
+            .unwrap())];
+            if delivered > 0 {
+                frames.push(Ok(frame(OutputChunk {
+                    start_byte: 0,
+                    end_byte: 1,
+                    data: b"x".to_vec(),
+                })));
+            }
+            frames.push(Ok(encode_frame(&ServerFrame::ReplayWindow {
+                first_available_byte: delivered + 1,
+                latest_output_bytes: 2,
+            })
+            .unwrap()));
+            let mut frames = stream::iter(frames);
+            assert!(matches!(
+                receive_replay(
+                    &mut frames,
+                    0,
+                    &mut snapshot,
+                    super::TerminalSeedLimits::default()
+                )
+                .await,
+                Err(ClientError::ProtocolContractViolation(
+                    "terminal checkpoint original tail was evicted during replay"
+                ))
+            ));
+        }
+    }
+
+    fn terminal_snapshot(restore_bytes: u64) -> AttachedSnapshot {
+        let mut snapshot = snapshot(0);
+        snapshot.terminal = ctxmux_protocol::TerminalContinuation::BasicVt {
+            checkpoint: ctxmux_protocol::TerminalCheckpointHeader {
+                run_id: snapshot.run.id,
+                through_byte: 0,
+                resize_revision: 0,
+                size: ctxmux_protocol::TerminalSize::default(),
+                restore_size: ctxmux_protocol::TerminalSize::default(),
+                restore_scrollback_rows: None,
+                resize_after_restore_bytes: 0,
+                restore_bytes,
+            },
+            resizes: Vec::new(),
+        };
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn valid_large_seed_is_local_policy_pressure_but_bad_identity_still_violates_contract() {
+        let bytes = super::TerminalSeedLimits::default().restore_bytes + 1;
+        let mut snapshot = terminal_snapshot(bytes);
+        let mut no_body = stream::poll_fn(
+            |_| -> std::task::Poll<Option<Result<String, LinesCodecError>>> {
+                panic!("refusal must precede body reads and allocation")
+            },
+        );
+        assert!(
+            matches!(receive_replay(&mut no_body, 0, &mut snapshot, super::TerminalSeedLimits::default()).await,
+            Err(ClientError::TerminalSeedResource(super::TerminalSeedResourceError::RestoreLimit {
+                requested_bytes, limit_bytes,
+            })) if requested_bytes == bytes && limit_bytes + 1 == bytes)
+        );
+        assert_eq!(snapshot.terminal_restore.capacity(), 0);
+        if let ctxmux_protocol::TerminalContinuation::BasicVt { checkpoint, .. } =
+            &mut snapshot.terminal
+        {
+            checkpoint.run_id = ctxmux_protocol::RunId::new();
+        }
+        assert!(matches!(
+            receive_replay(
+                &mut no_body,
+                0,
+                &mut snapshot,
+                super::TerminalSeedLimits::default()
+            )
+            .await,
+            Err(ClientError::ProtocolContractViolation(
+                "invalid terminal checkpoint fence"
+            ))
+        ));
+        assert_eq!(snapshot.terminal_restore.capacity(), 0);
+    }
+
+    #[tokio::test]
+    async fn explicitly_funded_large_seed_assembles_every_ordered_binary_byte() {
+        let bytes = super::TerminalSeedLimits::default().restore_bytes + 1;
+        let mut snapshot = terminal_snapshot(bytes);
+        // Representative multi-frame opaque bytes, not a production capacity.
+        let mut frames = stream::iter((0..bytes).step_by(256 * 1024).map(|offset| {
+            let count = usize::try_from((bytes - offset).min(256 * 1024)).expect("chunk length");
+            let data = (0_u8..=255).cycle().take(count).collect();
+            Ok(
+                encode_frame(&ServerFrame::TerminalCheckpointChunk { offset, data })
+                    .expect("seed chunk"),
+            )
+        }));
+        receive_replay(
+            &mut frames,
+            0,
+            &mut snapshot,
+            super::TerminalSeedLimits {
+                restore_bytes: bytes,
+            },
+        )
+        .await
+        .expect("configured valid seed above historical default");
+        assert_eq!(snapshot.terminal_restore.len() as u64, bytes);
+        assert!(
+            snapshot
+                .terminal_restore
+                .iter()
+                .copied()
+                .eq((0_u8..=255).cycle().take(usize::try_from(bytes).unwrap()))
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_replay_keeps_the_explicit_newer_retained_window() {
+        let mut snapshot = snapshot(2);
+        let mut frames = stream::iter([
+            Ok(encode_frame(&ServerFrame::ReplayWindow {
+                first_available_byte: 1,
+                latest_output_bytes: 2,
+            })
+            .unwrap()),
+            Ok(frame(OutputChunk {
+                start_byte: 1,
+                end_byte: 2,
+                data: b"y".to_vec(),
+            })),
+        ]);
+        receive_replay(
+            &mut frames,
+            0,
+            &mut snapshot,
+            super::TerminalSeedLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.replay.truncated);
+        assert_eq!(snapshot.replay.first_available_byte, 1);
+        assert_eq!(snapshot.replay.chunks[0].data, b"y");
+    }
+
+    #[tokio::test]
     async fn replay_accepts_the_exact_advertised_byte_boundary() {
         let mut snapshot = snapshot(2);
         let mut frames = stream::iter([Ok(frame(OutputChunk {
@@ -1385,9 +1790,14 @@ mod replay_tests {
             data: vec![0, 255],
         }))]);
 
-        receive_replay(&mut frames, 0, &mut snapshot)
-            .await
-            .expect("accept exact replay boundary");
+        receive_replay(
+            &mut frames,
+            0,
+            &mut snapshot,
+            super::TerminalSeedLimits::default(),
+        )
+        .await
+        .expect("accept exact replay boundary");
         assert_eq!(snapshot.replay.chunks[0].end_byte, 2);
     }
 
@@ -1415,7 +1825,13 @@ mod replay_tests {
             let mut frames = stream::iter([Ok(frame(chunk))]);
             assert!(
                 matches!(
-                    receive_replay(&mut frames, 0, &mut snapshot).await,
+                    receive_replay(
+                        &mut frames,
+                        0,
+                        &mut snapshot,
+                        super::TerminalSeedLimits::default()
+                    )
+                    .await,
                     Err(ClientError::UnexpectedFrame(
                         "expected ordered replay output"
                     ))
@@ -1428,7 +1844,13 @@ mod replay_tests {
         let mut snapshot = snapshot(1);
         let mut eof = stream::empty::<Result<String, LinesCodecError>>();
         assert!(matches!(
-            receive_replay(&mut eof, 0, &mut snapshot).await,
+            receive_replay(
+                &mut eof,
+                0,
+                &mut snapshot,
+                super::TerminalSeedLimits::default()
+            )
+            .await,
             Err(ClientError::Closed)
         ));
     }
@@ -1456,7 +1878,11 @@ mod replay_tests {
                 attachments: 1,
                 applied_input_bytes: Some(0),
                 current_size: None,
+                native_service: None,
             },
+            terminal: ctxmux_protocol::TerminalContinuation::NotRequested,
+            terminal_restore: Vec::new(),
+            resize_revision: 0,
             replay: OutputReplay {
                 chunks: Vec::new(),
                 first_available_byte: 0,

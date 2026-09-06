@@ -1,0 +1,2 @@
+# Preserve the upstream terminal byte stream as binary, without text conversion.
+third_party/vte/tests/demo.vte binary

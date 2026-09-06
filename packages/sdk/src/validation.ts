@@ -82,6 +82,13 @@ export function validateServerFrame(value: unknown): ServerFrame {
           "no later than the replay head",
         );
       break;
+    case "terminal_checkpoint_chunk":
+      exactFields(frame, "$frame", ["type", "offset", "data"]);
+      validateCursorValue(frame.offset, "$frame.offset");
+      frame.data = decodeOutputBytes(frame.data, "$frame.data");
+      if ((frame.data as Uint8Array).length === 0)
+        throw invalid("$frame.data", "nonempty restore bytes");
+      break;
     case "event":
       exactFields(frame, "$frame", ["type", "event"]);
       runEvent(frame.event, "$frame.event");
@@ -102,6 +109,88 @@ export function validateServerFrame(value: unknown): ServerFrame {
       throw invalid("$frame.type", "a known server-frame discriminant");
   }
   return value as ServerFrame;
+}
+
+function diagnosticsSnapshot(value: unknown, path: string): void {
+  const diagnostics = record(value, path);
+  const counts = [
+    "queue_budget_bytes",
+    "record_limit_bytes",
+    "funded_bytes",
+    "formatting_records",
+    "queued_records",
+    "active_record_bytes",
+    "admitted_records",
+    "written_records",
+    "written_bytes",
+    "notice_written_bytes",
+    "dropped_before_encoding_records",
+    "dropped_encoded_records",
+    "discarded_encoded_bytes",
+    "oversized_records",
+    "format_failed_records",
+    "sink_write_failures",
+    "initialization_failures",
+    "partially_written_records",
+    "scoped_panics",
+  ] as const;
+  exactFields(diagnostics, path, [
+    ...counts,
+    "sink",
+    "last_sink_errno",
+    "writer_alive",
+    "shutdown_requested",
+    "counters_saturated",
+  ]);
+  for (const field of counts)
+    safeUnsignedInteger(diagnostics[field], `${path}.${field}`);
+  const states = [
+    "not_initialized",
+    "starting",
+    "idle",
+    "writing",
+    "failed",
+    "stopped",
+  ];
+  if (!states.includes(string(diagnostics.sink, `${path}.sink`)))
+    throw invalid(`${path}.sink`, "a known diagnostic sink state");
+  if (diagnostics.last_sink_errno !== null)
+    unsignedInteger(
+      diagnostics.last_sink_errno,
+      `${path}.last_sink_errno`,
+      0x7fffffff,
+      1,
+    );
+  for (const field of [
+    "writer_alive",
+    "shutdown_requested",
+    "counters_saturated",
+  ] as const)
+    boolean(diagnostics[field], `${path}.${field}`);
+  // Atomic fields are sampled independently; concurrent transitions do not
+  // justify inventing equality between counters or sink/writer facts.
+  if (diagnostics.sink === "not_initialized") {
+    for (const field of counts) {
+      if (
+        field !== "dropped_before_encoding_records" &&
+        field !== "scoped_panics" &&
+        diagnostics[field] !== 0
+      )
+        throw invalid(`${path}.${field}`, "zero before initialization");
+    }
+    if (
+      diagnostics.last_sink_errno !== null ||
+      diagnostics.writer_alive !== false ||
+      diagnostics.shutdown_requested !== false
+    )
+      throw invalid(path, "uninitialized sink observations");
+  } else if (
+    Number(diagnostics.record_limit_bytes) === 0 ||
+    Number(diagnostics.queue_budget_bytes) <
+      Number(diagnostics.record_limit_bytes)
+  ) {
+    throw invalid(path, "positive funded diagnostic policy");
+  }
 }
 
 function runtimeIdentity(value: unknown, path: string): void {
@@ -300,6 +389,10 @@ function response(value: unknown, path: string): void {
         runId(valueRecord.next_cursor, `${path}.next_cursor`);
       }
       return;
+    case "diagnostics":
+      exactFields(valueRecord, path, ["type", "diagnostics"]);
+      diagnosticsSnapshot(valueRecord.diagnostics, `${path}.diagnostics`);
+      return;
     case "removed":
       exactFields(valueRecord, path, ["type", "id"]);
       runId(valueRecord.id, `${path}.id`);
@@ -311,9 +404,127 @@ function response(value: unknown, path: string): void {
 
 function attachedHeader(value: unknown, path: string): void {
   const header = record(value, path);
-  exactFields(header, path, ["run", "replay"]);
+  exactFields(header, path, ["run", "replay", "terminal", "resize_revision"]);
   runInfo(header.run, `${path}.run`);
   outputReplayHeader(header.replay, `${path}.replay`);
+  validateCursorValue(header.resize_revision, `${path}.resize_revision`);
+  terminalContinuation(header.terminal, `${path}.terminal`, header);
+}
+
+function terminalContinuation(
+  value: unknown,
+  path: string,
+  header: Record<string, unknown>,
+): void {
+  const terminal = record(value, path);
+  const kind = discriminant(terminal, path);
+  if (kind === "not_requested") {
+    exactFields(terminal, path, ["type"]);
+    return;
+  }
+  if (kind === "unknown" || kind === "unavailable") {
+    exactFields(terminal, path, ["type", "reason"]);
+    const reason = string(terminal.reason, `${path}.reason`);
+    if (
+      ![
+        "origin_unknown",
+        "source_gap",
+        "tail_evicted",
+        "checkpoint_too_large",
+        "invalid_checkpoint",
+      ].includes(reason)
+    ) {
+      throw invalid(`${path}.reason`, "a declared continuation absence");
+    }
+    return;
+  }
+  if (kind !== "basic_vt")
+    throw invalid(`${path}.type`, "a terminal continuation scope");
+  exactFields(terminal, path, ["type", "checkpoint", "resizes"]);
+  const checkpoint = record(terminal.checkpoint, `${path}.checkpoint`);
+  exactFields(checkpoint, `${path}.checkpoint`, [
+    "run_id",
+    "through_byte",
+    "resize_revision",
+    "size",
+    "restore_bytes",
+    "restore_size",
+    "restore_scrollback_rows",
+    "resize_after_restore_bytes",
+  ]);
+  runId(checkpoint.run_id, `${path}.checkpoint.run_id`);
+  const run = record(header.run, "$frame.snapshot.run");
+  const replay = record(header.replay, "$frame.snapshot.replay");
+  validateCursorValue(
+    checkpoint.through_byte,
+    `${path}.checkpoint.through_byte`,
+  );
+  validateCursorValue(
+    checkpoint.resize_revision,
+    `${path}.checkpoint.resize_revision`,
+  );
+  terminalSize(checkpoint.size, `${path}.checkpoint.size`, true);
+  terminalSize(
+    checkpoint.restore_size,
+    `${path}.checkpoint.restore_size`,
+    true,
+  );
+  if (checkpoint.restore_scrollback_rows !== null)
+    safeUnsignedInteger(
+      checkpoint.restore_scrollback_rows,
+      `${path}.checkpoint.restore_scrollback_rows`,
+    );
+  unsignedInteger(
+    checkpoint.restore_bytes,
+    `${path}.checkpoint.restore_bytes`,
+    Number.MAX_SAFE_INTEGER,
+    1,
+  );
+  unsignedInteger(
+    checkpoint.resize_after_restore_bytes,
+    `${path}.checkpoint.resize_after_restore_bytes`,
+    Number(checkpoint.restore_bytes),
+  );
+  if (
+    checkpoint.run_id !== run.id ||
+    (checkpoint.through_byte as number) <
+      (replay.first_available_byte as number) ||
+    (checkpoint.through_byte as number) > (replay.latest_output_bytes as number)
+  ) {
+    throw invalid(path, "exact Run and retained original-tail fence");
+  }
+  let revision = checkpoint.resize_revision as number;
+  let throughByte = checkpoint.through_byte as number;
+  const resizes = array(terminal.resizes, `${path}.resizes`);
+  for (const [index, item] of resizes.entries()) {
+    const resizePath = `${path}.resizes[${String(index)}]`;
+    const resize = record(item, resizePath);
+    exactFields(resize, resizePath, [
+      "through_byte",
+      "resize_revision",
+      "size",
+    ]);
+    validateCursorValue(resize.through_byte, `${resizePath}.through_byte`);
+    validateCursorValue(
+      resize.resize_revision,
+      `${resizePath}.resize_revision`,
+    );
+    terminalSize(resize.size, `${resizePath}.size`, true);
+    if (
+      resize.resize_revision !== revision + 1 ||
+      (resize.through_byte as number) < throughByte ||
+      (resize.through_byte as number) > (replay.latest_output_bytes as number)
+    ) {
+      throw invalid(
+        resizePath,
+        "contiguous geometry revisions in original byte order",
+      );
+    }
+    revision = resize.resize_revision as number;
+    throughByte = resize.through_byte as number;
+  }
+  if (revision !== header.resize_revision)
+    throw invalid(path, "complete acknowledged geometry tail");
 }
 
 function runEvent(value: unknown, path: string): void {
@@ -322,6 +533,10 @@ function runEvent(value: unknown, path: string): void {
     case "output":
       exactFields(event, path, ["type", "chunk"]);
       outputChunk(event.chunk, `${path}.chunk`);
+      return;
+    case "service_changed":
+      exactFields(event, path, ["type", "service"]);
+      nativeServiceSnapshot(event.service, `${path}.service`);
       return;
     case "exited":
       exactFields(event, path, ["type", "state"]);
@@ -341,7 +556,19 @@ function runEvent(value: unknown, path: string): void {
       exactFields(event, path, ["type"]);
       return;
     case "resized":
-      exactFields(event, path, ["type", "size"]);
+      exactFields(event, path, [
+        "type",
+        "size",
+        "through_byte",
+        "resize_revision",
+      ]);
+      validateCursorValue(event.through_byte, `${path}.through_byte`);
+      unsignedInteger(
+        event.resize_revision,
+        `${path}.resize_revision`,
+        Number.MAX_SAFE_INTEGER,
+        1,
+      );
       // The owner only publishes a size it read back from the PTY, and it
       // rejects a zero read-back rather than reporting it, so a zero here is
       // a contract violation rather than a degenerate-but-legal terminal.
@@ -407,6 +634,7 @@ function runInfo(value: unknown, path: string): void {
     "attachments",
     "applied_input_bytes",
     "current_size",
+    "native_service",
   ]);
   runId(run.id, `${path}.id`);
   if (run.spec !== null) {
@@ -419,6 +647,11 @@ function runInfo(value: unknown, path: string): void {
     unsignedInteger(run.pid, `${path}.pid`, 0xffff_ffff);
   }
   const backend = runBackend(run.backend, `${path}.backend`);
+  if (backend === "native") {
+    nativeServiceSnapshot(run.native_service, `${path}.native_service`);
+  } else if (run.native_service !== null) {
+    throw invalid(`${path}.native_service`, "null for a non-native Run");
+  }
   runCapabilities(run.capabilities, `${path}.capabilities`, backend);
   if (backend === "native" && run.spec === null) {
     throw invalid(`${path}.spec`, "a native Run specification");
@@ -458,6 +691,111 @@ function runInfo(value: unknown, path: string): void {
   // a dimension pair here would be an unconfirmed guess dressed as an answer.
   if (backend === "tmux" && run.current_size !== null) {
     throw invalid(`${path}.current_size`, "null for a tmux Run");
+  }
+}
+
+function nativeServiceSnapshot(value: unknown, path: string): void {
+  const service = record(value, path);
+  exactFields(service, path, [
+    "revision",
+    "owner",
+    "output",
+    "input",
+    "terminal_fault",
+  ]);
+  safeUnsignedInteger(service.revision, `${path}.revision`);
+  nativeServiceStatus(
+    service.owner,
+    `${path}.owner`,
+    ["starting", "serving", "draining"],
+    "stopped",
+  );
+  nativeServiceStatus(
+    service.output,
+    `${path}.output`,
+    ["pending", "serving", "backpressured", "closed"],
+    "unavailable",
+  );
+  const inputPath = `${path}.input`;
+  const input = record(service.input, inputPath);
+  exactFields(input, inputPath, [
+    "phase",
+    "unsettled_commands",
+    "unsettled_request_bytes",
+    "write_blocked",
+    "completed_input_bytes",
+    "current_size",
+    "active_confirmed_bytes",
+  ]);
+  nativeServiceStatus(
+    input.phase,
+    `${inputPath}.phase`,
+    ["open", "closed"],
+    "unavailable",
+  );
+  safeUnsignedInteger(
+    input.unsettled_commands,
+    `${inputPath}.unsettled_commands`,
+  );
+  safeUnsignedInteger(
+    input.unsettled_request_bytes,
+    `${inputPath}.unsettled_request_bytes`,
+  );
+  boolean(input.write_blocked, `${inputPath}.write_blocked`);
+  if (input.completed_input_bytes !== null) {
+    safeUnsignedInteger(
+      input.completed_input_bytes,
+      `${inputPath}.completed_input_bytes`,
+    );
+  }
+  if (input.current_size !== null)
+    terminalSize(input.current_size, `${inputPath}.current_size`, true);
+  safeUnsignedInteger(
+    input.active_confirmed_bytes,
+    `${inputPath}.active_confirmed_bytes`,
+  );
+  if (service.terminal_fault !== null) {
+    const faultPath = `${path}.terminal_fault`;
+    const fault = record(service.terminal_fault, faultPath);
+    exactFields(fault, faultPath, ["stage", "through_byte"]);
+    if (
+      !["process", "resize", "export", "recovery"].includes(
+        string(fault.stage, `${faultPath}.stage`),
+      )
+    ) {
+      throw invalid(`${faultPath}.stage`, "a declared terminal fault stage");
+    }
+    safeUnsignedInteger(fault.through_byte, `${faultPath}.through_byte`);
+  }
+}
+
+function nativeServiceStatus(
+  value: unknown,
+  path: string,
+  available: readonly string[],
+  failed: string,
+): void {
+  const status = record(value, path);
+  const type = discriminant(status, path);
+  if (available.includes(type)) {
+    exactFields(status, path, ["type"]);
+    return;
+  }
+  if (type !== failed) {
+    throw invalid(`${path}.type`, "a declared native service status");
+  }
+  exactFields(status, path, ["type", "reason"]);
+  if (
+    ![
+      "owner_stopped",
+      "owner_unwound",
+      "read_failed",
+      "write_failed",
+      "historical",
+      "control_closed",
+    ].includes(string(status.reason, `${path}.reason`))
+  ) {
+    throw invalid(`${path}.reason`, "a declared native service failure");
   }
 }
 
@@ -790,19 +1128,29 @@ function controlReceipt(value: unknown, path: string): void {
 
 function controlFailure(value: unknown, path: string): void {
   const failure = record(value, path);
-  exactFields(failure, path, ["error", "disposition"]);
+  exactFields(failure, path, ["error", "disposition", "confirmed_input_bytes"]);
+  if (failure.confirmed_input_bytes !== null) {
+    safeUnsignedInteger(
+      failure.confirmed_input_bytes,
+      `${path}.confirmed_input_bytes`,
+    );
+    if (
+      failure.disposition === "not_applied" &&
+      failure.confirmed_input_bytes !== 0
+    ) {
+      throw invalid(
+        `${path}.confirmed_input_bytes`,
+        "zero for a command not applied",
+      );
+    }
+  }
   protocolError(failure.error, `${path}.error`);
   const disposition = string(failure.disposition, `${path}.disposition`);
   if (disposition !== "not_applied" && disposition !== "unknown") {
     throw invalid(`${path}.disposition`, "a known command disposition");
   }
-  const error = record(failure.error, `${path}.error`);
-  if (error.code === "control_backpressure" && disposition !== "not_applied") {
-    throw invalid(
-      `${path}.disposition`,
-      '"not_applied" for control backpressure',
-    );
-  }
+  // Pressure describes capacity, not whether a recoverable key was already
+  // applied. Preserve owner-reported uncertainty when its ledger is busy.
 }
 
 function terminalSize(value: unknown, path: string, nonzero = false): void {

@@ -52,8 +52,8 @@ test("qualification scopes the historical GC quota without inheriting candidate 
   );
   assert.deepEqual(Object.keys(base).sort(), Object.keys(gc).sort());
   // One consumer cannot edit the next invocation's frozen operating point.
-  base.input_workers = 1;
-  assert.equal(qualificationResourceLimits(loaded).input_workers, 8);
+  base.input_turn_commands = 1;
+  assert.equal(qualificationResourceLimits(loaded).input_turn_commands, 64);
   const changed = Object.keys(gc).filter(
     (key) => gc[key] !== qualificationResourceLimits(loaded)[key],
   );
