@@ -2525,7 +2525,10 @@ impl StateLockGuard {
 impl Drop for StateLockGuard {
     fn drop(&mut self) {
         if let Err(error) = File::unlock(&self.0) {
-            eprintln!("ctxmuxd failed to release its state lock: {error}");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "ctxmuxd failed to release its state lock: {error}"
+            );
         }
     }
 }

@@ -120,7 +120,7 @@ The remaining numbers have distinct jobs:
 - Protocol frame/key/cursor ranges (1 MiB frame, 128-byte operation keys, JSON safe integer range) bound one peer message or identity; paged List/replay remove fleet-size coupling.
 - 8 KiB PTY reads, 64 KiB cache/replay/coalescing blocks, 1 MiB storage work units and 128-row startup batches bound transient work. Adaptive reduction must handle a smaller configured page budget.
 - 64 creation lock stripes distribute key contention; they neither allocate one worker per stripe nor limit distinct Runs.
-- 64-command/256 KiB input bursts yield blocking workers for fairness; queued operations remain owned after a yield.
+- 64-command/256 KiB input bursts yield workers only after completed blocking writes; queued operations remain owned after a yield. These work units do not bound one write or establish fairness when a child stops reading. Blocked writes can occupy every input worker and starve unrelated Runs. Feature `f-22vcz84zn` owns readiness-driven progression and its real blocked-Run acceptance; raising the worker count is not that repair.
 - FD baseline 16 and attachment headroom 64 provision ordinary service descriptors; three descriptors per native live owner and creation overlap come from actual owners. These are headroom, not an attachment or Run population promise.
 - Control/cleanup/upgrade deadlines bound acknowledgement or owner transitions; they do not convert unknown effects into not-applied results. The one-second terminal-output deadline applies to an idle surviving writer: readable or pressure-paused finite output continues draining, and an idle cutoff reports a source gap.
 - Bounded retry/backoff numbers apply to typed transient conflicts; unknown commit is never retried.

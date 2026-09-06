@@ -75,7 +75,10 @@ impl OwnerWake {
                 *writer_owner = None;
             }
             Err(error) => {
-                eprintln!("ctxmuxd native owner wake failed: {error}");
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "ctxmuxd native owner wake failed: {error}"
+                );
                 writer.shutdown(std::net::Shutdown::Both).ok();
                 *writer_owner = None;
             }
@@ -1573,7 +1576,10 @@ fn poll_and_read_outputs(
         }
         Err(Errno::INTR) => Vec::new(),
         Err(error) => {
-            eprintln!("ctxmuxd daemon-wide native output poll failed: {error}");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "ctxmuxd daemon-wide native output poll failed: {error}"
+            );
             Vec::new()
         }
     };
@@ -1588,7 +1594,10 @@ fn poll_and_read_outputs(
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => {
-                    eprintln!("ctxmuxd native owner wake drain failed: {error}");
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "ctxmuxd native owner wake drain failed: {error}"
+                    );
                     break;
                 }
             }
@@ -1630,7 +1639,11 @@ fn poll_and_read_outputs(
             }
             Err(error) => {
                 if let Some(run) = entries[index].run.upgrade() {
-                    eprintln!("ctxmuxd PTY read failed for {}: {error}", run.id);
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "ctxmuxd PTY read failed for {}: {error}",
+                        run.id
+                    );
                 }
                 entries[index].output = None;
             }

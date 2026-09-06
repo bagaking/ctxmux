@@ -479,6 +479,12 @@ reaps that unpublished child. These checks leave independently owned input
 service intact. They are passive entry checks; proactive service observations,
 exit-cause retention and complete derived-fault containment remain open.
 
+Long-lived daemon diagnostics use fallible stderr writes: a closed diagnostic
+receiver cannot panic an owner or its caller. This contains diagnostic I/O
+errors; it does not make a full, open stderr pipe nonblocking. Runtime service
+facts and input results must have their own public observation owner, so a
+diagnostic receiver cannot determine availability or conceal a real failure.
+
 The important guarantees are behavioral, not implied by lock types.
 
 - Output byte ranges are allocated under the output-log mutex before broadcast.

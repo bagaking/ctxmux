@@ -478,7 +478,8 @@ fn apply_startup_fd_budget(manager: &RunManager) {
     let describe =
         |limit: Option<u64>| limit.map_or_else(|| "unlimited".to_owned(), |n| n.to_string());
     if outcome.clamped {
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "ctxmuxd: RLIMIT_NOFILE soft {} hard {} funds only {} live Run(s); \
              effective Run ceiling clamped below the configured {} \
              (fd budget {} unavailable); excess Runs are refused with run_capacity",
@@ -489,7 +490,8 @@ fn apply_startup_fd_budget(manager: &RunManager) {
             outcome.provisioned_fds,
         );
     } else if outcome.raised {
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "ctxmuxd: raised RLIMIT_NOFILE soft {} -> {} (hard {}); funds {} live Run(s)",
             describe(outcome.original_soft),
             describe(outcome.effective_soft),
@@ -575,7 +577,8 @@ fn become_child_subreaper() {
         // which CLEARS the attribute. Naming ourselves is what sets it.
         let me = rustix::process::getpid();
         if let Err(error) = rustix::process::set_child_subreaper(Some(me)) {
-            eprintln!(
+            let _ = writeln!(
+                io::stderr().lock(),
                 "ctxmuxd: failed to become a child subreaper ({error}); an orphaned \
                  Run descendant may escape the session emptiness proof"
             );
@@ -600,7 +603,8 @@ async fn serve_with_manager(
     apply_startup_fd_budget(&manager);
     if let Some(handoff) = &handoff {
         // A12 wires manifest.state_lock_fd into the incoming-image startup path.
-        eprintln!(
+        let _ = writeln!(
+            io::stderr().lock(),
             "ctxmuxd: adopted inherited listener for handoff (epoch {}, {} run(s))",
             handoff.epoch,
             handoff.runs.len()
@@ -639,7 +643,7 @@ async fn serve_with_manager(
                         // Run we still own. Back off inside this arm — a bare retry
                         // spins at 100% CPU while the socket stays readable, and
                         // staying in this arm keeps SIGHUP/ctrl_c responsive.
-                        eprintln!("ctxmuxd: transient accept error, continuing to serve: {source}");
+                        let _ = writeln!(io::stderr().lock(),"ctxmuxd: transient accept error, continuing to serve: {source}");
                         tokio::time::sleep(ACCEPT_BACKOFF).await;
                         continue;
                     }
@@ -647,7 +651,7 @@ async fn serve_with_manager(
                 let manager = Arc::clone(&manager);
                 tokio::spawn(async move {
                     if let Err(error) = handle_connection(stream, manager).await {
-                        eprintln!("ctxmuxd connection error: {error}");
+                        let _ = writeln!(io::stderr().lock(),"ctxmuxd connection error: {error}");
                     }
                 });
             }
@@ -671,13 +675,13 @@ async fn serve_with_manager(
             }
             _ = sighup.recv() => {
                 if manager.persistence.is_none() {
-                    eprintln!(
+                    let _ = writeln!(io::stderr().lock(),
                         "ctxmuxd: SIGHUP ignored: upgrade continuity requires --state-dir"
                     );
                     continue;
                 }
                 let Some(state_dir) = state_dir.as_deref() else {
-                    eprintln!(
+                    let _ = writeln!(io::stderr().lock(),
                         "ctxmuxd: SIGHUP ignored: no state directory recorded for re-exec"
                     );
                     continue;
@@ -693,7 +697,7 @@ async fn serve_with_manager(
                         // Reversible failure: nothing has been extracted, all
                         // controls are still owned. Abort the upgrade and keep
                         // serving by falling through to the next loop iteration.
-                        eprintln!(
+                        let _ = writeln!(io::stderr().lock(),
                             "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
                         );
                     }
@@ -1282,7 +1286,8 @@ impl RecoverableStopSettlementOwner {
                 Ok(true) => return,
                 Ok(false) => {}
                 Err(error) => {
-                    eprintln!(
+                    let _ = writeln!(
+                        io::stderr().lock(),
                         "ctxmuxd recoverable Stop handoff readiness probe failed for Run {}: {error}",
                         self.run_id
                     );
@@ -1291,7 +1296,8 @@ impl RecoverableStopSettlementOwner {
             }
             let now = Instant::now();
             if now >= deadline {
-                eprintln!(
+                let _ = writeln!(
+                    io::stderr().lock(),
                     "ctxmuxd timed out waiting for Run {} Stop cleanup to reach a handoff boundary",
                     self.run_id
                 );
@@ -1632,7 +1638,10 @@ impl Drop for PersistentPublicationOwner<'_> {
                 Ok(()) => self.phase = PersistentPublicationPhase::NotCommitted,
                 Err(failure) if failure.disposition() == StartDisposition::NotCommitted => {
                     self.phase = PersistentPublicationPhase::NotCommitted;
-                    eprintln!("ctxmuxd failed to finish staged persistence rollback: {failure}");
+                    let _ = writeln!(
+                        io::stderr().lock(),
+                        "ctxmuxd failed to finish staged persistence rollback: {failure}"
+                    );
                 }
                 Err(failure) => self.retain_unknown(&failure.to_string()),
             }
@@ -3111,7 +3120,10 @@ impl Drop for PendingChild {
             return;
         };
         if let Err(error) = child.kill() {
-            eprintln!("ctxmuxd failed to terminate rejected child: {error}");
+            let _ = writeln!(
+                io::stderr().lock(),
+                "ctxmuxd failed to terminate rejected child: {error}"
+            );
             if let Some(control) = &self.reap_control {
                 control.record_cleanup_error(format!(
                     "failed to terminate rejected unpublished child: {error}"
@@ -3125,7 +3137,10 @@ impl Drop for PendingChild {
                 }
             }
             Err(error) => {
-                eprintln!("ctxmuxd failed to reap rejected child: {error}");
+                let _ = writeln!(
+                    io::stderr().lock(),
+                    "ctxmuxd failed to reap rejected child: {error}"
+                );
                 if let Some(control) = &self.reap_control {
                     control.record_wait_error(format!(
                         "failed to reap rejected unpublished child: {error}"

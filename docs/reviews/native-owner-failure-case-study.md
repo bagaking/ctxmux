@@ -108,6 +108,16 @@ a 2-by-2 parser receives `abcdefgh`, then grows to 3-by-4. The source shows
 is rendered using the new geometry. This failure remains open and must not be
 hidden by the original sixteen passing fixtures.
 
+A separate causal probe found that infallible stderr diagnostics panic when
+their pipe receiver closes. After two real Runs served exact input/output, a
+memory-only SIGHUP diagnostic exited the old daemon; fallible writes preserved
+the same daemon, Runtime, original Runs and child identities, exact subsequent
+bytes and completed public Stop. A real Native read-error probe also preserved
+the healthy Run after its diagnostic failed; reversing that diagnostic alone
+failed the same probe. This establishes another shared-owner amplification
+path, not the missing original incident trigger. A full, open diagnostic pipe
+can still block, and truthful public service observations remain required.
+
 The resource and Native candidates both advertised protocol generation 18 but
 have different wire shapes, persistence schemas and handoff formats. Integration
 must preserve funded raw replay, durable pagination and complete operation
