@@ -495,6 +495,48 @@ Remaining consumer failures, baseline regression, control-parser limits,
 resource funding and saved-register semantics must be resolved at their owners
 before broader terminal fidelity is advertised.
 
+## Borrowed producers can hide a completed owner failure
+
+A separate real counterexample identifies an owner-completion ordering defect
+in the private joined runtime. The owner retains its failure and stops accepting
+new registrations, then blocks draining its command channel until every borrowed
+sender is released. Existing Run service publication, input fencing and an
+already extracted Stop refusal originally occurred only after that wait.
+A suspended producer could therefore leave an actually failed owner publicly
+Serving and still admit input. The original unwind fixture released its sender
+before checking service failure, so it did not cover this window.
+
+The minimal private repair moves those existing per-Run transitions before the
+producer-retirement wait and applies the same helper to accepted late
+registrations. It preserves their actual child and PTY authority; physical
+retirement stays unfinished while a producer remains. Two real Runs through two
+public clients retain identity and exact ordered output, then expose stopped
+service through both events and Status. A blocked input settles Unknown with
+its actual confirmed prefix, and the extracted Stop remains NotApplied.
+The four new cases and seventeen original owner cases pass. Reversing only the
+initial publication order restores the three corresponding contract failures.
+
+A held-out two-second producer pause also exposes a private teardown defect:
+cleanup after reader-owner retirement can time out with unread PTY output.
+Reading the exact five READY bytes after failure allows a same-budget retry,
+but that alone confounds drainage with extra time and repeated signals.
+A first-cleanup concurrent-reader experiment instead retains every actual byte
+through the real raw Run owner and completes cleanup within the original
+budgets. Its single-point no-read inverse fails its first cleanup, preserves the
+exact raw bytes afterward and still records the original failure. The original
+no-drain case remains RED. No workload, timeout, byte oracle or first outcome is
+weakened to call this complete.
+
+These experiments qualify local publication ordering and isolate a missing
+reader in private cleanup. They do not establish the historical exit trigger,
+a Darwin kernel mechanism or a shipping recovery owner after shared-owner loss.
+The temporary reader descriptor and worker belong only to the experiment.
+Orca's independent I/O-failure and process-exit states reinforce preserving
+process authority until actual exit; ctxmux must additionally expose truthful
+input outcomes through its public contract. The joined source remains
+unintegrated and uninstalled; complete cleanup and recovery qualification stay
+open.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |
