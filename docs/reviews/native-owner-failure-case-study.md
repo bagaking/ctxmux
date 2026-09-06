@@ -506,7 +506,7 @@ A suspended producer could therefore leave an actually failed owner publicly
 Serving and still admit input. The original unwind fixture released its sender
 before checking service failure, so it did not cover this window.
 
-The minimal private repair moves those existing per-Run transitions before the
+The minimal repair moves those existing per-Run transitions before the
 producer-retirement wait and applies the same helper to accepted late
 registrations. It preserves their actual child and PTY authority; physical
 retirement stays unfinished while a producer remains. Two real Runs through two
@@ -527,15 +527,28 @@ exact raw bytes afterward and still records the original failure. The original
 no-drain case remains RED. No workload, timeout, byte oracle or first outcome is
 weakened to call this complete.
 
+The publication-order slice and its four regressions are now integrated into
+the JOIN worktree. Integration initially reproduced two unread-PTY failures in
+private fixture cleanup. A general cleanup reader preserves every actual byte
+once and in order, retains the public clients' exact eleven- and twelve-byte
+echoes, and does not invent a READY prerequisite for bootstrap Stop or late
+registration. A copied READY-only assertion initially failed these different
+fixtures; that test-author error and the earlier failures remain recorded.
+Final integration passes all twenty-one owner cases, strict daemon library and
+test lint, and formatting. The shipping slice is byte-identical to the reviewed
+private repair; the extra reader descriptor and cleanup worker are test-only.
+This result does not replace the separate two-second no-drain RED.
+
 These experiments qualify local publication ordering and isolate a missing
 reader in private cleanup. They do not establish the historical exit trigger,
 a Darwin kernel mechanism or a shipping recovery owner after shared-owner loss.
 The temporary reader descriptor and worker belong only to the experiment.
 Orca's independent I/O-failure and process-exit states reinforce preserving
 process authority until actual exit; ctxmux must additionally expose truthful
-input outcomes through its public contract. The joined source remains
-unintegrated and uninstalled; complete cleanup and recovery qualification stay
-open.
+input outcomes through its public contract. The complete joined runtime remains
+outside Main and uninstalled; complete cleanup and recovery qualification stay
+open. Fatal poll and wake-drain failures still collapse into OwnerStopped, so
+their exact stage and system error need a separate observation-owner repair.
 
 ## Required completion
 
