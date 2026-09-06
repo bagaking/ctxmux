@@ -20,6 +20,31 @@ two Rust binaries with the locked release profile, builds and packs the existing
 `@ctxmux/sdk` workspace, and then rechecks the same clean source identity before
 publishing the output directory.
 
+The producer owns `CARGO_ENCODED_RUSTFLAGS`: it removes ambient Rust flags,
+target-specific flag overrides and compiler-selection aliases, and explicitly
+disables configured compiler wrappers. Probes and Cargo use the same PATH-selected
+`rustc`. Each invocation builds the two named binaries for that compiler's host
+target in a fresh producer-owned directory and copies only those actual outputs.
+Cargo target and output-directory configuration cannot redirect that copy to an
+old default-target binary with the same printed version. The temporary build
+cache is retired before publication; this source binding costs a fresh native
+build's storage and compilation time. It changes no runtime resource policy.
+The producer then remaps the resolved
+checkout, user directory, Cargo cache, Rustup directory and actual compiler
+sysroot and build directory to relative source/dependency/toolchain labels. Cache aliases are mapped
+as well. More specific prefixes follow broader prefixes because rustc applies
+[the last matching path remap](https://doc.rust-lang.org/rustc/remap-source-paths.html).
+Arguments are encoded separately so spaces and equals signs in source paths
+remain valid. These local prefixes are never added to the manifest. Source
+filenames, line numbers and diagnostic context remain available under the
+stable labels; the producer does not strip or edit compiled binaries.
+
+Compiler remapping covers compiler-emitted source paths. A source literal or an
+external tool that embeds a machine path needs its own owner correction; macOS
+linker OSO paths also have separate linker semantics. Inspect the complete
+produced binaries and SDK for environment information before accepting a
+consumer artifact. A clean Git identity alone does not prove artifact privacy.
+
 The output contains exactly:
 
 ```text

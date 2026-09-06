@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -17,12 +18,22 @@ const GIT_OBJECT_PATTERN = /^[0-9a-f]{40}$/u;
 const COMMAND_OUTPUT_LIMIT = 8 * 1024 * 1024;
 const SUPPORTED_PLATFORMS = new Set(["darwin", "linux"]);
 
-function canonicalEnvironment() {
-  const environment = { ...process.env };
+export function canonicalEnvironment(ambientEnvironment = process.env) {
+  const environment = { ...ambientEnvironment };
   for (const name of Object.keys(environment)) {
     if (
       name === "BASH_ENV" ||
       name === "ENV" ||
+      name === "RUSTFLAGS" ||
+      name === "CARGO_ENCODED_RUSTFLAGS" ||
+      name === "CARGO_BUILD_RUSTFLAGS" ||
+      name === "RUSTC" ||
+      name === "CARGO_BUILD_RUSTC" ||
+      name === "CARGO_BUILD_RUSTC_WRAPPER" ||
+      name === "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER" ||
+      name === "RUSTC_WRAPPER" ||
+      name === "RUSTC_WORKSPACE_WRAPPER" ||
+      (name.startsWith("CARGO_TARGET_") && name.endsWith("_RUSTFLAGS")) ||
       name === "GIT_DIR" ||
       name === "GIT_WORK_TREE" ||
       name === "GIT_COMMON_DIR" ||
@@ -46,8 +57,69 @@ function canonicalEnvironment() {
   return environment;
 }
 
-function buildEnvironment(sourceDateEpoch, npmConfigRoot) {
-  const environment = canonicalEnvironment();
+// rustc applies the last matching textual prefix. Directory separators prevent
+// an adjacent checkout or cache name from being mistaken for this directory.
+// Complete arguments are encoded for Cargo, so spaces and equals signs in FROM
+// never pass through shell splitting. These private build inputs are not facts
+// in the consumer manifest.
+export function pathRemapFlags({
+  sourceRoot,
+  homeDirectory,
+  cargoHomeDirectory,
+  rustupHomeDirectory,
+  sysroot,
+  buildDirectory = path.join(sourceRoot, "target"),
+}) {
+  const directories = [
+    [homeDirectory, "build-home"],
+    [rustupHomeDirectory, "rust-toolchains"],
+    [cargoHomeDirectory, "rust-dependencies"],
+    [sysroot, "rust-sysroot"],
+    [buildDirectory, "ctxmux-build"],
+    [sourceRoot, "ctxmux-source"],
+  ].map(([directory, label]) => {
+    const resolved = path.resolve(sourceRoot, directory);
+    // A fresh build directory can be absent beneath an aliased parent. Resolve
+    // the existing ancestor first so future generated files are mapped too.
+    let ancestor = resolved;
+    while (!fs.existsSync(ancestor)) ancestor = path.dirname(ancestor);
+    const real = path.join(
+      fs.realpathSync(ancestor),
+      path.relative(ancestor, resolved),
+    );
+    return { resolved, real, label };
+  });
+  const prefixes = new Map();
+  for (const { resolved, real, label } of directories) {
+    const aliases = new Set([resolved, real]);
+    // On hosts with an aliased parent (for example a temporary directory), a
+    // cache alias can resolve beneath that parent's real path. Cover the same
+    // child beneath each declared parent spelling without scanning the cache.
+    for (const parent of directories) {
+      if (real.startsWith(`${parent.real}${path.sep}`)) {
+        aliases.add(`${parent.resolved}${real.slice(parent.real.length)}`);
+      }
+    }
+    for (const prefix of aliases) {
+      prefixes.set(`${prefix}${path.sep}`, `${label}/`);
+    }
+  }
+  return [...prefixes.entries()]
+    .sort(([left], [right]) => left.length - right.length)
+    .map(([prefix, label]) => `--remap-path-prefix=${prefix}=${label}`);
+}
+
+export function buildEnvironment(
+  sourceDateEpoch,
+  npmConfigRoot,
+  {
+    root = DEFAULT_ROOT,
+    ambientEnvironment = process.env,
+    pathRoots,
+    buildDirectory = path.join(root, "target"),
+  } = {},
+) {
+  const environment = canonicalEnvironment(ambientEnvironment);
   for (const name of Object.keys(environment)) {
     if (
       name.toLowerCase().startsWith("npm_config_") ||
@@ -60,6 +132,29 @@ function buildEnvironment(sourceDateEpoch, npmConfigRoot) {
       delete environment[name];
     }
   }
+  // Probe and Cargo use the same PATH-selected compiler. Empty wrappers also
+  // override Cargo configuration; merely deleting ambient keys does not.
+  environment.RUSTC = "rustc";
+  environment.RUSTC_WRAPPER = "";
+  environment.RUSTC_WORKSPACE_WRAPPER = "";
+  const homeDirectory = os.homedir();
+  const roots = pathRoots ?? {
+    sourceRoot: root,
+    buildDirectory,
+    homeDirectory,
+    cargoHomeDirectory:
+      environment.CARGO_HOME ?? path.join(homeDirectory, ".cargo"),
+    rustupHomeDirectory:
+      environment.RUSTUP_HOME ?? path.join(homeDirectory, ".rustup"),
+    // A registered toolchain may live outside both RUSTUP_HOME and HOME.
+    sysroot: String(
+      runChecked(environment.RUSTC, ["--print", "sysroot"], {
+        cwd: root,
+        environment,
+      }),
+    ).trim(),
+  };
+  environment.CARGO_ENCODED_RUSTFLAGS = pathRemapFlags(roots).join("\u001f");
   environment.CARGO_INCREMENTAL = "0";
   environment.SOURCE_DATE_EPOCH = sourceDateEpoch;
   environment.npm_config_audit = "false";
@@ -237,7 +332,7 @@ export function parseBinaryVersion(name, output) {
 
 function rustToolchain(root, environment) {
   const verbose = String(
-    runChecked("rustc", ["-vV"], { cwd: root, environment }),
+    runChecked(environment.RUSTC, ["-vV"], { cwd: root, environment }),
   ).trim();
   const host = /^host: (?<host>[^\n]+)$/mu.exec(verbose)?.groups?.host;
   const release = /^release: (?<release>[^\n]+)$/mu.exec(verbose)?.groups
@@ -251,6 +346,36 @@ function rustToolchain(root, environment) {
       runChecked("cargo", ["--version"], { cwd: root, environment }),
     ).trim(),
     target: host,
+  };
+}
+
+// The caller owns this previously absent directory. A fresh source-specific
+// build avoids binding an old default-target binary to a new source receipt.
+export function buildNativeArtifacts(root, environment, targetDirectory) {
+  fs.mkdirSync(targetDirectory);
+  const toolchain = rustToolchain(root, environment);
+  runChecked(
+    "cargo",
+    [
+      "build",
+      "--locked",
+      "--release",
+      "--target-dir",
+      targetDirectory,
+      "--target",
+      toolchain.target,
+      "--config",
+      `build.build-dir=${JSON.stringify(targetDirectory)}`,
+      "--bin",
+      "ctxmux",
+      "--bin",
+      "ctxmuxd",
+    ],
+    { cwd: root, environment },
+  );
+  return {
+    directory: path.join(targetDirectory, toolchain.target, "release"),
+    toolchain,
   };
 }
 
@@ -270,24 +395,15 @@ export async function buildLocalArtifacts({
         `unsupported local artifact platform: ${process.platform}`,
       );
     }
-    const environment = buildEnvironment(source.commit_time_unix, stage);
-    runChecked(
-      "cargo",
-      [
-        "build",
-        "--locked",
-        "--release",
-        // Name the shipped binaries rather than their packages. `--package`
-        // builds every bin the package declares, which includes the test-only
-        // forwarder stand-in in ctxmux-daemon. Selecting binaries keeps a test
-        // binary out of a release build by construction instead of relying on
-        // the copy allowlist below to exclude it afterwards.
-        "--bin",
-        "ctxmux",
-        "--bin",
-        "ctxmuxd",
-      ],
-      { cwd: resolvedRoot, environment },
+    const targetDirectory = path.join(stage, ".native-build");
+    const environment = buildEnvironment(source.commit_time_unix, stage, {
+      root: resolvedRoot,
+      buildDirectory: targetDirectory,
+    });
+    const native = buildNativeArtifacts(
+      resolvedRoot,
+      environment,
+      targetDirectory,
     );
     runChecked("npm", ["run", "build", "--workspace", "@ctxmux/sdk"], {
       cwd: resolvedRoot,
@@ -337,7 +453,7 @@ export async function buildLocalArtifacts({
     fs.mkdirSync(binDirectory);
     for (const name of ["ctxmux", "ctxmuxd"]) {
       fs.copyFileSync(
-        path.join(resolvedRoot, "target", "release", name),
+        path.join(native.directory, name),
         path.join(binDirectory, name),
       );
       fs.chmodSync(path.join(binDirectory, name), 0o755);
@@ -374,7 +490,9 @@ export async function buildLocalArtifacts({
     ) {
       throw new Error("SDK and binary build identities disagree");
     }
-    const toolchain = rustToolchain(resolvedRoot, environment);
+    // Retire only this producer-owned build cache before publishing the bundle.
+    fs.rmSync(targetDirectory, { recursive: true });
+    const toolchain = native.toolchain;
     const sdkArchive = artifactDescriptor(
       stage,
       sdkArchivePath,
