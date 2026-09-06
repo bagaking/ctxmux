@@ -7,10 +7,41 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from run_benchmark import FrameSink, Ledger
+from run_benchmark import FrameSink, Ledger, Runtime
 
 
 class RecordingContracts(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_workload_survives_a_pending_failed_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Runtime.__new__(Runtime)
+            runtime.directory = Path(directory)
+            runtime.views = []
+            runtime.ledger = Ledger(runtime.directory, 1)
+            await runtime.ledger.measure("input_output", asyncio.sleep(0))
+            workload = {"outcome": "completed", "verified_bytes": 4096}
+            waiting = asyncio.Event()
+            release = asyncio.Event()
+
+            async def stalled_cleanup():
+                waiting.set()
+                await release.wait()
+                raise RuntimeError("terminal publication is unknown")
+
+            runtime.save_workload_snapshot(workload)
+            pending = asyncio.create_task(stalled_cleanup())
+            await waiting.wait()
+            snapshot = json.loads((runtime.directory / "workload.private.json").read_text())
+            self.assertEqual(snapshot["result"], workload)
+            self.assertFalse(snapshot["cleanup_qualified"])
+            self.assertFalse((runtime.directory / "result.private.json").exists())
+            timings = json.loads((runtime.directory / "latencies-before-cleanup.json").read_text())
+            self.assertEqual(timings["input_output"]["outcomes"], {"completed": 1})
+            release.set()
+            with self.assertRaisesRegex(RuntimeError, "unknown"):
+                await pending
+            self.assertEqual(json.loads((runtime.directory / "workload.private.json").read_text()), snapshot)
+            runtime.ledger.trace.close()
+
     async def test_concurrent_producers_survive_real_pipe_backpressure(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "frames.gz"

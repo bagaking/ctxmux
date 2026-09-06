@@ -58,3 +58,8 @@ records the actual launch arguments. It does not modify any offered workload,
 byte oracle, timeout or durability assertion. Preserve the original default
 failures when a second arm funds more shared event memory. Per-Run arming
 results and framed refusals are retained before the cell-level failure.
+
+Before cleanup starts, `workload.private.json`, byte-oracle facts and latency
+summaries preserve the completed workload. This snapshot explicitly leaves
+cleanup unqualified. Only the final cell result joins workload and lifecycle
+cleanup; a passing traffic phase cannot conceal failed Stop or removal.

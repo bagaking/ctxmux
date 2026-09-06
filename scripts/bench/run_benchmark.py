@@ -596,6 +596,14 @@ class Runtime:
         self.socket_directory.cleanup()
         return cleanup
 
+    def save_workload_snapshot(self, result):
+        """Keep finished workload evidence while lifecycle cleanup is pending."""
+        save(self.directory / "workload.private.json", {
+            "phase": "before_cleanup", "cleanup_qualified": False, "result": result,
+        })
+        save(self.directory / "views-before-cleanup.private.json", [view.facts() for view in self.views])
+        save(self.directory / "latencies-before-cleanup.json", self.ledger.summary())
+
 
 async def bounded_map(concurrency, items, action):
     semaphore = asyncio.Semaphore(concurrency)
@@ -1160,6 +1168,13 @@ async def campaign(args):
         except Exception as error:
             result.update(outcome="failed", error=repr(error))
         finally:
+            # A slow or failed Stop must not keep completed byte oracles only
+            # in generator memory until a Job deadline destroys the process.
+            # This snapshot cannot qualify cleanup or the whole cell.
+            try:
+                runtime.save_workload_snapshot(result)
+            except Exception as error:
+                result.update(outcome="failed", snapshot_error=repr(error))
             try:
                 result["cleanup"] = await runtime.close()
             except Exception as error:
