@@ -26,6 +26,7 @@ import {
   validatePassingQualificationReceipt,
 } from "./reliability-baseline-policy.mjs";
 import { deriveObservedMaxima } from "./reliability-budget-contract.mjs";
+import { empiricalBudgetApplicabilityErrors } from "./reliability-budget-applicability.mts";
 import {
   enterCanonicalArtifactOwner,
   openFreshOwnedFile,
@@ -813,6 +814,7 @@ function passingNightlyV3ReceiptFixture() {
     qualificationPolicy,
     gc,
     budgets: inputs.budgets,
+    baselineReceipts: inputs.baselineReceipts,
     preflight: {
       invocation_nonce: invocationNonce,
       workload_contract: structuredClone(gc.workload_contract),
@@ -1050,6 +1052,8 @@ test("production v3 verifier is mutation-sensitive to the frozen GC evidence", (
       gc: fixture.gc,
       preflight: fixture.preflight,
       budgets: fixture.budgets,
+      baselineReceipts: fixture.baselineReceipts,
+      qualificationEnvironment: fixture.receipt.value.environment,
       notBefore: fixture.notBefore,
       verifiedAt: fixture.verifiedAt,
     });
@@ -3153,4 +3157,169 @@ test("rejects observation and freeze chronology contradictions", async (t) => {
       errors.some((error) => error.includes("before the budget freeze")),
     );
   });
+});
+
+test("empirical budget applicability preserves independent reference source and rejects incompatible scopes", () => {
+  const fixture = passingNightlyV3ReceiptFixture();
+  const check = (
+    value = fixture.receipt.value,
+    budgets = fixture.budgets,
+    baselineReceipts = fixture.baselineReceipts,
+  ) =>
+    empiricalBudgetApplicabilityErrors({
+      value,
+      budgets,
+      baselineReceipts,
+      qualificationEnvironment: fixture.receipt.value.environment,
+    });
+  assert.deepEqual(check(), []);
+  assert.ok(
+    empiricalBudgetApplicabilityErrors({
+      value: fixture.receipt.value,
+      budgets: fixture.budgets,
+      baselineReceipts: fixture.baselineReceipts,
+      qualificationEnvironment: undefined,
+    }).some((error) => error.includes("independent qualification environment")),
+  );
+  const optimized = structuredClone(fixture.receipt.value);
+  optimized.provenance.source.commit = "e".repeat(40);
+  optimized.provenance.source.tree = "f".repeat(40);
+  optimized.provenance.daemon.sha256 = "a".repeat(64);
+  assert.deepEqual(
+    check(optimized),
+    [],
+    "candidate source may differ from its frozen reference",
+  );
+
+  for (const [field, changed] of [
+    ["os", "foreign-os"],
+    ["os_release", "foreign-kernel"],
+    ["architecture", "foreign-architecture"],
+    ["logical_cpus", fixture.receipt.value.environment.logical_cpus + 1],
+    ["cpu_model", "foreign-cpu"],
+  ]) {
+    const value = structuredClone(fixture.receipt.value);
+    value.environment[field] = changed;
+    assert.ok(
+      check(value).some((error) => error.includes(`environment ${field}`)),
+      field,
+    );
+    delete value.environment[field];
+    assert.ok(
+      check(value).some((error) => error.includes(`environment ${field}`)),
+      `missing ${field}`,
+    );
+  }
+  for (const [label, mutate] of [
+    [
+      "measurement",
+      (value) => delete value.provenance.measurement_contract_sha256,
+    ],
+    [
+      "workload",
+      (value) => (value.declared_limits.retained_output_bytes_per_run /= 2),
+    ],
+    [
+      "missing workload",
+      (value) => delete value.declared_limits.resource_start_concurrency,
+    ],
+    [
+      "count outside reference",
+      (value) => value.declared_limits.resource_counts.push(4000),
+    ],
+    ["build profile", (value) => value.provenance.build.argv.push("--release")],
+    ["missing build", (value) => delete value.provenance.build],
+  ]) {
+    const value = structuredClone(fixture.receipt.value);
+    mutate(value);
+    assert.notDeepEqual(check(value), [], label);
+  }
+  const subset = structuredClone(fixture.receipt.value);
+  subset.declared_limits.resource_counts = [1];
+  assert.deepEqual(
+    check(subset),
+    [],
+    "a scoped smoke cell remains covered by the reference",
+  );
+  assert.notDeepEqual(check(undefined, {}), []);
+  assert.notDeepEqual(
+    empiricalBudgetApplicabilityErrors({
+      value: fixture.receipt.value,
+      budgets: fixture.budgets,
+      baselineReceipts: undefined,
+      qualificationEnvironment: fixture.receipt.value.environment,
+    }),
+    [],
+  );
+  const changedReference = structuredClone(fixture.baselineReceipts);
+  changedReference[0].sha256 = "0".repeat(64);
+  assert.notDeepEqual(
+    check(fixture.receipt.value, fixture.budgets, changedReference),
+    [],
+  );
+});
+
+test("independent v3 verifier rejects forged PASS from a foreign environment or absent reference", () => {
+  const fixture = passingNightlyV3ReceiptFixture();
+  const verify = (
+    value = fixture.receipt.value,
+    baselineReceipts = fixture.baselineReceipts,
+    budgets = fixture.budgets,
+    qualificationEnvironment = fixture.receipt.value.environment,
+  ) =>
+    validatePassingQualificationReceiptV3({
+      receiptPath: fixture.receipt.path,
+      value,
+      expectedProfile: "nightly",
+      qualificationPolicy: fixture.qualificationPolicy,
+      gc: fixture.gc,
+      preflight: fixture.preflight,
+      budgets,
+      baselineReceipts,
+      qualificationEnvironment,
+      notBefore: fixture.notBefore,
+      verifiedAt: fixture.verifiedAt,
+    });
+  assert.deepEqual(verify(), []);
+  const foreignEnvironment = {
+    ...fixture.receipt.value.environment,
+    os: "foreign-os",
+  };
+  assert.ok(
+    verify(
+      fixture.receipt.value,
+      fixture.baselineReceipts,
+      fixture.budgets,
+      foreignEnvironment,
+    ).some((error) => error.includes("independent qualification environment")),
+    "a forged baseline environment must not conceal the actual foreign execution environment",
+  );
+  const forged = structuredClone(fixture.receipt.value);
+  forged.environment.os = "foreign-os";
+  assert.equal(forged.status, "pass");
+  assert.ok(
+    verify(forged).some((error) =>
+      error.includes("empirical resource baseline is not applicable"),
+    ),
+  );
+  assert.ok(
+    verify(fixture.receipt.value, []).some((error) =>
+      error.includes("reference receipts are required"),
+    ),
+  );
+  const noBaseline = structuredClone(fixture.budgets);
+  delete noBaseline.observation_baseline;
+  assert.ok(
+    verify(fixture.receipt.value, fixture.baselineReceipts, noBaseline).some(
+      (error) => error.includes("reference receipts are required"),
+    ),
+  );
+  const leak = structuredClone(fixture.receipt.value);
+  leak.stages.find(
+    (stage) => stage.id === "resource-census",
+  ).result[0].cleanup_live_children = 1;
+  assert.ok(
+    verify(leak).some((error) => error.includes("resource census")),
+    "applicable reference cannot legitimize a child leak",
+  );
 });

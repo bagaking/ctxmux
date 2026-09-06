@@ -2,8 +2,10 @@ import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { arch, cpus, platform, release } from "node:os";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { empiricalBudgetApplicabilityErrors } from "./reliability-budget-applicability.mts";
 
 import {
   canonicalFixturePath,
@@ -486,8 +488,20 @@ export function validatePassingQualificationReceiptV3({
   verifiedAt,
   current,
   budgets,
+  baselineReceipts,
+  qualificationEnvironment,
 }) {
   const errors = [];
+  if (expectedProfile !== "observe") {
+    errors.push(
+      ...empiricalBudgetApplicabilityErrors({
+        budgets,
+        baselineReceipts,
+        value,
+        qualificationEnvironment,
+      }),
+    );
+  }
   const expect = (condition, message) => {
     if (!condition) errors.push(`v3 ${message}: ${receiptPath}`);
   };
@@ -2335,6 +2349,14 @@ function verifyQualificationReceipt(args) {
       gc,
       preflight,
       budgets,
+      baselineReceipts: loadBaselineReceipts(root, budgets),
+      qualificationEnvironment: {
+        os: platform(),
+        os_release: release(),
+        architecture: arch(),
+        logical_cpus: cpus().length,
+        cpu_model: cpus()[0]?.model ?? "unknown",
+      },
       current: currentQualificationIdentity(
         root,
         {

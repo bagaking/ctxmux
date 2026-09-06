@@ -410,6 +410,23 @@ consecutive status snapshots at the expected count. A transient sample is
 therefore not treated as a leak, while a persistent extra descriptor or
 attachment remains visible to the gate.
 
+Empirical cost comparisons require an applicable frozen reference. After the
+complete census, the producer checks the reference receipts against the actual
+qualification environment, build profile, measurement contract and declared
+workload coverage. The independent receipt consumer checks them again and
+captures its own environment; changing a receipt's self-reported platform
+cannot qualify a foreign run. Missing or mismatched reference evidence fails
+the required cost gate. It does not skip workload, excuse an observed resource
+increase, change historical budgets or turn an unqualified result into a pass.
+
+The historical receipts identify a host class through OS/release, architecture,
+CPU model and CPU count. They do not identify a physical host or encode every
+harness behavior. Applicability is a necessary fence, not proof of complete
+workload equivalence or a performance improvement. Candidate source may differ
+from its independently frozen reference. The Darwin empirical envelope does
+not establish a portable Linux resource requirement; Linux cost qualification
+needs its own independent reference and actual memory-cost investigation.
+
 The generation-1 transition ended when the first complete source-bound baseline
 was frozen. Current policy accepts only generation 2; an all-generation-1 set,
 mixed generations, or an unknown generation fails closed. All three

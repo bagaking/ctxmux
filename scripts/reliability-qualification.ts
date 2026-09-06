@@ -57,6 +57,7 @@ import {
   startRssSampler,
   type RssSampler,
 } from "./reliability-rss-sampler.mts";
+import { empiricalBudgetApplicabilityErrors } from "./reliability-budget-applicability.mts";
 import {
   gcTuple,
   retryGcRun,
@@ -155,6 +156,9 @@ interface ResourceBudget {
 interface BudgetFile {
   readonly schema: "ctxmux.reliability-budgets.v1";
   readonly frozen_before_optimization: true;
+  readonly observation_baseline: {
+    readonly raw_receipts: readonly { path: string; sha256: string }[];
+  };
   readonly measurement_contract: {
     readonly cpu: string;
     readonly rss: string;
@@ -545,6 +549,29 @@ async function qualify(options: QualificationOptions): Promise<void> {
     if (options.profile !== "observe") {
       const budgets = readBudgets();
       await stage("frozen-resource-budgets", async () => {
+        // Complete the real workload and cleanup oracles before refusing an
+        // empirical comparison whose reference does not apply to this host.
+        const baselineReceipts = budgets.observation_baseline.raw_receipts.map(
+          ({ path }) => {
+            const bytes = readFileSync(resolve(root, path));
+            return {
+              path,
+              sha256: sha256(bytes),
+              value: JSON.parse(bytes.toString("utf8")) as unknown,
+            };
+          },
+        );
+        const applicabilityErrors = empiricalBudgetApplicabilityErrors({
+          budgets,
+          baselineReceipts,
+          value: receipt,
+          qualificationEnvironment: receipt.environment,
+        });
+        assert.deepEqual(
+          applicabilityErrors,
+          [],
+          applicabilityErrors.join("; "),
+        );
         for (const measurement of resources) {
           assertResourceBudget(measurement, budgetFor(budgets, measurement));
         }
