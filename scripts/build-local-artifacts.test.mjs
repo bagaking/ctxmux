@@ -441,40 +441,34 @@ test("the real binaries print an identity the vendor parser accepts", () => {
   // to what the binaries ACTUALLY print. Only the pair catches a drift, because
   // the failure mode was precisely a parser and a printer that disagreed while
   // each looked right on its own.
-  const built = spawnSync(
-    "cargo",
-    [
-      "build",
-      "--quiet",
-      "-p",
-      "ctxmux-daemon",
-      "--bin",
-      "ctxmuxd",
-      "-p",
-      "ctxmux",
-      "--bin",
-      "ctxmux",
-    ],
-    {
-      cwd: root,
-      encoding: "utf8",
-      env: buildEnvironment("0", os.tmpdir(), { root }),
-    },
+  const directory = fs.mkdtempSync(
+    path.join(os.tmpdir(), "ctxmux-artifact-identity-"),
   );
-  assert.equal(
-    built.status,
-    0,
-    `real binary build failed: ${built.error?.message ?? ""}\n${built.stderr}\n${built.stdout}`,
-  );
-  for (const name of ["ctxmux", "ctxmuxd"]) {
-    const binary = path.join(root, "target/debug", name);
-    const printed = run(binary, ["--version"], root).stdout.trim();
-    const parsed = parseBinaryVersion(name, printed);
-    assert.equal(
-      Number.isSafeInteger(parsed.protocol) && parsed.protocol > 0,
-      true,
-      `${name} --version must yield a usable protocol: ${printed}`,
+  try {
+    // Own the source-specific build and execute its actual outputs. A default
+    // target path can retain an older same-version binary after Cargo config
+    // redirects the current compilation.
+    const targetDirectory = path.join(directory, "native");
+    const built = buildNativeArtifacts(
+      root,
+      buildEnvironment("0", directory, {
+        root,
+        buildDirectory: targetDirectory,
+      }),
+      targetDirectory,
     );
+    for (const name of ["ctxmux", "ctxmuxd"]) {
+      const binary = path.join(built.directory, name);
+      const printed = run(binary, ["--version"], root).stdout.trim();
+      const parsed = parseBinaryVersion(name, printed);
+      assert.equal(
+        Number.isSafeInteger(parsed.protocol) && parsed.protocol > 0,
+        true,
+        `${name} --version must yield a usable protocol: ${printed}`,
+      );
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
   }
 });
 

@@ -29,6 +29,9 @@ Cargo target and output-directory configuration cannot redirect that copy to an
 old default-target binary with the same printed version. The temporary build
 cache is retired before publication; this source binding costs a fresh native
 build's storage and compilation time. It changes no runtime resource policy.
+The binary-printer/parser test uses this same fresh output owner and executes
+the returned host-release paths; it cannot pass by reading an older default
+debug binary. It retires only its own temporary build after the check.
 The producer then remaps the resolved
 checkout, user directory, Cargo cache, Rustup directory and actual compiler
 sysroot and build directory to relative source/dependency/toolchain labels. Cache aliases are mapped
