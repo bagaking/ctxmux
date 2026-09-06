@@ -471,6 +471,14 @@ of this contract. Any unavoidable pressure or unsupported recovery class is
 reported explicitly. Both fault scope and resource cost require two real Runs
 and public clients before a shared-owner change is qualified.
 
+The current entry guard checks the Native owner's actual thread completion
+before PTY creation and at registration and handoff. A finished owner rejects
+Start with `backend_unavailable` before physical launch. If completion races
+an already-spawned child, the existing registration rollback terminates and
+reaps that unpublished child. These checks leave independently owned input
+service intact. They are passive entry checks; proactive service observations,
+exit-cause retention and complete derived-fault containment remain open.
+
 The important guarantees are behavioral, not implied by lock types.
 
 - Output byte ranges are allocated under the output-log mutex before broadcast.

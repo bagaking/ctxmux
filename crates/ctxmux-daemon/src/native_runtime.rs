@@ -387,6 +387,19 @@ impl NativeRunOwner {
 }
 
 impl NativeRunOwner {
+    /// Observe the existing thread at a lifecycle entry point. Independent
+    /// input workers retain their own admission and completion authority.
+    pub(crate) fn ensure_running(&self) -> Result<(), String> {
+        let mut state = mutex_lock(&self.inner.state);
+        if matches!(&*state, OwnerState::Running { thread, .. } if thread.is_finished()) {
+            *state = OwnerState::Failed("daemon-wide native owner stopped".to_owned());
+        }
+        match &*state {
+            OwnerState::Running { .. } => Ok(()),
+            OwnerState::Failed(message) => Err(message.clone()),
+        }
+    }
+
     pub(crate) fn owner_wake(&self) -> OwnerWake {
         self.inner.wake.clone()
     }
@@ -410,6 +423,12 @@ impl NativeRunOwner {
         &self,
         registration: NativeRunRegistration,
     ) -> Result<(), NativeRegistrationError> {
+        if let Err(message) = self.ensure_running() {
+            return Err(NativeRegistrationError {
+                message,
+                registration: Box::new(registration),
+            });
+        }
         let state = mutex_lock(&self.inner.state);
         match &*state {
             OwnerState::Running { commands, .. } => {
@@ -448,6 +467,7 @@ impl NativeRunOwner {
         &self,
         preflight: HandoffPreflight,
     ) -> Result<Vec<LiveDescriptors>, String> {
+        self.ensure_running()?;
         let commands = {
             let state = mutex_lock(&self.inner.state);
             match &*state {
@@ -472,6 +492,7 @@ impl NativeRunOwner {
     }
 
     pub(crate) fn handoff_ready(&self, run_id: RunId) -> Result<bool, String> {
+        self.ensure_running()?;
         let commands = {
             let state = mutex_lock(&self.inner.state);
             match &*state {
@@ -1675,6 +1696,114 @@ mod tests {
     use crate::{
         NativeWaitFailure, Run, native_control::NativeControlOwner, native_session::NativeSession,
     };
+
+    fn finished_owner_with_open_receiver() -> (NativeRunOwner, mpsc::Receiver<super::OwnerCommand>)
+    {
+        let owner = NativeRunOwner::default();
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        // A real completed thread with a still-open receiver: successful send
+        // alone cannot establish that a service is consuming its commands.
+        let (commands, receiver) =
+            mpsc::sync_channel(crate::ResourceLimits::DEFAULT.creation_workers);
+        let thread = std::thread::spawn(|| {});
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        *crate::mutex_lock(&owner.inner.state) = super::OwnerState::Running { commands, thread };
+        (owner, receiver)
+    }
+
+    #[test]
+    fn finished_owner_is_not_reported_running_even_while_command_receiver_exists() {
+        let (owner, receiver) = finished_owner_with_open_receiver();
+        assert_eq!(
+            owner.ensure_running(),
+            Err("daemon-wide native owner stopped".to_owned())
+        );
+        assert!(matches!(
+            &*crate::mutex_lock(&owner.inner.state),
+            super::OwnerState::Failed(_)
+        ));
+        assert!(
+            owner
+                .handoff_ready(RunId::new())
+                .unwrap_err()
+                .contains("owner stopped")
+        );
+        assert!(
+            owner
+                .extract_for_handoff()
+                .unwrap_err()
+                .contains("owner stopped")
+        );
+        drop(receiver);
+    }
+
+    #[test]
+    fn finished_owner_rejects_handoff_before_waiting_for_an_open_receiver() {
+        for extract in [false, true] {
+            let (owner, receiver) = finished_owner_with_open_receiver();
+            let (result_tx, result_rx) = mpsc::channel();
+            let request = std::thread::spawn(move || {
+                let result = if extract {
+                    owner.extract_for_handoff().map(|_| ())
+                } else {
+                    owner.handoff_ready(RunId::new()).map(|_| ())
+                };
+                result_tx.send(result).unwrap();
+            });
+            let result = result_rx.recv_timeout(Duration::from_secs(2));
+            // Release the private receiver even if the guarded request stalls.
+            // This wakes its send/reply boundary so no failing test leaks a thread.
+            drop(receiver);
+            request.join().unwrap();
+            assert!(
+                result
+                    .expect("finished owner must reject without receiver cleanup")
+                    .unwrap_err()
+                    .contains("owner stopped")
+            );
+        }
+    }
+
+    #[test]
+    fn finished_owner_rejects_registration_without_queuing_it() {
+        let (owner, receiver) = finished_owner_with_open_receiver();
+        let id = RunId::new();
+        let failure = NativeWaitFailure::default();
+        let (control, run) = test_run(&owner, id, failure.clone());
+        let result = owner.register_for_test(
+            &run,
+            Box::new(WatchingChild),
+            watching_session(Arc::new(AtomicUsize::new(0))),
+            control,
+            failure,
+            || {},
+        );
+        let (message, registration) = result
+            .expect_err("completed owner cannot accept registration")
+            .into_parts();
+        assert!(message.contains("owner stopped"));
+        assert!(!matches!(
+            receiver.try_recv(),
+            Ok(super::OwnerCommand::Register(_))
+        ));
+        drop(registration);
+    }
+
+    #[test]
+    fn live_owner_remains_available_after_ordinary_clone_release() {
+        let owner = NativeRunOwner::default();
+        drop(owner.clone());
+        assert_eq!(owner.ensure_running(), Ok(()));
+        owner
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+    }
 
     #[derive(Debug)]
     struct WatchingChild;

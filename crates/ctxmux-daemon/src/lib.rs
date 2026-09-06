@@ -3958,6 +3958,10 @@ impl Run {
         G: FnOnce() + Send + 'static,
     {
         validate_run_spec(&config.spec).map_err(invalid_run_spec)?;
+        config
+            .native_runs
+            .ensure_running()
+            .map_err(|message| ProtocolError::new(ErrorCode::BackendUnavailable, message))?;
         let qualification_stats = config.qualification_stats.clone();
         let pair = native_pty_system()
             .openpty(to_pty_size(config.spec.initial_size))
@@ -8061,6 +8065,102 @@ mod tests {
                 resolved.error.message,
             );
         }
+    }
+
+    #[test]
+    fn stopped_native_owner_rejects_start_before_pty_setup() {
+        let manager = RunManager::default();
+        manager
+            .native_runs
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .expect("complete the actual native owner thread");
+        let captured_run = Arc::new(Mutex::new(None));
+        let mut setup_steps = 0;
+        let error = manager
+            .start_with_setup(
+                CreateOperationKey::new("stopped-owner-before-pty").unwrap(),
+                long_running_spec(),
+                &captured_run,
+                |_, _| {
+                    setup_steps += 1;
+                    Ok(())
+                },
+            )
+            .expect_err("a stopped owner cannot admit physical launch");
+        assert_eq!(error.code, ErrorCode::BackendUnavailable);
+        assert!(error.message.contains("owner stopped"));
+        assert_eq!(setup_steps, 0);
+        assert!(mutex_lock(&captured_run).is_none());
+        assert!(manager.list_all().is_empty());
+        assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_native_owner_public_start_reports_backend_unavailable() {
+        let manager = Arc::new(RunManager::default());
+        manager
+            .native_runs
+            .shutdown(Instant::now() + Duration::from_secs(2))
+            .expect("complete the actual native owner thread");
+        let server = InProcessServer::start(Arc::clone(&manager));
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            server.client.start(long_running_spec()),
+        )
+        .await
+        .expect("public Start returns instead of waiting for a dead owner")
+        .expect_err("the public protocol reports owner unavailability");
+        assert!(matches!(
+            error,
+            ClientError::Protocol {
+                code: ErrorCode::BackendUnavailable,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("owner stopped"));
+        assert!(server.client.list().await.unwrap().is_empty());
+        assert_eq!(manager.unpublished_cleanups.owned_count(), 0);
+        server.abort_and_wait().await;
+    }
+
+    #[test]
+    fn native_owner_exit_after_spawn_rolls_registration_back() {
+        let manager = RunManager::default();
+        let captured_run = Arc::new(Mutex::new(None));
+        let mut child_pid = None;
+        let error = manager
+            .start_with_setup(
+                CreateOperationKey::new("owner-exit-during-launch").unwrap(),
+                long_running_spec(),
+                &captured_run,
+                |step, pid| {
+                    if step == LaunchSetupStep::RegisterWaitOwner {
+                        let pid = pid.expect("physical child exists before registration");
+                        assert!(process_exists(pid));
+                        child_pid = Some(pid);
+                        manager
+                            .native_runs
+                            .shutdown(Instant::now() + Duration::from_secs(2))
+                            .expect("stop only the private empty fixture owner");
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("owner exit races physical launch but cannot publish it");
+        assert_eq!(error.code, ErrorCode::SpawnFailed);
+        assert!(error.message.contains("owner stopped"));
+        assert!(!process_exists(
+            child_pid.expect("record the exact fixture child")
+        ));
+        assert!(manager.list_all().is_empty());
+        mutex_lock(&captured_run).take();
+        assert!(
+            manager
+                .unpublished_cleanups
+                .wait_until(Instant::now() + Duration::from_secs(2))
+                .is_empty(),
+            "rejected registration must release exact private child ownership"
+        );
     }
 
     #[test]
