@@ -329,6 +329,20 @@ source and public-cursor contracts, saved registers, both buffers, history and
 future growth require qualification together. The private Unicode candidate
 is not integrated; direct crate lint and full resource costs remain open.
 
+Read-only numeric-parser review finds two further boundaries. A corrected
+drawing column of 65,536 followed by the original control `CSI 65536 D`
+cannot reach zero if its parameter first saturates to the parser's 16-bit
+maximum. This is a source deduction awaiting an executed regression, not a
+new passing test. Separately, the thirty-two-parameter parser ceiling sets an
+ignore flag on overflow, but the Screen dispatcher discards that flag and
+applies the retained prefix. Raising that constant would postpone the same
+silent partial interpretation. Complete numeric meaning, command-specific
+normalization and a real parameter-storage owner require repair together.
+Physical dimensions, stored drawing coordinates and numeric control parameters
+must remain distinct. The current terminal wire carries restore bytes rather
+than a numeric drawing-cursor field; widening the internal coordinate does not
+mechanically require adding such a field.
+
 ## Reversible upgrade refusal and startup budget
 
 An actual downstream installation attempt retained the old daemon image.
@@ -365,8 +379,44 @@ success as well as schema, and bind verification to the executable actually
 selected for handoff. Public failure and stage results must accompany
 preserved Run identities and byte cursors. Timeout alone cannot establish
 rollback, and cached lifecycle cannot establish availability. The current
-production diagnosis sent no signal and changed no executable or user Run;
-the failed installation and its separate UI recovery failure remain open.
+production diagnosis sent no signal and changed no executable or user Run.
+The refusal and the separate UI recovery failure remain historical evidence;
+subsequent positive delivery evidence must be evaluated independently.
+
+## Subsequent actual upgrade and ordinary restoration
+
+A later actual planned exec maps the qualified normal-height daemon artifact
+at the canonical installation path. Read-only image identity and digest checks
+confirm the replacement with the same daemon PID and state-file mapping. The
+original Runtime and daemon incarnation remain unchanged. All fourteen Runs
+in the complete pre-install census retain their IDs, PIDs and running lifecycle,
+with monotonic input and output byte cursors. The earlier installation plan
+tracked twelve of those Runs; both baseline scopes remain explicit. These
+facts do not by themselves establish usable input and output for every Run.
+
+Separate ordinary GUI quit and restart evidence confirms the installed client,
+seventy-nine tabs, layouts and focus, and fifty-two persisted drafts. Root
+compares the complete closed-storage files byte for byte and all twenty-six
+actual state keys and values, including the real steer-queue key. The original
+installation receipt remains Native committed with UI unknown. The subsequent
+positive restoration record does not rewrite it, establish the historical
+role of a disappeared helper, or qualify sudden-exit durability.
+
+This review also finds a concrete oracle defect: the original five-key
+collector used `agentComposerSteerQueues`, while actual storage uses
+`agentSteerQueues`. Comparing two absent values passed without checking the
+real queue. The complete-file equality and successor actual-key assertions
+independently establish preservation here; the misspelled assertion is still
+defective. Required-key checks must require presence and validate actual schema
+names. Preserve the old collector and result, repair future collectors and
+record the stronger successor evidence. A passing mistaken fixture must never
+be represented as the intended contract proof.
+
+Actual normal-height installation and ordinary stored-state restoration now
+have positive evidence. Cold-launch timeout causality, full terminal fidelity,
+continuous rendering, aggregate resource costs and the complete P00 boundary
+remain unqualified. This does not install or qualify the broader joined
+protocol and handoff changes.
 
 ## Required completion
 
