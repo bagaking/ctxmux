@@ -15,6 +15,14 @@ export type {
   AttachmentViewResources,
   AttachmentViewResourcePolicy,
 } from "./attachment.js";
+export type {
+  AttachmentEvent,
+  AttachmentGapEvent,
+  AttachmentGapObservation,
+  AttachmentGapQueue,
+  AttachmentGapLocalPressure,
+} from "./gap-observation.js";
+export type { OutputGapCauses } from "./generated/OutputGapCauses.js";
 export { stopOperationKey } from "./stop-operation.js";
 export type {
   AttachmentControlAccepted,

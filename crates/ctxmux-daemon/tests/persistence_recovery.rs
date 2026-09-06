@@ -55,6 +55,7 @@ async fn detached_paced_output_commits_during_silence_and_recovers_after_crash()
                 RunEvent::Resized { size, .. } => panic!("no resize precedes READY: {size:?}"),
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => {
                     panic!("READY bytes were lost at {latest_output_bytes}");
                 }
@@ -352,9 +353,7 @@ async fn terminal_event(attachment: &mut Attachment) -> RunEvent {
                 RunEvent::ServiceChanged { service } => {
                     panic!("recovered historical Run cannot publish live Native service transitions: {service:?}")
                 }
-                RunEvent::Gap {
-                    latest_output_bytes,
-                } => panic!("unexpected recovered gap at {latest_output_bytes}"),
+                RunEvent::Gap { latest_output_bytes, .. } => panic!("unexpected recovered gap at {latest_output_bytes}"),
                 RunEvent::Tmux { event } => panic!("unexpected recovered tmux event: {event:?}"),
                 RunEvent::Resized { size, .. } => {
                     panic!("a recovered Run has no live PTY to confirm a resize: {size:?}")

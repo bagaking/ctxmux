@@ -847,6 +847,7 @@ async fn wait_for_output(
                 }
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => {
                     panic!("Run exited before expected output: {state:?}")
@@ -887,6 +888,7 @@ async fn wait_for_exit(attachment: &mut Attachment) -> RunState {
                 RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Interrupted { reason } => {
                     panic!("live Run was unexpectedly interrupted: {reason:?}")
@@ -1536,7 +1538,7 @@ async fn attachment_pipeline_preserves_raw_bytes_applied_size_and_stop_ordering(
                             );
                             return state;
                         }
-                        RunEvent::Gap { latest_output_bytes } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
+                        RunEvent::Gap { latest_output_bytes, .. } => panic!("unexpected post-stop gap at {latest_output_bytes}"),
                         RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                         RunEvent::Resized { .. } => {}
                         RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
@@ -1661,6 +1663,7 @@ async fn saturated_real_pty_backpressures_input_without_starving_resize_or_stop(
                 RunEvent::ServiceChanged { service } => assert_native_service_progress(&service),
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => panic!("unexpected saturation gap at {latest_output_bytes}"),
                 RunEvent::Interrupted { reason } => panic!("native Run interrupted: {reason:?}"),
                 RunEvent::Tmux { event } => panic!("unexpected tmux event: {event:?}"),
@@ -4609,6 +4612,7 @@ async fn upgrade_preserves_live_run() {
                 }
                 Ok(Some(RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 })) => panic!("old attachment observed an output gap at {latest_output_bytes}"),
                 Ok(Some(event)) => {
                     panic!("old attachment ended with an unexpected event: {event:?}")

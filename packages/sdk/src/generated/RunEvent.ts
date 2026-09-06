@@ -2,6 +2,7 @@
 import type { InterruptionReason } from "./InterruptionReason.js";
 import type { NativeServiceSnapshot } from "./NativeServiceSnapshot.js";
 import type { OutputChunk } from "./OutputChunk.js";
+import type { OutputGapCauses } from "./OutputGapCauses.js";
 import type { RunState } from "./RunState.js";
 import type { TerminalSize } from "./TerminalSize.js";
 import type { TmuxRunEvent } from "./TmuxRunEvent.js";
@@ -37,4 +38,4 @@ export type RunEvent =
   | { type: "interrupted"; reason: InterruptionReason }
   | { type: "tmux"; event: TmuxRunEvent }
   | { type: "observation_discontinuity" }
-  | { type: "gap"; latest_output_bytes: number };
+  | { type: "gap"; latest_output_bytes: number; causes: OutputGapCauses };

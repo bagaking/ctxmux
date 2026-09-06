@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -1947,6 +1947,116 @@ pub struct AttachedHeader {
     pub resize_revision: u64,
 }
 
+/// Owner-observed causes of an attachment discontinuity. Several causes can
+/// coexist; none of these flags proves a permanently missing byte count.
+/// Fixed fields keep merged observations independent of event population.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, TS)]
+#[serde(deny_unknown_fields)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent observed causes can coexist; fixed flags bound merged metadata"
+)]
+pub struct OutputGapCauses {
+    pub live_event_pressure: bool,
+    pub subscriber_lag: bool,
+    pub source_discontinuity: bool,
+    pub terminal_catchup: bool,
+    /// A missed confirmed resize also invalidates the continuation view.
+    pub geometry_lag: bool,
+    /// Set by a client inbox, never inferred from a daemon byte head.
+    pub client_view_pressure: bool,
+    pub unknown: bool,
+}
+
+impl<'de> Deserialize<'de> for OutputGapCauses {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(
+            clippy::struct_excessive_bools,
+            reason = "strict wire decoding of the same independent cause flags"
+        )]
+        struct Fields {
+            live_event_pressure: bool,
+            subscriber_lag: bool,
+            source_discontinuity: bool,
+            terminal_catchup: bool,
+            geometry_lag: bool,
+            client_view_pressure: bool,
+            unknown: bool,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let causes = Self {
+            live_event_pressure: fields.live_event_pressure,
+            subscriber_lag: fields.subscriber_lag,
+            source_discontinuity: fields.source_discontinuity,
+            terminal_catchup: fields.terminal_catchup,
+            geometry_lag: fields.geometry_lag,
+            client_view_pressure: fields.client_view_pressure,
+            unknown: fields.unknown,
+        };
+        if causes == Self::NONE {
+            return Err(D::Error::custom(
+                "Gap requires an observed cause or explicit unknown",
+            ));
+        }
+        Ok(causes)
+    }
+}
+
+impl OutputGapCauses {
+    pub const NONE: Self = Self {
+        live_event_pressure: false,
+        subscriber_lag: false,
+        source_discontinuity: false,
+        terminal_catchup: false,
+        geometry_lag: false,
+        client_view_pressure: false,
+        unknown: false,
+    };
+    pub const LIVE_EVENT_PRESSURE: Self = Self {
+        live_event_pressure: true,
+        ..Self::NONE
+    };
+    pub const SUBSCRIBER_LAG: Self = Self {
+        subscriber_lag: true,
+        ..Self::NONE
+    };
+    pub const SOURCE_DISCONTINUITY: Self = Self {
+        source_discontinuity: true,
+        ..Self::NONE
+    };
+    pub const TERMINAL_CATCHUP: Self = Self {
+        terminal_catchup: true,
+        ..Self::NONE
+    };
+    pub const GEOMETRY_LAG: Self = Self {
+        geometry_lag: true,
+        ..Self::NONE
+    };
+    pub const CLIENT_VIEW_PRESSURE: Self = Self {
+        client_view_pressure: true,
+        ..Self::NONE
+    };
+    pub const UNKNOWN: Self = Self {
+        unknown: true,
+        ..Self::NONE
+    };
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            live_event_pressure: self.live_event_pressure || other.live_event_pressure,
+            subscriber_lag: self.subscriber_lag || other.subscriber_lag,
+            source_discontinuity: self.source_discontinuity || other.source_discontinuity,
+            terminal_catchup: self.terminal_catchup || other.terminal_catchup,
+            geometry_lag: self.geometry_lag || other.geometry_lag,
+            client_view_pressure: self.client_view_pressure || other.client_view_pressure,
+            unknown: self.unknown || other.unknown,
+        }
+    }
+}
+
 /// Event delivered after an attachment snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1993,7 +2103,10 @@ pub enum RunEvent {
     /// Raw output delivery was discontinuous. The caller can reattach from its
     /// last observed byte cursor to obtain retained bytes or explicit
     /// truncation.
-    Gap { latest_output_bytes: u64 },
+    Gap {
+        latest_output_bytes: u64,
+        causes: OutputGapCauses,
+    },
 }
 
 /// Observable public-Control-Mode event for one imported tmux pane.
@@ -2270,6 +2383,28 @@ mod tests {
         TerminalSize, decode_frame, encode_frame,
     };
 
+    #[test]
+    fn gap_causes_are_required_and_unknown_is_explicit() {
+        let event = RunEvent::Gap {
+            latest_output_bytes: 0,
+            causes: super::OutputGapCauses::UNKNOWN,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            serde_json::from_value::<RunEvent>(value.clone()).unwrap(),
+            event
+        );
+        let mut missing = value.clone();
+        missing.as_object_mut().unwrap().remove("causes");
+        assert!(serde_json::from_value::<RunEvent>(missing).is_err());
+        let mut none = value.clone();
+        none["causes"] = serde_json::to_value(super::OutputGapCauses::NONE).unwrap();
+        assert!(serde_json::from_value::<RunEvent>(none).is_err());
+        let mut extra = value;
+        extra["causes"]["guessed_failure"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<RunEvent>(extra).is_err());
+    }
+
     /// The endpoint contract version is a client-side fact with a stable value.
     ///
     /// Pinned so a bump is a deliberate edit rather than silent drift. Consumers
@@ -2403,7 +2538,7 @@ mod tests {
     fn generation_20_service_facts_preserve_lifecycle_and_nullable_authority() {
         use super::{NativeInputPhase, NativeOwnerStatus, NativeServiceFailure};
 
-        assert_eq!(PROTOCOL_VERSION, 21);
+        assert_eq!(PROTOCOL_VERSION, 22);
         let mut run = sample_run_info();
         let service = run.native_service.as_mut().unwrap();
         service.revision = 7;
@@ -2631,7 +2766,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_and_recoverable_operations_have_exact_generation_21_wire_shapes() {
+    fn runtime_identity_and_recoverable_operations_have_exact_generation_22_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
         let run_id = RunId::new();
@@ -2649,7 +2784,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 21,
+                    "protocolGeneration": 22,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {

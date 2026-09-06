@@ -1,4 +1,4 @@
-# Local Protocol Generation 21
+# Local Protocol Generation 22
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -647,11 +647,57 @@ The wire schema makes this distinction explicit: `AttachedHeader` contains an
 `OutputReplay` are client API types produced only after ordered reassembly; a
 generation-16 peer that puts `chunks` back into the header is invalid.
 
-`Gap { latest_output_bytes }` reports raw-output delivery discontinuity only.
-It is not a recovery cursor: the caller must reattach using its own last
-successfully observed byte cursor. Replay then returns an exact retained
-continuation or sets `truncated` when the required history was evicted or the
-source itself could not provide a continuous raw stream.
+`Gap { latest_output_bytes, causes }` reports a delivery or continuation-view
+discontinuity. Its required fixed cause set contains `live_event_pressure`,
+`subscriber_lag`, `source_discontinuity`, `terminal_catchup`, `geometry_lag`,
+`client_view_pressure`, and `unknown`. Each is a boolean; at least one must be
+true. The original owner sets observed causes. An unclassified cause is
+explicitly `unknown`; a client never infers a PTY failure from a byte head.
+Generation 22 replaces the head-only wire shape. Earlier generations fail the
+Hello fence; omitted causes are invalid rather than silently defaulted.
+
+The shared live owner records event-funding and source-discontinuity causes.
+Private per-cause revisions preserve those facts even when the marker itself
+is overwritten in the ring. A lagging connection adds `subscriber_lag`; a
+terminal snapshot catch-up adds `terminal_catchup`. Missed confirmed geometry
+adds `geometry_lag`, including when the byte head has not advanced. The Rust
+and TypeScript inboxes add `client_view_pressure` only when their own view
+cannot retain output, and union causes when merging markers. A marker does not
+prove a permanently missing byte count or the child/PTY service state.
+
+`latest_output_bytes` is a reported head, not a received/delivered byte receipt
+or a recovery cursor. The caller must reattach using its own last successfully
+observed byte cursor. Replay then returns an exact retained continuation or
+sets `truncated` when required history was evicted or the source could not
+provide a continuous raw stream. Later output cannot erase an unresolved Gap.
+
+TypeScript `AttachmentEvent` enriches Gap with `observation`; this is client
+API metadata, not another wire field. It binds one generated attachment ID,
+the exact Run, and `runtimeId`/`daemonInstanceId` from Hello on the same dispatch
+connection. A manually constructed Attachment with no Hello reports null
+Runtime identity. `origins` preserves daemon, client, or both. Observation and
+API-delivery times are local wall-clock Unix milliseconds, not owner timestamps
+or synchronized clocks. `receivedOutputHeadByte` follows actual decoded original
+Output; `deliveredThroughByte` follows the contiguous available range handed out
+by this API, including its initial replay. Received head is null before any
+original Output is decoded; delivered head is null before a continuous original
+prefix is handed out. A later disconnected suffix does not advance that prefix. Advertised header heads and synthetic
+terminal seeds are not Output receipts. `requestedAfterByte` separately records
+the caller baseline. `recoveryAfterByte` follows available replay and continuous
+API delivery, or retains that caller baseline when empty. It never advances from
+a header, synthetic seed, Gap, or output after an unresolved discontinuity;
+a caller that commits processing later must retain its own earlier cursor.
+Initial history truncation remains explicit in the attachment snapshot.
+
+`missingOutputBytes` counts locally discarded decoded output only when the Gap
+has no daemon origin and the count remains a safe integer. Otherwise it is null.
+Mixed markers retain the local count separately, without assigning a fabricated
+length to upstream loss. `localPressure` records actual payload/envelope refusal
+and saturates explicitly. `queue` reports the sampled logical byte budgets,
+retained bytes, and high water before marker admission; these are not V8 RSS.
+The enriched queued marker consumes the existing envelope budget. If its facts
+cannot fit, the view reports the existing typed observation-unavailable error
+while the independent reader continues settling issued command results.
 
 `ObservationDiscontinuity` is a separate, cursor-free fail-closed marker: one
 or more non-output observations did not reach this attachment, and byte replay
@@ -743,16 +789,13 @@ complete, publishes nothing and leaves the previously confirmed size standing:
 there is no event, and no reported size, for dimensions no terminal
 acknowledged. Like `input` and `signal`, an uncertain resize is not replayable.
 
-The event stream is ordered but not lossless. An attachment that falls far
-enough behind can have a `resized` evicted from the daemon's bounded live-event
-ring, and lag recovery does not synthesize a marker for it: unlike a lost
-observation, which closes the attachment, and unlike lost output, which becomes
-a `gap`, a missed resize is silently absent. This is deliberate, because the
-size is recoverable — `RunInfo.current_size` is authoritative, and re-reading
-`status` or reattaching yields the current geometry. A client that tracks
-geometry from `resized` alone can therefore hold a stale value after a lag
-event; one that needs certainty should reconcile against `current_size` rather
-than assume the last event it saw is current.
+The event stream is ordered but not lossless. An attachment that falls behind
+can miss a confirmed `resized` in the daemon's live-event ring. Lag recovery
+reports Gap with `subscriber_lag` and `geometry_lag`, even if no output bytes
+advanced. This invalidates the continuation view without asserting raw-byte
+loss. `RunInfo.current_size` remains authoritative; reconcile it through
+`status` or reattachment. Lost non-reconstructable observations instead produce
+`ObservationDiscontinuity`; those meanings remain separate.
 
 `current_size` is `null` when no owner can confirm a size, which is a definite
 answer rather than a missing one:
@@ -822,7 +865,7 @@ resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
 preflighted before extraction. Known persistence failure rejects upgrade before
 target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellation
-and exec serialize through one final gate. Protocol generation 21 has no upgrade
+and exec serialize through one final gate. Protocol generation 22 has no upgrade
 wire operation.
 
 A valid store at its configured main-database page ceiling reclaims bounded oldest

@@ -633,7 +633,7 @@ export class CtxmuxClient {
     view: "raw" | "terminal",
   ): Promise<Attachment> {
     validateCursor(afterByte, "afterByte");
-    const { wire } = await this.#connectForDispatch();
+    const { wire, runtime } = await this.#connectForDispatch();
     try {
       await wire.send({
         type: "request",
@@ -661,7 +661,13 @@ export class CtxmuxClient {
         frame.snapshot,
         this.#terminalSeedRestoreBytes,
       );
-      return new Attachment(wire, snapshot, this.#attachmentViewResources);
+      return new Attachment(
+        wire,
+        snapshot,
+        this.#attachmentViewResources,
+        runtime,
+        afterByte,
+      );
     } catch (error) {
       wire.close();
       throw error;
@@ -678,8 +684,9 @@ export class CtxmuxClient {
   ): Promise<RecoverableStopAttachment> {
     validateCursor(afterByte, "afterByte");
     let wire: JsonLinesConnection;
+    let runtime: RuntimeIdentity;
     try {
-      ({ wire } = await this.#connectForDispatch());
+      ({ wire, runtime } = await this.#connectForDispatch());
     } catch (error) {
       if (isDispatchPreconditionError(error)) {
         throw error;
@@ -787,6 +794,8 @@ export class CtxmuxClient {
           wire,
           snapshot,
           this.#attachmentViewResources,
+          runtime,
+          afterByte,
         ),
         stop,
       };

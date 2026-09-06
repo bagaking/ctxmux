@@ -8,7 +8,8 @@ use std::{
 
 use ctxmux_protocol::{
     AttachmentCommandId, ClientFrame, ControlFailure, ControlOutcome, ControlReceipt,
-    RecoverableStop, RunEvent, RunSignal, ServerFrame, TerminalSize, decode_frame, encode_frame,
+    OutputGapCauses, RecoverableStop, RunEvent, RunSignal, ServerFrame, TerminalSize, decode_frame,
+    encode_frame,
 };
 use futures_util::{
     StreamExt,
@@ -656,7 +657,7 @@ struct EventInboxState {
     queue: VecDeque<RunEvent>,
     queued_bytes: usize,
     envelope_payload_bytes: usize,
-    pending_gap: Option<u64>,
+    pending_gap: Option<(u64, OutputGapCauses)>,
     local_observation: LocalObservationState,
     terminal: Option<RunEvent>,
     saw_terminal: bool,
@@ -783,16 +784,24 @@ impl EventInbox {
                 let latest_output_bytes = chunk.end_byte;
                 let event = RunEvent::Output { chunk };
                 let bytes = event_bytes(&event);
-                if state.pending_gap.is_some()
-                    || state
-                        .queued_bytes
-                        .checked_add(bytes)
-                        .is_none_or(|total| total > self.limits.payload_bytes)
-                    || !self.reserve_slots(&mut state, 1, event_envelope_payload_bytes(&event))
+                let required_slots = 1 + usize::from(state.pending_gap.is_some());
+                if state
+                    .queued_bytes
+                    .checked_add(bytes)
+                    .is_none_or(|total| total > self.limits.payload_bytes)
+                    || !self.reserve_slots(
+                        &mut state,
+                        required_slots,
+                        event_envelope_payload_bytes(&event),
+                    )
                 {
-                    state.pending_gap =
-                        Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
+                    let (head, causes) = state.pending_gap.unwrap_or((0, OutputGapCauses::NONE));
+                    state.pending_gap = Some((
+                        head.max(latest_output_bytes),
+                        causes.union(OutputGapCauses::CLIENT_VIEW_PRESSURE),
+                    ));
                 } else {
+                    Self::retain_pending_gap(&mut state);
                     state.queued_bytes += bytes;
                     state.envelope_payload_bytes += event_envelope_payload_bytes(&event);
                     state.queue.push_back(event);
@@ -800,8 +809,10 @@ impl EventInbox {
             }
             RunEvent::Gap {
                 latest_output_bytes,
+                causes,
             } => {
-                state.pending_gap = Some(state.pending_gap.unwrap_or(0).max(latest_output_bytes));
+                let (head, previous) = state.pending_gap.unwrap_or((0, OutputGapCauses::NONE));
+                state.pending_gap = Some((head.max(latest_output_bytes), previous.union(causes)));
             }
             terminal @ (RunEvent::Exited { .. } | RunEvent::Interrupted { .. }) => {
                 self.retain_terminal(&mut state, terminal);
@@ -830,11 +841,7 @@ impl EventInbox {
                     self.ready.notify_one();
                     return Ok(());
                 }
-                if let Some(latest_output_bytes) = state.pending_gap.take() {
-                    state.queue.push_back(RunEvent::Gap {
-                        latest_output_bytes,
-                    });
-                }
+                Self::retain_pending_gap(&mut state);
                 state.queued_bytes += bytes;
                 state.envelope_payload_bytes += event_envelope_payload_bytes(&event);
                 state.queue.push_back(event);
@@ -843,6 +850,15 @@ impl EventInbox {
         drop(state);
         self.ready.notify_one();
         Ok(())
+    }
+
+    fn retain_pending_gap(state: &mut EventInboxState) {
+        if let Some((latest_output_bytes, causes)) = state.pending_gap.take() {
+            state.queue.push_back(RunEvent::Gap {
+                latest_output_bytes,
+                causes,
+            });
+        }
     }
 
     fn retain_terminal(&self, state: &mut EventInboxState, terminal: RunEvent) {
@@ -899,9 +915,10 @@ impl EventInbox {
                     state.envelope_payload_bytes -= event_envelope_payload_bytes(&event);
                     return Ok(Some(event));
                 }
-                if let Some(latest_output_bytes) = state.pending_gap.take() {
+                if let Some((latest_output_bytes, causes)) = state.pending_gap.take() {
                     return Ok(Some(RunEvent::Gap {
                         latest_output_bytes,
+                        causes,
                     }));
                 }
                 if state.local_observation == LocalObservationState::LostMarkerPending {
@@ -1232,6 +1249,66 @@ mod tests {
     const HISTORICAL_EVENT_COUNT: usize = 256;
 
     #[tokio::test]
+    async fn gap_causes_merge_without_discarding_an_admissible_later_output() {
+        for gap_first in [false, true] {
+            let inbox = EventInbox::with_limits(AttachmentEventLimits {
+                payload_bytes: 1,
+                ..AttachmentEventLimits::default()
+            });
+            let source = RunEvent::Gap {
+                latest_output_bytes: 1,
+                causes: OutputGapCauses::SOURCE_DISCONTINUITY,
+            };
+            if gap_first {
+                inbox.push(source.clone()).unwrap();
+            }
+            inbox
+                .push(RunEvent::Output {
+                    chunk: OutputChunk {
+                        start_byte: 0,
+                        end_byte: 2,
+                        data: vec![0, 255],
+                    },
+                })
+                .unwrap();
+            if !gap_first {
+                inbox.push(source).unwrap();
+            }
+            assert_eq!(
+                inbox.next().await.unwrap(),
+                Some(RunEvent::Gap {
+                    latest_output_bytes: 2,
+                    causes: OutputGapCauses::SOURCE_DISCONTINUITY
+                        .union(OutputGapCauses::CLIENT_VIEW_PRESSURE),
+                })
+            );
+        }
+        let inbox = EventInbox::new();
+        inbox
+            .push(RunEvent::Gap {
+                latest_output_bytes: 2,
+                causes: OutputGapCauses::SOURCE_DISCONTINUITY,
+            })
+            .unwrap();
+        let later = RunEvent::Output {
+            chunk: OutputChunk {
+                start_byte: 2,
+                end_byte: 3,
+                data: vec![255],
+            },
+        };
+        inbox.push(later.clone()).unwrap();
+        assert_eq!(
+            inbox.next().await.unwrap(),
+            Some(RunEvent::Gap {
+                latest_output_bytes: 2,
+                causes: OutputGapCauses::SOURCE_DISCONTINUITY,
+            })
+        );
+        assert_eq!(inbox.next().await.unwrap(), Some(later));
+    }
+
+    #[tokio::test]
     async fn output_overflow_gap_precedes_later_tmux_event() {
         let inbox = EventInbox::new();
         inbox
@@ -1267,7 +1344,8 @@ mod tests {
         assert_eq!(
             inbox.next().await.unwrap(),
             Some(RunEvent::Gap {
-                latest_output_bytes: MAX_QUEUED_EVENT_BYTES as u64 + 1
+                latest_output_bytes: MAX_QUEUED_EVENT_BYTES as u64 + 1,
+                causes: OutputGapCauses::CLIENT_VIEW_PRESSURE,
             })
         );
         assert_eq!(
@@ -1283,16 +1361,19 @@ mod tests {
         let gaps = EventInbox::new();
         gaps.push(RunEvent::Gap {
             latest_output_bytes: 1,
+            causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
         })
         .expect("accept first output Gap");
         gaps.push(RunEvent::Gap {
             latest_output_bytes: 7,
+            causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
         })
         .expect("coalesce later output Gap");
         assert_eq!(
             gaps.next().await.unwrap(),
             Some(RunEvent::Gap {
                 latest_output_bytes: 7,
+                causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
             })
         );
 
@@ -1405,7 +1486,8 @@ mod tests {
         assert_eq!(
             inbox.next().await.unwrap(),
             Some(RunEvent::Gap {
-                latest_output_bytes: HISTORICAL_EVENT_COUNT as u64 + 1
+                latest_output_bytes: HISTORICAL_EVENT_COUNT as u64 + 1,
+                causes: OutputGapCauses::CLIENT_VIEW_PRESSURE,
             })
         );
         assert_eq!(inbox.next().await.unwrap(), Some(exited));

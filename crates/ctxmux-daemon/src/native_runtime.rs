@@ -1653,6 +1653,7 @@ fn queue_ready_terminals(entries: &mut [NativeEntry], queued: &mut VecDeque<Work
             let latest_output_bytes = turn.mark_source_gap();
             run.publish_event(crate::RunEvent::Gap {
                 latest_output_bytes,
+                causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY,
             });
             drop(turn);
             entry.output = None;

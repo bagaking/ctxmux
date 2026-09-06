@@ -3325,6 +3325,44 @@ struct LiveEventCursor {
     resize_revision: u64,
     /// Service state has an authoritative snapshot, unlike tmux observations.
     service_revision: u64,
+    gap_causes: GapCauseRevisions,
+}
+
+// The ring may evict a Gap itself. Per-cause stamps preserve the facts between
+// two subscriber boundaries without retaining another event journal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct GapCauseRevisions {
+    live_event_pressure: u64,
+    source_discontinuity: u64,
+    unknown: u64,
+}
+
+impl GapCauseRevisions {
+    fn record(&mut self, causes: ctxmux_protocol::OutputGapCauses) {
+        // Only shared output owners publish these causes. Subscriber, terminal
+        // and geometry lag belong to a connection; client pressure belongs to
+        // its inbox. Neither needs another shared-owner counter.
+        for (revision, observed) in [
+            (&mut self.live_event_pressure, causes.live_event_pressure),
+            (&mut self.source_discontinuity, causes.source_discontinuity),
+            (&mut self.unknown, causes.unknown),
+        ] {
+            if observed {
+                *revision = revision
+                    .checked_add(1)
+                    .expect("live gap cause revision remains representable");
+            }
+        }
+    }
+
+    fn since(self, before: Self) -> ctxmux_protocol::OutputGapCauses {
+        ctxmux_protocol::OutputGapCauses {
+            live_event_pressure: self.live_event_pressure > before.live_event_pressure,
+            source_discontinuity: self.source_discontinuity > before.source_discontinuity,
+            unknown: self.unknown > before.unknown,
+            ..ctxmux_protocol::OutputGapCauses::NONE
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -3345,7 +3383,7 @@ struct FundedRunEvent {
 #[derive(Clone, Debug)]
 enum PublishedRunEvent {
     Funded(Arc<FundedRunEvent>),
-    OutputGap(u64),
+    OutputGap(u64, ctxmux_protocol::OutputGapCauses),
     ObservationDiscontinuity,
 }
 
@@ -3356,9 +3394,10 @@ impl LiveRunEvent {
     fn event(&self) -> std::borrow::Cow<'_, RunEvent> {
         match &self.published {
             PublishedRunEvent::Funded(funded) => std::borrow::Cow::Borrowed(&funded.event),
-            PublishedRunEvent::OutputGap(latest_output_bytes) => {
+            PublishedRunEvent::OutputGap(latest_output_bytes, causes) => {
                 std::borrow::Cow::Owned(RunEvent::Gap {
                     latest_output_bytes: *latest_output_bytes,
+                    causes: *causes,
                 })
             }
             PublishedRunEvent::ObservationDiscontinuity => {
@@ -3397,6 +3436,7 @@ impl LiveEventOwner {
                     terminal_revision: 0,
                     resize_revision: 0,
                     service_revision: 0,
+                    gap_causes: GapCauseRevisions::default(),
                 },
             }),
         }
@@ -3406,26 +3446,16 @@ impl LiveEventOwner {
         let mut state = mutex_lock(&self.state);
         // The lease follows each heap envelope past ring eviction and across
         // async sends, including events with no variable payload.
-        let memory = if state
+        let memory = if matches!(&event, RunEvent::Gap { .. }) {
+            // Inline marker storage is already funded with the broadcast ring.
+            // Pressure must not replace a known source cause with metadata loss.
+            None
+        } else if state
             .sender
             .as_ref()
             .is_some_and(|sender| sender.receiver_count() > 0)
         {
-            let bytes = match &event {
-                RunEvent::Output { chunk } => chunk.data.capacity(),
-                RunEvent::Tmux {
-                    event: TmuxRunEvent::SessionRenamed { name },
-                } => name.capacity(),
-                RunEvent::Exited {
-                    state:
-                        RunState::Exited {
-                            signal: Some(signal),
-                            ..
-                        },
-                    ..
-                } => signal.capacity(),
-                _ => 0,
-            };
+            let bytes = Self::payload_capacity(&event);
             if let Some(permit) = self
                 .budget
                 .reserve(bytes.saturating_add(EVENT_ALLOCATION_BYTES))
@@ -3435,6 +3465,7 @@ impl LiveEventOwner {
                 event = match &event {
                     RunEvent::Output { chunk } => RunEvent::Gap {
                         latest_output_bytes: chunk.end_byte,
+                        causes: ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE,
                     },
                     _ => RunEvent::ObservationDiscontinuity,
                 };
@@ -3451,6 +3482,7 @@ impl LiveEventOwner {
             }
             RunEvent::Gap {
                 latest_output_bytes,
+                causes,
             } => {
                 state.cursor.output_discontinuity_revision = state
                     .cursor
@@ -3458,6 +3490,7 @@ impl LiveEventOwner {
                     .checked_add(1)
                     .expect("live output-discontinuity revision remains representable");
                 state.cursor.latest_output_discontinuity_byte = *latest_output_bytes;
+                state.cursor.gap_causes.record(*causes);
             }
             RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => {
                 state.cursor.terminal_revision = state
@@ -3493,7 +3526,8 @@ impl LiveEventOwner {
                 None => match event {
                     RunEvent::Gap {
                         latest_output_bytes,
-                    } => PublishedRunEvent::OutputGap(latest_output_bytes),
+                        causes,
+                    } => PublishedRunEvent::OutputGap(latest_output_bytes, causes),
                     _ => PublishedRunEvent::ObservationDiscontinuity,
                 },
             };
@@ -3503,6 +3537,24 @@ impl LiveEventOwner {
                 after: state.cursor,
             };
             let _ = sender.send(envelope);
+        }
+    }
+
+    fn payload_capacity(event: &RunEvent) -> usize {
+        match event {
+            RunEvent::Output { chunk } => chunk.data.capacity(),
+            RunEvent::Tmux {
+                event: TmuxRunEvent::SessionRenamed { name },
+            } => name.capacity(),
+            RunEvent::Exited {
+                state:
+                    RunState::Exited {
+                        signal: Some(signal),
+                        ..
+                    },
+                ..
+            } => signal.capacity(),
+            _ => 0,
         }
     }
 
@@ -6042,6 +6094,7 @@ fn handle_tmux_control_item(
             });
             run.publish_event(RunEvent::Gap {
                 latest_output_bytes,
+                causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY,
             });
             let command = format!("refresh-client -A {pane_id}:continue\n");
             if let Err(error) =
@@ -9008,6 +9061,17 @@ mod tests {
         Arc<AttachmentTestHook>,
         mpsc::UnboundedReceiver<()>,
     ) {
+        hooked_server_with_capacity(point, LIVE_EVENT_CAPACITY)
+    }
+
+    fn hooked_server_with_capacity(
+        point: AttachmentHookPoint,
+        live_event_capacity: usize,
+    ) -> (
+        InProcessServer,
+        Arc<AttachmentTestHook>,
+        mpsc::UnboundedReceiver<()>,
+    ) {
         let (reached_tx, reached_rx) = mpsc::unbounded_channel();
         let hook = Arc::new(AttachmentTestHook {
             point,
@@ -9017,6 +9081,7 @@ mod tests {
         });
         let manager = Arc::new(RunManager {
             attachment_hook: Some(Arc::clone(&hook)),
+            live_event_capacity,
             ..RunManager::default()
         });
         (InProcessServer::start(manager), hook, reached_rx)
@@ -9036,6 +9101,193 @@ mod tests {
         })
         .await
         .expect("Run exits before the test deadline");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_geometry_only_lag_keeps_two_real_runs_and_exact_raw_replay() {
+        let (server, hook, mut reached) =
+            hooked_server_with_capacity(AttachmentHookPoint::AfterSnapshot, 2);
+        hook.armed.store(false, Ordering::Release);
+        let clients = [
+            server.client.clone(),
+            Client::new(server.directory.path().join("ctxmux.sock")),
+        ];
+        let mut runs = Vec::new();
+        for client in &clients {
+            let run = client.start(RunSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "stty -echo -onlcr; printf READY; while IFS= read -r line; do printf '%s\\n' \"$line\"; done".into()],
+                cwd: None, env: BTreeMap::new(), initial_size: TerminalSize { rows: 4, cols: 12 },
+                declared_inputs: Vec::new(),
+            }).await.unwrap();
+            expect_original_raw(client, &run, b"READY").await;
+            runs.push(run);
+        }
+        hook.armed.store(true, Ordering::Release);
+        let (slow, snapshot) = clients[0].attach(runs[0].id, 5).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for size in [
+            TerminalSize { rows: 5, cols: 13 },
+            TerminalSize { rows: 6, cols: 14 },
+            TerminalSize { rows: 7, cols: 15 },
+        ] {
+            assert_eq!(
+                clients[0]
+                    .resize(runs[0].id, size)
+                    .await
+                    .unwrap()
+                    .receipt
+                    .applied_size,
+                size
+            );
+        }
+        assert_eq!(
+            clients[0]
+                .status(runs[0].id)
+                .await
+                .unwrap()
+                .latest_output_bytes,
+            5
+        );
+        clients[1]
+            .input(runs[1].id, b"healthy\n".to_vec())
+            .await
+            .unwrap();
+        expect_original_raw(&clients[1], &runs[1], b"READYhealthy\n").await;
+        hook.release.notify_one();
+        assert_eq!(
+            next_event_before_timeout(&slow).await,
+            Some(RunEvent::Gap {
+                latest_output_bytes: snapshot.replay.latest_output_bytes,
+                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG
+                    .union(ctxmux_protocol::OutputGapCauses::GEOMETRY_LAG),
+            })
+        );
+        slow.detach().await.unwrap();
+        let (fresh, replay) = clients[1].attach(runs[0].id, 0).await.unwrap();
+        assert!(!replay.replay.truncated);
+        assert_eq!(replay_bytes(&replay.replay.chunks), b"READY");
+        assert_eq!(
+            replay.run.current_size,
+            Some(TerminalSize { rows: 7, cols: 15 })
+        );
+        fresh.detach().await.unwrap();
+        clients[0]
+            .input(runs[0].id, b"after\n".to_vec())
+            .await
+            .unwrap();
+        expect_original_raw(&clients[0], &runs[0], b"READYafter\n").await;
+        for (client, run) in clients.iter().zip(&runs) {
+            assert_eq!(client.status(run.id).await.unwrap().pid, run.pid);
+            client.stop(fresh_stop(client, run.id).await).await.unwrap();
+            assert!(!process_exists(run.pid.unwrap()));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gap_snapshot_covered_geometry_does_not_invent_a_continuation_failure() {
+        let (server, hook, mut reached) =
+            hooked_server_with_capacity(AttachmentHookPoint::AfterSubscribe, 2);
+        let info = server.client.start(long_running_spec()).await.unwrap();
+        let client = server.client.clone();
+        let id = info.id;
+        let attaching = tokio::spawn(async move { client.attach(id, 0).await });
+        tokio::time::timeout(Duration::from_secs(5), reached.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for size in [
+            TerminalSize { rows: 5, cols: 13 },
+            TerminalSize { rows: 6, cols: 14 },
+            TerminalSize { rows: 7, cols: 15 },
+        ] {
+            assert_eq!(
+                server
+                    .client
+                    .resize(id, size)
+                    .await
+                    .unwrap()
+                    .receipt
+                    .applied_size,
+                size
+            );
+        }
+        hook.release.notify_one();
+        let (attachment, snapshot) = attaching.await.unwrap().unwrap();
+        assert_eq!(snapshot.resize_revision, 3);
+        assert_eq!(
+            snapshot.run.current_size,
+            Some(TerminalSize { rows: 7, cols: 15 })
+        );
+        // A real applied Input produces the next event, proving that a false
+        // Gap does not precede it and that this original child remains usable.
+        server
+            .client
+            .input(id, b"after-snapshot\n".to_vec())
+            .await
+            .unwrap();
+        let next =
+            tokio::time::timeout(Duration::from_secs(5), next_non_service_event(&attachment))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(next, Some(RunEvent::Output { .. })),
+            "snapshot-covered resize must not introduce Gap: {next:?}"
+        );
+        assert_eq!(server.client.status(id).await.unwrap().pid, info.pid);
+        attachment.detach().await.unwrap();
+        server
+            .client
+            .stop(fresh_stop(&server.client, id).await)
+            .await
+            .unwrap();
+        assert!(!process_exists(info.pid.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn gap_pressure_marker_preserves_source_cause_and_evicted_cause_stamps() {
+        let budget = crate::resources::ByteBudget::new((super::EVENT_ALLOCATION_BYTES + 1) as u64);
+        let owner = super::LiveEventOwner::with_budget(1, budget.clone());
+        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
+        mutex_lock(&owner.state).sender = Some(sender);
+        let before = owner.cursor();
+        owner.publish(RunEvent::Output {
+            chunk: ctxmux_protocol::OutputChunk {
+                start_byte: 0,
+                end_byte: 2,
+                data: vec![0, 255],
+            },
+        });
+        owner.publish(RunEvent::Gap {
+            latest_output_bytes: 2,
+            causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY,
+        });
+        assert!(matches!(
+            receiver.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+        ));
+        let retained = receiver.recv().await.unwrap();
+        assert_eq!(
+            retained.event().as_ref(),
+            &RunEvent::Gap {
+                latest_output_bytes: 2,
+                causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY
+            }
+        );
+        assert_eq!(
+            retained.after.gap_causes.since(before.gap_causes),
+            ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE
+                .union(ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY)
+        );
+        assert_eq!(
+            budget.used(),
+            0,
+            "inline markers do not fabricate another heap lease"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11191,6 +11443,7 @@ mod tests {
 
         run.publish_event(RunEvent::Gap {
             latest_output_bytes: 7,
+            causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
         });
         assert!(matches!(
             first_events
@@ -11198,7 +11451,8 @@ mod tests {
                 .try_recv()
                 .map(|envelope| envelope.event().into_owned()),
             Ok(RunEvent::Gap {
-                latest_output_bytes: 7
+                latest_output_bytes: 7,
+                causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
             })
         ));
 
@@ -11298,6 +11552,7 @@ mod tests {
         let gap_head = run.mark_output_source_gap();
         run.publish_event(RunEvent::Gap {
             latest_output_bytes: gap_head,
+            causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
         });
         run.publish_event(RunEvent::Tmux {
             event: TmuxRunEvent::Continued,
@@ -11383,6 +11638,7 @@ mod tests {
             next_event_before_timeout(&attachment).await,
             Some(RunEvent::Gap {
                 latest_output_bytes: 4,
+                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG,
             })
         );
         assert_eq!(
@@ -11441,6 +11697,7 @@ mod tests {
             next_event_before_timeout(&attachment).await,
             Some(RunEvent::Gap {
                 latest_output_bytes: 2,
+                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG,
             })
         );
         assert_eq!(
@@ -11502,6 +11759,7 @@ mod tests {
         let source_gap_head = run.mark_output_source_gap();
         run.publish_event(RunEvent::Gap {
             latest_output_bytes: source_gap_head,
+            causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
         });
         run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
         hook.release.notify_one();
@@ -11561,6 +11819,7 @@ mod tests {
         let source_gap_head = run.mark_output_source_gap();
         run.publish_event(RunEvent::Gap {
             latest_output_bytes: source_gap_head,
+            causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY,
         });
         hook.release.notify_one();
 
@@ -11568,6 +11827,8 @@ mod tests {
             next_event_before_timeout(&attachment).await,
             Some(RunEvent::Gap {
                 latest_output_bytes: 1,
+                causes: ctxmux_protocol::OutputGapCauses::TERMINAL_CATCHUP
+                    .union(ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY),
             })
         );
         assert_eq!(
@@ -11715,6 +11976,7 @@ mod tests {
             {
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => latest_output_bytes,
                 event => panic!("expected public Gap event, got {event:?}"),
             };

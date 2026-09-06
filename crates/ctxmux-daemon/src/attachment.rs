@@ -4,9 +4,9 @@ use std::{collections::VecDeque, future::Future, sync::Arc};
 
 use ctxmux_protocol::{
     AttachedHeader, AttachedSnapshot, AttachmentCommandId, AttachmentView, ClientFrame,
-    ControlOutcome, ErrorCode, MAX_FRAME_BYTES, OutputChunk, OutputReplay, OutputReplayHeader,
-    ProtocolError, RecoverableStop, Response, RunEvent, RunId, RunSignal, RunState, ServerFrame,
-    TerminalSize,
+    ControlOutcome, ErrorCode, MAX_FRAME_BYTES, OutputChunk, OutputGapCauses, OutputReplay,
+    OutputReplayHeader, ProtocolError, RecoverableStop, Response, RunEvent, RunId, RunSignal,
+    RunState, ServerFrame, TerminalSize,
 };
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{net::UnixStream, sync::broadcast};
@@ -264,6 +264,7 @@ pub(super) async fn handle_pinned(
                                 envelope.before,
                                 &mut sent_through_byte,
                                 &mut sent_service_revision,
+                                sent_resize_revision,
                             )
                             .await?
                             {
@@ -384,6 +385,11 @@ async fn finish_terminal_snapshot(
             &ServerFrame::Event {
                 event: RunEvent::Gap {
                     latest_output_bytes,
+                    causes: OutputGapCauses::TERMINAL_CATCHUP.union(
+                        cursor_after_snapshot
+                            .gap_causes
+                            .since(live_cursor.gap_causes),
+                    ),
                 },
             },
         )
@@ -412,6 +418,7 @@ async fn recover_lagged_delivery(
     retained_before: LiveEventCursor,
     sent_through_byte: &mut u64,
     sent_service_revision: &mut u64,
+    sent_resize_revision: u64,
 ) -> Result<LagRecovery, ConnectionError> {
     let authoritative = run.info();
     let lost_observation = retained_before.observation_revision > delivered.observation_revision;
@@ -419,7 +426,10 @@ async fn recover_lagged_delivery(
     let lost_output_marker =
         retained_before.output_discontinuity_revision > delivered.output_discontinuity_revision;
     let lost_output_bytes = retained_before.output_bytes > *sent_through_byte;
-    let lost_resize = retained_before.resize_revision > delivered.resize_revision;
+    // The initial snapshot can already cover revisions published after
+    // subscription. Geometry has its own sent fence; advancing shared cause
+    // cursors here could conceal an unreplayable source discontinuity.
+    let lost_resize = retained_before.resize_revision > sent_resize_revision;
     if lost_observation {
         send(
             wire,
@@ -445,6 +455,13 @@ async fn recover_lagged_delivery(
             &ServerFrame::Event {
                 event: RunEvent::Gap {
                     latest_output_bytes,
+                    causes: OutputGapCauses::SUBSCRIBER_LAG
+                        .union(if lost_resize {
+                            OutputGapCauses::GEOMETRY_LAG
+                        } else {
+                            OutputGapCauses::NONE
+                        })
+                        .union(retained_before.gap_causes.since(delivered.gap_causes)),
                 },
             },
         )

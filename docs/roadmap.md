@@ -487,3 +487,11 @@ and identities, Ctrl+C, disconnect/reconnect, healthy planned exec, cold
 historical recovery, terminal allocation/encoding pressure, macOS/Linux resource
 costs and AgentMux consumption. Original failing or unqualified resource receipts
 remain visible. No reduced workload or relaxed budget closes this milestone.
+
+The independently deliverable Gap slice in this Feature binds daemon and local
+client origins, preserves causes through coalescing and ring eviction, and keeps
+received/delivered/recovery cursors distinct. Its acceptance includes a real
+slow view beside a healthy client, exact replay on the original Runs, continued
+input/ACK and Ctrl+C, plus resize-only lag at an unchanged byte head. Its finite
+receipt contributes to final P0 sign-off; it does not close terminal fidelity,
+fleet resources, all recovery classes or downstream product-use acceptance.

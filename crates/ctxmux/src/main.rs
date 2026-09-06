@@ -760,8 +760,10 @@ fn write_event(event: RunEvent, stdout: &mut impl Write) -> Result<bool, String>
         ),
         RunEvent::Gap {
             latest_output_bytes,
+            causes,
         } => Err(format!(
-            "attachment fell behind at output byte {latest_output_bytes}; reattach from the last observed byte cursor"
+            "attachment output/view discontinuity at reported byte {latest_output_bytes}; causes={}; reattach from the last observed byte cursor",
+            serde_json::to_string(&causes).map_err(|error| error.to_string())?
         )),
     }
 }

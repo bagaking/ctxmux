@@ -20,6 +20,7 @@ import {
   PROTOCOL_VERSION,
   inputOperationKey,
   type OutputChunk,
+  type RunEvent,
   type RecoverableStopOperation,
   type RuntimeIdentity,
   type ServerFrame,
@@ -34,6 +35,31 @@ import {
   WireClosedError,
   parseJsonFrame,
 } from "../src/wire.ts";
+
+import { emptyGapCauses } from "../src/gap-observation.ts";
+const UNKNOWN_GAP_CAUSES = { ...emptyGapCauses(), unknown: true };
+const CLIENT_GAP_CAUSES = { ...emptyGapCauses(), client_view_pressure: true };
+
+function assertGap(
+  event: RunEvent | undefined,
+  head: number,
+  client = false,
+): void {
+  assert.ok(event?.type === "gap");
+  assert.equal(event.latest_output_bytes, head);
+  assert.deepEqual(
+    event.causes,
+    client ? CLIENT_GAP_CAUSES : UNKNOWN_GAP_CAUSES,
+  );
+  const observed =
+    event as import("../src/gap-observation.ts").AttachmentGapEvent;
+  assert.equal(observed.observation.runId, RUN_ID);
+  assert.deepEqual(observed.observation.runtime, {
+    runtimeId: RUNTIME_ID,
+    daemonInstanceId: DAEMON_INSTANCE,
+  });
+  assert.deepEqual(observed.observation.origins, { daemon: !client, client });
+}
 
 const RUN_ID = "018f47f2-9df7-7f5f-8f2d-d3353f114ae8";
 const DAEMON_INSTANCE = "018f47f2-9df7-7f5f-8f2d-d3353f114ae9";
@@ -98,7 +124,11 @@ const MALFORMED_PROTOCOL_FRAMES = (
 test("SC-01 rejects unsafe u64 cursors before replay", async (context) => {
   const safeFrame = {
     type: "event",
-    event: { type: "gap", latest_output_bytes: Number.MAX_SAFE_INTEGER },
+    event: {
+      type: "gap",
+      latest_output_bytes: Number.MAX_SAFE_INTEGER,
+      causes: UNKNOWN_GAP_CAUSES,
+    },
   } satisfies ServerFrame;
   assert.equal(validateServerFrame(safeFrame), safeFrame);
 
@@ -962,7 +992,14 @@ test("SC-02 accepts TypeScript-authored server variants and rejects mutations", 
       type: "event",
       event: { type: "interrupted", reason: "tmux_protocol_error" },
     },
-    { type: "event", event: { type: "gap", latest_output_bytes: 1 } },
+    {
+      type: "event",
+      event: {
+        type: "gap",
+        latest_output_bytes: 1,
+        causes: UNKNOWN_GAP_CAUSES,
+      },
+    },
     {
       type: "command_result",
       command_id: 1,
@@ -2642,10 +2679,7 @@ test(
       });
     }
     const gap = await attachment.nextEvent();
-    assert.deepEqual(gap, {
-      type: "gap",
-      latest_output_bytes: frameCount,
-    });
+    assertGap(gap, frameCount, true);
     assert.equal(
       gap === undefined ? undefined : runEventSource(gap),
       RUN_ID,
@@ -2801,10 +2835,7 @@ test("SDK-02 preserves Gap, tmux, later output, and terminal order across satura
       },
     });
   }
-  assert.deepEqual(await attachment.nextEvent(), {
-    type: "gap",
-    latest_output_bytes: 257,
-  });
+  assertGap(await attachment.nextEvent(), 257, true);
   assert.deepEqual(await attachment.nextEvent(), {
     type: "tmux",
     event: { type: "paused" },
@@ -2856,7 +2887,11 @@ test("SDK-02 permits only one pending attachment event consumer", async (context
     await delay(50);
     peer.send({
       type: "event",
-      event: { type: "gap", latest_output_bytes: 7 },
+      event: {
+        type: "gap",
+        latest_output_bytes: 7,
+        causes: UNKNOWN_GAP_CAUSES,
+      },
     });
   });
 
@@ -2868,7 +2903,7 @@ test("SDK-02 permits only one pending attachment event consumer", async (context
     attachment.nextEvent(),
     /only one nextEvent\(\) call may be pending/,
   );
-  assert.deepEqual(await first, { type: "gap", latest_output_bytes: 7 });
+  assertGap(await first, 7);
   attachment.close();
 });
 
@@ -3066,7 +3101,11 @@ test("SDK-02 coalesces daemon output Gaps at the latest byte cursor", async (con
     for (let sequence = 1; sequence <= 257; sequence += 1) {
       peer.send({
         type: "event",
-        event: { type: "gap", latest_output_bytes: sequence },
+        event: {
+          type: "gap",
+          latest_output_bytes: sequence,
+          causes: UNKNOWN_GAP_CAUSES,
+        },
       });
     }
   });
@@ -3075,10 +3114,7 @@ test("SDK-02 coalesces daemon output Gaps at the latest byte cursor", async (con
     socketPath: daemon.socketPath,
   }).attach(RUN_ID);
   await delay(50);
-  assert.deepEqual(await attachment.nextEvent(), {
-    type: "gap",
-    latest_output_bytes: 257,
-  });
+  assertGap(await attachment.nextEvent(), 257);
   attachment.close();
 });
 

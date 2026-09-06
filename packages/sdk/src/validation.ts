@@ -675,15 +675,33 @@ function runEvent(value: unknown, path: string): void {
       terminalSize(event.size, `${path}.size`, true);
       return;
     case "gap":
-      exactFields(event, path, ["type", "latest_output_bytes"]);
+      exactFields(event, path, ["type", "latest_output_bytes", "causes"]);
       validateCursorValue(
         event.latest_output_bytes,
         `${path}.latest_output_bytes`,
       );
+      outputGapCauses(event.causes, `${path}.causes`);
       return;
     default:
       throw invalid(`${path}.type`, "a known Run-event discriminant");
   }
+}
+
+function outputGapCauses(value: unknown, path: string): void {
+  const causes = record(value, path);
+  const fields = [
+    "live_event_pressure",
+    "subscriber_lag",
+    "source_discontinuity",
+    "terminal_catchup",
+    "geometry_lag",
+    "client_view_pressure",
+    "unknown",
+  ] as const;
+  exactFields(causes, path, fields);
+  for (const field of fields) boolean(causes[field], `${path}.${field}`);
+  if (!fields.some((field) => causes[field] === true))
+    throw invalid(path, "at least one observed cause or explicit unknown");
 }
 
 function runSummary(value: unknown, path: string): void {

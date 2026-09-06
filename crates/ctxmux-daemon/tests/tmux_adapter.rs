@@ -1189,6 +1189,7 @@ async fn wait_for_output(
                 }
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
@@ -1226,6 +1227,7 @@ async fn wait_for_tmux_event(attachment: &mut Attachment, expected: TmuxRunEvent
                 RunEvent::Output { .. } => {}
                 RunEvent::Gap {
                     latest_output_bytes,
+                    ..
                 } => panic!("unexpected output gap at {latest_output_bytes}"),
                 RunEvent::Exited { state } => panic!("tmux Run exited unexpectedly: {state:?}"),
                 RunEvent::Interrupted { reason } => {
@@ -2263,6 +2265,7 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
             .expect("receive public Gap event"),
         Some(RunEvent::Gap {
             latest_output_bytes: caller_cursor,
+            causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY,
         })
     );
     assert_eq!(

@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   asError,
   bytes,
@@ -20,6 +21,7 @@ import type { ControlReceipt } from "./generated/ControlReceipt.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { RunEvent } from "./generated/RunEvent.js";
 import type { RunId } from "./generated/RunId.js";
+import type { RuntimeIdentity } from "./generated/RuntimeIdentity.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import type { TerminalSize } from "./generated/TerminalSize.js";
 import {
@@ -28,6 +30,13 @@ import {
 } from "./stop-operation.js";
 import { CtxmuxInvalidFrameError, validateServerFrame } from "./validation.js";
 import { encodeJsonLine, WireClosedError } from "./wire.js";
+import {
+  emptyGapCauses,
+  unionGapCauses,
+  type AttachmentEvent,
+  type AttachmentGapEvent,
+  type AttachmentGapLocalPressure,
+} from "./gap-observation.js";
 
 const MAX_ATTACHMENT_COMMAND_ID = 0xffff_ffff;
 // Per-attachment pipeline windows bound queued envelopes and payload while a
@@ -154,6 +163,18 @@ export class Attachment {
   readonly #viewResources: AttachmentViewResourcePolicy;
   #viewError: CtxmuxAttachmentObservationUnavailableError | undefined;
   #queuedEnvelopeBytes = 0;
+  #payloadHighWaterBytes = 0;
+  #envelopeHighWaterBytes = 0;
+  #receivedOutputHeadByte: number | null;
+  #deliveredThroughByte: number | null;
+  #recoveryAfterByte: number;
+  readonly #requestedAfterByte: number;
+  #continuityLost = false;
+  readonly #attachmentId = randomUUID();
+  readonly #runtime: Pick<
+    RuntimeIdentity,
+    "runtimeId" | "daemonInstanceId"
+  > | null;
   #state: AttachmentState = "open";
   #nextCommandId: AttachmentCommandId | undefined = 1;
   #pendingInputCommands = 0;
@@ -176,10 +197,27 @@ export class Attachment {
     wire: AttachmentWire,
     snapshot: AttachedSnapshot,
     resources: AttachmentViewResources = {},
+    runtime?: RuntimeIdentity,
+    requestedAfterByte = 0,
   ) {
     this.#viewResources = attachmentViewResourcePolicy(resources);
     this.#wire = wire;
     this.snapshot = snapshot;
+    // Headers and synthetic terminal seeds advertise a position; only original
+    // decoded replay chunks prove Output receipt and API delivery. An empty
+    // retained window must not manufacture a receipt at the owner's head.
+    const replayHead = snapshot.replay.chunks.at(-1)?.end_byte ?? null;
+    this.#receivedOutputHeadByte = replayHead;
+    this.#deliveredThroughByte = replayHead;
+    this.#requestedAfterByte = requestedAfterByte;
+    this.#recoveryAfterByte = replayHead ?? requestedAfterByte;
+    this.#runtime =
+      runtime === undefined
+        ? null
+        : Object.freeze({
+            runtimeId: runtime.runtimeId,
+            daemonInstanceId: runtime.daemonInstanceId,
+          });
     for (const chunk of snapshot.replay.chunks) {
       runEventSources.set(chunk, snapshot.run.id);
     }
@@ -255,7 +293,7 @@ export class Attachment {
     this.#wire.close();
   }
 
-  public async nextEvent(): Promise<RunEvent | undefined> {
+  public async nextEvent(): Promise<AttachmentEvent | undefined> {
     const queued = this.#events[this.#eventHead];
     if (queued !== undefined) {
       this.#events[this.#eventHead++] = undefined;
@@ -267,20 +305,20 @@ export class Attachment {
     }
     if (queued !== undefined) {
       this.#releaseEvent(queued);
-      return queued.event;
+      return this.#deliverEvent(queued.event);
     }
     if (this.#pendingOutputGap !== undefined) {
       const gap = this.#pendingOutputGap;
       this.#pendingOutputGap = undefined;
       this.#releaseEvent(gap);
-      return gap.event;
+      return this.#deliverEvent(gap.event);
     }
     if (this.#terminalEvent !== undefined) {
       const terminal = this.#terminalEvent;
       this.#terminalEvent = undefined;
       this.#eventStreamEnded = true;
       this.#releaseEvent(terminal);
-      return terminal.event;
+      return this.#deliverEvent(terminal.event);
     }
     if (this.#eventError !== undefined) {
       throw this.#eventError;
@@ -294,12 +332,12 @@ export class Attachment {
         "only one nextEvent() call may be pending per attachment",
       );
     }
-    return await new Promise<RunEvent | undefined>((resolve, reject) => {
+    return await new Promise<AttachmentEvent | undefined>((resolve, reject) => {
       this.#eventWaiter = { resolve, reject };
     });
   }
 
-  public async *events(): AsyncGenerator<RunEvent, void, void> {
+  public async *events(): AsyncGenerator<AttachmentEvent, void, void> {
     while (true) {
       const event = await this.nextEvent();
       if (event === undefined) {
@@ -562,6 +600,11 @@ export class Attachment {
     if (terminal) this.#terminalSeen = true;
     if (event.type === "observation_discontinuity")
       this.#observationDiscontinuitySeen = true;
+    if (event.type === "output")
+      this.#receivedOutputHeadByte = Math.max(
+        this.#receivedOutputHeadByte ?? 0,
+        event.chunk.end_byte,
+      );
     // A local view failure never stops strict validation or the wire/ACK owner.
     if (this.#viewError !== undefined) {
       this.#viewError.recordDrop(event);
@@ -575,11 +618,15 @@ export class Attachment {
       const waiter = this.#eventWaiter;
       this.#eventWaiter = undefined;
       if (terminal) this.#eventStreamEnded = true;
-      waiter.resolve(event);
+      waiter.resolve(
+        this.#deliverEvent(
+          event.type === "gap" ? this.#gapEvent(event) : event,
+        ),
+      );
       return true;
     }
     if (event.type === "gap") {
-      this.#extendPendingOutputGap(event.latest_output_bytes, event);
+      this.#extendPendingOutputGap(event);
       return true;
     }
     const retained: QueuedEvent = {
@@ -588,8 +635,7 @@ export class Attachment {
       envelopeBytes: eventEnvelopeBytes(event),
     };
     if (!this.#eventCapacity(retained)) {
-      if (event.type === "output")
-        this.#extendPendingOutputGap(event.chunk.end_byte, event);
+      if (event.type === "output") this.#extendPendingOutputGap(event);
       else
         this.#loseObservation(
           event,
@@ -628,19 +674,27 @@ export class Attachment {
   #chargeEvent(event: QueuedEvent): void {
     this.#queuedEventBytes += event.bytes;
     this.#queuedEnvelopeBytes += event.envelopeBytes;
+    this.#payloadHighWaterBytes = Math.max(
+      this.#payloadHighWaterBytes,
+      this.#queuedEventBytes,
+    );
+    this.#envelopeHighWaterBytes = Math.max(
+      this.#envelopeHighWaterBytes,
+      this.#queuedEnvelopeBytes,
+    );
   }
   #releaseEvent(event: QueuedEvent): void {
     this.#queuedEventBytes -= event.bytes;
     this.#queuedEnvelopeBytes -= event.envelopeBytes;
   }
-  #extendPendingOutputGap(latestOutputBytes: number, dropped: RunEvent): void {
+  #extendPendingOutputGap(
+    dropped: Extract<RunEvent, { type: "gap" | "output" }>,
+  ): void {
     const previous = this.#pendingOutputGap;
-    const head =
-      previous?.event.type === "gap" ? previous.event.latest_output_bytes : 0;
-    const event: RunEvent = {
-      type: "gap",
-      latest_output_bytes: Math.max(head, latestOutputBytes),
-    };
+    const event = this.#gapEvent(
+      dropped,
+      previous?.event.type === "gap" ? previous.event : undefined,
+    );
     const envelopeBytes = eventEnvelopeBytes(event);
     const additional = envelopeBytes - (previous?.envelopeBytes ?? 0);
     if (
@@ -652,7 +706,115 @@ export class Attachment {
     }
     rememberRunEventSource(event, this.snapshot.run.id);
     this.#queuedEnvelopeBytes += additional;
+    this.#envelopeHighWaterBytes = Math.max(
+      this.#envelopeHighWaterBytes,
+      this.#queuedEnvelopeBytes,
+    );
     this.#pendingOutputGap = { event, bytes: 0, envelopeBytes };
+  }
+
+  #gapEvent(
+    dropped: Extract<RunEvent, { type: "gap" | "output" }>,
+    previous?: AttachmentGapEvent,
+  ): AttachmentGapEvent {
+    const prior = previous?.observation;
+    const daemon = dropped.type === "gap";
+    const now = Date.now();
+    let localPressure: AttachmentGapLocalPressure | null =
+      prior?.localPressure ?? null;
+    if (!daemon) {
+      const attemptedPayloadBytes = eventBytes(dropped);
+      const attemptedEnvelopeBytes = eventEnvelopeBytes(dropped);
+      const oldBytes = localPressure?.droppedOutputBytes ?? 0;
+      const saturated =
+        localPressure?.countersSaturated === true ||
+        attemptedPayloadBytes > Number.MAX_SAFE_INTEGER - oldBytes;
+      localPressure = {
+        payloadLimitHit:
+          localPressure?.payloadLimitHit === true ||
+          attemptedPayloadBytes >
+            this.#viewResources.payloadBytes - this.#queuedEventBytes,
+        envelopeLimitHit:
+          localPressure?.envelopeLimitHit === true ||
+          attemptedEnvelopeBytes >
+            this.#viewResources.envelopeBytes - this.#queuedEnvelopeBytes,
+        attemptedPayloadBytes,
+        attemptedEnvelopeBytes,
+        droppedOutputBytes: saturated ? null : oldBytes + attemptedPayloadBytes,
+        countersSaturated: saturated,
+      };
+    }
+    const origins = {
+      daemon: prior?.origins.daemon === true || daemon,
+      client: prior?.origins.client === true || !daemon,
+    };
+    const ownCauses = daemon
+      ? dropped.causes
+      : { ...emptyGapCauses(), client_view_pressure: true };
+    return {
+      type: "gap",
+      latest_output_bytes: Math.max(
+        previous?.latest_output_bytes ?? 0,
+        daemon ? dropped.latest_output_bytes : dropped.chunk.end_byte,
+      ),
+      causes: unionGapCauses(previous?.causes ?? emptyGapCauses(), ownCauses),
+      observation: {
+        attachmentId: this.#attachmentId,
+        runtime: this.#runtime,
+        runId: this.snapshot.run.id,
+        origins,
+        firstObservedAtUnixMs: prior?.firstObservedAtUnixMs ?? now,
+        lastObservedAtUnixMs: now,
+        deliveredAtUnixMs: null,
+        receivedOutputHeadByte: this.#receivedOutputHeadByte,
+        deliveredThroughByte: this.#deliveredThroughByte,
+        requestedAfterByte: this.#requestedAfterByte,
+        recoveryAfterByte: this.#recoveryAfterByte,
+        missingOutputBytes: origins.daemon
+          ? null
+          : (localPressure?.droppedOutputBytes ?? null),
+        queue: {
+          payloadBudgetBytes: this.#viewResources.payloadBytes,
+          envelopeBudgetBytes: this.#viewResources.envelopeBytes,
+          retainedPayloadBytes: this.#queuedEventBytes,
+          retainedEnvelopeBytes: this.#queuedEnvelopeBytes,
+          payloadHighWaterBytes: this.#payloadHighWaterBytes,
+          envelopeHighWaterBytes: this.#envelopeHighWaterBytes,
+        },
+        localPressure,
+      },
+    };
+  }
+
+  #deliverEvent(event: AttachmentEvent): AttachmentEvent {
+    if (event.type === "output" && !this.#continuityLost) {
+      if (event.chunk.start_byte > this.#recoveryAfterByte)
+        this.#continuityLost = true;
+      else {
+        this.#deliveredThroughByte = Math.max(
+          this.#deliveredThroughByte ?? 0,
+          event.chunk.end_byte,
+        );
+        this.#recoveryAfterByte = Math.max(
+          this.#recoveryAfterByte,
+          event.chunk.end_byte,
+        );
+      }
+    }
+    if (event.type !== "gap") return event;
+    this.#continuityLost = true;
+    const delivered: AttachmentGapEvent = {
+      ...event,
+      observation: {
+        ...event.observation,
+        receivedOutputHeadByte: this.#receivedOutputHeadByte,
+        deliveredAtUnixMs: Date.now(),
+        deliveredThroughByte: this.#deliveredThroughByte,
+        recoveryAfterByte: this.#recoveryAfterByte,
+      },
+    };
+    rememberRunEventSource(delivered, this.snapshot.run.id);
+    return delivered;
   }
   #loseObservation(
     event: RunEvent,
@@ -753,13 +915,13 @@ interface PendingCommand {
 }
 
 interface QueuedEvent {
-  readonly event: RunEvent;
+  readonly event: AttachmentEvent;
   readonly bytes: number;
   readonly envelopeBytes: number;
 }
 
 interface EventWaiter {
-  readonly resolve: (event: RunEvent | undefined) => void;
+  readonly resolve: (event: AttachmentEvent | undefined) => void;
   readonly reject: (error: Error) => void;
 }
 
