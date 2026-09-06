@@ -126,6 +126,38 @@ before mutation. Installing one candidate does not qualify the joined candidate.
 Semantic Session resumption into a new Run is distinct from preserving an old
 PTY or child; unknown input must never be replayed automatically.
 
+## Orca implementation comparison
+
+The comparison is pinned to Orca commit
+`3135fbbf49fef6199cdf1882eb9a3141af7ff098`. Its inspected source hashes and
+read-only review are retained with the private incident evidence. Referenced
+Orca tests were read, not run. These source findings do not establish the
+original ctxmux incident trigger.
+
+Orca's `pty-write-settlement.ts` distinguishes accepted, refused and
+unverifiable transport delivery. Its stream batcher retains Session-local FIFO
+while allowing another Session's small output to pass held bulk. Its connection
+lifecycle binds actual daemon identity, and its process observation separates
+live, unverifiable and exited. These mechanisms support separate service facts,
+explicit ambiguity and fair scheduling; transport acceptance still cannot
+substitute for ctxmux's completed PTY byte receipt.
+
+The comparison also identifies behavior ctxmux must correct rather than copy:
+`SubprocessHandle.write` catches native failure and returns without an applied
+result, while the request router can still return success. Derived headless
+parsing precedes recording. Startup buffering discards an old text prefix, and
+local reattach removes existing viewers. Those paths do not satisfy byte-exact
+durable output or concurrent Clients. Synchronous diagnostic logging can still
+block on a stalled sink even when errors are caught.
+
+Orca's public xterm shrink tests provide a useful consumer-oriented example.
+Their dimensions, history length, batching constants and simulated sockets are
+not ctxmux capacity requirements or real PTY fairness evidence. The remaining
+ctxmux proof must fill a real non-reading child's input buffer, retain its
+original request and confirmed prefix, and demonstrate another original Run's
+input, output and Ctrl+C. Screen restoration or a replacement shell cannot
+stand in for original child continuity.
+
 ## Required completion
 
 | Boundary                               | Acceptance                                                                                              |
