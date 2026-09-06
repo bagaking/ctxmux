@@ -102,24 +102,12 @@ async function inputModes(t) {
       await write(target, c.seed);
       const beforeReference = snapshot(reference),
         beforeTarget = snapshot(target);
-      const precisionLimit =
-        c.name === "normal origin pending wrap through alternate";
       const differences = leafDifferences(beforeTarget, beforeReference);
-      if (precisionLimit) {
-        // Root-reviewed P2/T004 boundary: one empty alternate-row wrap flag.
-        // Every other cell, cursor, history and input-mode leaf must agree.
-        assert.deepEqual(
-          differences,
-          [{ path: "alternate.rows.4.wrapped", actual: false, expected: true }],
-          "exact known precision boundary, no other mismatch permitted",
-        );
-      } else {
-        assert.deepEqual(
-          beforeTarget,
-          beforeReference,
-          c.name + ": checkpoint state",
-        );
-      }
+      assert.deepEqual(
+        differences,
+        [],
+        c.name + ": checkpoint state",
+      );
       const beforeModeReference = await inputModes(reference),
         beforeModeTarget = await inputModes(target);
       assert.deepEqual(
@@ -167,10 +155,7 @@ async function inputModes(t) {
           length: afterTarget.normal.length,
           mouse: afterTarget.modes.mouseTrackingMode,
         },
-        passed: !precisionLimit,
-        precisionLimit: precisionLimit
-          ? { priority: "P2", task: "T-004", differences, tailExact: true }
-          : undefined,
+        passed: true,
       });
     } finally {
       reference.dispose();
@@ -179,10 +164,11 @@ async function inputModes(t) {
   }
   const sha = (p) =>
     crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex");
-  assert.equal(results.filter((result) => result.passed).length, 6);
-  assert.equal(results.filter((result) => result.precisionLimit).length, 1);
+  assert.equal(results.filter((result) => result.passed).length, 7);
   const receipt = {
     basicPassed: true,
+    allFixtureCasesPassed: true,
+    fixtureCount: results.length,
     fullCodecPassed: false,
     nodeVersion: process.version,
     privateFieldsUsed: false,
@@ -192,7 +178,7 @@ async function inputModes(t) {
     modulePath,
     moduleSha: sha(modulePath),
     conditions:
-      "Public native-generated seed vs uninterrupted public xterm, no browser/physical wheel/lifecycle claim.",
+      "Seven public native-generated seeds and continuations match uninterrupted public xterm exactly. This bounded fixture set does not qualify all codec, resize, browser, physical wheel or lifecycle behavior.",
     results,
   };
   fs.writeFileSync(
