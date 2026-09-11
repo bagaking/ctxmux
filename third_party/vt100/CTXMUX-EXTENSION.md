@@ -111,3 +111,21 @@ their existing contracts; this is a storage representation change. Owning
 verification exercises public SGR color/style/reset behavior and the existing
 checkpoint, resize, Unicode and external xterm qualification suites. Whole-Run
 resource and latency effects require executed workload evidence.
+
+## Exact implicit default cells
+
+Rows retain their semantic width independently of their stored cell prefix.
+Untouched default cells read as complete default Cells, and drawing materializes
+the required prefix. When a normal row enters history, only its exact default
+suffix becomes implicit and unused allocation is released. Blank rows, explicit
+spaces, all rendition bits, wide partners, combining payloads, wrapping and
+alternate cells retained outside the viewport preserve their meaning. Resize,
+reflow and physical-line editing materialize the same cells they require.
+
+This representation does not reduce the retained row policy, shorten graphemes
+or change checkpoint bytes. Dense rows and styled blanks retain their full
+storage costs. Public parser tests cover historical cell state, restoring a
+checkpoint, bringing history back into the live viewport, editing its tail and
+resizing again. Matched private dense/sparse workloads compare complete restore
+bytes and geometry, not only visible text. These proofs do not provide aggregate
+daemon funding or qualify the original fleet soak; those remain separate owners.

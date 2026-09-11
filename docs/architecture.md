@@ -464,6 +464,16 @@ admission and ordering must survive a local derived-view fault; an unavailable
 derived continuation must be explicit, with its supported raw path remaining
 truthful. Recovery must not silently manufacture an equivalent terminal view.
 
+The terminal row representation separates semantic width from initialized
+storage. Untouched exact default cells are implicit; normal history releases
+only an exact default suffix. Styled blanks, explicit spaces, Unicode payloads,
+wide partners, wrap relations and retained alternate physical cells remain
+explicit where required. Returning history to a live viewport, drawing, editing
+and reflow preserve the same cell meaning. This saves representation cost
+without reducing retention policy or original-byte fidelity. It does not fund
+aggregate terminal allocations or remove the daemon's remaining export and
+recovery policy limits; those resource boundaries still require qualification.
+
 Child lifecycle, runtime-service availability, and view availability are
 separate facts. `RunState::Running` does not prove that an input/output owner
 still exists, and a static capability does not prove a particular operation

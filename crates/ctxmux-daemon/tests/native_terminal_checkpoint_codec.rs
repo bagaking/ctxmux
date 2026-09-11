@@ -371,6 +371,56 @@ fn identical_geometry_keeps_existing_wrap_on_both_screens() {
 }
 
 #[test]
+fn retained_history_preserves_default_cells_styles_spaces_and_long_graphemes() {
+    let cases = [
+        "short".to_owned(),
+        String::new(),
+        "\x1b[48;2;73;19;201m\x1b[2K\x1b[0m".to_owned(),
+        " ".to_owned(),
+        "\x1b[38;2;7;93;201m中e\u{301}\u{327}\x1b[0m".to_owned(),
+        format!("e{}", "\u{301}".repeat(100)),
+    ];
+    for line in cases {
+        let mut expected = Parser::new(2, 12, 8);
+        expected.process(line.as_bytes());
+        let mut source = Parser::new(2, 12, 8);
+        source.process(format!("{line}\r\n").repeat(6).as_bytes());
+        let mut target = restored(&source);
+        source.set_scrollback(usize::MAX);
+        target.set_scrollback(usize::MAX);
+        assert_eq!(source.screen().scrollback(), 5);
+        assert_same(&source, &target);
+        for col in 0..12 {
+            assert_eq!(
+                source.screen().cell(0, col),
+                expected.screen().cell(0, col),
+                "historical cell {col}, line {line:?}"
+            );
+        }
+        // Real height growth pulls the same historical physical rows back into
+        // the live viewport. Mutating an untouched column must remain ordinary
+        // drawing, including editing and erasing the formerly blank tail.
+        source.set_scrollback(0);
+        target.set_scrollback(0);
+        source.set_size(7, 12);
+        target.set_size(7, 12);
+        assert_same(&source, &target);
+        let tail = b"\x1b[1;12HX\x1b[1;9H\x1b[2@Y\x1b[1;10H\x1b[2P\x1b[1;11H\x1b[2X";
+        source.process(tail);
+        target.process(tail);
+        assert_eq!(source.screen().cell(0, 8).unwrap().contents(), "Y");
+        assert_eq!(source.screen().cell(0, 10).unwrap().contents(), "");
+        assert_same(&source, &target);
+        source.set_size(4, 8);
+        target.set_size(4, 8);
+        assert_same(&source, &target);
+        source.set_size(7, 16);
+        target.set_size(7, 16);
+        assert_same(&source, &target);
+    }
+}
+
+#[test]
 fn write_nonempty_public_xterm_inputs_for_independent_target_proof() {
     let cases = [
         ("normal history",4,20,b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix".to_vec(), b"\r\nseven".to_vec()),

@@ -124,7 +124,11 @@ impl Grid {
             self.rows.truncate(old_rows - cropped);
             let historical = removed - cropped;
             if self.scrollback_len > 0 {
-                self.scrollback.extend(self.rows.drain(..historical));
+                self.scrollback
+                    .extend(self.rows.drain(..historical).map(|mut row| {
+                        row.compact_history();
+                        row
+                    }));
                 while self.scrollback.len() > self.scrollback_len {
                     self.first_row_continuation = self.scrollback.pop_front().unwrap().wrapped();
                     self.saved_row_absolute = self.saved_row_absolute.saturating_sub(1);
@@ -313,7 +317,10 @@ impl Grid {
             history -= evicted;
         }
         self.rows = output.split_off(history);
-        self.scrollback.extend(output);
+        self.scrollback.extend(output.into_iter().map(|mut row| {
+            row.compact_history();
+            row
+        }));
     }
 
     pub fn set_scrollback_limit(&mut self, limit: usize) -> usize {
@@ -961,6 +968,8 @@ impl Grid {
                 self.first_row_continuation = removed.wrapped();
             }
             if self.scrollback_len > 0 && !self.scroll_region_active() {
+                let mut removed = removed;
+                removed.compact_history();
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
                     self.first_row_continuation = self.scrollback.pop_front().unwrap().wrapped();

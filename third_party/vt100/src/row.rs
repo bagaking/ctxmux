@@ -1,8 +1,12 @@
 use crate::term::BufWrite as _;
 
+static EMPTY_CELL: std::sync::LazyLock<crate::cell::Cell> =
+    std::sync::LazyLock::new(crate::cell::Cell::default);
+
 #[derive(Clone, Debug)]
 pub struct Row {
     cells: Vec<crate::cell::Cell>,
+    cols: u16,
     retained: Option<Vec<crate::cell::Cell>>,
     wrapped: bool,
 }
@@ -10,32 +14,36 @@ pub struct Row {
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::cell::Cell::default(); usize::from(cols)],
+            cells: Vec::with_capacity(usize::from(cols)),
+            cols,
             retained: None,
             wrapped: false,
         }
     }
 
     fn cols(&self) -> u16 {
-        self.cells
-            .len()
-            .try_into()
-            // we limit the number of cols to a u16 (see Size)
-            .unwrap()
+        self.cols
     }
 
     pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
         if let Some(last) = self.cols().checked_sub(1) {
             self.clear_wide(last, attrs);
         }
-        for cell in &mut self.cells {
-            cell.clear(attrs);
+        if attrs == crate::attrs::Attrs::default() {
+            self.cells.clear();
+        } else {
+            self.materialize();
+            for cell in &mut self.cells {
+                cell.clear(attrs);
+            }
         }
         self.wrapped = false;
     }
 
     fn cells(&self) -> impl Iterator<Item = &crate::cell::Cell> {
-        self.cells.iter()
+        self.cells
+            .iter()
+            .chain(std::iter::repeat(&*EMPTY_CELL).take(usize::from(self.cols) - self.cells.len()))
     }
 
     pub fn retained_cols(&self) -> u16 {
@@ -44,8 +52,31 @@ impl Row {
             .map_or(self.cols(), |cells| u16::try_from(cells.len()).unwrap())
     }
 
-    pub fn into_cells(self) -> Vec<crate::cell::Cell> {
+    pub fn into_cells(mut self) -> Vec<crate::cell::Cell> {
+        self.materialize();
         self.cells
+    }
+
+    /// Only exact default cells are implicit. Width, wrapping, colors, wide
+    /// partners and every retained physical cell keep their original meaning.
+    /// Live rows reserve their width without initializing untouched defaults;
+    /// bulk mutation materializes them, and history releases unused capacity.
+    pub fn compact_history(&mut self) {
+        if self.retained.is_some() {
+            return;
+        }
+        let explicit = self
+            .cells
+            .iter()
+            .rposition(|cell| cell != &*EMPTY_CELL)
+            .map_or(0, |index| index + 1);
+        self.cells.truncate(explicit);
+        self.cells.shrink_to_fit();
+    }
+
+    fn materialize(&mut self) {
+        self.cells
+            .resize(usize::from(self.cols), crate::cell::Cell::default());
     }
 
     pub fn content_length(&self) -> usize {
@@ -56,21 +87,34 @@ impl Row {
     }
 
     pub fn get(&self, col: u16) -> Option<&crate::cell::Cell> {
-        self.cells.get(usize::from(col))
+        if col >= self.cols {
+            None
+        } else {
+            Some(self.cells.get(usize::from(col)).unwrap_or(&EMPTY_CELL))
+        }
     }
 
     pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::cell::Cell> {
+        if col >= self.cols {
+            return None;
+        }
+        let required = usize::from(col) + 1;
+        if self.cells.len() < required {
+            self.cells.resize(required, crate::cell::Cell::default());
+        }
         self.cells.get_mut(usize::from(col))
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
         self.clear_wide(i, attrs);
-        self.cells[usize::from(i)].clear(attrs);
+        self.get_mut(i).unwrap().clear(attrs);
         // Erasing cells does not undo the already observed automatic line
         // continuation. Public xterm retains that relationship after ECH.
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
+        self.materialize();
+        self.cols = len;
         self.retained = None;
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
@@ -87,6 +131,7 @@ impl Row {
     /// sees the real wide lead at the right edge even when its continuation is
     /// outside the viewport. Growing exposes an untouched retained pair again.
     pub fn resize_retaining(&mut self, cols: u16) {
+        self.materialize();
         let mut retained = self.retained.take().unwrap_or_default();
         retained.resize(
             retained.len().max(self.cells.len()),
@@ -109,6 +154,7 @@ impl Row {
             crate::cell::Cell::default(),
         );
         self.cells = retained[..usize::from(cols)].to_vec();
+        self.cols = cols;
         if retained.len() > usize::from(cols) {
             self.retained = Some(retained);
         }
@@ -157,7 +203,7 @@ impl Row {
     /// retained off-right. Pair cleanup must reach that real physical cell,
     /// without making ordinary drawing positions extend beyond the viewport.
     pub fn wide_partner_mut(&mut self, col: u16) -> Option<&mut crate::cell::Cell> {
-        let cell = self.cells.get(usize::from(col))?;
+        let cell = self.get(col)?;
         let other = if cell.is_wide() {
             usize::from(col) + 1
         } else if cell.is_wide_continuation() {
@@ -165,8 +211,8 @@ impl Row {
         } else {
             return None;
         };
-        if other < self.cells.len() {
-            self.cells.get_mut(other)
+        if other < usize::from(self.cols) {
+            self.get_mut(u16::try_from(other).unwrap())
         } else {
             self.retained
                 .as_mut()
@@ -238,7 +284,7 @@ impl Row {
         });
         let mut prev_attrs = prev_attrs.unwrap_or_default();
 
-        let first_cell = &self.cells[usize::from(start)];
+        let first_cell = self.get(start).unwrap();
         if wrapping && first_cell == &default_cell {
             let default_attrs = default_cell.attrs();
             if &prev_attrs != default_attrs {
@@ -358,8 +404,8 @@ impl Row {
     ) -> (crate::grid::Pos, crate::attrs::Attrs) {
         let mut prev_was_wide = false;
 
-        let first_cell = &self.cells[usize::from(start)];
-        let prev_first_cell = &prev.cells[usize::from(start)];
+        let first_cell = self.get(start).unwrap();
+        let prev_first_cell = prev.get(start).unwrap();
         if wrapping
             && !prev_wrapping
             && first_cell == prev_first_cell
@@ -482,7 +528,7 @@ impl Row {
         // position the cursor after the end of the line correctly so that
         // drawing the next line can just start writing and be wrapped.
         if (!self.wrapped && prev.wrapped) || (!prev.wrapped && self.wrapped) {
-            let end_pos = if self.cells[usize::from(self.cols() - 1)].is_wide_continuation() {
+            let end_pos = if self.get(self.cols() - 1).unwrap().is_wide_continuation() {
                 crate::grid::Pos {
                     row,
                     col: self.cols() - 2,
@@ -498,7 +544,7 @@ impl Row {
             if !self.wrapped {
                 crate::term::EraseChar::new(1).write_buf(contents);
             }
-            let end_cell = &self.cells[usize::from(end_pos.col)];
+            let end_cell = self.get(end_pos.col).unwrap();
             if end_cell.has_contents() {
                 let attrs = end_cell.attrs();
                 if &prev_attrs != attrs {
