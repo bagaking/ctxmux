@@ -55,15 +55,14 @@ assert(!daemonOption || !flags.has("--mutations"), "artifact checks cannot prete
 for (const name of cases) {
   const directory = path.join(output, name);
   fs.mkdirSync(directory);
-  let source = root;
+  const source = path.join(directory, "source");
   let daemonBinary = daemonOption;
   let sdkPath = sdkOption;
-  if (!daemonBinary) {
-    source = path.join(directory, "source");
-    fs.mkdirSync(source);
+  fs.mkdirSync(source);
     const archive = path.join(directory, "source.tar");
     command("git", ["archive", "--output", archive, base], root, path.join(directory, "archive.log"));
     command("tar", ["-xf", archive, "-C", source], root, path.join(directory, "extract.log"));
+  if (!daemonBinary) {
     const implementation = path.join(source, owned[0]);
     let text = fs.readFileSync(implementation, "utf8");
     if (name === "history-invalidates-terminal") {
