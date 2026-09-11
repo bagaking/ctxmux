@@ -142,7 +142,7 @@ attrs[6][termios.VMIN]=1;attrs[6][termios.VTIME]=0
 termios.tcsetattr(0,termios.TCSANOW,attrs)
 os.write(1,b''.join(('ROW%03d\r\n'%i).encode() for i in range(30)))
 if {alternate}: os.write(1,b'\x1b[?1049h\x1b[?1003h\x1b[?1006h')
-os.write(1,b'\x1b[HFRAME'+b'\x1b[1;1Hframe'*450000+b'\x1b[2;1HREADY')
+os.write(1,b'\x1b[HFRAME'+b'\x1b[1;1Hframe'*450000+b'\x1b[2;1H\x1b[1;2mREADY\x1b[22m')
 while True:
  b=os.read(0,1)
  if not b: break
@@ -298,6 +298,8 @@ async fn native_alternate_sgr_and_normal_history_survive_new_attachment() {
         vt100::MouseProtocolEncoding::Sgr
     );
     assert!(parser.screen().contents().contains("READY"));
+    assert!(parser.screen().cell(1, 0).unwrap().faint());
+    assert!(parser.screen().cell(1, 0).unwrap().bold());
     let before = daemon.client.status(run.id).await.unwrap();
     let receipt = view.input(b"x".to_vec()).await.unwrap();
     assert_eq!(receipt.receipt.written_bytes, 1);
@@ -380,6 +382,7 @@ async fn native_same_byte_resizes_and_partial_control_tail_keep_one_ordered_fenc
     assert_eq!(resizes[1].resize_revision, resizes[0].resize_revision + 1);
     let mut parser = restore(&snapshot);
     assert_eq!(parser.screen().size(), (6, 15));
+    assert!(parser.screen().cell(1, 0).unwrap().faint());
     assert!(
         !parser.is_ground(),
         "partial original CSI must remain carry, not a fake complete seed"
@@ -397,6 +400,13 @@ async fn native_planned_exec_keeps_known_state_same_daemon_pid_child_pty_and_inp
     wait_ready(&daemon.client, run.id).await;
     let daemon_pid = daemon.child.id();
     let (old, before) = daemon.client.attach_terminal(run.id, 0).await.unwrap();
+    old.resize(TerminalSize { rows: 5, cols: 14 })
+        .await
+        .unwrap();
+    old.resize(TerminalSize { rows: 6, cols: 15 })
+        .await
+        .unwrap();
+    let other = daemon.client.start(seed_pressure_spec()).await.unwrap();
     daemon.sighup();
     daemon
         .wait_log("adopted inherited listener for handoff")
@@ -417,6 +427,7 @@ async fn native_planned_exec_keeps_known_state_same_daemon_pid_child_pty_and_inp
     assert_eq!(after.run.pid, before.run.pid);
     assert_eq!(after.run.id, before.run.id);
     let parser = restore(&after);
+    assert_eq!(parser.screen().size(), (6, 15));
     assert!(parser.screen().alternate_screen());
     assert_eq!(
         parser.screen().mouse_protocol_encoding(),
@@ -427,6 +438,19 @@ async fn native_planned_exec_keeps_known_state_same_daemon_pid_child_pty_and_inp
         vt100::MouseProtocolMode::AnyMotion
     );
     assert!(parser.screen().contents().contains("READY"));
+    assert!(parser.screen().cell(1, 0).unwrap().faint());
+    let (second, second_snapshot) = daemon.client.attach_terminal(other.id, 0).await.unwrap();
+    assert_eq!(second_snapshot.run.pid, other.pid);
+    assert_eq!(
+        second
+            .input(b"z".to_vec())
+            .await
+            .unwrap()
+            .receipt
+            .written_bytes,
+        1
+    );
+    second.detach().await.unwrap();
     assert_eq!(
         view.input(b"x".to_vec())
             .await
@@ -457,6 +481,7 @@ async fn native_planned_exec_keeps_known_state_same_daemon_pid_child_pty_and_inp
     assert!(parser.screen().contents().contains("ROW000"));
     last.detach().await.unwrap();
     daemon.stop_run(run.id).await;
+    daemon.stop_run(other.id).await;
 }
 #[tokio::test]
 async fn native_checkpoint_file_failure_refuses_exec_before_extract_and_keeps_old_service() {

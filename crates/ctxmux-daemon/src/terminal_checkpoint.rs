@@ -303,9 +303,9 @@ mod tests {
     #[test]
     fn public_sgr_preserves_all_indexed_colors_and_independent_styles() {
         for index in 0..=u8::MAX {
-            for style in 0..16_u8 {
+            for style in 0..32_u8 {
                 let mut sgr = vec!["0".to_owned()];
-                for (bit, code) in [(1, "1"), (2, "3"), (4, "4"), (8, "7")] {
+                for (bit, code) in [(1, "1"), (2, "3"), (4, "4"), (8, "7"), (16, "2")] {
                     if style & bit != 0 {
                         sgr.push(code.to_owned());
                     }
@@ -327,18 +327,74 @@ mod tests {
                     assert_eq!(cell.fgcolor(), foreground);
                     assert_eq!(cell.bgcolor(), vt100::Color::Rgb(rgb.0, rgb.1, rgb.2));
                     assert_eq!(
-                        [cell.bold(), cell.italic(), cell.underline(), cell.inverse()],
+                        [
+                            cell.bold(),
+                            cell.italic(),
+                            cell.underline(),
+                            cell.inverse(),
+                            cell.faint()
+                        ],
                         [
                             style & 1 != 0,
                             style & 2 != 0,
                             style & 4 != 0,
-                            style & 8 != 0
+                            style & 8 != 0,
+                            style & 16 != 0
                         ]
                     );
                 }
                 let mut plain = vt100::Parser::new(1, 1, 0);
                 plain.process(b"Z");
                 assert_eq!(parser.screen().cell(0, 2), plain.screen().cell(0, 0));
+            }
+        }
+    }
+    #[test]
+    fn faint_checkpoint_preserves_intensity_wide_geometry_and_cell_memory() {
+        // Both supported native targets retain the pre-faint Cell layout. This
+        // guards allocation size rather than changing a resource-policy limit.
+        assert_eq!(std::mem::size_of::<vt100::Cell>(), 32);
+        let mut parser = vt100::Parser::new(4, 20, 20);
+        parser.process(b"\x1b[1;2mA\x1b[22mB");
+        assert!(parser.screen().cell(0, 0).unwrap().faint());
+        assert!(parser.screen().cell(0, 0).unwrap().bold());
+        assert!(!parser.screen().cell(0, 1).unwrap().faint());
+        assert!(!parser.screen().cell(0, 1).unwrap().bold());
+        parser.process("\x1b[2m界\x1b[22mplain".as_bytes());
+        assert!(parser.screen().cell(0, 2).unwrap().is_wide());
+        assert!(parser.screen().cell(0, 2).unwrap().faint());
+        assert!(parser.screen().cell(0, 3).unwrap().is_wide_continuation());
+        let seed = parser.basic_checkpoint().unwrap();
+        let mut restored = vt100::Parser::new(4, 20, 20);
+        restored.process(&seed.restore_bytes);
+        for row in 0..4 {
+            for col in 0..20 {
+                assert_eq!(
+                    parser.screen().cell(row, col),
+                    restored.screen().cell(row, col)
+                );
+            }
+        }
+        // All sixteen intensity transitions exercise SGR22's shared reset.
+        for old in 0..4 {
+            for new in 0..4 {
+                let sgr = |value| {
+                    format!(
+                        "\x1b[0{}{}mX",
+                        if value & 1 != 0 { ";1" } else { "" },
+                        if value & 2 != 0 { ";2" } else { "" }
+                    )
+                };
+                let mut reference = vt100::Parser::new(1, 2, 0);
+                reference.process(sgr(old).as_bytes());
+                let previous = reference.screen().clone();
+                reference.process(b"\x1b[H");
+                reference.process(sgr(new).as_bytes());
+                let diff = reference.screen().contents_diff(&previous);
+                let mut target = vt100::Parser::new(1, 2, 0);
+                target.process(sgr(old).as_bytes());
+                target.process(&diff);
+                assert_eq!(reference.screen().cell(0, 0), target.screen().cell(0, 0));
             }
         }
     }

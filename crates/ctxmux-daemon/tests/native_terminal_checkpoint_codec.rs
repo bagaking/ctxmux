@@ -423,20 +423,31 @@ fn retained_history_preserves_default_cells_styles_spaces_and_long_graphemes() {
 #[test]
 fn write_nonempty_public_xterm_inputs_for_independent_target_proof() {
     let cases = [
-        ("normal history",4,20,b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix".to_vec(), b"\r\nseven".to_vec()),
-        ("alternate sgr and real exit",4,20,b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2004h\x1b[32mALT\x1b[3;5H".to_vec(), b"Z\x1b[?1049l\x1b[?1003l\x1b[?1006lQ".to_vec()),
+        ("normal history",4,20,b"\x1b[1;2mone\r\ntwo\r\nthree\x1b[22m\r\nfour\r\n\x1b[2mfive\r\nsix".to_vec(), b"\x1b[22m\r\nseven".to_vec()),
+        ("alternate sgr and real exit",4,20,b"\x1b[2mone\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2004h\x1b[1;2;32mALT\x1b[3;5H".to_vec(), b"\x1b[22mZ\x1b[?1049l\x1b[?1003l\x1b[?1006lQ".to_vec()),
         ("CUP only no manufactured history",4,20,b"\x1b[Hlive\x1b[K".repeat(100), b"\x1b[2;1Hnext".to_vec()),
         ("normal wrapped history pending wrap",3,6,b"abcdefghijklmnopqrstuvwx".to_vec(), b"Y".to_vec()),
         ("origin scroll margins",6,12,b"top\x1b[6;1Hbottom\x1b[2;5r\x1b[?6h\x1b[3;2H\x1b[31mM".to_vec(), b"\r\nA\r\nB\r\nC".to_vec()),
         ("blank and wide wrapped history",3,6,"first\r\n\r\nabc中xabcdefQ".as_bytes().to_vec(), b"R".to_vec()),
         ("normal origin pending wrap through alternate",6,8,b"one\r\n\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\x1b[2;5r\x1b[?6h\x1b[3;1H\x1b[31mabcdefgh\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[32mALT".to_vec(), b"\x1b[?1049lQ".to_vec()),
     ];
+    let intensity_transitions: Vec<_> = (0..4).flat_map(|old| (0..4).map(move |new| {
+        let text = |value| format!("\x1b[0{}{}mX", if value & 1 != 0 { ";1" } else { "" }, if value & 2 != 0 { ";2" } else { "" });
+        let prefix = text(old).into_bytes();
+        let next = format!("\x1b[H{}", text(new)).into_bytes();
+        let mut source = Parser::new(1, 2, 0);
+        source.process(&prefix);
+        let previous = source.screen().clone();
+        source.process(&next);
+        serde_json::json!({"old":old,"new":new,"prefix":prefix,"next":next,"diff":source.screen().contents_diff(&previous)})
+    })).collect();
+    assert_eq!(intensity_transitions.len(), 16);
     let fixtures: Vec<_> = cases.into_iter().map(|(name,rows,cols,prefix,tail)| {
         let mut source = Parser::new(rows,cols,100);
         source.process(&prefix);
         let seed = source.basic_checkpoint().expect("complete fixture prefix");
         assert!(!seed.restore_bytes.is_empty());
-        serde_json::json!({"name":name,"rows":rows,"cols":cols,"prefix":prefix,"tail":tail,"seed":seed.restore_bytes})
+        serde_json::json!({"name":name,"rows":rows,"cols":cols,"prefix":prefix,"tail":tail,"seed":seed.restore_bytes,"intensityTransitions":intensity_transitions})
     }).collect();
     assert_eq!(fixtures.len(), 7);
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.tmp/basic-codec");

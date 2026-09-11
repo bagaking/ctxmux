@@ -19,27 +19,77 @@ impl Default for Color {
     }
 }
 
-const TEXT_MODE_BOLD: u8 = 0b0000_0001;
-const TEXT_MODE_ITALIC: u8 = 0b0000_0010;
-const TEXT_MODE_UNDERLINE: u8 = 0b0000_0100;
-const TEXT_MODE_INVERSE: u8 = 0b0000_1000;
+const TEXT_MODE_BOLD: u16 = 0b0000_0001;
+const TEXT_MODE_ITALIC: u16 = 0b0000_0010;
+const TEXT_MODE_UNDERLINE: u16 = 0b0000_0100;
+const TEXT_MODE_INVERSE: u16 = 0b0000_1000;
 
-// Four independent style bits leave two bits for each color's three semantic
-// variants (default, indexed, RGB). RGB payloads remain three full bytes each.
-// Together this is seven bytes, avoiding enum padding in every retained cell.
-const FOREGROUND_KIND_SHIFT: u8 = 4;
-const BACKGROUND_KIND_SHIFT: u8 = 6;
-const COLOR_KIND_MASK: u8 = 0b11;
+// Five independent styles and two color tags fit in nine bits. The two wide
+// cell flags share the unused high bits: Attrs plus cell metadata still occupies
+// eight bytes, preserving the original Cell allocation without losing RGB bits.
+const TEXT_MODE_FAINT: u16 = 1 << 4;
+const FOREGROUND_KIND_SHIFT: u16 = 5;
+const BACKGROUND_KIND_SHIFT: u16 = 7;
+const COLOR_KIND_MASK: u16 = 0b11;
+const STYLE_COLOR_MASK: u16 = (1 << 9) - 1;
+const CELL_WIDE: u16 = 1 << 9;
+const CELL_CONTINUATION: u16 = 1 << 10;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, Eq, Debug)]
 pub struct Attrs {
     foreground: [u8; 3],
     background: [u8; 3],
-    mode: u8,
+    mode: u16,
+}
+
+// Cell geometry is deliberately not a text attribute. Diff/erase callers compare
+// logical attributes, while Cell equality separately compares the geometry bits.
+impl PartialEq for Attrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.foreground == other.foreground
+            && self.background == other.background
+            && self.mode & STYLE_COLOR_MASK == other.mode & STYLE_COLOR_MASK
+    }
 }
 
 impl Attrs {
-    fn decode_color(payload: [u8; 3], kind: u8) -> Color {
+    pub(crate) fn cell_flags(&self) -> u16 {
+        self.mode & (CELL_WIDE | CELL_CONTINUATION)
+    }
+    pub(crate) fn clear_cell_flags(&mut self) {
+        self.mode &= STYLE_COLOR_MASK;
+    }
+    pub(crate) fn is_wide(&self) -> bool {
+        self.mode & CELL_WIDE != 0
+    }
+    pub(crate) fn is_wide_continuation(&self) -> bool {
+        self.mode & CELL_CONTINUATION != 0
+    }
+    pub(crate) fn set_wide(&mut self, wide: bool) {
+        if wide {
+            self.mode |= CELL_WIDE;
+        } else {
+            self.mode &= !CELL_WIDE;
+        }
+    }
+    pub(crate) fn set_wide_continuation(&mut self, wide: bool) {
+        if wide {
+            self.mode |= CELL_CONTINUATION;
+        } else {
+            self.mode &= !CELL_CONTINUATION;
+        }
+    }
+    pub fn faint(&self) -> bool {
+        self.mode & TEXT_MODE_FAINT != 0
+    }
+    pub fn set_faint(&mut self, faint: bool) {
+        if faint {
+            self.mode |= TEXT_MODE_FAINT;
+        } else {
+            self.mode &= !TEXT_MODE_FAINT;
+        }
+    }
+    fn decode_color(payload: [u8; 3], kind: u16) -> Color {
         match kind {
             0 => Color::Default,
             1 => Color::Idx(payload[0]),
@@ -48,7 +98,7 @@ impl Attrs {
         }
     }
 
-    fn encode_color(color: Color) -> ([u8; 3], u8) {
+    fn encode_color(color: Color) -> ([u8; 3], u16) {
         match color {
             Color::Default => ([0; 3], 0),
             Color::Idx(index) => ([index, 0, 0], 1),
@@ -150,11 +200,18 @@ impl Attrs {
         } else {
             attrs.bgcolor(self.bgcolor())
         };
-        let attrs = if self.bold() == other.bold() {
-            attrs
+        let reset_intensity = (!self.bold() && other.bold()) || (!self.faint() && other.faint());
+        let mut attrs = if reset_intensity {
+            attrs.bold(self.bold()).faint(self.faint())
         } else {
-            attrs.bold(self.bold())
+            attrs
         };
+        if !reset_intensity && self.bold() != other.bold() {
+            attrs = attrs.bold(self.bold());
+        }
+        if !reset_intensity && self.faint() != other.faint() {
+            attrs = attrs.faint(self.faint());
+        }
         let attrs = if self.italic() == other.italic() {
             attrs
         } else {

@@ -1071,6 +1071,11 @@ optional temporary policy, writes the prefix through its completion callback,
 restores its original history policy, resizes to the actual source geometry,
 then writes the final suffix. Only then may it consume original live bytes and
 ordered resize fences. Synthetic bytes never advance raw byte cursors.
+Basic VT checkpoints preserve independent bold and faint (SGR 1 and 2)
+intensity in cells, retained history, saved screens and the current drawing pen.
+SGR 22 resets both intensities. Attribute diffs restore either surviving
+intensity after a shared reset; wide-cell geometry remains separate from text
+attribute equality. This does not increase the per-cell allocation size.
 Checkpoint frames must fit the actual JSON envelope, largest legal offset and
 padded base64 string: each complete group of three payload bytes needs four
 encoded bytes. The largest whole padded group that fits the remaining envelope

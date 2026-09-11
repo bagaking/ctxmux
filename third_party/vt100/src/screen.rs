@@ -722,6 +722,12 @@ impl Screen {
         self.attrs.bgcolor()
     }
 
+    /// Returns whether newly drawn text uses faint (SGR2) intensity.
+    #[must_use]
+    pub fn faint(&self) -> bool {
+        self.attrs.faint()
+    }
+
     /// Returns whether newly drawn text should be rendered with the bold text
     /// attribute.
     #[must_use]
@@ -1409,10 +1415,14 @@ impl Screen {
             match next_param!() {
                 &[0] => self.attrs = crate::attrs::Attrs::default(),
                 &[1] => self.attrs.set_bold(true),
+                &[2] => self.attrs.set_faint(true),
                 &[3] => self.attrs.set_italic(true),
                 &[4] => self.attrs.set_underline(true),
                 &[7] => self.attrs.set_inverse(true),
-                &[22] => self.attrs.set_bold(false),
+                &[22] => {
+                    self.attrs.set_bold(false);
+                    self.attrs.set_faint(false);
+                }
                 &[23] => self.attrs.set_italic(false),
                 &[24] => self.attrs.set_underline(false),
                 &[27] => self.attrs.set_inverse(false),

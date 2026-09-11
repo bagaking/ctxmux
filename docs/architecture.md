@@ -469,8 +469,12 @@ storage. Untouched exact default cells are implicit; normal history releases
 only an exact default suffix. Styled blanks, explicit spaces, Unicode payloads,
 wide partners, wrap relations and retained alternate physical cells remain
 explicit where required. Returning history to a live viewport, drawing, editing
-and reflow preserve the same cell meaning. This saves representation cost
-without reducing retention policy or original-byte fidelity. It does not fund
+and reflow preserve the same cell meaning, including independent bold/faint
+intensity. Packed rendition and wide
+metadata keep the existing Cell size; attribute equality and serialization
+compare text rendition separately from wide-cell geometry.
+This saves representation cost without reducing retention policy or
+original-byte fidelity. It does not fund
 aggregate terminal allocations or remove the daemon's remaining export and
 recovery policy limits; those resource boundaries still require qualification.
 

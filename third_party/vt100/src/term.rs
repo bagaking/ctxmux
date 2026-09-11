@@ -110,6 +110,7 @@ pub struct Attrs {
     fgcolor: Option<crate::attrs::Color>,
     bgcolor: Option<crate::attrs::Color>,
     bold: Option<bool>,
+    faint: Option<bool>,
     italic: Option<bool>,
     underline: Option<bool>,
     inverse: Option<bool>,
@@ -128,6 +129,11 @@ impl Attrs {
 
     pub fn bold(mut self, bold: bool) -> Self {
         self.bold = Some(bold);
+        self
+    }
+
+    pub fn faint(mut self, faint: bool) -> Self {
+        self.faint = Some(faint);
         self
     }
 
@@ -154,6 +160,7 @@ impl BufWrite for Attrs {
         if self.fgcolor.is_none()
             && self.bgcolor.is_none()
             && self.bold.is_none()
+            && self.faint.is_none()
             && self.italic.is_none()
             && self.underline.is_none()
             && self.inverse.is_none()
@@ -227,12 +234,16 @@ impl BufWrite for Attrs {
             }
         }
 
-        if let Some(bold) = self.bold {
-            if bold {
-                write_param!(1);
-            } else {
-                write_param!(22);
-            }
+        // SGR22 resets both intensity flags. Restore either retained flag after
+        // that shared reset instead of accidentally clearing it in an attr diff.
+        if self.bold == Some(false) || self.faint == Some(false) {
+            write_param!(22);
+        }
+        if self.bold == Some(true) {
+            write_param!(1);
+        }
+        if self.faint == Some(true) {
+            write_param!(2);
         }
 
         if let Some(italic) = self.italic {

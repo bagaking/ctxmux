@@ -36,6 +36,7 @@ function bufferSnapshot(buffer, cols) {
             fgMode: c.getFgColorMode(),
             bgMode: c.getBgColorMode(),
             bold: c.isBold(),
+            faint: c.isDim(),
             italic: c.isItalic(),
             underline: c.isUnderline(),
             inverse: c.isInverse(),
@@ -87,6 +88,19 @@ async function inputModes(t) {
 (async () => {
   const cases = JSON.parse(fs.readFileSync(inputPath, "utf8"));
   assert.equal(cases.length, 7, "exact nonempty native fixtures");
+  const intensityTransitions = cases[0].intensityTransitions;
+  assert.equal(intensityTransitions.length, 16, "all independent native intensity diffs");
+  for (const transition of intensityTransitions) {
+    const reference = new Terminal({rows: 1, cols: 2, allowProposedApi: true});
+    const target = new Terminal({rows: 1, cols: 2, allowProposedApi: true});
+    try {
+      await write(reference, transition.prefix);
+      await write(target, transition.prefix);
+      await write(reference, transition.next);
+      await write(target, transition.diff);
+      assert.deepEqual(snapshot(target), snapshot(reference), `native intensity diff ${transition.old} -> ${transition.new}`);
+    } finally { reference.dispose(); target.dispose(); }
+  }
   const results = [];
   for (const c of cases) {
     const options = {

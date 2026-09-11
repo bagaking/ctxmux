@@ -10,13 +10,14 @@ const INLINE_CODEPOINTS: usize =
 #[derive(Clone, Debug, Default, Eq)]
 pub struct Cell {
     contents: smallvec::SmallVec<[char; INLINE_CODEPOINTS]>,
-    flags: u8,
     attrs: crate::attrs::Attrs,
 }
 
 impl PartialEq<Self> for Cell {
     fn eq(&self, other: &Self) -> bool {
-        self.flags == other.flags && self.attrs == other.attrs && self.contents == other.contents
+        self.attrs.cell_flags() == other.attrs.cell_flags()
+            && self.attrs == other.attrs
+            && self.contents == other.contents
     }
 }
 
@@ -31,12 +32,12 @@ impl Cell {
         }
     }
 
-    pub(crate) fn set(&mut self, c: char, a: crate::attrs::Attrs) {
+    pub(crate) fn set(&mut self, c: char, mut a: crate::attrs::Attrs) {
         self.reset_contents();
         self.contents.push(c);
-        self.flags = 0;
-        self.set_wide(c.width().unwrap_or(1) > 1);
+        a.clear_cell_flags();
         self.attrs = a;
+        self.set_wide(c.width().unwrap_or(1) > 1);
     }
 
     pub(crate) fn append(&mut self, c: char) {
@@ -46,9 +47,9 @@ impl Cell {
         self.contents.push(c);
     }
 
-    pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
+    pub(crate) fn clear(&mut self, mut attrs: crate::attrs::Attrs) {
         self.reset_contents();
-        self.flags = 0;
+        attrs.clear_cell_flags();
         self.attrs = attrs;
     }
 
@@ -81,7 +82,7 @@ impl Cell {
     /// Returns whether the text data in the cell represents a wide character.
     #[must_use]
     pub fn is_wide(&self) -> bool {
-        self.flags & 0x80 == 0x80
+        self.attrs.is_wide()
     }
 
     /// Returns whether the cell contains the second half of a wide character
@@ -89,23 +90,15 @@ impl Cell {
     /// character)
     #[must_use]
     pub fn is_wide_continuation(&self) -> bool {
-        self.flags & 0x40 == 0x40
+        self.attrs.is_wide_continuation()
     }
 
     fn set_wide(&mut self, wide: bool) {
-        if wide {
-            self.flags |= 0x80;
-        } else {
-            self.flags &= 0x7f;
-        }
+        self.attrs.set_wide(wide);
     }
 
     pub(crate) fn set_wide_continuation(&mut self, wide: bool) {
-        if wide {
-            self.flags |= 0x40;
-        } else {
-            self.flags &= 0xbf;
-        }
+        self.attrs.set_wide_continuation(wide);
     }
 
     pub(crate) fn attrs(&self) -> &crate::attrs::Attrs {
@@ -122,6 +115,12 @@ impl Cell {
     #[must_use]
     pub fn bgcolor(&self) -> crate::attrs::Color {
         self.attrs.bgcolor()
+    }
+
+    /// Returns whether this cell uses faint (SGR2) intensity.
+    #[must_use]
+    pub fn faint(&self) -> bool {
+        self.attrs.faint()
     }
 
     /// Returns whether the cell should be rendered with the bold text
