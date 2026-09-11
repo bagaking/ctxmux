@@ -112,15 +112,19 @@ impl Row {
         // continuation. Public xterm retains that relationship after ECH.
     }
 
-    pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
-        self.materialize();
+    pub fn resize(&mut self, len: u16) {
         self.cols = len;
         self.retained = None;
-        self.cells.resize(usize::from(len), cell);
+        // Default growth changes semantic width, not stored content. Resizing
+        // a viewport must not expand every sparse normal-history row.
+        self.cells.truncate(usize::from(len));
         self.wrapped = false;
         // A clipped wide pair cannot leave a leading half at the right edge:
         // every drawing/erase/formatter consumer relies on its next cell.
-        if let Some(last_cell) = self.cells.last_mut() {
+        if let Some(last_cell) = len
+            .checked_sub(1)
+            .and_then(|last| self.cells.get_mut(usize::from(last)))
+        {
             if last_cell.is_wide() {
                 last_cell.clear(*last_cell.attrs());
             }

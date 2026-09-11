@@ -159,7 +159,7 @@ impl Grid {
         for row in self.scrollback.iter_mut().chain(self.rows.iter_mut()) {
             let wrapped = row.wrapped();
             if self.normal {
-                row.resize(size.cols, crate::cell::Cell::default());
+                row.resize(size.cols);
             } else {
                 row.resize_retaining(size.cols);
             }

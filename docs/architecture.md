@@ -470,7 +470,10 @@ only an exact default suffix. Styled blanks, explicit spaces, Unicode payloads,
 wide partners, wrap relations and retained alternate physical cells remain
 explicit where required. Returning history to a live viewport, drawing, editing
 and reflow preserve the same cell meaning. This saves representation cost
-without reducing retention policy or original-byte fidelity. It does not fund
+without reducing retention policy or original-byte fidelity. Normal default-fill
+resize keeps untouched cells implicit, including when a height change visits
+historical rows; wide-pair clipping still follows the real semantic right edge.
+It does not fund
 aggregate terminal allocations or remove the daemon's remaining export and
 recovery policy limits; those resource boundaries still require qualification.
 
