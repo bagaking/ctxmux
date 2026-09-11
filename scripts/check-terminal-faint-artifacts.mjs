@@ -14,7 +14,7 @@ assert.ok(artifactPaths.every(Boolean), 'provide both native artifact directorie
 const manifests = artifactPaths.map((directory, index) => {
   const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'manifest.json')));
   assert.equal(manifest.schema, 'ctxmux.local-artifacts.v1');
-  assert.deepEqual(manifest.source, source, 'artifacts must bind this exact committed clean source');
+  assert.deepEqual(manifest.source, { ...source, worktree_clean: true }, 'artifacts must bind this exact committed clean source');
   assert.equal(manifest.support.platform, index === 0 ? 'darwin' : 'linux');
   assert.equal(manifest.support.architecture, index === 0 ? 'arm64' : 'x64');
   assert.equal(manifest.build.profile, 'release');
