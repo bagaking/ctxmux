@@ -87,7 +87,9 @@ impl TestDaemon {
     ) -> Self {
         let socket = directory.path().join("ctxmux.sock");
         let _permit = daemon_spawn_permit().await;
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"));
+        let executable = std::env::var_os("CTXMUX_TEST_HISTORY_GAP_DAEMON")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_ctxmuxd").into());
+        let mut command = Command::new(executable);
         command.arg("--socket").arg(&socket);
         if let Some(state_dir) = state_dir {
             command.arg("--state-dir").arg(state_dir);
@@ -2232,6 +2234,22 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
     let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
     let client = daemon.client();
     let run = import_fake_pane(&client, &fake).await;
+    let (_, panes) = client.discover_tmux(fake.socket_string()).await.unwrap();
+    let source_size = panes[0].size;
+    let healthy = client
+        .start(RunSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                "stty raw -echo; printf SECOND_READY; exec /bin/cat".to_owned(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            initial_size: source_size,
+            declared_inputs: Vec::new(),
+        })
+        .await
+        .unwrap();
     let (mut attachment, snapshot) = attach_with_timeout(&client, run.id, 0).await;
     assert!(snapshot.replay.truncated);
     assert_eq!(snapshot.replay.latest_output_bytes, 0);
@@ -2311,6 +2329,58 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
         b"AFTER-CONTINUE\r\n"
     );
     detach_with_timeout(late).await;
+
+    let (terminal, snapshot) = client.attach_terminal(run.id, caller_cursor).await.unwrap();
+    assert_eq!(
+        snapshot.terminal,
+        ctxmux_protocol::TerminalContinuation::Unknown {
+            reason: ctxmux_protocol::TerminalCheckpointUnavailableReason::SourceGap,
+        }
+    );
+    assert!(snapshot.terminal_restore.is_empty());
+    assert!(snapshot.replay.truncated);
+    assert_eq!(snapshot.run.id, run.id);
+    assert_eq!(snapshot.run.current_size, run.current_size);
+    assert_eq!(
+        client.discover_tmux(fake.socket_string()).await.unwrap().1[0].size,
+        source_size
+    );
+    detach_with_timeout(terminal).await;
+    let receipt = client
+        .input(healthy.id, b"SECOND_AFTER_GAP".to_vec())
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt.receipt.written_bytes,
+        b"SECOND_AFTER_GAP".len() as u32
+    );
+    timeout(scaled(Duration::from_secs(5)), async {
+        loop {
+            let (view, snapshot) = client.attach(healthy.id, 0).await.unwrap();
+            let bytes = replay_bytes(&snapshot.replay.chunks);
+            detach_with_timeout(view).await;
+            if bytes == b"SECOND_READYSECOND_AFTER_GAP" {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second original Native Run serves exact bytes after backend source loss");
+    let (view, snapshot) = client.attach_terminal(healthy.id, 0).await.unwrap();
+    assert!(matches!(
+        snapshot.terminal,
+        ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+    ));
+    assert_eq!(snapshot.run.pid, healthy.pid);
+    view.resize(TerminalSize { rows: 5, cols: 30 })
+        .await
+        .unwrap();
+    detach_with_timeout(view).await;
+    client
+        .stop(fresh_stop(&client, healthy.id).await)
+        .await
+        .unwrap();
 
     assert!(client.status(run.id).await.unwrap().state.is_running());
     assert!(process_exists(control_pid));
