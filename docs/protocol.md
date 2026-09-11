@@ -670,12 +670,24 @@ Hello fence; omitted causes are invalid rather than silently defaulted.
 
 The shared live owner records event-funding and source-discontinuity causes.
 Private per-cause revisions preserve those facts even when the marker itself
-is overwritten in the ring. A lagging connection adds `subscriber_lag`; a
+is retired from live delivery. A lagging connection adds `subscriber_lag`; a
 terminal snapshot catch-up adds `terminal_catchup`. Missed confirmed geometry
 adds `geometry_lag`, including when the byte head has not advanced. The Rust
 and TypeScript inboxes add `client_view_pressure` only when their own view
 cannot retain output, and union causes when merging markers. A marker does not
 prove a permanently missing byte count or the child/PTY service state.
+
+The daemon funds each observed Run's live delivery state and actual backlog
+from the configured `live_event_bytes` allowance. It does not reserve a fixed
+256-slot ring per Run or impose an event-count capacity. Container growth,
+replacement overlap, actual slot capacity and shared payloads stay charged;
+consumed backing is released, while payloads held by receivers remain funded.
+Allocation pressure retires only that Run's live delivery envelopes and remains
+separate from original output retention. An unfunded output becomes an exact
+Gap; missed non-output facts use the existing authoritative snapshot and
+discontinuity semantics. No new durable journal, public event sequence or
+silent retry is introduced. Legitimate allowance changes are operating policy,
+and the historical 256-event backlog is a regression example, not capacity.
 
 `latest_output_bytes` is a reported head, not a received/delivered byte receipt
 or a recovery cursor. The caller must reattach using its own last successfully
