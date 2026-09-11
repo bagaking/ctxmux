@@ -122,6 +122,18 @@ slice needs them.
     service availability, and exact applied/unknown input separately from
     child lifecycle and static capabilities. Do not rely on stderr remaining
     open, cached Running, silent retries, or replacing the Run to hide failure.
+14. During the reliability and performance effort, deliver coherent, validated
+    changes in small commits through `git-commit-nt`; do not call `git commit`
+    directly or push without authorization. Before each commit, inspect the
+    complete staged blobs for private machine paths, personal identifiers,
+    wall-clock timestamps and secrets. Stage only exact owned files and keep
+    the selected source and its executed validation evidence identifiable.
+15. Keep cleanup incremental and evidence-based. Remove a worktree or branch
+    only after proving its work is preserved in main, its current changes are
+    preserved, and no active owner needs it. Remove only identified, unused,
+    rebuildable caches. Preserve failed runs, recovery evidence and user
+    Runtime state; leave other owners' edits visible and untouched. Never hide
+    files or delete evidence merely to make repository status look clean.
 
 ## Required Validation
 
