@@ -751,6 +751,41 @@ impl EventInbox {
         true
     }
 
+    fn replace_input_progress(state: &mut EventInboxState, event: &RunEvent) -> bool {
+        if state.pending_gap.is_some() {
+            return false;
+        }
+        let RunEvent::ServiceChanged { service: next } = event else {
+            return false;
+        };
+        let Some(RunEvent::ServiceChanged { service: previous }) = state.queue.back_mut() else {
+            return false;
+        };
+        // These are current-state snapshots, not a log of each write quantum.
+        // Replace only an unconsumed confirmed-prefix advance for the same
+        // pending command. Keep every availability, blocking, geometry, fault,
+        // settlement and intervening event boundary in its original order.
+        if next.revision <= previous.revision
+            || next.owner != previous.owner
+            || next.output != previous.output
+            || next.terminal_fault != previous.terminal_fault
+            || next.input.phase != previous.input.phase
+            || next.input.unsettled_commands == 0
+            || next.input.unsettled_commands != previous.input.unsettled_commands
+            || next.input.unsettled_request_bytes != previous.input.unsettled_request_bytes
+            || next.input.write_blocked != previous.input.write_blocked
+            || next.input.completed_input_bytes != previous.input.completed_input_bytes
+            || next.input.current_size != previous.input.current_size
+            || next.input.active_confirmed_bytes <= previous.input.active_confirmed_bytes
+        {
+            return false;
+        }
+        // NativeServiceSnapshot has no variable-size allocations; replacement
+        // uses the already funded slot and does not change either byte window.
+        *previous = next.clone();
+        true
+    }
+
     fn push(&self, event: RunEvent) -> Result<(), &'static str> {
         let mut state = lock(&self.state);
         if state.closed && state.local_observation == LocalObservationState::Available {
@@ -776,6 +811,12 @@ impl EventInbox {
                 RunEvent::ObservationDiscontinuity => state.saw_observation_discontinuity = true,
                 _ => {}
             }
+            return Ok(());
+        }
+
+        if Self::replace_input_progress(&mut state, &event) {
+            drop(state);
+            self.ready.notify_one();
             return Ok(());
         }
 
@@ -1247,6 +1288,135 @@ mod tests {
     }
 
     const HISTORICAL_EVENT_COUNT: usize = 256;
+
+    fn input_progress(prefix: usize) -> ctxmux_protocol::NativeServiceSnapshot {
+        use ctxmux_protocol::{
+            NativeInputPhase, NativeInputStatus, NativeOutputStatus, NativeOwnerStatus,
+        };
+        ctxmux_protocol::NativeServiceSnapshot {
+            revision: u64::try_from(prefix).unwrap() + 1,
+            owner: NativeOwnerStatus::Serving {},
+            output: NativeOutputStatus::Serving {},
+            input: NativeInputStatus {
+                phase: NativeInputPhase::Open {},
+                unsettled_commands: 1,
+                unsettled_request_bytes: MAX_PENDING_INPUT_BYTES,
+                write_blocked: false,
+                completed_input_bytes: Some(0),
+                current_size: Some(TerminalSize::default()),
+                active_confirmed_bytes: prefix,
+            },
+            terminal_fault: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_view_retains_latest_input_prefix_beyond_its_slot_window() {
+        let inbox = EventInbox::new();
+        // Qualification exceeds the actual default slot window; it is not a
+        // new production event count or a smaller accepted input workload.
+        let updates = AttachmentEventLimits::default().envelope_bytes
+            / std::mem::size_of::<RunEvent>()
+            + HISTORICAL_EVENT_COUNT;
+        for prefix in 0..=updates {
+            inbox
+                .push(RunEvent::ServiceChanged {
+                    service: input_progress(prefix),
+                })
+                .unwrap();
+        }
+        inbox.close(None);
+        assert_eq!(
+            inbox.next().await.unwrap(),
+            Some(RunEvent::ServiceChanged {
+                service: input_progress(updates)
+            })
+        );
+        assert_eq!(inbox.next().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn input_progress_keeps_intervening_output_gap_geometry_and_tmux_order() {
+        let barriers = [
+            RunEvent::Output {
+                chunk: OutputChunk {
+                    start_byte: 0,
+                    end_byte: 1,
+                    data: vec![42],
+                },
+            },
+            RunEvent::Gap {
+                latest_output_bytes: 1,
+                causes: OutputGapCauses::SOURCE_DISCONTINUITY,
+            },
+            RunEvent::Resized {
+                size: TerminalSize { cols: 81, rows: 25 },
+                through_byte: 0,
+                resize_revision: 1,
+            },
+            RunEvent::Tmux {
+                event: TmuxRunEvent::Paused,
+            },
+        ];
+        for barrier in barriers {
+            let inbox = EventInbox::new();
+            let first = RunEvent::ServiceChanged {
+                service: input_progress(1),
+            };
+            let next = RunEvent::ServiceChanged {
+                service: input_progress(2),
+            };
+            for event in [first.clone(), barrier.clone(), next.clone()] {
+                inbox.push(event).unwrap();
+            }
+            inbox.close(None);
+            for event in [first, barrier, next] {
+                assert_eq!(inbox.next().await.unwrap(), Some(event));
+            }
+            assert_eq!(inbox.next().await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn input_progress_never_erases_service_transitions_or_backward_facts() {
+        use ctxmux_protocol::{
+            NativeInputPhase, NativeOutputStatus, NativeOwnerStatus, NativeTerminalFault,
+            NativeTerminalFaultStage,
+        };
+        let changes: &[fn(&mut ctxmux_protocol::NativeServiceSnapshot)] = &[
+            |s| s.owner = NativeOwnerStatus::Draining {},
+            |s| s.output = NativeOutputStatus::Backpressured {},
+            |s| s.input.phase = NativeInputPhase::Closed {},
+            |s| s.input.write_blocked = true,
+            |s| s.input.unsettled_commands = 0,
+            |s| s.input.unsettled_request_bytes -= 1,
+            |s| s.input.completed_input_bytes = Some(1),
+            |s| s.input.current_size = Some(TerminalSize { cols: 81, rows: 25 }),
+            |s| {
+                s.terminal_fault = Some(NativeTerminalFault {
+                    stage: NativeTerminalFaultStage::Process,
+                    through_byte: 0,
+                });
+            },
+            |s| s.input.active_confirmed_bytes = 0,
+            |s| s.revision = 1,
+        ];
+        for change in changes {
+            let inbox = EventInbox::new();
+            let first = RunEvent::ServiceChanged {
+                service: input_progress(1),
+            };
+            let mut service = input_progress(2);
+            change(&mut service);
+            let next = RunEvent::ServiceChanged { service };
+            inbox.push(first.clone()).unwrap();
+            inbox.push(next.clone()).unwrap();
+            inbox.close(None);
+            assert_eq!(inbox.next().await.unwrap(), Some(first));
+            assert_eq!(inbox.next().await.unwrap(), Some(next));
+            assert_eq!(inbox.next().await.unwrap(), None);
+        }
+    }
 
     #[tokio::test]
     async fn gap_causes_merge_without_discarding_an_admissible_later_output() {

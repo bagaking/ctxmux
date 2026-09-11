@@ -767,6 +767,15 @@ explicit; no queue, payload, replay or population policy is enlarged to conceal
 pressure. Input receipts and child/Native-service facts remain independent of
 view loss. The protocol document owns the public cause and recovery semantics.
 
+The Rust client's existing event inbox can replace adjacent unconsumed service
+snapshots that differ only by the same pending input's increasing confirmed
+prefix. It reuses the funded slot without raising the payload or envelope
+budget. Availability, blocking, geometry, fault, settlement and intervening
+event boundaries remain ordered; receipts and raw byte replay are unchanged.
+This client-owned reduction does not suppress daemon service facts or introduce
+a write-quantum history guarantee. The protocol document specifies which
+snapshot revisions a consumer may observe.
+
 ## Planned one-shot native foreground observation
 
 One exact Run may be observed through `observeForeground({runId})` without input, resize, signal, Stop, reap or a new Run. The original NativeEntry/NativeSession and PTY control provide the root/SID/master scope; OS member reads remain outside the shared native turn. A result is `observed`, `unknown`, or `unsupported`. Only a complete revalidated group is observed. Process incarnation and exec generation are opaque strings, never PID/name/birth alone. The SDK carries RuntimeIdentity from the same connection. Provider or Agent identity remains above ctxmux.

@@ -1008,7 +1008,16 @@ real Native owner observations. Every `RunInfo` has required nullable
 report a revisioned owner/output/input/terminal-fault snapshot. `running` remains
 child lifecycle. It is not evidence that input, output or the derived view can
 serve an operation. Existing attachments receive `service_changed` with strictly
-increasing revisions beyond their initial snapshot.
+increasing revisions beyond their initial snapshot; revisions need not be
+contiguous. These events contain current-state snapshots, rather than a history
+of every PTY write quantum. The Rust client may replace an unconsumed adjacent
+snapshot when only the same pending input's confirmed prefix advances. Owner,
+output, input phase, blocking, geometry, fault and command-settlement changes
+remain ordered observations. Replacement never crosses output, Gap, geometry,
+Backend or lifecycle events, and does not alter a command receipt or replay
+cursor. This keeps a paused view from exhausting its envelope window on
+redundant input progress without increasing its budgets or hiding a service
+transition.
 
 The snapshot names starting/serving/draining/stopped ownership, pending/serving/
 backpressured/closed/unavailable output, and open/closed/unavailable input.

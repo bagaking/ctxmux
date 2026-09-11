@@ -1058,25 +1058,29 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     );
     assert_eq!(runtime.platform, std::env::consts::OS);
     assert_eq!(runtime.arch, std::env::consts::ARCH);
-    assert_eq!(
-        runtime.capabilities,
-        BTreeMap::from([
-            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
-            (
-                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
-                1,
-            ),
-            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
-            (RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1),
-            (
-                RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY.to_owned(),
-                1,
-            ),
-        ])
-    );
+    let mut expected_capabilities = BTreeMap::from([
+        (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+        (
+            RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+            1,
+        ),
+        (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+        (RUNTIME_CAPABILITY_PERSISTENT_STATE.to_owned(), 1),
+        (
+            RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY.to_owned(),
+            1,
+        ),
+    ]);
+    if cfg!(target_os = "macos") {
+        expected_capabilities.insert(
+            ctxmux_protocol::RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION.to_owned(),
+            1,
+        );
+    }
+    assert_eq!(runtime.capabilities, expected_capabilities);
 }
 
 fn assert_memory_only_runtime_identity(runtime: &RuntimeIdentity) {
@@ -1084,21 +1088,25 @@ fn assert_memory_only_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.runtime_id_persistence, RuntimeIdPersistence::Daemon);
     assert_eq!(runtime.platform, std::env::consts::OS);
     assert_eq!(runtime.arch, std::env::consts::ARCH);
-    assert_eq!(
-        runtime.capabilities,
-        BTreeMap::from([
-            (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
-            (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
-            (
-                RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
-                1,
-            ),
-            (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
-            (RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1),
-        ])
-    );
+    let mut expected_capabilities = BTreeMap::from([
+        (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
+        (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
+        (
+            RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B.to_owned(),
+            1,
+        ),
+        (RUNTIME_CAPABILITY_TMUX_DISCOVER.to_owned(), 1),
+        (RUNTIME_CAPABILITY_TMUX_IMPORT.to_owned(), 1),
+    ]);
+    if cfg!(target_os = "macos") {
+        expected_capabilities.insert(
+            ctxmux_protocol::RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION.to_owned(),
+            1,
+        );
+    }
+    assert_eq!(runtime.capabilities, expected_capabilities);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
