@@ -33,6 +33,7 @@ usage:
   ctxmux [--socket <path>] ping
   ctxmux [--socket <path>] runtime
   ctxmux [--socket <path>] diagnostics
+  ctxmux [--socket <path>] storage <run-id>
   ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux [--socket <path>] tmux-list <tmux-socket>
   ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
@@ -85,6 +86,7 @@ async fn run() -> Result<(), String> {
         "ping"
             | "runtime"
             | "diagnostics"
+            | "storage"
             | "start"
             | "tmux-list"
             | "tmux-import"
@@ -138,6 +140,22 @@ async fn dispatch_command(
                 "{}",
                 serde_json::to_string(&diagnostics)
                     .map_err(|error| format!("failed to encode diagnostics: {error}"))?
+            ))?;
+        }
+        "storage" => {
+            let id = take_run_id(&mut args)?;
+            ensure_empty(&args)?;
+            let (runtime, observation) = client
+                .observe_storage(id)
+                .await
+                .map_err(|error| error.to_string())?;
+            print_stdout(format_args!(
+                "{}",
+                serde_json::to_string(&serde_json::json!({
+                    "runtime": runtime,
+                    "observation": observation,
+                }))
+                .map_err(|error| format!("failed to encode storage observation: {error}"))?
             ))?;
         }
         "start" => start(client, args).await?,

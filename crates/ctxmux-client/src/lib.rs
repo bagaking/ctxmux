@@ -458,6 +458,39 @@ impl Client {
         }
     }
 
+    /// Observe bounded storage facts from the same dispatch connection's owner.
+    ///
+    /// # Errors
+    /// Returns an explicit unsupported-capability error before dispatch when
+    /// the Runtime lacks storage observations, or a transport/protocol error.
+    pub async fn observe_storage(
+        &self,
+        id: RunId,
+    ) -> Result<(RuntimeIdentity, ctxmux_protocol::RunStorageObservation), ClientError> {
+        let (mut wire, runtime) = self.connect_for_dispatch().await?;
+        let capability = ctxmux_protocol::RUNTIME_CAPABILITY_STORAGE_OBSERVATION;
+        validate_runtime_capability_requirements(
+            &runtime,
+            &BTreeMap::from([(capability.to_owned(), 1)]),
+        )?;
+        send(
+            &mut wire,
+            &ClientFrame::Request {
+                request: Request::ObserveStorage { id },
+            },
+        )
+        .await?;
+        match receive(&mut wire).await? {
+            ServerFrame::Response {
+                response: Response::StorageObservation { observation },
+            } if observation.run_id == id => Ok((runtime, observation)),
+            ServerFrame::Error { error } => Err(error.into()),
+            _ => Err(ClientError::UnexpectedFrame(
+                "expected exact Run storage observation",
+            )),
+        }
+    }
+
     /// Return the identity of the currently reachable daemon incarnation.
     ///
     /// # Errors

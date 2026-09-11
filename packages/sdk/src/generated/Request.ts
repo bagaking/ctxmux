@@ -37,6 +37,7 @@ export type Request =
       limit: number | null;
     }
   | { type: "status"; id: RunId }
+  | { type: "observe_storage"; id: RunId }
   | { type: "remove"; id: RunId }
   | { type: "input"; id: RunId; data: Array<number> }
   | { type: "recoverable_input"; operation: RecoverableInput }

@@ -6,6 +6,7 @@ import type { DiagnosticsSnapshot } from "./DiagnosticsSnapshot.js";
 import type { RunForegroundObservation } from "./RunForegroundObservation.js";
 import type { RunId } from "./RunId.js";
 import type { RunInfo } from "./RunInfo.js";
+import type { RunStorageObservation } from "./RunStorageObservation.js";
 import type { RunSummary } from "./RunSummary.js";
 import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
 
@@ -15,6 +16,7 @@ import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
 export type Response =
   | { type: "foreground_observation"; observation: RunForegroundObservation }
   | { type: "diagnostics"; diagnostics: DiagnosticsSnapshot }
+  | { type: "storage_observation"; observation: RunStorageObservation }
   | { type: "started"; run: RunInfo }
   | { type: "tmux_panes"; tmux_version: string; panes: Array<TmuxPaneInfo> }
   | { type: "imported"; run: RunInfo }

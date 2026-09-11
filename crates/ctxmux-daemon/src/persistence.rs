@@ -577,6 +577,56 @@ pub(crate) enum RemovalDisposition {
     Unknown(PersistenceError),
 }
 
+/// One indexed SQL effect of an atomic maintenance transaction. A witness is
+/// useful only when apply actually changes it: an unchanged row cannot prove
+/// that a COMMIT error rolled back unrelated effects.
+#[derive(Clone, Copy)]
+enum MaintenanceWitness {
+    Run(RunId),
+    ReplayChunk(i64),
+    ActiveReplay,
+    Unchanged,
+}
+
+impl MaintenanceWitness {
+    fn read(
+        self,
+        connection: &Connection,
+    ) -> Result<Option<Vec<rusqlite::types::Value>>, PersistenceError> {
+        use rusqlite::types::Value;
+        let (sql, key) = match self {
+            Self::Run(id) => (
+                "SELECT state_kind, state_json, pid, durable_first_available_byte,
+                 durable_output_bytes, replay_bytes, replay_truncated, metadata_bytes,
+                 updated_at_ms, terminal_at_ms FROM runs WHERE id = ?1",
+                Value::Text(id.to_string()),
+            ),
+            Self::ReplayChunk(ordinal) => (
+                "SELECT run_id, start_byte, end_byte, data_file, data_offset,
+                 data_bytes FROM replay_chunks WHERE ordinal = ?1",
+                Value::Integer(ordinal),
+            ),
+            Self::ActiveReplay => (
+                "SELECT replay_file FROM runtime_meta WHERE singleton = ?1",
+                Value::Integer(1),
+            ),
+            Self::Unchanged => return Ok(None),
+        };
+        connection
+            .prepare_cached(sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_row([key], |row| {
+                        (0..row.as_ref().column_count())
+                            .map(|column| row.get::<_, Value>(column))
+                            .collect()
+                    })
+                    .optional()
+            })
+            .map_err(PersistenceError::database)
+    }
+}
+
 /// Monotonic durable disposition of one staged Run start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartDisposition {
@@ -778,6 +828,21 @@ impl PersistentRun {
     pub(crate) fn is_failed(&self) -> bool {
         self.persistence.is_failed()
     }
+    /// Does not send actor work, read replay, or inspect the database. These are
+    /// independent observations, not a receipt that all accepted bytes are saved.
+    pub(crate) fn storage_observation(&self) -> ctxmux_protocol::RunPersistenceObservation {
+        let inner = &self.persistence.inner;
+        ctxmux_protocol::RunPersistenceObservation {
+            first_failure: mutex_lock(&inner.failure).clone(),
+            actor_stopped: mutex_lock(&inner.join)
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished),
+            queued_append_commands: inner.queue_depth.load(Ordering::Acquire) as u64,
+            offered_output_bytes: self.offered_head.load(Ordering::Acquire),
+            committed_output_bytes: self.durable_head.load(Ordering::Acquire),
+        }
+    }
+
     pub(crate) fn load_terminal_checkpoint(&self, id: RunId) -> Option<StoredCheckpoint> {
         self.persistence.load_terminal_checkpoint(id)
     }
@@ -1541,6 +1606,11 @@ impl Persistence {
     }
 
     #[cfg(test)]
+    pub(crate) fn inner_failure_for_test(&self) -> Arc<Mutex<Option<String>>> {
+        Arc::clone(&self.inner.failure)
+    }
+
+    #[cfg(test)]
     pub(crate) fn pause_next_finalize(&self) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
         let (reached_tx, reached_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
@@ -1608,6 +1678,21 @@ impl Persistence {
                 .fail_next_finalize_as_disk_full
                 .swap(true, Ordering::AcqRel),
             "only one finalize DiskFull fixture may be armed"
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_maintenance_commit_as_rolled_back_full(&self) {
+        self.inner
+            .test_hooks
+            .maintenance_error_committed
+            .store(false, Ordering::Release);
+        assert_eq!(
+            self.inner
+                .test_hooks
+                .maintenance_commits_before_error
+                .swap(1, Ordering::AcqRel),
+            0
         );
     }
 
@@ -4639,7 +4724,17 @@ impl StateStore {
         let path = replay_dir.join(&replay_file);
         let before = file_len(&path)?;
         let mut settlement = None;
-        let committed = self.commit_maintenance_batch(|transaction| {
+        let witness = batch.first().map_or_else(
+            || {
+                terminal
+                    .as_ref()
+                    .map_or(MaintenanceWitness::Unchanged, |value| {
+                        MaintenanceWitness::Run(value.0)
+                    })
+            },
+            |value| MaintenanceWitness::Run(value.0),
+        );
+        let committed = self.commit_maintenance_batch(witness, |transaction| {
             let mut cursor_updates = HashMap::new();
             for (id, replay, _) in coalesce_batch(batch) {
                 let _ = append_replay_external_with_limit(
@@ -4929,25 +5024,28 @@ impl StateStore {
             if candidates.is_empty() {
                 return Ok(false);
             }
-            if self.commit_maintenance_batch(|connection| {
-                for (ordinal, run_id, bytes, shed) in &candidates {
-                    if shed == bytes {
-                        connection
-                            .execute("DELETE FROM replay_chunks WHERE ordinal = ?1", [ordinal])
-                            .map_err(PersistenceError::database)?;
-                    } else {
-                        connection
-                            .execute(
-                                "UPDATE replay_chunks SET start_byte=start_byte+?2,
+            if self.commit_maintenance_batch(
+                MaintenanceWitness::ReplayChunk(candidates[0].0),
+                |connection| {
+                    for (ordinal, run_id, bytes, shed) in &candidates {
+                        if shed == bytes {
+                            connection
+                                .execute("DELETE FROM replay_chunks WHERE ordinal = ?1", [ordinal])
+                                .map_err(PersistenceError::database)?;
+                        } else {
+                            connection
+                                .execute(
+                                    "UPDATE replay_chunks SET start_byte=start_byte+?2,
                             data_offset=data_offset+?2, data_bytes=data_bytes-?2 WHERE ordinal=?1",
-                                params![ordinal, shed],
-                            )
-                            .map_err(PersistenceError::database)?;
+                                    params![ordinal, shed],
+                                )
+                                .map_err(PersistenceError::database)?;
+                        }
+                        shed_run_bytes(connection, run_id, *shed)?;
                     }
-                    shed_run_bytes(connection, run_id, *shed)?;
-                }
-                Ok(())
-            })? {
+                    Ok(())
+                },
+            )? {
                 return Ok(true);
             }
             if rows == 1 {
@@ -5038,9 +5136,11 @@ impl StateStore {
     /// Apply a maintenance transaction using the same measured, spill-disabled
     /// page proof as Start and Remove. `false` means a proven rollback exceeded
     /// the transaction budget; the caller can shrink its work unit. An unknown
-    /// COMMIT is always non-retryable, even when `SQLite` reports storage pressure.
+    /// A storage-pressure COMMIT error is retryable only after an exact Old
+    /// disposition. A committed or uncertain outcome remains non-retryable.
     fn commit_maintenance_batch(
         &mut self,
+        witness: MaintenanceWitness,
         apply: impl FnOnce(&Connection) -> Result<(), PersistenceError>,
     ) -> Result<bool, PersistenceError> {
         let baseline = self.fold_wal_below_ceiling(None)?;
@@ -5050,7 +5150,7 @@ impl StateStore {
         let previous = self
             .disable_cache_spill()
             .map_err(|failure| failure.error)?;
-        let result = self.commit_maintenance_batch_without_spill(baseline, apply);
+        let result = self.commit_maintenance_batch_without_spill(baseline, witness, apply);
         match self.restore_cache_spill(previous) {
             Ok(()) => result,
             Err(error) => Err(PersistenceError::Mutation(format!(
@@ -5062,6 +5162,7 @@ impl StateStore {
     fn commit_maintenance_batch_without_spill(
         &self,
         baseline: u64,
+        witness: MaintenanceWitness,
         apply: impl FnOnce(&Connection) -> Result<(), PersistenceError>,
     ) -> Result<bool, PersistenceError> {
         ctxmux_sqlite_status::reset_cache_io(&self.connection)
@@ -5070,7 +5171,9 @@ impl StateStore {
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(PersistenceError::database)?;
         let proof = (|| {
+            let old = witness.read(&self.connection)?;
             apply(&self.connection)?;
+            let new = witness.read(&self.connection)?;
             let snapshot = ctxmux_sqlite_status::cache_admission_snapshot(&self.connection)
                 .map_err(PersistenceError::database)?;
             if snapshot.writes != 0 || snapshot.spills != 0 || file_len(&self.wal_path)? != baseline
@@ -5079,9 +5182,9 @@ impl StateStore {
                     "maintenance changed the WAL before admission".to_owned(),
                 ));
             }
-            Ok(wal_charge_for_cache(snapshot.used_bytes))
+            Ok((wal_charge_for_cache(snapshot.used_bytes), old, new))
         })();
-        let charge = match proof {
+        let (charge, old, new) = match proof {
             Ok(charge) => charge,
             Err(error) => return self.rollback_maintenance_error(error),
         };
@@ -5123,14 +5226,12 @@ impl StateStore {
             .execute_batch("COMMIT")
             .map_err(PersistenceError::database);
         if let Err(error) = committed {
-            // No later write may guess whether the rows moved. All possibly
-            // referenced payloads survive so startup can read SQLite's truth.
-            if !self.connection.is_autocommit() {
-                let _ = self.connection.execute_batch("ROLLBACK");
-            }
-            return Err(PersistenceError::Mutation(format!(
-                "maintenance COMMIT outcome requires recovery: {error}"
-            )));
+            return Err(self.classify_maintenance_commit_error(
+                error,
+                witness,
+                old.as_deref(),
+                new.as_deref(),
+            ));
         }
         let actual = self.committed_maintenance_wal_len().map_err(|error| {
             PersistenceError::Mutation(format!(
@@ -5143,6 +5244,40 @@ impl StateStore {
             )));
         }
         Ok(true)
+    }
+
+    fn classify_maintenance_commit_error(
+        &self,
+        error: PersistenceError,
+        witness: MaintenanceWitness,
+        old: Option<&[rusqlite::types::Value]>,
+        new: Option<&[rusqlite::types::Value]>,
+    ) -> PersistenceError {
+        if !self.connection.is_autocommit() {
+            // An active transaction has not committed. A successful explicit
+            // rollback proves Old even if the selected effect was unchanged.
+            let rolled_back = self.connection.execute_batch("ROLLBACK").is_ok()
+                && self.connection.is_autocommit();
+            if rolled_back && error.is_transient_storage() {
+                return error;
+            }
+        } else if error.is_transient_storage() && old != new {
+            // FULL can automatically roll back the whole transaction. Only a
+            // genuinely changed effect at its original value proves Old; New,
+            // a mismatched row or a failed read remains unknown. The unique
+            // actor owns every write and SQLite commits these effects atomically.
+            if witness
+                .read(&self.connection)
+                .is_ok_and(|actual| actual.as_deref() == old)
+            {
+                return error;
+            }
+        }
+        // Do not truncate payload that may already be indexed, advance an
+        // atomic watermark or clear a failure latch on an unknown outcome.
+        PersistenceError::Mutation(format!(
+            "maintenance COMMIT outcome requires recovery: {error}"
+        ))
     }
 
     fn committed_maintenance_wal_len(&self) -> Result<u64, PersistenceError> {
@@ -5243,15 +5378,16 @@ impl StateStore {
             sync_directory(&self.replay_dir)?;
             #[cfg(test)]
             crash_replay_compaction_if_armed("before_commit");
-            let result = self.commit_maintenance_batch(|connection| {
-                connection
-                    .execute(
-                        "UPDATE runtime_meta SET replay_file = ?1 WHERE singleton = 1",
-                        [&new_file],
-                    )
-                    .map_err(PersistenceError::database)?;
-                Ok(())
-            });
+            let result =
+                self.commit_maintenance_batch(MaintenanceWitness::ActiveReplay, |connection| {
+                    connection
+                        .execute(
+                            "UPDATE runtime_meta SET replay_file = ?1 WHERE singleton = 1",
+                            [&new_file],
+                        )
+                        .map_err(PersistenceError::database)?;
+                    Ok(())
+                });
             // A COMMIT error can still have published the destination name.
             // Preserve it on every error; recovery removes it if unreferenced.
             if matches!(&result, Ok(true) | Err(PersistenceError::Mutation(_))) {
@@ -5410,7 +5546,7 @@ impl StateStore {
                 .sync_data()
                 .map_err(|source| PersistenceError::io(&target_path, source))?;
             let target_name = self.replay_file.clone();
-            let committed = self.commit_maintenance_batch(|connection| {
+            let commit_result = self.commit_maintenance_batch(MaintenanceWitness::ReplayChunk(moves[0].0), |connection| {
                 let mut update = connection.prepare_cached(
                     "UPDATE replay_chunks SET data_file = ?2, data_offset = ?3 WHERE ordinal = ?1 AND data_file = ?4")
                     .map_err(PersistenceError::database)?;
@@ -5422,7 +5558,22 @@ impl StateStore {
                     }
                 }
                 Ok(())
-            })?;
+            });
+            let committed = match commit_result {
+                Ok(committed) => committed,
+                Err(error) => {
+                    // Only a proved rollback or pre-commit refusal permits
+                    // dropping this copied, unindexed tail. Unknown/New keeps
+                    // every possibly referenced byte for exact recovery.
+                    if !matches!(error, PersistenceError::Mutation(_)) {
+                        output
+                            .get_ref()
+                            .set_len(start)
+                            .map_err(|source| PersistenceError::io(&target_path, source))?;
+                    }
+                    return Err(error);
+                }
+            };
             if !committed {
                 output
                     .get_ref()
@@ -7556,16 +7707,16 @@ mod tests {
 
     use super::{
         AdmissionLimits, CommitProbe, DATABASE_FILE, DATABASE_MAX_BYTES, GLOBAL_REPLAY_BYTES,
-        MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, PAGE_SIZE_BYTES, PER_RUN_REPLAY_BYTES,
-        PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError, PersistenceTestHooks,
-        PersistentCandidate, PersistentStartCompletion, REPLAY_COMPACTION_CRASH_PHASE, REPLAY_DIR,
-        SHM_MAX_BYTES, STATE_FILES_MAX_BYTES, StartCommitCrashPhase, StartDisposition,
-        StartReceipt, StateLockGuard, StateStore, WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES,
-        WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES, append_replay, append_replay_external,
-        create_schema, directory_file_len, file_len, idle_fold_wal, load_recovered, metadata_size,
-        mutex_lock, nonnegative_u64, prune_global_replay_to, read_replay_segment,
-        retry_transient_storage, retry_wal_checkpoint, validate_existing_schema,
-        validate_replay_window, wal_charge_for_cache,
+        MAX_TRANSACTION_PAYLOAD_BYTES, METADATA_BYTES, MaintenanceWitness, PAGE_SIZE_BYTES,
+        PER_RUN_REPLAY_BYTES, PERSISTENCE_QUEUE_CAPACITY, Persistence, PersistenceError,
+        PersistenceTestHooks, PersistentCandidate, PersistentStartCompletion,
+        REPLAY_COMPACTION_CRASH_PHASE, REPLAY_DIR, SHM_MAX_BYTES, STATE_FILES_MAX_BYTES,
+        StartCommitCrashPhase, StartDisposition, StartReceipt, StateLockGuard, StateStore,
+        WAL_CHECKPOINT_BYTES, WAL_CHECKPOINT_MAX_RETRIES, WAL_IDLE_FOLD_FLOOR_BYTES, WAL_MAX_BYTES,
+        append_replay, append_replay_external, create_schema, directory_file_len, file_len,
+        idle_fold_wal, load_recovered, metadata_size, mutex_lock, nonnegative_u64,
+        prune_global_replay_to, read_replay_segment, retry_transient_storage, retry_wal_checkpoint,
+        validate_existing_schema, validate_replay_window, wal_charge_for_cache,
     };
     use crate::resources::ResourceLimits;
 
@@ -9248,11 +9399,217 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_real_sqlite_full_automatic_rollback_proves_old() {
+        let temp = TempDir::new().unwrap();
+        let (store, _) = StateStore::open(
+            &temp.path().join("state"),
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        store
+            .connection
+            .execute_batch("CREATE TABLE full_ballast(value BLOB)")
+            .unwrap();
+        let pages: i64 = store
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "max_page_count", pages)
+            .unwrap();
+        let witness = MaintenanceWitness::ActiveReplay;
+        let old = witness.read(&store.connection).unwrap();
+        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE runtime_meta SET replay_file='replay-new.bin' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let new = witness.read(&store.connection).unwrap();
+        assert_ne!(old, new);
+        let sqlite_error = store
+            .connection
+            .execute("INSERT INTO full_ballast VALUES(zeroblob(4194304))", [])
+            .unwrap_err();
+        let error = PersistenceError::database(sqlite_error);
+        assert!(
+            error.is_disk_full(),
+            "fixture must raise actual SQLite FULL"
+        );
+        assert!(
+            store.connection.is_autocommit(),
+            "actual FULL must exercise SQLite automatic rollback"
+        );
+        assert_eq!(witness.read(&store.connection).unwrap(), old);
+        let classified =
+            store.classify_maintenance_commit_error(error, witness, old.as_deref(), new.as_deref());
+        assert!(
+            classified.is_disk_full(),
+            "proven automatic rollback retains original typed FULL"
+        );
+    }
+
+    #[test]
+    fn maintenance_active_rollback_proves_old_but_new_and_unknown_stay_fatal() {
+        for outcome in ["active", "new", "hybrid", "unchanged", "read-failure"] {
+            let temp = TempDir::new().unwrap();
+            let (store, _) = StateStore::open(
+                &temp.path().join("state"),
+                &AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::new(PersistenceTestHooks::default()),
+            )
+            .unwrap();
+            let witness = MaintenanceWitness::ActiveReplay;
+            let old = witness.read(&store.connection).unwrap();
+            store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE runtime_meta SET replay_file='replay-new.bin' WHERE singleton=1",
+                    [],
+                )
+                .unwrap();
+            let mut new = witness.read(&store.connection).unwrap();
+            if outcome != "active" {
+                store.connection.execute_batch("COMMIT").unwrap();
+            }
+            if outcome == "hybrid" {
+                store
+                    .connection
+                    .execute(
+                        "UPDATE runtime_meta SET replay_file='replay-third.bin' WHERE singleton=1",
+                        [],
+                    )
+                    .unwrap();
+            } else if outcome == "unchanged" {
+                new = old.clone();
+                let rusqlite::types::Value::Text(original) = &old.as_ref().unwrap()[0] else {
+                    panic!("active replay witness is text")
+                };
+                store
+                    .connection
+                    .execute(
+                        "UPDATE runtime_meta SET replay_file=?1 WHERE singleton=1",
+                        [original],
+                    )
+                    .unwrap();
+            } else if outcome == "read-failure" {
+                store
+                    .connection
+                    .execute_batch("ALTER TABLE runtime_meta RENAME TO unavailable_meta")
+                    .unwrap();
+            }
+            let classified = store.classify_maintenance_commit_error(
+                PersistenceError::injected_disk_full(),
+                witness,
+                old.as_deref(),
+                new.as_deref(),
+            );
+            if outcome == "active" {
+                assert!(
+                    classified.is_disk_full(),
+                    "active transaction with successful rollback is proven Old"
+                );
+                assert!(store.connection.is_autocommit());
+                assert_eq!(witness.read(&store.connection).unwrap(), old);
+            } else {
+                assert!(
+                    !classified.is_transient_storage(),
+                    "New, mismatched, unchanged and unreadable witnesses must not retry: {outcome}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maintenance_proven_old_compaction_retries_original_accepted_bytes() {
+        for lost_at_commit in [1, 2] {
+            let temp = TempDir::new().unwrap();
+            let state_dir = temp.path().join("state");
+            let (persistence, _) = Persistence::open(&state_dir).unwrap();
+            persistence
+                .inner
+                .test_hooks
+                .suppress_idle_fold
+                .store(true, Ordering::Release);
+            let first = running_info(RunId::new());
+            let first_durable = persistence
+                .insert_start(&test_operation_key(first.id), &first)
+                .unwrap();
+            let second = running_info(RunId::new());
+            let second_durable = persistence
+                .insert_start(&test_operation_key(second.id), &second)
+                .unwrap();
+            expect_queued(
+                first_durable.append(first.id, replay(vec![chunk(0, b"original-prefix")])),
+            );
+            persistence.barrier().unwrap();
+            let replay_path = fs::read_dir(state_dir.join(REPLAY_DIR))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            OpenOptions::new()
+                .write(true)
+                .open(replay_path)
+                .unwrap()
+                .set_len(4096)
+                .unwrap();
+            persistence
+                .inner
+                .test_hooks
+                .maintenance_error_committed
+                .store(false, Ordering::Release);
+            persistence
+                .inner
+                .test_hooks
+                .maintenance_commits_before_error
+                .store(lost_at_commit, Ordering::Release);
+            expect_queued(
+                first_durable.append(first.id, replay(vec![chunk(15, b"original-tail")])),
+            );
+            expect_queued(
+                second_durable.append(second.id, replay(vec![chunk(0, b"second-original")])),
+            );
+            persistence
+                .barrier()
+                .expect("proven Old FULL must retry accepted batches instead of latching");
+            assert!(!persistence.is_failed());
+            drop(first_durable);
+            drop(second_durable);
+            persistence.assert_exclusive_owner();
+            drop(persistence);
+            let (_, recovered) = Persistence::open(&state_dir).unwrap();
+            for (id, expected) in [
+                (first.id, b"original-prefixoriginal-tail".as_slice()),
+                (second.id, b"second-original".as_slice()),
+            ] {
+                let actual = recovered.iter().find(|run| run.info.id == id).unwrap();
+                let bytes: Vec<u8> = actual
+                    .replay
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.data.iter().copied())
+                    .collect();
+                assert_eq!(
+                    bytes, expected,
+                    "original ordered bytes must survive both bounded compaction commit sites"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn uncertain_compaction_commit_latches_even_when_error_looks_like_disk_full() {
         for (committed, lost_at_commit, stat_failure) in [
-            (false, 1, false),
             (true, 1, false),
-            (false, 2, false),
             (true, 2, false),
             (true, 1, true),
             (true, 2, true),

@@ -102,6 +102,7 @@ export {
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
+  RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
@@ -220,3 +221,7 @@ export type { TerminalCheckpointUnavailableReason } from "./generated/TerminalCh
 
 export type { DiagnosticsSnapshot } from "./generated/DiagnosticsSnapshot.js";
 export type { DiagnosticsSinkState } from "./generated/DiagnosticsSinkState.js";
+
+export type { RunStorageObservation } from "./generated/RunStorageObservation.js";
+export type { RunPersistenceObservation } from "./generated/RunPersistenceObservation.js";
+export type { RunStoragePolicy } from "./generated/RunStoragePolicy.js";

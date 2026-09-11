@@ -939,7 +939,14 @@ transactions. Both generations can be durably referenced during migration;
 startup validates their indexed extents and resumes before serving. Source files
 are removed only after their last reference moves. An uncertain maintenance
 COMMIT fences later writes even when its underlying error resembles storage
-pressure. Compaction precedes append/finalize COMMIT and remains transparent to
+pressure. A maintenance COMMIT error remains retryable only when its original
+transient storage error and a successful explicit rollback, or an indexed
+transaction effect observed at its original value after automatic rollback,
+prove that the transaction did not commit. The automatic-rollback proof requires
+a changed effect: an unchanged, committed, mismatched or unreadable witness
+remains uncertain. Uncertain outcomes preserve possibly indexed payload and
+never clear an existing persistence failure latch. Compaction precedes
+append/finalize COMMIT and remains transparent to
 protocol cursors. Its file budget includes the required source/destination
 scratch overlap; the main-database ceiling is unchanged.
 
@@ -956,6 +963,33 @@ conflicts, integrity, uncertain-commit and owner-invariant failures latch persis
 reject later durable mutations. This changes no wire frame or error code: a
 client may observe output progress stall until storage recovers, and a client
 restart alone neither owns nor resets the daemon-side wait.
+
+### Bounded storage observations
+
+A Runtime advertising `services.storage_observation: 1` accepts
+`{"type":"observe_storage","id":"<RunId>"}` and returns a
+`storage_observation` response with `RunStorageObservation`. Rust
+`Client::observe_storage`, SDK `CtxmuxClient.observeStorage(runId)` and CLI
+`ctxmux storage <RunId>` validate the optional capability against the same
+connection's Hello before dispatch, return that owner identity, and reject a
+response naming another Run. Generation 22 and older frame shapes are unchanged;
+a missing capability is explicit unsupported, not a failure of the original Run.
+
+The memory floor and latest byte are one bounded output-facts snapshot. The
+optional persistence object independently samples the actor's original first
+latched failure, actor completion, advisory not-yet-dequeued append count,
+accepted-output watermark and **last confirmed committed** watermark. An unknown
+COMMIT can leave disk ahead of the confirmed watermark: differences do not prove
+lost or uncommitted bytes. Null persistence denotes a Run with no persistence
+owner. Null first failure alone promises neither health nor complete durability.
+The effective per-Run and shared raw budgets, database/WAL policy and VT limits
+come from the current owner's policy, including handoff-preserved values.
+
+This observation does not query replay, wait for the persistence actor, export
+VT, mutate a Run, or clear a failure. A persistence failure does not invalidate
+healthy live VT that still consumes continuous PTY bytes. Actual source gaps
+still invalidate that VT; an already discarded model is not reconstructed from
+a truncated suffix. Fatal mutation and uncertain-COMMIT exec gates remain.
 
 Persistent startup requires a real same-owner `0700` directory, regular
 same-owner `0600` database/WAL/SHM/lock/replay files, and a process-lifetime

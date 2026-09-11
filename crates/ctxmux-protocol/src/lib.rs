@@ -42,6 +42,9 @@ pub const RUNTIME_CAPABILITY_TMUX_IMPORT: &str = "tmux.import";
 /// Retain Runtime identity and historical Run state in one state directory.
 pub const RUNTIME_CAPABILITY_PERSISTENT_STATE: &str = "services.persistent_state";
 
+/// Observe bounded Run storage facts without waiting for the persistence actor.
+pub const RUNTIME_CAPABILITY_STORAGE_OBSERVATION: &str = "services.storage_observation";
+
 /// Preserve live ownership across a validated planned exec-in-place upgrade.
 pub const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY: &str =
     "services.planned_exec_upgrade_continuity";
@@ -1635,6 +1638,8 @@ pub enum Request {
     },
     /// Read current metadata for one Run.
     Status { id: RunId },
+    /// Observe storage owner watermarks and the effective capacity policy.
+    ObserveStorage { id: RunId },
     /// Reclaim one already-terminal, unpinned Run and its retained record.
     ///
     /// This releases a retained-but-terminal Run so its capacity slot returns
@@ -1761,6 +1766,8 @@ pub enum Response {
     },
     /// Current diagnostic sink observations, independent of Run service facts.
     Diagnostics { diagnostics: DiagnosticsSnapshot },
+    /// Bounded, non-mutating storage observations for one exact Run.
+    StorageObservation { observation: RunStorageObservation },
     /// A Run was created.
     Started { run: RunInfo },
     /// Existing panes discovered through the tmux executable.
@@ -1842,6 +1849,61 @@ pub enum RunForegroundObservation {
         run_id: RunId,
         reason: String,
     },
+}
+
+/// Last observed facts from the persistence owner, not a durability receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RunPersistenceObservation {
+    /// First latched failure. Absence does not independently promise health.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub first_failure: Option<String>,
+    /// Whether the persistence actor thread has finished or been joined.
+    pub actor_stopped: bool,
+    /// Advisory append commands not yet dequeued; excludes in-flight work.
+    pub queued_append_commands: u64,
+    /// End of output accepted by this Run's ordered persistence queue.
+    pub offered_output_bytes: u64,
+    /// Last confirmed committed watermark. An unknown COMMIT can leave disk
+    /// ahead of this value; subtracting it never proves bytes were lost.
+    pub committed_output_bytes: u64,
+}
+
+/// Effective owner policy, including the policy preserved by a live handoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RunStoragePolicy {
+    /// Per-Run raw in-memory output capacity.
+    pub run_output_bytes: u64,
+    /// Shared raw in-memory output capacity.
+    pub hot_output_bytes: u64,
+    /// Per-Run raw durable replay capacity.
+    pub durable_run_output_bytes: u64,
+    /// Shared raw durable replay capacity.
+    pub durable_replay_bytes: u64,
+    /// Durable database file policy.
+    pub database_bytes: u64,
+    /// WAL checkpoint target, not available filesystem capacity.
+    pub wal_checkpoint_bytes: u64,
+    /// Maximum retained rows in the live VT model.
+    pub terminal_history_rows: u64,
+    /// Maximum synthetic terminal checkpoint payload.
+    pub terminal_checkpoint_bytes: u64,
+}
+
+/// Independent bounded observations for one exact Run. The memory range is
+/// one atomic owner snapshot; persistence watermarks are sampled separately.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct RunStorageObservation {
+    pub run_id: RunId,
+    pub latest_output_bytes: u64,
+    /// Earliest byte in memory, not the earliest durable byte on disk.
+    pub memory_first_available_byte: u64,
+    /// No persistence owner for this Run is represented explicitly as null.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub persistence: Option<RunPersistenceObservation>,
+    pub policy: RunStoragePolicy,
 }
 
 /// Complete-boundary basic VT state, distinct from original Run output.

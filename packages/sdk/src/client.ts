@@ -31,6 +31,7 @@ import type { ClientFrame } from "./generated/ClientFrame.js";
 import type { CreateOperationKey } from "./generated/CreateOperationKey.js";
 import type { DaemonInstanceId } from "./generated/DaemonInstanceId.js";
 import type { ForkPlan } from "./generated/ForkPlan.js";
+import type { RunStorageObservation } from "./generated/RunStorageObservation.js";
 import type { RunForegroundObservation } from "./generated/RunForegroundObservation.js";
 import type { InputOperationKey } from "./generated/InputOperationKey.js";
 import {
@@ -39,6 +40,7 @@ import {
   PROTOCOL_VERSION,
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
+  RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
 } from "./generated/constants.js";
 import type { Request } from "./generated/Request.js";
 import type { Response } from "./generated/Response.js";
@@ -423,6 +425,41 @@ export class CtxmuxClient {
       throw unexpected("status response", response.type);
     }
     return response.run;
+  }
+
+  /** Independent storage owner facts, not a durability receipt or health verdict. */
+  public async observeStorage(runId: RunId): Promise<{
+    readonly runtime: RuntimeIdentity;
+    readonly observation: RunStorageObservation;
+  }> {
+    const { wire, runtime } = await this.#connectForDispatch();
+    try {
+      const advertised =
+        runtime.capabilities[RUNTIME_CAPABILITY_STORAGE_OBSERVATION];
+      if ((advertised ?? 0) < 1) {
+        throw new CtxmuxUnsupportedCapabilityError(
+          RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
+          1,
+          advertised,
+        );
+      }
+      await wire.send({
+        type: "request",
+        request: { type: "observe_storage", id: runId },
+      } satisfies ClientFrame);
+      const frame = serverFrame(await wire.receive());
+      if (frame.type === "error") throw protocolError(frame.error);
+      if (
+        frame.type !== "response" ||
+        frame.response.type !== "storage_observation" ||
+        frame.response.observation.run_id !== runId
+      ) {
+        throw unexpected("exact Run storage observation", frame.type);
+      }
+      return { runtime, observation: frame.response.observation };
+    } finally {
+      wire.close();
+    }
   }
 
   /** One-shot physical facts from the SAME connection's Hello identity. */

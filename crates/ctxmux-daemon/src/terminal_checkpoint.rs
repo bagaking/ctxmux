@@ -12,7 +12,7 @@ pub(crate) fn derive_terminal<T>(derive: impl FnOnce() -> T) -> Option<T> {
     crate::diagnostics::catch_native_unwind(std::panic::AssertUnwindSafe(derive)).ok()
 }
 
-const HISTORY_ROWS: usize = 10_000;
+pub(crate) const HISTORY_ROWS: usize = 10_000;
 pub(crate) const MAX_RESTORE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_RESIZE_TAIL: usize = 1024;
 

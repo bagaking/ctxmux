@@ -2015,6 +2015,10 @@ impl RunManager {
     fn runtime_identity(&self) -> RuntimeIdentity {
         let persistent = self.persistence.is_some();
         let mut capabilities = BTreeMap::from([
+            (
+                ctxmux_protocol::RUNTIME_CAPABILITY_STORAGE_OBSERVATION.to_owned(),
+                1,
+            ),
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
@@ -4976,6 +4980,32 @@ impl Run {
         }
     }
 
+    fn storage_observation(
+        &self,
+        resources: ResourceLimits,
+    ) -> ctxmux_protocol::RunStorageObservation {
+        let output = self.output.snapshot();
+        let persistence = mutex_lock(&self.persistence)
+            .durable()
+            .map(PersistentRun::storage_observation);
+        ctxmux_protocol::RunStorageObservation {
+            run_id: self.id,
+            latest_output_bytes: output.latest_output_bytes,
+            memory_first_available_byte: output.first_available_byte,
+            persistence,
+            policy: ctxmux_protocol::RunStoragePolicy {
+                run_output_bytes: resources.run_output_bytes as u64,
+                hot_output_bytes: resources.hot_output_bytes,
+                durable_run_output_bytes: resources.durable_run_output_bytes,
+                durable_replay_bytes: resources.durable_replay_bytes,
+                database_bytes: resources.database_bytes,
+                wal_checkpoint_bytes: resources.wal_checkpoint_bytes,
+                terminal_history_rows: terminal_checkpoint::HISTORY_ROWS as u64,
+                terminal_checkpoint_bytes: terminal_checkpoint::MAX_RESTORE_BYTES as u64,
+            },
+        }
+    }
+
     /// Fleet enumeration uses only current short owner observations. A slow
     /// terminal export does not consume every async request worker via List.
     fn summary(&self) -> RunSummary {
@@ -7215,6 +7245,9 @@ async fn execute_request(
             *foreground_bytes = permit;
             Ok(Response::ForegroundObservation { observation })
         }
+        Request::ObserveStorage { id } => Ok(Response::StorageObservation {
+            observation: manager.pin(id)?.storage_observation(manager.resources),
+        }),
         Request::Diagnostics {} => Ok(Response::Diagnostics {
             diagnostics: diagnostics::snapshot(),
         }),
@@ -9511,6 +9544,72 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maintenance_proven_old_full_keeps_two_real_runs_input_and_original_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, recovered) = super::Persistence::open(&state_dir).unwrap();
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let run = server.client.start(RunSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "stty -echo -onlcr; printf READY; while IFS= read -r line; do printf '%s\n' \"$line\"; done".into()],
+                cwd: None, env: BTreeMap::new(), initial_size: TerminalSize { rows: 4, cols: 12 },
+                declared_inputs: Vec::new(),
+            }).await.unwrap();
+            expect_original_raw(&server.client, &run, b"READY").await;
+            runs.push(run);
+        }
+        persistence.barrier().unwrap();
+        persistence.fail_next_maintenance_commit_as_rolled_back_full();
+        let (first, second) = tokio::join!(
+            server
+                .client
+                .input(runs[0].id, b"first-after-full\n".to_vec()),
+            server
+                .client
+                .input(runs[1].id, b"second-after-full\n".to_vec())
+        );
+        first.unwrap();
+        second.unwrap();
+        for (run, expected) in runs.iter().zip([
+            b"READYfirst-after-full\n".as_slice(),
+            b"READYsecond-after-full\n".as_slice(),
+        ]) {
+            expect_original_raw(&server.client, run, expected).await;
+            let (attachment, snapshot) = server.client.attach_terminal(run.id, 0).await.unwrap();
+            assert!(
+                matches!(
+                    snapshot.terminal,
+                    ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+                ),
+                "continuous VT must remain available through proven Old capacity failure"
+            );
+            assert_eq!(snapshot.run.pid, run.pid);
+            assert!(snapshot.run.state.is_running());
+            attachment.detach().await.unwrap();
+        }
+        persistence.barrier().unwrap();
+        assert!(!persistence.is_failed());
+        for run in &runs {
+            let status = server.client.status(run.id).await.unwrap();
+            assert_eq!(
+                status.durable_output_bytes,
+                Some(status.latest_output_bytes)
+            );
+            assert!(process_exists(run.pid.unwrap()));
+            server
+                .client
+                .stop(fresh_stop(&server.client, run.id).await)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn latched_persistence_refuses_upgrade_before_extract_and_keeps_public_controls() {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = temp.path().join("state");
@@ -9561,6 +9660,170 @@ mod tests {
         assert!(matches!(event, RunEvent::Output { .. }));
         attachment.detach().await.unwrap();
         server.manager.get(first.id).unwrap().stop().await.unwrap();
+    }
+
+    /// Two real native PTYs, a blocked actor, and a latched storage failure.
+    /// The observation executes through the public Rust dispatch client.
+    async fn exercise_storage_fault(
+        server: &InProcessServer,
+        persistence: &super::Persistence,
+    ) -> Vec<RunId> {
+        let first = server.client.start(long_running_spec()).await.unwrap();
+        let second = server.client.start(long_running_spec()).await.unwrap();
+        persistence.barrier().unwrap();
+        let (reached, release) = persistence.pause_next_append();
+        server
+            .client
+            .input(first.id, b"before-failure\n".to_vec())
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, pending) = tokio::time::timeout(
+            Duration::from_secs(1),
+            server.client.observe_storage(first.id),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let owner = pending.persistence.unwrap();
+        assert!(
+            owner.offered_output_bytes > owner.committed_output_bytes,
+            "a paused append must expose distinct accepted and confirmed cursors"
+        );
+        assert_eq!(owner.first_failure, None);
+        release.send(()).unwrap();
+        persistence.barrier().unwrap();
+        persistence.fail_next_insert_after_commit();
+        assert!(server.client.start(long_running_spec()).await.is_err());
+        assert!(persistence.is_failed());
+        let first_failure = mutex_lock(&persistence.inner_failure_for_test()).clone();
+        for run in [&first, &second] {
+            let status = server.client.status(run.id).await.unwrap();
+            assert_eq!(status.pid, run.pid);
+            assert!(status.state.is_running());
+            assert!(process_exists(run.pid.unwrap()));
+            server
+                .client
+                .input(run.id, b"after-failure\n".to_vec())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status = server.client.status(run.id).await.unwrap();
+                    if status.latest_output_bytes
+                        > if run.id == first.id {
+                            pending.latest_output_bytes
+                        } else {
+                            0
+                        }
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (_, observation) = server.client.observe_storage(run.id).await.unwrap();
+            let owner = observation.persistence.as_ref().unwrap();
+            assert_eq!(owner.first_failure, first_failure);
+            assert!(
+                owner
+                    .first_failure
+                    .as_deref()
+                    .is_some_and(|error| error.contains("injected"))
+            );
+            assert!(!owner.actor_stopped);
+            assert_eq!(
+                observation.policy.run_output_bytes,
+                server.manager.resources.run_output_bytes as u64
+            );
+            assert_eq!(
+                observation.policy.durable_run_output_bytes,
+                server.manager.resources.durable_run_output_bytes
+            );
+            let (view, snapshot) = server.client.attach_terminal(run.id, 0).await.unwrap();
+            assert!(
+                matches!(
+                    snapshot.terminal,
+                    ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+                ),
+                "storage failure must not destroy continuously observed live VT"
+            );
+            view.detach().await.unwrap();
+        }
+        // Genuine source loss still invalidates terminal continuation.
+        let actual = server.manager.get(second.id).unwrap();
+        actual.mark_output_source_gap();
+        let (view, snapshot) = server.client.attach_terminal(second.id, 0).await.unwrap();
+        assert!(matches!(
+            snapshot.terminal,
+            ctxmux_protocol::TerminalContinuation::Unknown {
+                reason: ctxmux_protocol::TerminalCheckpointUnavailableReason::SourceGap,
+            }
+        ));
+        view.detach().await.unwrap();
+        vec![first.id, second.id]
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn latched_storage_preserves_terminal_and_exposes_owner_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let (persistence, recovered) = super::Persistence::open(temp.path().join("state")).unwrap();
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let ids = exercise_storage_fault(&server, &persistence).await;
+        for id in ids {
+            server.manager.get(id).unwrap().stop().await.unwrap();
+        }
+    }
+
+    /// Isolated test-process daemon seam for source-bound SDK/CLI qualification.
+    /// No fault injection enters the public daemon or user Runtime.
+    #[test]
+    fn storage_observation_fault_subprocess() {
+        let Some(directory) = std::env::var_os("CTXMUX_STORAGE_TEST_DIR") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (persistence, recovered) =
+                    super::Persistence::open(directory.join("state")).unwrap();
+                let server = InProcessServer::start(Arc::new(RunManager::persistent(
+                    persistence.clone(),
+                    recovered,
+                )));
+                let ids = exercise_storage_fault(&server, &persistence).await;
+                let receipt = serde_json::json!({
+                    "socketPath": server.directory.path().join("ctxmux.sock"),
+                    "runIds": ids,
+                });
+                std::fs::write(
+                    directory.join("ready.json"),
+                    serde_json::to_vec(&receipt).unwrap(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while !directory.join("release").exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                for id in ids {
+                    server.manager.get(id).unwrap().stop().await.unwrap();
+                }
+            });
     }
 
     #[test]

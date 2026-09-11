@@ -111,6 +111,63 @@ export function validateServerFrame(value: unknown): ServerFrame {
   return value as ServerFrame;
 }
 
+function storageObservation(value: unknown, path: string): void {
+  const item = record(value, path);
+  exactFields(item, path, [
+    "run_id",
+    "latest_output_bytes",
+    "memory_first_available_byte",
+    "persistence",
+    "policy",
+  ]);
+  runId(item.run_id, `${path}.run_id`);
+  safeUnsignedInteger(item.latest_output_bytes, `${path}.latest_output_bytes`);
+  safeUnsignedInteger(
+    item.memory_first_available_byte,
+    `${path}.memory_first_available_byte`,
+  );
+  if (
+    (item.memory_first_available_byte as number) >
+    (item.latest_output_bytes as number)
+  )
+    throw invalid(
+      `${path}.memory_first_available_byte`,
+      "no greater than latest_output_bytes",
+    );
+  if (item.persistence !== null) {
+    const persistence = record(item.persistence, `${path}.persistence`);
+    const counts = [
+      "queued_append_commands",
+      "offered_output_bytes",
+      "committed_output_bytes",
+    ] as const;
+    exactFields(persistence, `${path}.persistence`, [
+      "first_failure",
+      "actor_stopped",
+      ...counts,
+    ]);
+    if (persistence.first_failure !== null)
+      string(persistence.first_failure, `${path}.persistence.first_failure`);
+    boolean(persistence.actor_stopped, `${path}.persistence.actor_stopped`);
+    for (const field of counts)
+      safeUnsignedInteger(persistence[field], `${path}.persistence.${field}`);
+  }
+  const policy = record(item.policy, `${path}.policy`);
+  const limits = [
+    "run_output_bytes",
+    "hot_output_bytes",
+    "durable_run_output_bytes",
+    "durable_replay_bytes",
+    "database_bytes",
+    "wal_checkpoint_bytes",
+    "terminal_history_rows",
+    "terminal_checkpoint_bytes",
+  ] as const;
+  exactFields(policy, `${path}.policy`, limits);
+  for (const field of limits)
+    safeUnsignedInteger(policy[field], `${path}.policy.${field}`);
+}
+
 function diagnosticsSnapshot(value: unknown, path: string): void {
   const diagnostics = record(value, path);
   const counts = [
@@ -392,6 +449,10 @@ function response(value: unknown, path: string): void {
       if (valueRecord.next_cursor !== null) {
         runId(valueRecord.next_cursor, `${path}.next_cursor`);
       }
+      return;
+    case "storage_observation":
+      exactFields(valueRecord, path, ["type", "observation"]);
+      storageObservation(valueRecord.observation, `${path}.observation`);
       return;
     case "diagnostics":
       exactFields(valueRecord, path, ["type", "diagnostics"]);
