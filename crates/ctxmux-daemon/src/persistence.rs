@@ -1588,7 +1588,7 @@ impl Persistence {
     }
 
     #[cfg(test)]
-    fn fail_next_append_as_io_error(&self) {
+    pub(crate) fn fail_next_append_as_io_error(&self) {
         assert!(
             !self
                 .inner

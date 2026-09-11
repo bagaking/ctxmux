@@ -5204,7 +5204,9 @@ impl Run {
             && protected == u64::MAX
             && output.source_gap_after_byte.is_none()
         {
-            output.mark_source_gap();
+            // Persistence lost a replay path, not the ordered PTY bytes already
+            // consumed by the live terminal model.
+            output.mark_history_gap();
         }
         let chunk = output.push_protected(data, protected);
         output.terminal_pressure(self.id);
@@ -6567,6 +6569,10 @@ impl OutputLog {
     fn mark_source_gap(&mut self) -> u64 {
         self.terminal = None;
         self.terminal_absence = TerminalCheckpointUnavailableReason::SourceGap;
+        self.mark_history_gap()
+    }
+
+    fn mark_history_gap(&mut self) -> u64 {
         self.source_gap_after_byte = Some(self.latest_output_bytes);
         self.latest_output_bytes
     }
@@ -10458,6 +10464,150 @@ mod tests {
             runs.push(run);
         }
         runs
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_gap_preserves_live_terminal_and_two_public_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (persistence, recovered) = super::Persistence::open(temp.path().join("state")).unwrap();
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let clients = [
+            server.client.clone(),
+            Client::new(server.directory.path().join("ctxmux.sock")),
+        ];
+        let runs = start_derivation_fault_runs(&clients).await;
+        persistence.barrier().unwrap();
+        let (before, snapshot) = clients[1].attach_terminal(runs[0].id, 0).await.unwrap();
+        assert!(matches!(
+            snapshot.terminal,
+            ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+        ));
+        before.detach().await.unwrap();
+        persistence.fail_next_append_as_io_error();
+        clients[0].input(runs[0].id, b"!".to_vec()).await.unwrap();
+        expect_original_raw(&clients[0], &runs[0], b"A:READY\nA:!\n").await;
+        assert!(persistence.barrier().is_err());
+        assert!(persistence.is_failed());
+        let durable_head = clients[0]
+            .status(runs[0].id)
+            .await
+            .unwrap()
+            .durable_output_bytes;
+        clients[1].input(runs[0].id, b"z".to_vec()).await.unwrap();
+        expect_original_raw(&clients[1], &runs[0], b"A:READY\nA:!\nA:z\n").await;
+        let (raw, history) = clients[0].attach(runs[0].id, 0).await.unwrap();
+        assert!(history.replay.truncated);
+        assert_eq!(history.run.durable_output_bytes, durable_head);
+        assert!(durable_head.unwrap() < history.run.latest_output_bytes);
+        raw.detach().await.unwrap();
+        let (view, live) = clients[1].attach_terminal(runs[0].id, 0).await.unwrap();
+        assert!(matches!(
+            live.terminal,
+            ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+        ));
+        let mut original_screen = vt100::Parser::new(4, 12, 0);
+        original_screen.process(&replay_bytes(&history.replay.chunks));
+        let mut restored_screen = vt100::Parser::new(4, 12, 0);
+        restored_screen.process(&live.terminal_restore);
+        assert_eq!(
+            restored_screen.screen().contents(),
+            original_screen.screen().contents()
+        );
+        assert_eq!(
+            restored_screen.screen().cursor_position(),
+            original_screen.screen().cursor_position()
+        );
+        let service = live.run.native_service.unwrap();
+        assert!(matches!(
+            service.owner,
+            ctxmux_protocol::NativeOwnerStatus::Serving {}
+        ));
+        assert!(matches!(
+            service.output,
+            ctxmux_protocol::NativeOutputStatus::Serving {}
+        ));
+        assert!(matches!(
+            service.input.phase,
+            ctxmux_protocol::NativeInputPhase::Open {}
+        ));
+        assert!(service.terminal_fault.is_none());
+        view.detach().await.unwrap();
+        clients[0].input(runs[1].id, b"b".to_vec()).await.unwrap();
+        expect_original_raw(&clients[0], &runs[1], b"B:READY\nB:b\n").await;
+        let (other, healthy) = clients[1].attach_terminal(runs[1].id, 0).await.unwrap();
+        assert!(matches!(
+            healthy.terminal,
+            ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+        ));
+        assert_eq!(healthy.run.pid, runs[1].pid);
+        other
+            .resize(TerminalSize { rows: 3, cols: 9 })
+            .await
+            .unwrap();
+        other.detach().await.unwrap();
+        for (client, run) in clients.iter().zip(&runs) {
+            assert_eq!(
+                client
+                    .input(run.id, vec![3])
+                    .await
+                    .unwrap()
+                    .receipt
+                    .written_bytes,
+                1
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while process_exists(run.pid.unwrap()) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("failed history does not prevent actual child reaping");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_gap_distinction_keeps_true_source_gap_unknown() {
+        let server = InProcessServer::start(Arc::new(RunManager::default()));
+        let clients = [
+            server.client.clone(),
+            Client::new(server.directory.path().join("ctxmux.sock")),
+        ];
+        let runs = start_derivation_fault_runs(&clients).await;
+        let (view, before) = clients[0].attach_terminal(runs[0].id, 0).await.unwrap();
+        assert!(matches!(
+            before.terminal,
+            ctxmux_protocol::TerminalContinuation::BasicVt { .. }
+        ));
+        view.detach().await.unwrap();
+        // Exercise the existing owning source-discontinuity boundary, rather
+        // than clearing the derived model directly in the fixture.
+        server
+            .manager
+            .get(runs[0].id)
+            .unwrap()
+            .mark_output_source_gap();
+        clients[1].input(runs[0].id, b"z".to_vec()).await.unwrap();
+        expect_original_raw(&clients[1], &runs[0], b"A:READY\nA:z\n").await;
+        let (view, after) = clients[1].attach_terminal(runs[0].id, 0).await.unwrap();
+        assert_eq!(
+            after.terminal,
+            ctxmux_protocol::TerminalContinuation::Unknown {
+                reason: ctxmux_protocol::TerminalCheckpointUnavailableReason::SourceGap,
+            }
+        );
+        assert!(after.terminal_restore.is_empty());
+        assert!(after.replay.truncated);
+        view.detach().await.unwrap();
+        clients[0].input(runs[1].id, b"b".to_vec()).await.unwrap();
+        expect_original_raw(&clients[0], &runs[1], b"B:READY\nB:b\n").await;
+        for (client, run) in clients.iter().zip(&runs) {
+            client.input(run.id, vec![3]).await.unwrap();
+            wait_for_exit(client, run.id).await;
+            assert!(!process_exists(run.pid.unwrap()));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

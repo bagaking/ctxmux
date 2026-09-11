@@ -628,6 +628,13 @@ chunks, and truncation describe exactly that committed retained window. A late
 attachment receives either one `exited` event or one `interrupted` event after
 replay reassembly.
 
+A latched persistence failure leaves `durable_output_bytes` at its committed
+head and marks the affected replay history as truncated. `TerminalContinuation`
+may still be `basic_vt` when the live model has consumed all ordered source bytes
+at the reported geometry. A history saving gap alone does not change that live
+screen authority. Actual ordered-source discontinuity still yields an unknown
+continuation; an already absent model is not reconstructed by this distinction.
+
 Output persistence batches small Appends across empty-queue intervals for up to
 10 ms from the first collected Append, with an independent 1 MiB payload cap.
 Live attachment delivery does not wait for that collection or commit. Lifecycle

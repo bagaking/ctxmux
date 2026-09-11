@@ -702,7 +702,11 @@ reports typed `DiskFull`, write-side I/O pressure, or the external file reports
 exact command at the head of the queue and retries after a short delay; later
 durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
 other storage, replay, budget, integrity, and owner-invariant failure remains
-fail-stop for later durable mutations. Startup performs journal
+fail-stop for later durable mutations. A latched persistence failure marks the
+replay history gap and preserves its lagging durable head. It does not invalidate
+an intact live terminal model that has consumed every ordered PTY byte. Actual
+source discontinuity still discards that model; a missing model is not rebuilt
+from a later screen or guessed state. Startup performs journal
 recovery and exact schema/application validation against the schema-6 format
 envelope, then uses bounded, restartable page-admitted transactions to
 reconcile old running rows, preserve valid retained history under the configured policy, and finally
