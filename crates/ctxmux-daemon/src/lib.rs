@@ -29,6 +29,7 @@ mod diagnostics;
 mod fd_budget;
 mod foreground_observation;
 mod handoff;
+mod live_event_journal;
 mod native_control;
 mod native_output;
 mod native_runtime;
@@ -76,7 +77,7 @@ use run_spec::{validate_run_spec, validate_terminal_size};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
-    sync::{Notify, broadcast},
+    sync::Notify,
 };
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
@@ -110,7 +111,6 @@ use crate::tmux::{
 
 #[cfg(test)]
 const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
-const LIVE_EVENT_CAPACITY: usize = 256;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -1402,7 +1402,6 @@ struct RunManager {
     qualification_stats: QualificationStats,
     retention_budget: RetentionBudget,
     resources: ResourceLimits,
-    live_event_capacity: usize,
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
     incarnation_failure: IncarnationFailure,
@@ -2000,7 +1999,6 @@ impl RunManager {
             qualification_stats,
             retention_budget: RetentionBudget::with_resources(resources),
             resources,
-            live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
@@ -2088,7 +2086,6 @@ impl RunManager {
                     Run::recover(
                         recovered,
                         durable,
-                        LIVE_EVENT_CAPACITY,
                         terminal_publications.clone(),
                         qualification_stats.clone(),
                         retention_budget.clone(),
@@ -2126,7 +2123,6 @@ impl RunManager {
             qualification_stats,
             retention_budget,
             resources,
-            live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
@@ -2210,7 +2206,6 @@ impl RunManager {
                     child_pid,
                     input_state,
                     native_runs.clone(),
-                    LIVE_EVENT_CAPACITY,
                     terminal_publications.clone(),
                     qualification_stats.clone(),
                     native_input_drains.clone(),
@@ -2232,7 +2227,6 @@ impl RunManager {
                 Run::recover_with_control(
                     recovered,
                     durable,
-                    LIVE_EVENT_CAPACITY,
                     terminal_publications.clone(),
                     qualification_stats.clone(),
                     retention_budget.clone(),
@@ -2263,7 +2257,6 @@ impl RunManager {
             qualification_stats,
             retention_budget,
             resources,
-            live_event_capacity: LIVE_EVENT_CAPACITY,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
             incarnation_failure,
@@ -2394,7 +2387,6 @@ impl RunManager {
                 spec,
                 lineage,
                 persistence_mode,
-                live_event_capacity: self.live_event_capacity,
                 input_drains: self.native_input_drains.clone(),
                 native_runs: self.native_runs.clone(),
                 terminal_publications: self.terminal_publications.clone(),
@@ -2712,7 +2704,6 @@ impl RunManager {
                 pane_id,
                 TmuxImportConfig {
                     id: new_run_id,
-                    live_event_capacity: self.live_event_capacity,
                     terminal_publications: self.terminal_publications.clone(),
                     discovery_deadline: started_at + TMUX_IMPORT_DISCOVERY_TIMEOUT,
                     discovery_bytes: self.resources.tmux_discovery_bytes,
@@ -3066,7 +3057,6 @@ impl RunManager {
                 spec,
                 lineage: None,
                 persistence_mode: self.persistence_mode(),
-                live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
                 native_runs: self.native_runs.clone(),
                 terminal_publications: self.terminal_publications.clone(),
@@ -3131,7 +3121,6 @@ struct NativeSpawnConfig {
     spec: RunSpec,
     lineage: Option<RunLineage>,
     persistence_mode: PersistenceMode,
-    live_event_capacity: usize,
     input_drains: InputDrainGate,
     native_runs: NativeRuntimeOwner,
     terminal_publications: TerminalPublicationOwner,
@@ -3183,7 +3172,6 @@ impl From<PersistentCollectionCandidate> for PersistentCandidate {
 struct TmuxImportConfig {
     discovery_bytes: usize,
     id: RunId,
-    live_event_capacity: usize,
     terminal_publications: TerminalPublicationOwner,
     discovery_deadline: Instant,
     prepare_deadline: Instant,
@@ -3406,14 +3394,12 @@ struct Run {
 }
 
 struct LiveEventOwner {
-    capacity: usize,
     budget: crate::resources::ByteBudget,
     state: Mutex<LiveEventState>,
 }
 
 struct LiveEventState {
-    sender: Option<broadcast::Sender<LiveRunEvent>>,
-    ring_memory: Option<crate::resources::BytePermit>,
+    sender: Option<live_event_journal::Sender>,
     cursor: LiveEventCursor,
 }
 
@@ -3437,7 +3423,50 @@ struct LiveEventCursor {
     gap_causes: GapCauseRevisions,
 }
 
-// The ring may evict a Gap itself. Per-cause stamps preserve the facts between
+impl LiveEventCursor {
+    fn record(&mut self, event: &RunEvent) {
+        match event {
+            RunEvent::Output { chunk } => {
+                self.output_bytes = self.output_bytes.max(chunk.end_byte);
+            }
+            RunEvent::Gap {
+                latest_output_bytes,
+                causes,
+            } => {
+                self.output_discontinuity_revision = self
+                    .output_discontinuity_revision
+                    .checked_add(1)
+                    .expect("live output-discontinuity revision remains representable");
+                self.latest_output_discontinuity_byte = *latest_output_bytes;
+                self.gap_causes.record(*causes);
+            }
+            RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => {
+                self.terminal_revision = self
+                    .terminal_revision
+                    .checked_add(1)
+                    .expect("live terminal revision remains representable");
+            }
+            RunEvent::Tmux { .. } | RunEvent::ObservationDiscontinuity => {
+                self.observation_revision = self
+                    .observation_revision
+                    .checked_add(1)
+                    .expect("live observation revision remains representable");
+            }
+            RunEvent::ServiceChanged { .. } | RunEvent::Resized { .. } => {
+                let revision = if matches!(&event, RunEvent::Resized { .. }) {
+                    &mut self.resize_revision
+                } else {
+                    &mut self.service_revision
+                };
+                *revision = revision
+                    .checked_add(1)
+                    .expect("live recoverable snapshot revision remains representable");
+            }
+        }
+    }
+}
+
+// The journal may retire a Gap itself. Per-cause stamps preserve the facts between
 // two subscriber boundaries without retaining another event journal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GapCauseRevisions {
@@ -3494,14 +3523,15 @@ enum PublishedRunEvent {
     Funded(Arc<FundedRunEvent>),
     OutputGap(u64, ctxmux_protocol::OutputGapCauses),
     ObservationDiscontinuity,
+    SnapshotNeeded,
 }
 
 const EVENT_ALLOCATION_BYTES: usize =
     std::mem::size_of::<FundedRunEvent>() + 2 * std::mem::size_of::<usize>();
 
 impl LiveRunEvent {
-    fn event(&self) -> std::borrow::Cow<'_, RunEvent> {
-        match &self.published {
+    fn event(&self) -> Option<std::borrow::Cow<'_, RunEvent>> {
+        Some(match &self.published {
             PublishedRunEvent::Funded(funded) => std::borrow::Cow::Borrowed(&funded.event),
             PublishedRunEvent::OutputGap(latest_output_bytes, causes) => {
                 std::borrow::Cow::Owned(RunEvent::Gap {
@@ -3512,31 +3542,29 @@ impl LiveRunEvent {
             PublishedRunEvent::ObservationDiscontinuity => {
                 std::borrow::Cow::Owned(RunEvent::ObservationDiscontinuity)
             }
-        }
+            PublishedRunEvent::SnapshotNeeded => return None,
+        })
     }
 }
 
 struct LiveEventSubscription {
-    receiver: broadcast::Receiver<LiveRunEvent>,
+    receiver: live_event_journal::Receiver,
     cursor: LiveEventCursor,
 }
 
 impl LiveEventOwner {
     #[cfg(test)]
-    fn new(capacity: usize) -> Self {
-        Self::with_budget(
-            capacity,
-            crate::resources::ByteBudget::new(ResourceLimits::DEFAULT.live_event_bytes),
-        )
+    fn new() -> Self {
+        Self::with_budget(crate::resources::ByteBudget::new(
+            ResourceLimits::DEFAULT.live_event_bytes,
+        ))
     }
 
-    fn with_budget(capacity: usize, budget: crate::resources::ByteBudget) -> Self {
+    fn with_budget(budget: crate::resources::ByteBudget) -> Self {
         Self {
-            capacity,
             budget,
             state: Mutex::new(LiveEventState {
                 sender: None,
-                ring_memory: None,
                 cursor: LiveEventCursor {
                     output_bytes: 0,
                     output_discontinuity_revision: 0,
@@ -3553,79 +3581,58 @@ impl LiveEventOwner {
 
     fn publish(&self, mut event: RunEvent) {
         let mut state = mutex_lock(&self.state);
-        // The lease follows each heap envelope past ring eviction and across
-        // async sends, including events with no variable payload.
-        let memory = if matches!(&event, RunEvent::Gap { .. }) {
-            // Inline marker storage is already funded with the broadcast ring.
-            // Pressure must not replace a known source cause with metadata loss.
-            None
-        } else if state
+        // Fund actual container growth and the shared payload before publication.
+        // Retirement is Run-local; original output and durable replay remain
+        // authoritative. Leases held by async receivers remain charged.
+        let prepared = state
             .sender
             .as_ref()
-            .is_some_and(|sender| sender.receiver_count() > 0)
+            .filter(|sender| sender.receiver_count() > 0)
+            .map(|sender| {
+                sender.prepare(if matches!(&event, RunEvent::Gap { .. }) {
+                    None
+                } else {
+                    Some(Self::payload_capacity(&event).saturating_add(EVENT_ALLOCATION_BYTES))
+                })
+            });
+        if prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.retired_output)
         {
-            let bytes = Self::payload_capacity(&event);
-            if let Some(permit) = self
-                .budget
-                .reserve(bytes.saturating_add(EVENT_ALLOCATION_BYTES))
-            {
-                Some(permit)
-            } else {
-                event = match &event {
-                    RunEvent::Output { chunk } => RunEvent::Gap {
-                        latest_output_bytes: chunk.end_byte,
-                        causes: ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE,
-                    },
-                    _ => RunEvent::ObservationDiscontinuity,
-                };
-                None
-            }
-        } else {
-            None
-        };
+            state.cursor.output_discontinuity_revision = state
+                .cursor
+                .output_discontinuity_revision
+                .checked_add(1)
+                .expect("live output-discontinuity revision remains representable");
+            state.cursor.latest_output_discontinuity_byte = state
+                .cursor
+                .output_bytes
+                .max(state.cursor.latest_output_discontinuity_byte);
+            state
+                .cursor
+                .gap_causes
+                .record(ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE);
+        }
+        let memory = prepared.and_then(|prepared| prepared.memory);
+        if memory.is_none()
+            && !matches!(&event, RunEvent::Gap { .. })
+            && state
+                .sender
+                .as_ref()
+                .is_some_and(|sender| sender.receiver_count() > 0)
+        {
+            event = match &event {
+                RunEvent::Output { chunk } => RunEvent::Gap {
+                    latest_output_bytes: chunk.end_byte,
+                    causes: ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE,
+                },
+                RunEvent::Tmux { .. } => RunEvent::ObservationDiscontinuity,
+                _ => event,
+            };
+        }
 
         let before = state.cursor;
-        match &event {
-            RunEvent::Output { chunk } => {
-                state.cursor.output_bytes = state.cursor.output_bytes.max(chunk.end_byte);
-            }
-            RunEvent::Gap {
-                latest_output_bytes,
-                causes,
-            } => {
-                state.cursor.output_discontinuity_revision = state
-                    .cursor
-                    .output_discontinuity_revision
-                    .checked_add(1)
-                    .expect("live output-discontinuity revision remains representable");
-                state.cursor.latest_output_discontinuity_byte = *latest_output_bytes;
-                state.cursor.gap_causes.record(*causes);
-            }
-            RunEvent::Exited { .. } | RunEvent::Interrupted { .. } => {
-                state.cursor.terminal_revision = state
-                    .cursor
-                    .terminal_revision
-                    .checked_add(1)
-                    .expect("live terminal revision remains representable");
-            }
-            RunEvent::Tmux { .. } | RunEvent::ObservationDiscontinuity => {
-                state.cursor.observation_revision = state
-                    .cursor
-                    .observation_revision
-                    .checked_add(1)
-                    .expect("live observation revision remains representable");
-            }
-            RunEvent::ServiceChanged { .. } | RunEvent::Resized { .. } => {
-                let revision = if matches!(&event, RunEvent::Resized { .. }) {
-                    &mut state.cursor.resize_revision
-                } else {
-                    &mut state.cursor.service_revision
-                };
-                *revision = revision
-                    .checked_add(1)
-                    .expect("live recoverable snapshot revision remains representable");
-            }
-        }
+        state.cursor.record(&event);
         if let Some(sender) = state.sender.as_ref() {
             let published = match memory {
                 Some(memory) => PublishedRunEvent::Funded(Arc::new(FundedRunEvent {
@@ -3637,7 +3644,10 @@ impl LiveEventOwner {
                         latest_output_bytes,
                         causes,
                     } => PublishedRunEvent::OutputGap(latest_output_bytes, causes),
-                    _ => PublishedRunEvent::ObservationDiscontinuity,
+                    RunEvent::ObservationDiscontinuity | RunEvent::Tmux { .. } => {
+                        PublishedRunEvent::ObservationDiscontinuity
+                    }
+                    _ => PublishedRunEvent::SnapshotNeeded,
                 },
             };
             let envelope = LiveRunEvent {
@@ -3645,7 +3655,7 @@ impl LiveEventOwner {
                 before,
                 after: state.cursor,
             };
-            let _ = sender.send(envelope);
+            sender.send(envelope);
         }
     }
 
@@ -4082,10 +4092,7 @@ impl Run {
             terminal_ordinal,
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::with_budget(
-                LIVE_EVENT_CAPACITY,
-                retention_budget.event_budget(),
-            ),
+            events: LiveEventOwner::with_budget(retention_budget.event_budget()),
             retention_budget,
         })
     }
@@ -4127,7 +4134,7 @@ impl Run {
                 },
                 lineage: None,
                 persistence_mode: PersistenceMode::MemoryOnly,
-                live_event_capacity: LIVE_EVENT_CAPACITY,
+
                 input_drains: InputDrainGate::default(),
                 native_runs,
                 terminal_publications: TerminalPublicationOwner::default(),
@@ -4146,7 +4153,6 @@ impl Run {
         spec: RunSpec,
         lineage: Option<RunLineage>,
         persistence_mode: PersistenceMode,
-        live_event_capacity: usize,
         input_drains: InputDrainGate,
     ) -> Result<Arc<Self>, ProtocolError> {
         Self::spawn_with_hooks(
@@ -4155,7 +4161,7 @@ impl Run {
                 spec,
                 lineage,
                 persistence_mode,
-                live_event_capacity,
+
                 input_drains,
                 native_runs: NativeRuntimeOwner::default(),
                 terminal_publications: TerminalPublicationOwner::default(),
@@ -4227,7 +4233,6 @@ impl Run {
                 spec,
                 lineage: None,
                 persistence_mode,
-                live_event_capacity: LIVE_EVENT_CAPACITY,
                 input_drains: InputDrainGate::default(),
                 native_runs: NativeRuntimeOwner::default(),
                 terminal_publications,
@@ -4417,10 +4422,7 @@ impl Run {
             terminal_ordinal: OnceLock::new(),
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::with_budget(
-                config.live_event_capacity,
-                config.retention_budget.event_budget(),
-            ),
+            events: LiveEventOwner::with_budget(config.retention_budget.event_budget()),
             retention_budget: config.retention_budget,
         });
         Self::register_retention(run)
@@ -4515,10 +4517,7 @@ impl Run {
             terminal_ordinal: OnceLock::new(),
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::with_budget(
-                config.live_event_capacity,
-                config.retention_budget.event_budget(),
-            ),
+            events: LiveEventOwner::with_budget(config.retention_budget.event_budget()),
             retention_budget: config.retention_budget,
         });
         let run = Self::register_retention(run);
@@ -4638,7 +4637,7 @@ impl Run {
     fn recover(
         recovered: RecoveredRun,
         persistence: PersistentRun,
-        live_event_capacity: usize,
+
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
         retention_budget: RetentionBudget,
@@ -4646,7 +4645,6 @@ impl Run {
         Self::recover_with_control(
             recovered,
             persistence,
-            live_event_capacity,
             terminal_publications,
             qualification_stats,
             retention_budget,
@@ -4658,7 +4656,7 @@ impl Run {
     fn recover_with_control(
         recovered: RecoveredRun,
         persistence: PersistentRun,
-        live_event_capacity: usize,
+
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
         retention_budget: RetentionBudget,
@@ -4700,10 +4698,7 @@ impl Run {
             terminal_ordinal,
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::with_budget(
-                live_event_capacity,
-                retention_budget.event_budget(),
-            ),
+            events: LiveEventOwner::with_budget(retention_budget.event_budget()),
             retention_budget,
         });
         Self::register_retention(run)
@@ -4730,7 +4725,7 @@ impl Run {
         child_pid: u32,
         input_state: HandoffInputState,
         native_runs: NativeRuntimeOwner,
-        live_event_capacity: usize,
+
         terminal_publications: TerminalPublicationOwner,
         qualification_stats: QualificationStats,
         input_drains: InputDrainGate,
@@ -4835,10 +4830,7 @@ impl Run {
             terminal_ordinal,
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: LiveEventOwner::with_budget(
-                live_event_capacity,
-                retention_budget.event_budget(),
-            ),
+            events: LiveEventOwner::with_budget(retention_budget.event_budget()),
             retention_budget,
         });
         let run = Self::register_retention(run);
@@ -5318,28 +5310,22 @@ impl Run {
         // Taking the lock first closes the count-to-subscription race: once
         // publishers can observe the new attachment, its receiver exists.
         let mut event_state = mutex_lock(&self.events.state);
-        if event_state.sender.is_none() {
-            // Tokio broadcast uses a power-of-two boxed ring of Mutex<Slot<T>>;
-            // Slot owns remaining receivers, position and Option<T>. Shared
-            // control/allocator headers have an additional 1 KiB reservation.
-            let slots = self.events.capacity.next_power_of_two();
-            let bytes = slots
-                .saturating_mul(std::mem::size_of::<
-                    Mutex<(AtomicUsize, u64, Option<LiveRunEvent>)>,
-                >())
-                .saturating_add(1024);
-            event_state.ring_memory = Some(self.events.budget.reserve(bytes).ok_or_else(|| ProtocolError::new(
-                ErrorCode::BackendUnavailable, "live event buffer policy exhausted; increase live_event_bytes or release an attachment",
-            ))?);
-        }
+        let exhausted = || {
+            ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "live event allocation policy exhausted; increase live_event_bytes or release an attachment",
+            )
+        };
+        let receiver = if let Some(sender) = event_state.sender.as_ref() {
+            sender.subscribe().ok_or_else(exhausted)?
+        } else {
+            let sender = live_event_journal::Sender::new(self.events.budget.clone())
+                .ok_or_else(exhausted)?;
+            let receiver = sender.subscribe().ok_or_else(exhausted)?;
+            event_state.sender = Some(sender);
+            receiver
+        };
         self.attachments.fetch_add(1, Ordering::AcqRel);
-        let receiver = event_state
-            .sender
-            .get_or_insert_with(|| {
-                let (sender, _) = broadcast::channel(self.events.capacity);
-                sender
-            })
-            .subscribe();
         let subscription = LiveEventSubscription {
             receiver,
             cursor: event_state.cursor,
@@ -6362,7 +6348,6 @@ impl Drop for AttachmentGuard {
         let mut state = mutex_lock(&self.run.events.state);
         if self.run.attachments.load(Ordering::Acquire) == 0 {
             state.sender.take();
-            state.ring_memory.take();
         }
     }
 }
@@ -7546,17 +7531,17 @@ mod tests {
 
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
-        CreationTestHook, HandoffInputState, LIVE_EVENT_CAPACITY, LaunchSetupStep,
-        NativeRuntimeOwner, NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay,
-        PendingTmuxPublication, Persistence, PersistenceBinding, PersistenceMode, RecoveredRun,
-        Run, RunManager, ServerError, ServerFrame, TMUX_DISCOVERY_TIMEOUT,
-        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
-        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
-        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
-        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
-        TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission, UpgradeRequestGate, codec,
-        mutex_lock, prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
-        send_capped, serve_with_manager, serve_with_persistence_manager, spawn_error,
+        CreationTestHook, HandoffInputState, LaunchSetupStep, NativeRuntimeOwner,
+        NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
+        Persistence, PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager,
+        ServerError, ServerFrame, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
+        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
+        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
+        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
+        TmuxRunControl, TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission,
+        UpgradeRequestGate, codec, mutex_lock, prepare_socket_path, prepare_socket_path_with_hook,
+        resolve_tmux_termination, send_capped, serve_with_manager, serve_with_persistence_manager,
+        spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
 
@@ -8073,7 +8058,6 @@ mod tests {
             child_pid,
             HandoffInputState::empty(),
             native_runs.clone(),
-            LIVE_EVENT_CAPACITY,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
             input_drains,
@@ -8563,7 +8547,7 @@ mod tests {
             terminal_ordinal: std::sync::OnceLock::new(),
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: super::LiveEventOwner::new(1),
+            events: super::LiveEventOwner::new(),
             retention_budget: crate::retention::RetentionBudget::production(),
         });
         (run, command_rx)
@@ -9170,17 +9154,6 @@ mod tests {
         Arc<AttachmentTestHook>,
         mpsc::UnboundedReceiver<()>,
     ) {
-        hooked_server_with_capacity(point, LIVE_EVENT_CAPACITY)
-    }
-
-    fn hooked_server_with_capacity(
-        point: AttachmentHookPoint,
-        live_event_capacity: usize,
-    ) -> (
-        InProcessServer,
-        Arc<AttachmentTestHook>,
-        mpsc::UnboundedReceiver<()>,
-    ) {
         let (reached_tx, reached_rx) = mpsc::unbounded_channel();
         let hook = Arc::new(AttachmentTestHook {
             point,
@@ -9190,7 +9163,7 @@ mod tests {
         });
         let manager = Arc::new(RunManager {
             attachment_hook: Some(Arc::clone(&hook)),
-            live_event_capacity,
+
             ..RunManager::default()
         });
         (InProcessServer::start(manager), hook, reached_rx)
@@ -9214,8 +9187,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gap_geometry_only_lag_keeps_two_real_runs_and_exact_raw_replay() {
-        let (server, hook, mut reached) =
-            hooked_server_with_capacity(AttachmentHookPoint::AfterSnapshot, 2);
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSnapshot);
         hook.armed.store(false, Ordering::Release);
         let clients = [
             server.client.clone(),
@@ -9238,6 +9210,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let observed_run = server.manager.get(runs[0].id).unwrap();
+        let pressure = pressure_live_backlog(&observed_run, super::EVENT_ALLOCATION_BYTES);
         for size in [
             TerminalSize { rows: 5, cols: 13 },
             TerminalSize { rows: 6, cols: 14 },
@@ -9265,6 +9239,9 @@ mod tests {
             .input(runs[1].id, b"healthy\n".to_vec())
             .await
             .unwrap();
+        // The other original child accepts input under the same global pressure;
+        // release the test lease to admit its new replay subscriber afterwards.
+        drop(pressure);
         expect_original_raw(&clients[1], &runs[1], b"READYhealthy\n").await;
         hook.release.notify_one();
         assert_eq!(
@@ -9298,8 +9275,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn gap_snapshot_covered_geometry_does_not_invent_a_continuation_failure() {
-        let (server, hook, mut reached) =
-            hooked_server_with_capacity(AttachmentHookPoint::AfterSubscribe, 2);
+        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterSubscribe);
         let info = server.client.start(long_running_spec()).await.unwrap();
         let client = server.client.clone();
         let id = info.id;
@@ -9357,12 +9333,41 @@ mod tests {
         assert!(!process_exists(info.pid.unwrap()));
     }
 
+    fn live_owner_with_payload_allowance(
+        available: usize,
+        receivers: usize,
+    ) -> (
+        super::LiveEventOwner,
+        Vec<super::live_event_journal::Receiver>,
+        crate::resources::ByteBudget,
+        crate::resources::BytePermit,
+    ) {
+        // Test-only global pressure, derived from actual owner allocations.
+        // The original event workload is unchanged; no slot-count cap is set.
+        let limit = 1024 * 1024;
+        let budget = crate::resources::ByteBudget::new(limit);
+        let owner = super::LiveEventOwner::with_budget(budget.clone());
+        let sender = super::live_event_journal::Sender::new(budget.clone()).unwrap();
+        let receivers = (0..receivers)
+            .map(|_| sender.subscribe().unwrap())
+            .collect();
+        mutex_lock(&owner.state).sender = Some(sender);
+        let pressure = budget
+            .reserve(
+                usize::try_from(limit).unwrap()
+                    - usize::try_from(budget.used()).unwrap()
+                    - available,
+            )
+            .unwrap();
+        (owner, receivers, budget, pressure)
+    }
+
     #[tokio::test]
     async fn gap_pressure_marker_preserves_source_cause_and_evicted_cause_stamps() {
-        let budget = crate::resources::ByteBudget::new((super::EVENT_ALLOCATION_BYTES + 1) as u64);
-        let owner = super::LiveEventOwner::with_budget(1, budget.clone());
-        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
-        mutex_lock(&owner.state).sender = Some(sender);
+        let (owner, mut receivers, budget, _pressure) =
+            live_owner_with_payload_allowance(super::EVENT_ALLOCATION_BYTES + 1, 1);
+        let mut receiver = receivers.pop().unwrap();
+        let baseline = budget.used();
         let before = owner.cursor();
         owner.publish(RunEvent::Output {
             chunk: ctxmux_protocol::OutputChunk {
@@ -9381,7 +9386,7 @@ mod tests {
         ));
         let retained = receiver.recv().await.unwrap();
         assert_eq!(
-            retained.event().as_ref(),
+            retained.event().unwrap().as_ref(),
             &RunEvent::Gap {
                 latest_output_bytes: 2,
                 causes: ctxmux_protocol::OutputGapCauses::SOURCE_DISCONTINUITY
@@ -9394,8 +9399,8 @@ mod tests {
         );
         assert_eq!(
             budget.used(),
-            0,
-            "inline markers do not fabricate another heap lease"
+            baseline,
+            "inline markers add no heap lease beyond the funded owner/receiver"
         );
     }
 
@@ -10681,7 +10686,6 @@ mod tests {
         let run = Run::recover(
             recovered,
             durable,
-            16,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
             crate::retention::RetentionBudget::with_limit(u64::MAX),
@@ -10702,7 +10706,7 @@ mod tests {
             .try_recv()
             .expect("subscribed raw event is published");
         assert!(
-            matches!(envelope.event().as_ref(), RunEvent::Output { chunk }
+            matches!(envelope.event().unwrap().as_ref(), RunEvent::Output { chunk }
             if chunk.start_byte == 0 && chunk.end_byte == 5 && chunk.data == b"alpha")
         );
         reached
@@ -10844,7 +10848,6 @@ mod tests {
                 metadata_bytes: 0,
             },
             durable,
-            16,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
             crate::retention::RetentionBudget::with_limit(u64::MAX),
@@ -11001,7 +11004,6 @@ mod tests {
                 metadata_bytes: 0,
             },
             durable,
-            16,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
             crate::retention::RetentionBudget::with_limit(u64::MAX),
@@ -11105,7 +11107,6 @@ mod tests {
                 metadata_bytes: 0,
             },
             durable,
-            16,
             TerminalPublicationOwner::default(),
             crate::qualification_stats::QualificationStats::default(),
             crate::retention::RetentionBudget::with_limit(u64::MAX),
@@ -11478,11 +11479,9 @@ mod tests {
     #[tokio::test]
     async fn broadcast_receivers_share_one_funded_payload_until_the_last_owner_drops() {
         let bytes = super::EVENT_ALLOCATION_BYTES + 8;
-        let budget = crate::resources::ByteBudget::new(bytes as u64);
-        let owner = super::LiveEventOwner::with_budget(2, budget.clone());
-        let (sender, mut first) = tokio::sync::broadcast::channel(2);
-        let mut second = sender.subscribe();
-        mutex_lock(&owner.state).sender = Some(sender);
+        let (owner, mut receivers, budget, _pressure) = live_owner_with_payload_allowance(bytes, 2);
+        let mut first = receivers.pop().unwrap();
+        let mut second = receivers.pop().unwrap();
         owner.publish(RunEvent::Output {
             chunk: ctxmux_protocol::OutputChunk {
                 start_byte: 0,
@@ -11511,10 +11510,8 @@ mod tests {
     #[tokio::test]
     async fn empty_event_envelopes_remain_funded_after_ring_eviction() {
         let bytes = super::EVENT_ALLOCATION_BYTES;
-        let budget = crate::resources::ByteBudget::new(bytes as u64);
-        let owner = super::LiveEventOwner::with_budget(1, budget.clone());
-        let (sender, mut receiver) = tokio::sync::broadcast::channel(1);
-        mutex_lock(&owner.state).sender = Some(sender);
+        let (owner, mut receivers, budget, _pressure) = live_owner_with_payload_allowance(bytes, 1);
+        let mut receiver = receivers.pop().unwrap();
         owner.publish(RunEvent::Resized {
             size: TerminalSize::default(),
             through_byte: 0,
@@ -11534,12 +11531,13 @@ mod tests {
             let marker = receiver.recv().await.unwrap();
             assert!(matches!(
                 marker.published,
-                super::PublishedRunEvent::ObservationDiscontinuity
+                super::PublishedRunEvent::SnapshotNeeded
             ));
-            assert!(matches!(
-                marker.event().as_ref(),
-                RunEvent::ObservationDiscontinuity
-            ));
+            assert_eq!(
+                marker.after.observation_revision, 0,
+                "known snapshots must not invent nonreplayable observation loss"
+            );
+            assert!(marker.after.resize_revision > marker.before.resize_revision);
             assert!(
                 budget.reserve(1).is_none(),
                 "held envelope keeps its lease after eviction"
@@ -11571,7 +11569,7 @@ mod tests {
             first_events
                 .receiver
                 .try_recv()
-                .map(|envelope| envelope.event().into_owned()),
+                .map(|envelope| envelope.event().unwrap().into_owned()),
             Ok(RunEvent::Gap {
                 latest_output_bytes: 7,
                 causes: ctxmux_protocol::OutputGapCauses::UNKNOWN,
@@ -11585,7 +11583,7 @@ mod tests {
         assert!(mutex_lock(&run.events.state).sender.is_none());
     }
 
-    fn tmux_delivery_test_run(pane_pid: u32, live_event_capacity: usize) -> Arc<Run> {
+    fn tmux_delivery_test_run(pane_pid: u32) -> Arc<Run> {
         let (commands, _command_rx) = std::sync::mpsc::channel();
         let (_completion_tx, completion) = std::sync::mpsc::channel::<Result<(), String>>();
         Arc::new(Run {
@@ -11627,9 +11625,24 @@ mod tests {
             terminal_ordinal: std::sync::OnceLock::new(),
             live_permit: Mutex::new(None),
             terminal_visible: Notify::new(),
-            events: super::LiveEventOwner::new(live_event_capacity),
+            events: super::LiveEventOwner::new(),
             retention_budget: crate::retention::RetentionBudget::production(),
         })
+    }
+
+    fn pressure_live_backlog(
+        run: &Run,
+        available_payload_bytes: usize,
+    ) -> crate::resources::BytePermit {
+        let budget = &run.events.budget;
+        let limit = super::ResourceLimits::DEFAULT.live_event_bytes;
+        budget
+            .reserve(
+                usize::try_from(limit).unwrap()
+                    - usize::try_from(budget.used()).unwrap()
+                    - available_payload_bytes,
+            )
+            .expect("fixture funds a real global byte-pressure owner")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11643,7 +11656,7 @@ mod tests {
             .spawn()
             .expect("spawn tmux-owned pane sentinel");
         let pane_pid = pane.id();
-        let run = tmux_delivery_test_run(pane_pid, 2);
+        let run = tmux_delivery_test_run(pane_pid);
         server
             .manager
             .registry
@@ -11661,6 +11674,8 @@ mod tests {
             .expect("attachment reaches snapshot barrier")
             .expect("attachment barrier remains connected");
 
+        // Force the protected resource, not an implementation slot count.
+        let journal_pressure = pressure_live_backlog(&run, super::EVENT_ALLOCATION_BYTES + 1);
         run.record_output(b"a".to_vec());
         run.publish_event(RunEvent::Tmux {
             event: TmuxRunEvent::SessionRenamed {
@@ -11682,6 +11697,7 @@ mod tests {
         run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
         run.record_output(b"c".to_vec());
         run.record_output(b"d".to_vec());
+        let _journal_pressure = journal_pressure;
         hook.release.notify_one();
 
         assert_eq!(
@@ -11730,7 +11746,7 @@ mod tests {
             .spawn()
             .expect("spawn retained-observation pane sentinel");
         let pane_pid = pane.id();
-        let run = tmux_delivery_test_run(pane_pid, 3);
+        let run = tmux_delivery_test_run(pane_pid);
         server
             .manager
             .registry
@@ -11745,9 +11761,13 @@ mod tests {
             .expect("attachment reaches retained-observation barrier")
             .expect("retained-observation barrier remains connected");
 
+        // Force the protected resource, not an implementation slot count.
+        let journal_pressure = pressure_live_backlog(&run, super::EVENT_ALLOCATION_BYTES + 1);
         for byte in b"abcd" {
             run.record_output(vec![*byte]);
         }
+        // Retain the observation/terminal boundary after output-only pressure.
+        drop(journal_pressure);
         run.publish_event(RunEvent::Tmux {
             event: TmuxRunEvent::SessionRenamed {
                 name: b"retained".to_vec(),
@@ -11760,7 +11780,8 @@ mod tests {
             next_event_before_timeout(&attachment).await,
             Some(RunEvent::Gap {
                 latest_output_bytes: 4,
-                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG,
+                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG
+                    .union(ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE),
             })
         );
         assert_eq!(
@@ -11795,7 +11816,7 @@ mod tests {
             .spawn()
             .expect("spawn terminal-resnapshot pane sentinel");
         let pane_pid = pane.id();
-        let run = tmux_delivery_test_run(pane_pid, 1);
+        let run = tmux_delivery_test_run(pane_pid);
         server
             .manager
             .registry
@@ -11810,16 +11831,20 @@ mod tests {
             .expect("attachment reaches terminal-overwrite barrier")
             .expect("terminal-overwrite barrier remains connected");
 
+        // Force the protected resource, not an implementation slot count.
+        let journal_pressure = pressure_live_backlog(&run, super::EVENT_ALLOCATION_BYTES + 1);
         run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
         run.record_output(b"a".to_vec());
         run.record_output(b"b".to_vec());
+        let _journal_pressure = journal_pressure;
         hook.release.notify_one();
 
         assert_eq!(
             next_event_before_timeout(&attachment).await,
             Some(RunEvent::Gap {
                 latest_output_bytes: 2,
-                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG,
+                causes: ctxmux_protocol::OutputGapCauses::SUBSCRIBER_LAG
+                    .union(ctxmux_protocol::OutputGapCauses::LIVE_EVENT_PRESSURE),
             })
         );
         assert_eq!(
@@ -11859,7 +11884,7 @@ mod tests {
             .spawn()
             .expect("spawn join-window pane sentinel");
         let pane_pid = pane.id();
-        let run = tmux_delivery_test_run(pane_pid, 2);
+        let run = tmux_delivery_test_run(pane_pid);
         server
             .manager
             .registry
@@ -11920,7 +11945,7 @@ mod tests {
             .spawn()
             .expect("spawn terminal-join output sentinel");
         let pane_pid = pane.id();
-        let run = tmux_delivery_test_run(pane_pid, 2);
+        let run = tmux_delivery_test_run(pane_pid);
         run.publish_interrupted(InterruptionReason::TmuxServerUnavailable);
         server
             .manager
@@ -12001,7 +12026,6 @@ mod tests {
             release: Notify::new(),
         });
         let manager = Arc::new(RunManager {
-            live_event_capacity: 2,
             attachment_hook: Some(Arc::clone(&hook)),
             ..RunManager::default()
         });
@@ -12061,6 +12085,8 @@ mod tests {
             .expect("attachment reaches post-snapshot barrier")
             .expect("attachment barrier remains connected");
 
+        let recorded_run = manager.get(run.id).expect("Gap Run remains manager-owned");
+        let pressure = pressure_live_backlog(&recorded_run, super::EVENT_ALLOCATION_BYTES + 1);
         client
             .input(run.id, b"x".to_vec())
             .await
@@ -12089,19 +12115,22 @@ mod tests {
         .expect("daemon records all controlled output");
         hook.release.notify_one();
 
-        let gap_head =
-            match tokio::time::timeout(Duration::from_secs(5), lagged_attachment.next_event())
-                .await
-                .expect("lagged attachment reports Gap")
-                .expect("read lagged attachment event")
-                .expect("lagged attachment remains connected")
-            {
-                RunEvent::Gap {
-                    latest_output_bytes,
-                    ..
-                } => latest_output_bytes,
-                event => panic!("expected public Gap event, got {event:?}"),
-            };
+        let gap_head = match tokio::time::timeout(
+            Duration::from_secs(5),
+            next_non_service_event(&lagged_attachment),
+        )
+        .await
+        .expect("lagged attachment reports Gap")
+        .expect("read lagged attachment event")
+        .expect("lagged attachment remains connected")
+        {
+            RunEvent::Gap {
+                latest_output_bytes,
+                ..
+            } => latest_output_bytes,
+            event => panic!("expected public Gap event, got {event:?}"),
+        };
+        drop(pressure);
         drop(lagged_attachment);
 
         let (recovered_attachment, recovered) = client

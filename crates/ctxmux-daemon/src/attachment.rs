@@ -255,13 +255,14 @@ pub(super) async fn handle_pinned(
             received = events.recv(), if controls.held_terminal.is_none() && !observation_closed => {
                 match received {
                     Ok(envelope) => {
-                        if receiver_lagged {
+                        let snapshot_needed = matches!(&envelope.published, crate::PublishedRunEvent::SnapshotNeeded);
+                        if receiver_lagged || snapshot_needed {
                             receiver_lagged = false;
                             match recover_lagged_delivery(
                                 &mut wire,
                                 &run,
                                 live_cursor,
-                                envelope.before,
+                                if snapshot_needed { envelope.after } else { envelope.before },
                                 &mut sent_through_byte,
                                 &mut sent_service_revision,
                                 sent_resize_revision,
@@ -291,7 +292,8 @@ pub(super) async fn handle_pinned(
                             }
                         }
                         live_cursor = envelope.after;
-                        let event = envelope.event();
+                        if snapshot_needed { continue; }
+                        let Some(event) = envelope.event() else { continue; };
                         match event.as_ref() {
                             RunEvent::Output { chunk }
                                 if chunk.end_byte <= sent_through_byte => {}

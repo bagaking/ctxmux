@@ -244,7 +244,6 @@ async fn memory_only_output_does_not_take_durable_transition_locks() {
         long_running_spec(),
         None,
         PersistenceMode::MemoryOnly,
-        LIVE_EVENT_CAPACITY,
         InputDrainGate::default(),
     )
     .expect("spawn memory-only output fixture");
@@ -1390,7 +1389,11 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
     let terminal = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let envelope = events.receiver.recv().await.expect("read terminal event");
-            match envelope.event().into_owned() {
+            match envelope
+                .event()
+                .expect("funded event without pressure")
+                .into_owned()
+            {
                 RunEvent::ServiceChanged { service } => {
                     assert!(
                         service.revision > service_revision,
@@ -1414,6 +1417,7 @@ async fn durable_finalize_keeps_reads_responsive_and_late_output_memory_only() {
         .expect("late output remains broadcast")
         .expect("read late output event")
         .event()
+        .expect("funded late output without pressure")
         .into_owned();
     assert!(matches!(
         late,
@@ -3485,7 +3489,6 @@ async fn eight_pending_cleanup_owners_reject_a_ninth_key_before_spawn() {
             long_running_spec(),
             None,
             PersistenceMode::MemoryOnly,
-            LIVE_EVENT_CAPACITY,
             manager.native_input_drains.clone(),
         )
         .expect("spawn real pending cleanup child");

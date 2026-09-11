@@ -119,8 +119,11 @@ Untouched default cells read as complete default Cells, and drawing materializes
 the required prefix. When a normal row enters history, only its exact default
 suffix becomes implicit and unused allocation is released. Blank rows, explicit
 spaces, all rendition bits, wide partners, combining payloads, wrapping and
-alternate cells retained outside the viewport preserve their meaning. Resize,
-reflow and physical-line editing materialize the same cells they require.
+alternate cells retained outside the viewport preserve their meaning. Normal
+default-fill resizing changes semantic width without expanding untouched cells
+in every historical row; it still removes a wide lead clipped at the actual
+right edge. Reflow and physical-line editing materialize the same cells they
+require. Alternate retained cells continue to use their physical-line path.
 
 This representation does not reduce the retained row policy, shorten graphemes
 or change checkpoint bytes. Dense rows and styled blanks retain their full

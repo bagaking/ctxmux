@@ -470,11 +470,12 @@ only an exact default suffix. Styled blanks, explicit spaces, Unicode payloads,
 wide partners, wrap relations and retained alternate physical cells remain
 explicit where required. Returning history to a live viewport, drawing, editing
 and reflow preserve the same cell meaning, including independent bold/faint
-intensity. Packed rendition and wide
-metadata keep the existing Cell size; attribute equality and serialization
-compare text rendition separately from wide-cell geometry.
-This saves representation cost without reducing retention policy or
-original-byte fidelity. It does not fund
+intensity. Packed rendition and wide metadata keep the existing Cell size;
+attribute equality and serialization compare text rendition separately from
+wide-cell geometry. This saves representation cost without reducing retention
+policy or original-byte fidelity. Normal default-fill resize keeps untouched
+cells implicit, including when a height change visits historical rows;
+wide-pair clipping still follows the real semantic right edge. It does not fund
 aggregate terminal allocations or remove the daemon's remaining export and
 recovery policy limits; those resource boundaries still require qualification.
 
@@ -521,8 +522,9 @@ The important guarantees are behavioral, not implied by lock types.
   They provide correlation, not deduplication. A non-increasing ID is fatal
   before mutation; reconnect starts a new ID scope and cannot settle old work.
 - First-party Attachments retain at most 64 unresolved commands, including at
-  most 32 input commands and 1 MiB of input data. Their event inbox is bounded
-  to 256 entries and 1 MiB of byte payload. Local output overflow becomes an
+  most 32 input commands and 1 MiB of input data. Their configurable event
+  inboxes use separate default 1 MiB payload and envelope windows rather than
+  an event-count ceiling. Local output overflow becomes an
   ordered `Gap`; an unrepresentable non-output loss fails the attachment
   closed instead of being mislabeled as replayable output loss.
 - `RunInfo` reads output and lifecycle under separate locks, so it is useful metadata rather than a transactional snapshot of every field.
@@ -667,7 +669,7 @@ owns configurable resource policy. Live owners follow actual host descriptors
 and PTYs plus optional operator quota; retained records independently fund
 metadata and optional record quota. Both modes preserve exact candidate fencing,
 fully quiescent collection and persistent delete-plus-insert COMMIT ownership.
-Hot replay, live-event rings/payloads, control receipts, durable replay, database,
+Hot replay, live-event containers/payloads, control receipts, durable replay, database,
 WAL and handoff each have explicit owners. Hot caches may be smaller than disk
 history or empty; Attach pages available disk history through the public API.
 Valid state exceeding policy is resource pressure, and startup preserves history.
@@ -772,10 +774,21 @@ facts; a client reports its own dropped decoded output. Causes merge without
 discarding earlier origins. A missed resize can invalidate a continuation view
 at an unchanged byte head, so a Gap cannot imply an exact missing byte count.
 
-Three shared cause revisions preserve markers across ring eviction; attachment
-causes do not add shared counters. The inline marker and enlarged cursor storage
-remain part of the existing funded ring layout, calculated from actual type
-sizes. SDK queued diagnostic metadata consumes its existing logical envelope
+Three shared cause revisions preserve markers across delivery retirement;
+attachment causes do not add shared counters. Each observed Run funds one
+Run-local shared delivery owner and actual receiver registry. One inline
+envelope needs no heap-slot preallocation. A backlog grows only after funding
+its actual container capacity and shared payload, including replacement overlap
+and allocator-reported slot slack. Complete consumption or the last receiver's
+departure releases unneeded backing; payload leases held by a receiver remain
+charged. There is no fixed event-count retention ceiling. Funding pressure may
+retire that Run's oldest delivery envelope, reports real output causes or
+reconstructs current non-output facts from authoritative snapshots, and cannot
+alter original replay or another Run's owner. Empty-queue waits register before
+checking readiness, and owner closure wakes receivers after retained boundaries
+drain. This is volatile delivery state, not durable original history.
+
+SDK queued diagnostic metadata consumes its existing logical envelope
 window, and a returned event belongs to the caller. Extra retention cost is
 explicit; no queue, payload, replay or population policy is enlarged to conceal
 pressure. Input receipts and child/Native-service facts remain independent of

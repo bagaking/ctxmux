@@ -5,7 +5,9 @@ use crate::{
     Run, RunControl,
     resources::{ByteBudget, BytePermit, ResourceLimits},
 };
-use ctxmux_protocol::{ForegroundProcess, MAX_FRAME_BYTES, RunForegroundObservation, RunId};
+#[cfg(target_os = "macos")]
+use ctxmux_protocol::ForegroundProcess;
+use ctxmux_protocol::{MAX_FRAME_BYTES, RunForegroundObservation, RunId};
 use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -200,6 +202,7 @@ impl ForegroundObservationOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt as _;
 
     #[cfg(target_os = "macos")]
