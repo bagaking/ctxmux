@@ -709,10 +709,6 @@ async def fleet(runtime, population, soak=0):
         phase_views = []
         async def arm(item):
             i, (run, ready) = item
-            # All-active phase writes binary to every Run. Mixed phase varies
-            # shape by stable identity, keeping 3/4 of the fleet quiet.
-            if shape == "mixed" and i % 4:
-                return
             prefix = expected_by_run[run["id"]]
             view = await View(runtime.protocol, run, prefix, runtime.args.timeout).open()
             runtime.views.append(view)
@@ -743,12 +739,17 @@ async def fleet(runtime, population, soak=0):
         async def observed_arm(item):
             i, (run, _) = item
             return await runtime.ledger.measure("arm_" + shape, arm(item), run=run["id"], selected_index=i)
-        results = await bounded_map(runtime.args.concurrency, list(enumerate(accepted)), observed_arm)
+        # Mixed workload keeps the same three quarters of the fleet quiet.
+        # A quiet Run performs no arm operation and must not manufacture a
+        # zero-work completion in the operation latency denominator.
+        selected = [(i, item) for i, item in enumerate(accepted) if shape != "mixed" or i % 4 == 0]
+        results = await bounded_map(runtime.args.concurrency, selected, observed_arm)
         if any(isinstance(x, BaseException) for x in results):
-            errors += [{"phase": shape, "run": accepted[i][0]["id"], "selected_index": i, "error": repr(x)}
-                       for i, x in enumerate(results) if isinstance(x, BaseException)]
+            phase_errors = [{"phase": shape, "run": run["id"], "selected_index": i, "error": repr(x)}
+                            for (i, (run, _)), x in zip(selected, results) if isinstance(x, BaseException)]
+            errors += phase_errors
             save(runtime.directory / "phase-errors.private.json", {"population": population, "accepted": len(runtime.runs),
-                 "phase": shape, "attempted": len(results), "completed": len(results) - len(errors), "errors": errors})
+                 "phase": shape, "selected_runs": len(selected), "attempted": len(results), "completed": len(results) - len(phase_errors), "errors": phase_errors})
             raise AssertionError("fleet could not arm all selected producers; workload was not reduced")
         released = time.monotonic()
         tickets = b"x" * len(phase_views)
@@ -765,6 +766,7 @@ async def fleet(runtime, population, soak=0):
         facts = [v.facts() for v in phase_views]
         verified_payload = sum(max(0, view.oracle.cursor - view.payload_start) for view in phase_views)
         phases.append({"shape": shape, "seconds": elapsed, "participating_runs": len(facts),
+                       "offered_runs": population, "arm_operations": len(selected), "quiet_runs": population - len(selected),
                        "verified_bytes_including_replay": sum(v["verified_bytes"] for v in facts),
                        "verified_new_payload_bytes": verified_payload,
                        "verified_payload_bytes_per_second": verified_payload / elapsed,

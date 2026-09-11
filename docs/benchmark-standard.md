@@ -94,6 +94,14 @@ separately, raw repetitions, ordering and variance; never average percentiles or
 discard inconvenient outliers. [Google Benchmark](https://github.com/google/benchmark/blob/main/docs/user_guide.md)
 describes repetitions and variance; it does not provide ctxmux SLAs.
 
+An operation latency denominator includes only attempted operations. A quiet
+Run in the asymmetric mixed phase performs no arm operation and contributes no
+arm completion sample. Keep the full offered population, selected producers and
+quiet Runs explicit; changing that statistical denominator must not shrink the
+actual workload. Preserve the selected producer's original fleet index when
+attributing a failed operation. Historical samples that included quiet no-ops
+remain historical evidence and cannot qualify real arm latency.
+
 Budgets require a user contract or an explicitly frozen regression reference,
 with units, scope and derivation. Test deadlines are observation windows, not
 latency SLAs. Existing frozen budgets remain intact. New observational baselines
