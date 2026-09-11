@@ -181,6 +181,34 @@ for (const name of cases) {
     } else {
       assert.equal(result.status, 0, libLog);
       assert.match(raw, /1 passed; 0 failed/);
+      // This build-owned test launcher is not the production tmux binary.
+      // Its first OS executable validation is qualified separately; the public
+      // adapter retains its original short deadline and all gap assertions.
+      const preflightLog = path.join(directory, "native-fixture-preflight.log");
+      command("cargo", ["test", "--locked", "-p", "ctxmux-test-support", "--target-dir", target,
+        "--lib", "tests::native_fixture_probe_declares_only_the_selected_schema_and_rejects_exec",
+        "--", "--exact", "--nocapture"], source, preflightLog);
+      const preflightRaw = fs.readFileSync(preflightLog, "utf8");
+      assert.match(preflightRaw, /running 1 test/);
+      assert.match(preflightRaw, /1 passed; 0 failed/);
+      const fixtureOf = (raw) => {
+        const binary = raw.match(/Running unittests[^\n]* \(([^)]+)\)/)?.[1]
+          ?? raw.match(/Running tests\/[^\n]* \(([^)]+)\)/)?.[1];
+        assert(binary, "actual test executable is recorded");
+        const bytes = fs.readFileSync(path.resolve(source, binary));
+        const images = [];
+        const build = path.join(target, "debug", "build");
+        for (const entry of fs.readdirSync(build)) {
+          if (!entry.startsWith("ctxmux-test-support-")) continue;
+          const outputFile = path.join(build, entry, "output");
+          if (!fs.existsSync(outputFile)) continue;
+          const image = fs.readFileSync(outputFile, "utf8").match(/cargo:rustc-env=CTXMUX_FIXTURE_EXECUTABLE=([^\n]+)/)?.[1];
+          if (image && bytes.includes(Buffer.from(image))) images.push(image);
+        }
+        assert.equal(new Set(images).size, 1, "one exact compile-time native fixture image");
+        return { path: images[0], sha256: digest(images[0]) };
+      };
+      const preflightImage = fixtureOf(preflightRaw);
       const protocolLog = path.join(directory, "public-backend-source-gap.log");
       const protocolResult = spawnSync("cargo", ["test", "--locked", "-p", "ctxmux-daemon", "--target-dir", target, "--test", "tmux_adapter", "public_pause_emits_exact_gap_and_requests_control_mode_continue", "--", "--exact", "--nocapture"], {
         cwd: source, encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
@@ -192,6 +220,12 @@ for (const name of cases) {
       assert.match(protocolRaw, /running 1 test/, "nonempty independent backend gap consumer");
       assert.equal(protocolResult.status, 0, protocolLog);
       assert.match(protocolRaw, /1 passed; 0 failed/);
+      assert.deepEqual(fixtureOf(protocolRaw), preflightImage, "public backend consumes the exact preflighted fixture image");
+      fs.copyFileSync(preflightImage.path, path.join(directory, "executed-native-fixture"));
+      fs.writeFileSync(path.join(directory, "fixture-preflight.json"), JSON.stringify({
+        ...preflightImage, publicAdapterDeadlineChanged: false, coldR3FailurePreserved: true,
+        scope: "build-owned fixture readiness, not production cold-start budget acceptance",
+      }, null, 2) + "\n");
     }
     fs.writeFileSync(path.join(directory, "gap-boundaries.json"), JSON.stringify({
       knownModel: "two real Native Runs; owning mark_output_source_gap; public late continuation",
