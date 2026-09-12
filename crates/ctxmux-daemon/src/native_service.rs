@@ -94,6 +94,26 @@ impl NativeService {
         self.update(|snapshot| snapshot.output = output);
     }
 
+    pub(crate) fn update_output_pressure(&self, pressured: bool) {
+        self.update(|snapshot| {
+            // The service cell owns this atomic transition. A late pressure
+            // observation cannot replace a closed lane or lost owner.
+            if matches!(
+                snapshot.output,
+                NativeOutputStatus::Serving {} | NativeOutputStatus::Backpressured {}
+            ) && matches!(
+                snapshot.owner,
+                NativeOwnerStatus::Serving {} | NativeOwnerStatus::Draining {}
+            ) {
+                snapshot.output = if pressured {
+                    NativeOutputStatus::Backpressured {}
+                } else {
+                    NativeOutputStatus::Serving {}
+                };
+            }
+        });
+    }
+
     pub(crate) fn ready(&self) {
         self.update(|snapshot| {
             snapshot.owner = NativeOwnerStatus::Serving {};
@@ -153,4 +173,43 @@ impl NativeService {
 /// the event ring's existing leases. Weak binding never keeps a Run alive.
 pub(crate) const fn resident_service_owner_bytes() -> usize {
     std::mem::size_of::<ServiceInner>() + 2 * std::mem::size_of::<usize>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeService;
+    use ctxmux_protocol::{NativeOutputStatus, NativeServiceFailure};
+
+    #[test]
+    fn policy_pressure_cannot_replace_closed_or_unavailable_output() {
+        for output in [
+            NativeOutputStatus::Closed {},
+            NativeOutputStatus::Unavailable {
+                reason: NativeServiceFailure::ReadFailed,
+            },
+        ] {
+            let service = NativeService::new(false);
+            service.ready();
+            service.update_output(output);
+            let original = service.snapshot();
+            service.update_output_pressure(true);
+            service.update_output_pressure(false);
+            assert_eq!(
+                service.snapshot(),
+                original,
+                "pressure cannot replace actual closed/unavailable output"
+            );
+        }
+        let service = NativeService::new(false);
+        service.ready();
+        service.stopped(NativeServiceFailure::OwnerStopped);
+        let original = service.snapshot();
+        service.update_output_pressure(true);
+        service.update_output_pressure(false);
+        assert_eq!(
+            service.snapshot(),
+            original,
+            "late pressure cannot revive a stopped owner"
+        );
+    }
 }

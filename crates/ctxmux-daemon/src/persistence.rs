@@ -240,6 +240,14 @@ pub enum PersistenceError {
         /// broken store.
         extended_code: Option<i32>,
     },
+    #[error(
+        "ctxmux filesystem capacity: available={available:?} bytes (None means unknown), next work requires={required} bytes; {detail}; history and original output debt preserved"
+    )]
+    FilesystemCapacity {
+        available: Option<u64>,
+        required: u64,
+        detail: String,
+    },
     #[error("ctxmux persistence actor stopped")]
     ActorStopped,
     #[error(
@@ -341,7 +349,9 @@ impl PersistenceError {
     fn is_capacity_debt(&self) -> bool {
         matches!(
             self,
-            Self::DatabaseCapacity { .. } | Self::PendingPressure(_)
+            Self::DatabaseCapacity { .. }
+                | Self::FilesystemCapacity { .. }
+                | Self::PendingPressure(_)
         )
     }
 
@@ -424,8 +434,20 @@ pub(crate) struct Persistence {
     inner: Arc<PersistenceInner>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "same explicit byte units as the public storage policy consumed by clients"
+)]
+pub(crate) struct EffectiveStoragePolicy {
+    pub(crate) database_bytes: u64,
+    pub(crate) durable_replay_bytes: u64,
+    pub(crate) durable_run_output_bytes: u64,
+}
+
 struct PersistenceInner {
     resources: ResourceLimits,
+    effective_storage: Arc<Mutex<EffectiveStoragePolicy>>,
     lifecycle_space: Arc<tokio::sync::Notify>,
     output_wake: Arc<Mutex<Option<crate::native_runtime::OwnerWake>>>,
     output_wake_requested: Arc<AtomicBool>,
@@ -470,6 +492,7 @@ struct PersistenceInner {
     /// enough to skip the render when the queue is visibly saturated.
     queue_depth: Arc<AtomicUsize>,
     capacity_blocked: Arc<AtomicBool>,
+    capacity_pressure: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     shutdown: Arc<AtomicBool>,
     join: Mutex<Option<thread::JoinHandle<()>>>,
@@ -511,6 +534,9 @@ struct PersistenceTestHooks {
     /// the caller actually handed over is what catches a whole-log recopy.
     #[cfg(test)]
     observed_append: Mutex<Option<ObservedAppend>>,
+    // Controlled observation seam only; physical files and reclamation remain real.
+    filesystem_available_override_plus_one: AtomicU64,
+    filesystem_observation_failed: AtomicBool,
     startup_batch_wal_bytes: Mutex<Vec<u64>>,
     startup_fail_after_commits: AtomicU64,
     startup_over_budget_attempts: AtomicU64,
@@ -519,6 +545,9 @@ struct PersistenceTestHooks {
     fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
     fail_next_append_as_disk_full: AtomicBool,
     force_append_storage_full: AtomicBool,
+    force_compaction_storage_full: AtomicBool,
+    compaction_storage_full_as_database: AtomicBool,
+    compaction_storage_attempts: AtomicU64,
     fail_next_append_as_io_error: AtomicBool,
     fail_next_finalize_as_disk_full: AtomicBool,
     /// Extended `SQLite` result code to inject once on the next append, standing
@@ -861,6 +890,14 @@ impl PersistentRun {
     }
     /// Does not send actor work, read replay, or inspect the database. These are
     /// independent observations, not a receipt that all accepted bytes are saved.
+    pub(crate) fn capacity_blocked_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.persistence.inner.capacity_pressure)
+    }
+
+    pub(crate) fn effective_storage_policy(&self) -> EffectiveStoragePolicy {
+        self.persistence.effective_storage_policy()
+    }
+
     pub(crate) fn storage_observation(&self) -> ctxmux_protocol::RunPersistenceObservation {
         let inner = &self.persistence.inner;
         ctxmux_protocol::RunPersistenceObservation {
@@ -919,6 +956,10 @@ impl PersistentRun {
 
     pub(crate) fn durable_head_owner(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.durable_head)
+    }
+
+    pub(crate) fn offered_head_owner(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.offered_head)
     }
 
     /// The byte offset the next replay must start at.
@@ -1246,6 +1287,21 @@ impl Persistence {
         let _ = self.inner.sender.try_send(Command::LifecycleWake);
     }
 
+    pub(crate) fn effective_storage_policy(&self) -> EffectiveStoragePolicy {
+        *mutex_lock(&self.inner.effective_storage)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_filesystem_available_for_test(&self, available: Option<u64>) {
+        self.inner
+            .test_hooks
+            .filesystem_available_override_plus_one
+            .store(
+                available.map_or(0, |bytes| bytes.checked_add(1).unwrap()),
+                Ordering::Release,
+            );
+    }
+
     pub(crate) fn resources(&self) -> ResourceLimits {
         self.inner.resources
     }
@@ -1398,6 +1454,8 @@ impl Persistence {
         let actor_queue_depth = Arc::clone(&queue_depth);
         let capacity_blocked = Arc::new(AtomicBool::new(false));
         let actor_capacity_blocked = Arc::clone(&capacity_blocked);
+        let capacity_pressure = Arc::new(AtomicBool::new(false));
+        let actor_capacity_pressure = Arc::clone(&capacity_pressure);
         let failure = Arc::new(Mutex::new(None));
         let actor_failure = Arc::clone(&failure);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1416,6 +1474,7 @@ impl Persistence {
                     &lifecycle_rx,
                     &actor_queue_depth,
                     &actor_capacity_blocked,
+                    &actor_capacity_pressure,
                     &init_tx,
                     &actor_failure,
                     &actor_shutdown,
@@ -1427,7 +1486,8 @@ impl Persistence {
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
-        let (runtime_id, epoch, state_lock_fd, recovered) = match init_rx.recv() {
+        let (runtime_id, epoch, state_lock_fd, recovered, effective_storage) = match init_rx.recv()
+        {
             Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -1440,6 +1500,7 @@ impl Persistence {
         };
         let persistence = Self {
             inner: Arc::new(PersistenceInner {
+                effective_storage,
                 resources: admission_limits.resources,
                 lifecycle_space,
                 output_wake,
@@ -1449,6 +1510,7 @@ impl Persistence {
                 lifecycle: lifecycle_tx,
                 queue_depth,
                 capacity_blocked,
+                capacity_pressure,
                 failure,
                 shutdown,
                 join: Mutex::new(Some(join)),
@@ -1943,6 +2005,10 @@ enum CapacityTestAction {
 
 enum Command {
     #[cfg(test)]
+    TestPrepareIdleCompaction {
+        reply: mpsc::SyncSender<Result<bool, PersistenceError>>,
+    },
+    #[cfg(test)]
     TestCapacityFunding {
         action: CapacityTestAction,
         reply: mpsc::SyncSender<Result<(u64, u64, u64), PersistenceError>>,
@@ -2013,7 +2079,16 @@ enum StageCompletion {
 /// The persistence actor's startup handshake payload: the serving epoch, the
 /// raw fd its state lock is held on (surfaced for exec-in-place handoff), and
 /// the reconciled recovered Runs.
-type ActorInit = Result<(RuntimeId, String, RawFd, Vec<RecoveredRun>), PersistenceError>;
+type ActorInit = Result<
+    (
+        RuntimeId,
+        String,
+        RawFd,
+        Vec<RecoveredRun>,
+        Arc<Mutex<EffectiveStoragePolicy>>,
+    ),
+    PersistenceError,
+>;
 
 /// Fold the WAL while the actor's queue is empty, so a later lifecycle verb
 /// finds a small baseline instead of having to create one.
@@ -2051,6 +2126,7 @@ fn actor_main(
     lifecycle_rx: &mpsc::Receiver<Command>,
     queue_depth: &AtomicUsize,
     capacity_blocked: &AtomicBool,
+    capacity_pressure: &AtomicBool,
     init: &mpsc::SyncSender<ActorInit>,
     failure: &Mutex<Option<String>>,
     shutdown: &AtomicBool,
@@ -2079,6 +2155,7 @@ fn actor_main(
         store.epoch.clone(),
         store.state_lock_raw_fd(),
         recovered,
+        Arc::clone(&store.effective_storage),
     ));
     if init.send(init_payload).is_err() {
         return;
@@ -2088,11 +2165,20 @@ fn actor_main(
     let mut pending_lifecycle = None;
     let mut blocked_funding = None;
     let mut capacity_debt = false;
+    let mut capacity_progress = false;
     let mut pending_reason = String::new();
     let mut external_capacity = false;
+    let mut filesystem_debt = false;
     loop {
-        if pending.is_empty() && !capacity_blocked.load(Ordering::Acquire) {
+        if pending.is_empty()
+            && queue_depth.load(Ordering::Acquire) == 0
+            && !capacity_blocked.load(Ordering::Acquire)
+        {
             capacity_debt = false;
+            if capacity_progress {
+                publish_capacity_pressure(capacity_pressure, false, output_wake);
+            }
+            capacity_progress = false;
         }
         // Lifecycle first, at every dequeue. This is the whole of R25: the
         // command was never short of a slot (measured: 1 us blocked at
@@ -2160,16 +2246,42 @@ fn actor_main(
                                 && !capacity_blocked.load(Ordering::Acquire)
                                 && store.compaction_pending
                             {
-                                match store.compact_replay_step() {
-                                    Ok(()) => continue,
+                                let compacted = store
+                                    .compact_replay_step()
+                                    .map_err(|error| store.write_capacity_error(error));
+                                match compacted {
+                                    Ok(()) => {
+                                        if pending.is_empty()
+                                            && queue_depth.load(Ordering::Acquire) == 0
+                                        {
+                                            publish_capacity_pressure(
+                                                capacity_pressure,
+                                                false,
+                                                output_wake,
+                                            );
+                                        }
+                                        continue;
+                                    }
                                     Err(error) if error.is_capacity_debt() => {
                                         pending_reason = error.to_string();
+                                        filesystem_debt = matches!(
+                                            error,
+                                            PersistenceError::FilesystemCapacity { .. }
+                                        );
                                         external_capacity = matches!(
                                             error,
                                             PersistenceError::DatabaseCapacity { .. }
+                                                | PersistenceError::FilesystemCapacity { .. }
                                         );
-                                        blocked_funding =
-                                            store.capacity_funding(external_capacity).ok();
+                                        blocked_funding = store
+                                            .capacity_funding(external_capacity, filesystem_debt)
+                                            .ok();
+                                        capacity_progress = false;
+                                        publish_capacity_pressure(
+                                            capacity_pressure,
+                                            true,
+                                            output_wake,
+                                        );
                                         capacity_blocked.store(true, Ordering::Release);
                                         let _ = crate::diagnostics::record(format_args!("{error}"));
                                     }
@@ -2182,7 +2294,9 @@ fn actor_main(
                                     Err(error) => remember_failure(failure, &error),
                                 }
                             }
-                            if mutex_lock(failure).is_none() {
+                            if mutex_lock(failure).is_none()
+                                && !capacity_blocked.load(Ordering::Acquire)
+                            {
                                 idle_fold_wal(&store, shutdown);
                             }
                             // Block on the append channel alone. A lifecycle
@@ -2195,9 +2309,10 @@ fn actor_main(
                             // which this daemon spent a round driving to zero.
                             let next = if capacity_blocked.load(Ordering::Acquire)
                                 && external_capacity
-                                && blocked_funding.as_ref().is_some_and(
-                                    |(pages, free, limit, _)| pages < limit || *free > 0,
-                                ) {
+                                && (filesystem_debt
+                                    || blocked_funding.as_ref().is_some_and(
+                                        |(pages, free, limit, _)| pages < limit || *free > 0,
+                                    )) {
                                 // A filesystem can regain space without a
                                 // client command. Observe that funding only;
                                 // unchanged capacity never reruns a mutation.
@@ -2233,8 +2348,9 @@ fn actor_main(
             }
             // An observation never retries unchanged policy pressure. External
             // space release or a completed owner mutation must fund a new try.
-            if let Ok(funding) = store.capacity_funding(external_capacity)
-                && blocked_funding.as_ref().is_some_and(|old| *old != funding)
+            if let Ok(funding) = store.capacity_funding(external_capacity, filesystem_debt)
+                && (blocked_funding.as_ref().is_some_and(|old| *old != funding)
+                    || filesystem_debt && blocked_funding.is_none())
             {
                 capacity_blocked.store(false, Ordering::Release);
                 pending.push_back(command);
@@ -2276,6 +2392,19 @@ fn actor_main(
         }
         lifecycle_space.notify_waiters();
         match command {
+            #[cfg(test)]
+            Command::TestPrepareIdleCompaction { reply } => {
+                // Prepare real unfinished generation migration on this actor;
+                // the controlled write failure starts only on its idle step.
+                store.force_compaction = true;
+                let result = store.compact_replay_step().map(|()| {
+                    test_hooks
+                        .force_compaction_storage_full
+                        .store(true, Ordering::Release);
+                    store.compaction_pending
+                });
+                let _ = reply.send(result);
+            }
             #[cfg(test)]
             Command::TestCapacityFunding { action, reply } => {
                 if matches!(action, CapacityTestAction::Release) {
@@ -2341,6 +2470,7 @@ fn actor_main(
                     ) == Ok(false)
                     {
                         capacity_blocked.store(false, Ordering::Release);
+                        capacity_progress = true;
                         let _ = fs::remove_file(terminal_checkpoint_path(state_dir, candidate.id));
                     }
                 }
@@ -2363,6 +2493,7 @@ fn actor_main(
                 };
                 if matches!(&disposition, RemovalDisposition::Removed) {
                     capacity_blocked.store(false, Ordering::Release);
+                    capacity_progress = true;
                     let _ = fs::remove_file(terminal_checkpoint_path(state_dir, candidate.id));
                 }
                 let _ = reply.send(disposition);
@@ -2501,6 +2632,8 @@ fn actor_main(
                         }
                         store.append_batch_with_shutdown(&batch, Some(shutdown))
                     });
+                    let result = result
+                        .map(|result| result.map_err(|error| store.write_capacity_error(error)));
                     match result {
                         Some(Err(PersistenceError::ActorStopped))
                             if shutdown.load(Ordering::Acquire) =>
@@ -2510,9 +2643,18 @@ fn actor_main(
                         Some(Err(error)) if error.is_capacity_debt() => {
                             let _ = crate::diagnostics::record(format_args!("{error}"));
                             pending_reason = error.to_string();
-                            external_capacity =
-                                matches!(error, PersistenceError::DatabaseCapacity { .. });
-                            blocked_funding = store.capacity_funding(external_capacity).ok();
+                            filesystem_debt =
+                                matches!(error, PersistenceError::FilesystemCapacity { .. });
+                            external_capacity = matches!(
+                                error,
+                                PersistenceError::DatabaseCapacity { .. }
+                                    | PersistenceError::FilesystemCapacity { .. }
+                            );
+                            blocked_funding = store
+                                .capacity_funding(external_capacity, filesystem_debt)
+                                .ok();
+                            capacity_progress = false;
+                            publish_capacity_pressure(capacity_pressure, true, output_wake);
                             capacity_blocked.store(true, Ordering::Release);
                             capacity_debt = true;
                             if !held_credits {
@@ -2530,7 +2672,9 @@ fn actor_main(
                             continue;
                         }
                         Some(Err(error)) => remember_failure(failure, &error),
-                        Some(Ok(())) => {}
+                        Some(Ok(())) => {
+                            capacity_progress = true;
+                        }
                         None => return,
                     }
                 }
@@ -2576,6 +2720,7 @@ fn actor_main(
                 let Some(result) = result else {
                     return;
                 };
+                let result = result.map_err(|error| store.write_capacity_error(error));
                 if matches!(
                     &result,
                     Err(PersistenceError::ActorStopped)
@@ -2587,9 +2732,18 @@ fn actor_main(
                     if error.is_capacity_debt() {
                         let _ = crate::diagnostics::record(format_args!("{error}"));
                         pending_reason = error.to_string();
-                        external_capacity =
-                            matches!(error, PersistenceError::DatabaseCapacity { .. });
-                        blocked_funding = store.capacity_funding(external_capacity).ok();
+                        filesystem_debt =
+                            matches!(error, PersistenceError::FilesystemCapacity { .. });
+                        external_capacity = matches!(
+                            error,
+                            PersistenceError::DatabaseCapacity { .. }
+                                | PersistenceError::FilesystemCapacity { .. }
+                        );
+                        blocked_funding = store
+                            .capacity_funding(external_capacity, filesystem_debt)
+                            .ok();
+                        capacity_progress = false;
+                        publish_capacity_pressure(capacity_pressure, true, output_wake);
                         capacity_blocked.store(true, Ordering::Release);
                         capacity_debt = true;
                         pending.push_back(Command::Finalize {
@@ -2607,6 +2761,7 @@ fn actor_main(
                     remember_failure(failure, error);
                 } else {
                     capacity_blocked.store(false, Ordering::Release);
+                    capacity_progress = true;
                 }
                 let _ = reply.send(result);
             }
@@ -2673,6 +2828,20 @@ fn actor_main(
     }
 }
 
+fn publish_capacity_pressure(
+    blocked: &AtomicBool,
+    value: bool,
+    output_wake: &Mutex<Option<crate::native_runtime::OwnerWake>>,
+) {
+    if blocked.swap(value, Ordering::AcqRel) != value
+        && let Some(wake) = &*mutex_lock(output_wake)
+    {
+        // The existing Native owner merges disk admission pressure with PTY
+        // pressure, including a quiet live Run, and publishes ServiceChanged.
+        wake.wake();
+    }
+}
+
 fn take_required_append(
     required_id: RunId,
     pending: &mut VecDeque<Command>,
@@ -2697,12 +2866,21 @@ fn retry_transient_storage(
     shutdown: &AtomicBool,
     mut mutation: impl FnMut() -> Result<(), PersistenceError>,
 ) -> Option<Result<(), PersistenceError>> {
+    let mut storage_retried = false;
     loop {
         if shutdown.load(Ordering::Acquire) {
             return None;
         }
         match mutation() {
             Err(error) if error.is_transient_storage() => {
+                if !matches!(error, PersistenceError::WalCheckpointBusy { .. }) {
+                    if storage_retried {
+                        return Some(Err(error));
+                    }
+                    // One refreshed transaction can observe externally restored
+                    // funding. Repeated failure returns to the shared actor lane.
+                    storage_retried = true;
+                }
                 if wait_for_shutdown(shutdown, STORAGE_RETRY_INTERVAL) {
                     return None;
                 }
@@ -3032,6 +3210,8 @@ struct StateStore {
     /// on the crash-recovery path, where every `running` row is reconciled.
     live_set: HashSet<RunId>,
     admission_limits: AdmissionLimits,
+    effective_storage: Arc<Mutex<EffectiveStoragePolicy>>,
+    force_compaction: bool,
     compaction_pending: bool,
     compaction_sources_pending: VecDeque<String>,
     compaction_cursor: i64,
@@ -3083,15 +3263,212 @@ impl Drop for StateLockGuard {
 type TerminalSettlement<'a> = (RunId, u32, &'a RunState, &'a Arc<AtomicU64>, Option<u64>);
 
 impl StateStore {
+    fn effective_storage_policy(&self) -> EffectiveStoragePolicy {
+        *mutex_lock(&self.effective_storage)
+    }
+
+    fn write_capacity_error(&self, error: PersistenceError) -> PersistenceError {
+        if error.is_transient_storage()
+            && !matches!(error, PersistenceError::WalCheckpointBusy { .. })
+            && self.connection.is_autocommit()
+        {
+            // Mutation/unknown COMMIT is deliberately excluded. Preserve the
+            // real write failure even if statvfs still reports ample space
+            // (quota/inode/racing writers); it does not reserve host resources.
+            match self.filesystem_available_bytes() {
+                Ok(available) => PersistenceError::FilesystemCapacity {
+                    available: Some(available),
+                    required: MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                    detail: error.to_string(),
+                },
+                Err(observation) => PersistenceError::FilesystemCapacity {
+                    available: None,
+                    required: MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                    detail: format!("{error}; filesystem funding is unknown: {observation}"),
+                },
+            }
+        } else {
+            error
+        }
+    }
+
+    fn filesystem_available_bytes(&self) -> Result<u64, PersistenceError> {
+        #[cfg(test)]
+        {
+            if self
+                .test_hooks
+                .filesystem_observation_failed
+                .load(Ordering::Acquire)
+            {
+                return Err(PersistenceError::io(
+                    &self.state_dir,
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "controlled filesystem observation unavailable",
+                    ),
+                ));
+            }
+            let controlled = self
+                .test_hooks
+                .filesystem_available_override_plus_one
+                .load(Ordering::Acquire);
+            if controlled != 0 {
+                return Ok(controlled - 1);
+            }
+        }
+        let stats = rustix::fs::statvfs(&self.state_dir)
+            .map_err(|error| PersistenceError::io(&self.state_dir, io::Error::from(error)))?;
+        stats.f_bavail.checked_mul(stats.f_frsize).ok_or_else(|| {
+            PersistenceError::ResourcePressure(
+                "filesystem available-byte observation overflows".to_owned(),
+            )
+        })
+    }
+
+    /// Sample once per admitted transaction/maintenance turn, never per PTY byte.
+    /// Three generations are the existing physical proof: a source up to twice
+    /// retained history plus its packed replacement. Available space is an
+    /// observation, not a reservation against unrelated host writers.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one owner resolves exact filesystem scratch, configured quotas and atomic prefix retirement together"
+    )]
+    fn prepare_storage_work(&mut self, payload: u64) -> Result<(), PersistenceError> {
+        let resources = self.admission_limits.resources;
+        let previous = self.effective_storage_policy();
+        let database = if previous.database_bytes == 0 {
+            let pages: i64 = self
+                .connection
+                .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+                .map_err(PersistenceError::database)?;
+            let page_size: i64 = self
+                .connection
+                .query_row("PRAGMA page_size", [], |row| row.get(0))
+                .map_err(PersistenceError::database)?;
+            nonnegative_u64(pages, "SQLite maximum pages")?
+                .checked_mul(nonnegative_u64(page_size, "SQLite page size")?)
+                .ok_or_else(|| {
+                    PersistenceError::ResourcePressure(
+                        "SQLite effective page capacity overflows".to_owned(),
+                    )
+                })?
+        } else {
+            previous.database_bytes
+        };
+        mutex_lock(&self.effective_storage).database_bytes = database;
+        let physical = directory_file_len(&self.replay_dir)?;
+        let allocated = directory_allocated_bytes(&self.replay_dir)?;
+        let wal = file_allocated_bytes(&self.wal_path)?.min(file_len(&self.wal_path)?);
+        let shm = file_allocated_bytes(&self.shm_path)?.min(file_len(&self.shm_path)?);
+        // Existing allocated WAL/SHM already reduce f_bavail. Fund their next
+        // growth, one checkpoint's database pages and the existing 1 MiB append.
+        let work = resources
+            .wal_bytes()
+            .saturating_sub(wal)
+            .checked_add(resources.shm_bytes().saturating_sub(shm))
+            .and_then(|bytes| bytes.checked_add(resources.wal_checkpoint_bytes))
+            .and_then(|bytes| bytes.checked_add(MAX_TRANSACTION_PAYLOAD_BYTES as u64))
+            .ok_or_else(|| {
+                PersistenceError::ResourcePressure(
+                    "filesystem scratch arithmetic overflows".to_owned(),
+                )
+            })?;
+        let available = self.filesystem_available_bytes().map_err(|observation| {
+            // An unknown host observation proves no new write funding. It does
+            // not change the engine ceiling or make existing history invalid.
+            let mut effective = mutex_lock(&self.effective_storage);
+            effective.durable_replay_bytes = 0;
+            effective.durable_run_output_bytes = 0;
+            PersistenceError::FilesystemCapacity {
+                available: None,
+                required: work.saturating_add(payload),
+                detail: format!("filesystem funding is unknown: {observation}"),
+            }
+        })?;
+        let funded = available
+            .checked_add(allocated)
+            .ok_or_else(|| {
+                PersistenceError::ResourcePressure("filesystem owner funding overflows".to_owned())
+            })?
+            .saturating_sub(work)
+            / 3;
+        let mut aggregate = resources
+            .durable_replay_bytes
+            .map_or(funded, |quota| quota.min(funded));
+        // External pressure can consume the old replacement headroom. Before
+        // retiring any prefix, prove that its remaining confirmed suffix fits
+        // a replacement using currently available scratch.
+        let compact = physical > aggregate.saturating_mul(2);
+        if compact {
+            aggregate = aggregate.min(available.saturating_sub(work));
+        }
+        let per_run = resources
+            .durable_run_output_bytes
+            .map_or(aggregate, |quota| quota.min(aggregate));
+        *mutex_lock(&self.effective_storage) = EffectiveStoragePolicy {
+            database_bytes: database,
+            durable_replay_bytes: aggregate,
+            durable_run_output_bytes: per_run,
+        };
+        if available < work || payload > available.saturating_sub(work) {
+            let error = PersistenceError::FilesystemCapacity {
+                available: Some(available),
+                required: work.saturating_add(payload),
+                detail: "next append/compaction scratch is not funded".to_owned(),
+            };
+            let _ = crate::diagnostics::record(format_args!(
+                "{error}; configured database={:?}, replay={:?}, per_run={:?}; effective replay={aggregate}",
+                resources.database_bytes,
+                resources.durable_replay_bytes,
+                resources.durable_run_output_bytes
+            ));
+            return Err(error);
+        }
+        if compact {
+            loop {
+                let retained: i64 = self
+                    .connection
+                    .query_row(
+                        "SELECT coalesce(sum(replay_bytes), 0) FROM runs",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(PersistenceError::database)?;
+                let retained = nonnegative_u64(retained, "confirmed replay funding")?;
+                if retained <= aggregate {
+                    break;
+                }
+                if !self.reclaim_confirmed_prefix(retained - aggregate, None)? {
+                    return Err(PersistenceError::FilesystemCapacity {
+                        available: Some(available),
+                        required: work.saturating_add(retained),
+                        detail: "confirmed suffix has no funded replacement scratch".to_owned(),
+                    });
+                }
+                let _ = crate::diagnostics::record(format_args!(
+                    "filesystem pressure retired oldest confirmed replay prefix; configured replay={:?}; effective replay={aggregate}; confirmed heads and recovery metadata preserved",
+                    resources.durable_replay_bytes
+                ));
+            }
+            self.force_compaction = true;
+            self.maybe_compact_replay()?;
+        }
+        Ok(())
+    }
+
     fn replay_compaction_trigger_bytes(&self) -> u64 {
         #[cfg(test)]
         {
-            (self.admission_limits.resources.durable_replay_bytes * 2)
-                .min(TEST_REPLAY_COMPACTION_TRIGGER_BYTES)
+            (mutex_lock(&self.effective_storage)
+                .durable_replay_bytes
+                .saturating_mul(2))
+            .min(TEST_REPLAY_COMPACTION_TRIGGER_BYTES)
         }
         #[cfg(not(test))]
         {
-            self.admission_limits.resources.durable_replay_bytes * 2
+            mutex_lock(&self.effective_storage)
+                .durable_replay_bytes
+                .saturating_mul(2)
         }
     }
 
@@ -3201,14 +3578,16 @@ impl StateStore {
             sync_directory(&replay_dir)?;
         }
         validate_state_file(&replay_path)?;
-        connection
-            .pragma_update(
-                None,
-                "max_page_count",
-                i64::try_from(admission_limits.resources.database_bytes / PAGE_SIZE_BYTES)
-                    .expect("database page limit fits SQLite"),
-            )
-            .map_err(PersistenceError::database)?;
+        if let Some(database_bytes) = admission_limits.resources.database_bytes {
+            connection
+                .pragma_update(
+                    None,
+                    "max_page_count",
+                    i64::try_from(database_bytes / PAGE_SIZE_BYTES)
+                        .expect("database page limit fits SQLite"),
+                )
+                .map_err(PersistenceError::database)?;
+        }
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA wal_autocheckpoint=0;",
@@ -3243,6 +3622,8 @@ impl StateStore {
             epoch,
             live_set,
             admission_limits: *admission_limits,
+            effective_storage: Arc::new(Mutex::new(EffectiveStoragePolicy::default())),
+            force_compaction: false,
             compaction_pending,
             compaction_sources_pending: VecDeque::new(),
             compaction_cursor: i64::MIN,
@@ -3272,7 +3653,26 @@ impl StateStore {
         // today's write window. Recover/checkpoint it after integrity checks
         // instead of treating its size alone as damaged database content.
         store.fold_wal_below_ceiling(None)?;
-        store.maybe_compact_replay()?;
+        // Cold recovery is not a future maximum-sized Append. Sample policy,
+        // but do not reject valid readable state merely because optional
+        // compaction/append scratch is absent. Actual startup dirty-page work
+        // still uses its existing WAL proof and cannot fake an epoch commit.
+        let prepared = store.prepare_storage_work(0);
+        let compact_funded = store.optional_recovery_maintenance(prepared)?;
+        let effective = store.effective_storage_policy();
+        let _ = crate::diagnostics::record(format_args!(
+            "storage configured database={:?}, replay={:?}, per_run={:?}; resolved database={} replay={} per_run={}; allowances observe available filesystem funding, not reserved host space",
+            admission_limits.resources.database_bytes,
+            admission_limits.resources.durable_replay_bytes,
+            admission_limits.resources.durable_run_output_bytes,
+            effective.database_bytes,
+            effective.durable_replay_bytes,
+            effective.durable_run_output_bytes
+        ));
+        if compact_funded {
+            let compacted = store.maybe_compact_replay();
+            store.optional_recovery_maintenance(compacted)?;
+        }
         validate_physical_limits(
             state_dir,
             &store.replay_dir,
@@ -3291,6 +3691,26 @@ impl StateStore {
         )?;
         store.validate_files()?;
         Ok((store, recovered))
+    }
+
+    /// Optional replacement work cannot take away valid cold reads merely
+    /// because its proven-old physical write needs more host funding. Necessary
+    /// startup mutations keep their own actual page and commit proofs below.
+    fn optional_recovery_maintenance(
+        &mut self,
+        result: Result<(), PersistenceError>,
+    ) -> Result<bool, PersistenceError> {
+        match result.map_err(|error| self.write_capacity_error(error)) {
+            Ok(()) => Ok(true),
+            Err(error @ PersistenceError::FilesystemCapacity { .. }) => {
+                self.replay_cleanup_needed = true;
+                let _ = crate::diagnostics::record(format_args!(
+                    "optional recovery maintenance deferred: {error}"
+                ));
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn validate_recovery_policy(&self) -> Result<(), PersistenceError> {
@@ -3329,6 +3749,14 @@ impl StateStore {
                     ),
                 self.admission_limits.metadata_bytes,
             ),
+        ] {
+            if actual > limit {
+                return Err(PersistenceError::ResourcePressure(format!(
+                    "valid retained state requires {name} >= {actual}; current policy is {limit}; history was preserved"
+                )));
+            }
+        }
+        for (name, actual, quota) in [
             (
                 "durable_replay_bytes",
                 nonnegative_u64(replay, "replay bytes")?,
@@ -3340,9 +3768,9 @@ impl StateStore {
                 self.admission_limits.resources.durable_run_output_bytes,
             ),
         ] {
-            if actual > limit {
+            if quota.is_some_and(|limit| actual > limit) {
                 return Err(PersistenceError::ResourcePressure(format!(
-                    "valid retained state requires {name} >= {actual}; current policy is {limit}; history was preserved"
+                    "valid retained state requires {name} >= {actual}; configured quota is {quota:?}; history was preserved"
                 )));
             }
         }
@@ -3725,6 +4153,15 @@ impl StateStore {
                 "one Run metadata record exceeds the {} byte budget",
                 self.admission_limits.metadata_bytes
             ))));
+        }
+
+        if let Err(error) = self.prepare_storage_work(0) {
+            let _ = receipt.decide(StartDisposition::NotCommitted);
+            return Ok(StageDriveResult::ReadyFailed(StageFailure {
+                fatal: !error.is_admission_failure(),
+                capacity: error.is_capacity_debt(),
+                error,
+            }));
         }
 
         let wal_baseline = match self.fold_wal_below_ceiling(shutdown) {
@@ -5075,13 +5512,13 @@ impl StateStore {
                 "output transaction payload {payload} exceeds the 1 MiB admission ceiling"
             )));
         }
+        self.prepare_storage_work(payload as u64)?;
         self.compact_replay_step()?;
         // Old and replacement generations share one scratch allowance. If
         // foreground writes consume that headroom, finish admitted maintenance
         // before accepting more payload, rather than latching ordinary growth.
         let replay_allowance = self
-            .admission_limits
-            .resources
+            .effective_storage_policy()
             .durable_replay_bytes
             .saturating_mul(3)
             .saturating_add(MAX_TRANSACTION_PAYLOAD_BYTES as u64);
@@ -5098,7 +5535,7 @@ impl StateStore {
         }
         let replay_dir = self.replay_dir.clone();
         let replay_file = self.replay_file.clone();
-        let resources = self.admission_limits.resources;
+        let effective = self.effective_storage_policy();
         let path = replay_dir.join(&replay_file);
         let mut writer = ReplayFileWriter::open(&replay_dir, &replay_file)?;
         let before = writer.next_offset;
@@ -5128,12 +5565,12 @@ impl StateStore {
                     id,
                     &replay,
                     &mut writer,
-                    resources.durable_run_output_bytes,
+                    effective.durable_run_output_bytes,
                 )?;
                 let head = read_run_head(transaction, id)?;
                 cursor_updates.insert(id, head);
             }
-            let _ = prune_global_replay_to(transaction, resources.durable_replay_bytes)?;
+            let _ = prune_global_replay_to(transaction, effective.durable_replay_bytes)?;
             let mut terminal_metadata = None;
             if let Some((id, actual_pid, state, metadata_owner, source_gap)) = terminal {
                 let (kind, mut state_json) = encoded_state(state)?;
@@ -5356,11 +5793,11 @@ impl StateStore {
         } else {
             (bytes)
                 .saturating_add(fresh)
-                .saturating_sub(self.admission_limits.resources.durable_run_output_bytes)
+                .saturating_sub(self.effective_storage_policy().durable_run_output_bytes)
         };
         let global_needed = nonnegative_u64(global, "global replay bytes")?
             .saturating_add(fresh)
-            .saturating_sub(self.admission_limits.resources.durable_replay_bytes);
+            .saturating_sub(self.effective_storage_policy().durable_replay_bytes);
         let needed = own_needed.max(global_needed);
         if needed == 0 {
             return Ok(false);
@@ -5370,6 +5807,14 @@ impl StateStore {
         } else {
             None
         };
+        self.reclaim_confirmed_prefix(needed, target.as_deref())
+    }
+
+    fn reclaim_confirmed_prefix(
+        &mut self,
+        needed: u64,
+        target: Option<&str>,
+    ) -> Result<bool, PersistenceError> {
         let mut rows = (self.admission_limits.resources.wal_checkpoint_bytes / WAL_FRAME_BYTES)
             .max(1) as usize;
         loop {
@@ -5469,6 +5914,7 @@ impl StateStore {
     fn capacity_funding(
         &self,
         observe_filesystem: bool,
+        filesystem_debt: bool,
     ) -> Result<(u64, u64, u64, u64), PersistenceError> {
         let PersistenceError::DatabaseCapacity {
             pages,
@@ -5480,13 +5926,12 @@ impl StateStore {
         };
         // At the page ceiling, filesystem activity cannot fund a database
         // page. Below it, an actual filesystem-space change may release FULL.
-        let filesystem_bytes = if observe_filesystem && (pages < page_limit || free_pages > 0) {
-            let stats = rustix::fs::statvfs(&self.state_dir)
-                .map_err(|error| PersistenceError::io(&self.state_dir, io::Error::from(error)))?;
-            stats.f_bavail.saturating_mul(stats.f_frsize)
-        } else {
-            0
-        };
+        let filesystem_bytes =
+            if observe_filesystem && (filesystem_debt || pages < page_limit || free_pages > 0) {
+                self.filesystem_available_bytes()?
+            } else {
+                0
+            };
         Ok((pages, free_pages, page_limit, filesystem_bytes))
     }
 
@@ -5506,8 +5951,9 @@ impl StateStore {
         {
             // FULL is also a physical-storage result. Do not erase confirmed
             // history when SQLite still has funded reusable or growth pages.
-            // Retain the original debt and observe actual external funding.
-            return Err(capacity);
+            // Return the original proven-old FULL to the caller's physical
+            // capacity classifier instead of inventing exhausted SQLite pages.
+            return Ok(false);
         }
         let mut rows =
             usize::try_from(self.admission_limits.resources.wal_checkpoint_bytes / WAL_FRAME_BYTES)
@@ -5872,7 +6318,10 @@ impl StateStore {
             self.replay_cleanup_needed = !self.normalize_replay_files()?;
         }
         let active_bytes = file_len(&self.replay_dir.join(&self.replay_file))?;
-        if !self.compaction_pending && active_bytes <= self.replay_compaction_trigger_bytes() {
+        if !self.force_compaction
+            && !self.compaction_pending
+            && active_bytes <= self.replay_compaction_trigger_bytes()
+        {
             return Ok(());
         }
         if self.compaction_pending && self.compaction_sources_pending.is_empty() {
@@ -5880,7 +6329,9 @@ impl StateStore {
         }
         if self.compaction_sources_pending.is_empty() {
             let old_path = self.replay_dir.join(&self.replay_file);
-            if file_len(&old_path)? <= self.replay_compaction_trigger_bytes() {
+            if !self.force_compaction
+                && file_len(&old_path)? <= self.replay_compaction_trigger_bytes()
+            {
                 self.compaction_pending = false;
                 return Ok(());
             }
@@ -5895,9 +6346,10 @@ impl StateStore {
             // Compaction must reclaim meaningful space. A small test/operator
             // trigger can sit below the retained window; copying that same
             // live window on every append would spend I/O without reclaiming it.
-            if file_len(&old_path)?
-                .saturating_sub(nonnegative_u64(indexed, "indexed replay bytes")?)
-                < self.replay_compaction_trigger_bytes() / 2
+            if !self.force_compaction
+                && file_len(&old_path)?
+                    .saturating_sub(nonnegative_u64(indexed, "indexed replay bytes")?)
+                    < self.replay_compaction_trigger_bytes() / 2
             {
                 return Ok(());
             }
@@ -5963,6 +6415,7 @@ impl StateStore {
         }
         self.replay_cleanup_needed = !self.normalize_replay_files()?;
         self.compaction_pending = false;
+        self.force_compaction = false;
         Ok(())
     }
 
@@ -6084,6 +6537,8 @@ impl StateStore {
                 .sync_data()
                 .map_err(|source| PersistenceError::io(&target_path, source))?;
             let target_name = self.replay_file.clone();
+            #[cfg(test)]
+            let test_hooks = Arc::clone(&self.test_hooks);
             let commit_result = self.commit_maintenance_batch(MaintenanceWitness::ReplayChunk(moves[0].0), |connection| {
                 let mut update = connection.prepare_cached(
                     "UPDATE replay_chunks SET data_file = ?2, data_offset = ?3 WHERE ordinal = ?1 AND data_file = ?4")
@@ -6093,6 +6548,20 @@ impl StateStore {
                         .map_err(PersistenceError::database)?;
                     if changed != 1 {
                         return Err(PersistenceError::Mutation("compaction coordinate owner changed".to_owned()));
+                    }
+                }
+                #[cfg(test)]
+                {
+                    // Controlled external write shape, after actual payload
+                    // copy/sync and coordinate staging, before any COMMIT.
+                    test_hooks.compaction_storage_attempts.fetch_add(1, Ordering::AcqRel);
+                    if test_hooks.force_compaction_storage_full.load(Ordering::Acquire) {
+                        if test_hooks.compaction_storage_full_as_database.load(Ordering::Acquire) {
+                            return Err(PersistenceError::injected_disk_full());
+                        }
+                        return Err(PersistenceError::io(&target_path, io::Error::new(
+                            io::ErrorKind::StorageFull, "controlled compaction write FULL",
+                        )));
                     }
                 }
                 Ok(())
@@ -8116,6 +8585,16 @@ fn file_len(path: &Path) -> Result<u64, PersistenceError> {
     }
 }
 
+fn file_allocated_bytes(path: &Path) -> Result<u64, PersistenceError> {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.blocks().checked_mul(512).ok_or_else(|| {
+            PersistenceError::ResourcePressure("allocated file funding overflows".to_owned())
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(0),
+        Err(source) => Err(PersistenceError::io(path, source)),
+    }
+}
+
 /// Persist directory entries that are part of the replay generation protocol.
 /// File `sync_all` makes payload bytes durable; the directory sync makes the
 /// generation name durable before `SQLite` is allowed to publish it.
@@ -8138,10 +8617,10 @@ fn validate_physical_limits(
     let wal = file_len(wal_path)?;
     let shm = file_len(shm_path)?;
     let replay = directory_file_len(replay_dir)?;
-    if database > limits.database_bytes {
+    if limits.database_bytes.is_some_and(|quota| database > quota) {
         return Err(PersistenceError::ResourcePressure(format!(
             "main database uses {database} bytes; policy funds {}",
-            limits.database_bytes
+            limits.database_bytes.expect("the quota was checked")
         )));
     }
     if wal > limits.wal_bytes() {
@@ -8156,13 +8635,14 @@ fn validate_physical_limits(
             limits.shm_bytes()
         )));
     }
-    if database
-        .saturating_add(wal)
-        .saturating_add(shm)
-        .saturating_add(replay)
-        > limits
-            .state_file_bytes()
-            .expect("validated storage arithmetic")
+    if let Some(limit) = limits
+        .state_file_bytes()
+        .map_err(PersistenceError::ResourcePressure)?
+        && database
+            .saturating_add(wal)
+            .saturating_add(shm)
+            .saturating_add(replay)
+            > limit
     {
         return Err(PersistenceError::ResourcePressure(format!(
             "state files in {} exceed the compaction-aware file budget",
@@ -8187,6 +8667,30 @@ fn directory_file_len(path: &Path) -> Result<u64, PersistenceError> {
             });
         }
         total = total.saturating_add(metadata.len());
+    }
+    Ok(total)
+}
+
+fn directory_allocated_bytes(path: &Path) -> Result<u64, PersistenceError> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path).map_err(|source| PersistenceError::io(path, source))? {
+        let entry = entry.map_err(|source| PersistenceError::io(path, source))?;
+        let child = entry.path();
+        let metadata =
+            fs::symlink_metadata(&child).map_err(|source| PersistenceError::io(&child, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(PersistenceError::InvalidDirectory {
+                path: child,
+                message: "replay directory may contain only regular files".to_owned(),
+            });
+        }
+        total = metadata
+            .blocks()
+            .checked_mul(512)
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| {
+                PersistenceError::ResourcePressure("allocated replay funding overflows".to_owned())
+            })?;
     }
     Ok(total)
 }
@@ -9302,6 +9806,297 @@ mod tests {
     }
 
     #[test]
+    fn policy_explicit_quotas_bound_actual_database_and_retained_suffix() {
+        let temp = TempDir::new().unwrap();
+        let resources = ResourceLimits {
+            database_bytes: Some(128 * 1024),
+            durable_replay_bytes: Some(8192),
+            durable_run_output_bytes: Some(4096),
+            ..ResourceLimits::DEFAULT
+        };
+        let (mut store, _) = StateStore::open(
+            &temp.path().join("state"),
+            &AdmissionLimits::from(resources),
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let payload = vec![0x53; 6000];
+        let head = Arc::new(AtomicU64::new(0));
+        store
+            .append_batch(&[(ids[0], replay(vec![chunk(0, &payload)]), Arc::clone(&head))])
+            .unwrap();
+        let pages: i64 = store
+            .connection
+            .query_row("PRAGMA max_page_count", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            u64::try_from(pages).unwrap() * PAGE_SIZE_BYTES,
+            128 * 1024,
+            "explicit database quota must remain the actual SQLite page ceiling"
+        );
+        let retained =
+            super::load_replay_page(&store.connection, &store.replay_dir, ids[0], 0, 6000).unwrap();
+        assert_eq!(
+            retained.first_available_byte,
+            6000 - 4096,
+            "explicit per-Run quota must bound the actual confirmed suffix"
+        );
+        assert!(retained.truncated);
+        assert_eq!(retained.latest_output_bytes, 6000);
+        assert_eq!(
+            retained
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            payload[6000 - 4096..]
+        );
+        assert_eq!(head.load(Ordering::Acquire), 6000);
+    }
+
+    #[test]
+    fn policy_default_retains_beyond_old_quota_and_second_process_reads_original() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let expected = 257_u64 * 1024 * 1024;
+        assert!(
+            store.filesystem_available_bytes().unwrap() > expected * 3 + 32 * 1024 * 1024,
+            "this real-filesystem qualification needs generation/scratch funding independently of configured quota"
+        );
+        let head = Arc::new(AtomicU64::new(0));
+        let payload = vec![0x5a; MAX_TRANSACTION_PAYLOAD_BYTES];
+        for index in 0..257_u64 {
+            store
+                .append_batch(&[(
+                    ids[0],
+                    replay(vec![chunk(index * 1024 * 1024, &payload)]),
+                    Arc::clone(&head),
+                )])
+                .unwrap();
+        }
+        let second_head = Arc::new(AtomicU64::new(0));
+        store
+            .append_batch(&[(
+                ids[1],
+                replay(vec![chunk(0, b"second original Run")]),
+                second_head,
+            )])
+            .unwrap();
+        assert_eq!(head.load(Ordering::Acquire), expected);
+        let retained: i64 = store
+            .connection
+            .query_row(
+                "SELECT replay_bytes FROM runs WHERE id=?1",
+                [ids[0].to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            retained,
+            i64::try_from(expected).unwrap(),
+            "default resource policy must preserve the actual 257 MiB funded history"
+        );
+        assert!(store.effective_storage_policy().database_bytes > 384 * 1024 * 1024);
+        drop(store);
+        let child = ProcessCommand::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "persistence::tests::policy_default_cold_reader",
+                "--nocapture",
+            ])
+            .env("CTXMUX_POLICY_COLD_STATE", &state_dir)
+            .env("CTXMUX_POLICY_COLD_RUN", ids[0].to_string())
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("original-policy-history-confirmed")
+        );
+    }
+
+    #[test]
+    fn policy_default_cold_reader() {
+        let Some(state_dir) = env::var_os("CTXMUX_POLICY_COLD_STATE") else {
+            return;
+        };
+        let id: RunId = env::var("CTXMUX_POLICY_COLD_RUN").unwrap().parse().unwrap();
+        let (store, recovered) = StateStore::open(
+            Path::new(&state_dir),
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 2);
+        let original = recovered.iter().find(|run| run.info.id == id).unwrap();
+        assert_eq!(original.replay.first_available_byte, 0);
+        assert_eq!(original.replay.latest_output_bytes, 257 * 1024 * 1024);
+        assert!(!original.replay.truncated);
+        assert_eq!(
+            original
+                .replay
+                .chunks
+                .iter()
+                .map(|chunk| chunk.data.len())
+                .sum::<usize>(),
+            257 * 1024 * 1024
+        );
+        assert!(
+            original
+                .replay
+                .chunks
+                .iter()
+                .all(|chunk| chunk.data.iter().all(|byte| *byte == 0x5a))
+        );
+        assert_eq!(store.admission_limits.resources.database_bytes, None);
+        assert_eq!(store.admission_limits.resources.durable_replay_bytes, None);
+        println!("original-policy-history-confirmed");
+    }
+
+    #[test]
+    fn policy_controlled_low_funding_preserves_cold_metadata_and_readable_history() {
+        cold_unfunded_history(false);
+    }
+
+    #[test]
+    fn policy_unknown_filesystem_observation_preserves_cold_metadata_and_readable_history() {
+        cold_unfunded_history(true);
+    }
+
+    fn cold_unfunded_history(unknown_funding: bool) {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let head = Arc::new(AtomicU64::new(0));
+        store
+            .append_batch(&[(
+                ids[0],
+                replay(vec![chunk(0, b"original confirmed bytes")]),
+                head,
+            )])
+            .unwrap();
+        drop(store);
+        // This controls the resource observation, not physical writes/FULL.
+        // Actual startup commits still run against the real retained files.
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        hooks
+            .filesystem_available_override_plus_one
+            .store(1, Ordering::Release);
+        hooks
+            .filesystem_observation_failed
+            .store(unknown_funding, Ordering::Release);
+        let (mut reopened, recovered) =
+            StateStore::open(&state_dir, &AdmissionLimits::OPERATIONAL, None, hooks).unwrap();
+        assert_eq!(recovered.len(), 2);
+        let original = recovered.iter().find(|run| run.info.id == ids[0]).unwrap();
+        assert_eq!(
+            original.replay,
+            replay(vec![chunk(0, b"original confirmed bytes")])
+        );
+        assert_eq!(reopened.effective_storage_policy().durable_replay_bytes, 0);
+        assert!(reopened.effective_storage_policy().database_bytes > 384 * 1024 * 1024);
+        assert!(matches!(
+            reopened.prepare_storage_work(0),
+            Err(PersistenceError::FilesystemCapacity { .. })
+        ));
+        assert_eq!(
+            super::load_replay_page(&reopened.connection, &reopened.replay_dir, ids[0], 0, 24)
+                .unwrap()
+                .latest_output_bytes,
+            24
+        );
+    }
+
+    #[test]
+    fn policy_controlled_pressure_retires_confirmed_oldest_and_physically_compacts() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let head = Arc::new(AtomicU64::new(0));
+        let payload = vec![0x41; MAX_TRANSACTION_PAYLOAD_BYTES];
+        for index in 0..40_u64 {
+            store
+                .append_batch(&[(
+                    ids[0],
+                    replay(vec![chunk(index * 1024 * 1024, &payload)]),
+                    Arc::clone(&head),
+                )])
+                .unwrap();
+        }
+        let before = super::directory_allocated_bytes(&store.replay_dir).unwrap();
+        let original_head = head.load(Ordering::Acquire);
+        // A controlled low observation drives real SQLite prefix retirement
+        // and real generation copy/sync/removal, not a physical FULL claim.
+        hooks
+            .filesystem_available_override_plus_one
+            .store(30 * 1024 * 1024 + 1, Ordering::Release);
+        store.prepare_storage_work(0).unwrap();
+        let after = super::directory_allocated_bytes(&store.replay_dir).unwrap();
+        assert!(
+            after < before,
+            "indexed deletion alone cannot pass this physical release oracle"
+        );
+        let (floor, durable_head, bytes, truncated): (i64, i64, i64, bool) = store.connection.query_row(
+            "SELECT durable_first_available_byte,durable_output_bytes,replay_bytes,replay_truncated FROM runs WHERE id=?1",
+            [ids[0].to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).unwrap();
+        assert!(floor > 0 && truncated);
+        assert_eq!(u64::try_from(durable_head).unwrap(), original_head);
+        assert_eq!(bytes, durable_head - floor);
+        assert_eq!(head.load(Ordering::Acquire), original_head);
+        let rows: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+        let old = MaintenanceWitness::Run(ids[0])
+            .read(&store.connection)
+            .unwrap();
+        hooks
+            .filesystem_available_override_plus_one
+            .store(1, Ordering::Release);
+        assert!(matches!(
+            store.prepare_storage_work(1),
+            Err(PersistenceError::FilesystemCapacity { .. })
+        ));
+        assert_eq!(
+            MaintenanceWitness::Run(ids[0])
+                .read(&store.connection)
+                .unwrap(),
+            old
+        );
+    }
+
+    #[test]
     fn transaction_payload_sync_preserves_interleaved_binary_rows_on_reopen() {
         let temp = TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
@@ -10062,7 +10857,7 @@ mod tests {
         let extents = 121_733_i64;
         let resources = ResourceLimits {
             wal_checkpoint_bytes: 1024 * 1024,
-            durable_run_output_bytes: u64::try_from(extents).unwrap(),
+            durable_run_output_bytes: Some(u64::try_from(extents).unwrap()),
             ..ResourceLimits::DEFAULT
         };
         let limits = AdmissionLimits::from(resources);
@@ -10145,7 +10940,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
         let resources = ResourceLimits {
-            durable_run_output_bytes: 8,
+            durable_run_output_bytes: Some(8),
             ..ResourceLimits::DEFAULT
         };
         let (persistence, _) =
@@ -12151,7 +12946,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
         let resources = crate::ResourceLimits {
-            durable_run_output_bytes: 8,
+            durable_run_output_bytes: Some(8),
             ..crate::ResourceLimits::DEFAULT
         };
         let (persistence, _) =
@@ -13504,11 +14299,14 @@ mod tests {
                     .unwrap();
             }
             assert!(
-                store
+                !store
                     .reclaim_database_pages(&PersistenceError::injected_disk_full())
-                    .unwrap_err()
-                    .is_capacity_debt()
+                    .unwrap()
             );
+            assert!(matches!(
+                store.write_capacity_error(PersistenceError::injected_disk_full()),
+                PersistenceError::FilesystemCapacity { .. }
+            ));
             assert_eq!(
                 MaintenanceWitness::Run(ids[0])
                     .read(&store.connection)
@@ -13516,7 +14314,7 @@ mod tests {
                 old
             );
             assert_eq!(head.load(Ordering::Acquire), bytes.len() as u64);
-            let funding = store.capacity_funding(true).unwrap();
+            let funding = store.capacity_funding(true, false).unwrap();
             assert!(
                 funding.3 > 0,
                 "actual external funding is observed even with reusable pages"
@@ -13528,7 +14326,7 @@ mod tests {
     fn sqlite_page_capacity_start_without_history_is_not_committed_or_latched() {
         let temp = TempDir::new().unwrap();
         let resources = ResourceLimits {
-            database_bytes: 128 * 1024,
+            database_bytes: Some(128 * 1024),
             ..ResourceLimits::DEFAULT
         };
         let (persistence, _) =
@@ -13578,6 +14376,465 @@ mod tests {
         );
         assert!(restored.iter().any(|run| run.info.id == original.id));
         assert!(restored.iter().all(|run| run.info.id != oversized.id));
+    }
+
+    #[test]
+    fn policy_controlled_filesystem_debt_recovers_even_at_database_page_limit() {
+        let temp = TempDir::new().unwrap();
+        let resources = ResourceLimits {
+            database_bytes: Some(128 * 1024),
+            ..ResourceLimits::DEFAULT
+        };
+        let (persistence, _) =
+            Persistence::open_with_resources(temp.path().join("state"), resources, None).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let funding = controlled_capacity_action(&persistence, super::CapacityTestAction::Fill);
+        assert_eq!(funding.0, funding.2);
+        assert_eq!(funding.1, 0);
+        persistence.set_filesystem_available_for_test(Some(0));
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"original filesystem debt")])));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !persistence.is_capacity_blocked() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "preflight must preserve nonfatal original debt"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(persistence.barrier().unwrap_err().is_capacity_debt());
+        assert_eq!(durable.durable_head(), 0);
+        assert!(!persistence.is_failed());
+        // Change only the controlled filesystem observation; no command/page
+        // release wakes the actor. Its quiet external-funding poll must suffice.
+        persistence.set_filesystem_available_for_test(None);
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while durable.durable_head() != 24 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "filesystem release must restore the original debt even at a full page cap"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        persistence.barrier().unwrap();
+        assert!(!persistence.is_failed());
+        assert!(!persistence.is_capacity_blocked());
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "both actual optional cold-maintenance paths prove rollback and necessary startup commit before original identity and byte recovery"
+    )]
+    fn policy_controlled_optional_compaction_full_preserves_cold_metadata_and_bytes() {
+        for (inline_prepare, database_full) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let temp = TempDir::new().unwrap();
+            let state_dir = temp.path().join("state");
+            let hooks = Arc::new(PersistenceTestHooks::default());
+            let (mut store, _) = StateStore::open(
+                &state_dir,
+                &AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::clone(&hooks),
+            )
+            .unwrap();
+            let ids = insert_valid_replay_test_runs(&mut store);
+            let runtime_id = store.runtime_id;
+            let epoch = store.epoch.clone();
+            let payload = vec![0x43; MAX_TRANSACTION_PAYLOAD_BYTES];
+            let head = Arc::new(AtomicU64::new(0));
+            for index in 0..2_u64 {
+                store
+                    .append_batch(&[(
+                        ids[0],
+                        replay(vec![chunk(
+                            index * MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                            &payload,
+                        )]),
+                        Arc::clone(&head),
+                    )])
+                    .unwrap();
+            }
+            let old_source = store.replay_dir.join(&store.replay_file);
+            store.force_compaction = true;
+            store.compact_replay_step().unwrap();
+            assert!(store.compaction_pending);
+            if inline_prepare {
+                // Real unindexed garbage leaves a fundable compacted suffix.
+                // The low-positive observation forces prepare(0)'s compaction;
+                // otherwise the later optional pending-migration path runs it.
+                use std::io::Write;
+                let mut source = OpenOptions::new().append(true).open(old_source).unwrap();
+                source
+                    .write_all(&vec![0; 6 * MAX_TRANSACTION_PAYLOAD_BYTES])
+                    .unwrap();
+                source.sync_all().unwrap();
+            }
+            let expected_identity = load_recovered(&store.connection, &store.replay_dir).unwrap();
+            drop(store);
+            hooks.filesystem_available_override_plus_one.store(
+                if inline_prepare {
+                    28 * 1024 * 1024 + 1
+                } else {
+                    64 * 1024 * 1024 + 1
+                },
+                Ordering::Release,
+            );
+            hooks
+                .force_compaction_storage_full
+                .store(true, Ordering::Release);
+            hooks
+                .compaction_storage_full_as_database
+                .store(database_full, Ordering::Release);
+            let (reopened, recovered) = Persistence::open_with_admission_limits_and_hooks(
+                state_dir,
+                &AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::clone(&hooks),
+            )
+            .unwrap_or_else(|error| {
+                panic!("cold optional write FULL must preserve original read service: {error}")
+            });
+            assert_eq!(reopened.runtime_id(), runtime_id);
+            assert_ne!(
+                reopened.inner.epoch, epoch,
+                "necessary startup epoch publication actually committed"
+            );
+            assert_eq!(recovered.len(), 2);
+            let original = recovered.iter().find(|run| run.info.id == ids[0]).unwrap();
+            let expected = expected_identity
+                .iter()
+                .find(|run| run.info.id == ids[0])
+                .unwrap();
+            assert_eq!(original.operation_key, expected.operation_key);
+            assert_eq!(original.info.spec, expected.info.spec);
+            assert_eq!(original.info.lineage, expected.info.lineage);
+            assert!(expected.info.state.is_running());
+            assert_eq!(
+                original.info.state,
+                RunState::Interrupted {
+                    reason: InterruptionReason::DaemonRestart
+                },
+                "necessary startup reconciliation actually committed without inventing live continuity"
+            );
+            assert_eq!(original.replay.first_available_byte, 0);
+            assert_eq!(
+                original.replay.latest_output_bytes,
+                2 * MAX_TRANSACTION_PAYLOAD_BYTES as u64
+            );
+            assert!(!original.replay.truncated);
+            assert_eq!(
+                original
+                    .replay
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                vec![0x43; 2 * MAX_TRANSACTION_PAYLOAD_BYTES]
+            );
+            assert!(
+                hooks.compaction_storage_attempts.load(Ordering::Acquire) >= 2,
+                "the optional recovery path must encounter an actual copied batch before controlled write FULL"
+            );
+            assert!(!reopened.is_failed());
+            let durable = reopened
+                .recovered_run(original.replay.latest_output_bytes, original.metadata_bytes);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let page = runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    durable.read_replay_page(
+                        ids[0],
+                        MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                        2 * MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            });
+            assert_eq!(
+                page.chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                vec![0x43; 64 * 1024]
+            );
+            assert_eq!(
+                durable.durable_head(),
+                2 * MAX_TRANSACTION_PAYLOAD_BYTES as u64
+            );
+        }
+    }
+
+    #[test]
+    fn policy_controlled_idle_compaction_full_waits_for_funding_without_repeating_io() {
+        for database_full in [false, true] {
+            idle_compaction_full_debt(database_full);
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual actor fixture preserves the pending generation, unchanged-funding I/O bound and same-owner exact recovery"
+    )]
+    fn idle_compaction_full_debt(database_full: bool) {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, _) = Persistence::open(&state_dir).unwrap();
+        let first = running_info(RunId::new());
+        let second = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(first.id), &first)
+            .unwrap();
+        let healthy = persistence
+            .insert_start(&test_operation_key(second.id), &second)
+            .unwrap();
+        for (index, byte) in [0x31_u8, 0x32].into_iter().enumerate() {
+            let payload = vec![byte; MAX_TRANSACTION_PAYLOAD_BYTES];
+            expect_queued(durable.append(
+                first.id,
+                replay(vec![chunk(
+                    index as u64 * MAX_TRANSACTION_PAYLOAD_BYTES as u64,
+                    &payload,
+                )]),
+            ));
+            persistence.barrier().unwrap();
+        }
+        let original_head = 2 * MAX_TRANSACTION_PAYLOAD_BYTES as u64;
+        assert_eq!(durable.durable_head(), original_head);
+        // Fixed ample observations isolate unchanged funding from other host
+        // writers. The generations, copy, sync, SQLite rollback and reads are real.
+        persistence.set_filesystem_available_for_test(Some(64 * 1024 * 1024));
+        persistence
+            .inner
+            .test_hooks
+            .compaction_storage_full_as_database
+            .store(database_full, Ordering::Release);
+        let (reply, received) = std::sync::mpsc::sync_channel(1);
+        assert!(
+            persistence
+                .inner
+                .send_lifecycle(super::Command::TestPrepareIdleCompaction { reply })
+        );
+        assert!(
+            received
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap(),
+            "production compaction step must leave real unfinished migration"
+        );
+        let hooks = &persistence.inner.test_hooks;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !persistence.is_capacity_blocked() {
+            assert!(
+                Instant::now() < deadline,
+                "idle compaction FULL must enter bounded capacity debt"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let attempts = hooks.compaction_storage_attempts.load(Ordering::Acquire);
+        // The preparation copied one batch; idle tried the second exactly once.
+        assert_eq!(
+            attempts, 2,
+            "idle compaction must make one actual failed copy attempt"
+        );
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            hooks.compaction_storage_attempts.load(Ordering::Acquire),
+            attempts,
+            "unchanged funding must not repeat compaction copy/sync/SQL"
+        );
+        let barrier_error = persistence.barrier().unwrap_err().to_string();
+        assert!(barrier_error.contains(if database_full {
+            "injected database or disk is full"
+        } else {
+            "controlled compaction write FULL"
+        }));
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), original_head);
+        assert_eq!(healthy.durable_head(), 0);
+        assert_eq!(
+            fs::read_dir(state_dir.join(REPLAY_DIR)).unwrap().count(),
+            2,
+            "both referenced generations must remain owned during debt"
+        );
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let original = runtime.block_on(async {
+            let mut original = Vec::new();
+            for after in [0, MAX_TRANSACTION_PAYLOAD_BYTES as u64] {
+                let page = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    durable.read_replay_page(first.id, after, original_head),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(page.first_available_byte, 0);
+                assert_eq!(page.latest_output_bytes, original_head);
+                assert!(!page.truncated);
+                original.push(
+                    page.chunks
+                        .into_iter()
+                        .flat_map(|chunk| chunk.data)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            original
+        });
+        assert_eq!(
+            original,
+            vec![vec![0x31; 64 * 1024], vec![0x32; 64 * 1024]],
+            "confirmed original bytes remain readable across pending generation owners"
+        );
+        hooks
+            .force_compaction_storage_full
+            .store(false, Ordering::Release);
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            hooks.compaction_storage_attempts.load(Ordering::Acquire),
+            attempts,
+            "releasing a controlled error alone must not replay unchanged resource work"
+        );
+        persistence.set_filesystem_available_for_test(Some(64 * 1024 * 1024 + 4096));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while persistence.inner.capacity_pressure.load(Ordering::Acquire)
+            || fs::read_dir(state_dir.join(REPLAY_DIR)).unwrap().count() != 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "same owner must resume original idle migration after observed funding changes"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        persistence.barrier().unwrap();
+        assert!(hooks.compaction_storage_attempts.load(Ordering::Acquire) > attempts);
+        assert!(!persistence.is_failed());
+        assert_eq!(durable.durable_head(), original_head);
+        let restored = runtime.block_on(async {
+            let mut restored = Vec::new();
+            for after in [0, MAX_TRANSACTION_PAYLOAD_BYTES as u64] {
+                restored.push(
+                    durable
+                        .read_replay_page(first.id, after, original_head)
+                        .await
+                        .unwrap()
+                        .chunks
+                        .into_iter()
+                        .flat_map(|chunk| chunk.data)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            restored
+        });
+        assert_eq!(
+            restored, original,
+            "same Run and exact confirmed suffix survive physical source retirement"
+        );
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn policy_repeated_write_full_preserves_debt_and_services_other_commands() {
+        repeated_write_full_debt(false);
+    }
+
+    #[test]
+    fn policy_write_full_with_unknown_filesystem_preserves_debt_and_read_service() {
+        repeated_write_full_debt(true);
+    }
+
+    fn repeated_write_full_debt(unknown_funding: bool) {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let first = running_info(RunId::new());
+        let second = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(first.id), &first)
+            .unwrap();
+        let healthy = persistence
+            .insert_start(&test_operation_key(second.id), &second)
+            .unwrap();
+        expect_queued(durable.append(first.id, replay(vec![chunk(0, b"confirmed")])));
+        persistence.barrier().unwrap();
+        persistence.force_append_storage_full();
+        persistence
+            .inner
+            .test_hooks
+            .filesystem_observation_failed
+            .store(unknown_funding, Ordering::Release);
+        expect_queued(durable.append(first.id, replay(vec![chunk(9, b"original-debt")])));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !persistence.is_capacity_blocked() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "repeated write FULL must return to the shared owner as debt"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let pressure = persistence.barrier().unwrap_err().to_string();
+        assert!(
+            pressure.contains("injected database or disk is full"),
+            "the real original write error must remain visible"
+        );
+        if unknown_funding {
+            assert!(
+                pressure.contains("funding is unknown"),
+                "unknown funding must remain explicit without poisoning the owner"
+            );
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let saved = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                durable.read_replay_page(first.id, 0, 9),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        });
+        assert_eq!(
+            saved
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            b"confirmed"
+        );
+        assert!(!persistence.is_failed());
+        assert_eq!(healthy.durable_head(), 0);
+        assert_eq!(durable.durable_head(), 9);
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 1);
+        persistence
+            .inner
+            .test_hooks
+            .force_append_storage_full
+            .store(false, Ordering::Release);
+        persistence
+            .inner
+            .test_hooks
+            .filesystem_observation_failed
+            .store(false, Ordering::Release);
+        let observed = persistence.effective_storage_policy().durable_replay_bytes;
+        // Explicitly change the resource observation, rather than inventing a
+        // durability ACK for a fixed/unknown write failure with unchanged funds.
+        persistence.set_filesystem_available_for_test(Some(observed * 3 + 64 * 1024 * 1024));
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while durable.durable_head() != 22 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "original pending output must settle on the same owner"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        persistence.barrier().unwrap();
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+        assert!(!persistence.is_failed());
     }
 
     fn controlled_capacity_action(
@@ -13636,7 +14893,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let state_dir = temp.path().join("state");
         let resources = ResourceLimits {
-            database_bytes: 128 * 1024,
+            database_bytes: Some(128 * 1024),
             ..ResourceLimits::DEFAULT
         };
         let (persistence, _) =

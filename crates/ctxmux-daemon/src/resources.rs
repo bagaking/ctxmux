@@ -7,7 +7,6 @@
 
 // Historical aggregate byte defaults; operator policy documented in ADR 019.
 const DEFAULT_HOT_REPLAY_BYTES: usize = 1024 * 1024 * 1024;
-const DEFAULT_DURABLE_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
 
 // SQLite file-format constants: 4096-byte pages in this store, 32-byte WAL
 // header and 24-byte frame header. wal.c uses 32 KiB index blocks, with 4062
@@ -32,9 +31,11 @@ pub struct ResourceLimits {
     pub live_event_bytes: u64,
     pub run_output_bytes: usize,
     pub metadata_bytes: u64,
-    pub durable_replay_bytes: u64,
-    pub durable_run_output_bytes: u64,
-    pub database_bytes: u64,
+    /// None follows observed filesystem funding, rather than a fixed quota.
+    pub durable_replay_bytes: Option<u64>,
+    pub durable_run_output_bytes: Option<u64>,
+    /// None retains `SQLite`'s own page ceiling on the serving connection.
+    pub database_bytes: Option<u64>,
     pub wal_checkpoint_bytes: u64,
     pub handoff_input_bytes: usize,
     pub handoff_diagnostic_bytes: usize,
@@ -90,9 +91,9 @@ impl ResourceLimits {
         live_event_bytes: 64 * 1024 * 1024,
         run_output_bytes: DEFAULT_HOT_REPLAY_BYTES,
         metadata_bytes: 64 * 1024 * 1024,
-        durable_replay_bytes: DEFAULT_DURABLE_REPLAY_BYTES,
-        durable_run_output_bytes: DEFAULT_DURABLE_REPLAY_BYTES,
-        database_bytes: 384 * 1024 * 1024,
+        durable_replay_bytes: None,
+        durable_run_output_bytes: None,
+        database_bytes: None,
         wal_checkpoint_bytes: 8 * 1024 * 1024,
         handoff_input_bytes: 128 * 1024 * 1024,
         handoff_diagnostic_bytes: 16 * 1024 * 1024,
@@ -152,6 +153,10 @@ impl ResourceLimits {
     ///
     /// # Errors
     /// Rejects zero, unrepresentable counts, incomplete pages and overflowing sums.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "validate the complete resource snapshot before creating any owner"
+    )]
     pub fn validate(&self) -> Result<(), String> {
         if self.live_runs == Some(0) || self.retained_runs == Some(0) {
             return Err("population limits must be positive or null".to_owned());
@@ -161,9 +166,6 @@ impl ResourceLimits {
             ("live_event_bytes", self.live_event_bytes),
             ("run_output_bytes", self.run_output_bytes as u64),
             ("metadata_bytes", self.metadata_bytes),
-            ("durable_replay_bytes", self.durable_replay_bytes),
-            ("durable_run_output_bytes", self.durable_run_output_bytes),
-            ("database_bytes", self.database_bytes),
             ("wal_checkpoint_bytes", self.wal_checkpoint_bytes),
             ("handoff_input_bytes", self.handoff_input_bytes as u64),
             (
@@ -186,7 +188,23 @@ impl ResourceLimits {
                 return Err(format!("{name} must fit a positive host/SQLite byte count"));
             }
         }
-        if !self.database_bytes.is_multiple_of(SQLITE_PAGE_BYTES) {
+        for (name, quota) in [
+            ("durable_replay_bytes", self.durable_replay_bytes),
+            ("durable_run_output_bytes", self.durable_run_output_bytes),
+            ("database_bytes", self.database_bytes),
+        ] {
+            if quota.is_some_and(|bytes| {
+                bytes == 0 || bytes > i64::MAX as u64 || usize::try_from(bytes).is_err()
+            }) {
+                return Err(format!(
+                    "{name} must fit a positive host/SQLite byte count or null"
+                ));
+            }
+        }
+        if self
+            .database_bytes
+            .is_some_and(|bytes| !bytes.is_multiple_of(SQLITE_PAGE_BYTES))
+        {
             return Err(
                 "database_bytes must be a multiple of the 4096-byte SQLite page".to_owned(),
             );
@@ -240,8 +258,7 @@ impl ResourceLimits {
             record_bytes: self.diagnostic_record_bytes,
         })
         .map_err(|error| error.to_string())?;
-        self.state_file_bytes()
-            .ok_or("combined storage budgets overflow")?;
+        self.state_file_bytes()?;
         Ok(())
     }
 
@@ -255,25 +272,37 @@ impl ResourceLimits {
         (1 + additional.div_ceil(SHM_FRAME_SLOTS)) * SHM_BLOCK_BYTES
     }
 
-    pub(crate) const fn state_file_bytes(&self) -> Option<u64> {
+    pub(crate) fn state_file_bytes(&self) -> Result<Option<u64>, String> {
         // Source generation (up to twice retained replay), packed replacement,
         // one 1 MiB admitted append, database, WAL and SHM scratch reservation.
-        let Some(replay) = self.durable_replay_bytes.checked_mul(3) else {
-            return None;
-        };
-        let Some(wal) = self.wal_checkpoint_bytes.checked_mul(2) else {
-            return None;
-        };
-        let Some(bytes) = self.database_bytes.checked_add(wal) else {
-            return None;
-        };
-        let Some(bytes) = bytes.checked_add(replay) else {
-            return None;
-        };
-        let Some(bytes) = bytes.checked_add(self.shm_bytes()) else {
-            return None;
-        };
-        bytes.checked_add(1024 * 1024)
+        let overflow = || "combined storage budgets overflow".to_owned();
+        let wal = self
+            .wal_checkpoint_bytes
+            .checked_mul(2)
+            .ok_or_else(overflow)?;
+        let fixed = wal
+            .checked_add(self.shm_bytes())
+            .and_then(|bytes| bytes.checked_add(1024 * 1024))
+            .ok_or_else(overflow)?;
+        let replay = self
+            .durable_replay_bytes
+            .map(|bytes| bytes.checked_mul(3).ok_or_else(overflow))
+            .transpose()?;
+        // Still validate each bounded component when another owner is derived.
+        if let Some(database) = self.database_bytes {
+            database.checked_add(fixed).ok_or_else(overflow)?;
+        }
+        if let Some(replay) = replay {
+            replay.checked_add(fixed).ok_or_else(overflow)?;
+        }
+        match (self.database_bytes, replay) {
+            (Some(database), Some(replay)) => database
+                .checked_add(replay)
+                .and_then(|bytes| bytes.checked_add(fixed))
+                .map(Some)
+                .ok_or_else(overflow),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -345,6 +374,29 @@ mod tests {
     }
 
     #[test]
+    fn disk_defaults_have_no_operator_ceiling_and_null_round_trips() {
+        for json in [
+            "{}",
+            r#"{"database_bytes":null,"durable_replay_bytes":null,"durable_run_output_bytes":null}"#,
+        ] {
+            let limits = ResourceLimits::from_json(json).unwrap();
+            assert_eq!(limits.database_bytes, None);
+            assert_eq!(limits.durable_replay_bytes, None);
+            assert_eq!(limits.durable_run_output_bytes, None);
+            assert_eq!(limits.state_file_bytes().unwrap(), None);
+            assert_eq!(
+                ResourceLimits::from_json(&serde_json::to_string(&limits).unwrap()).unwrap(),
+                limits
+            );
+        }
+        let explicit = ResourceLimits::from_json(r#"{"database_bytes":131072,"durable_replay_bytes":8192,"durable_run_output_bytes":null}"#).unwrap();
+        assert_eq!(explicit.database_bytes, Some(131_072));
+        assert_eq!(explicit.durable_replay_bytes, Some(8192));
+        assert_eq!(explicit.durable_run_output_bytes, None);
+        assert!(explicit.state_file_bytes().unwrap().is_some());
+    }
+
+    #[test]
     fn omitted_run_history_quotas_follow_the_aggregate_owner() {
         let defaults = ResourceLimits::default();
         assert_eq!(defaults.run_output_bytes as u64, defaults.hot_output_bytes);
@@ -356,7 +408,7 @@ mod tests {
             ResourceLimits::from_json(r#"{"hot_output_bytes":8192,"durable_replay_bytes":16384}"#)
                 .unwrap();
         assert_eq!(limits.run_output_bytes, 8192);
-        assert_eq!(limits.durable_run_output_bytes, 16384);
+        assert_eq!(limits.durable_run_output_bytes, Some(16384));
     }
 
     #[test]
@@ -366,7 +418,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(limits.run_output_bytes, 512);
-        assert_eq!(limits.durable_run_output_bytes, 1024);
+        assert_eq!(limits.durable_run_output_bytes, Some(1024));
         let encoded = serde_json::to_string(&limits).unwrap();
         assert_eq!(ResourceLimits::from_json(&encoded).unwrap(), limits);
     }

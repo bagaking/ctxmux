@@ -615,20 +615,14 @@
     {
       "id": "PERSIST-03",
       "choice": "009-runtime-persistence-recovery",
-      "source_ids": [
-        "i04"
-      ],
-      "source_refs": [
-        "https://www.sqlite.org/lang_transaction.html"
-      ],
-      "failure_mechanism": "Small replay-coordinate rows and their uniqueness index exhaust a fixed SQLite page cap even below the independent logical payload allowance. Apply-stage FULL can automatically roll back; unconditional extra ROLLBACK then mislabels pressure as a global fault. Preserving typed FULL alone can instead retry an unchanged cap forever and block later Start, finalize and cold startup reconciliation.",
-      "invariant": "Proven pre-COMMIT rollback preserves the original typed error. Finite page-pressure recovery atomically retires only confirmed oldest prefixes, preserving Run/key/spec/lifecycle metadata, confirmed heads and accepted unconfirmed debt with truthful floors, truncation and Gap. Unfunded Start has no child or published row; pending debt cannot be acknowledged by a barrier or starve reads and healthy controls. Unknown COMMIT still fences writes.",
-      "preconditions": "Real SQLite FULL is induced at a fixed page cap through production maintenance and tiny real PTY appends while logical payload remains below policy. Two real Native Runs use public Rust client operations in the first process; a distinct process reopens its actual saved state at the same cap. Separate controlled no-progress seams exercise scheduling and receipt boundaries, not real-FULL qualification.",
-      "action": "Trigger automatic rollback before COMMIT, then prove same-owner continuation without raising the cap. Drive physical coordinate pressure below the payload quota and exercise both real Runs, later Start/finalize and cold normalization. Also reject metadata admission with no reclaimable history, and independently inject no-progress pressure into accepted work to verify bounded debt ownership, per-Run ordering, readable history/control and barrier refusal.",
-      "oracle": "Original rows and confirmed heads do not change on rejected apply. Real page reclamation remains within the unchanged cap, yields exact retained suffixes and explicit truncation, and a second process recovers original Runtime/Run/key/spec identity and terminal facts without reseeding or inventing live PTY continuity. Start without funding is NotCommitted and does not latch the owner. Controlled scheduling evidence preserves accepted debt and refuses false barrier ACK; it does not substitute for real SQLite FULL or public two-process recovery.",
-      "platform": [
-        "unix"
-      ],
+      "source_ids": ["i04"],
+      "source_refs": ["https://www.sqlite.org/lang_transaction.html"],
+      "failure_mechanism": "Small replay-coordinate rows and their uniqueness index exhaust a fixed SQLite page cap even below the independent logical payload allowance. Apply-stage FULL can automatically roll back; unconditional extra ROLLBACK then mislabels pressure as a global fault. Preserving typed FULL alone can instead retry an unchanged cap forever and block later Start, finalize and cold startup reconciliation. Artificial default quotas hide legitimate disk capacity; deriving history from logical payload alone can leave no physical compaction scratch. Continuous actual write FULL or an unavailable funding probe can otherwise monopolize or falsely poison the shared owner.",
+      "invariant": "Proven pre-COMMIT rollback preserves the original typed error. Finite page-pressure recovery atomically retires only confirmed oldest prefixes, preserving Run/key/spec/lifecycle metadata, confirmed heads and accepted unconfirmed debt with truthful floors, truncation and Gap. Unfunded Start has no child or published row; pending debt cannot be acknowledged by a barrier or starve reads and healthy controls. Unknown COMMIT still fences writes. Default retention uses observed host funding with explicit optional quotas, preserves replacement scratch and exposes nonfatal capacity through Backpressured; valid cold history is not refused for an unfunded future maximum append. Funding unknown is not guessed as zero actual free space.",
+      "preconditions": "Real SQLite FULL is induced at a fixed page cap through production maintenance and tiny real PTY appends while logical payload remains below policy. Two real Native Runs use public Rust client operations in the first process; a distinct process reopens its actual saved state at the same cap. Separate controlled no-progress seams exercise scheduling and receipt boundaries, not real-FULL qualification. A distinct policy arm writes 257 MiB to real state and reads those original bytes in a second process; controlled filesystem observations drive real confirmed-prefix retirement and physical compaction, without claiming real host ENOSPC.",
+      "action": "Trigger automatic rollback before COMMIT, then prove same-owner continuation without raising the cap. Drive physical coordinate pressure below the payload quota and exercise both real Runs, later Start/finalize and cold normalization. Also reject metadata admission with no reclaimable history, and independently inject no-progress pressure into accepted work to verify bounded debt ownership, per-Run ordering, readable history/control and barrier refusal. Also exercise omitted/null/explicit SDK activation and CLI storage facts before and after cold reopening; quiet public service pressure stays until original debt settles even after an insufficient resource increase. Controlled continuous write FULL during real pending idle compaction must stop repeated copy/sync/SQL at unchanged positive funding; both typed SQLite FULL with growth/reusable pages and file StorageFull during proven-old optional cold compaction must not prevent necessary startup reconciliation and original history reads.",
+      "oracle": "Original rows and confirmed heads do not change on rejected apply. Real page reclamation remains within the unchanged cap, yields exact retained suffixes and explicit truncation, and a second process recovers original Runtime/Run/key/spec identity and terminal facts without reseeding or inventing live PTY continuity. Start without funding is NotCommitted and does not latch the owner. Controlled scheduling evidence preserves accepted debt and refuses false barrier ACK; it does not substitute for real SQLite FULL or public two-process recovery. The policy arm retains original identity and every byte beyond the former default quota when actual disk funding is available. Controlled low/unknown funding keeps confirmed history readable, retires only confirmed prefixes with actual physical release when scratch exists, and retains nonfatal original debt at no scratch or repeated write failure.",
+      "platform": ["unix"],
       "tags": [
         "persistence",
         "recovery",
@@ -670,6 +664,58 @@
         {
           "path": "crates/ctxmux-daemon/src/persistence.rs",
           "anchor": "sqlite_page_capacity_controlled_retries_preserve_funding_observation_and_finalize_order"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_default_retains_beyond_old_quota_and_second_process_reads_original"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_controlled_low_funding_preserves_cold_metadata_and_readable_history"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_unknown_filesystem_observation_preserves_cold_metadata_and_readable_history"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_controlled_pressure_retires_confirmed_oldest_and_physically_compacts"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_controlled_filesystem_debt_recovers_even_at_database_page_limit"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_repeated_write_full_preserves_debt_and_services_other_commands"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_write_full_with_unknown_filesystem_preserves_debt_and_read_service"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "policy_public_quiet_pressure_preserves_input_and_clears_only_after_debt"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/handoff.rs",
+          "anchor": "policy_optional_quotas_round_trip_through_private_v8_manifest"
+        },
+        {
+          "path": "packages/sdk/test/activation.test.ts",
+          "anchor": "policy disk quota omission/null and explicit quota are real SDK/CLI owner facts"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_explicit_quotas_bound_actual_database_and_retained_suffix"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_controlled_idle_compaction_full_waits_for_funding_without_repeating_io"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "policy_controlled_optional_compaction_full_preserves_cold_metadata_and_bytes"
         }
       ]
     },

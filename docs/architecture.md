@@ -750,15 +750,27 @@ does not promise permanent retention of every output byte or cold-restart PTY
 continuity.
 
 `ResourceLimits::DEFAULT` in
-[`resources.rs`](../crates/ctxmux-daemon/src/resources.rs) sets the 384 MiB
-`database_bytes` operating default. It is configurable SQLite page funding,
-not a format limit or a qualified fleet capacity. The separately funded replay
-payload is external to SQLite; its row coordinates, uniqueness index and
-partially occupied pages can exhaust the database even while logical replay
-is below its byte allowance. Protecting finite storage therefore requires
-actual owner page funding and recovery behavior; increasing a fixture's cap
-does not prove this boundary safe.
+[`resources.rs`](../crates/ctxmux-daemon/src/resources.rs) has no operator
+ceiling for the main database or durable history. An explicit `database_bytes`
+quota still funds SQLite pages; without it the serving connection retains
+SQLite's actual engine page ceiling, not a fabricated unlimited-byte value.
+Replay payload is external to SQLite. Its coordinate rows, uniqueness index and
+partially occupied pages consume actual disk resources even below the logical
+payload allowance. The former 384 MiB database / 256 MiB replay defaults could
+therefore exhaust index funding without exceeding payload policy; increasing a
+fixture cap does not prove that owner boundary safe.
 
+Default replay funding follows the observed filesystem's available blocks plus
+already allocated replay storage, after the existing append, WAL, SHM and
+checkpoint work is funded. Three replay generations fund a source up to twice
+the retained window and its packed replacement. Under pressure, the owner first
+proves replacement scratch, atomically retires oldest confirmed prefixes and
+physically compacts their storage. Explicit aggregate and per-Run quotas remain
+independent operator limits. The same owner resolves this policy once per
+transaction or maintenance turn, rather than per PTY byte. Observations are not
+space reservations against unrelated writers; see
+[resource policy](architecture/choices/019-resource-policy-and-honest-qualification.md#storage-and-recovery)
+for the retained cost and unqualified memory boundaries.
 A maintenance apply or page-proof error before `COMMIT` is not an uncertain
 `COMMIT` result. The exclusive connection either confirms an active transaction
 was explicitly rolled back, or proves SQLite already ended it without any
@@ -793,12 +805,20 @@ a tight retry loop, an unbounded second queue or a reason to disable authoritati
 reads and healthy process controls. Actual child reap and durable terminal
 confirmation remain separate facts when settlement cannot yet be saved.
 
-External typed `DiskFull`, write-side I/O pressure or `StorageFull` still retries
-the exact ordered unit under bounded queue backpressure until resources recover
-or daemon shutdown cancels the wait. Waiting alone cannot resolve an unchanged
-configured page cap. A persistence client reconnect neither changes the policy
-nor clears an uncertain-outcome fence; an upgrade cannot extract healthy owners
-past unresolved durable work.
+External typed `DiskFull` or write-side storage pressure gets a bounded exact
+retry after a proven rollback. Continued shortage becomes original ordered debt;
+the actor keeps serving reads, lifecycle observation and healthy controls rather
+than monopolizing the owner in an unchanged-resource retry loop. Unknown
+filesystem funding also retains debt and explicitly refuses new writes. Valid
+cold metadata/history remains readable without first reserving a future maximum
+append window; optional compaction receiving a proven-old physical write failure
+also defers while necessary startup mutations retain their actual page and
+commit proofs. Idle pending compaction shares the same capacity-debt boundary:
+unchanged funding does not repeat copy, sync or coordinate mutation. Shared durable debt appears through existing public native
+`Backpressured` service state, including quiet Runs with their own accepted debt, and clears only after actual
+settlement. Its reason stays separate from the fatal first-failure latch. A
+persistence client reconnect neither changes policy nor clears an uncertain
+outcome fence; upgrade cannot extract healthy owners past unresolved work.
 
 ## Technical decision index
 

@@ -22,35 +22,35 @@ Policy applies when a daemon starts; connecting to an existing Runtime does not
 reconfigure it. Planned exec preserves the complete established policy in its
 versioned handoff manifest and explicit incoming CLI arguments.
 
-| Field                       | Default | Owner and consequence                                                                                                          |
-| --------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `live_runs`                 | null    | Optional operator live-owner quota; host FD/PTY funding still applies                                                          |
-| `retained_runs`             | null    | Optional retained/projected record quota; exact quiescent replacement at pressure                                              |
-| `metadata_bytes`            | 64 MiB  | Registry serialized metadata, actual String/Vec capacities, conservatively funded BTreeMap nodes and fixed owner/index costs   |
-| `hot_output_bytes`          | 1 GiB   | Aggregate hot replay payload; reclaim offered history and backpressure only unoffered persistent bytes                         |
-| `run_output_bytes`          | follows hot aggregate | Optional independent per-Run hot replay quota; omitted quota follows `hot_output_bytes`                                       |
-| `live_event_bytes`          | 64 MiB  | Shared broadcast backing and one leased payload across receivers; attach refusal, Gap or observation discontinuity at pressure |
-| `durable_replay_bytes`      | 256 MiB | Aggregate disk replay history, independently of hot cache                                                                      |
+| Field                       | Default                | Owner and consequence                                                                                                          |
+| --------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `live_runs`                 | null                   | Optional operator live-owner quota; host FD/PTY funding still applies                                                          |
+| `retained_runs`             | null                   | Optional retained/projected record quota; exact quiescent replacement at pressure                                              |
+| `metadata_bytes`            | 64 MiB                 | Registry serialized metadata, actual String/Vec capacities, conservatively funded BTreeMap nodes and fixed owner/index costs   |
+| `hot_output_bytes`          | 1 GiB                  | Aggregate hot replay payload; reclaim offered history and backpressure only unoffered persistent bytes                         |
+| `run_output_bytes`          | follows hot aggregate  | Optional independent per-Run hot replay quota; omitted quota follows `hot_output_bytes`                                        |
+| `live_event_bytes`          | 64 MiB                 | Shared broadcast backing and one leased payload across receivers; attach refusal, Gap or observation discontinuity at pressure |
+| `durable_replay_bytes`      | null                   | Observed filesystem-funded disk history; optional explicit aggregate quota                                                     |
 | `durable_run_output_bytes`  | follows disk aggregate | Optional independent per-Run disk quota; omitted quota follows `durable_replay_bytes`, with a monotone lifetime head           |
-| `database_bytes`            | 384 MiB | SQLite page funding, not a Run-count format limit                                                                              |
-| `wal_checkpoint_bytes`      | 8 MiB   | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
-| `control_state_bytes`       | 128 MiB | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
-| `handoff_input_bytes`       | 128 MiB | Input receipt payload carried intact across exec                                                                               |
-| `handoff_diagnostic_bytes`  | 16 MiB  | Aggregate handoff diagnostics                                                                                                  |
-| `handoff_bytes`             | 256 MiB | Serialized manifest admission before relinquishing native ownership                                                            |
-| `creation_workers`          | 8       | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
-| `input_turn_commands`       | 64      | Completed commands before yielding a reactor turn; pending original commands remain owned                                      |
-| `input_turn_bytes`          | 256 KiB | Written bytes before yielding a reactor turn; not a payload limit                                                              |
-| `stop_admission_timeout_ms` | 250 ms  | Cleanup-slot acquisition before a Stop side effect; explicit refusal on unavailable capacity                                   |
-| `diagnostic_queue_bytes`    | 64 MiB  | Shared formatting, queued and active diagnostic allocations; producers never wait for stderr                                   |
-| `diagnostic_record_bytes`   | 1 MiB   | One diagnostic record's configurable format budget; whole-record refusal is observable                                         |
-| `cleanup_workers`           | 8       | Blocking session cleanup workers                                                                                               |
-| `finalize_workers`          | 8       | Blocking durable terminal publication workers                                                                                  |
-| `input_queue_commands`      | 1024    | Per-Run pending input commands, additionally byte-funded                                                                       |
-| `input_queue_bytes`         | 4 MiB   | Per-Run pending input payload                                                                                                  |
-| `input_result_entries`      | 256     | Retained duplicate-result ledger window                                                                                        |
-| `input_result_bytes`        | 1 MiB   | Per-Run retained input request payload, additionally globally funded                                                           |
-| `tmux_discovery_bytes`      | 128 KiB | Bounded discovery subprocess output; explicit configurable rejection                                                           |
+| `database_bytes`            | null                   | Optional operator page quota; otherwise the actual SQLite engine ceiling                                                       |
+| `wal_checkpoint_bytes`      | 8 MiB                  | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
+| `control_state_bytes`       | 128 MiB                | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
+| `handoff_input_bytes`       | 128 MiB                | Input receipt payload carried intact across exec                                                                               |
+| `handoff_diagnostic_bytes`  | 16 MiB                 | Aggregate handoff diagnostics                                                                                                  |
+| `handoff_bytes`             | 256 MiB                | Serialized manifest admission before relinquishing native ownership                                                            |
+| `creation_workers`          | 8                      | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
+| `input_turn_commands`       | 64                     | Completed commands before yielding a reactor turn; pending original commands remain owned                                      |
+| `input_turn_bytes`          | 256 KiB                | Written bytes before yielding a reactor turn; not a payload limit                                                              |
+| `stop_admission_timeout_ms` | 250 ms                 | Cleanup-slot acquisition before a Stop side effect; explicit refusal on unavailable capacity                                   |
+| `diagnostic_queue_bytes`    | 64 MiB                 | Shared formatting, queued and active diagnostic allocations; producers never wait for stderr                                   |
+| `diagnostic_record_bytes`   | 1 MiB                  | One diagnostic record's configurable format budget; whole-record refusal is observable                                         |
+| `cleanup_workers`           | 8                      | Blocking session cleanup workers                                                                                               |
+| `finalize_workers`          | 8                      | Blocking durable terminal publication workers                                                                                  |
+| `input_queue_commands`      | 1024                   | Per-Run pending input commands, additionally byte-funded                                                                       |
+| `input_queue_bytes`         | 4 MiB                  | Per-Run pending input payload                                                                                                  |
+| `input_result_entries`      | 256                    | Retained duplicate-result ledger window                                                                                        |
+| `input_result_bytes`        | 1 MiB                  | Per-Run retained input request payload, additionally globally funded                                                           |
+| `tmux_discovery_bytes`      | 128 KiB                | Bounded discovery subprocess output; explicit configurable rejection                                                           |
 
 Per-Run history has no independent default 4 MiB ceiling. Omitting the two
 per-Run quota fields derives their effective allowance from their respective
@@ -58,27 +58,21 @@ aggregate owner; an explicit quota remains an operator choice. Input queue
 capacity is independent and keeps its own byte budget: pending input is work
 not yet applied, unlike already observed output history.
 
-The existing 1 GiB hot and 256 MiB durable aggregate defaults are still historical
-operating points, not suitable-scale claims. Removing the per-Run ceiling does
-not qualify those aggregate defaults for large fleets, provide permanent
-archival, or establish a throughput improvement. The original qualification
-policies, including any explicit 4 MiB per-Run quota, remain frozen in their
-historical workloads; a changed default is a distinct capacity-policy arm.
+The remaining 1 GiB hot default is a historical operating point, not a fleet
+qualification. Disk defaults use no artificial 256 MiB replay or 384 MiB database
+ceiling. Omission and JSON `null` select the resource-derived policy; explicit
+positive quotas stay enforceable. An omitted per-Run disk quota follows the
+configured aggregate; explicit `null` removes that independent ceiling while
+still following actual aggregate funding. Frozen qualification policies remain
+unchanged; revised defaults are a distinct policy arm, not a passing throughput
+or scale result.
 
-These defaults are operating points carried forward from the repository's
-existing resource qualification, not universal optima or auto-research goals.
-They are independently configurable; no default is forced above a fixture's
-working set. In particular, `ResourceLimits::DEFAULT` supplies the 384 MiB
-database default; it is neither a SQLite format limit nor proof that a logically
-funded replay workload fits its physical coordinate/index pages. The
-[persistence owner's capacity contract](../../architecture.md#persistent-state-and-database-capacity)
-governs finite progress, identity preservation, cold recovery and honest
-capacity refusal at that policy. Raising the default alone cannot close those
-correctness obligations. Immutable recovered specs shed deserialize growth slack so the same
-admitted policy funds cold recovery and planned exec. Resource policy bounds owned logical allocations/work, not total
-process RSS: allocator overhead, library/runtime state, kernel buffers and
-socket transport also require measured RSS/FD/CPU qualification. A lower cost
-only counts as improvement when the same work and truth guarantees pass.
+The [persistence owner contract](../../architecture.md#persistent-state-and-database-capacity)
+governs identity, finite progress, cold recovery and capacity refusal. Immutable
+recovered specs shed deserialize growth slack so the admitted metadata policy
+funds cold recovery and planned exec. Resource policy bounds owned logical
+allocations/work, not total RSS: allocator, library/runtime, kernel and socket
+costs require measured RSS/FD/CPU qualification.
 
 ## Independent history owners and terminal settlement
 
@@ -98,15 +92,46 @@ a 32-byte WAL header and 24-byte frame headers. The total WAL allowance is twice
 the configured page-charge/checkpoint window. SQLite's WAL index uses 32 KiB
 blocks, 4062 frame slots in its first block and 4096 thereafter. SHM funding is
 derived from the permitted WAL frame count rather than an unrelated 4 MiB cap.
-The state-file allowance funds the database, WAL, SHM, three replay windows
-(source, replacement, retained payload) and one 1 MiB append work unit.
+Explicit state-file quotas fund the database, WAL, SHM, three replay windows
+(source, replacement, retained payload) and one 1 MiB append work unit. Without
+operator disk quotas, the owner derives effective history allowance from actual
+`statvfs` available blocks and replay allocations. It subtracts missing allocated
+WAL/SHM funding, a checkpoint's database pages and the existing 1 MiB append
+before dividing the remainder among those three generations. Existing sparse
+logical lengths do not count as allocated scratch. Database/index occupancy
+already reduces filesystem availability; SQLite's engine ceiling remains a
+separate observed page fact, not a fake large sentinel.
+
+Filesystem sampling occurs on admitted transactions, maintenance and blocked
+pressure observation, not every raw chunk. If unrelated writers consume the
+replacement headroom, the owner proves a smaller physically fundable suffix
+before retiring only confirmed oldest history. Compaction copies and syncs that
+suffix, commits its coordinates, then retires unreferenced generations. With no
+scratch, new Start refuses before creating a child; original accepted debt stays
+funded in the existing bounded queue, reads and healthy controls remain usable,
+and Barrier refuses a false ACK. Bounded retries also contain actual write FULL
+when quota/inode/racing-writer pressure is absent from `statvfs`; a failed space
+probe remains explicitly unknown. Uncertain COMMIT still fences all mutations.
+
+Valid cold history does not require reservation of the maximum future append
+window. Startup applies its existing actual dirty-page/commit proof, loads the
+saved metadata/history, and refuses unfunded future writes. Effective allowances
+are sampled admission facts, not permanent quotas, actual-free-byte readings or
+host reservations. The existing public storage observation and CLI expose those
+numeric allowances; SDK/daemon activation accepts the configured nullable quotas.
+Bounded diagnostic records retain configured-versus-effective details, but the
+public diagnostics RPC currently exposes sink counters rather than record
+messages or structured configured quotas. No new public shape is claimed.
+Shared durable capacity debt merges with existing native `Backpressured` and
+`ServiceChanged`, including quiet Runs with their own accepted debt; small fund changes do not clear pressure
+until original work actually settles. Truncation uses the existing exact floor,
+head and Gap facts, rather than disguising pressure as a fatal first failure.
 
 A valid oversized WAL is checkpointed during recovery; its size does not make
 it corrupt. Structural checks still reject invalid schema, unsafe file ownership,
 missing/short referenced data, invalid JSON/cursors and inconsistent accounting.
 Valid retained state that does not fit a new operator policy is preserved and
-reported as resource pressure with the required budget. Startup does not evict
-history merely to fit a smaller policy. Recovery at the same established page
+reported as resource pressure with the required budget. A smaller explicit policy does not make valid history corrupt. Recovery at the same established page
 cap follows the [persistence owner contract](../../architecture.md#persistent-state-and-database-capacity):
 confirmed prefixes may be atomically retired with truthful cursors, while
 metadata, confirmed heads and unconfirmed debt are protected. Policy pressure,
@@ -139,7 +164,21 @@ Known durable failure rejects upgrade before descriptor extraction. Upgrade stor
 waits remain Ctrl-C cancellable without a deadline that discards durability. It cannot strand an already-reaped Run forever
 behind a budget it will never be able to commit.
 
-Cold recovery hydrates at most the configured hot payload budget. Attach reads
+Cold recovery hydrates at most the configured global hot payload budget, further
+bounded by each Run's hot quota. It does not read the full resource-derived disk
+history into RAM. SQLite coordinate rows are streamed; contiguous tiny extents
+are merged into output blocks with at most 64 KiB payload rather than one resident vector
+entry per database row. Hot output uses the same bounded-block packing. The hot
+payload budget nevertheless is not a whole-process RSS bound: vector capacity,
+front-block slack, metadata, terminal models and SQLite's work have additional
+cost. Existing byte/cold recovery and packing regressions do not qualify all old
+fragmented-coordinate populations, arbitrary host pressure or fleet-scale RSS.
+Removing the artificial disk cap makes no unlimited-memory or performance claim.
+Startup validates coordinates by streaming all retained rows; global sorting and
+grouping work can still grow with retained history. Old forensic RSS observations
+are not a measurement of this candidate or a current cold-start benchmark.
+
+Cold recovery hydrates the configured hot payload window. Attach reads
 older available durable bytes in bounded actor-owned pages. Protocol generation
 18 adds `replay_window { first_available_byte, latest_output_bytes }` during
 initial replay: if concurrent retention advances the floor, both clients discard

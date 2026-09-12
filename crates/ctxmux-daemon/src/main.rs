@@ -66,6 +66,10 @@ fn resolve_inherited_descriptors(
     })
 }
 
+#[allow(
+    clippy::large_types_passed_by_value,
+    reason = "startup transfers one immutable Copy resource snapshot into the daemon owner"
+)]
 async fn serve(
     socket: PathBuf,
     state_dir: Option<PathBuf>,

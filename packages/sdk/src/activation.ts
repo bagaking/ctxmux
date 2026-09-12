@@ -93,9 +93,9 @@ export interface RuntimeResourceLimits {
   readonly live_event_bytes?: number;
   readonly run_output_bytes?: number;
   readonly metadata_bytes?: number;
-  readonly durable_replay_bytes?: number;
-  readonly durable_run_output_bytes?: number;
-  readonly database_bytes?: number;
+  readonly durable_replay_bytes?: number | null;
+  readonly durable_run_output_bytes?: number | null;
+  readonly database_bytes?: number | null;
   readonly wal_checkpoint_bytes?: number;
   readonly handoff_input_bytes?: number;
   readonly handoff_diagnostic_bytes?: number;
@@ -771,7 +771,16 @@ function normalizeResourceLimits(
   for (const [name, value] of Object.entries(policy)) {
     if (!allowed.has(name))
       throw new TypeError(`unknown resource limit ${name}`);
-    if (value === null && (name === "live_runs" || name === "retained_runs")) {
+    if (
+      value === null &&
+      [
+        "live_runs",
+        "retained_runs",
+        "database_bytes",
+        "durable_replay_bytes",
+        "durable_run_output_bytes",
+      ].includes(name)
+    ) {
       normalized[name] = null;
       continue;
     }

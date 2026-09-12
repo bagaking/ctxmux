@@ -1,5 +1,10 @@
 //! Long-lived native Run owner and local protocol server.
 
+#![allow(
+    clippy::large_types_passed_by_value,
+    reason = "ResourceLimits is one immutable Copy owner snapshot; optional disk quotas make it 280 bytes, and construction/dispatch copies preserve established ownership without borrowed configuration lifetimes"
+)]
+
 #[cfg(not(unix))]
 compile_error!("the first ctxmux native transport currently requires Unix sockets");
 
@@ -3386,6 +3391,9 @@ struct Run {
     /// Shares the actor's actual COMMIT cursor after its one durable binding.
     /// Observation must not wait for a persistence publication transition.
     durable_output_head: OnceLock<Arc<AtomicU64>>,
+    durable_offered_head: OnceLock<Arc<AtomicU64>>,
+    durable_capacity_blocked: OnceLock<Arc<AtomicBool>>,
+    published_output_pressure: AtomicBool,
     attachments: AtomicUsize,
     qualification_stats: QualificationStats,
     terminal_publications: TerminalPublicationOwner,
@@ -4096,6 +4104,9 @@ impl Run {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: QualificationStats::default(),
@@ -4421,6 +4432,9 @@ impl Run {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(match config.persistence_mode {
                 PersistenceMode::MemoryOnly => PersistenceBinding::Disabled,
                 PersistenceMode::PersistentCapable => {
@@ -4521,6 +4535,9 @@ impl Run {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: config.qualification_stats.clone(),
@@ -4702,6 +4719,9 @@ impl Run {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
             qualification_stats,
@@ -4834,6 +4854,9 @@ impl Run {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Active(persistence)),
             attachments: AtomicUsize::new(0),
             qualification_stats,
@@ -4947,12 +4970,27 @@ impl Run {
     }
 
     fn native_output_pressure(&self, pressured: bool) {
+        let pressured = pressured
+            || self
+                .durable_capacity_blocked
+                .get()
+                .is_some_and(|blocked| blocked.load(Ordering::Acquire))
+                && self
+                    .durable_offered_head
+                    .get()
+                    .zip(self.durable_output_head.get())
+                    .is_some_and(|(offered, committed)| {
+                        offered.load(Ordering::Acquire) > committed.load(Ordering::Acquire)
+                    });
+        if self
+            .published_output_pressure
+            .swap(pressured, Ordering::AcqRel)
+            == pressured
+        {
+            return;
+        }
         if let Some(service) = &self.native_service {
-            service.update_output(if pressured {
-                ctxmux_protocol::NativeOutputStatus::Backpressured {}
-            } else {
-                ctxmux_protocol::NativeOutputStatus::Serving {}
-            });
+            service.update_output_pressure(pressured);
         }
     }
 
@@ -4992,9 +5030,14 @@ impl Run {
         resources: ResourceLimits,
     ) -> ctxmux_protocol::RunStorageObservation {
         let output = self.output.snapshot();
-        let persistence = mutex_lock(&self.persistence)
-            .durable()
-            .map(PersistentRun::storage_observation);
+        let binding = mutex_lock(&self.persistence);
+        let durable = binding.durable();
+        let persistence = durable.map(PersistentRun::storage_observation);
+        // A memory-only Run has no durable owner or effective disk allowance.
+        let effective = durable.map_or_else(
+            persistence::EffectiveStoragePolicy::default,
+            PersistentRun::effective_storage_policy,
+        );
         ctxmux_protocol::RunStorageObservation {
             run_id: self.id,
             latest_output_bytes: output.latest_output_bytes,
@@ -5003,9 +5046,9 @@ impl Run {
             policy: ctxmux_protocol::RunStoragePolicy {
                 run_output_bytes: resources.run_output_bytes as u64,
                 hot_output_bytes: resources.hot_output_bytes,
-                durable_run_output_bytes: resources.durable_run_output_bytes,
-                durable_replay_bytes: resources.durable_replay_bytes,
-                database_bytes: resources.database_bytes,
+                durable_run_output_bytes: effective.durable_run_output_bytes,
+                durable_replay_bytes: effective.durable_replay_bytes,
+                database_bytes: effective.database_bytes,
                 wal_checkpoint_bytes: resources.wal_checkpoint_bytes,
                 terminal_history_rows: terminal_checkpoint::HISTORY_ROWS as u64,
                 terminal_checkpoint_bytes: terminal_checkpoint::MAX_RESTORE_BYTES as u64,
@@ -5631,6 +5674,10 @@ impl Run {
     }
 
     fn bind_durable_output_head(&self, persistence: &PersistentRun) {
+        self.durable_capacity_blocked
+            .get_or_init(|| persistence.capacity_blocked_flag());
+        self.durable_offered_head
+            .get_or_init(|| persistence.offered_head_owner());
         assert!(
             self.durable_output_head
                 .set(persistence.durable_head_owner())
@@ -8586,6 +8633,9 @@ mod tests {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: std::sync::atomic::AtomicUsize::new(0),
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
@@ -9686,6 +9736,10 @@ mod tests {
 
     /// Two real native PTYs, a blocked actor, and a latched storage failure.
     /// The observation executes through the public Rust dispatch client.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one public two-Run fixture keeps original ownership, fault and recovery oracles together"
+    )]
     async fn exercise_storage_fault(
         server: &InProcessServer,
         persistence: &super::Persistence,
@@ -9765,7 +9819,13 @@ mod tests {
             );
             assert_eq!(
                 observation.policy.durable_run_output_bytes,
-                server.manager.resources.durable_run_output_bytes
+                server
+                    .manager
+                    .persistence
+                    .as_ref()
+                    .unwrap()
+                    .effective_storage_policy()
+                    .durable_run_output_bytes
             );
             let (view, snapshot) = server.client.attach_terminal(run.id, 0).await.unwrap();
             assert!(
@@ -9801,6 +9861,139 @@ mod tests {
         )));
         let ids = exercise_storage_fault(&server, &persistence).await;
         for id in ids {
+            server.manager.get(id).unwrap().stop().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one public fixture observes quiet pressure, healthy Input, honest Start refusal and exact same-owner recovery"
+    )]
+    async fn policy_public_quiet_pressure_preserves_input_and_clears_only_after_debt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (persistence, recovered) = super::Persistence::open(temp.path().join("state")).unwrap();
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let first = server.client.start(long_running_spec()).await.unwrap();
+        let second = server.client.start(long_running_spec()).await.unwrap();
+        persistence.barrier().unwrap();
+        let (view, _) = server.client.attach(first.id, 0).await.unwrap();
+        persistence.set_filesystem_available_for_test(Some(0));
+        server
+            .client
+            .input(first.id, b"original-pending\n".to_vec())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = server.client.status(first.id).await.unwrap();
+                if matches!(
+                    status.native_service.unwrap().output,
+                    ctxmux_protocol::NativeOutputStatus::Backpressured {}
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("quiet original Run must publicly expose storage pressure");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = view.next_event().await.unwrap().unwrap();
+                if matches!(event, RunEvent::ServiceChanged { service } if matches!(service.output, ctxmux_protocol::NativeOutputStatus::Backpressured {})) {
+                    break;
+                }
+            }
+        }).await.expect("the attached quiet Run needs the existing public pressure event");
+        let pressured = server
+            .client
+            .status(first.id)
+            .await
+            .unwrap()
+            .native_service
+            .unwrap();
+        persistence.set_filesystem_available_for_test(Some(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let insufficient = server
+            .client
+            .status(first.id)
+            .await
+            .unwrap()
+            .native_service
+            .unwrap();
+        assert_eq!(
+            insufficient.revision, pressured.revision,
+            "a funding change without a successful write cannot advertise Serving"
+        );
+        assert!(matches!(
+            insufficient.output,
+            ctxmux_protocol::NativeOutputStatus::Backpressured {}
+        ));
+        assert!(
+            matches!(
+                server
+                    .client
+                    .status(second.id)
+                    .await
+                    .unwrap()
+                    .native_service
+                    .unwrap()
+                    .output,
+                ctxmux_protocol::NativeOutputStatus::Serving {}
+            ),
+            "an unaffected Run without original output debt keeps Serving"
+        );
+        let receipt = server
+            .client
+            .input(second.id, b"healthy-input\n".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(receipt.run.id, second.id);
+        assert_eq!(receipt.run.pid, second.pid);
+        assert_eq!(receipt.receipt.written_bytes, 14);
+        assert!(receipt.run.state.is_running());
+        let (_, facts) = server.client.observe_storage(first.id).await.unwrap();
+        let observed = facts.persistence.unwrap();
+        assert_eq!(observed.first_failure, None);
+        assert!(!observed.actor_stopped);
+        assert!(observed.offered_output_bytes > observed.committed_output_bytes);
+        let rejected = server
+            .client
+            .start(long_running_spec())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            rejected.contains("filesystem capacity"),
+            "new Start must report actual pressure before child admission"
+        );
+        assert_eq!(server.client.list().await.unwrap().len(), 2);
+        persistence.set_filesystem_available_for_test(None);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = server.client.status(first.id).await.unwrap();
+                if matches!(
+                    status.native_service.unwrap().output,
+                    ctxmux_protocol::NativeOutputStatus::Serving {}
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same owner must clear pressure only after original output settles");
+        persistence.barrier().unwrap();
+        let (_, settled) = server.client.observe_storage(first.id).await.unwrap();
+        let settled = settled.persistence.unwrap();
+        assert_eq!(settled.offered_output_bytes, settled.committed_output_bytes);
+        assert_eq!(settled.first_failure, None);
+        view.detach().await.unwrap();
+        for id in [first.id, second.id] {
             server.manager.get(id).unwrap().stop().await.unwrap();
         }
     }
@@ -12095,6 +12288,9 @@ mod tests {
             persistence_unlocked: Notify::new(),
             persistence_transition: Mutex::new(()),
             durable_output_head: std::sync::OnceLock::new(),
+            durable_offered_head: std::sync::OnceLock::new(),
+            durable_capacity_blocked: std::sync::OnceLock::new(),
+            published_output_pressure: AtomicBool::new(false),
             persistence: Mutex::new(PersistenceBinding::Disabled),
             attachments: AtomicUsize::new(0),
             qualification_stats: crate::qualification_stats::QualificationStats::default(),
@@ -12907,9 +13103,9 @@ mod tests {
     }
 
     const SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES: super::ResourceLimits = super::ResourceLimits {
-        database_bytes: 128 * 1024,
-        durable_replay_bytes: 256 * 1024,
-        durable_run_output_bytes: 256 * 1024,
+        database_bytes: Some(128 * 1024),
+        durable_replay_bytes: Some(256 * 1024),
+        durable_run_output_bytes: Some(256 * 1024),
         hot_output_bytes: 256 * 1024,
         run_output_bytes: 256 * 1024,
         ..super::ResourceLimits::DEFAULT
@@ -12975,7 +13171,9 @@ mod tests {
             .unwrap();
         assert!(
             u64::try_from(pages).unwrap() * 4096
-                <= SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+                <= SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                    .database_bytes
+                    .unwrap()
         );
         let mut truncated = false;
         for run in expected["runs"].as_array().unwrap() {
@@ -13014,7 +13212,9 @@ mod tests {
             expected["producer_pid"],
             expected["database_capacity_reclaims"],
             pages,
-            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                .database_bytes
+                .unwrap()
         );
         drop(database);
         let second = sqlite_page_capacity_public_process(directory.path(), "recover");
@@ -13129,8 +13329,12 @@ mod tests {
         assert!(persistence.database_capacity_reclaims() > 0);
         assert!(
             expected.iter().map(Vec::len).sum::<usize>()
-                < usize::try_from(SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.durable_replay_bytes)
-                    .unwrap()
+                < usize::try_from(
+                    SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                        .durable_replay_bytes
+                        .unwrap()
+                )
+                .unwrap()
         );
         for (index, marker) in [
             b"first-after-pressure".as_slice(),
@@ -13152,7 +13356,9 @@ mod tests {
             let (_, storage) = server.client.observe_storage(runs[index].id).await.unwrap();
             assert_eq!(
                 storage.policy.database_bytes,
-                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                    .database_bytes
+                    .unwrap()
             );
             let owner = storage.persistence.unwrap();
             assert_eq!(owner.first_failure, None);
@@ -13249,7 +13455,9 @@ mod tests {
             let (_, storage) = server.client.observe_storage(original.id).await.unwrap();
             assert_eq!(
                 storage.policy.database_bytes,
-                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                    .database_bytes
+                    .unwrap()
             );
             assert_eq!(storage.persistence.unwrap().first_failure, None);
         }
@@ -13282,7 +13490,9 @@ mod tests {
         eprintln!(
             "sqlite_page_capacity_public: distinct_recovery_process={}, recovered_original_runs=3, same_fixed_database_bytes={}",
             std::process::id(),
-            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES
+                .database_bytes
+                .unwrap()
         );
     }
 

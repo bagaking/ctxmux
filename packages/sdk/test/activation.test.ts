@@ -983,6 +983,118 @@ test("invalid resource policy fails before creating a Runtime directory", async 
 });
 
 test(
+  "policy disk quota omission/null and explicit quota are real SDK/CLI owner facts",
+  { timeout: scaled(30_000) },
+  async (context) => {
+    const directory = await temporaryDirectory(context, "ctxmux-policy-");
+    const cliBinary =
+      process.env.CTXMUX_BIN ?? join(repositoryRoot, "target/debug/ctxmux");
+    for (const [name, resourceLimits] of [
+      ["omitted", {}],
+      [
+        "null",
+        {
+          database_bytes: null,
+          durable_replay_bytes: null,
+          durable_run_output_bytes: null,
+        },
+      ],
+      [
+        "explicit",
+        {
+          database_bytes: 128 * 1024,
+          durable_replay_bytes: 8192,
+          durable_run_output_bytes: 4096,
+        },
+      ],
+    ] as const) {
+      const socketPath = join(directory, `${name}.sock`);
+      const stateDir = join(directory, name);
+      let activation: RuntimeActivation | undefined;
+      context.after(async () => shutdownOwned(activation));
+      activation = await activateRuntime({
+        executable: daemonBinary,
+        socketPath,
+        stateDir,
+        resourceLimits,
+        timeoutMs: scaled(5_000),
+      });
+      const original = await activation.client.start(
+        defineRun(process.execPath, {
+          args: ["-e", 'process.stdout.write("original-policy-output")'],
+          cwd: directory,
+        }),
+      );
+      const deadline = Date.now() + scaled(5_000);
+      while (
+        (await activation.client.status(original.id)).durable_output_bytes !==
+          22 ||
+        (await activation.client.status(original.id)).state.type === "running"
+      ) {
+        assert.ok(Date.now() < deadline);
+        await delay(10);
+      }
+      for (let incarnation = 0; incarnation < 2; incarnation += 1) {
+        const facts: Awaited<ReturnType<CtxmuxClient["observeStorage"]>> =
+          await activation.client.observeStorage(original.id);
+        assert.equal(facts.observation.persistence!.first_failure, null);
+        if (name === "explicit") {
+          assert.equal(facts.observation.policy.database_bytes, 128 * 1024);
+          assert.equal(facts.observation.policy.durable_replay_bytes, 8192);
+          assert.equal(facts.observation.policy.durable_run_output_bytes, 4096);
+        } else {
+          assert.ok(
+            facts.observation.policy.database_bytes > 384 * 1024 * 1024,
+          );
+          assert.ok(
+            facts.observation.policy.durable_replay_bytes > 256 * 1024 * 1024,
+          );
+          assert.equal(
+            facts.observation.policy.durable_run_output_bytes,
+            facts.observation.policy.durable_replay_bytes,
+          );
+        }
+        const { stdout } = await execFile(cliBinary, [
+          "--socket",
+          socketPath,
+          "storage",
+          original.id,
+        ]);
+        const cli = JSON.parse(stdout) as {
+          observation: typeof facts.observation;
+        };
+        assert.deepEqual(cli.observation, facts.observation);
+        const attached: Attachment = await activation.client.attach(
+          original.id,
+          0,
+        );
+        const bytes = Buffer.concat(
+          attached.snapshot.replay.chunks.map((chunk) =>
+            Buffer.from(chunk.data),
+          ),
+        );
+        assert.equal(attached.snapshot.run.id, original.id);
+        assert.equal(attached.snapshot.replay.first_available_byte, 0);
+        assert.equal(bytes.toString(), "original-policy-output");
+        attached.close();
+        if (incarnation === 0) {
+          await activation.shutdown();
+          activation = await activateRuntime({
+            executable: daemonBinary,
+            socketPath,
+            stateDir,
+            resourceLimits,
+            timeoutMs: scaled(5_000),
+          });
+        }
+      }
+      await activation.shutdown();
+      activation = undefined;
+    }
+  },
+);
+
+test(
   "fully evicted history attaches as an explicit empty window before and after cold restart",
   { timeout: scaled(20_000) },
   async (context) => {

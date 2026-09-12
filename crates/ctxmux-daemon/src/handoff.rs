@@ -48,7 +48,7 @@ use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::Hand
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v7";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v8";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -505,6 +505,26 @@ mod tests {
     }
 
     #[test]
+    fn policy_optional_quotas_round_trip_through_private_v8_manifest() {
+        for quotas in [
+            (None, None, None),
+            (Some(128 * 1024), Some(8192), Some(4096)),
+        ] {
+            let mut manifest = HandoffManifest::new("policy-epoch".to_owned(), 3, 4, vec![]);
+            manifest.resources.database_bytes = quotas.0;
+            manifest.resources.durable_replay_bytes = quotas.1;
+            manifest.resources.durable_run_output_bytes = quotas.2;
+            let parsed: HandoffManifest =
+                serde_json::from_slice(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert_eq!(
+                parsed.resources, manifest.resources,
+                "original configured quotas must survive planned exec unchanged"
+            );
+            assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v8");
+        }
+    }
+
+    #[test]
     fn reads_manifest_from_a_pipe_fd() {
         use std::io::Write;
         let (reader, writer) = rustix::pipe::pipe().unwrap();
@@ -585,7 +605,7 @@ mod tests {
         );
 
         let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
-        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v7");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v8");
         assert_eq!(parsed.stop_operations, [operation]);
     }
 
@@ -722,9 +742,9 @@ mod tests {
             ".resources.live_event_bytes:number",
             ".resources.run_output_bytes:number",
             ".resources.metadata_bytes:number",
-            ".resources.durable_replay_bytes:number",
-            ".resources.durable_run_output_bytes:number",
-            ".resources.database_bytes:number",
+            ".resources.durable_replay_bytes:null",
+            ".resources.durable_run_output_bytes:null",
+            ".resources.database_bytes:null",
             ".resources.wal_checkpoint_bytes:number",
             ".resources.handoff_input_bytes:number",
             ".resources.handoff_diagnostic_bytes:number",

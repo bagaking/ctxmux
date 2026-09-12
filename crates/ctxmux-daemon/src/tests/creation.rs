@@ -16,8 +16,8 @@ async fn hot_tail_finalize_fences_interleaved_real_run_prefixes() {
     let resources = ResourceLimits {
         hot_output_bytes: 2,
         run_output_bytes: 1,
-        durable_replay_bytes: 2,
-        durable_run_output_bytes: 1,
+        durable_replay_bytes: Some(2),
+        durable_run_output_bytes: Some(1),
         ..ResourceLimits::DEFAULT
     };
     let (persistence, recovered) =

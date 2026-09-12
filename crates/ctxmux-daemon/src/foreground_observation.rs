@@ -401,7 +401,7 @@ mod tests {
         };
         assert!(
             reason.contains("accepts handoff schema")
-                && reason.contains("ctxmux.daemon-handoff.v7")
+                && reason.contains(crate::handoff::HANDOFF_SCHEMA)
         );
         assert_eq!(observations.len(), 2);
         for (before, after, bytes, expected) in observations {

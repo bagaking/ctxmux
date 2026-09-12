@@ -1755,15 +1755,18 @@ fn poll_and_read_outputs(
             input_files.push((index, file));
         }
         if let Some(output) = &mut entry.output
-            && (output.paused || output.pending_offer)
             && let Some(run) = entry.run.upgrade()
         {
-            if let Some(mut turn) = run.try_output_turn() {
-                output.paused = turn.capacity() == 0;
-                output.pending_offer = turn.has_unoffered();
-            } else {
-                output.paused = true;
+            if output.paused || output.pending_offer {
+                if let Some(mut turn) = run.try_output_turn() {
+                    output.paused = turn.capacity() == 0;
+                    output.pending_offer = turn.has_unoffered();
+                } else {
+                    output.paused = true;
+                }
             }
+            // A disk-pressure transition wakes this existing owner even when
+            // the child is quiet. No additional output-turn lock is acquired.
             run.native_output_pressure(output.paused);
         }
     }

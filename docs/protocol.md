@@ -907,7 +907,7 @@ write, while later attachment commands receive an explicit retryable
 `backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
-fail-stop. The schema-v7 handoff manifest carries the complete established
+fail-stop. The schema-v8 handoff manifest carries the complete established
 resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
 preflighted before extraction. Known persistence failure rejects upgrade before
@@ -916,7 +916,7 @@ and exec serialize through one final gate. Protocol generation 22 has no upgrade
 wire operation.
 
 The handoff schema declares manifest shape, independently of the public protocol
-generation. A matching `ctxmux.daemon-handoff.v7` in the selected target's
+generation. A matching `ctxmux.daemon-handoff.v8` in the selected target's
 `--version` is necessary for preflight; it does not qualify a cross-generation
 upgrade. Generation-21 clients must reconnect using generation-22 clients after
 an upgrade to this image. The complete selected-source live upgrade qualification
@@ -960,23 +960,24 @@ preserved. A transaction that remains active must be explicitly rolled back and
 confirmed inactive. A failed or unconfirmed rollback still fences writes. This
 does not weaken the witness required to classify an attempted `COMMIT`.
 
-An output append or terminal finalize that receives external storage `DiskFull`,
-or whose WAL admission is temporarily blocked by a reader during
-`wal_checkpoint(TRUNCATE)`, does not permanently poison the serving daemon. The
-persistence actor retries that same ordered unit after a short delay and admits
-no later durable mutation ahead of it. Its bounded queue applies backpressure
-while storage is unavailable; daemon shutdown cancels the wait. A checkpoint
-that remains busy through its bounded local retry budget is reported as
-retryable storage pressure and the ordered unit continues waiting; it is not
-latched as durable corruption. Non-transient database and I/O errors, replay
-conflicts, integrity, uncertain-commit and owner-invariant failures latch persistence and
-reject later durable mutations. This changes no wire frame or error code: a
-client may observe output progress stall until storage recovers, and a client
-restart alone neither owns nor resets the daemon-side wait. Proven configured
-page pressure follows finite owner reclamation or explicit capacity handling
-instead of this unchanged-resource retry loop; it is not itself an integrity
-failure or permission to discard accepted output. Uncertain commit still
-retains the original fail-closed disposition.
+An output append or terminal finalize receiving proven pre-COMMIT external
+`DiskFull` gets a bounded exact retry; continued physical shortage becomes
+original ordered debt. Filesystem observations do not reserve space or dismiss
+a real write failure. Unavailable funding remains explicitly unknown. The
+existing bounded queue preserves accepted debt without monopolizing the shared
+actor; reads and healthy process controls keep serving and Barrier cannot
+acknowledge uncommitted bytes. An actual filesystem funding change can retry the
+same debt, including when the database is at its page ceiling. WAL checkpoint
+busy retains its bounded-local-retry semantics. Non-transient I/O, replay
+conflicts, integrity and uncertain COMMIT still latch persistence and refuse
+later mutations.
+
+Public native `Backpressured` and `ServiceChanged` expose durable capacity debt,
+merged with existing PTY/memory pressure even for quiet live Runs with their own accepted debt. A small funding
+change alone does not publish `Serving`; original debt must actually settle.
+Start without funds refuses before physical launch, with the capacity reason.
+Confirmed history retirement is visible through existing floors/truncation/Gap;
+nonfatal pressure is not inserted into the original fatal first-failure latch.
 
 ### Bounded storage observations
 
@@ -991,14 +992,24 @@ a missing capability is explicit unsupported, not a failure of the original Run.
 
 The memory floor and latest byte are one bounded output-facts snapshot. The
 optional persistence object independently samples the actor's original first
-latched failure, actor completion, advisory not-yet-dequeued append count,
+latched failure, actor completion, advisory queued/owned append command credits, including retained retry debt,
 accepted-output watermark and **last confirmed committed** watermark. An unknown
 COMMIT can leave disk ahead of the confirmed watermark: differences do not prove
 lost or uncommitted bytes. Null persistence denotes a Run with no persistence
 owner. Null first failure alone promises neither health nor complete durability.
 The effective per-Run and shared raw budgets, database/WAL policy and VT limits
 come from the current owner's policy, including handoff-preserved values.
-Database policy is a budget, not sampled occupancy. This observation does not
+Database policy is the serving connection's effective SQLite page ceiling, not
+sampled occupancy. Default disk quotas are omitted or `null`; explicit positive
+quotas remain supported by daemon/SDK activation and private schema-v8 handoff.
+Default replay numbers are the most recently sampled filesystem-funded allowance,
+not reserved bytes or a configured permanent ceiling. Unfunded or unknown
+filesystem observation can yield zero new-write allowance without asserting zero
+actual free space or invalidating saved history. Memory-only Runs report zero
+for disk allowances because no disk owner exists. Public wire generation 22 does
+not expose nullable configured quotas or filesystem available/required fields;
+bounded daemon diagnostics record those details, while the diagnostics RPC
+reports sink counters rather than messages. This observation does not
 report SQLite page/free-page counts, table/index usage, filesystem free space or
 structured SQLite failure stage; those unavailable facts cannot be inferred
 from the budget or a null first failure.
