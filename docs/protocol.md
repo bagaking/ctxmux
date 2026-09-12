@@ -599,10 +599,11 @@ the pane.
 
 ## Output and reconnect
 
-PTY output is divided into contiguous half-open cumulative byte ranges. The
-daemon defaults to 4 MiB hot and durable replay per Run, with independent
-configurable per-Run and aggregate budgets. An attachment supplies its last observed byte cursor
-and receives:
+PTY output is divided into contiguous half-open cumulative byte ranges. An
+omitted per-Run hot or durable replay quota follows its respective aggregate
+budget; there is no independent default 4 MiB history ceiling. Explicit per-Run
+quotas remain configurable, and aggregate pressure can evict old history.
+An attachment supplies its last observed byte cursor and receives:
 
 - retained bytes after that cursor, slicing the first range when it falls inside a retained chunk;
 - the first retained byte and total output bytes allocated;

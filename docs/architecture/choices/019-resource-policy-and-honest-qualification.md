@@ -28,10 +28,10 @@ versioned handoff manifest and explicit incoming CLI arguments.
 | `retained_runs`             | null    | Optional retained/projected record quota; exact quiescent replacement at pressure                                              |
 | `metadata_bytes`            | 64 MiB  | Registry serialized metadata, actual String/Vec capacities, conservatively funded BTreeMap nodes and fixed owner/index costs   |
 | `hot_output_bytes`          | 1 GiB   | Aggregate hot replay payload; reclaim offered history and backpressure only unoffered persistent bytes                         |
-| `run_output_bytes`          | 4 MiB   | Per-Run hot replay; may be smaller than durable replay, may become empty                                                       |
+| `run_output_bytes`          | follows hot aggregate | Optional independent per-Run hot replay quota; omitted quota follows `hot_output_bytes`                                       |
 | `live_event_bytes`          | 64 MiB  | Shared broadcast backing and one leased payload across receivers; attach refusal, Gap or observation discontinuity at pressure |
 | `durable_replay_bytes`      | 256 MiB | Aggregate disk replay history, independently of hot cache                                                                      |
-| `durable_run_output_bytes`  | 4 MiB   | Per-Run disk history; actor-owned prefix trimming, monotone lifetime head                                                      |
+| `durable_run_output_bytes`  | follows disk aggregate | Optional independent per-Run disk quota; omitted quota follows `durable_replay_bytes`, with a monotone lifetime head           |
 | `database_bytes`            | 384 MiB | SQLite page funding, not a Run-count format limit                                                                              |
 | `wal_checkpoint_bytes`      | 8 MiB   | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
 | `control_state_bytes`       | 128 MiB | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
@@ -51,6 +51,19 @@ versioned handoff manifest and explicit incoming CLI arguments.
 | `input_result_entries`      | 256     | Retained duplicate-result ledger window                                                                                        |
 | `input_result_bytes`        | 1 MiB   | Per-Run retained input request payload, additionally globally funded                                                           |
 | `tmux_discovery_bytes`      | 128 KiB | Bounded discovery subprocess output; explicit configurable rejection                                                           |
+
+Per-Run history has no independent default 4 MiB ceiling. Omitting the two
+per-Run quota fields derives their effective allowance from their respective
+aggregate owner; an explicit quota remains an operator choice. Input queue
+capacity is independent and keeps its own byte budget: pending input is work
+not yet applied, unlike already observed output history.
+
+The existing 1 GiB hot and 256 MiB durable aggregate defaults are still historical
+operating points, not suitable-scale claims. Removing the per-Run ceiling does
+not qualify those aggregate defaults for large fleets, provide permanent
+archival, or establish a throughput improvement. The original qualification
+policies, including any explicit 4 MiB per-Run quota, remain frozen in their
+historical workloads; a changed default is a distinct capacity-policy arm.
 
 These defaults are operating points carried forward from the repository's
 existing resource qualification, not universal optima or auto-research goals.

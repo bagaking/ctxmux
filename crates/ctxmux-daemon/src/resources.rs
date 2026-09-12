@@ -5,6 +5,10 @@
 //! descriptors; retained records follow metadata. Explicit population limits
 //! are optional operator policy. Qualification fleet sizes never set defaults.
 
+// Historical aggregate byte defaults; operator policy documented in ADR 019.
+const DEFAULT_HOT_REPLAY_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_DURABLE_REPLAY_BYTES: u64 = 256 * 1024 * 1024;
+
 // SQLite file-format constants: 4096-byte pages in this store, 32-byte WAL
 // header and 24-byte frame header. wal.c uses 32 KiB index blocks, with 4062
 // frame slots in the first and 4096 thereafter (136-byte index header).
@@ -82,12 +86,12 @@ impl ResourceLimits {
     pub const DEFAULT: Self = Self {
         live_runs: None,
         retained_runs: None,
-        hot_output_bytes: 1024 * 1024 * 1024,
+        hot_output_bytes: DEFAULT_HOT_REPLAY_BYTES as u64,
         live_event_bytes: 64 * 1024 * 1024,
-        run_output_bytes: 4 * 1024 * 1024,
+        run_output_bytes: DEFAULT_HOT_REPLAY_BYTES,
         metadata_bytes: 64 * 1024 * 1024,
-        durable_replay_bytes: 256 * 1024 * 1024,
-        durable_run_output_bytes: 4 * 1024 * 1024,
+        durable_replay_bytes: DEFAULT_DURABLE_REPLAY_BYTES,
+        durable_run_output_bytes: DEFAULT_DURABLE_REPLAY_BYTES,
         database_bytes: 384 * 1024 * 1024,
         wal_checkpoint_bytes: 8 * 1024 * 1024,
         handoff_input_bytes: 128 * 1024 * 1024,
@@ -123,7 +127,23 @@ impl ResourceLimits {
     /// Parse and validate one policy. Unknown names fail instead of silently
     /// leaving an intended budget at its default.
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let limits: Self = serde_json::from_str(json).map_err(|error| error.to_string())?;
+        // Deserialize the original input first so duplicate and unknown
+        // fields retain the strict policy error instead of last-value wins.
+        let mut limits: Self = serde_json::from_str(json).map_err(|error| error.to_string())?;
+        let value: serde_json::Value =
+            serde_json::from_str(json).map_err(|error| error.to_string())?;
+        let hot_quota = value.get("run_output_bytes").is_some();
+        let durable_quota = value.get("durable_run_output_bytes").is_some();
+        // A missing per-Run quota follows its actual aggregate owner. It must
+        // not remain an unrelated smaller ceiling after an operator changes
+        // the aggregate budget. Explicit quotas survive exec and round trips.
+        if !hot_quota {
+            limits.run_output_bytes = usize::try_from(limits.hot_output_bytes)
+                .map_err(|_| "hot_output_bytes must fit the host")?;
+        }
+        if !durable_quota {
+            limits.durable_run_output_bytes = limits.durable_replay_bytes;
+        }
         limits.validate()?;
         Ok(limits)
     }
@@ -325,8 +345,38 @@ mod tests {
     }
 
     #[test]
+    fn omitted_run_history_quotas_follow_the_aggregate_owner() {
+        let defaults = ResourceLimits::default();
+        assert_eq!(defaults.run_output_bytes as u64, defaults.hot_output_bytes);
+        assert_eq!(
+            defaults.durable_run_output_bytes,
+            defaults.durable_replay_bytes
+        );
+        let limits =
+            ResourceLimits::from_json(r#"{"hot_output_bytes":8192,"durable_replay_bytes":16384}"#)
+                .unwrap();
+        assert_eq!(limits.run_output_bytes, 8192);
+        assert_eq!(limits.durable_run_output_bytes, 16384);
+    }
+
+    #[test]
+    fn explicit_history_quotas_and_resolved_exec_policy_remain_exact() {
+        let limits = ResourceLimits::from_json(
+            r#"{"hot_output_bytes":8192,"run_output_bytes":512,"durable_replay_bytes":16384,"durable_run_output_bytes":1024}"#,
+        )
+        .unwrap();
+        assert_eq!(limits.run_output_bytes, 512);
+        assert_eq!(limits.durable_run_output_bytes, 1024);
+        let encoded = serde_json::to_string(&limits).unwrap();
+        assert_eq!(ResourceLimits::from_json(&encoded).unwrap(), limits);
+    }
+
+    #[test]
     fn invalid_policy_fails_before_owner_creation() {
         for json in [
+            r#"{"hot_output_bytes":8192,"hot_output_bytes":16384}"#,
+            r#"{"run_output_bytes":512,"run_output_bytes":1024}"#,
+            r#"{"durable_run_output_bytes":512,"durable_run_output_bytes":1024}"#,
             r#"{"live_run":5000}"#,
             r#"{"live_runs":0}"#,
             r#"{"database_bytes":4097}"#,
