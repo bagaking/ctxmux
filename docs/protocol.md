@@ -923,12 +923,14 @@ an upgrade to this image. The complete selected-source live upgrade qualificatio
 must precede applying that transition to a user Runtime; memory-only `SIGHUP`
 still performs no upgrade.
 
-A valid store at its configured main-database page ceiling reclaims bounded oldest
-replay prefixes before allocating mutations or startup reconciliation. This
-physical-pressure retention preserves Run/key/metadata and the durable head,
-while advancing the replay floor and truncation fact in the same transaction.
-It never raises the file ceiling or presents evicted bytes as contiguous replay.
-See ADR 009 for the independent physical and logical retention bounds.
+A valid store at its configured main-database page ceiling follows the
+[persistence owner contract](architecture.md#persistent-state-and-database-capacity)
+for bounded replay-prefix reclamation, safe Start refusal, accepted debt and
+cold reconciliation. Retention is observable through the existing exact replay
+floor/head and truncation/Gap facts; it does not change the wire generation or
+invent missing bytes. A policy-capacity refusal before Start readiness has no
+physical child effect. Reads and healthy process controls retain their existing
+scope even when a durable barrier cannot confirm pending work.
 
 Replay payloads are append-only files under the state directory. SQLite stores
 only the contiguous window index and the active generation name. The writer
@@ -970,7 +972,11 @@ latched as durable corruption. Non-transient database and I/O errors, replay
 conflicts, integrity, uncertain-commit and owner-invariant failures latch persistence and
 reject later durable mutations. This changes no wire frame or error code: a
 client may observe output progress stall until storage recovers, and a client
-restart alone neither owns nor resets the daemon-side wait.
+restart alone neither owns nor resets the daemon-side wait. Proven configured
+page pressure follows finite owner reclamation or explicit capacity handling
+instead of this unchanged-resource retry loop; it is not itself an integrity
+failure or permission to discard accepted output. Uncertain commit still
+retains the original fail-closed disposition.
 
 ### Bounded storage observations
 
@@ -992,6 +998,10 @@ lost or uncommitted bytes. Null persistence denotes a Run with no persistence
 owner. Null first failure alone promises neither health nor complete durability.
 The effective per-Run and shared raw budgets, database/WAL policy and VT limits
 come from the current owner's policy, including handoff-preserved values.
+Database policy is a budget, not sampled occupancy. This observation does not
+report SQLite page/free-page counts, table/index usage, filesystem free space or
+structured SQLite failure stage; those unavailable facts cannot be inferred
+from the budget or a null first failure.
 
 This observation does not query replay, wait for the persistence actor, export
 VT, mutate a Run, or clear a failure. A persistence failure does not invalidate

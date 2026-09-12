@@ -710,6 +710,8 @@ reaps its Control process before `Interrupted` becomes observable. Retaining its
 historical Run record therefore has no per-terminal Control descriptor slope;
 this cleanup does not imply Run GC.
 
+### Persistent state and database capacity
+
 Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread
 commits starts, replay coordinates, pruning/accounting, and terminal
@@ -717,18 +719,14 @@ transitions; replay payloads are synced to the active external generation
 before their coordinates commit. Each output transaction owns one shared replay
 file handle and its append offset across all participating Runs. Successful
 writes advance that offset without a file-stat call per row; one payload sync
-precedes the SQLite `FULL` commit. Durable heads publish only after a confirmed
-commit. Proven rollback permits tail truncation, while uncertain commit,
+precedes the SQLite `synchronous=FULL` commit. Durable heads publish only after
+a confirmed commit. Proven rollback permits tail truncation, while uncertain commit,
 rollback or post-commit inspection preserves possibly indexed bytes for recovery.
 The writer releases its handle before adaptive transaction reduction; its
 destructor never decides commit disposition. Empty payload performs no replay
 sync. The actor queue and output grants fund pending work; ordinary append
-offers do not block the shared PTY reader when the queue is full. If SQLite
-reports typed `DiskFull`, write-side I/O pressure, or the external file reports
-`StorageFull` while appending output or finalizing a Run, that actor keeps the
-exact command at the head of the queue and retries after a short delay; later
-durable mutations cannot pass it, and daemon shutdown cancels the wait. Every
-other storage, replay, budget, integrity, and owner-invariant failure remains
+offers do not block the shared PTY reader when the queue is full. Uncertain
+commit/rollback, replay conflicts, integrity and owner-invariant failures remain
 fail-stop for later durable mutations. A latched persistence failure marks the
 replay history gap and preserves its lagging durable head. It does not invalidate
 an intact live terminal model that has consumed every ordered PTY byte. Actual
@@ -742,6 +740,65 @@ publish its socket. Recovered exited or interrupted Runs support list, status, r
 attach, and Level A fork; input, resize, stop, and recovered Level B fork fail
 explicitly. The replacement daemon never opens, adopts, attaches to, or signals
 a PID from durable metadata.
+
+Durable identity, exact creation keys, immutable specs, lineage, terminal facts
+and the last confirmed byte head are correctness requirements. Resource policy
+must protect those facts and cold recovery, rather than obtaining an apparent
+recovery by deleting Runs or starting an empty store. Provider Session identity
+and semantic resume remain the embedding client's responsibility. Persistence
+does not promise permanent retention of every output byte or cold-restart PTY
+continuity.
+
+`ResourceLimits::DEFAULT` in
+[`resources.rs`](../crates/ctxmux-daemon/src/resources.rs) sets the 384 MiB
+`database_bytes` operating default. It is configurable SQLite page funding,
+not a format limit or a qualified fleet capacity. The separately funded replay
+payload is external to SQLite; its row coordinates, uniqueness index and
+partially occupied pages can exhaust the database even while logical replay
+is below its byte allowance. Protecting finite storage therefore requires
+actual owner page funding and recovery behavior; increasing a fixture's cap
+does not prove this boundary safe.
+
+A maintenance apply or page-proof error before `COMMIT` is not an uncertain
+`COMMIT` result. The exclusive connection either confirms an active transaction
+was explicitly rolled back, or proves SQLite already ended it without any
+attempted commit. SQLite `FULL` can perform that automatic rollback; an extra
+`ROLLBACK` reporting no active transaction must not replace the original typed
+error with a global fatal fault. An attempted `COMMIT` still requires the exact
+Old disposition proof described in the [persistent protocol](protocol.md#lifetime-and-persistent-mode);
+unknown, New, hybrid or unreadable outcomes preserve possibly indexed data and
+fence later mutations.
+
+After a proven rollback, typed `FULL` and the connection's page count, free pages
+and effective maximum identify configured page pressure separately from
+external storage shortage. The same owner reclaims confirmed oldest replay
+prefixes in bounded, spill-disabled maintenance transactions under its measured
+WAL charge. Each commit preserves Run/key/spec/lifecycle metadata and the byte
+head while atomically advancing the floor, accounting and truncation fact.
+The existing prefix-retention contract also permits safely retiring a confirmed
+last extent when necessary. An emptied retained window reports its floor at the
+unchanged head and remains
+explicitly truncated. Existing Replay/Gap facts never claim the retired prefix
+is still available. Accepted but unconfirmed output is not a reclamation source.
+
+The exact original allocating operation retries only after finite reclamation
+progress or an actual funding change. Startup reconciliation, Start staging
+before child readiness, append and finalize obey this boundary at the unchanged
+configured cap. If no safe candidate can fund a Start, it is rejected before
+physical launch with no published Run/key or child. Accepted output and finalize
+work remain owned and funded in the existing bounded queue; the offered head is
+not rewound, same-Run work cannot pass its debt, and a barrier cannot acknowledge
+uncommitted work. Capacity blockage does not become a global integrity latch,
+a tight retry loop, an unbounded second queue or a reason to disable authoritative
+reads and healthy process controls. Actual child reap and durable terminal
+confirmation remain separate facts when settlement cannot yet be saved.
+
+External typed `DiskFull`, write-side I/O pressure or `StorageFull` still retries
+the exact ordered unit under bounded queue backpressure until resources recover
+or daemon shutdown cancels the wait. Waiting alone cannot resolve an unchanged
+configured page cap. A persistence client reconnect neither changes the policy
+nor clears an uncertain-outcome fence; an upgrade cannot extract healthy owners
+past unresolved durable work.
 
 ## Technical decision index
 

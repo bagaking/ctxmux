@@ -33,7 +33,12 @@ let chat history, code comments, or a second planning file become product truth.
    the runtime's foundational types.
 2. The daemon owns PTYs, child processes, Run identity, lifecycle, output, and
    durable runtime state. A Run must not depend on an editor or SDK process
-   staying alive.
+   staying alive. Preserving admitted durable identity and recovering the actual
+   saved state are correctness requirements; resource protection must not erase
+   those facts or turn fixed capacity into a permanent recovery deadlock. The
+   [persistence owner contract](docs/architecture.md#persistent-state-and-database-capacity)
+   defines retention, transaction outcomes and capacity refusal; Provider Session
+   identity remains owned by embedding clients.
 3. Clients use public protocol and SDK boundaries. A first-party client must
    not bypass the same API offered to external clients.
 4. ctxmux is a multiplexer, not an Agent Harness. It does not plan work,

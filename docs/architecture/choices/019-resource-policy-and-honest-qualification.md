@@ -68,7 +68,13 @@ historical workloads; a changed default is a distinct capacity-policy arm.
 These defaults are operating points carried forward from the repository's
 existing resource qualification, not universal optima or auto-research goals.
 They are independently configurable; no default is forced above a fixture's
-working set. Immutable recovered specs shed deserialize growth slack so the same
+working set. In particular, `ResourceLimits::DEFAULT` supplies the 384 MiB
+database default; it is neither a SQLite format limit nor proof that a logically
+funded replay workload fits its physical coordinate/index pages. The
+[persistence owner's capacity contract](../../architecture.md#persistent-state-and-database-capacity)
+governs finite progress, identity preservation, cold recovery and honest
+capacity refusal at that policy. Raising the default alone cannot close those
+correctness obligations. Immutable recovered specs shed deserialize growth slack so the same
 admitted policy funds cold recovery and planned exec. Resource policy bounds owned logical allocations/work, not total
 process RSS: allocator overhead, library/runtime state, kernel buffers and
 socket transport also require measured RSS/FD/CPU qualification. A lower cost
@@ -100,7 +106,12 @@ it corrupt. Structural checks still reject invalid schema, unsafe file ownership
 missing/short referenced data, invalid JSON/cursors and inconsistent accounting.
 Valid retained state that does not fit a new operator policy is preserved and
 reported as resource pressure with the required budget. Startup does not evict
-history merely to fit a smaller policy.
+history merely to fit a smaller policy. Recovery at the same established page
+cap follows the [persistence owner contract](../../architecture.md#persistent-state-and-database-capacity):
+confirmed prefixes may be atomically retired with truthful cursors, while
+metadata, confirmed heads and unconfirmed debt are protected. Policy pressure,
+external storage shortage and unknown commit outcomes have different handling;
+none is classified from error text alone.
 
 Every coordinate migration, replay-prefix reclamation and output metadata write
 uses spill-disabled staging, exact dirty-cache page measurement, proven rollback

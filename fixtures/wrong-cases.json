@@ -621,11 +621,11 @@
       "source_refs": [
         "https://www.sqlite.org/lang_transaction.html"
       ],
-      "failure_mechanism": "A real SQLite FULL during pre-COMMIT apply automatically rolls back the transaction; a second unconditional ROLLBACK fails and incorrectly latches recoverable pressure as a global persistence fault.",
-      "invariant": "A proven pre-COMMIT rollback preserves the original typed storage error, confirmed Run identities and byte heads; an active transaction is explicitly rolled back, while an unknown COMMIT still fences writes.",
-      "preconditions": "Two Runs have committed original replay in one persistence owner; a fixed real SQLite page ceiling makes an allocating maintenance statement fail before COMMIT.",
-      "action": "Trigger real apply-stage FULL after a tentative Run-row change, release fixture ballast without increasing the ceiling, save both original continuations through the same connection, and read that actual store from an independent recovery process.",
-      "oracle": "The result remains typed FULL; both original rows and confirmed heads stay unchanged at rejection. Same-owner continuation succeeds after pressure clears, and cold recovery reads the original Runtime/Run/key identities and byte-exact replay without reseeding.",
+      "failure_mechanism": "Small replay-coordinate rows and their uniqueness index exhaust a fixed SQLite page cap even below the independent logical payload allowance. Apply-stage FULL can automatically roll back; unconditional extra ROLLBACK then mislabels pressure as a global fault. Preserving typed FULL alone can instead retry an unchanged cap forever and block later Start, finalize and cold startup reconciliation.",
+      "invariant": "Proven pre-COMMIT rollback preserves the original typed error. Finite page-pressure recovery atomically retires only confirmed oldest prefixes, preserving Run/key/spec/lifecycle metadata, confirmed heads and accepted unconfirmed debt with truthful floors, truncation and Gap. Unfunded Start has no child or published row; pending debt cannot be acknowledged by a barrier or starve reads and healthy controls. Unknown COMMIT still fences writes.",
+      "preconditions": "Real SQLite FULL is induced at a fixed page cap through production maintenance and tiny real PTY appends while logical payload remains below policy. Two real Native Runs use public Rust client operations in the first process; a distinct process reopens its actual saved state at the same cap. Separate controlled no-progress seams exercise scheduling and receipt boundaries, not real-FULL qualification.",
+      "action": "Trigger automatic rollback before COMMIT, then prove same-owner continuation without raising the cap. Drive physical coordinate pressure below the payload quota and exercise both real Runs, later Start/finalize and cold normalization. Also reject metadata admission with no reclaimable history, and independently inject no-progress pressure into accepted work to verify bounded debt ownership, per-Run ordering, readable history/control and barrier refusal.",
+      "oracle": "Original rows and confirmed heads do not change on rejected apply. Real page reclamation remains within the unchanged cap, yields exact retained suffixes and explicit truncation, and a second process recovers original Runtime/Run/key/spec identity and terminal facts without reseeding or inventing live PTY continuity. Start without funding is NotCommitted and does not latch the owner. Controlled scheduling evidence preserves accepted debt and refuses false barrier ACK; it does not substitute for real SQLite FULL or public two-process recovery.",
       "platform": [
         "unix"
       ],
@@ -634,6 +634,10 @@
         "recovery",
         "sqlite-full",
         "automatic-rollback",
+        "page-capacity",
+        "index-funding",
+        "cold-start",
+        "pending-debt",
         "identity",
         "ordered-bytes"
       ],
@@ -654,6 +658,18 @@
         {
           "path": "crates/ctxmux-daemon/src/persistence.rs",
           "anchor": "maintenance_active_rollback_proves_old_but_new_and_unknown_stay_fatal"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "sqlite_page_capacity_public_two_runs_survive_and_cold_recover"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "sqlite_page_capacity_start_without_history_is_not_committed_or_latched"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "sqlite_page_capacity_controlled_retries_preserve_funding_observation_and_finalize_order"
         }
       ]
     },

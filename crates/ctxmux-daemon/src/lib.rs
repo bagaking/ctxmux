@@ -1083,7 +1083,7 @@ fn perform_exec_upgrade(
     if manager
         .persistence
         .as_ref()
-        .is_some_and(Persistence::is_failed)
+        .is_some_and(|store| store.is_failed() || store.is_capacity_blocked())
     {
         return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
             failures: "durable state requires recovery; live ownership was preserved".to_owned(),
@@ -1106,7 +1106,7 @@ fn perform_exec_upgrade(
         .as_ref()
         .expect("persistent upgrade")
         .clone();
-    if durable.is_failed() {
+    if durable.is_failed() || durable.is_capacity_blocked() {
         return Err(UpgradeAbort::BeforeExtract(ServerError::Shutdown {
             failures: "durable state requires recovery; live ownership was preserved".to_owned(),
         }));
@@ -1172,7 +1172,7 @@ fn perform_exec_upgrade(
         .native_runs
         .extract_for_handoff_after_preflight(Box::new(move |live| {
             owner_cancellation.check()?;
-            if durable.is_failed() {
+            if durable.is_failed() || durable.is_capacity_blocked() {
                 return Err(
                     "durable state requires recovery; live ownership was preserved".to_owned(),
                 );
@@ -12904,5 +12904,408 @@ mod tests {
             super::accept_error_is_fatal(&io::Error::other("no errno")),
             "an errno-less accept error must be treated as fatal"
         );
+    }
+
+    const SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES: super::ResourceLimits = super::ResourceLimits {
+        database_bytes: 128 * 1024,
+        durable_replay_bytes: 256 * 1024,
+        durable_run_output_bytes: 256 * 1024,
+        hot_output_bytes: 256 * 1024,
+        run_output_bytes: 256 * 1024,
+        ..super::ResourceLimits::DEFAULT
+    };
+
+    fn sqlite_page_capacity_public_process(
+        directory: &std::path::Path,
+        phase: &str,
+    ) -> std::process::Output {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::sqlite_page_capacity_public_subprocess",
+                "--nocapture",
+            ])
+            .env("CTXMUX_PAGE_CAPACITY_PUBLIC_DIRECTORY", directory)
+            .env("CTXMUX_PAGE_CAPACITY_PUBLIC_PHASE", phase)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the source-bound independent Native owner");
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "{phase} owner failed to advance within 60 seconds: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn sqlite_page_capacity_public_two_runs_survive_and_cold_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = sqlite_page_capacity_public_process(directory.path(), "produce");
+        assert_eq!(
+            first.status.code(),
+            Some(86),
+            "first owner must save the actual workload before abrupt departure: {}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("expected.json")).unwrap())
+                .unwrap();
+        assert!(expected["database_capacity_reclaims"].as_u64().unwrap() > 0);
+        let database = rusqlite::Connection::open_with_flags(
+            directory.path().join("state/state.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let pages: i64 = database
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            u64::try_from(pages).unwrap() * 4096
+                <= SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+        );
+        let mut truncated = false;
+        for run in expected["runs"].as_array().unwrap() {
+            let id: RunId = serde_json::from_value(run["original"]["id"].clone()).unwrap();
+            let (floor, head, replay, state, key): (i64, i64, i64, String, String) = database
+                .query_row(
+                    "SELECT durable_first_available_byte, durable_output_bytes,
+                            replay_bytes, state_kind, creation_key FROM runs WHERE id=?1",
+                    [id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                u64::try_from(head).unwrap(),
+                run["bytes"].as_array().unwrap().len() as u64
+            );
+            assert_eq!(replay, head - floor);
+            assert_eq!(state, "running", "original rows survive abrupt owner exit");
+            assert_eq!(key, run["key"].as_str().unwrap());
+            truncated |= floor > 0;
+        }
+        assert!(
+            truncated,
+            "actual index page pressure reclaimed an old prefix"
+        );
+        eprintln!(
+            "sqlite_page_capacity_public: producer={}, real_full_reclaims={}, database_pages={}, fixed_database_bytes={}, tiny_pty_chunks=2400",
+            expected["producer_pid"],
+            expected["database_capacity_reclaims"],
+            pages,
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+        );
+        drop(database);
+        let second = sqlite_page_capacity_public_process(directory.path(), "recover");
+        assert!(
+            second.status.success(),
+            "a distinct owner must recover the same fixed-cap state without reseeding: {}{}",
+            String::from_utf8_lossy(&second.stdout),
+            String::from_utf8_lossy(&second.stderr)
+        );
+        for line in String::from_utf8_lossy(&second.stderr)
+            .lines()
+            .filter(|line| line.starts_with("sqlite_page_capacity_public:"))
+        {
+            eprintln!("{line}");
+        }
+    }
+
+    async fn sqlite_page_capacity_public_write(
+        client: &Client,
+        original: &RunInfo,
+        view: &Attachment,
+        expected: &mut Vec<u8>,
+        data: &[u8],
+    ) {
+        let input = [data, b"\n"].concat();
+        let receipt = client.input(original.id, input.clone()).await.unwrap();
+        assert_eq!(receipt.receipt.written_bytes as usize, input.len());
+        assert_eq!(receipt.run.id, original.id);
+        assert_eq!(receipt.run.pid, original.pid);
+        assert!(receipt.run.state.is_running());
+        let mut observed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observed.len() < data.len() {
+                match next_non_service_event(view).await.unwrap().unwrap() {
+                    RunEvent::Output { chunk } => observed.extend_from_slice(&chunk.data),
+                    event => panic!("original live Native output was replaced: {event:?}"),
+                }
+            }
+        })
+        .await
+        .expect("same PID emits the exact accepted input after page pressure");
+        assert_eq!(observed, data);
+        expected.extend_from_slice(data);
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one owner phase preserves public controls, original bytes and abrupt-exit evidence"
+    )]
+    async fn sqlite_page_capacity_public_produce(directory: &std::path::Path) {
+        let (persistence, recovered) = Persistence::open_with_resources(
+            directory.join("state"),
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES,
+            None,
+        )
+        .unwrap();
+        assert!(
+            recovered.is_empty(),
+            "only the first process creates the workload"
+        );
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let runtime = server.client.runtime_info().await.unwrap();
+        let spec = RunSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "stty -echo -onlcr; printf READY; while IFS= read -r line; do printf '%s' \"$line\"; done".into(),
+            ],
+            cwd: None,
+            env: BTreeMap::new(),
+            initial_size: TerminalSize { rows: 4, cols: 12 },
+            declared_inputs: Vec::new(),
+        };
+        let mut runs = Vec::new();
+        let mut views = Vec::new();
+        let mut expected = [b"READY".to_vec(), b"READY".to_vec()];
+        let keys = [
+            CreateOperationKey::new("page-capacity-first").unwrap(),
+            CreateOperationKey::new("page-capacity-second").unwrap(),
+        ];
+        for key in &keys {
+            let run = server
+                .client
+                .start_with_operation_key(spec.clone(), key.clone())
+                .await
+                .unwrap();
+            expect_original_raw(&server.client, &run, b"READY").await;
+            let (view, snapshot) = server.client.attach(run.id, 5).await.unwrap();
+            assert!(snapshot.replay.chunks.is_empty());
+            runs.push(run);
+            views.push(view);
+        }
+        persistence.barrier().unwrap();
+        // Payload remains below its independent quota. Each real PTY byte is
+        // committed before the next input, so its coordinate consumes a distinct
+        // SQLite row rather than disappearing into a collected append batch.
+        for index in 0..2400 {
+            let slot = index % 2;
+            sqlite_page_capacity_public_write(
+                &server.client,
+                &runs[slot],
+                &views[slot],
+                &mut expected[slot],
+                b"x",
+            )
+            .await;
+            persistence.barrier().unwrap();
+        }
+        assert!(persistence.database_capacity_reclaims() > 0);
+        assert!(
+            expected.iter().map(Vec::len).sum::<usize>()
+                < usize::try_from(SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.durable_replay_bytes)
+                    .unwrap()
+        );
+        for (index, marker) in [
+            b"first-after-pressure".as_slice(),
+            b"second-after-pressure".as_slice(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            sqlite_page_capacity_public_write(
+                &server.client,
+                &runs[index],
+                &views[index],
+                &mut expected[index],
+                marker,
+            )
+            .await;
+            persistence.barrier().unwrap();
+            expect_original_raw(&server.client, &runs[index], &expected[index]).await;
+            let (_, storage) = server.client.observe_storage(runs[index].id).await.unwrap();
+            assert_eq!(
+                storage.policy.database_bytes,
+                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+            );
+            let owner = storage.persistence.unwrap();
+            assert_eq!(owner.first_failure, None);
+            assert!(!owner.actor_stopped);
+            assert_eq!(owner.committed_output_bytes, expected[index].len() as u64);
+            assert!(process_exists(runs[index].pid.unwrap()));
+        }
+        let third = server
+            .client
+            .start(RunSpec {
+                args: vec!["-c".into(), "printf third-finalized".into()],
+                ..spec
+            })
+            .await
+            .expect("later Start is not fenced by a shared capacity failure");
+        wait_for_exit(&server.client, third.id).await;
+        persistence.barrier().unwrap();
+        expect_original_raw(&server.client, &third, b"third-finalized").await;
+        assert!(!persistence.is_failed());
+        let receipt = serde_json::json!({
+            "producer_pid": std::process::id(),
+            "runtime": runtime,
+            "database_capacity_reclaims": persistence.database_capacity_reclaims(),
+            "runs": runs.iter().enumerate().map(|(index, original)| serde_json::json!({
+                "original": original, "key": keys[index], "bytes": expected[index]
+            })).collect::<Vec<_>>(),
+            "finalized": server.client.status(third.id).await.unwrap(),
+            "finalized_bytes": b"third-finalized".to_vec()
+        });
+        fs::write(
+            directory.join("expected.json"),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        // Model a real owner/host departure: no Rust drop can finalize the two
+        // live Run rows or flush invented data before the second process opens.
+        std::process::exit(86);
+    }
+
+    async fn sqlite_page_capacity_public_recover(directory: &std::path::Path) {
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("expected.json")).unwrap()).unwrap();
+        assert_ne!(
+            serde_json::to_value(std::process::id()).unwrap(),
+            expected["producer_pid"],
+            "cold recovery must execute in a distinct OS process"
+        );
+        let (persistence, recovered) = Persistence::open_with_resources(
+            directory.join("state"),
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES,
+            None,
+        )
+        .expect("actual startup normalization succeeds at the unchanged page cap");
+        assert_eq!(recovered.len(), 3, "retain every original persisted Run");
+        let server = InProcessServer::start(Arc::new(RunManager::persistent(
+            persistence.clone(),
+            recovered,
+        )));
+        let runtime = server.client.runtime_info().await.unwrap();
+        assert_eq!(
+            serde_json::to_value(runtime.runtime_id).unwrap(),
+            expected["runtime"]["runtimeId"]
+        );
+        assert_ne!(
+            serde_json::to_value(runtime.daemon_instance_id).unwrap(),
+            expected["runtime"]["daemonInstanceId"]
+        );
+        let mut truncated = false;
+        for entry in expected["runs"].as_array().unwrap() {
+            let original: RunInfo = serde_json::from_value(entry["original"].clone()).unwrap();
+            let bytes: Vec<u8> = serde_json::from_value(entry["bytes"].clone()).unwrap();
+            let status = server.client.status(original.id).await.unwrap();
+            assert_eq!(status.id, original.id);
+            assert_eq!(status.spec, original.spec);
+            assert_eq!(status.lineage, original.lineage);
+            assert_eq!(
+                status.pid, None,
+                "reboot does not invent a live incarnation"
+            );
+            assert_eq!(
+                status.state,
+                RunState::Interrupted {
+                    reason: InterruptionReason::DaemonRestart
+                }
+            );
+            assert_eq!(status.durable_output_bytes, Some(bytes.len() as u64));
+            let (view, snapshot) = server.client.attach(original.id, 0).await.unwrap();
+            let floor = usize::try_from(snapshot.replay.first_available_byte).unwrap();
+            assert_eq!(snapshot.replay.latest_output_bytes, bytes.len() as u64);
+            assert_eq!(replay_bytes(&snapshot.replay.chunks), bytes[floor..]);
+            assert_eq!(snapshot.replay.truncated, floor > 0);
+            truncated |= floor > 0;
+            drop(view);
+            let (_, storage) = server.client.observe_storage(original.id).await.unwrap();
+            assert_eq!(
+                storage.policy.database_bytes,
+                SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+            );
+            assert_eq!(storage.persistence.unwrap().first_failure, None);
+        }
+        assert!(
+            truncated,
+            "page-pressure history loss stays explicitly reported after reboot"
+        );
+        let finalized: RunInfo = serde_json::from_value(expected["finalized"].clone()).unwrap();
+        let status = server.client.status(finalized.id).await.unwrap();
+        assert_eq!(status.spec, finalized.spec);
+        assert_eq!(
+            status.state,
+            RunState::Exited {
+                code: 0,
+                signal: None
+            }
+        );
+        let (view, snapshot) = server.client.attach(finalized.id, 0).await.unwrap();
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"third-finalized");
+        drop(view);
+        let later = server.client.start(long_running_spec()).await.unwrap();
+        server
+            .client
+            .stop(fresh_stop(&server.client, later.id).await)
+            .await
+            .unwrap();
+        wait_for_exit(&server.client, later.id).await;
+        persistence.barrier().unwrap();
+        assert!(!persistence.is_failed());
+        eprintln!(
+            "sqlite_page_capacity_public: distinct_recovery_process={}, recovered_original_runs=3, same_fixed_database_bytes={}",
+            std::process::id(),
+            SQLITE_PAGE_CAPACITY_PUBLIC_RESOURCES.database_bytes
+        );
+    }
+
+    #[test]
+    fn sqlite_page_capacity_public_subprocess() {
+        let Some(directory) = std::env::var_os("CTXMUX_PAGE_CAPACITY_PUBLIC_DIRECTORY") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            match std::env::var("CTXMUX_PAGE_CAPACITY_PUBLIC_PHASE")
+                .unwrap()
+                .as_str()
+            {
+                "produce" => sqlite_page_capacity_public_produce(&directory).await,
+                "recover" => sqlite_page_capacity_public_recover(&directory).await,
+                phase => panic!("unexpected public capacity fixture phase: {phase}"),
+            }
+        });
     }
 }
