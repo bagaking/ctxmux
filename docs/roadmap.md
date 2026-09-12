@@ -211,6 +211,15 @@ queue, FIFO barriers, and planned exec continuity. The
 records wins, the sparse-output tradeoff, and host-specific measurement limits.
 This delivery does not deploy or migrate an external consumer's state directory.
 
+The [matched Farm Run/storage report](reviews/farm-run-storage-benchmark.md)
+adds source-bound Linux transaction-sync comparisons, raw suffix/read fanout,
+codec geometry and independent short frontier evidence. Its original
+4000-Run/1000-stream/1800-second persistent soak remains failed; database-budget
+pressure, removal failure, observer overhead and full-repository gate gaps
+retain their original disposition. Explicit regression budgets and proper
+terminal/admission fixture semantics do not close these product failures.
+Production compression and its joined owner/consumer acceptance remain open.
+
 ## Architecture evidence and failure corpus
 
 Before widening the runtime with Integrations, make the current system legible

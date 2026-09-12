@@ -199,3 +199,31 @@ uncertainty and any necessary tradeoff before selecting a production candidate.
 Exploration can proceed before the full fleet join, but only the exact joined
 candidate can claim end-to-end qualification. Existing failed soak receipts
 remain failures until the original workload passes on that candidate.
+
+## Farm evidence ratchet
+
+The [matched Farm report](reviews/farm-run-storage-benchmark.md) records the
+raw transaction-sync gain, live-completion costs, original failed soak,
+separately identified frontier, read-service baseline and codec exploration.
+It does not select a production codec or close raw sustained qualification.
+
+Carry its findings into the next source-bound campaign:
+
+- A retention regression that exercises a particular eviction boundary must
+  configure that policy explicitly. Keep its offered bytes and exact oracle;
+  the historical 4 MiB fixture cannot force a production default or capacity.
+- Distinguish child exit, owner availability, caller-requested close and
+  unexpected EOF. A terminal attachment may close before Detach; prove normal
+  exit on the original Run and keep full byte checks. A live loss is a failure.
+- Record an immutable connection/view identity in raw fanout traces. Run ID and
+  byte cursor alone cannot independently attribute every concurrent Client.
+  Retain original incomplete evidence as unqualified in that dimension.
+- Measure observer CPU, memory, sampling time and missed schedule alongside
+  the owner. Reduce redundant observation work with causal evidence; keep all
+  accepted Runs, original bytes, durations and failures. Expensive procfs
+  sampling cannot serve as a low-interference capacity measurement.
+- Compare larger frames against tiny/interior reads and context working memory.
+  Choose codec/settings from held-out content as well as repetitive controls;
+  higher compression level is not a universal ratio or speed ordering. Require
+  whole-store, continuation flush, integrity, recovery and incompressible raw
+  fallback costs before interpreting payload geometry as a product improvement.
