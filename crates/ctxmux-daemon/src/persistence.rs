@@ -3385,8 +3385,17 @@ impl StateStore {
         &self,
         error: PersistenceError,
     ) -> Result<StartupBatchDisposition, PersistenceError> {
+        // This path has not attempted COMMIT. SQLite can roll back the entire
+        // transaction on FULL; an inactive transaction therefore already proves
+        // Old and must retain the original typed failure.
+        if self.connection.is_autocommit() {
+            return Err(error);
+        }
         match self.connection.execute_batch("ROLLBACK") {
-            Ok(()) => Err(error),
+            Ok(()) if self.connection.is_autocommit() => Err(error),
+            Ok(()) => Err(PersistenceError::Mutation(format!(
+                "{error}; startup normalization rollback left a transaction active"
+            ))),
             Err(rollback_error) => Err(PersistenceError::Mutation(format!(
                 "{error}; startup normalization rollback failed: {rollback_error}"
             ))),
@@ -5321,8 +5330,17 @@ impl StateStore {
         &self,
         error: PersistenceError,
     ) -> Result<bool, PersistenceError> {
+        // Apply/page-proof failed before COMMIT was attempted. FULL may have
+        // already rolled back the transaction; issuing ROLLBACK again would
+        // replace a recoverable storage error with a false fatal mutation.
+        if self.connection.is_autocommit() {
+            return Err(error);
+        }
         match self.connection.execute_batch("ROLLBACK") {
-            Ok(()) => Err(error),
+            Ok(()) if self.connection.is_autocommit() => Err(error),
+            Ok(()) => Err(PersistenceError::Mutation(format!(
+                "{error}; maintenance rollback left a transaction active"
+            ))),
             Err(rollback) => Err(PersistenceError::Mutation(format!(
                 "{error}; maintenance rollback failed: {rollback}"
             ))),
@@ -12875,6 +12893,313 @@ mod tests {
              a short replay here is the exec-over-unoffered-output defect"
         );
         drop(reopened);
+    }
+
+    #[test]
+    fn sqlite_full_before_commit_preserves_two_runs_and_same_owner_continuation() {
+        let temp = TempDir::new().expect("create automatic rollback fixture");
+        let state_dir = temp.path().join("state");
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .expect("open original persistence owner");
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let heads = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let original = [
+            b"original\0first".as_slice(),
+            b"original\xffsecond".as_slice(),
+        ];
+        store
+            .append_batch(&[
+                (
+                    ids[0],
+                    replay(vec![chunk(0, original[0])]),
+                    Arc::clone(&heads[0]),
+                ),
+                (
+                    ids[1],
+                    replay(vec![chunk(0, original[1])]),
+                    Arc::clone(&heads[1]),
+                ),
+            ])
+            .expect("persist both original byte ranges");
+        store
+            .connection
+            .execute_batch(
+                "CREATE TABLE full_ballast(value BLOB);
+                 INSERT INTO full_ballast VALUES(zeroblob(131072));",
+            )
+            .expect("allocate releasable fixture storage");
+        let pages: i64 = store
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .expect("read real SQLite allocation");
+        store
+            .connection
+            .pragma_update(None, "max_page_count", pages)
+            .expect("hold a fixed actual SQLite page ceiling");
+        let witnesses = [
+            MaintenanceWitness::Run(ids[0]),
+            MaintenanceWitness::Run(ids[1]),
+        ];
+        let old = witnesses.map(|witness| witness.read(&store.connection).unwrap());
+        let error = store
+            .commit_maintenance_batch(witnesses[0], |connection| {
+                connection
+                    .execute(
+                        "UPDATE runs SET durable_output_bytes = durable_output_bytes + 1
+                         WHERE id = ?1",
+                        [ids[0].to_string()],
+                    )
+                    .map_err(PersistenceError::database)?;
+                connection
+                    .execute("INSERT INTO full_ballast VALUES(zeroblob(4194304))", [])
+                    .map_err(PersistenceError::database)?;
+                panic!("fixture must reach actual FULL before any COMMIT")
+            })
+            .expect_err("actual apply-stage FULL must reject the original transaction");
+        assert!(error.is_disk_full(), "preserve typed FULL: {error}");
+        assert!(
+            error.is_transient_storage(),
+            "known rollback remains recoverable"
+        );
+        assert!(
+            store.connection.is_autocommit(),
+            "FULL actually rolled back"
+        );
+        assert_eq!(
+            witnesses.map(|witness| witness.read(&store.connection).unwrap()),
+            old,
+            "both confirmed Run rows must remain exactly Old"
+        );
+        for (head, bytes) in heads.iter().zip(original) {
+            assert_eq!(head.load(Ordering::Acquire), bytes.len() as u64);
+        }
+        store
+            .connection
+            .execute_batch("DROP TABLE full_ballast")
+            .expect("release fixture resources without raising the ceiling");
+        assert_eq!(
+            store
+                .connection
+                .query_row("PRAGMA max_page_count", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            pages,
+            "continuation must use the unchanged page ceiling"
+        );
+        let tails = [
+            b"\ncontinued-first".as_slice(),
+            b"\ncontinued-second".as_slice(),
+        ];
+        store
+            .append_batch(&[
+                (
+                    ids[0],
+                    replay(vec![chunk(original[0].len() as u64, tails[0])]),
+                    Arc::clone(&heads[0]),
+                ),
+                (
+                    ids[1],
+                    replay(vec![chunk(original[1].len() as u64, tails[1])]),
+                    Arc::clone(&heads[1]),
+                ),
+            ])
+            .expect("same owner and connection save both original continuations");
+        let expected: Vec<_> = ids
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| {
+                let bytes = [original[index], tails[index]].concat();
+                let key: String = store
+                    .connection
+                    .query_row(
+                        "SELECT creation_key FROM runs WHERE id = ?1",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(heads[index].load(Ordering::Acquire), bytes.len() as u64);
+                serde_json::json!({"id": id, "key": key, "bytes": bytes})
+            })
+            .collect();
+        let expectation_path = temp.path().join("expected.json");
+        fs::write(
+            &expectation_path,
+            serde_json::to_vec(&serde_json::json!({
+                "runtime_id": store.runtime_id,
+                "runs": expected,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        drop(store);
+        let child = ProcessCommand::new(env::current_exe().expect("selected test binary"))
+            .args([
+                "--exact",
+                "persistence::tests::sqlite_full_before_commit_recovery_subprocess",
+                "--nocapture",
+            ])
+            .env("CTXMUX_FULL_RECOVERY_STATE_DIR", &state_dir)
+            .env("CTXMUX_FULL_RECOVERY_EXPECTATION", expectation_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start a distinct cold recovery process");
+        let output = wait_for_test_subprocess(child, "full-before-commit-recovery");
+        assert!(
+            output.status.success(),
+            "cold original-data recovery failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn sqlite_full_before_commit_recovery_subprocess() {
+        let Some(state_dir) = env::var_os("CTXMUX_FULL_RECOVERY_STATE_DIR") else {
+            return;
+        };
+        let expected: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                env::var_os("CTXMUX_FULL_RECOVERY_EXPECTATION").expect("original expectation"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let (persistence, recovered) =
+            Persistence::open(state_dir).expect("cold actor opens the actual original store");
+        assert_eq!(
+            serde_json::to_value(persistence.runtime_id()).unwrap(),
+            expected["runtime_id"]
+        );
+        let runs = expected["runs"].as_array().expect("original runs");
+        assert_eq!(recovered.len(), runs.len());
+        for expected_run in runs {
+            let id: RunId = serde_json::from_value(expected_run["id"].clone()).unwrap();
+            let run = recovered
+                .iter()
+                .find(|run| run.info.id == id)
+                .expect("original identity");
+            assert_eq!(
+                serde_json::to_value(&run.operation_key).unwrap(),
+                expected_run["key"]
+            );
+            let bytes: Vec<u8> = serde_json::from_value(expected_run["bytes"].clone()).unwrap();
+            assert_eq!(
+                run.replay
+                    .chunks
+                    .iter()
+                    .flat_map(|chunk| chunk.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                bytes
+            );
+            assert_eq!(run.replay.latest_output_bytes, bytes.len() as u64);
+            assert_eq!(run.info.durable_output_bytes, Some(bytes.len() as u64));
+            assert_eq!(run.replay.first_available_byte, 0);
+            assert!(!run.replay.truncated);
+        }
+        persistence
+            .barrier()
+            .expect("recovered actor remains responsive");
+    }
+
+    #[test]
+    fn sqlite_full_before_commit_startup_rollback_preserves_typed_failure() {
+        let temp = TempDir::new().unwrap();
+        let (store, _) = StateStore::open(
+            &temp.path().join("state"),
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        store
+            .connection
+            .execute_batch("CREATE TABLE full_ballast(value BLOB)")
+            .unwrap();
+        let pages: i64 = store
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        store
+            .connection
+            .pragma_update(None, "max_page_count", pages)
+            .unwrap();
+        let witness = MaintenanceWitness::ActiveReplay;
+        let old = witness.read(&store.connection).unwrap();
+        store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE runtime_meta SET replay_file='never-committed.bin'",
+                [],
+            )
+            .unwrap();
+        let failure = PersistenceError::database(
+            store
+                .connection
+                .execute("INSERT INTO full_ballast VALUES(zeroblob(4194304))", [])
+                .unwrap_err(),
+        );
+        assert!(
+            store.connection.is_autocommit(),
+            "actual whole-transaction rollback"
+        );
+        let classified = store
+            .rollback_startup_error(failure)
+            .err()
+            .expect("startup rejects");
+        assert!(
+            classified.is_disk_full(),
+            "startup preserves typed FULL: {classified}"
+        );
+        assert_eq!(witness.read(&store.connection).unwrap(), old);
+    }
+
+    #[test]
+    fn sqlite_full_before_commit_active_transactions_are_explicitly_rolled_back() {
+        let temp = TempDir::new().unwrap();
+        let (store, _) = StateStore::open(
+            &temp.path().join("state"),
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let witness = MaintenanceWitness::ActiveReplay;
+        let old = witness.read(&store.connection).unwrap();
+        for startup in [false, true] {
+            store.connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE runtime_meta SET replay_file='never-committed.bin'",
+                    [],
+                )
+                .unwrap();
+            let failure = PersistenceError::injected_disk_full();
+            let classified = if startup {
+                store
+                    .rollback_startup_error(failure)
+                    .err()
+                    .expect("startup rejects")
+            } else {
+                store
+                    .rollback_maintenance_error(failure)
+                    .err()
+                    .expect("maintenance rejects")
+            };
+            assert!(classified.is_disk_full());
+            assert!(
+                store.connection.is_autocommit(),
+                "explicit rollback ended the transaction"
+            );
+            assert_eq!(witness.read(&store.connection).unwrap(), old);
+        }
     }
 
     /// The catch-up re-sends bytes that are already durable. That must be a

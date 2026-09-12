@@ -951,6 +951,13 @@ append/finalize COMMIT and remains transparent to
 protocol cursors. Its file budget includes the required source/destination
 scratch overlap; the main-database ceiling is unchanged.
 
+An apply or page-proof failure before a maintenance or startup `COMMIT` is
+different from a lost `COMMIT` outcome. The exclusive connection's inactive
+transaction proves SQLite already rolled it back; the original typed error is
+preserved. A transaction that remains active must be explicitly rolled back and
+confirmed inactive. A failed or unconfirmed rollback still fences writes. This
+does not weaken the witness required to classify an attempted `COMMIT`.
+
 An output append or terminal finalize that receives external storage `DiskFull`,
 or whose WAL admission is temporarily blocked by a reader during
 `wal_checkpoint(TRUNCATE)`, does not permanently poison the serving daemon. The

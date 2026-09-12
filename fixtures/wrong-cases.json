@@ -613,6 +613,51 @@
       ]
     },
     {
+      "id": "PERSIST-03",
+      "choice": "009-runtime-persistence-recovery",
+      "source_ids": [
+        "i04"
+      ],
+      "source_refs": [
+        "https://www.sqlite.org/lang_transaction.html"
+      ],
+      "failure_mechanism": "A real SQLite FULL during pre-COMMIT apply automatically rolls back the transaction; a second unconditional ROLLBACK fails and incorrectly latches recoverable pressure as a global persistence fault.",
+      "invariant": "A proven pre-COMMIT rollback preserves the original typed storage error, confirmed Run identities and byte heads; an active transaction is explicitly rolled back, while an unknown COMMIT still fences writes.",
+      "preconditions": "Two Runs have committed original replay in one persistence owner; a fixed real SQLite page ceiling makes an allocating maintenance statement fail before COMMIT.",
+      "action": "Trigger real apply-stage FULL after a tentative Run-row change, release fixture ballast without increasing the ceiling, save both original continuations through the same connection, and read that actual store from an independent recovery process.",
+      "oracle": "The result remains typed FULL; both original rows and confirmed heads stay unchanged at rejection. Same-owner continuation succeeds after pressure clears, and cold recovery reads the original Runtime/Run/key identities and byte-exact replay without reseeding.",
+      "platform": [
+        "unix"
+      ],
+      "tags": [
+        "persistence",
+        "recovery",
+        "sqlite-full",
+        "automatic-rollback",
+        "identity",
+        "ordered-bytes"
+      ],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "sqlite_full_before_commit_preserves_two_runs_and_same_owner_continuation"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "sqlite_full_before_commit_startup_rollback_preserves_typed_failure"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "sqlite_full_before_commit_active_transactions_are_explicitly_rolled_back"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/persistence.rs",
+          "anchor": "maintenance_active_rollback_proves_old_but_new_and_unknown_stay_fatal"
+        }
+      ]
+    },
+    {
       "id": "INTEGRATION-01",
       "choice": "010-explicit-typescript-integrations",
       "source_ids": ["j01"],

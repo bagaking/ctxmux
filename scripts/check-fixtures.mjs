@@ -195,10 +195,10 @@ const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
   // Preserve 41 runtime cases and six REMOTE cases, plus decision 019's
-  // population-independent resource/recovery regression.
-  if (corpus.cases.length !== 48) {
+  // population-independent resource/recovery regression and actual FULL rollback.
+  if (corpus.cases.length !== 49) {
     fail(
-      `corpus must contain all 48 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 49 retained cases, got ${corpus.cases.length}`,
     );
   }
 
@@ -394,10 +394,11 @@ if (actualChoiceFiles.join("\0") !== expectedChoiceFiles.join("\0")) {
 // This count is an explicit gate: adding an external source must be an
 // acknowledged decision, not a silent import. 41 for the runtime, protocol,
 // SDK, and persistence decisions, plus n02/n03 for the OpenSSH manual pages
-// that own the remote endpoint's transport behavior.
-if (sourceRegistry.size !== 43) {
+// that own the remote endpoint's transport behavior, plus i04 for SQLite's
+// transaction-error and automatic-rollback contract.
+if (sourceRegistry.size !== 44) {
   fail(
-    `source coverage drifted: expected 43 retained source ids, got ${sourceRegistry.size}`,
+    `source coverage drifted: expected 44 retained source ids, got ${sourceRegistry.size}`,
   );
 }
 
