@@ -118,7 +118,7 @@ impl Run {
         Some(
             self.try_owner(&self.persistence)?
                 .active()
-                .map_or(0, PersistentRun::next_replay_start),
+                .map_or(0, PersistentRun::retention_protected_from),
         )
     }
     pub(crate) fn try_output_turn(&self) -> Option<NativeOutputTurn<'_>> {
@@ -155,9 +155,16 @@ impl NativeOutputTurn<'_> {
         }
         self.persistence
             .as_ref()
-            .map_or(0, PersistentRun::next_replay_start)
+            .map_or(0, PersistentRun::retention_protected_from)
     }
     pub(crate) fn capacity(&mut self) -> usize {
+        // Register before observing the committed cursor so a concurrent commit
+        // either exposes room here or wakes this original reader after settling.
+        if let Some(durable) = &self.persistence
+            && self.output.latest_output_bytes() > durable.retention_protected_from()
+        {
+            durable.request_output_wake();
+        }
         if let Some(durable) = &self.persistence
             && !durable.is_failed()
             && durable.queue_has_room()
@@ -168,12 +175,12 @@ impl NativeOutputTurn<'_> {
             let _accepted = durable.append(self.run.id, replay);
         }
         let protected = self.protected_from();
-        let unoffered = self.output.latest_output_bytes().saturating_sub(protected);
+        let uncommitted = self.output.latest_output_bytes().saturating_sub(protected);
         let per_run_available = self
             .run
             .retention_budget
             .per_run_limit()
-            .saturating_sub(usize::try_from(unoffered).unwrap_or(usize::MAX));
+            .saturating_sub(usize::try_from(uncommitted).unwrap_or(usize::MAX));
         let reclaimable =
             usize::try_from(protected.saturating_sub(self.output.first_available_byte()))
                 .unwrap_or(usize::MAX)
@@ -190,7 +197,11 @@ impl NativeOutputTurn<'_> {
     }
     pub(crate) fn has_unoffered(&self) -> bool {
         self.run.persistence_mode == PersistenceMode::PersistentCapable
-            && self.output.latest_output_bytes() > self.protected_from()
+            && self.output.latest_output_bytes()
+                > self
+                    .persistence
+                    .as_ref()
+                    .map_or(0, PersistentRun::next_replay_start)
     }
     pub(crate) fn record(mut self, data: Vec<u8>) -> bool {
         let run = self.run;

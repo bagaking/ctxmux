@@ -333,8 +333,9 @@ pub(crate) struct TmuxCleanupReservation {
 /// Armed ownership for one native Run that has started but is not published.
 ///
 /// Creation arms this owner immediately after spawn and native-control
-/// construction. Persistent pre-COMMIT and commit-unknown separation belongs
-/// to the later exact-replacement owner. Panic and owner-unwind paths request
+/// construction. The persistent publication owner keeps this value across its
+/// durable decision: unknown or committed publication retains it intact, while
+/// proven rollback permits cleanup. Other panic and owner-unwind paths request
 /// cleanup and transfer the exact Run, request, key, and physical-overlap
 /// reservation until full cleanup is proven. `Drop` never waits for cleanup or
 /// reap completion.
@@ -1816,10 +1817,11 @@ impl Drop for LiveResourcePermit {
     }
 }
 
-/// Incarnation-local owner for a durable outcome `SQLite` could not classify.
-/// Dropping this owner never restores candidates; daemon restart discards the
-/// entire Registry and lets `SQLite` recovery decide the exact old-or-new unit.
-pub(crate) struct CommitUnknownReservation {
+/// Incarnation-local fence for an original durable publication that lost its
+/// settlement owner, including a known COMMIT before Registry publication.
+/// Dropping this fence never restores candidates; only a later independent
+/// Runtime can recover the original committed SQLite state.
+pub(crate) struct UnresolvedPublicationReservation {
     _state: Arc<RwLock<RegistryState>>,
     _ticket: PublicationTicket,
     _live_permit: Option<LiveResourcePermit>,
@@ -2844,12 +2846,14 @@ impl PublicationReservation {
             .collect()
     }
 
-    pub(crate) fn into_commit_unknown(mut self) -> Option<CommitUnknownReservation> {
-        self.ticket.take().map(|ticket| CommitUnknownReservation {
-            _state: Arc::clone(&self.state),
-            _ticket: ticket,
-            _live_permit: self.live_permit.take(),
-        })
+    pub(crate) fn into_unresolved(mut self) -> Option<UnresolvedPublicationReservation> {
+        self.ticket
+            .take()
+            .map(|ticket| UnresolvedPublicationReservation {
+                _state: Arc::clone(&self.state),
+                _ticket: ticket,
+                _live_permit: self.live_permit.take(),
+            })
     }
 }
 

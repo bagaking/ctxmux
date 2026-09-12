@@ -88,11 +88,11 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 
 use crate::adopted_pty::AdoptedMasterPty;
 use crate::creation::{
-    CommitUnknownReservation, CreationFlight, CreationFlightOwner, CreationRequest,
-    HandoffStopOperation, PendingPublication, PersistentCollectionCandidate, PersistentRemoval,
-    PublicationReservation, RecoverableStopAdmission, RecoverableStopFlight,
-    RecoverableStopSettlement, RunRegistry, TerminalOrdinal, TerminalPublicationOwner,
-    TmuxCleanupReservation, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
+    CreationFlight, CreationFlightOwner, CreationRequest, HandoffStopOperation, PendingPublication,
+    PersistentCollectionCandidate, PersistentRemoval, PublicationReservation,
+    RecoverableStopAdmission, RecoverableStopFlight, RecoverableStopSettlement, RunRegistry,
+    TerminalOrdinal, TerminalPublicationOwner, TmuxCleanupReservation, UnpublishedCleanupOwner,
+    UnpublishedCleanupReservation, UnresolvedPublicationReservation,
 };
 use crate::native_control::{
     ControlResult, DetachedNativeDescriptors, HandoffInputState, InputDrainGate,
@@ -1575,7 +1575,6 @@ struct RunManager {
     retention_budget: RetentionBudget,
     resources: ResourceLimits,
     persistence: Option<Persistence>,
-    commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
     pending_persistence: Mutex<Vec<PendingPersistence>>,
     incarnation_failure: IncarnationFailure,
     upgrade_requests: UpgradeRequestGate,
@@ -1851,6 +1850,7 @@ struct PersistentPublicationOwner<'a> {
     manager: &'a RunManager,
     reservation: Option<PublicationReservation>,
     staged: Option<StagedPersistentStart>,
+    pending: Option<(CreateOperationKey, PendingPublication)>,
     flight: Option<CreationFlight>,
     phase: PersistentPublicationPhase,
 }
@@ -1860,11 +1860,19 @@ struct PersistentPublicationOwner<'a> {
 /// this is neither a second operation index nor an unbounded retry queue.
 enum PendingPersistence {
     Admission {
+        pending: Option<PendingPublication>,
         reservation: PublicationReservation,
         receipt: StartReceipt,
         flight: CreationFlight,
     },
     Creation(Box<PendingPersistentCreation>),
+    /// No live persistence owner can settle this original publication. Retain
+    /// its exact resources without scheduling recovery or replaying effects.
+    Fenced {
+        _reservation: Option<UnresolvedPublicationReservation>,
+        pending: Option<PendingPublication>,
+        _flight: CreationFlight,
+    },
     Removal {
         removal: PersistentRemoval,
         completion: std::sync::mpsc::Receiver<bool>,
@@ -1891,7 +1899,7 @@ enum PersistentPublicationPhase {
 
 enum CreationPublication<'a> {
     Memory(PublicationReservation, CreationFlight),
-    Persistent(PersistentPublicationOwner<'a>),
+    Persistent(Box<PersistentPublicationOwner<'a>>),
 }
 
 impl CreationPublication<'_> {
@@ -1914,6 +1922,7 @@ impl<'a> PersistentPublicationOwner<'a> {
             manager,
             reservation: Some(reservation),
             staged: Some(staged),
+            pending: None,
             flight: Some(flight),
             phase: PersistentPublicationPhase::Staged,
         }
@@ -1955,12 +1964,11 @@ impl<'a> PersistentPublicationOwner<'a> {
 
     fn publish_committed(
         &mut self,
-        operation_key: CreateOperationKey,
-        pending: PendingPublication,
         committed: CommittedStart,
     ) -> (RunInfo, Option<PersistenceError>) {
         debug_assert_eq!(self.phase, PersistentPublicationPhase::CommittedUnpublished);
         let post_commit_error = committed.post_commit_error;
+        let pending = &self.pending.as_ref().expect("one original pending Run").1;
         #[cfg(test)]
         if let Some(hook) = &self.manager.creation_hook {
             hook.capture_run(
@@ -1980,6 +1988,7 @@ impl<'a> PersistentPublicationOwner<'a> {
             );
             hook.pause_once(CreationHookPoint::PanicBeforePersistentRegistryConsume);
         }
+        let (operation_key, pending) = self.take_pending();
         let info = self.manager.registry.publish_creation(
             operation_key,
             pending,
@@ -1993,14 +2002,22 @@ impl<'a> PersistentPublicationOwner<'a> {
         let reservation = self
             .reservation
             .take()
-            .and_then(PublicationReservation::into_commit_unknown);
+            .and_then(PublicationReservation::into_unresolved);
         self.phase = PersistentPublicationPhase::Finished;
-        self.manager.fail_stop_persistence(reservation, message);
+        let pending = self.pending.take().map(|(_, pending)| pending);
+        let flight = self.flight.take().expect("one original creation flight");
+        self.manager
+            .fence_persistence(reservation, pending, flight, message);
+    }
+
+    fn take_pending(&mut self) -> (CreateOperationKey, PendingPublication) {
+        self.pending.take().expect("one original pending Run")
     }
 
     fn retain_aborted(&mut self, failure: &PersistentStartFailure) {
         if let Some(receipt) = failure.recovery_receipt() {
             mutex_lock(&self.manager.pending_persistence).push(PendingPersistence::Admission {
+                pending: self.pending.take().map(|(_, pending)| pending),
                 reservation: self.reservation.take().expect("one original reservation"),
                 receipt,
                 flight: self.flight.take().expect("one original creation flight"),
@@ -2234,7 +2251,6 @@ impl RunManager {
             retention_budget: RetentionBudget::with_resources(resources),
             resources,
             persistence: None,
-            commit_unknown_reservations: Mutex::new(Vec::new()),
             pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
             upgrade_requests: UpgradeRequestGate::default(),
@@ -2367,7 +2383,6 @@ impl RunManager {
             retention_budget,
             resources,
             persistence: Some(persistence),
-            commit_unknown_reservations: Mutex::new(Vec::new()),
             pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
             upgrade_requests: UpgradeRequestGate::default(),
@@ -2502,7 +2517,6 @@ impl RunManager {
             retention_budget,
             resources,
             persistence: Some(persistence),
-            commit_unknown_reservations: Mutex::new(Vec::new()),
             pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure,
             upgrade_requests: UpgradeRequestGate::default(),
@@ -2621,13 +2635,20 @@ impl RunManager {
         })
     }
 
-    fn fail_stop_persistence(&self, reservation: Option<CommitUnknownReservation>, message: &str) {
-        if let Some(reservation) = reservation {
-            mutex_lock(&self.commit_unknown_reservations).push(reservation);
-        }
-        self.creation_flights.fence();
-        self.incarnation_failure.record(format!(
-            "persistent start COMMIT outcome is unknown; restart is required: {message}"
+    fn fence_persistence(
+        &self,
+        reservation: Option<UnresolvedPublicationReservation>,
+        pending: Option<PendingPublication>,
+        flight: CreationFlight,
+        message: &str,
+    ) {
+        mutex_lock(&self.pending_persistence).push(PendingPersistence::Fenced {
+            _reservation: reservation,
+            pending,
+            _flight: flight,
+        });
+        let _ = crate::diagnostics::record(format_args!(
+            "ctxmuxd retained an unresolved persistent publication; Native owners remain available: {message}"
         ));
     }
 
@@ -2717,17 +2738,14 @@ impl RunManager {
             manager: self,
             reservation: Some(reservation),
             staged: None,
+            pending: Some((operation_key, pending)),
             flight: Some(flight),
             phase: PersistentPublicationPhase::CommittedUnpublished,
         };
-        let (run, _) = publication.publish_committed(
-            operation_key,
-            pending,
-            CommittedStart {
-                durable,
-                post_commit_error: None,
-            },
-        );
+        let (run, _) = publication.publish_committed(CommittedStart {
+            durable,
+            post_commit_error: None,
+        });
         let _ = crate::diagnostics::record(format_args!(
             "ctxmuxd recovered original durable publication for Run {}",
             run.id
@@ -2792,7 +2810,7 @@ impl RunManager {
                 Some(flight),
             ),
             CreationPublication::Persistent(publication) => {
-                self.publish_persistent_creation(operation_key, pending, publication)
+                self.publish_persistent_creation(operation_key, pending, *publication)
             }
         };
         #[cfg(test)]
@@ -2846,9 +2864,9 @@ impl RunManager {
             .map(PersistentCandidate::from)
             .collect();
         match persistence.stage_start(prepared, candidates) {
-            Ok(staged) => Ok(CreationPublication::Persistent(
+            Ok(staged) => Ok(CreationPublication::Persistent(Box::new(
                 PersistentPublicationOwner::new(self, reservation, staged, flight),
-            )),
+            ))),
             Err(failure) => {
                 let disposition = failure.disposition();
                 let code = if failure.is_capacity() {
@@ -2862,12 +2880,18 @@ impl RunManager {
                 if disposition == StartDisposition::CommitUnknown {
                     if let Some(receipt) = recovery {
                         mutex_lock(&self.pending_persistence).push(PendingPersistence::Admission {
+                            pending: None,
                             reservation,
                             receipt,
                             flight,
                         });
                     } else {
-                        self.fail_stop_persistence(reservation.into_commit_unknown(), &message);
+                        self.fence_persistence(
+                            reservation.into_unresolved(),
+                            None,
+                            flight,
+                            &message,
+                        );
                     }
                 }
                 let mut error = ProtocolError::new(code, message);
@@ -2905,17 +2929,22 @@ impl RunManager {
         pending: PendingPublication,
         mut publication: PersistentPublicationOwner<'_>,
     ) -> (Result<RunInfo, ProtocolError>, Option<CreationFlight>) {
-        let result = self.finish_persistent_creation(operation_key, pending, &mut publication);
+        publication.pending = Some((operation_key, pending));
+        let result = self.finish_persistent_creation(&mut publication);
         (result, publication.flight.take())
     }
 
     fn finish_persistent_creation(
         &self,
-        operation_key: CreateOperationKey,
-        pending: PendingPublication,
         publication: &mut PersistentPublicationOwner<'_>,
     ) -> Result<RunInfo, ProtocolError> {
         debug_assert!(std::ptr::eq(self, publication.manager));
+        #[cfg(test)]
+        let pending = &publication
+            .pending
+            .as_ref()
+            .expect("one original pending Run")
+            .1;
         #[cfg(test)]
         if let Some(hook) = &self.creation_hook {
             hook.capture_run(
@@ -2928,6 +2957,7 @@ impl RunManager {
         let committed = match publication.commit() {
             PersistentStartCompletion::Committed(committed) => committed,
             PersistentStartCompletion::NotCommitted(failure) => {
+                let (_, pending) = publication.take_pending();
                 return cleanup_failed_persistent_creation(pending, failure);
             }
             PersistentStartCompletion::CommitUnknown(UnknownStart {
@@ -2936,14 +2966,19 @@ impl RunManager {
                 receipt,
             }) => {
                 let storage_failure = Some(failure.storage_failure());
-                let mut error = persistence_protocol_error(&failure.into_error());
+                let failure = failure.into_error();
+                let mut error = persistence_protocol_error(&failure);
                 error.storage_failure = storage_failure;
-                publication.retain_creation(operation_key, pending, durable, receipt);
+                if matches!(failure, PersistenceError::ActorStopped) {
+                    publication.retain_unknown(&failure.to_string());
+                } else {
+                    let (operation_key, pending) = publication.take_pending();
+                    publication.retain_creation(operation_key, pending, durable, receipt);
+                }
                 return Err(error);
             }
         };
-        let (info, post_commit_error) =
-            publication.publish_committed(operation_key, pending, committed);
+        let (info, post_commit_error) = publication.publish_committed(committed);
         let post_commit_error = post_commit_error.map(|error| {
             let mut error = persistence_protocol_error(&error);
             if let Some(storage) = &mut error.storage_failure {
@@ -3211,12 +3246,18 @@ impl RunManager {
         // got an unknown reply. Shutdown requests its cleanup without dropping
         // the durable witness, original output, or publication reservation.
         for original in mutex_lock(&self.pending_persistence).iter() {
-            if let PendingPersistence::Creation(original) = original
-                && let Err(error) = original.pending.run().request_unpublished_cleanup()
+            let pending = match original {
+                PendingPersistence::Creation(original) => Some(&original.pending),
+                PendingPersistence::Admission { pending, .. }
+                | PendingPersistence::Fenced { pending, .. } => pending.as_ref(),
+                PendingPersistence::Removal { .. } => None,
+            };
+            if let Some(pending) = pending
+                && let Err(error) = pending.run().request_unpublished_cleanup()
             {
                 failures.push(format!(
                     "unpublished Run {} cleanup: {error}",
-                    original.pending.run().id
+                    pending.run().id
                 ));
             }
         }
@@ -5724,16 +5765,8 @@ impl Run {
         let protected = if self.persistence_mode == PersistenceMode::MemoryOnly {
             u64::MAX
         } else {
-            persistence.map_or(0, PersistentRun::next_replay_start)
+            persistence.map_or(0, PersistentRun::retention_protected_from)
         };
-        if self.persistence_mode == PersistenceMode::PersistentCapable
-            && protected == u64::MAX
-            && output.source_gap_after_byte.is_none()
-        {
-            // Persistence lost a replay path, not the ordered PTY bytes already
-            // consumed by the live terminal model.
-            output.mark_history_gap();
-        }
         let chunk = output.push_protected(data, protected);
         output.terminal_pressure(self.id);
         // Raw and geometry publications share this admission lock. Both memory
@@ -8117,6 +8150,7 @@ mod tests {
 
     mod creation;
     mod creation_recovery;
+    mod owner_loss;
     mod persistence_reconciliation;
 
     /// Build a `RunInfo` whose echoed spec carries a declared input of exactly

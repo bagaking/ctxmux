@@ -47,7 +47,7 @@ versioned handoff manifest and explicit incoming CLI arguments. Startup
 `ResourceConfig` resolves sparse choices once; the immutable `ResourceLimits`
 snapshot requires every established field, including explicitly nullable quotas.
 Removing the two transfer-quota fields changes private manifest shape to v9;
-public protocol generation 22 remains unchanged. Incompatible targets refuse
+the public protocol remained generation 22 at that resource-policy change. Incompatible targets refuse
 before ownership extraction rather than silently interpreting an old snapshot.
 Handoff never fills missing saved settings from fresh host defaults. Omitted
 foreground observation memory is derived from the selected worker width at one

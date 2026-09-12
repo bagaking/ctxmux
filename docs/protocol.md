@@ -408,7 +408,11 @@ publication. A pre-launch transaction without commit authorization can instead
 release its reservation after its rollback is proven. Neither recovery clears
 an unrelated shutdown or native child-wait failure. The original response
 remains unknown; subsequent read-only creation observation returns the settled
-original Run when publication is complete.
+original Run when publication is complete. If the persistence actor stops or the
+publication owner unwinds, the original unresolved key, child and reservation
+remain fenced. This is containment, not a promise of same-incarnation recovery:
+healthy retained Runs keep their existing Native control capabilities, and the
+original operation remains unknown rather than authorizing a new Start.
 The disposition describes this dispatched request, within the retained-key
 contract above. It is not a timeless claim about every earlier use of a key.
 A consumer already holding an unknown original result must not resend it to
@@ -1088,6 +1092,11 @@ accepted-output watermark and **last confirmed committed** watermark. An unknown
 COMMIT can leave disk ahead of the confirmed watermark: differences do not prove
 lost or uncommitted bytes. Null persistence denotes a Run with no persistence
 owner. Null first failure alone promises neither health nor complete durability.
+`actor_stopped: true` means that durable owner has ended; it does not mean the
+Native child died or revoke its confirmed input and control capabilities.
+Uncommitted raw output remains protected by the last committed watermark, even
+when its former actor had already accepted it. No new actor or empty state is
+silently substituted.
 Required nullable `storage_failure` reports the current unsettled storage fact;
 `first_failure` provides its human-readable description. Successful settlement
 clears the original fault; a free-space sample alone cannot clear it. The same object may appear

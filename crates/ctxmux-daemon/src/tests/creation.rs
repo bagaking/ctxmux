@@ -3182,6 +3182,10 @@ async fn trigger_persistent_commit_unwind(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exact replacement boundary retains its original reservation across unwind, shutdown and cold reopen"
+)]
 async fn assert_persistent_commit_unwind_converges(
     index: usize,
     fixture: PersistentCommitUnwindFixture,
@@ -3208,8 +3212,19 @@ async fn assert_persistent_commit_unwind_converges(
             .collect::<Vec<_>>(),
         vec![old.id]
     );
-    assert_eq!(mutex_lock(&manager.commit_unknown_reservations).len(), 1);
-    assert!(manager.incarnation_failure.message().is_some());
+    assert!(matches!(
+        mutex_lock(&manager.pending_persistence).as_slice(),
+        [crate::PendingPersistence::Fenced {
+            pending: Some(_),
+            ..
+        }]
+    ));
+    assert!(manager.incarnation_failure.message().is_none());
+    assert!(!manager.creation_flights.is_fenced());
+    assert!(
+        process_exists(committed_pid),
+        "publication unwind preserves the original live child"
+    );
     let old_retry = manager
         .create(old_key.clone(), CreationRequest::Start { spec: old_spec })
         .await
@@ -3231,15 +3246,29 @@ async fn assert_persistent_commit_unwind_converges(
             },
         )
         .await
-        .expect_err("known COMMIT unwind fences new creation admission");
-    assert_eq!(unrelated.code, ErrorCode::BackendUnavailable);
+        .expect_err("the original reserved record still consumes its exact capacity");
+    assert_eq!(unrelated.code, ErrorCode::RunCapacity);
     assert_eq!(read_marker_pids(&marker), vec![committed_pid]);
     assert_persistent_run_key_absent(&state_dir, old.id, &old_key);
     assert_eq!(persistent_key_count(&state_dir, &operation_key), 1);
     hook.release_captured_runs();
-    wait_for_rejected_children_reaped(&manager, &marker).await;
-    assert!(!process_exists(committed_pid));
+    let shutdown = manager
+        .shutdown_owned_controls(Duration::from_millis(150))
+        .unwrap_err();
+    assert!(
+        shutdown
+            .to_string()
+            .contains("original Run creation or durable mutation")
+    );
+    assert!(manager.creation_flights.is_fenced());
     drop(manager);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process_exists(committed_pid) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     persistence.assert_exclusive_owner();
     drop(persistence);
 

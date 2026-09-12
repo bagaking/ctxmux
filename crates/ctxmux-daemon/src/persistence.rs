@@ -720,10 +720,9 @@ struct PersistenceInner {
     join: Mutex<Option<thread::JoinHandle<()>>>,
     runtime_id: RuntimeId,
     epoch: String,
-    /// Raw fd of the advisory state lock held by the persistence actor thread.
-    /// Surfaced so an exec-in-place upgrade can record it in the handoff manifest
-    /// and have the incoming image adopt the still-held lock instead of re-locking.
-    state_lock_fd: RawFd,
+    /// The Runtime retains its original namespace even if its writer exits.
+    /// This shares one guard, not duplicated descriptors with independent unlocks.
+    state_lock: Arc<StateLockGuard>,
     #[cfg(test)]
     test_hooks: Arc<PersistenceTestHooks>,
 }
@@ -731,6 +730,7 @@ struct PersistenceInner {
 #[cfg(test)]
 #[derive(Default)]
 struct PersistenceTestHooks {
+    actor_loss_point: AtomicU8,
     database_capacity_reclaims: AtomicUsize,
     force_append_capacity: AtomicBool,
     forced_capacity_attempts: AtomicUsize,
@@ -791,6 +791,29 @@ struct PersistenceTestHooks {
     /// Set by fixtures whose subject is the WAL state itself -- an idle fold
     /// arriving first would zero the WAL out from under them.
     suppress_idle_fold: AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(crate) enum ActorLossPoint {
+    BeforeStartReady = 1,
+    BeforeStartCommit,
+    AfterStartCommit,
+    BeforeAppend,
+}
+
+#[cfg(test)]
+impl PersistenceTestHooks {
+    fn lose_actor_if_armed(&self, point: ActorLossPoint) {
+        if self
+            .actor_loss_point
+            .compare_exchange(point as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            panic!("injected original persistence actor loss");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1217,6 +1240,29 @@ impl PersistenceInner {
     }
 }
 
+struct ActorExitGuard<'a> {
+    shutdown: &'a AtomicBool,
+    failure: &'a Mutex<Option<String>>,
+    lifecycle_space: &'a tokio::sync::Notify,
+    output_wake: &'a Mutex<Option<crate::native_runtime::OwnerWake>>,
+}
+
+impl Drop for ActorExitGuard<'_> {
+    fn drop(&mut self) {
+        if !self.shutdown.load(Ordering::Acquire) {
+            let mut failure = mutex_lock(self.failure);
+            if failure.is_none() {
+                *failure = Some(PersistenceError::ActorStopped.to_string());
+            }
+            drop(failure);
+            self.lifecycle_space.notify_waiters();
+            if let Some(wake) = &*mutex_lock(self.output_wake) {
+                wake.wake();
+            }
+        }
+    }
+}
+
 impl Drop for PersistenceInner {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
@@ -1236,9 +1282,8 @@ pub(crate) struct PersistentRun {
     /// exclusive end of the newest ACCEPTED append, which is where the next
     /// replay must start.
     ///
-    /// This is deliberately NOT `durable_head`. Every accepted append either
-    /// commits or latches persistence off daemon-wide (`remember_failure`);
-    /// it remains exact original debt until its owner settles the outcome.
+    /// This is deliberately NOT `durable_head`. The live Run retains its raw
+    /// bytes until confirmed settlement, including if the writer exits.
     /// Re-sending bytes that are merely still IN FLIGHT buys no safety while
     /// costing the whole difference between the two watermarks — which under
     /// load is an entire queue depth of output.
@@ -1400,6 +1445,13 @@ impl PersistentRun {
 
     pub(crate) fn next_replay_start(&self) -> u64 {
         self.offered_head.load(Ordering::Acquire)
+    }
+
+    /// Offered bytes still belong to the live Run until durable confirmation.
+    /// The writer may disappear together with its queue or in-flight payload.
+    /// Protect the existing raw log, without changing the incremental offer cursor.
+    pub(crate) fn retention_protected_from(&self) -> u64 {
+        self.durable_head.load(Ordering::Acquire)
     }
 
     pub(crate) fn metadata_bytes_owner(&self) -> Arc<AtomicU64> {
@@ -1742,7 +1794,7 @@ impl Persistence {
     /// image adopts the still-held lock across exec instead of re-locking
     /// (which would self-deadlock on the same open file description).
     pub(crate) fn state_lock_fd(&self) -> RawFd {
-        self.inner.state_lock_fd
+        self.inner.state_lock.as_raw_fd()
     }
 
     /// Drive a synchronous durable-commit barrier: block until every Append
@@ -1858,6 +1910,12 @@ impl Persistence {
         let join = thread::Builder::new()
             .name("ctxmux-persistence".to_owned())
             .spawn(move || {
+                let _exit = ActorExitGuard {
+                    shutdown: &actor_shutdown,
+                    failure: &actor_failure,
+                    lifecycle_space: &actor_lifecycle_space,
+                    output_wake: &actor_output_wake,
+                };
                 actor_main(
                     &actor_state_dir,
                     &admission_limits,
@@ -1879,8 +1937,7 @@ impl Persistence {
                 );
             })
             .map_err(|error| PersistenceError::ActorStart(error.to_string()))?;
-        let (runtime_id, epoch, state_lock_fd, recovered, effective_storage) = match init_rx.recv()
-        {
+        let (runtime_id, epoch, state_lock, recovered, effective_storage) = match init_rx.recv() {
             Ok(Ok(initialized)) => initialized,
             Ok(Err(error)) => {
                 let _ = join.join();
@@ -1912,12 +1969,24 @@ impl Persistence {
                 join: Mutex::new(Some(join)),
                 runtime_id,
                 epoch,
-                state_lock_fd,
+                state_lock,
                 #[cfg(test)]
                 test_hooks,
             }),
         };
         Ok((persistence, recovered))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lose_actor_at_for_test(&self, point: ActorLossPoint) {
+        assert_eq!(
+            self.inner
+                .test_hooks
+                .actor_loss_point
+                .swap(point as u8, Ordering::AcqRel),
+            0,
+            "only one actor-loss seam may be armed"
+        );
     }
 
     #[cfg(test)]
@@ -2640,7 +2709,7 @@ type ActorInit = Result<
     (
         RuntimeId,
         String,
-        RawFd,
+        Arc<StateLockGuard>,
         Vec<RecoveredRun>,
         Arc<Mutex<EffectiveStoragePolicy>>,
     ),
@@ -2711,7 +2780,7 @@ fn actor_main(
     let init_payload = Ok((
         store.runtime_id,
         store.epoch.clone(),
-        store.state_lock_raw_fd(),
+        Arc::clone(&store.state_lock),
         recovered,
         Arc::clone(&store.effective_storage),
     ));
@@ -3072,7 +3141,9 @@ fn actor_main(
                         .expect("pending Finalize is retained")
                 });
         }
-        if output_wake_requested.swap(false, Ordering::AcqRel)
+        // Dequeue may free admission, but it is not a durable ACK. Keep the
+        // request armed until this turn settles its original bytes as well.
+        if output_wake_requested.load(Ordering::Acquire)
             && let Some(wake) = &*mutex_lock(output_wake)
         {
             wake.wake();
@@ -3246,6 +3317,8 @@ fn actor_main(
                 }
                 #[cfg(test)]
                 pause_before_append(test_hooks);
+                #[cfg(test)]
+                test_hooks.lose_actor_if_armed(ActorLossPoint::BeforeAppend);
                 let mut batch = vec![(id, replay, durable_head)];
                 let mut payload = replay_payload(&batch[0].1);
                 let window = APPEND_BATCH_WINDOW;
@@ -4206,7 +4279,7 @@ struct StateStore {
     /// Each resumed turn rechecks the original prefix against canonical rows.
     reclaiming_output: HashSet<RunId>,
     // Fields drop in declaration order: close SQLite before releasing ownership.
-    _state_lock: StateLockGuard,
+    state_lock: Arc<StateLockGuard>,
     #[cfg(test)]
     test_hooks: Arc<PersistenceTestHooks>,
 }
@@ -4787,14 +4860,6 @@ impl StateStore {
         }
     }
 
-    // `_state_lock` is underscore-prefixed to document that it is held for its
-    // Drop side effect (releasing the flock); reading its raw fd for the
-    // exec-in-place handoff is a deliberate, narrow exception.
-    #[allow(clippy::used_underscore_binding)]
-    fn state_lock_raw_fd(&self) -> RawFd {
-        self._state_lock.as_raw_fd()
-    }
-
     #[allow(clippy::too_many_lines)]
     fn open(
         state_dir: &Path,
@@ -4960,7 +5025,7 @@ impl StateStore {
             compaction_cursor: i64::MIN,
             replay_cleanup_needed: false,
             reclaiming_output: HashSet::new(),
-            _state_lock: state_lock,
+            state_lock: Arc::new(state_lock),
             #[cfg(test)]
             test_hooks,
         };
@@ -5690,6 +5755,9 @@ impl StateStore {
 
         let decision = match decision_owner {
             StageDecisionOwner::Caller { ready, decision } => {
+                #[cfg(test)]
+                self.test_hooks
+                    .lose_actor_if_armed(ActorLossPoint::BeforeStartReady);
                 if ready.send(Ok(())).is_err() {
                     return self.rollback_after_ready_loss(receipt);
                 }
@@ -6233,6 +6301,9 @@ impl StateStore {
     ) -> StageDriveResult {
         receipt.commit_authorized.store(true, Ordering::Release);
         #[cfg(test)]
+        self.test_hooks
+            .lose_actor_if_armed(ActorLossPoint::BeforeStartCommit);
+        #[cfg(test)]
         if let Some(result) = self.abort_start_before_commit_if_armed(receipt) {
             return result;
         }
@@ -6249,6 +6320,9 @@ impl StateStore {
             Ok(()) => {
                 #[cfg(test)]
                 self.crash_start_commit_if_armed(StartCommitCrashPhase::After);
+                #[cfg(test)]
+                self.test_hooks
+                    .lose_actor_if_armed(ActorLossPoint::AfterStartCommit);
                 let _ = receipt.decide(StartDisposition::Committed);
                 let mut post_commit_error = None;
                 #[cfg(test)]

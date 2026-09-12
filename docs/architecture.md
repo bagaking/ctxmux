@@ -12,7 +12,7 @@ Current guarantees are deliberately narrower than the product vision.
 | ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------- |
 | Run lifetime     | A native child survives client disconnects. Optional `--state-dir` mode recovers historical Run state and committed replay after cold restart and preserves live PTY control across a planned exec-in-place `SIGHUP` upgrade. Existing attachments reconnect.                                                                                                                                                                                                                                                                                                                                                                                                            | Crash-time PTY adoption and host-reboot process continuity remain unsupported.                                                   |
 | Transport        | Versioned NDJSON over a Unix socket. The CLI uses `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock` (else a process-temp path) and starts `ctxmuxd` when nothing is listening; other clients still select the socket explicitly.                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Windows transport and multi-daemon discovery are open.                                                                           |
-| Clients          | Rust CLI and dependency-free TypeScript SDK share protocol generation 22, including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
+| Clients          | Rust CLI and dependency-free TypeScript SDK share the versioned public protocol defined in [the protocol contract](protocol.md), including strict padded base64 PTY output on the wire (decoded once to `Uint8Array` in the SDK), a daemon-authored RuntimeIdentity, daemon-incarnation fencing, recoverable native Input and Stop, foreground-group Interrupt, correlated attachment controls, typed owner receipts, explicit non-output observation discontinuity, client-driven removal of terminated Runs, and the shared memory-only/persistent retained-Run capacity boundary. Public Rust and TypeScript clients may additionally enforce local capability requirements; CLI readiness remains raw and requirement-free. | Other SDKs appear only for a real client requirement.                                                                            |
 | Attach           | Retained raw bytes plus ordered live events; interactive CLI reconstructs the current screen, then follows live bytes with raw mode and `Ctrl-b d`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Multi-writer policy remains open.                                                                                                |
 | Input recovery   | A native operation adds same-incarnation retry, exact applied-input byte ranges, a bounded Run-local result ledger, and a daemon-instance fence. The cursor and complete settled ledger cross a planned exec-in-place upgrade with the preserved instance. Attachment command IDs remain connection-local; ordinary Input result loss remains unknown.                                                                                                                                                                                                                                                                                                                   | Cold-restart exactly-once and semantic acknowledgement remain above or outside ctxmux.                                           |
 | Stop recovery    | One caller-retained operation joins or replays the complete-session Stop receipt across connection loss. A Runtime-global key binding and one per-Run record fence conflicts before mutation, survive planned exec, and end at exact Run collection.                                                                                                                                                                                                                                                                                                                                                                                                                     | Cold-restart exactly-once and recoverable Resize/Interrupt remain unsupported.                                                   |
@@ -734,8 +734,8 @@ Input/Stop state under the original aggregate control owner, without separate
 transfer quotas for payload or diagnostics. Its encoded-file allowance still
 protects staging/read memory and is preflighted before ownership extraction.
 The private manifest is v10 because the current listener's pathname device/inode
-identity is required alongside its descriptor; public protocol generation 22 is
-unchanged. Terminal
+identity is required alongside its descriptor; that resource-policy change did
+not alter the public protocol. Terminal
 allocation/history/restore and some derived allowances remain unfinished
 resource work. The [source-level defense and configuration audit](reviews/runtime-defense-and-configuration-audit.md)
 records the dispositions and existing execution owners. This accepted direction
@@ -834,7 +834,7 @@ offers do not block the shared PTY reader when the queue is full. Uncertain
 commit/rollback fences later durable mutations until the same owner establishes
 the original outcome. Replay conflicts, integrity and owner-invariant failures
 remain fenced. Persistence failure preserves accepted bytes, the protected
-unoffered suffix and the last confirmed durable head; it neither invents a
+uncommitted suffix and the last confirmed durable head; it neither invents a
 history Gap nor invalidates an intact live terminal model that has consumed
 every ordered PTY byte. Actual
 source discontinuity still discards that model; a missing model is not rebuilt
@@ -963,9 +963,13 @@ checkpoint attempts instead of monopolizing the actor through an outer retry
 loop. Reads validate their actual replay-directory dependency; an unavailable
 active destination does not deny a page still stored in an older generation.
 Fatal and uncertain outcomes retain accepted output copies, queue funding and
-terminal settlement under the original owner. The native output buffer protects
-the unoffered suffix even while persistence is fenced, applying its existing
-bounded backpressure instead of releasing those bytes as disposable history.
+terminal settlement under the original owner. From normal operation onward, the
+native raw buffer protects every byte beyond the confirmed durable head, even
+when the writer has accepted it. The offered head remains the incremental-send
+cursor; it never authorizes eviction. This uses the existing raw buffer and
+bounded grants, not an additional recovery copy. When that funded window fills,
+only the affected producer pauses; confirmed settlement wakes the same reader.
+No additional input or output event is required to resume it.
 `storage_failure` reports the current structured blocking fault. The original
 `first_failure` is retained until its precise transaction is reconciled; a
 foreign owner, corrupt witness or unqualified fault remains fenced. Clearing a
@@ -1007,6 +1011,26 @@ controls or fail the daemon incarnation. Shutdown still waits for the original
 creation/removal continuations and reports unresolved ownership at its real
 deadline rather than declaring success early.
 
+A writer that exits has lost its transaction continuation; it cannot be treated
+as a temporarily unreadable live actor. The existing storage observation exposes
+`actor_stopped` and retains the original failure. This case is contained, not
+automatically healed: no replacement actor, invented successful receipt or
+cold-start normalization is permitted beneath still-running Native owners.
+The Runtime and writer share the same state-lock guard. The writer's unwind
+closes its connection but does not unlock that Runtime's namespace; only the
+last Runtime owner releases it. Exec handoff still transfers that original
+locked descriptor. A second daemon must refuse the same state directory while
+any original Runtime owner remains.
+
+Loss of a creation reply or publication unwind retains the original key,
+reservation, physical child and creation flight. An irreducible owner does not
+enter a retry loop or disable unrelated Native Input/Output/Stop. A missing
+receipt does not prove NotCommitted. Accepted output remains in its original raw
+owner under the committed cursor, including bytes whose actor queue was lost.
+Shutdown requests the original child's cleanup and reports any unresolved
+publication at its existing deadline; it does not silently release the fence.
+Actual loss of Native wait/child authority remains its separate fatal boundary.
+
 #### Recoverability and antifragility
 
 **可恢复、抗脆弱** are design requirements for the persistence owner. Recoverable
@@ -1021,9 +1045,10 @@ runtime can automatically repair arbitrary corruption.
 The [persistent-failure case study](architecture/case-study-persistence-failure-latch.md)
 shows an implementation gap at source `ad69f47`: an unclassified open failure
 becomes a permanent string latch, and there is no qualified same-owner
-reconciliation path. The following requirements are normative targets, **not
-claims that this recovery protocol, public fields or live repair are already
-implemented**. The current protocol continues to describe shipped behavior.
+reconciliation path. The following requirements are normative design principles. The implementation
+and qualified boundaries are described above and in that case study; they do
+not establish that an older live daemon has been upgraded or repaired. The
+public protocol remains the authority for client-visible fields and effects.
 
 - **Separate availability, transaction outcome and physical effects.** Record
   the storage condition and its scope, the original transaction's confirmed

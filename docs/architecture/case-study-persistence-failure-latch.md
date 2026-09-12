@@ -308,6 +308,18 @@ maintenance timing case passed alone but exceeded its unchanged deadline under
 concurrent test/build load; that evidence does not establish general loaded
 performance.
 
+A further owner-loss review found that merely keeping the daemon alive would
+still violate the original-state contract. The writer alone held a lock guard
+whose destructor explicitly unlocked the state directory, allowing a second
+daemon to cold-open state beneath live Native children. The raw cache also used
+the offered cursor for reclamation, although a writer unwind could destroy the
+queued copy of accepted bytes. The Runtime now shares the original lock guard,
+and raw reclamation is bounded by committed bytes from the start of normal
+operation. Incremental offers still use the separate offered cursor. These
+changes preserve the original namespace and available data when a writer is
+irretrievably gone; they do not recreate its lost transaction witness or grant
+automatic replay of an operation. The architecture remains the rule owner.
+
 ## Required proof and remaining gaps
 
 The following matrix defines full acceptance; the focused evidence above does
@@ -325,7 +337,7 @@ then exercise the same public CLI/SDK paths used by consuming clients.
 | Same configured capacity during reclamation and cold restart | Original saved data is used, with no larger quota or reseeded fixture; recovery and necessary settlement can make progress within their funded work space |
 | Repeated exhaustion/release cycles plus held-out faults | Repeated recovery converges without leaked grants, growing queues or forgotten lifecycle work |
 | Existing failed writer plus proposed upgrade | Either a proven full transfer of unresolved work and live ownership, or truthful refusal; merely removing preflight must fail the test |
-| Agent creation and at least two managed-service consumers | Same Native receipts reach public client/CLI and actual consumer; failed observation does not invent a new operation or bypass necessary durability |
+| Agent creation and affected managed-service consumers | Qualify Agent/Terminal and Capsule consumers with distinct trigger shapes. Connector Host itself owns an independent database under the same host resource pressure; Mote creation depends indirectly on ctxmux. Start/Fork are two triggers, not two managed-service businesses |
 
 Use bounded isolated storage and controlled I/O injection; never fill the user's
 host disk. [SQLite's fault-testing approach](https://www.sqlite.org/testing.html)
@@ -337,8 +349,9 @@ and make the corresponding behavior test fail.
 Remaining gaps: the original syscall/errno and precise failed transaction are
 unknown; the user-reported service failures were not converted into test writes;
 the amount of unconfirmed output across all Runs is unmeasured. The new source
-implements online continuation, but full artifact/consumer qualification and a
-safe remedy for the already-failed old instance remain separate delivery work.
+implements online continuation. Owner proofs do not replace artifact/consumer
+qualification, whose receipts must bind the exact source, binaries and consumer
+routes. A safe remedy for the already-failed old instance remains unproven.
 The original live daemon has not been replaced or proven healed by these tests;
 source review, an installed binary or a newly created empty Run cannot substitute
 for that evidence.

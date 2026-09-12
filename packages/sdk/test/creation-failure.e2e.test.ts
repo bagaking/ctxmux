@@ -44,6 +44,7 @@ for (const beforeCommit of [false, true]) {
       logs += String(part);
     });
     const exited = once(daemon, "exit");
+    let requestFailure: unknown;
     try {
       let socketPath: string | undefined;
       for (let attempt = 0; attempt < 500; attempt++) {
@@ -157,11 +158,21 @@ for (const beforeCommit of [false, true]) {
         await client.input(original.id, "still-the-original\n");
         assert.equal((await client.status(original.id)).pid, original.pid);
       }
+    } catch (error) {
+      requestFailure = error;
     } finally {
       await writeFile(join(directory, "release"), "done");
       const [code] = await exited;
+      if (code !== 0 && requestFailure !== undefined) {
+        throw new AggregateError(
+          [requestFailure, new Error(logs)],
+          `Original request failed: ${String(requestFailure)}; fixture cleanup also failed: ${logs}`,
+        );
+      }
       assert.equal(code, 0, logs);
-      await rm(directory, { recursive: true, force: true });
+      if (requestFailure === undefined)
+        await rm(directory, { recursive: true, force: true });
     }
+    if (requestFailure !== undefined) throw requestFailure;
   });
 }
