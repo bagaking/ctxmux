@@ -596,6 +596,7 @@ try {
     "native.recoverable_input": 1,
     "native.recoverable_stop": 1,
     "native.start": 1,
+    "services.storage_observation": 1,
     "tmux.discover": 1,
     "tmux.import": 1,
   });

@@ -102,7 +102,7 @@ for (const name of cases) {
   const client = new CtxmuxClient({ socketPath: socket });
   const runs = [];
   let failure;
-  const report = { name, base, selected, nativeTestBuild: { profile: "dev", incremental: false, debugInfo: false }, implementationSha256: digest(path.join(source, owned[0])), daemonSha256: digest(path.resolve(daemonBinary)), sdkSha256: digest(path.resolve(sdkPath)) };
+  const report = { name, base, selected, nativeTestBuild: daemonOption ? { profile: "published-artifact", sourceManifestBoundExternally: true } : { profile: "dev", incremental: false, debugInfo: false }, implementationSha256: digest(path.join(source, owned[0])), daemonSha256: digest(path.resolve(daemonBinary)), sdkSha256: digest(path.resolve(sdkPath)) };
   try {
     await until(() => fs.existsSync(socket), "private daemon socket");
     report.runtime = await client.runtimeInfo();
@@ -114,10 +114,19 @@ for (const name of cases) {
     await attachment.detach();
     await client.input(runs[0].id, "F");
     await until(async () => (await client.status(runs[0].id)).latest_output_bytes > 6 * 1024 * 1024, "complete original burst admitted", 30_000);
+    // Output admission can lead the asynchronous durable actor. Wait for its
+    // actual public failure before testing the later mutation boundary.
+    await until(async () => {
+      const observed = await client.observeStorage(runs[0].id);
+      assert.equal(observed.observation.run_id, runs[0].id);
+      if (!/File too large|os error 27|file too large/i.test(observed.observation.persistence?.first_failure ?? "")) return false;
+      report.storageObservation = observed;
+      return true;
+    }, "private append failure is publicly observed");
     // Inspect the authoritative public mutation error. An optional diagnostic
     // sink need not print a persistence failure for the daemon to stay usable.
     let persistenceFailure;
-    try { runs.push(await client.start(defineRun("/bin/true"))); }
+    try { runs.push(await client.start(defineRun("/usr/bin/python3", { args: ["-c", "pass"] }))); }
     catch (error) { persistenceFailure = error; }
     assert(persistenceFailure, "actual private append failure refuses later durable mutations");
     assert.match(persistenceFailure.message, /File too large|os error 27|file too large/i, "actual private EFBIG append failure");
