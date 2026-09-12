@@ -463,6 +463,9 @@ struct PersistenceInner {
 #[derive(Default)]
 struct PersistenceTestHooks {
     append_transaction_commits: AtomicU64,
+    replay_transaction_opens: AtomicU64,
+    replay_payload_syncs: AtomicU64,
+    fail_next_replay_payload_sync: AtomicBool,
     append_batch_window: Mutex<Option<Duration>>,
     append_wait_started: Mutex<Option<mpsc::Sender<()>>>,
     fail_next_insert_after_commit: AtomicBool,
@@ -4722,7 +4725,15 @@ impl StateStore {
         let replay_file = self.replay_file.clone();
         let resources = self.admission_limits.resources;
         let path = replay_dir.join(&replay_file);
-        let before = file_len(&path)?;
+        let mut writer = ReplayFileWriter::open(&replay_dir, &replay_file)?;
+        let before = writer.next_offset;
+        #[cfg(test)]
+        {
+            writer.test_hooks = Some(Arc::clone(&self.test_hooks));
+            self.test_hooks
+                .replay_transaction_opens
+                .fetch_add(1, Ordering::AcqRel);
+        }
         let mut settlement = None;
         let witness = batch.first().map_or_else(
             || {
@@ -4737,12 +4748,11 @@ impl StateStore {
         let committed = self.commit_maintenance_batch(witness, |transaction| {
             let mut cursor_updates = HashMap::new();
             for (id, replay, _) in coalesce_batch(batch) {
-                let _ = append_replay_external_with_limit(
+                let _ = append_replay_with_storage(
                     transaction,
                     id,
                     &replay,
-                    &replay_dir,
-                    &replay_file,
+                    &mut writer,
                     resources.durable_run_output_bytes,
                 )?;
                 let head = read_run_head(transaction, id)?;
@@ -4812,9 +4822,15 @@ impl StateStore {
                 }
                 terminal_metadata = Some((Arc::clone(metadata_owner), metadata_bytes));
             }
+            // All indexed payload belongs to this transaction. Publish none of
+            // its coordinates or watermarks until the shared file is synced.
+            writer.sync()?;
             settlement = Some((cursor_updates, terminal_metadata));
             Ok(())
         });
+        // Release the file before adaptive rollback reduction recurses. Tail
+        // disposition belongs to the transaction result below, never Drop.
+        drop(writer);
         match committed {
             Ok(true) => {}
             Ok(false) => {
@@ -6813,19 +6829,19 @@ fn stored_range_matches_in(
 /// chunk advances `durable_head` before the bytes are a row, so anything that
 /// reads the table mid-loop must flush first. Keeping them in one value is what
 /// makes that coupling visible rather than a rule to remember.
-struct ReplayCursors {
+struct ReplayCursors<'writer> {
     durable_oldest: i64,
     durable_head: i64,
     replay_bytes: i64,
     pending: Vec<u8>,
     pending_start: i64,
-    writer: ReplayFileWriter,
+    writer: &'writer mut ReplayFileWriter,
 }
 
 fn flush_pending_row_for_cursors(
     transaction: &Connection,
     id_text: &str,
-    cursors: &mut ReplayCursors,
+    cursors: &mut ReplayCursors<'_>,
 ) -> Result<(), PersistenceError> {
     if cursors.pending.is_empty() {
         return Ok(());
@@ -6859,16 +6875,19 @@ fn flush_pending_row_for_cursors(
 
 /// Append-only payload owner for one persistence transaction.
 ///
-/// `SQLite` stores only replay coordinates. Bytes are written and synced before
-/// the transaction commits; an abandoned tail is harmless and is reclaimed by
-/// the next startup/compaction sweep. The actor is the sole writer, so one
-/// shared file can serve every Run without cross-process locking.
+/// `SQLite` stores only replay coordinates. One writer supplies every Run's
+/// extents in the transaction, then syncs once before `SQLite` can COMMIT. The
+/// actor is the sole file writer, so its offset advances with each successful
+/// write without stat calls per row. The outer transaction alone decides when
+/// rollback permits truncation; Drop must preserve possibly indexed bytes.
 struct ReplayFileWriter {
     dir: PathBuf,
     file_name: String,
     file: File,
-    base_len: u64,
-    committed: bool,
+    next_offset: u64,
+    unsynced: bool,
+    #[cfg(test)]
+    test_hooks: Option<Arc<PersistenceTestHooks>>,
 }
 
 struct ReplayGenerationGuard {
@@ -6921,7 +6940,7 @@ impl ReplayFileWriter {
             .open(&path)
             .map_err(|source| PersistenceError::io(&path, source))?;
         validate_state_file(&path)?;
-        let base_len = file
+        let next_offset = file
             .metadata()
             .map_err(|source| PersistenceError::io(&path, source))?
             .len();
@@ -6929,40 +6948,57 @@ impl ReplayFileWriter {
             dir: dir.to_path_buf(),
             file_name: file_name.to_owned(),
             file,
-            base_len,
-            committed: false,
+            next_offset,
+            unsynced: false,
+            #[cfg(test)]
+            test_hooks: None,
         })
     }
 
     fn append(&mut self, data: &[u8]) -> Result<u64, PersistenceError> {
-        let offset = self
-            .file
-            .metadata()
-            .map_err(|source| PersistenceError::io(self.path(), source))?
-            .len();
+        let offset = self.next_offset;
+        let bytes = u64::try_from(data.len()).map_err(|_| {
+            PersistenceError::Mutation("replay payload exceeds file offsets".to_owned())
+        })?;
+        let next_offset = offset
+            .checked_add(bytes)
+            .ok_or_else(|| PersistenceError::Mutation("replay file offset overflows".to_owned()))?;
         self.file
             .write_all(data)
             .map_err(|source| PersistenceError::io(self.path(), source))?;
+        self.next_offset = next_offset;
+        self.unsynced |= !data.is_empty();
+        Ok(offset)
+    }
+
+    fn sync(&mut self) -> Result<(), PersistenceError> {
+        if !self.unsynced {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if self.test_hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .fail_next_replay_payload_sync
+                .swap(false, Ordering::AcqRel)
+        }) {
+            return Err(PersistenceError::io(
+                self.path(),
+                io::Error::other("injected replay payload sync failure"),
+            ));
+        }
         self.file
             .sync_data()
             .map_err(|source| PersistenceError::io(self.path(), source))?;
-        Ok(offset)
+        #[cfg(test)]
+        if let Some(hooks) = &self.test_hooks {
+            hooks.replay_payload_syncs.fetch_add(1, Ordering::AcqRel);
+        }
+        self.unsynced = false;
+        Ok(())
     }
 
     fn path(&self) -> PathBuf {
         self.dir.join(&self.file_name)
-    }
-
-    fn commit(&mut self) {
-        self.committed = true;
-    }
-}
-
-impl Drop for ReplayFileWriter {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.file.set_len(self.base_len);
-        }
     }
 }
 
@@ -6974,7 +7010,7 @@ fn apply_replay_chunk(
     id_text: &str,
     replay: &OutputReplay,
     chunk: &OutputChunk,
-    cursors: &mut ReplayCursors,
+    cursors: &mut ReplayCursors<'_>,
 ) -> Result<(), PersistenceError> {
     let data_len = u64::try_from(chunk.data.len())
         .map_err(|_| PersistenceError::Mutation("output chunk is too large".to_owned()))?;
@@ -7131,40 +7167,18 @@ fn append_replay_external(
     replay_dir: &Path,
     replay_file: &str,
 ) -> Result<bool, PersistenceError> {
-    append_replay_external_with_limit(
-        transaction,
-        id,
-        replay,
-        replay_dir,
-        replay_file,
-        PER_RUN_REPLAY_BYTES,
-    )
-}
-
-fn append_replay_external_with_limit(
-    transaction: &Connection,
-    id: RunId,
-    replay: &OutputReplay,
-    replay_dir: &Path,
-    replay_file: &str,
-    replay_limit: u64,
-) -> Result<bool, PersistenceError> {
-    append_replay_with_storage(
-        transaction,
-        id,
-        replay,
-        replay_dir,
-        replay_file,
-        replay_limit,
-    )
+    let mut writer = ReplayFileWriter::open(replay_dir, replay_file)?;
+    let evicted =
+        append_replay_with_storage(transaction, id, replay, &mut writer, PER_RUN_REPLAY_BYTES)?;
+    writer.sync()?;
+    Ok(evicted)
 }
 
 fn append_replay_with_storage(
     transaction: &Connection,
     id: RunId,
     replay: &OutputReplay,
-    replay_dir: &Path,
-    replay_file: &str,
+    writer: &mut ReplayFileWriter,
     replay_limit: u64,
 ) -> Result<bool, PersistenceError> {
     let id_text = id.to_string();
@@ -7205,7 +7219,7 @@ fn append_replay_with_storage(
         replay_bytes,
         pending: Vec::new(),
         pending_start: 0,
-        writer: ReplayFileWriter::open(replay_dir, replay_file)?,
+        writer,
     };
     for chunk in &replay.chunks {
         apply_replay_chunk(transaction, id, &id_text, replay, chunk, &mut cursors)?;
@@ -7219,7 +7233,7 @@ fn append_replay_with_storage(
         mut replay_bytes,
         pending: _,
         pending_start: _,
-        mut writer,
+        writer: _,
     } = cursors;
     let evicted = prune_run_replay_to(
         transaction,
@@ -7246,7 +7260,6 @@ fn append_replay_with_storage(
             ])
         })
         .map_err(PersistenceError::database)?;
-    writer.commit();
     Ok(evicted)
 }
 
@@ -8574,6 +8587,7 @@ mod tests {
              vs 0.303 ms carrying bytes)"
         );
         assert_eq!(head.load(Ordering::Acquire), 0, "no bytes became durable");
+        assert_eq!(hooks.replay_payload_syncs.load(Ordering::Acquire), 0);
 
         // The regression this guards: the same empty replay sandwiched between
         // two contiguous appends. All three are one contiguous run of bytes for
@@ -8681,6 +8695,296 @@ mod tests {
                 )
                 .expect("read append-batch durable tuple");
             assert_eq!(actual, expected);
+        }
+    }
+
+    fn insert_valid_replay_test_runs(store: &mut StateStore) -> [RunId; 2] {
+        let ids = [RunId::new(), RunId::new()];
+        let transaction = store.connection.transaction().unwrap();
+        for id in ids {
+            let metadata = insert_test_run(&transaction, id, "running", 1);
+            transaction
+                .execute(
+                    "UPDATE runs SET metadata_bytes=?2 WHERE id=?1",
+                    params![id.to_string(), metadata],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        ids
+    }
+
+    #[test]
+    fn transaction_payload_sync_preserves_interleaved_binary_rows_on_reopen() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        // Uneven binary ranges cross the row boundary, and Run order differs
+        // from byte order. These are workload examples, not capacity bounds.
+        let first: Vec<u8> = (0..131_079_u32).map(|n| n.to_le_bytes()[0]).collect();
+        let second: Vec<u8> = (0..70_013_u32).map(|n| n.to_le_bytes()[1]).collect();
+        let heads = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        store
+            .append_batch(&[
+                (
+                    ids[1],
+                    replay(vec![chunk(0, &second[..65_536])]),
+                    Arc::clone(&heads[1]),
+                ),
+                (
+                    ids[0],
+                    replay(vec![chunk(0, &first[..65_537])]),
+                    Arc::clone(&heads[0]),
+                ),
+                (
+                    ids[1],
+                    replay(vec![chunk(65_536, &second[65_536..])]),
+                    Arc::clone(&heads[1]),
+                ),
+                (
+                    ids[0],
+                    replay(vec![chunk(65_537, &first[65_537..])]),
+                    Arc::clone(&heads[0]),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(hooks.replay_transaction_opens.load(Ordering::Acquire), 1);
+        assert_eq!(hooks.replay_payload_syncs.load(Ordering::Acquire), 1);
+        assert_eq!(hooks.append_transaction_commits.load(Ordering::Acquire), 1);
+        for (head, bytes) in heads.iter().zip([&first, &second]) {
+            assert_eq!(head.load(Ordering::Acquire), bytes.len() as u64);
+        }
+        let rows: i64 = store
+            .connection
+            .query_row("SELECT count(*) FROM replay_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            rows > 2,
+            "the test must exercise multiple payload rows per Run"
+        );
+        drop(store);
+        let (_, recovered) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        for (id, expected) in ids.into_iter().zip([first, second]) {
+            let run = recovered.iter().find(|run| run.info.id == id).unwrap();
+            assert_eq!(run.replay.first_available_byte, 0);
+            let actual: Vec<_> = run
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(actual, expected);
+            assert_eq!(run.replay.latest_output_bytes, actual.len() as u64);
+        }
+    }
+
+    #[test]
+    fn transaction_payload_sync_faults_preserve_commit_disposition() {
+        for outcome in ["sync", "rolled-back", "committed", "post-commit-stat"] {
+            assert_transaction_payload_sync_fault(outcome);
+        }
+    }
+
+    #[test]
+    fn transaction_payload_rollback_failure_preserves_unclassified_tail() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let heads = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        store
+            .append_batch(&[
+                (
+                    ids[0],
+                    replay(vec![chunk(0, b"first")]),
+                    Arc::clone(&heads[0]),
+                ),
+                (
+                    ids[1],
+                    replay(vec![chunk(0, b"other")]),
+                    Arc::clone(&heads[1]),
+                ),
+            ])
+            .unwrap();
+        let path = store.replay_dir.join(&store.replay_file);
+        let before = fs::read(&path).unwrap();
+        // SQLite itself ends the transaction before the owner's explicit
+        // ROLLBACK. That real SQL command must fail, not be silently assumed.
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_replay
+            BEFORE INSERT ON replay_chunks BEGIN
+                SELECT RAISE(ROLLBACK, 'injected automatic rollback'); END",
+            )
+            .unwrap();
+        let error = store
+            .append_batch(&[
+                (
+                    ids[1],
+                    replay(vec![chunk(5, b"-two")]),
+                    Arc::clone(&heads[1]),
+                ),
+                (
+                    ids[0],
+                    replay(vec![chunk(5, b"-one")]),
+                    Arc::clone(&heads[0]),
+                ),
+            ])
+            .unwrap_err();
+        assert!(matches!(error, PersistenceError::Mutation(_)));
+        assert!(error.to_string().contains("maintenance rollback failed"));
+        assert!(store.connection.is_autocommit());
+        assert!(file_len(&path).unwrap() > before.len() as u64);
+        for head in &heads {
+            assert_eq!(head.load(Ordering::Acquire), 5);
+        }
+        drop(store);
+        let (store, recovered) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        for (id, bytes) in ids.into_iter().zip([b"first", b"other"]) {
+            let run = recovered.iter().find(|run| run.info.id == id).unwrap();
+            let actual: Vec<_> = run
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(actual, bytes);
+        }
+        assert_eq!(
+            fs::read(store.replay_dir.join(&store.replay_file)).unwrap(),
+            before
+        );
+    }
+
+    fn assert_transaction_payload_sync_fault(outcome: &str) {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let hooks = Arc::new(PersistenceTestHooks::default());
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::clone(&hooks),
+        )
+        .unwrap();
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let heads = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        let prefix = [
+            (
+                ids[0],
+                replay(vec![chunk(0, b"first")]),
+                Arc::clone(&heads[0]),
+            ),
+            (
+                ids[1],
+                replay(vec![chunk(0, b"other")]),
+                Arc::clone(&heads[1]),
+            ),
+        ];
+        store.append_batch(&prefix).unwrap();
+        let path = store.replay_dir.join(&store.replay_file);
+        let before = fs::read(&path).unwrap();
+        match outcome {
+            "sync" => hooks
+                .fail_next_replay_payload_sync
+                .store(true, Ordering::Release),
+            "post-commit-stat" => hooks
+                .maintenance_commits_before_stat_error
+                .store(1, Ordering::Release),
+            _ => {
+                hooks
+                    .maintenance_commits_before_error
+                    .store(1, Ordering::Release);
+                hooks
+                    .maintenance_error_committed
+                    .store(outcome == "committed", Ordering::Release);
+            }
+        }
+        let suffix = [
+            (
+                ids[1],
+                replay(vec![chunk(5, b"-two")]),
+                Arc::clone(&heads[1]),
+            ),
+            (
+                ids[0],
+                replay(vec![chunk(5, b"-one")]),
+                Arc::clone(&heads[0]),
+            ),
+        ];
+        let error = store.append_batch(&suffix).unwrap_err();
+        let indexed = matches!(outcome, "committed" | "post-commit-stat");
+        assert_eq!(
+            matches!(error, PersistenceError::Mutation(_)),
+            indexed,
+            "{outcome}: {error}"
+        );
+        for head in &heads {
+            assert_eq!(
+                head.load(Ordering::Acquire),
+                5,
+                "failure must not publish a durable watermark"
+            );
+        }
+        if indexed {
+            assert_eq!(file_len(&path).unwrap(), before.len() as u64 + 8);
+        } else {
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "proven rollback must restore the file tail"
+            );
+            // A known rollback leaves the same owner usable. Resubmitting
+            // the identical bytes must not duplicate either Run's prefix.
+            store.append_batch(&suffix).unwrap();
+            for head in &heads {
+                assert_eq!(head.load(Ordering::Acquire), 9);
+            }
+        }
+        drop(store);
+        let (_, recovered) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        for (id, expected) in ids.into_iter().zip([b"first-one", b"other-two"]) {
+            let run = recovered.iter().find(|run| run.info.id == id).unwrap();
+            let actual: Vec<_> = run
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect();
+            assert_eq!(actual, expected, "{outcome}");
         }
     }
 

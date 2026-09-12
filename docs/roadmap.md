@@ -89,6 +89,12 @@ first freeze the grounded byte, write/read, physical-space and recovery matrix,
 then compare raw transaction sync/index improvements and lossless indexed codecs
 on private source-bound candidates. Local usage and geometry evidence do not
 replace the original fleet soak, change policy budgets or qualify compression.
+The first raw-storage slice now shares one payload sync across an owning output
+transaction. Its [local qualification](reviews/transaction-replay-sync-qualification.md)
+covers exact bytes, commit-disposition faults, real public clients and matched
+32-Run costs. Codec selection, read amplification and the original Linux
+fleet/soak remain separate acceptance work; the local improvement does not close
+those tasks.
 
 ## P0 — shared Native owner failure containment and recovery qualification
 

@@ -695,8 +695,16 @@ Persistent mode validates and exclusively locks one owner-only state directory
 before socket publication. One bundled SQLite connection on one actor thread
 commits starts, replay coordinates, pruning/accounting, and terminal
 transitions; replay payloads are synced to the active external generation
-before their coordinates commit. A bounded actor queue backpressures the PTY
-reader instead of accumulating an unbounded durable-output backlog. If SQLite
+before their coordinates commit. Each output transaction owns one shared replay
+file handle and its append offset across all participating Runs. Successful
+writes advance that offset without a file-stat call per row; one payload sync
+precedes the SQLite `FULL` commit. Durable heads publish only after a confirmed
+commit. Proven rollback permits tail truncation, while uncertain commit,
+rollback or post-commit inspection preserves possibly indexed bytes for recovery.
+The writer releases its handle before adaptive transaction reduction; its
+destructor never decides commit disposition. Empty payload performs no replay
+sync. The actor queue and output grants fund pending work; ordinary append
+offers do not block the shared PTY reader when the queue is full. If SQLite
 reports typed `DiskFull`, write-side I/O pressure, or the external file reports
 `StorageFull` while appending output or finalizing a Run, that actor keeps the
 exact command at the head of the queue and retries after a short delay; later
@@ -770,6 +778,9 @@ Replay payloads remain uncompressed. The [storage benchmark contract](replay-sto
 owns the accepted evidence requirements for evaluating transaction-scoped sync,
 index density and indexed lossless compression; the [local usage grounding](reviews/replay-storage-usage-grounding.md)
 is observational input, not a shipped compression or recovery guarantee.
+The [transaction sync qualification](reviews/transaction-replay-sync-qualification.md)
+records the implemented raw-storage optimization, matched local results and
+remaining resource and fleet qualification limits.
 
 ## Output delivery observations
 
