@@ -204,6 +204,10 @@ impl TestDaemon {
     /// never blocked on the synchronous pipe. The thread ends when the daemon
     /// dies and closes the pipe (see `Drop`).
     async fn start_persistent() -> Self {
+        Self::start_persistent_with_resources("{}").await
+    }
+
+    async fn start_persistent_with_resources(resources: &str) -> Self {
         let _permit = daemon_spawn_permit().await;
         let directory = Arc::new(tempfile::tempdir().expect("create daemon temp directory"));
         let socket = directory.path().join("ctxmux.sock");
@@ -213,6 +217,8 @@ impl TestDaemon {
             .arg(&socket)
             .arg("--state-dir")
             .arg(&state_dir)
+            .arg("--resource-limits")
+            .arg(resources)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -1060,6 +1066,10 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.arch, std::env::consts::ARCH);
     let mut expected_capabilities = BTreeMap::from([
         (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+        (
+            ctxmux_protocol::RUNTIME_CAPABILITY_STORAGE_OBSERVATION.to_owned(),
+            1,
+        ),
         (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
         (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
         (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
@@ -1090,6 +1100,10 @@ fn assert_memory_only_runtime_identity(runtime: &RuntimeIdentity) {
     assert_eq!(runtime.arch, std::env::consts::ARCH);
     let mut expected_capabilities = BTreeMap::from([
         (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+        (
+            ctxmux_protocol::RUNTIME_CAPABILITY_STORAGE_OBSERVATION.to_owned(),
+            1,
+        ),
         (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
         (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
         (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
@@ -2762,7 +2776,10 @@ async fn recoverable_input_response_loss_reconnects_without_duplicate_write() {
     reason = "one end-to-end fixture keeps response loss, re-exec, retry, and child byte oracle in one causal proof"
 )]
 async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
-    let daemon = TestDaemon::start_persistent().await;
+    let daemon = TestDaemon::start_persistent_with_resources(
+        r#"{"hot_output_bytes":8388608,"durable_replay_bytes":16777216,"durable_run_output_bytes":null,"foreground_observation_workers":2,"foreground_observation_bytes":3145728}"#,
+    )
+    .await;
     let run = daemon
         .client
         .start(raw_capture_shell(2))
@@ -2786,6 +2803,14 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
         wait_for_output(&mut attachment, &mut observed, &mut last_seq, b"READY").await;
     }
     let replay_cursor = last_seq;
+
+    let (_, storage_before) = daemon.client.observe_storage(run.id).await.unwrap();
+    assert_eq!(storage_before.policy.durable_replay_bytes, 16 * 1024 * 1024);
+    // Explicit null is a real absence of per-Run quota, rather than omission.
+    assert_eq!(
+        storage_before.policy.durable_run_output_bytes,
+        storage_before.policy.durable_replay_bytes
+    );
 
     let key = InputOperationKey::new("upgrade-lost-response-input").unwrap();
     let unread_response = request_with_unread_response(
@@ -2824,6 +2849,14 @@ async fn upgrade_preserves_response_loss_input_ledger_and_cursor() {
     assert_eq!(
         after_runtime.daemon_instance_id, daemon_instance,
         "planned upgrade preserves the retry fence"
+    );
+
+    let (_, storage_after) = daemon.client.observe_storage(run.id).await.unwrap();
+    assert_eq!(storage_after.policy, storage_before.policy);
+    assert_eq!(
+        daemon.client.status(run.id).await.unwrap().pid,
+        run.pid,
+        "the actual child survives client disconnect and exec"
     );
 
     let recovered = daemon

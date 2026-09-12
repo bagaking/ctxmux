@@ -36,7 +36,12 @@ incomplete database pages and an unfunded WAL frame fail before owner creation.
 The TypeScript SDK exposes the same policy as activation `resourceLimits`.
 Policy applies when a daemon starts; connecting to an existing Runtime does not
 reconfigure it. Planned exec preserves the complete established policy in its
-versioned handoff manifest and explicit incoming CLI arguments.
+versioned handoff manifest and explicit incoming CLI arguments. Startup
+`ResourceConfig` resolves sparse choices once; the immutable `ResourceLimits`
+snapshot requires every established field, including explicitly nullable quotas.
+Handoff never fills missing saved settings from fresh host defaults. Unknown
+and duplicate JSON fields fail in both contracts; startup omission and explicit
+null remain distinct without reparsing the original JSON.
 
 | Field                               | Default                            | Owner and consequence                                                                                                          |
 | ----------------------------------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |

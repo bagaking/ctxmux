@@ -45,7 +45,7 @@ mod persistence;
 mod qualification_stats;
 pub mod resources;
 mod retention;
-pub use resources::ResourceLimits;
+pub use resources::{ResourceConfig, ResourceLimits};
 mod run_spec;
 mod terminal_checkpoint;
 mod tmux;

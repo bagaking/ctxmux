@@ -20,11 +20,56 @@ const SHM_FIRST_FRAME_SLOTS: u64 = 4062;
 
 use serde::{Deserialize, Serialize};
 
-/// Daemon resource policy, accepted as strict JSON by `ctxmuxd` and preserved
-/// across planned exec. Omitted fields use the documented defaults.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ResourceLimits {
+// The field catalogue is shared by two deliberately different contracts:
+// startup values may be omitted, but every established snapshot field is required.
+// Keeping one declaration prevents their names/types drifting during upgrades.
+macro_rules! resource_policy {
+    ($( $(#[$meta:meta])* pub $field:ident: $ty:ty, )*) => {
+        /// Fully resolved, immutable owner policy carried intact across exec.
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct ResourceLimits {
+            $( $(#[$meta])*
+                #[serde(deserialize_with = "required_value")]
+                pub $field: $ty,
+            )*
+        }
+
+        /// Sparse startup choices; omission is resolved before creating owners.
+        #[derive(Clone, Copy, Debug, Default, Deserialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct ResourceConfig {
+            $( #[serde(deserialize_with = "configured_value")] $field: Option<$ty>, )*
+        }
+
+        impl ResourceConfig {
+            fn apply(self, limits: &mut ResourceLimits) {
+                $( if let Some(value) = self.$field { limits.$field = value; } )*
+            }
+        }
+    };
+}
+
+// deserialize_with prevents Serde's implicit missing-Option -> None behavior
+// in snapshots. In startup configuration Some(None) distinguishes explicit
+// JSON null from an omitted quota. Duplicate fields still fail in Serde.
+fn required_value<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer)
+}
+
+fn configured_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+resource_policy! {
     pub live_runs: Option<usize>,
     pub retained_runs: Option<usize>,
     pub hot_output_bytes: u64,
@@ -63,6 +108,36 @@ pub struct ResourceLimits {
     pub input_result_entries: usize,
     pub input_result_bytes: usize,
     pub tmux_discovery_bytes: usize,
+}
+
+impl ResourceConfig {
+    /// Parse strict startup choices without applying any owner policy yet.
+    ///
+    /// # Errors
+    /// Rejects invalid JSON, unknown or duplicate fields and invalid field types.
+    pub fn from_json(json: &str) -> Result<Self, String> {
+        serde_json::from_str(json).map_err(|error| error.to_string())
+    }
+
+    /// Resolve omissions once and validate before creating any runtime owner.
+    ///
+    /// # Errors
+    /// Rejects unfunded or unrepresentable resource policy.
+    pub fn resolve(self) -> Result<ResourceLimits, String> {
+        let mut limits = ResourceLimits::default();
+        self.apply(&mut limits);
+        // Missing per-Run quotas follow their aggregate owner; explicit null
+        // removes a durable per-Run quota and must survive snapshot round trips.
+        if self.run_output_bytes.is_none() {
+            limits.run_output_bytes = usize::try_from(limits.hot_output_bytes)
+                .map_err(|_| "hot_output_bytes must fit the host")?;
+        }
+        if self.durable_run_output_bytes.is_none() {
+            limits.durable_run_output_bytes = limits.durable_replay_bytes;
+        }
+        limits.validate()?;
+        Ok(limits)
+    }
 }
 
 impl Default for ResourceLimits {
@@ -121,33 +196,6 @@ impl ResourceLimits {
         input_result_bytes: 1024 * 1024,
         tmux_discovery_bytes: 128 * 1024,
     };
-
-    /// # Errors
-    /// Rejects invalid JSON, unknown fields, and invalid resource arithmetic.
-    ///
-    /// Parse and validate one policy. Unknown names fail instead of silently
-    /// leaving an intended budget at its default.
-    pub fn from_json(json: &str) -> Result<Self, String> {
-        // Deserialize the original input first so duplicate and unknown
-        // fields retain the strict policy error instead of last-value wins.
-        let mut limits: Self = serde_json::from_str(json).map_err(|error| error.to_string())?;
-        let value: serde_json::Value =
-            serde_json::from_str(json).map_err(|error| error.to_string())?;
-        let hot_quota = value.get("run_output_bytes").is_some();
-        let durable_quota = value.get("durable_run_output_bytes").is_some();
-        // A missing per-Run quota follows its actual aggregate owner. It must
-        // not remain an unrelated smaller ceiling after an operator changes
-        // the aggregate budget. Explicit quotas survive exec and round trips.
-        if !hot_quota {
-            limits.run_output_bytes = usize::try_from(limits.hot_output_bytes)
-                .map_err(|_| "hot_output_bytes must fit the host")?;
-        }
-        if !durable_quota {
-            limits.durable_run_output_bytes = limits.durable_replay_bytes;
-        }
-        limits.validate()?;
-        Ok(limits)
-    }
 
     /// Validate arithmetic and representation before creating any owner.
     ///
@@ -359,14 +407,16 @@ impl Drop for BytePermit {
 
 #[cfg(test)]
 mod tests {
-    use super::ResourceLimits;
+    use super::{ResourceConfig, ResourceLimits};
+
+    fn parse(json: &str) -> Result<ResourceLimits, String> {
+        ResourceConfig::from_json(json)?.resolve()
+    }
 
     #[test]
     fn population_is_not_bound_to_a_qualification_tier() {
-        let limits = ResourceLimits::from_json(
-            r#"{"live_runs":12000,"retained_runs":50000,"hot_output_bytes":4096}"#,
-        )
-        .unwrap();
+        let limits =
+            parse(r#"{"live_runs":12000,"retained_runs":50000,"hot_output_bytes":4096}"#).unwrap();
         assert_eq!(limits.live_runs, Some(12000));
         assert_eq!(limits.retained_runs, Some(50000));
         assert_eq!(limits.hot_output_bytes, 4096);
@@ -379,17 +429,18 @@ mod tests {
             "{}",
             r#"{"database_bytes":null,"durable_replay_bytes":null,"durable_run_output_bytes":null}"#,
         ] {
-            let limits = ResourceLimits::from_json(json).unwrap();
+            let limits = parse(json).unwrap();
             assert_eq!(limits.database_bytes, None);
             assert_eq!(limits.durable_replay_bytes, None);
             assert_eq!(limits.durable_run_output_bytes, None);
             assert_eq!(limits.state_file_bytes().unwrap(), None);
             assert_eq!(
-                ResourceLimits::from_json(&serde_json::to_string(&limits).unwrap()).unwrap(),
+                serde_json::from_str::<ResourceLimits>(&serde_json::to_string(&limits).unwrap())
+                    .unwrap(),
                 limits
             );
         }
-        let explicit = ResourceLimits::from_json(r#"{"database_bytes":131072,"durable_replay_bytes":8192,"durable_run_output_bytes":null}"#).unwrap();
+        let explicit = parse(r#"{"database_bytes":131072,"durable_replay_bytes":8192,"durable_run_output_bytes":null}"#).unwrap();
         assert_eq!(explicit.database_bytes, Some(131_072));
         assert_eq!(explicit.durable_replay_bytes, Some(8192));
         assert_eq!(explicit.durable_run_output_bytes, None);
@@ -404,23 +455,40 @@ mod tests {
             defaults.durable_run_output_bytes,
             defaults.durable_replay_bytes
         );
-        let limits =
-            ResourceLimits::from_json(r#"{"hot_output_bytes":8192,"durable_replay_bytes":16384}"#)
-                .unwrap();
+        let limits = parse(r#"{"hot_output_bytes":8192,"durable_replay_bytes":16384}"#).unwrap();
         assert_eq!(limits.run_output_bytes, 8192);
         assert_eq!(limits.durable_run_output_bytes, Some(16384));
     }
 
     #[test]
     fn explicit_history_quotas_and_resolved_exec_policy_remain_exact() {
-        let limits = ResourceLimits::from_json(
+        let limits = parse(
             r#"{"hot_output_bytes":8192,"run_output_bytes":512,"durable_replay_bytes":16384,"durable_run_output_bytes":1024}"#,
         )
         .unwrap();
         assert_eq!(limits.run_output_bytes, 512);
         assert_eq!(limits.durable_run_output_bytes, Some(1024));
         let encoded = serde_json::to_string(&limits).unwrap();
-        assert_eq!(ResourceLimits::from_json(&encoded).unwrap(), limits);
+        assert_eq!(
+            serde_json::from_str::<ResourceLimits>(&encoded).unwrap(),
+            limits
+        );
+    }
+
+    #[test]
+    fn established_snapshot_requires_every_field_including_nullable_quotas() {
+        let limits = ResourceLimits::default();
+        let complete = serde_json::to_value(limits).unwrap();
+        for field in complete.as_object().unwrap().keys() {
+            let mut partial = complete.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ResourceLimits>(partial).is_err(),
+                "missing snapshot field {field} silently received a default"
+            );
+        }
+        assert_eq!(parse("{}").unwrap(), limits);
+        assert!(serde_json::from_str::<ResourceLimits>("{}").is_err());
     }
 
     #[test]
@@ -430,11 +498,13 @@ mod tests {
             r#"{"run_output_bytes":512,"run_output_bytes":1024}"#,
             r#"{"durable_run_output_bytes":512,"durable_run_output_bytes":1024}"#,
             r#"{"live_run":5000}"#,
+            r#"{"durable_replay_bytes":null,"durable_replay_bytes":8192}"#,
+            r#"{"hot_output_bytes":null}"#,
             r#"{"live_runs":0}"#,
             r#"{"database_bytes":4097}"#,
             r#"{"durable_replay_bytes":9223372036854775807}"#,
         ] {
-            assert!(ResourceLimits::from_json(json).is_err(), "accepted {json}");
+            assert!(parse(json).is_err(), "accepted {json}");
         }
     }
 }

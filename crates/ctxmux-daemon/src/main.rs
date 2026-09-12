@@ -189,7 +189,7 @@ fn main() -> ExitCode {
     let resource_json = resource_json.or_else(|| env::var("CTXMUX_RESOURCE_LIMITS").ok());
     let resources = match resource_json.map_or_else(
         || Ok(ctxmux_daemon::ResourceLimits::default()),
-        |json| ctxmux_daemon::ResourceLimits::from_json(&json),
+        |json| ctxmux_daemon::ResourceConfig::from_json(&json)?.resolve(),
     ) {
         Ok(resources) => resources,
         Err(error) => {

@@ -690,6 +690,14 @@ allowance and an optional durable replay quota; these do not constitute a
 whole-process memory or whole-directory disk limit. README is the entrypoint
 for defaults, consequences, pressure and startup-only semantics.
 
+Startup configuration and established policy have separate contracts.
+`ResourceConfig` accepts sparse choices and resolves omissions exactly once
+before owner creation. `ResourceLimits` is the complete immutable snapshot:
+every field, including nullable quotas, is required when restoring a planned
+exec. Missing saved policy is invalid handoff state, not permission to recompute
+it from the incoming host. The shared field catalogue keeps these two schemas
+aligned without parsing JSON a second time.
+
 Execution settings must follow their actual owners. Worker widths, queue and
 fairness work units, WAL staging and handoff encoding allowances should be
 derived where their resource relation is known. An independent override needs
