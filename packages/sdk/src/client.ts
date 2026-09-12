@@ -896,6 +896,17 @@ export class CtxmuxClient {
       await wire.send({ type: "request", request } satisfies ClientFrame);
       const frame = serverFrame(await wire.receive());
       if (frame.type === "error") {
+        const failure = frame.error.creation_failure;
+        if (
+          failure !== undefined &&
+          ((request.type !== "start" && request.type !== "fork") ||
+            failure.operation_key !== request.operation_key)
+        ) {
+          throw new CtxmuxInvalidFrameError(
+            "$frame.error.creation_failure.operation_key",
+            "the exact requested creation operation",
+          );
+        }
         throw protocolError(frame.error);
       }
       if (frame.type !== "response") {

@@ -118,13 +118,7 @@ impl Run {
         Some(
             self.try_owner(&self.persistence)?
                 .active()
-                .map_or(0, |durable| {
-                    if durable.is_failed() {
-                        u64::MAX
-                    } else {
-                        durable.next_replay_start()
-                    }
-                }),
+                .map_or(0, PersistentRun::next_replay_start),
         )
     }
     pub(crate) fn try_output_turn(&self) -> Option<NativeOutputTurn<'_>> {
@@ -159,13 +153,9 @@ impl NativeOutputTurn<'_> {
         if self.run.persistence_mode == PersistenceMode::MemoryOnly {
             return u64::MAX;
         }
-        self.persistence.as_ref().map_or(0, |durable| {
-            if durable.is_failed() {
-                u64::MAX
-            } else {
-                durable.next_replay_start()
-            }
-        })
+        self.persistence
+            .as_ref()
+            .map_or(0, PersistentRun::next_replay_start)
     }
     pub(crate) fn capacity(&mut self) -> usize {
         if let Some(durable) = &self.persistence

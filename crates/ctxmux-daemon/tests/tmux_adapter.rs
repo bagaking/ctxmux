@@ -1474,7 +1474,7 @@ async fn oversized_discovery_output_fails_explicitly_without_publication() {
 
 fn assert_bounded_capture_error(error: ClientError) {
     match error {
-        ClientError::Protocol { code, message } => {
+        ClientError::Protocol { code, message, .. } => {
             assert_eq!(code, ErrorCode::BackendUnavailable);
             assert!(
                 message.contains("131072-byte capture limit"),
@@ -1988,7 +1988,7 @@ async fn open_command_block_before_readiness_rejects_import_with_transcript_deta
         .expect("join truncated-bootstrap import")
         .expect_err("truncated bootstrap must reject import")
     {
-        ClientError::Protocol { code, message } => {
+        ClientError::Protocol { code, message, .. } => {
             assert_eq!(code, ErrorCode::BackendUnavailable);
             assert!(
                 message.contains("ended inside a command block"),

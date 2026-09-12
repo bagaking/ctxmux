@@ -1,4 +1,4 @@
-# Local Protocol Generation 22
+# Local Protocol Generation 23
 
 This document describes the currently implemented local daemon boundary. It is
 pre-stable: obsolete contracts are replaced directly rather than preserved with
@@ -335,8 +335,9 @@ persistent records.
 
 Every `start` and `fork` request carries one caller-owned
 `CreateOperationKey`. It is a non-empty opaque UTF-8 string of at most 128
-bytes. Equality is byte-exact: ctxmux does not trim, case-fold, parse, or echo
-the key in an error. The key is not a `RunId`, Session identity, mutable tag,
+bytes. Equality is byte-exact: ctxmux does not trim, case-fold, or parse the key.
+The key is returned only as a typed operation fact, never interpolated into error
+messages. The key is not a `RunId`, Session identity, mutable tag,
 owner credential, or attach target.
 
 The daemon compares canonical typed requests after generation-16 decoding and
@@ -385,6 +386,33 @@ Run and its mapping are collected, the key may create a new Run. A daemon crash
 before atomic persistent publication is still outside live process recovery;
 ctxmux does not preserve a pending tombstone, adopt an unrecorded process, or
 claim that such a process cannot have survived.
+
+Generation 23 preserves creation failures in the existing top-level
+`ProtocolError` envelope. Optional `creation_failure` contains the exact
+`operation_key` and `disposition: "not_applied" | "unknown"`. It is independent
+of `ControlFailure` and carries no input prefix. A proven pre-spawn durable
+admission refusal is `not_applied`; a transaction rolled back **after physical
+launch**, cleanup after launch, a committed publication whose response fails,
+or unproven creation completion is `unknown`. These are physical-effect facts:
+`storage_failure.transaction_outcome: "not_committed"` does not imply
+`creation_failure.disposition: "not_applied"`. Neither a missing field nor an
+absent list entry proves a negative. Unknown does not authorize another launch.
+Retained committed keys continue to resolve the original Run.
+The disposition describes this dispatched request, within the retained-key
+contract above. It is not a timeless claim about every earlier use of a key.
+A consumer already holding an unknown original result must not resend it to
+obtain a later `not_applied` result and overwrite that uncertainty.
+
+Rust `ClientError::Protocol` and TypeScript `CtxmuxProtocolError` retain these
+facts (`creation_failure` / `creationFailure`, and `storage_failure` /
+`storageFailure`). Both clients reject a failure naming a different creation
+operation. Neither client retries a Start or Fork automatically. CLI
+`start --json` and `fork --json` print one stdout object: `{ "run": RunInfo }`
+on success or `{ "error": ProtocolError }` for a daemon rejection. A dispatched
+request with a local/transport failure instead reports `{ "transport_error":
+string }`, supplying no daemon disposition. Failures exit nonzero and retain
+human-readable stderr. Argument/activation failures can occur before this
+request-result output. Without `--json`, ordinary CLI presentation is unchanged.
 
 ### Recoverable native Input
 
@@ -1038,7 +1066,7 @@ A Runtime advertising `services.storage_observation: 1` accepts
 `Client::observe_storage`, SDK `CtxmuxClient.observeStorage(runId)` and CLI
 `ctxmux storage <RunId>` validate the optional capability against the same
 connection's Hello before dispatch, return that owner identity, and reject a
-response naming another Run. Generation 22 and older frame shapes are unchanged;
+response naming another Run. Generation 23 adds structured failure facts;
 a missing capability is explicit unsupported, not a failure of the original Run.
 
 The memory floor and latest byte are one bounded output-facts snapshot. The
@@ -1048,6 +1076,35 @@ accepted-output watermark and **last confirmed committed** watermark. An unknown
 COMMIT can leave disk ahead of the confirmed watermark: differences do not prove
 lost or uncommitted bytes. Null persistence denotes a Run with no persistence
 owner. Null first failure alone promises neither health nor complete durability.
+Required nullable `storage_failure` reports the current unsettled storage fact;
+it is separate from historical `first_failure` text. The same object may appear
+as optional `ProtocolError.storage_failure` on the original failed request:
+
+```ts
+type StorageFailure = {
+  stage:
+    | "open"
+    | "read"
+    | "start"
+    | "append"
+    | "finalize"
+    | "maintenance"
+    | "checkpoint"
+    | null;
+  sqlite_primary_code: number | null;
+  sqlite_extended_code: number | null;
+  system_errno: number | null;
+  transaction_outcome:
+    "not_started" | "not_committed" | "committed" | "unknown";
+};
+```
+
+Every object field is required. Numeric facts are positive signed-32-bit
+integers from the serving owner, or null when unavailable. The stage and outcome
+are observed facts, never parsed from display text. SQLite `CANTOPEN` alone does
+not prove disk full; errno, when captured, describes the actual underlying
+failure. Missing or null facts do not promise health, absence of effects, or
+permission to resend an operation. Observing a failure never repairs it.
 The effective per-Run and shared raw budgets, database/WAL policy and VT limits
 come from the current owner's policy, including handoff-preserved values.
 Database policy is the serving connection's effective SQLite page ceiling, not
@@ -1057,12 +1114,12 @@ Default replay numbers are the most recently sampled filesystem-funded allowance
 not reserved bytes or a configured permanent ceiling. Unfunded or unknown
 filesystem observation can yield zero new-write allowance without asserting zero
 actual free space or invalidating saved history. Memory-only Runs report zero
-for disk allowances because no disk owner exists. Public wire generation 22 does
+for disk allowances because no disk owner exists. Public wire generation 23 does
 not expose nullable configured quotas or filesystem available/required fields;
 bounded daemon diagnostics record those details, while the diagnostics RPC
 reports sink counters rather than messages. This observation does not
-report SQLite page/free-page counts, table/index usage, filesystem free space or
-structured SQLite failure stage; those unavailable facts cannot be inferred
+report SQLite page/free-page counts, table/index usage or filesystem free space;
+those unavailable facts cannot be inferred
 from the budget or a null first failure.
 
 This observation does not query replay, wait for the persistence actor, export

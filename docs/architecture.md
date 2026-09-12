@@ -943,6 +943,36 @@ settlement. Its reason stays separate from the fatal first-failure latch. A
 persistence client reconnect neither changes policy nor clears an uncertain
 outcome fence; upgrade cannot extract healthy owners past unresolved work.
 
+Removable open failures now retain the original SQLite result, extended code
+and immediately sampled connection errno, or the original filesystem errno.
+After a proven pre-commit refusal/rollback, missing original paths, corrected
+permissions and descriptor exhaustion return to the same bounded debt owner.
+The actor retries only after checking the original state directory, database,
+lock, replay directory and active generation identities. It never opens an
+empty replacement store. Non-space conditions use an owner deadline with
+backoff from 50 ms to 1 s; client reads do not accelerate retries. Space pressure
+still requires changed funding. A known non-removable errno, changed inode,
+symlink or corrupt state remains fenced. `CANTOPEN` without a retained errno is
+insufficient evidence for automatic recovery.
+
+A held WAL reader also returns to the original debt queue after bounded
+checkpoint attempts instead of monopolizing the actor through an outer retry
+loop. Reads validate their actual replay-directory dependency; an unavailable
+active destination does not deny a page still stored in an older generation.
+Fatal and uncertain outcomes retain accepted output copies, queue funding and
+terminal settlement under the original owner. The native output buffer protects
+the unoffered suffix even while persistence is fenced, applying its existing
+bounded backpressure instead of releasing those bytes as disposable history.
+`storage_failure` reports the current structured blocking fault and clears only
+after actual debt settlement; `first_failure` remains the permanent-fence reason.
+
+Online recovery of an uncertain `COMMIT` is not yet implemented: original bytes
+are retained, but the exact transaction witness and post-commit continuation
+are not yet transferred from every failed transaction into resumable owner
+state. Such an outcome remains fenced; neither free space nor a reconnect
+proves its disposition. This limitation is distinct from the pre-commit
+recovery implementation and must not be described as automatic reconciliation.
+
 #### Recoverability and antifragility
 
 **可恢复、抗脆弱** are design requirements for the persistence owner. Recoverable

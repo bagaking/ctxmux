@@ -144,11 +144,17 @@ function storageObservation(value: unknown, path: string): void {
     ] as const;
     exactFields(persistence, `${path}.persistence`, [
       "first_failure",
+      "storage_failure",
       "actor_stopped",
       ...counts,
     ]);
     if (persistence.first_failure !== null)
       string(persistence.first_failure, `${path}.persistence.first_failure`);
+    if (persistence.storage_failure !== null)
+      storageFailure(
+        persistence.storage_failure,
+        `${path}.persistence.storage_failure`,
+      );
     boolean(persistence.actor_stopped, `${path}.persistence.actor_stopped`);
     for (const field of counts)
       safeUnsignedInteger(persistence[field], `${path}.persistence.${field}`);
@@ -1394,12 +1400,85 @@ function terminalSize(value: unknown, path: string, nonzero = false): void {
 
 function protocolError(value: unknown, path: string): void {
   const error = record(value, path);
-  exactFields(error, path, ["code", "message"]);
+  exactFields(error, path, [
+    "code",
+    "message",
+    "creation_failure",
+    "storage_failure",
+  ]);
   const code = string(error.code, `${path}.code`);
   if (!ERROR_CODES.has(code as ErrorCode)) {
     throw invalid(`${path}.code`, "a known protocol error code");
   }
   string(error.message, `${path}.message`);
+  if ("creation_failure" in error) {
+    const failure = record(error.creation_failure, `${path}.creation_failure`);
+    exactFields(failure, `${path}.creation_failure`, [
+      "operation_key",
+      "disposition",
+    ]);
+    const key = string(
+      failure.operation_key,
+      `${path}.creation_failure.operation_key`,
+    );
+    const length = Buffer.byteLength(key, "utf8");
+    if (length === 0 || length > MAX_CREATE_OPERATION_KEY_BYTES)
+      throw invalid(
+        `${path}.creation_failure.operation_key`,
+        "a nonempty creation key of at most 128 UTF-8 bytes",
+      );
+    if (
+      failure.disposition !== "not_applied" &&
+      failure.disposition !== "unknown"
+    )
+      throw invalid(
+        `${path}.creation_failure.disposition`,
+        "a known command disposition",
+      );
+  }
+  if ("storage_failure" in error)
+    storageFailure(error.storage_failure, `${path}.storage_failure`);
+}
+
+function storageFailure(value: unknown, path: string): void {
+  const failure = record(value, path);
+  exactFields(failure, path, [
+    "stage",
+    "sqlite_primary_code",
+    "sqlite_extended_code",
+    "system_errno",
+    "transaction_outcome",
+  ]);
+  if (
+    failure.stage !== null &&
+    ![
+      "open",
+      "read",
+      "start",
+      "append",
+      "finalize",
+      "maintenance",
+      "checkpoint",
+    ].includes(string(failure.stage, `${path}.stage`))
+  )
+    throw invalid(`${path}.stage`, "a known storage failure stage or null");
+  for (const field of [
+    "sqlite_primary_code",
+    "sqlite_extended_code",
+    "system_errno",
+  ] as const) {
+    if (failure[field] !== null)
+      unsignedInteger(failure[field], `${path}.${field}`, 0x7fffffff, 1);
+  }
+  if (
+    !["not_started", "not_committed", "committed", "unknown"].includes(
+      string(failure.transaction_outcome, `${path}.transaction_outcome`),
+    )
+  )
+    throw invalid(
+      `${path}.transaction_outcome`,
+      "a known storage transaction outcome",
+    );
 }
 
 function runId(value: unknown, path: string): void {

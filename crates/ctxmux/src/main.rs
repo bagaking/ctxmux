@@ -35,10 +35,10 @@ usage:
   ctxmux [--socket <path>] diagnostics
   ctxmux [--socket <path>] storage <run-id>
   ctxmux --socket <path> creation <key>
-  ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
+  ctxmux [--socket <path>] start [--json] [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux [--socket <path>] tmux-list <tmux-socket>
   ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
-  ctxmux [--socket <path>] fork [--operation-key <key>] <run-id>
+  ctxmux [--socket <path>] fork [--json] [--operation-key <key>] <run-id>
   ctxmux [--socket <path>] list
   ctxmux [--socket <path>] status <run-id>
   ctxmux [--socket <path>] remove <run-id>
@@ -250,6 +250,7 @@ async fn creation(client: &Client, mut args: Vec<OsString>) -> Result<(), String
 }
 
 async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let mut json = false;
     let mut cwd = env::current_dir()
         .map_err(|error| format!("failed to read current directory: {error}"))?
         .to_string_lossy()
@@ -262,6 +263,10 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
             break;
         }
         match flag.to_str() {
+            Some("--json") => {
+                args.remove(0);
+                json = true;
+            }
             Some("--operation-key") => {
                 args.remove(0);
                 set_operation_key(&mut operation_key, &mut args)?;
@@ -286,7 +291,7 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
         .into_iter()
         .map(|value| os_string(value, "program argument"))
         .collect::<Result<Vec<_>, _>>()?;
-    let run = client
+    let result = client
         .start_with_operation_key(
             RunSpec {
                 program,
@@ -298,33 +303,74 @@ async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
             },
             operation_key.unwrap_or_else(CreateOperationKey::random),
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    print_stdout(format_args!("{}", run.id))?;
+        .await;
+    let run = creation_result(result, json)?;
+    if json {
+        print_creation_json(&serde_json::json!({ "run": run }))?;
+    } else {
+        print_stdout(format_args!("{}", run.id))?;
+    }
     Ok(())
 }
 
 async fn fork(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
     let mut operation_key = None;
-    if args
-        .first()
-        .is_some_and(|argument| argument == "--operation-key")
-    {
-        args.remove(0);
-        set_operation_key(&mut operation_key, &mut args)?;
+    let mut json = false;
+    while let Some(flag) = args.first() {
+        match flag.to_str() {
+            Some("--operation-key") => {
+                args.remove(0);
+                set_operation_key(&mut operation_key, &mut args)?;
+            }
+            Some("--json") => {
+                args.remove(0);
+                json = true;
+            }
+            _ => break,
+        }
     }
     let parent = take_run_id(&mut args)?;
     ensure_empty(&args)?;
-    let run = client
+    let result = client
         .fork_with_operation_key(
             parent,
             ForkPlan::LevelA,
             operation_key.unwrap_or_else(CreateOperationKey::random),
         )
-        .await
-        .map_err(|error| error.to_string())?;
-    print_run(&run)?;
+        .await;
+    let run = creation_result(result, json)?;
+    if json {
+        print_creation_json(&serde_json::json!({ "run": run }))?;
+    } else {
+        print_run(&run)?;
+    }
     Ok(())
+}
+
+fn creation_result(
+    result: Result<RunInfo, ctxmux_client::ClientError>,
+    json: bool,
+) -> Result<RunInfo, String> {
+    result.map_err(|error| {
+        if json {
+            let value = if let ctxmux_client::ClientError::Protocol { code, message, creation_failure, storage_failure } = &error {
+                serde_json::json!({ "error": ctxmux_protocol::ProtocolError {
+                    code: *code, message: message.clone(), creation_failure: creation_failure.clone(), storage_failure: storage_failure.clone(),
+                } })
+            } else {
+                // A transport/local failure supplies no daemon creation receipt.
+                serde_json::json!({ "transport_error": error.to_string() })
+            };
+            if let Err(output_error) = print_creation_json(&value) {
+                return format!("{error}; {output_error}");
+            }
+        }
+        error.to_string()
+    })
+}
+
+fn print_creation_json(value: &serde_json::Value) -> Result<(), String> {
+    print_stdout(format_args!("{value}")).map(|_| ())
 }
 
 fn set_operation_key(

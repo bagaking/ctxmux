@@ -8,12 +8,14 @@ import {
   CtxmuxClient,
   CtxmuxUnsupportedCapabilityError,
   CtxmuxInvalidFrameError,
+  CtxmuxProtocolError,
   PROTOCOL_VERSION,
   RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
   type RunStorageObservation,
   type RuntimeIdentity,
 } from "../src/index.ts";
 import { validateServerFrame } from "../src/validation.ts";
+import { protocolError } from "../src/control.ts";
 const runId = "fbd067ef-4437-4e11-9450-eac87e699f61";
 const runtime: RuntimeIdentity = {
   daemonInstanceId: "ea519054-5e27-4ed3-acbc-a0c947e82aeb",
@@ -31,6 +33,7 @@ const observation: RunStorageObservation = {
   memory_first_available_byte: 25,
   persistence: {
     first_failure: "unknown COMMIT",
+    storage_failure: null,
     actor_stopped: false,
     queued_append_commands: 0,
     offered_output_bytes: 40,
@@ -84,6 +87,107 @@ async function endpoint(reply: (frame: any, socket: Socket) => void) {
 }
 const send = (socket: Socket, value: unknown) =>
   socket.write(JSON.stringify(value) + "\n");
+
+test("creation failures preserve separate process and transaction outcomes", () => {
+  const error = {
+    code: "persistence" as const,
+    message: "display only",
+    creation_failure: {
+      operation_key: "original",
+      disposition: "unknown" as const,
+    },
+    storage_failure: {
+      stage: "start" as const,
+      sqlite_primary_code: 14,
+      sqlite_extended_code: 14,
+      system_errno: 28,
+      transaction_outcome: "not_committed" as const,
+    },
+  };
+  assert.doesNotThrow(() => validateServerFrame({ type: "error", error }));
+  const decoded = protocolError(error);
+  assert.deepEqual(decoded.creationFailure, error.creation_failure);
+  assert.deepEqual(decoded.storageFailure, error.storage_failure);
+  assert.equal(
+    new CtxmuxProtocolError("persistence", "not applied").creationFailure,
+    undefined,
+  );
+  for (const facts of [
+    null,
+    { operation_key: "", disposition: "not_applied" },
+    { operation_key: "other", disposition: "committed" },
+  ]) {
+    assert.throws(
+      () =>
+        validateServerFrame({
+          type: "error",
+          error: { ...error, creation_failure: facts },
+        }),
+      CtxmuxInvalidFrameError,
+    );
+  }
+  for (const field of Object.keys(error.storage_failure)) {
+    const incomplete: Record<string, unknown> = { ...error.storage_failure };
+    delete incomplete[field];
+    assert.throws(
+      () =>
+        validateServerFrame({
+          type: "error",
+          error: { ...error, storage_failure: incomplete },
+        }),
+      CtxmuxInvalidFrameError,
+    );
+  }
+  for (const system_errno of [0, -1, 2147483648, "28"]) {
+    assert.throws(
+      () =>
+        validateServerFrame({
+          type: "error",
+          error: {
+            ...error,
+            storage_failure: { ...error.storage_failure, system_errno },
+          },
+        }),
+      CtxmuxInvalidFrameError,
+    );
+  }
+});
+
+test("creation failure from another operation cannot authorize a retry", async () => {
+  const owner = await endpoint((message, socket) => {
+    if (message.type === "hello") send(socket, { type: "hello", runtime });
+    else
+      send(socket, {
+        type: "error",
+        error: {
+          code: "persistence",
+          message: "admission rejected",
+          creation_failure: {
+            operation_key: "another-operation",
+            disposition: "not_applied",
+          },
+        },
+      });
+  });
+  try {
+    await assert.rejects(
+      new CtxmuxClient({ socketPath: owner.socketPath }).start(
+        {
+          program: "/bin/sh",
+          args: [],
+          env: {},
+          cwd: null,
+          initial_size: { cols: 80, rows: 24 },
+          declared_inputs: [],
+        },
+        "original-operation",
+      ),
+      CtxmuxInvalidFrameError,
+    );
+  } finally {
+    await owner.close();
+  }
+});
 test("storage observation keeps nullable persistence and independent cursor facts explicit", () => {
   assert.deepEqual(validateServerFrame(frame(observation)), frame(observation));
   assert.doesNotThrow(() =>

@@ -247,10 +247,42 @@ They require a real recovery transition, scoped faults, conserved debt, useful
 public outcomes and an explicitly funded loss/backpressure policy. They do not
 promise unlimited persistence on a full disk.
 
+## Current implementation boundary
+
+The current source adds a first repair slice under the existing persistence
+actor. Known pre-commit removable open/write failures preserve their structured
+SQLite/OS evidence and accepted byte/lifecycle debt. Rechecking the original
+physical paths permits same-owner recovery after directory or permission repair;
+capacity recovery continues to use actual funding. Repeated failures have a
+bounded retry schedule, and held WAL readers return execution to the actor's
+read/observation lane. Wrong physical identities and uncertain commits remain
+fenced. Failed persistence no longer makes the unoffered live-output suffix
+eligible for reclamation.
+
+Focused owner tests exercise a real SQLite CANTOPEN/ENOENT observation, two
+restoration cycles with unchanged capacity, replacement-inode refusal with
+retained bytes and terminal work, a held external WAL reader, and old-generation
+reads while an unrelated active destination is unavailable. Existing FULL,
+write-IOERR and old/new commit-witness regressions remain part of qualification.
+The same-source daemon process test also verifies original Runtime/Run/PID
+continuity across path loss and restoration, independent control, exact replay
+bytes and a later cold process reopen. A separately compiled counterfactual
+with the owner recheck disabled fails the same-owner recovery assertion.
+These checks do not establish that this incident's old daemon recovered or that
+a new artifact has been installed.
+
+The next unresolved boundary is online uncertain-COMMIT reconciliation. Keeping
+accepted bytes is necessary, but the failed transaction's exact old/new witness
+and specific continuation must also stay with the original owner. Clearing a
+latch, replaying a Finalize against an already-terminal row, or treating a new
+compaction generation as the old one is not a recovery transition. Creation
+uncertainty additionally owns the actual child and publication reservation;
+its durable result cannot authorize another spawn.
+
 ## Required proof and remaining gaps
 
-The following is the acceptance direction for an implementation, **not executed
-validation of a fix**. Extend the existing owner fault seams and
+The following matrix defines full acceptance; the focused evidence above does
+not establish that every row has been validated. Extend the existing owner fault seams and
 [`persistence_recovery.rs`](../../crates/ctxmux-daemon/tests/persistence_recovery.rs),
 then exercise the same public CLI/SDK paths used by consuming clients.
 
@@ -275,7 +307,6 @@ and make the corresponding behavior test fail.
 
 Remaining gaps: the original syscall/errno and precise failed transaction are
 unknown; the user-reported service failures were not converted into test writes;
-the amount of unconfirmed output across all Runs is unmeasured; the complete
-new recovery path, protocol and safe old-instance repair have not been
-implemented or qualified. Independent source review and documentation checks
+the amount of unconfirmed output across all Runs is unmeasured; online uncertain-COMMIT continuation, full artifact/consumer qualification and
+safe old-instance repair remain incomplete. Independent source review and documentation checks
 do not close these implementation gaps.

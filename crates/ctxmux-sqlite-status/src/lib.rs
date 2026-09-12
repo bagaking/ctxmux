@@ -23,6 +23,18 @@ pub struct CacheStatus {
     pub spills: u64,
 }
 
+/// Read the operating-system error retained by this exact SQLite connection.
+/// Call immediately after a failed SQLite operation, before issuing more SQL.
+/// A missing/zero observation is unknown, not proof of a particular cause.
+#[must_use]
+#[allow(unsafe_code)]
+pub fn system_errno(connection: &Connection) -> Option<i32> {
+    // SAFETY: the borrowed connection keeps its handle alive; SQLite only reads
+    // the connection's saved error and neither retains nor owns the pointer.
+    let code = unsafe { ffi::sqlite3_system_errno(connection.handle()) };
+    (code > 0).then_some(code)
+}
+
 /// Reset the cache-write and dirty-spill counters before staged admission.
 ///
 /// # Errors

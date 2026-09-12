@@ -12,7 +12,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 /// Current protocol generation developed in this repository.
-pub const PROTOCOL_VERSION: u16 = 22;
+pub const PROTOCOL_VERSION: u16 = 23;
 
 /// Start a daemon-owned native Run.
 pub const RUNTIME_CAPABILITY_NATIVE_START: &str = "native.start";
@@ -1483,15 +1483,11 @@ fn parse_runtime_capability_version(source: &str) -> Result<u64, String> {
         return Err("Runtime capability version must be greater than zero".to_owned());
     }
 
-    let (significand, exponent) = source
-        .split_once(['e', 'E'])
-        .map_or((source, "0"), |parts| parts);
+    let (significand, exponent) = source.split_once(['e', 'E']).unwrap_or((source, "0"));
     let exponent = exponent
         .parse::<i128>()
         .map_err(|_| "Runtime capability version exponent is outside the supported domain")?;
-    let (integer, fraction) = significand
-        .split_once('.')
-        .map_or((significand, ""), |parts| parts);
+    let (integer, fraction) = significand.split_once('.').unwrap_or((significand, ""));
     if integer.is_empty()
         || !integer.bytes().all(|byte| byte.is_ascii_digit())
         || !fraction.bytes().all(|byte| byte.is_ascii_digit())
@@ -1726,7 +1722,7 @@ pub enum ControlReceipt {
     Stop { disposition: StopDisposition },
 }
 
-/// Whether a rejected control command may already have crossed its owner.
+/// Whether a rejected command may already have crossed its operation owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandDisposition {
@@ -1891,6 +1887,9 @@ pub struct RunPersistenceObservation {
     /// First latched failure. Absence does not independently promise health.
     #[serde(deserialize_with = "deserialize_required_option")]
     pub first_failure: Option<String>,
+    /// Current unsettled storage failure, independent of the historical text.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub storage_failure: Option<StorageFailure>,
     /// Whether the persistence actor thread has finished or been joined.
     pub actor_stopped: bool,
     /// Advisory append commands not yet dequeued; excludes in-flight work.
@@ -2276,6 +2275,63 @@ pub enum ErrorCode {
     Internal,
 }
 
+/// Failure stage observed by the storage owner, not inferred from its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageFailureStage {
+    Open,
+    Read,
+    Start,
+    Append,
+    Finalize,
+    Maintenance,
+    Checkpoint,
+}
+
+/// Proven database transaction outcome; this says nothing about process effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageTransactionOutcome {
+    NotStarted,
+    NotCommitted,
+    Committed,
+    Unknown,
+}
+
+/// Exact available storage facts. A null code or stage denotes missing evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct StorageFailure {
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub stage: Option<StorageFailureStage>,
+    #[serde(deserialize_with = "deserialize_native_os_error")]
+    pub sqlite_primary_code: Option<i32>,
+    #[serde(deserialize_with = "deserialize_native_os_error")]
+    pub sqlite_extended_code: Option<i32>,
+    #[serde(deserialize_with = "deserialize_native_os_error")]
+    pub system_errno: Option<i32>,
+    pub transaction_outcome: StorageTransactionOutcome,
+}
+
+/// Physical-effect boundary for the exact rejected Start or Fork request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CreationFailure {
+    #[serde(deserialize_with = "deserialize_creation_failure_key")]
+    pub operation_key: CreateOperationKey,
+    /// `not_applied` proves this dispatch launched no child and its durable
+    /// admission was not committed. It cannot erase an earlier unknown result
+    /// for the same reusable key. Cleanup after launch can only be `unknown`.
+    pub disposition: CommandDisposition,
+}
+
+fn deserialize_creation_failure_key<'de, D>(deserializer: D) -> Result<CreateOperationKey, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    CreateOperationKey::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
 /// Error returned through the public client boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 pub struct ProtocolError {
@@ -2283,6 +2339,22 @@ pub struct ProtocolError {
     pub code: ErrorCode,
     /// Human-readable detail that must not be parsed for control flow.
     pub message: String,
+    /// Absent on non-creation errors or when no exact operation fact is known.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_fact"
+    )]
+    #[ts(optional)]
+    pub creation_failure: Option<CreationFailure>,
+    /// Absent when the error has no structured storage evidence.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_fact"
+    )]
+    #[ts(optional)]
+    pub storage_failure: Option<StorageFailure>,
 }
 
 impl ProtocolError {
@@ -2292,8 +2364,18 @@ impl ProtocolError {
         Self {
             code,
             message: message.into(),
+            creation_failure: None,
+            storage_failure: None,
         }
     }
+}
+
+fn deserialize_present_fact<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Frames sent by the daemon.
@@ -2633,7 +2715,7 @@ mod tests {
     fn generation_20_service_facts_preserve_lifecycle_and_nullable_authority() {
         use super::{NativeInputPhase, NativeOwnerStatus, NativeServiceFailure};
 
-        assert_eq!(PROTOCOL_VERSION, 22);
+        assert_eq!(PROTOCOL_VERSION, 23);
         let mut run = sample_run_info();
         let service = run.native_service.as_mut().unwrap();
         service.revision = 7;
@@ -2861,6 +2943,61 @@ mod tests {
     }
 
     #[test]
+    fn creation_and_storage_failures_keep_independent_authority() {
+        let error = serde_json::json!({
+            "code": "persistence", "message": "owner failure",
+            "creation_failure": { "operation_key": "original-start", "disposition": "unknown" },
+            "storage_failure": {
+                "stage": "start", "sqlite_primary_code": 14, "sqlite_extended_code": 14,
+                "system_errno": 28, "transaction_outcome": "not_committed"
+            }
+        });
+        let parsed: ProtocolError = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(
+            parsed.creation_failure.as_ref().unwrap().disposition,
+            CommandDisposition::Unknown
+        );
+        assert_eq!(
+            parsed.storage_failure.as_ref().unwrap().transaction_outcome,
+            super::StorageTransactionOutcome::NotCommitted
+        );
+        assert_eq!(serde_json::to_value(parsed).unwrap(), error);
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!({ "operation_key": "", "disposition": "not_applied" }),
+            serde_json::json!({ "operation_key": "start", "disposition": "committed" }),
+        ] {
+            let mut value = error.clone();
+            value["creation_failure"] = invalid;
+            assert!(serde_json::from_value::<ProtocolError>(value).is_err());
+        }
+        for field in [
+            "stage",
+            "sqlite_primary_code",
+            "sqlite_extended_code",
+            "system_errno",
+            "transaction_outcome",
+        ] {
+            let mut value = error.clone();
+            value["storage_failure"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<ProtocolError>(value).is_err());
+        }
+        for invalid in [0, -1] {
+            let mut value = error.clone();
+            value["storage_failure"]["system_errno"] = serde_json::json!(invalid);
+            assert!(serde_json::from_value::<ProtocolError>(value).is_err());
+        }
+        let plain = ProtocolError::new(ErrorCode::Persistence, "no observed facts");
+        assert_eq!(
+            serde_json::to_value(plain).unwrap(),
+            serde_json::json!({"code":"persistence", "message":"no observed facts"})
+        );
+    }
+
+    #[test]
     fn runtime_identity_and_recoverable_operations_have_exact_generation_22_wire_shapes() {
         let daemon_instance: DaemonInstanceId =
             "018f47f2-9df7-7f5f-8f2d-d3353f114ae9".parse().unwrap();
@@ -2879,7 +3016,7 @@ mod tests {
                     "runtimeId": "018f47f2-9df7-7f5f-8f2d-d3353f114aea",
                     "runtimeIdPersistence": "daemon",
                     "buildId": "ctxmuxd/0.1.0",
-                    "protocolGeneration": 22,
+                    "protocolGeneration": 23,
                     "platform": "linux",
                     "arch": "x86_64",
                     "capabilities": {

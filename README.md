@@ -25,6 +25,11 @@ otherwise a process-temp path. `--socket` or `CTXMUX_SOCKET` selects a
 different daemon. Closing the CLI never stops the Run; only `stop` (or daemon
 exit, in memory-only mode) does.
 
+Scripts can use `start --json` or `fork --json` to receive the Run or the original
+typed failure, including available creation and storage facts. A failed database
+transaction can follow a physical launch; follow the
+[creation receipt contract](docs/protocol.md#retry-safe-run-creation) before retrying.
+
 Other commands:
 
 ```bash

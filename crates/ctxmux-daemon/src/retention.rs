@@ -675,7 +675,7 @@ mod tests {
             // A fresh public client observes the same Runs and exact input
             // cursor. Repeating one operation must not write it a second time.
             let reconnected = Client::new(server.directory.path().join("ctxmux.sock"));
-            for (index, byte) in [b'a', b'b'].into_iter().enumerate() {
+            for (index, byte) in b"ab".iter().copied().enumerate() {
                 let operation = RecoverableInput {
                     daemon_instance: runtime.daemon_instance_id,
                     operation_key: InputOperationKey::new(format!("retention-reconnect-{index}"))

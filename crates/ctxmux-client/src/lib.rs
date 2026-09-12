@@ -75,6 +75,10 @@ pub enum ClientError {
         code: ctxmux_protocol::ErrorCode,
         /// Human-readable detail.
         message: String,
+        /// Original Start/Fork application boundary; never inferred from text.
+        creation_failure: Option<ctxmux_protocol::CreationFailure>,
+        /// Structured storage facts captured at the failing owner.
+        storage_failure: Option<ctxmux_protocol::StorageFailure>,
     },
     /// A configured client-local capability requirement is outside the public
     /// JavaScript-safe positive-integer domain.
@@ -311,6 +315,8 @@ impl From<ProtocolError> for ClientError {
         Self::Protocol {
             code: error.code,
             message: error.message,
+            creation_failure: error.creation_failure,
+            storage_failure: error.storage_failure,
         }
     }
 }
@@ -1221,10 +1227,27 @@ impl Client {
 
     async fn request(&self, request: Request) -> Result<Response, ClientError> {
         let (mut wire, _) = self.connect_for_dispatch().await?;
+        let creation_key = match &request {
+            Request::Start { operation_key, .. } | Request::Fork { operation_key, .. } => {
+                Some(operation_key.clone())
+            }
+            _ => None,
+        };
         send(&mut wire, &ClientFrame::Request { request }).await?;
         match receive(&mut wire).await? {
             ServerFrame::Response { response } => Ok(response),
-            ServerFrame::Error { error } => Err(error.into()),
+            ServerFrame::Error { error } => {
+                if error
+                    .creation_failure
+                    .as_ref()
+                    .is_some_and(|failure| Some(&failure.operation_key) != creation_key.as_ref())
+                {
+                    return Err(ClientError::ProtocolContractViolation(
+                        "creation failure named another operation",
+                    ));
+                }
+                Err(error.into())
+            }
             _ => Err(ClientError::UnexpectedFrame("expected request response")),
         }
     }
@@ -1710,6 +1733,89 @@ mod runtime_tests {
     };
 
     use super::{ClientError, PROTOCOL_VERSION};
+
+    #[tokio::test]
+    async fn creation_request_retains_only_its_exact_failure_facts() {
+        use ctxmux_protocol::{
+            CreateOperationKey, CreationFailure, ServerFrame, StorageFailure, StorageFailureStage,
+            StorageTransactionOutcome, encode_frame,
+        };
+        use futures_util::{SinkExt, StreamExt};
+        for returned_key in ["original", "another-operation"] {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("runtime.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut wire =
+                    tokio_util::codec::Framed::new(stream, tokio_util::codec::LinesCodec::new());
+                wire.next().await.unwrap().unwrap();
+                wire.send(
+                    encode_frame(&ServerFrame::Hello {
+                        runtime: runtime_identity(),
+                    })
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+                wire.next().await.unwrap().unwrap();
+                let mut error =
+                    ProtocolError::new(ErrorCode::Persistence, "display text is not authority");
+                error.creation_failure = Some(CreationFailure {
+                    operation_key: CreateOperationKey::new(returned_key).unwrap(),
+                    disposition: CommandDisposition::NotApplied,
+                });
+                error.storage_failure = Some(StorageFailure {
+                    stage: Some(StorageFailureStage::Start),
+                    sqlite_primary_code: Some(14),
+                    sqlite_extended_code: Some(14),
+                    system_errno: Some(28),
+                    transaction_outcome: StorageTransactionOutcome::NotStarted,
+                });
+                wire.send(encode_frame(&ServerFrame::Error { error }).unwrap())
+                    .await
+                    .unwrap();
+            });
+            let error = super::Client::new(socket)
+                .start_with_operation_key(
+                    ctxmux_protocol::RunSpec {
+                        program: "/bin/sh".to_owned(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: std::collections::BTreeMap::new(),
+                        initial_size: ctxmux_protocol::TerminalSize::default(),
+                        declared_inputs: Vec::new(),
+                    },
+                    CreateOperationKey::new("original").unwrap(),
+                )
+                .await
+                .unwrap_err();
+            if returned_key == "original" {
+                let ClientError::Protocol {
+                    creation_failure: Some(creation),
+                    storage_failure: Some(storage),
+                    ..
+                } = error
+                else {
+                    panic!("original failure facts were discarded: {error:?}");
+                };
+                assert_eq!(creation.disposition, CommandDisposition::NotApplied);
+                assert_eq!(storage.system_errno, Some(28));
+                assert_eq!(
+                    storage.transaction_outcome,
+                    StorageTransactionOutcome::NotStarted
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    ClientError::ProtocolContractViolation(
+                        "creation failure named another operation"
+                    )
+                ));
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[test]
     fn client_rejects_an_incompatible_runtime_protocol_generation() {

@@ -5,6 +5,64 @@ use crate::native_control::InputDrainGate;
 use ctxmux_protocol::{ForkFidelity, RunId, RunInfo, RunLineage};
 use std::collections::{HashSet, VecDeque};
 
+/// The executable Rust test owns an isolated real daemon for SDK/CLI failures.
+#[test]
+fn creation_failure_public_subprocess() {
+    let Some(directory) = std::env::var_os("CTXMUX_CREATION_TEST_DIR") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let before_commit = std::env::var_os("CTXMUX_CREATION_BEFORE_COMMIT").is_some();
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (persistence, recovered) = Persistence::open(directory.join("state")).unwrap();
+            let (hook, _reached) = creation_hook(CreationHookPoint::AfterSpawn, false);
+            let manager = Arc::new(RunManager {
+                creation_hook: Some(Arc::clone(&hook)),
+                ..RunManager::persistent(persistence.clone(), recovered)
+            });
+            let server = InProcessServer::start(manager);
+            if before_commit {
+                persistence.fail_next_start_before_commit();
+            } else {
+                persistence.fail_next_insert_after_commit();
+            }
+            std::fs::write(
+                directory.join("ready.json"),
+                serde_json::to_vec(
+                    &serde_json::json!({"socketPath": server.directory.path().join("ctxmux.sock")}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !directory.join("release").exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                hook.physical_spawn_count(),
+                1,
+                "all retries and prelaunch refusals retain one physical launch"
+            );
+            for run in server.manager.list_all() {
+                if run.state.is_running() {
+                    server.manager.get(run.id).unwrap().stop().await.unwrap();
+                }
+            }
+            server
+                .manager
+                .shutdown_owned_controls(Duration::from_secs(5))
+                .unwrap();
+        });
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::too_many_lines,
@@ -3238,6 +3296,13 @@ async fn persistent_capacity_rejects_before_spawn_without_consuming_key() {
         .expect_err("oversized metadata rejects before physical spawn");
     assert_eq!(error.code, ErrorCode::RunCapacity);
     assert!(error.message.contains("metadata"));
+    assert_eq!(
+        error.creation_failure,
+        Some(ctxmux_protocol::CreationFailure {
+            operation_key: operation_key.clone(),
+            disposition: ctxmux_protocol::CommandDisposition::NotApplied,
+        })
+    );
     assert!(read_marker_pids(&marker).is_empty());
     assert!(manager.list_all().is_empty());
     assert_eq!(manager.unpublished_cleanups.unresolved_count(), 0);
@@ -3315,6 +3380,14 @@ async fn rejected_persistent_fork_cleans_only_the_unpublished_child() {
         .await
         .expect("fork owner task remains live")
         .expect_err("injected pre-COMMIT failure rejects the unpublished fork");
+    assert_eq!(
+        error.creation_failure,
+        Some(ctxmux_protocol::CreationFailure {
+            operation_key: operation_key.clone(),
+            disposition: ctxmux_protocol::CommandDisposition::Unknown,
+        }),
+        "a child demonstrably ran before its transaction was rolled back"
+    );
     assert_pending_rollback(&error);
     assert_eq!(
         manager

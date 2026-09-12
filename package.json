@@ -23,7 +23,8 @@
     "test:seeded-qualification": "node scripts/run-seeded-qualification.mjs",
     "test:unit": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present && npm run typecheck:scripts",
-    "typecheck:scripts": "tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --allowImportingTsExtensions --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes scripts/reliability-qualification.ts"
+    "typecheck:scripts": "tsc --noEmit --target ES2024 --module NodeNext --moduleResolution NodeNext --types node --allowImportingTsExtensions --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes scripts/reliability-qualification.ts",
+    "test:creation-failure": "node scripts/check-creation-failure.mjs"
   },
   "devDependencies": {
     "@types/node": "24.13.3",

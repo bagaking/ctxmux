@@ -3,6 +3,9 @@ import type { CommandDisposition } from "./generated/CommandDisposition.js";
 import type { ControlFailure } from "./generated/ControlFailure.js";
 import type { ControlReceipt } from "./generated/ControlReceipt.js";
 import type { ErrorCode } from "./generated/ErrorCode.js";
+import type { ProtocolError } from "./generated/ProtocolError.js";
+import type { CreationFailure } from "./generated/CreationFailure.js";
+import type { StorageFailure } from "./generated/StorageFailure.js";
 import { MAX_FRAME_BYTES } from "./generated/constants.js";
 import type { Response } from "./generated/Response.js";
 import type { RunInfo } from "./generated/RunInfo.js";
@@ -34,11 +37,19 @@ export interface AttachmentControlAccepted<R extends ControlReceipt> {
 
 export class CtxmuxProtocolError extends Error {
   public readonly code: ErrorCode;
+  public readonly creationFailure: CreationFailure | undefined;
+  public readonly storageFailure: StorageFailure | undefined;
 
-  public constructor(code: ErrorCode, message: string) {
+  public constructor(
+    code: ErrorCode,
+    message: string,
+    facts?: Pick<ProtocolError, "creation_failure" | "storage_failure">,
+  ) {
     super(message);
     this.name = "CtxmuxProtocolError";
     this.code = code;
+    this.creationFailure = facts?.creation_failure;
+    this.storageFailure = facts?.storage_failure;
   }
 }
 
@@ -55,14 +66,15 @@ export class CtxmuxCommandError extends CtxmuxProtocolError {
     disposition: CommandDisposition,
     commandId?: AttachmentCommandId,
     confirmedInputBytes: number | null = null,
+    facts?: Pick<ProtocolError, "creation_failure" | "storage_failure">,
   ) {
-    super(code, message);
+    super(code, message, facts);
     this.name = "CtxmuxCommandError";
     this.disposition = disposition;
     this.commandId = commandId;
     this.confirmedInputBytes = confirmedInputBytes;
     this.failure = {
-      error: { code, message },
+      error: { code, message, ...facts },
       disposition,
       confirmed_input_bytes: confirmedInputBytes,
     };
@@ -173,14 +185,12 @@ export function commandError(
     failure.disposition,
     commandId,
     failure.confirmed_input_bytes,
+    failure.error,
   );
 }
 
-export function protocolError(error: {
-  readonly code: ErrorCode;
-  readonly message: string;
-}): CtxmuxProtocolError {
-  return new CtxmuxProtocolError(error.code, error.message);
+export function protocolError(error: ProtocolError): CtxmuxProtocolError {
+  return new CtxmuxProtocolError(error.code, error.message, error);
 }
 
 export function asError(error: unknown): Error {

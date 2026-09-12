@@ -1509,3 +1509,134 @@ fn assert_startup_rejected(socket: &Path, state_dir: &Path, expected: &str) {
     );
     assert!(!socket.exists());
 }
+
+/// Real filesystem fault and real PTY, then a different daemon process reads
+/// the original committed bytes. Restoring the same inode is the only repair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removable_replay_path_recovers_same_live_owner_and_cold_process() {
+    use ctxmux_protocol::StorageTransactionOutcome;
+    use std::fs;
+    for permission_fault in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let state = temp.path().join("state");
+        let socket = temp.path().join("ctxmux.sock");
+        let mut first = Daemon::start(socket.clone(), &state).await;
+        let client = first.client();
+        let identity = client.runtime_info().await.unwrap();
+        let original = client
+            .start(shell_spec(
+                "stty -echo; printf before; read go; printf pending; read done; printf final",
+            ))
+            .await
+            .unwrap();
+        timeout(scaled(Duration::from_secs(5)), async {
+            while client
+                .status(original.id)
+                .await
+                .unwrap()
+                .durable_output_bytes
+                != Some(6)
+            {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let replay = state.join("replay");
+        let held = state.join("held-original-replay");
+        if permission_fault {
+            fs::set_permissions(&replay, fs::Permissions::from_mode(0)).unwrap();
+        } else {
+            fs::rename(&replay, &held).unwrap();
+        }
+        client.input(original.id, b"go\n".to_vec()).await.unwrap();
+        timeout(scaled(Duration::from_secs(5)), async {
+            loop {
+                let (_, observed) = client.observe_storage(original.id).await.unwrap();
+                let persistence = observed.persistence.unwrap();
+                if let Some(failure) = persistence.storage_failure {
+                    assert!(persistence.first_failure.is_none());
+                    assert!(persistence.queued_append_commands > 0);
+                    assert_eq!(persistence.committed_output_bytes, 6);
+                    assert_eq!(persistence.offered_output_bytes, 13);
+                    assert_eq!(
+                        failure.transaction_outcome,
+                        StorageTransactionOutcome::NotCommitted
+                    );
+                    assert_eq!(
+                        failure.system_errno,
+                        Some(if permission_fault { 13 } else { 2 })
+                    );
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("real filesystem failure must retain accepted output");
+        // Repeat observations through a sustained fault; they must neither retry
+        // the client's input nor silently release actor debt.
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(client.status(original.id).await.unwrap().pid, original.pid);
+        assert!(
+            client
+                .list()
+                .await
+                .unwrap()
+                .iter()
+                .any(|run| run.id == original.id)
+        );
+        if permission_fault {
+            fs::set_permissions(&replay, fs::Permissions::from_mode(0o700)).unwrap();
+        } else {
+            fs::rename(&held, &replay).unwrap();
+        }
+        timeout(scaled(Duration::from_secs(5)), async {
+            loop {
+                let (_, observed) = client.observe_storage(original.id).await.unwrap();
+                let persistence = observed.persistence.unwrap();
+                if persistence.committed_output_bytes == 13 && persistence.storage_failure.is_none()
+                {
+                    assert_eq!(persistence.queued_append_commands, 0);
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("same owner converges after original path repair without resending");
+        assert_eq!(client.runtime_info().await.unwrap(), identity);
+        assert_eq!(client.status(original.id).await.unwrap().pid, original.pid);
+        let second = client
+            .start(shell_spec(
+                "stty -echo; printf second; read done; printf ok",
+            ))
+            .await
+            .unwrap();
+        timeout(scaled(Duration::from_secs(5)), async {
+            while client.status(second.id).await.unwrap().durable_output_bytes != Some(6) {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        client.input(second.id, b"done\n".to_vec()).await.unwrap();
+        wait_terminal(&client, second.id).await;
+        client.input(original.id, b"done\n".to_vec()).await.unwrap();
+        let ended = wait_terminal(&client, original.id).await;
+        assert_eq!(ended.durable_output_bytes, Some(18));
+        let (_, snapshot) = client.attach(original.id, 0).await.unwrap();
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"beforependingfinal");
+        first.kill_and_wait();
+        let reopened = Daemon::start(socket, &state).await;
+        let cold = reopened.client();
+        let saved = cold.status(original.id).await.unwrap();
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.spec, original.spec);
+        assert_eq!(saved.durable_output_bytes, Some(18));
+        let (_, snapshot) = cold.attach(original.id, 0).await.unwrap();
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"beforependingfinal");
+        let (_, snapshot) = cold.attach(second.id, 0).await.unwrap();
+        assert_eq!(replay_bytes(&snapshot.replay.chunks), b"secondok");
+    }
+}

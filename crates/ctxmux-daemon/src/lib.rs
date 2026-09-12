@@ -2457,6 +2457,26 @@ impl RunManager {
         operation_key: CreateOperationKey,
         request: CreationRequest,
     ) -> Result<RunInfo, ProtocolError> {
+        self.create_inner(operation_key.clone(), request)
+            .await
+            .map_err(|mut error| {
+                if operation_key.validate().is_ok() {
+                    error
+                        .creation_failure
+                        .get_or_insert(ctxmux_protocol::CreationFailure {
+                            operation_key,
+                            disposition: ctxmux_protocol::CommandDisposition::Unknown,
+                        });
+                }
+                error
+            })
+    }
+
+    async fn create_inner(
+        self: &Arc<Self>,
+        operation_key: CreateOperationKey,
+        request: CreationRequest,
+    ) -> Result<RunInfo, ProtocolError> {
         operation_key
             .validate()
             .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?;
@@ -2582,10 +2602,12 @@ impl RunManager {
             Ok(pending) => pending,
             Err(spawn_error) => {
                 if let Err(failure) = publication.abort() {
-                    return Err(ProtocolError::new(
+                    let mut error = ProtocolError::new(
                         ErrorCode::Persistence,
                         format!("{}; persistent rollback: {failure}", spawn_error.message),
-                    ));
+                    );
+                    error.storage_failure = Some(failure.storage_failure());
+                    return Err(error);
                 }
                 return Err(spawn_error);
             }
@@ -2616,28 +2638,36 @@ impl RunManager {
         new_run_id: RunId,
     ) -> Result<CreationPublication<'a>, ProtocolError> {
         let Some(persistence) = &self.persistence else {
-            let reservation = self.registry.reserve_memory_publication(
-                new_run_id,
-                Some(operation_key.clone()),
-                registry_metadata_bytes(
-                    &materialized.persistence_start_info(new_run_id),
-                    Some(operation_key),
-                ),
-            )?;
+            let reservation = self
+                .registry
+                .reserve_memory_publication(
+                    new_run_id,
+                    Some(operation_key.clone()),
+                    registry_metadata_bytes(
+                        &materialized.persistence_start_info(new_run_id),
+                        Some(operation_key),
+                    ),
+                )
+                .map_err(|error| creation_not_applied(error, operation_key))?;
             return Ok(CreationPublication::Memory(reservation));
         };
         let prospective = materialized.persistence_start_info(new_run_id);
         let prepared = persistence
             .prepare_start(operation_key, &prospective)
-            .map_err(|error| persistence_protocol_error(&error))?;
-        let reservation = self.registry.reserve_persistent_publication(
-            new_run_id,
-            operation_key.clone(),
-            materialized.request.clone(),
-            prepared
-                .metadata_bytes()
-                .saturating_add(resident_run_metadata_bytes(&prospective)),
-        )?;
+            .map_err(|error| {
+                creation_not_applied(persistence_protocol_error(&error), operation_key)
+            })?;
+        let reservation = self
+            .registry
+            .reserve_persistent_publication(
+                new_run_id,
+                operation_key.clone(),
+                materialized.request.clone(),
+                prepared
+                    .metadata_bytes()
+                    .saturating_add(resident_run_metadata_bytes(&prospective)),
+            )
+            .map_err(|error| creation_not_applied(error, operation_key))?;
         let candidates = reservation
             .persistent_candidates()
             .into_iter()
@@ -2654,11 +2684,17 @@ impl RunManager {
                 } else {
                     ErrorCode::Persistence
                 };
+                let storage_failure = Some(failure.storage_failure());
                 let message = failure.into_error().to_string();
                 if disposition == StartDisposition::CommitUnknown {
                     self.fail_stop_persistence(reservation.into_commit_unknown(), &message);
                 }
-                Err(ProtocolError::new(code, message))
+                let mut error = ProtocolError::new(code, message);
+                error.storage_failure = storage_failure;
+                if disposition == StartDisposition::NotCommitted {
+                    error = creation_not_applied(error, operation_key);
+                }
+                Err(error)
             }
         }
     }
@@ -2704,15 +2740,23 @@ impl RunManager {
                 return cleanup_failed_persistent_creation(pending, failure);
             }
             PersistentStartCompletion::CommitUnknown(failure) => {
-                let message = failure.into_error().to_string();
-                publication.retain_unknown(&message);
-                return cleanup_unknown_persistent_creation(pending, message);
+                let storage_failure = Some(failure.storage_failure());
+                let mut error = persistence_protocol_error(&failure.into_error());
+                error.storage_failure = storage_failure;
+                publication.retain_unknown(&error.message);
+                return cleanup_unknown_persistent_creation(pending, error);
             }
         };
         let (info, post_commit_error) =
             publication.publish_committed(operation_key, pending, committed);
-        let post_commit_error = post_commit_error
-            .map(|error| ProtocolError::new(ErrorCode::Persistence, error.to_string()));
+        let post_commit_error = post_commit_error.map(|error| {
+            let mut error = persistence_protocol_error(&error);
+            if let Some(storage) = &mut error.storage_failure {
+                storage.stage = Some(ctxmux_protocol::StorageFailureStage::Start);
+                storage.transaction_outcome = ctxmux_protocol::StorageTransactionOutcome::Committed;
+            }
+            error
+        });
         post_commit_error.map_or(Ok(info), Err)
     }
 
@@ -5435,13 +5479,7 @@ impl Run {
         let protected = if self.persistence_mode == PersistenceMode::MemoryOnly {
             u64::MAX
         } else {
-            persistence.map_or(0, |durable| {
-                if durable.is_failed() {
-                    u64::MAX
-                } else {
-                    durable.next_replay_start()
-                }
-            })
+            persistence.map_or(0, PersistentRun::next_replay_start)
         };
         if self.persistence_mode == PersistenceMode::PersistentCapable
             && protected == u64::MAX
@@ -7134,7 +7172,20 @@ fn invalid_run_spec(error: run_spec::RunSpecValidationError) -> ProtocolError {
 }
 
 fn persistence_protocol_error(error: &PersistenceError) -> ProtocolError {
-    ProtocolError::new(ErrorCode::Persistence, error.to_string())
+    let mut result = ProtocolError::new(ErrorCode::Persistence, error.to_string());
+    result.storage_failure = error.storage_failure();
+    result
+}
+
+fn creation_not_applied(
+    mut error: ProtocolError,
+    operation_key: &CreateOperationKey,
+) -> ProtocolError {
+    error.creation_failure = Some(ctxmux_protocol::CreationFailure {
+        operation_key: operation_key.clone(),
+        disposition: ctxmux_protocol::CommandDisposition::NotApplied,
+    });
+    error
 }
 
 fn cleanup_failed_persistent_creation(
@@ -7146,32 +7197,27 @@ fn cleanup_failed_persistent_creation(
     } else {
         ErrorCode::Persistence
     };
-    let error = ProtocolError::new(code, failure.into_error().to_string());
+    let storage_failure = Some(failure.storage_failure());
+    let mut error = ProtocolError::new(code, failure.into_error().to_string());
+    error.storage_failure = storage_failure;
     if let Err(cleanup_error) = pending.cleanup_unpublished() {
-        return Err(ProtocolError::new(
-            error.code,
-            format!(
-                "{}; rollback pending: exact creation key remains fenced until all unpublished native owners are quiescent: {cleanup_error}",
-                error.message
-            ),
-        ));
+        error.message = format!(
+            "{}; rollback pending: exact creation key remains fenced until all unpublished native owners are quiescent: {cleanup_error}",
+            error.message
+        );
     }
     Err(error)
 }
 
 fn cleanup_unknown_persistent_creation(
     pending: PendingPublication,
-    message: String,
+    mut error: ProtocolError,
 ) -> Result<RunInfo, ProtocolError> {
-    let error = ProtocolError::new(ErrorCode::Persistence, message);
     if let Err(cleanup_error) = pending.cleanup_unpublished() {
-        return Err(ProtocolError::new(
-            error.code,
-            format!(
-                "{}; cleanup pending after unknown COMMIT: {cleanup_error}",
-                error.message
-            ),
-        ));
+        error.message = format!(
+            "{}; cleanup pending after unknown COMMIT: {cleanup_error}",
+            error.message
+        );
     }
     Err(error)
 }
@@ -11138,8 +11184,12 @@ mod tests {
         runs
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one public fault boundary proves two Run identities and ordered byte continuity"
+    )]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn history_gap_preserves_live_terminal_and_two_public_runs() {
+    async fn storage_failure_preserves_continuous_history_and_two_public_runs() {
         let temp = tempfile::tempdir().unwrap();
         let (persistence, recovered) = super::Persistence::open(temp.path().join("state")).unwrap();
         let server = InProcessServer::start(Arc::new(RunManager::persistent(
@@ -11171,7 +11221,12 @@ mod tests {
         clients[1].input(runs[0].id, b"z".to_vec()).await.unwrap();
         expect_original_raw(&clients[1], &runs[0], b"A:READY\nA:!\nA:z\n").await;
         let (raw, history) = clients[0].attach(runs[0].id, 0).await.unwrap();
-        assert!(history.replay.truncated);
+        assert!(!history.replay.truncated);
+        assert_eq!(replay_bytes(&history.replay.chunks), b"A:READY\nA:!\nA:z\n");
+        let (_, storage) = clients[0].observe_storage(runs[0].id).await.unwrap();
+        let storage = storage.persistence.unwrap();
+        assert!(storage.first_failure.is_some());
+        assert!(storage.storage_failure.is_some());
         assert_eq!(history.run.durable_output_bytes, durable_head);
         assert!(durable_head.unwrap() < history.run.latest_output_bytes);
         raw.detach().await.unwrap();

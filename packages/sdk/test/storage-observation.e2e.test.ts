@@ -64,6 +64,7 @@ test("SDK and CLI consume storage fault facts from two real Native Runs", async 
         /injected failure after durable Run creation commit/u,
       );
       assert.equal(result.observation.persistence?.actor_stopped, false);
+      assert.ok(result.observation.persistence?.storage_failure);
       const fromCli = JSON.parse(
         execFileSync(cli, ["--socket", receipt.socketPath, "storage", id], {
           encoding: "utf8",
@@ -74,6 +75,10 @@ test("SDK and CLI consume storage fault facts from two real Native Runs", async 
       assert.equal(
         fromCli.observation.persistence.first_failure,
         result.observation.persistence?.first_failure,
+      );
+      assert.deepEqual(
+        fromCli.observation.persistence.storage_failure,
+        result.observation.persistence?.storage_failure,
       );
       assert.equal(
         fromCli.observation.persistence.committed_output_bytes,

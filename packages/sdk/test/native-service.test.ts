@@ -92,8 +92,8 @@ const failures: readonly NativeServiceFailure[] = [
   { owner_io_failed: { stage: "wake_drain", os_error: null } },
 ];
 
-test("generation 22 retains required native service facts, including historical Runs", () => {
-  assert.equal(PROTOCOL_VERSION, 22);
+test("generation 23 retains required native service facts, including historical Runs", () => {
+  assert.equal(PROTOCOL_VERSION, 23);
   const live = run();
   const missing: Partial<RunInfo> = { ...live };
   delete missing.native_service;

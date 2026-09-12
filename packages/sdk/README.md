@@ -226,8 +226,7 @@ and the complete current field contract are described in the
 and [resource policy](../../docs/architecture/choices/019-resource-policy-and-honest-qualification.md).
 
 `start` and `fork` accept an optional caller-retained creation operation key.
-When a connection closes before its response is known, retry the exact request
-with that same key: while the Run is retained, ctxmux returns that Run's current
+While the resulting Run is retained, an exact same-key request returns its current
 `RunInfo` instead of spawning another process. Different semantics return
 `creation_conflict`. Keys are byte-exact, non-empty, well-formed JavaScript
 strings whose UTF-8 encoding is at most 128 bytes. Lone UTF-16 surrogates are
@@ -236,6 +235,18 @@ only with the Run in its memory or persistent retention class; they are not
 Session IDs, tags, credentials, or a global exactly-once claim. A call that
 omits the key gets a fresh UUID and therefore cannot be manually retried after
 an uncertain response.
+
+A rejected request may expose `CtxmuxProtocolError.creationFailure` with the
+exact `operation_key` and `disposition`. `not_applied` proves this dispatch was
+refused before launch; `unknown` preserves possible process effects, including
+a child launched before its database transaction rolled back. Optional
+`storageFailure` independently preserves the storage stage, engine codes,
+system errno and transaction outcome. Missing facts are not negative receipts.
+The SDK never resends creation automatically. A lost response does not itself
+prove that a retained mapping exists, and a later `not_applied` response cannot
+erase an earlier unknown result for a reused key. See the
+[creation failure contract](../../docs/protocol.md#retry-safe-run-creation)
+for retention and physical-effect boundaries.
 
 ## Recover a native Input result
 
@@ -506,3 +517,8 @@ Types under `src/generated` are generated from `ctxmux-protocol` with `ts-rs`.
 Run `scripts/generate-protocol-types.sh` from the repository root after changing
 Rust wire types. `scripts/check-protocol-types.sh` verifies that committed
 declarations have not drifted.
+
+`npm run test:creation-failure` at the repository root builds the actual Native
+failure fixture, CLI and SDK. It checks before- and after-COMMIT process effects,
+exact operation receipts, and a separately built SDK mutation that drops those
+facts. Its source and executable identities are recorded under `target/`.
