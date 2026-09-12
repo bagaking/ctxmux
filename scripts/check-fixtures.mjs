@@ -194,11 +194,11 @@ const sourceRegistry = new Map();
 const counts = new Map([...allowedDispositions].map((value) => [value, 0]));
 
 if (Array.isArray(corpus.cases)) {
-  // Preserve 41 runtime cases and six REMOTE cases, plus decision 019's
-  // population-independent resource/recovery regression and actual FULL rollback.
-  if (corpus.cases.length !== 49) {
+  // Preserve the 49 retained cases and the serving-time socket publication
+  // regression. New case registration does not claim executed qualification.
+  if (corpus.cases.length !== 50) {
     fail(
-      `corpus must contain all 49 retained cases, got ${corpus.cases.length}`,
+      `corpus must contain all 50 retained cases, got ${corpus.cases.length}`,
     );
   }
 

@@ -346,7 +346,7 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    relinquished.
 4. Extraction is the point of no return. The old native owner stops its reader,
    relinquishes exactly one child/control owner per Run, flushes the durable
-   output barrier, writes the version-2 manifest, clears close-on-exec only on
+   output barrier, writes the schema-v10 manifest, clears close-on-exec only on
    the manifest, listener, state lock, and PTY masters, then calls `execve`.
 5. The incoming image reuses the Runtime ID, daemon instance, listener and state
    lock, reconciles only non-handed-off running rows, re-adopts the live masters
@@ -354,8 +354,9 @@ The key paths converge in the daemon rather than duplicating runtime logic in ea
    Input ledger, and settled recoverable Stop records. It rebuilds build identity
    and the advertised capability record from the incoming image and active
    persistence mode. Existing attachment transports end; clients reconnect from
-   their own output cursor. Failure after extraction is fail-stop, never a partial
-   return to service.
+   their own output cursor. Handoff/ownership failure after extraction is fail-stop,
+   never a partial return to service; recoverable endpoint publication follows the
+   [publication owner contract](#socket-publication-and-identity).
 
 ### Input, resize, output, and exit
 
@@ -723,8 +724,9 @@ The CLI/SDK accepts twenty-eight advanced resource fields. Handoff preserves
 Input/Stop state under the original aggregate control owner, without separate
 transfer quotas for payload or diagnostics. Its encoded-file allowance still
 protects staging/read memory and is preflighted before ownership extraction.
-The private manifest is v9 because two policy fields were removed; public
-protocol generation 22 is unchanged. Terminal
+The private manifest is v10 because the current listener's pathname device/inode
+identity is required alongside its descriptor; public protocol generation 22 is
+unchanged. Terminal
 allocation/history/restore and some derived allowances remain unfinished
 resource work. The [source-level defense and configuration audit](reviews/runtime-defense-and-configuration-audit.md)
 records the dispositions and existing execution owners. This accepted direction
@@ -732,8 +734,6 @@ and the README update do not claim that the remaining interface reduction,
 terminal allocation work or full recovery/scale qualification is complete.
 The [runtime policy refactor](reviews/runtime-policy-refactor.md) records the
 implemented boundaries and their local behavioral proof.
-
-The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
 [Decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md)
 owns configurable resource policy. Live owners follow actual host descriptors
@@ -761,6 +761,50 @@ releases its incarnation-local Control stdin and stdout reader descriptors and
 reaps its Control process before `Interrupted` becomes observable. Retaining its
 historical Run record therefore has no per-terminal Control descriptor slope;
 this cleanup does not imply Run GC.
+
+### Socket publication and identity
+
+One daemon publication owner keeps the current Unix listener and its bound
+pathname device/inode guard together. The socket is created with mode `0600`.
+Startup refuses ordinary files and symlinks and replaces a stale socket only
+after revalidating identity and liveness immediately before unlink. Serving-time
+repair instead binds only an absent name; it never borrows startup stale cleanup
+or another listener's guard. An absent private parent is recreated with mode
+`0700`, and an unsafe or foreign-owned namespace is refused.
+
+A removed socket name or private parent, or resource pressure preventing a new
+bind, is a publication failure rather than Run termination. The original owner
+observes and retries with bounded, cancellable work independent of Run count;
+unchanged failure diagnostics are deduplicated through the existing bounded
+sink. It keeps the same RunManager, Runtime/daemon identities, PTYs, child PIDs,
+ordered bytes, pending operations and already accepted streams. Rebinding a
+listener does not restart those owners or replay an unknown input. New-client
+reachability is established by the ordinary public Hello and Run operations,
+not pathname existence, filesystem free space, a live PID or an old connection.
+Native owns this endpoint only; an embedding client's control listener remains
+that client's responsibility.
+
+Planned exec uses the publication owner's current listener/guard pair and
+rechecks its pathname identity before extraction. The required schema-v10
+manifest carries both the descriptor and original pathname device/inode. An
+incoming image cannot adopt guard authority from a foreign pathname, even if
+that listener belongs to the same PID. A missing name is republished while the
+already adopted original Runs are retained; readiness waits for safe publication.
+Ordinary republish preserves accepted streams; exec retains its existing
+connection-disconnect/reconnect contract and exact Run/output identities. Schema
+mismatch is rejected before extraction, preserving the original serving owner;
+this does not provide compatibility with earlier manifests or qualify an old
+installed image for an in-place transition.
+
+Shutdown cancels further repair and removes a name only while it still matches
+the current owner's guard; a substituted file, symlink or live listener remains
+untouched. Pathname recheck and unlink are separate syscalls, not atomic
+conditional deletion. Arbitrary hostile same-UID pathname exchanges and
+attacker-writable parents remain outside that guarantee; authentication beyond
+filesystem access and peer-credential policy is open. The active `LP-04`
+wrong-case records actual name/parent loss and controlled publication pressure
+separately; source-bound private qualification, not corpus registration or this
+contract, establishes a selected candidate's delivered behavior.
 
 ### Persistent state and database capacity
 

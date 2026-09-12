@@ -48,7 +48,7 @@ use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::Hand
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v9";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v10";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -152,11 +152,20 @@ pub struct HandoffManifest {
     pub schema: String,
     pub epoch: String,
     pub listener_fd: RawFd,
+    pub listener_identity: HandoffSocketIdentity,
     pub state_lock_fd: RawFd,
     pub runs: Vec<HandoffRun>,
     pub stop_operations: Vec<HandoffStopOperation>,
     pub closed_inputs: Vec<HandoffClosedInput>,
     pub resources: ResourceLimits,
+}
+
+/// Pathname identity paired with the listener this owner actually published.
+/// The incoming image must not borrow a substituted socket's guard authority.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffSocketIdentity {
+    pub device: u64,
+    pub inode: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +223,7 @@ impl HandoffManifest {
             schema: HANDOFF_SCHEMA.to_string(),
             epoch,
             listener_fd,
+            listener_identity: HandoffSocketIdentity::default(),
             state_lock_fd,
             runs,
             stop_operations,
@@ -738,6 +748,9 @@ mod tests {
             ".schema:string",
             ".epoch:string",
             ".listener_fd:number",
+            ".listener_identity:object",
+            ".listener_identity.device:number",
+            ".listener_identity.inode:number",
             ".state_lock_fd:number",
             ".runs:array",
             ".runs[].run_id:string",

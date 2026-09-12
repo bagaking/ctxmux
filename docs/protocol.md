@@ -30,6 +30,18 @@ unlinking, the daemon rechecks the socket's device and inode and probes it a
 second time; an observed replacement fails with `SocketTargetChanged` and is
 left untouched.
 
+The original serving daemon automatically repairs a missing socket name or
+private parent under the [publication owner contract](architecture.md#socket-publication-and-identity).
+It does not delete a substituted target or restart Runs. Existing accepted
+attachments continue across ordinary republish; a new client uses the same
+Hello, Status, Attach and control operations to confirm the original Runtime
+and Runs. Resource failure or an unverified foreign target can delay fresh
+connections while the original work remains alive. Existing bounded daemon
+diagnostics report publication failure/recovery; there is no new generation-22
+Run state or publication RPC. Old-stream usability and pathname reachability
+remain separate observations. An embedding client's own control endpoint is
+outside Native ownership.
+
 ## Connection state
 
 Every connection begins with `ClientFrame::Hello`. The daemon either returns a
@@ -867,9 +879,11 @@ guard is armed, writes exactly one NDJSON record:
 The parent accepts bootstrap only when that instance equals the
 `runtime.daemonInstanceId` in the ordinary generation-16 public Hello from the selected
 socket. EOF, invalid JSON, a different instance, a closed descriptor, or a
-receipt write failure fails bootstrap; a requested write failure also removes
-the unpublished socket. The inherited channel proves which spawned child
-published readiness. A socket response, PID, delay, filesystem receipt, binary
+receipt write failure leaves that parent's bootstrap unconfirmed. Failure to
+write to the readiness observer does not retire the healthy Runtime: the daemon
+retains its serving socket and original work and records a bounded diagnostic,
+without pretending the receipt was delivered. The inherited channel proves
+which spawned child published readiness. A socket response, PID, delay, filesystem receipt, binary
 path, or matching protocol version does not. This is activation provenance,
 not Run state, discovery, persistence, cross-user authentication, or a new wire
 generation. Without the flag daemon startup is unchanged.
@@ -879,9 +893,11 @@ process, and `SIGHUP` is a logged no-op. With `--state-dir
 <dedicated-directory>`, one owner-only SQLite store recovers historical Run
 identity, exact `RunSpec`, lineage, terminal state, and the committed bounded
 replay window across cold daemon restart. On intentional `SIGHUP`, the daemon
-instead performs an exec-in-place upgrade: its PID, listener inode, state lock,
-live child and PTY masters, Runtime ID, daemon instance, input cursors and
-settled ledgers survive; attachments reconnect from their own output cursors.
+instead performs an exec-in-place upgrade: its PID, state lock, live child and
+PTY masters, Runtime ID, daemon instance, input cursors and
+settled ledgers survive; the current listener is inherited, and publication
+loss is repaired under the contract below. Attachments reconnect from their own
+output cursors.
 The serving daemon retains its executable route at startup, before a later
 replacement can make Linux report its running image as deleted. A verified
 absolute, relative or PATH symlink launch route selects the replacement at
@@ -906,8 +922,9 @@ already admitted retain their permit through owner completion and response
 write, while later attachment commands receive an explicit retryable
 `backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
 setup failure, or all-owner preflight failure restores normal admission. After
-extraction, ownership has been relinquished to the pending exec and any error is
-fail-stop. The schema-v9 handoff manifest carries the complete established
+extraction, ownership has been relinquished to the pending exec and a handoff
+or ownership error is fail-stop; recoverable publication conditions are described
+below. The schema-v10 handoff manifest carries the complete established
 resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
 preflighted before extraction. Input payload and complete diagnostics use the
@@ -918,8 +935,18 @@ target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellat
 and exec serialize through one final gate. Protocol generation 22 has no upgrade
 wire operation.
 
+The manifest requires the current listener descriptor paired with the original
+bound pathname device/inode. The outgoing image validates that pair before
+extraction; the incoming image never substitutes an independently replaced
+path's identity. If the name or parent disappears across the final exec window,
+it retains the adopted original Runs and repairs publication before readiness.
+An unknown/foreign publication delays readiness without authorizing deletion or
+a second Run owner. These publication conditions are distinct from corrupt
+handoff/descriptor ownership, which remains fail-stop. Attachments reconnect
+across exec; ordinary listener republish does not break their accepted streams.
+
 The handoff schema declares manifest shape, independently of the public protocol
-generation. A matching `ctxmux.daemon-handoff.v9` in the selected target's
+generation. A matching `ctxmux.daemon-handoff.v10` in the selected target's
 `--version` is necessary for preflight; it does not qualify a cross-generation
 upgrade. Generation-21 clients must reconnect using generation-22 clients after
 an upgrade to this image. The complete selected-source live upgrade qualification
@@ -1004,7 +1031,7 @@ The effective per-Run and shared raw budgets, database/WAL policy and VT limits
 come from the current owner's policy, including handoff-preserved values.
 Database policy is the serving connection's effective SQLite page ceiling, not
 sampled occupancy. Default disk quotas are omitted or `null`; explicit positive
-quotas remain supported by daemon/SDK activation and private schema-v9 handoff.
+quotas remain supported by daemon/SDK activation and private schema-v10 handoff.
 Default replay numbers are the most recently sampled filesystem-funded allowance,
 not reserved bytes or a configured permanent ceiling. Unfunded or unknown
 filesystem observation can yield zero new-write allowance without asserting zero
@@ -1211,7 +1238,7 @@ unrelated panic-hook behavior remains unchanged.
 
 ## Pre-stable format fence
 
-This candidate uses SQLite schema 6 and handoff schema 7. Valid schema-5 stores
+This candidate uses SQLite schema 6 and handoff schema 10. Valid schema-5 stores
 are explicitly unsupported, not corrupt. There is no implicit migration or
 fallback. A protocol-18 daemon and protocol-20 client cannot be mixed merely
 because their Run identifiers or executable names match. A deployment needs

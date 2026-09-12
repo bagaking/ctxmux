@@ -14,7 +14,7 @@ use std::{
     io::{self, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
     os::unix::{
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt},
         net::UnixStream as StdUnixStream,
     },
     path::{Path, PathBuf},
@@ -161,6 +161,9 @@ const UPGRADE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
 /// loop at 100% CPU until a descriptor frees. A short fixed sleep drains that
 /// window without any backpressure state to reason about.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
+/// One metadata observation per second bounds idle work independently of Runs.
+/// Missing publication retries at this cadence; it is not a resource quota.
+const SOCKET_PUBLICATION_INTERVAL: Duration = Duration::from_secs(1);
 
 fn runtime_build_id() -> RuntimeBuildId {
     RuntimeBuildId::new(concat!("ctxmuxd/", env!("CARGO_PKG_VERSION")))
@@ -436,9 +439,8 @@ async fn serve_with_persistence_manager(
     state_dir: Option<PathBuf>,
 ) -> Result<(), ServerError> {
     // On the exec-in-place path, reconstruct the listener from the inherited
-    // socket fd. Re-binding would unlink and recreate the socket inode, dropping
-    // every connected client and tripping our own AlreadyRunning guard, so the
-    // adopted path must skip prepare_socket_path / bind / set_permissions.
+    // socket fd. Preserve an unchanged publication; missing-name recovery is
+    // owned by the serving loop, without replacing the adopted Run owner.
     let listener = if let Some(manifest) = &handoff {
         adopt_listener(manifest.listener_fd)?
     } else {
@@ -642,8 +644,36 @@ async fn serve_with_manager(
     // Failure only disables this optional upgrade attempt, never Run serving.
     let upgrade_target =
         launch_executable_path(handoff.is_some()).map_err(|error| error.to_string());
-    let listener = Arc::new(listener);
-    let _socket_guard = SocketGuard::new(socket_path.clone())?;
+    let publication = SocketPublication::new(
+        socket_path.clone(),
+        listener,
+        handoff.as_ref().map(|manifest| manifest.listener_identity),
+    )?;
+    serve_with_publication(
+        socket_path,
+        publication,
+        manager,
+        readiness_fd,
+        handoff,
+        state_dir,
+        upgrade_target,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "signals, publication and current listener share one serving owner"
+)]
+async fn serve_with_publication(
+    socket_path: PathBuf,
+    mut publication: SocketPublication,
+    manager: Arc<RunManager>,
+    mut readiness_fd: Option<OwnedFd>,
+    handoff: Option<crate::handoff::HandoffManifest>,
+    state_dir: Option<PathBuf>,
+    upgrade_target: Result<PathBuf, String>,
+) -> Result<(), ServerError> {
     apply_startup_fd_budget(&manager);
     if let Some(handoff) = &handoff {
         // A12 wires manifest.state_lock_fd into the incoming-image startup path.
@@ -653,32 +683,21 @@ async fn serve_with_manager(
             handoff.runs.len()
         ));
     }
-    if let Some(readiness_fd) = readiness_fd {
-        let mut readiness = fs::File::from(readiness_fd);
-        let record = serde_json::to_vec(&serde_json::json!({
-            "schema": "ctxmux.daemon-ready.v1",
-            "daemon_instance": manager.daemon_instance.to_string(),
-        }))
-        .map_err(|source| ServerError::io("<readiness-fd>", io::Error::other(source)))?;
-        if let Err(error) = readiness
-            .write_all(&record)
-            .and_then(|()| readiness.write_all(b"\n"))
-            .and_then(|()| readiness.flush())
-        {
-            // The launcher observes readiness; it does not own this Runtime.
-            let _ = crate::diagnostics::record(format_args!(
-                "ctxmuxd: readiness observer unavailable ({error}); Runtime keeps serving"
-            ));
-        }
-    }
+    let mut publication_tick = tokio::time::interval(SOCKET_PUBLICATION_INTERVAL);
+    publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .map_err(|source| ServerError::io("<sighup>", source))?;
-
     let mut sigchld = arm_native_exit_relay(&manager)?;
 
     loop {
+        let listener = Arc::clone(&publication.listener);
         tokio::select! {
+            _ = publication_tick.tick() => {
+                if publication.observe() {
+                    publish_readiness(&mut readiness_fd, &manager)?;
+                }
+            }
             result = listener.accept() => {
                 let stream = match result {
                     Ok((stream, _)) => stream,
@@ -686,11 +705,6 @@ async fn serve_with_manager(
                         return Err(ServerError::io(&socket_path, source));
                     }
                     Err(source) => {
-                        // The listener is intact; a descriptor or buffer shortage
-                        // rejected this one connection. Log and keep serving every
-                        // Run we still own. Back off inside this arm — a bare retry
-                        // spins at 100% CPU while the socket stays readable, and
-                        // staying in this arm keeps SIGHUP/ctrl_c responsive.
                         let _ = crate::diagnostics::record(format_args!("ctxmuxd: transient accept error, continuing to serve: {source}"));
                         tokio::time::sleep(ACCEPT_BACKOFF).await;
                         continue;
@@ -710,18 +724,7 @@ async fn serve_with_manager(
                 let _ = diagnostics::shutdown();
                 return Ok(());
             }
-            _ = sigchld.recv() => {
-                // A child (any child) reached a waitable terminal state. Poke the
-                // native owner thread; it re-peeks its whole watched set once and
-                // routes any terminal leader through the same non-reaping
-                // peek-then-`reap_leader` path the timed sweep used. `recv`
-                // coalesces pending SIGCHLDs into a single readiness, so a burst of
-                // exits collapses to one wake — the owner's single sweep still sees
-                // every one, which is why coalescing is correct rather than lossy.
-                // We consult no siginfo/pid here: the wake is a pure hint, and the
-                // owner's peek remains the authoritative observation.
-                manager.native_runs.owner_wake().wake();
-            }
+            _ = sigchld.recv() => manager.native_runs.owner_wake().wake(),
             _ = sighup.recv() => {
                 if manager.persistence.is_none() {
                     let _ = crate::diagnostics::record(format_args!(
@@ -735,27 +738,24 @@ async fn serve_with_manager(
                     ));
                     continue;
                 };
+                if !publication.observe() {
+                    let _ = crate::diagnostics::record(format_args!(
+                        "ctxmuxd: exec-in-place upgrade refused: socket publication unavailable; live ownership was preserved"
+                    ));
+                    continue;
+                }
                 let Some(result) = drive_exec_upgrade(
-                    socket_path.clone(), state_dir.to_path_buf(), Arc::clone(&listener), Arc::clone(&manager), upgrade_target.clone()
+                    socket_path.clone(), state_dir.to_path_buf(), Arc::clone(&publication.listener),
+                    publication.guard.identity, Arc::clone(&manager), upgrade_target.clone()
                 ).await? else { return Ok(()); };
                 match result {
-                    Ok(()) => unreachable!(
-                        "a successful exec-in-place replaces the process image and never returns"
-                    ),
+                    Ok(()) => unreachable!("successful exec replaces the process image"),
                     Err(UpgradeAbort::BeforeExtract(error)) => {
-                        // Reversible failure: nothing has been extracted, all
-                        // controls are still owned. Abort the upgrade and keep
-                        // serving by falling through to the next loop iteration.
                         let _ = crate::diagnostics::record(format_args!(
                             "ctxmuxd: exec-in-place upgrade aborted before extract, continuing to serve: {error}"
                         ));
                     }
                     Err(UpgradeAbort::AfterExtract(error)) => {
-                        // Point of no return passed: native children/controls were
-                        // forgotten and their fds marked to survive exec, but exec
-                        // did not happen. There is no in-image owner to roll back
-                        // to — fail-stop so process death reclaims the fds (never
-                        // resume serving with forgotten controls).
                         let message = format!("exec-in-place upgrade failed after extract: {error}");
                         manager.incarnation_failure.record(message.clone());
                         let _ = manager.shutdown_owned_controls(TMUX_SHUTDOWN_TIMEOUT);
@@ -775,6 +775,32 @@ async fn serve_with_manager(
             }
         }
     }
+}
+
+fn publish_readiness(
+    readiness_fd: &mut Option<OwnedFd>,
+    manager: &RunManager,
+) -> Result<(), ServerError> {
+    if let Some(readiness_fd) = readiness_fd.take() {
+        let mut readiness = fs::File::from(readiness_fd);
+        let record = serde_json::to_vec(&serde_json::json!({
+            "schema": "ctxmux.daemon-ready.v1",
+            "daemon_instance": manager.daemon_instance.to_string(),
+        }))
+        .map_err(|source| ServerError::io("<readiness-fd>", io::Error::other(source)))?;
+        if let Err(error) = readiness
+            .write_all(&record)
+            .and_then(|()| readiness.write_all(b"\n"))
+            .and_then(|()| readiness.flush())
+        {
+            // The launcher observes readiness; it does not own this Runtime.
+            let _ = crate::diagnostics::record(format_args!(
+                "ctxmuxd: readiness observer unavailable ({error}); Runtime keeps serving"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// How an aborted exec-in-place upgrade failed, relative to two irreversible
@@ -1008,6 +1034,7 @@ async fn drive_exec_upgrade(
     socket_path: PathBuf,
     state_dir: PathBuf,
     listener: Arc<UnixListener>,
+    listener_identity: SocketIdentity,
     manager: Arc<RunManager>,
     upgrade_target: Result<PathBuf, String>,
 ) -> Result<Option<Result<(), UpgradeAbort>>, ServerError> {
@@ -1020,6 +1047,7 @@ async fn drive_exec_upgrade(
             &upgrade_socket,
             &state_dir,
             &listener,
+            listener_identity,
             &upgrade_manager,
             &worker_cancellation,
             &upgrade_target,
@@ -1067,12 +1095,14 @@ impl UpgradeCancellation {
 
 #[allow(
     clippy::too_many_lines,
+    clippy::too_many_arguments,
     reason = "reversible preflight and irreversible descriptor extraction form one ordered transaction"
 )]
 fn perform_exec_upgrade(
     socket_path: &std::path::Path,
     state_dir: &std::path::Path,
     listener: &UnixListener,
+    listener_identity: SocketIdentity,
     manager: &RunManager,
     cancellation: &Arc<UpgradeCancellation>,
     upgrade_target: &Result<PathBuf, String>,
@@ -1094,6 +1124,7 @@ fn perform_exec_upgrade(
             failures: "durable state requires recovery; live ownership was preserved".to_owned(),
         }));
     }
+    ensure_socket_identity(socket_path, listener_identity).map_err(UpgradeAbort::BeforeExtract)?;
     let (handoff_file, exe) = prepare_exec_upgrade(state_dir, upgrade_target)?;
 
     // Fence new request mutations and wait until every already-admitted request
@@ -1140,6 +1171,7 @@ fn perform_exec_upgrade(
     let resources = manager.resources;
     let prepared = Arc::new(Mutex::new(None));
     let prepared_by_owner = Arc::clone(&prepared);
+    let publication_path = socket_path.to_path_buf();
     let owner_cancellation = Arc::clone(cancellation);
     // Snapshot, validate, and serialize under the same native owner turn that
     // extracts descriptors. Any preflight error returns before forgetting a
@@ -1177,6 +1209,8 @@ fn perform_exec_upgrade(
         .native_runs
         .extract_for_handoff_after_preflight(Box::new(move |live| {
             owner_cancellation.check()?;
+            ensure_socket_identity(&publication_path, listener_identity)
+                .map_err(|error| error.to_string())?;
             if durable.is_failed() || durable.is_capacity_blocked() {
                 return Err(
                     "durable state requires recovery; live ownership was preserved".to_owned(),
@@ -1203,7 +1237,7 @@ fn perform_exec_upgrade(
                     });
                 }
             }
-            let manifest = crate::handoff::HandoffManifest::configured(
+            let mut manifest = crate::handoff::HandoffManifest::configured(
                 epoch,
                 listener_fd,
                 state_lock_fd,
@@ -1219,6 +1253,7 @@ fn perform_exec_upgrade(
                 closed_inputs,
                 resources,
             );
+            manifest.listener_identity = listener_identity;
             let mut file = handoff_file;
             manifest
                 .write_preflight(&mut file)
@@ -1355,11 +1390,7 @@ where
     fs::remove_file(path).map_err(|source| ServerError::io(path, source))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SocketIdentity {
-    device: u64,
-    inode: u64,
-}
+type SocketIdentity = crate::handoff::HandoffSocketIdentity;
 
 impl SocketIdentity {
     fn from_metadata(metadata: &fs::Metadata) -> Self {
@@ -1398,6 +1429,134 @@ impl Drop for SocketGuard {
             let _ = fs::remove_file(&self.path);
         }
     }
+}
+
+fn ensure_socket_identity(path: &Path, identity: SocketIdentity) -> Result<(), ServerError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| ServerError::io(path, source))?;
+    if !metadata.file_type().is_socket() || SocketIdentity::from_metadata(&metadata) != identity {
+        return Err(ServerError::SocketTargetChanged(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// One owner binds the listener and pathname guard together. Accepted streams
+/// have independent tasks; replacing this pair never replaces the Run owner.
+struct SocketPublication {
+    listener: Arc<UnixListener>,
+    guard: SocketGuard,
+    last_failure: Option<String>,
+    #[cfg(test)]
+    bind_hook: Option<Arc<SocketPublicationTestHook>>,
+}
+
+impl SocketPublication {
+    fn new(
+        path: PathBuf,
+        listener: UnixListener,
+        inherited_identity: Option<SocketIdentity>,
+    ) -> Result<Self, ServerError> {
+        let guard = match inherited_identity {
+            Some(identity) => SocketGuard { path, identity },
+            None => SocketGuard::new(path)?,
+        };
+        Ok(Self {
+            listener: Arc::new(listener),
+            guard,
+            last_failure: None,
+            #[cfg(test)]
+            bind_hook: None,
+        })
+    }
+
+    fn observe(&mut self) -> bool {
+        match self.ensure_published() {
+            Ok(()) => {
+                if self.last_failure.take().is_some() {
+                    #[cfg(test)]
+                    if let Some(hook) = &self.bind_hook {
+                        hook.recoveries.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = diagnostics::record(format_args!(
+                        "ctxmuxd: socket publication restored; original Run ownership retained"
+                    ));
+                }
+                true
+            }
+            Err(error) => {
+                let failure = error.to_string();
+                if self.last_failure.as_ref() != Some(&failure) {
+                    #[cfg(test)]
+                    if let Some(hook) = &self.bind_hook {
+                        hook.failure_reports.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let _ = diagnostics::record(format_args!(
+                        "ctxmuxd: socket publication unavailable; owned Runs retained: {failure}"
+                    ));
+                    self.last_failure = Some(failure);
+                }
+                false
+            }
+        }
+    }
+
+    fn ensure_published(&mut self) -> Result<(), ServerError> {
+        let path = &self.guard.path;
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && SocketIdentity::from_metadata(&metadata) == self.guard.identity =>
+            {
+                return Ok(());
+            }
+            Ok(_) => return Err(ServerError::SocketTargetChanged(path.clone())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ServerError::io(path, error)),
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.bind_hook {
+            hook.attempts.fetch_add(1, Ordering::SeqCst);
+            if hook.storage_full.load(Ordering::SeqCst) {
+                return Err(ServerError::io(
+                    path,
+                    io::Error::from(io::ErrorKind::StorageFull),
+                ));
+            }
+        }
+        if let Some(parent) = path.parent() {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|source| ServerError::io(parent, source))?;
+            let metadata =
+                fs::symlink_metadata(parent).map_err(|source| ServerError::io(parent, source))?;
+            if !metadata.file_type().is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o022 != 0
+            {
+                return Err(ServerError::InvalidSocketTarget(parent.to_path_buf()));
+            }
+        }
+        // Bind only the absent name. Do not invoke startup stale cleanup or
+        // unlink a protected replacement that raced the observation.
+        let listener = UnixListener::bind(path).map_err(|source| ServerError::io(path, source))?;
+        let guard = SocketGuard::new(path.clone())?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|source| ServerError::io(path, source))?;
+        ensure_socket_identity(path, guard.identity)?;
+        self.listener = Arc::new(listener);
+        self.guard = guard;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SocketPublicationTestHook {
+    storage_full: AtomicBool,
+    attempts: AtomicUsize,
+    failure_reports: AtomicUsize,
+    recoveries: AtomicUsize,
 }
 
 struct RunManager {
@@ -9700,6 +9859,7 @@ mod tests {
                 &server.directory.path().join("ctxmux.sock"),
                 &state_dir,
                 &listener,
+                super::SocketIdentity::from_metadata(&fs::symlink_metadata(server.client.socket_path()).unwrap()),
                 &server.manager,
                 &Arc::new(super::UpgradeCancellation::default()),
                 &super::launch_executable_path(false).map_err(|error| error.to_string())
@@ -13517,5 +13677,233 @@ mod tests {
                 phase => panic!("unexpected public capacity fixture phase: {phase}"),
             }
         });
+    }
+
+    #[tokio::test]
+    async fn socket_publication_inherited_identity_preserves_same_process_foreign_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ctxmux.sock");
+        let original = tokio::net::UnixListener::bind(&path).unwrap();
+        let identity = super::SocketIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap());
+        fs::rename(&path, directory.path().join("original.sock")).unwrap();
+        let foreign = tokio::net::UnixListener::bind(&path).unwrap();
+        let foreign_identity =
+            super::SocketIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap());
+        assert_ne!(identity, foreign_identity);
+        let mut publication =
+            super::SocketPublication::new(path.clone(), original, Some(identity)).unwrap();
+        assert!(
+            !publication.observe(),
+            "same process cannot lend foreign listener guard authority"
+        );
+        assert_eq!(publication.guard.identity, identity);
+        drop(publication);
+        assert_eq!(
+            super::SocketIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap()),
+            foreign_identity
+        );
+        let connecting = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let _accepted = foreign.accept().await.unwrap();
+        drop(connecting);
+    }
+
+    async fn publication_attachment_contains(
+        view: &Attachment,
+        bytes: &mut Vec<u8>,
+        cursor: &mut u64,
+        expected: &[u8],
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !bytes
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                match next_non_service_event(view).await.unwrap().unwrap() {
+                    RunEvent::Output { chunk } => {
+                        assert_eq!(chunk.start_byte, *cursor);
+                        *cursor = chunk.end_byte;
+                        bytes.extend_from_slice(&chunk.data);
+                    }
+                    other => panic!("original attachment lost continuity: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "controlled publication pressure protects two real PTYs, bytes, diagnostic and retry costs"
+    )]
+    async fn socket_publication_pressure_recovery_keeps_two_runs_and_bounds_retries() {
+        qualify_publication_pressure(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn socket_publication_protected_replacements_keep_two_runs() {
+        qualify_publication_pressure(true).await;
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "same controlled owner proves pressure and protected targets without replacing two real Runs"
+    )]
+    async fn qualify_publication_pressure(protected: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ctxmux.sock");
+        let (persistence, recovered) = Persistence::open(directory.path().join("state")).unwrap();
+        let manager = Arc::new(RunManager::persistent(persistence.clone(), recovered));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let hook = Arc::new(super::SocketPublicationTestHook::default());
+        hook.storage_full.store(true, Ordering::SeqCst);
+        let mut publication = super::SocketPublication::new(path.clone(), listener, None).unwrap();
+        publication.bind_hook = Some(Arc::clone(&hook));
+        let serving_manager = Arc::clone(&manager);
+        let socket = path.clone();
+        let task = tokio::spawn(super::serve_with_publication(
+            socket,
+            publication,
+            serving_manager,
+            None,
+            None,
+            None,
+            Err("fixture excludes upgrade".to_owned()),
+        ));
+        let client = Client::new(&path);
+        let runtime = client.runtime_info().await.unwrap();
+        let mut runs = Vec::new();
+        let mut views = Vec::new();
+        for input in [b"first-prefix\n".as_slice(), b"second-prefix\n".as_slice()] {
+            let run = client.start(long_running_spec()).await.unwrap();
+            let (view, snapshot) = client.attach(run.id, 0).await.unwrap();
+            let mut bytes = replay_bytes(&snapshot.replay.chunks);
+            let mut cursor = snapshot.replay.latest_output_bytes;
+            view.input(input.to_vec()).await.unwrap();
+            publication_attachment_contains(
+                &view,
+                &mut bytes,
+                &mut cursor,
+                &input[..input.len() - 1],
+            )
+            .await;
+            runs.push(run);
+            views.push((view, bytes, cursor));
+        }
+        let prefixes: Vec<_> = views.iter().map(|(_, bytes, _)| bytes.clone()).collect();
+        persistence.barrier().unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(
+            client.ping().await.is_err(),
+            "held publication cannot pretend ready"
+        );
+        for (view, bytes, cursor) in &mut views {
+            view.input(b"during-pressure\n".to_vec()).await.unwrap();
+            publication_attachment_contains(view, bytes, cursor, b"during-pressure").await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hook.attempts.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            hook.attempts.load(Ordering::SeqCst) <= 3,
+            "unchanged pressure must not spin"
+        );
+        assert_eq!(
+            hook.failure_reports.load(Ordering::SeqCst),
+            1,
+            "unchanged failure owns one diagnostic"
+        );
+        assert!(!task.is_finished());
+        hook.storage_full.store(false, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while client.ping().await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("released controlled ENOSPC must repair same owner");
+        assert_eq!(client.runtime_info().await.unwrap(), runtime);
+        assert_eq!(hook.recoveries.load(Ordering::SeqCst), 1);
+        if protected {
+            for replacement_kind in ["file", "symlink", "foreign"] {
+                hook.storage_full.store(true, Ordering::SeqCst);
+                let displaced = directory
+                    .path()
+                    .join(format!("displaced-{replacement_kind}"));
+                fs::rename(&path, &displaced).unwrap();
+                let foreign = match replacement_kind {
+                    "file" => {
+                        fs::write(&path, b"protected-target").unwrap();
+                        None
+                    }
+                    "symlink" => {
+                        symlink(&displaced, &path).unwrap();
+                        None
+                    }
+                    "foreign" => Some(UnixListener::bind(&path).unwrap()),
+                    _ => unreachable!(),
+                };
+                let identity =
+                    super::SocketIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap());
+                tokio::time::sleep(super::SOCKET_PUBLICATION_INTERVAL + Duration::from_millis(100))
+                    .await;
+                assert!(!task.is_finished());
+                assert_eq!(
+                    super::SocketIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap()),
+                    identity
+                );
+                if replacement_kind == "file" {
+                    assert_eq!(fs::read(&path).unwrap(), b"protected-target");
+                }
+                if replacement_kind == "symlink" {
+                    assert_eq!(fs::read_link(&path).unwrap(), displaced);
+                }
+                if let Some(foreign) = &foreign {
+                    let connection = UnixStream::connect(&path).unwrap();
+                    let _accepted = foreign.accept().unwrap();
+                    drop(connection);
+                }
+                for (view, bytes, cursor) in &mut views {
+                    let expected = format!("protected-{replacement_kind}");
+                    view.input(format!("{expected}\n").into_bytes())
+                        .await
+                        .unwrap();
+                    publication_attachment_contains(view, bytes, cursor, expected.as_bytes()).await;
+                }
+                drop(foreign);
+                fs::remove_file(&path).unwrap();
+                hook.storage_full.store(false, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while client.ping().await.is_err() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(client.runtime_info().await.unwrap(), runtime);
+            }
+        }
+        for (index, run) in runs.iter().enumerate() {
+            assert_eq!(client.status(run.id).await.unwrap().pid, run.pid);
+            assert!(process_exists(run.pid.unwrap()));
+            let (fresh, snapshot) = client.attach(run.id, 0).await.unwrap();
+            assert_eq!(
+                &replay_bytes(&snapshot.replay.chunks)[..prefixes[index].len()],
+                prefixes[index]
+            );
+            let (view, bytes, cursor) = &mut views[index];
+            view.input(b"after-recovery\n".to_vec()).await.unwrap();
+            publication_attachment_contains(view, bytes, cursor, b"after-recovery").await;
+            drop(fresh);
+            manager.get(run.id).unwrap().stop().await.unwrap();
+        }
+        persistence.barrier().unwrap();
+        task.abort();
+        let _ = task.await;
     }
 }

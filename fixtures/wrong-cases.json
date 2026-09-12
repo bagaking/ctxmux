@@ -160,6 +160,61 @@
       ]
     },
     {
+      "id": "LP-04",
+      "choice": "003-unix-socket-json-lines-protocol",
+      "source_ids": [
+        "c01"
+      ],
+      "source_refs": [
+        "https://man7.org/linux/man-pages/man7/unix.7.html"
+      ],
+      "failure_mechanism": "A live listener loses its pathname or private parent, so accepted streams and healthy Runs remain usable while fresh public clients cannot reach the original owner; repair can wrongly restart work, borrow a substituted listener identity or retire foreign names.",
+      "invariant": "The original publication owner repairs only an absent name/private parent while preserving Runtime, Run, child, ordered-byte and accepted-stream ownership; pressure and foreign targets never authorize a replacement owner, deletion or replay.",
+      "preconditions": "Two real interactive PTY Runs, confirmed original replay prefixes and admitted attachments exist before actual socket unlink or private-parent removal. Separately labelled controlled typed publication pressure and real protected target replacements exercise refusal. A real exec target carries the exact current listener and required bound device/inode.",
+      "action": "Remove only the socket, then its private parent in a separate public fixture; hold/release controlled publication failure; substitute ordinary files, symlinks and live listeners, including a same-process listener; repair and exec through the selected real image with a deterministic final-window parent removal.",
+      "oracle": "Fresh public clients reach the same Runtime/incarnation and original daemon/child PIDs, exact original Run IDs and prefixes plus subsequent input/output after automatic repair. Already accepted streams continue during ordinary republish, failure attempts/diagnostics stay bounded, foreign bytes/inodes/listeners are preserved, and exec uses the current listener/guard while retaining Runs and permitting reconnect. Controlled pressure is not evidence of actual host-full behavior; source-bound old-schema refusal is qualified separately from the ordinary corpus gate.",
+      "platform": [
+        "unix"
+      ],
+      "tags": [
+        "protocol",
+        "unix-socket",
+        "publication",
+        "recovery",
+        "ownership",
+        "pressure",
+        "exec",
+        "p0"
+      ],
+      "disposition": "active",
+      "test_refs": [
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "socket_publication_repair_preserves_two_live_runs"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "socket_publication_parent_loss_preserves_two_live_runs"
+        },
+        {
+          "path": "crates/ctxmux-daemon/tests/native_lifecycle.rs",
+          "anchor": "socket_publication_exec_uses_current_listener_and_restores_missing_parent"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "socket_publication_pressure_recovery_keeps_two_runs_and_bounds_retries"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "socket_publication_protected_replacements_keep_two_runs"
+        },
+        {
+          "path": "crates/ctxmux-daemon/src/lib.rs",
+          "anchor": "socket_publication_inherited_identity_preserves_same_process_foreign_listener"
+        }
+      ]
+    },
+    {
       "id": "LP-02",
       "choice": "003-unix-socket-json-lines-protocol",
       "source_ids": ["c02", "c03"],
@@ -699,7 +754,7 @@
         },
         {
           "path": "crates/ctxmux-daemon/src/handoff.rs",
-          "anchor": "policy_optional_quotas_round_trip_through_private_v8_manifest"
+          "anchor": "policy_optional_quotas_round_trip_through_private_v9_manifest"
         },
         {
           "path": "packages/sdk/test/activation.test.ts",

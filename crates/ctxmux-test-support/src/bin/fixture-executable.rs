@@ -7,6 +7,28 @@ use std::{env, process};
 
 fn main() {
     let args: Vec<_> = env::args_os().skip(1).collect();
+    #[cfg(unix)]
+    if let Some(target) = env::var_os("CTXMUX_FIXTURE_NATIVE_TARGET") {
+        use std::os::unix::process::CommandExt;
+
+        // Delegate the real version probe, without synthesizing a schema. Only
+        // the private real-exec case removes its empty publication namespace.
+        if args.iter().any(|arg| arg == "--handoff-fd")
+            && let Some(socket) = env::var_os("CTXMUX_FIXTURE_REMOVE_SOCKET")
+        {
+            let socket = std::path::PathBuf::from(socket);
+            let parent = socket.parent().expect("private socket has a parent");
+            assert_eq!(parent.file_name().unwrap(), "publication");
+            std::fs::remove_file(&socket).expect("remove only private test socket");
+            std::fs::remove_dir(parent).expect("remove only empty private socket parent");
+        }
+        let error = process::Command::new(target)
+            .arg0(env::args_os().next().expect("captured fixture route"))
+            .args(args)
+            .exec();
+        eprintln!("cannot exec real fixture Native: {error}");
+        process::exit(99);
+    }
     if let Some(script) = env::var_os("CTXMUX_FIXTURE_TMUX_SCRIPT") {
         #[cfg(unix)]
         {

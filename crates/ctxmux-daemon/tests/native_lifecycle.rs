@@ -5093,6 +5093,272 @@ async fn upgrade_preserves_live_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_publication_repair_preserves_two_live_runs() {
+    qualify_socket_publication(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_publication_parent_loss_preserves_two_live_runs() {
+    qualify_socket_publication(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn socket_publication_exec_uses_current_listener_and_restores_missing_parent() {
+    qualify_socket_publication(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "source-bound gate supplies the actually rebuilt original v9 Native binary"]
+async fn socket_publication_v9_refuses_v10_before_extract_with_two_live_runs() {
+    let _permit = daemon_spawn_permit().await;
+    let baseline =
+        std::env::var_os("CTXMUX_PUBLICATION_V9_NATIVE").expect("gate supplies original v9 Native");
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let route = directory.path().join("native-route");
+    std::fs::copy(baseline, &route).unwrap();
+    let socket = directory.path().join("ctxmux.sock");
+    let mut child = Command::new(&route)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--state-dir")
+        .arg(directory.path().join("state"))
+        .env(
+            "CTXMUX_FIXTURE_NATIVE_TARGET",
+            env!("CARGO_BIN_EXE_ctxmuxd"),
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = TestDaemon::drain_stderr(&mut child);
+    let mut daemon =
+        TestDaemon::from_spawned_with_stderr(child, Arc::clone(&directory), socket, Some(stderr))
+            .await;
+    let original_runtime = daemon.client.runtime_info().await.unwrap();
+    let original_pid = daemon.child.id();
+    let mut runs = Vec::new();
+    let mut views = Vec::new();
+    for _ in 0..2 {
+        let run = daemon.client.start(interactive_shell()).await.unwrap();
+        let (mut view, snapshot) = daemon.client.attach(run.id, 0).await.unwrap();
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        wait_for_output(&mut view, &mut bytes, &mut cursor, b"READY").await;
+        views.push((view, bytes, cursor));
+        runs.push(run);
+    }
+    let replacement = directory.path().join("next-image");
+    std::fs::copy(ctxmux_test_support::fixture_executable(), &replacement).unwrap();
+    std::fs::rename(replacement, &route).unwrap();
+    daemon.sighup();
+    let refusal = daemon
+        .wait_stderr_line(
+            "exec target rejected before any live Run was risked",
+            5,
+            "real original v9 must refuse actual v10 before extraction",
+        )
+        .await;
+    assert!(refusal.contains("writes ctxmux.daemon-handoff.v9"));
+    assert!(refusal.contains("accepts handoff schema ctxmux.daemon-handoff.v10"));
+    assert_eq!(daemon.child.id(), original_pid);
+    assert!(daemon.child.try_wait().unwrap().is_none());
+    assert_eq!(
+        daemon.client.runtime_info().await.unwrap(),
+        original_runtime
+    );
+    for (index, run) in runs.iter().enumerate() {
+        assert_eq!(daemon.client.status(run.id).await.unwrap().pid, run.pid);
+        assert!(process_exists(run.pid.unwrap()));
+        let (view, bytes, cursor) = &mut views[index];
+        view.input(b"schema-refusal-retains-owner\n".to_vec())
+            .await
+            .unwrap();
+        wait_for_output(view, bytes, cursor, b"OUT:schema-refusal-retains-owner").await;
+        stop_run(&daemon.client, run.id).await;
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one public fixture preserves two exact real PTY histories across publication and exec"
+)]
+async fn qualify_socket_publication(remove_parent: bool, exec_missing: bool) {
+    let _permit = daemon_spawn_permit().await;
+    let directory = Arc::new(tempfile::tempdir().unwrap());
+    let parent = directory.path().join("publication");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = parent.join("ctxmux.sock");
+    let state_dir = directory.path().join("state");
+    let native = Path::new(env!("CARGO_BIN_EXE_ctxmuxd"));
+    let route = directory.path().join("native-route");
+    std::fs::copy(native, &route).unwrap();
+    let mut command = Command::new(&route);
+    command.args([
+        "--socket",
+        socket.to_str().unwrap(),
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+    ]);
+    if exec_missing {
+        command
+            .env("CTXMUX_FIXTURE_NATIVE_TARGET", native)
+            .env("CTXMUX_FIXTURE_REMOVE_SOCKET", &socket);
+    }
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = TestDaemon::drain_stderr(&mut child);
+    let mut daemon = TestDaemon::from_spawned_with_stderr(
+        child,
+        Arc::clone(&directory),
+        socket.clone(),
+        Some(stderr),
+    )
+    .await;
+    let original_runtime = daemon.client.runtime_info().await.unwrap();
+    let original_daemon_pid = daemon.child.id();
+    let mut runs = Vec::new();
+    let mut views = Vec::new();
+    for label in [b"first".as_slice(), b"second".as_slice()] {
+        let run = daemon.client.start(interactive_shell()).await.unwrap();
+        let (mut view, snapshot) = daemon.client.attach(run.id, 0).await.unwrap();
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        wait_for_output(&mut view, &mut bytes, &mut cursor, b"READY").await;
+        let mut input = b"original-".to_vec();
+        input.extend_from_slice(label);
+        input.push(b'\n');
+        view.input(input).await.unwrap();
+        let mut expected = b"OUT:original-".to_vec();
+        expected.extend_from_slice(label);
+        wait_for_output(&mut view, &mut bytes, &mut cursor, &expected).await;
+        views.push((view, bytes, cursor));
+        runs.push(run);
+    }
+    let prefixes: Vec<_> = views.iter().map(|(_, bytes, _)| bytes.clone()).collect();
+    for (index, run) in runs.iter().enumerate() {
+        timeout(scaled(Duration::from_secs(5)), async {
+            while daemon
+                .client
+                .status(run.id)
+                .await
+                .unwrap()
+                .durable_output_bytes
+                .unwrap()
+                < views[index].2
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("original prefix must be confirmed before publication loss");
+    }
+    std::fs::remove_file(&socket).unwrap();
+    if remove_parent {
+        std::fs::remove_dir(&parent).unwrap();
+    }
+    // Existing connections remain independent of the missing listening name.
+    for (view, bytes, cursor) in &mut views {
+        view.input(b"accepted-stream\n".to_vec()).await.unwrap();
+        wait_for_output(view, bytes, cursor, b"OUT:accepted-stream").await;
+    }
+    timeout(scaled(Duration::from_secs(5)), async {
+        while daemon.client.ping().await.is_err() {
+            assert!(daemon.child.try_wait().unwrap().is_none());
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("same owner must automatically restore fresh-client reachability");
+    assert_eq!(
+        daemon.client.runtime_info().await.unwrap(),
+        original_runtime
+    );
+    assert_eq!(daemon.child.id(), original_daemon_pid);
+    assert_eq!(
+        std::fs::symlink_metadata(&socket).unwrap().mode() & 0o777,
+        0o600
+    );
+    if remove_parent {
+        assert_eq!(
+            std::fs::symlink_metadata(&parent).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
+    if exec_missing {
+        // Atomic route replacement retains the startup route. The fixture
+        // delegates the actual candidate --version and deletes only this
+        // publication after extraction, immediately before the real exec.
+        let replacement = directory.path().join("route-next");
+        std::fs::copy(ctxmux_test_support::fixture_executable(), &replacement).unwrap();
+        std::fs::rename(replacement, &route).unwrap();
+        daemon.sighup();
+        let adopted = timeout(scaled(Duration::from_secs(10)), async {
+            loop {
+                assert!(
+                    daemon.child.try_wait().unwrap().is_none(),
+                    "incoming image discarded original Run ownership after publication loss"
+                );
+                if let Some(line) = daemon
+                    .stderr_lines
+                    .as_ref()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|line| line.contains("adopted inherited listener for handoff"))
+                    .cloned()
+                {
+                    return line;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("incoming actual image must retain and adopt the original owner");
+        assert!(adopted.contains(" 2 run(s)"));
+        timeout(scaled(Duration::from_secs(5)), async {
+            while daemon.client.ping().await.is_err() {
+                assert!(daemon.child.try_wait().unwrap().is_none());
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("incoming actual image must republish its missing parent");
+        assert_eq!(
+            daemon.client.runtime_info().await.unwrap(),
+            original_runtime
+        );
+        assert_eq!(daemon.child.id(), original_daemon_pid);
+        assert!(daemon.child.try_wait().unwrap().is_none());
+    }
+    for (index, run) in runs.iter().enumerate() {
+        let status = daemon.client.status(run.id).await.unwrap();
+        assert_eq!(status.pid, run.pid);
+        assert_eq!(status.state, RunState::Running);
+        assert!(process_exists(run.pid.unwrap()));
+        let (mut fresh, snapshot) = daemon.client.attach(run.id, 0).await.unwrap();
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        assert_eq!(&bytes[..prefixes[index].len()], prefixes[index]);
+        fresh.input(b"fresh-client\n".to_vec()).await.unwrap();
+        wait_for_output(&mut fresh, &mut bytes, &mut cursor, b"OUT:fresh-client").await;
+        assert!(
+            bytes
+                .windows(b"OUT:accepted-stream".len())
+                .any(|w| w == b"OUT:accepted-stream")
+        );
+        drop(fresh);
+        stop_run(&daemon.client, run.id).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(
     clippy::too_many_lines,
     reason = "one continuous test drives a burst through the exec-upgrade reader window and proves content-complete, gapless continuity from the settled snapshot"
