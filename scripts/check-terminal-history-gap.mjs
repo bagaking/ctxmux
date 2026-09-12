@@ -13,6 +13,10 @@ assert(flags.has("--native") && flags.has("--consumer"), "both native owner and 
 const output = path.resolve(option("--output") ?? path.join(root, ".tmp", "terminal-history-gap", randomUUID()));
 fs.mkdirSync(output, { recursive: true });
 const digest = (filename) => createHash("sha256").update(fs.readFileSync(filename)).digest("hex");
+// Separate source-specific native output, without rebuildable incremental and
+// debugger data filling the user's shared filesystem. This is a test build
+// property; published release artifacts use the standard builder separately.
+const buildEnvironment = { ...process.env, CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0" };
 function replayBytes(chunks) {
   let cursor = chunks[0]?.start_byte;
   for (const chunk of chunks) {
@@ -23,7 +27,7 @@ function replayBytes(chunks) {
   return Buffer.concat(chunks.map((chunk) => Buffer.from(chunk.data)));
 }
 function command(program, args, cwd, log) {
-  const result = spawnSync(program, args, { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+  const result = spawnSync(program, args, { cwd, env: buildEnvironment, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
   fs.writeFileSync(log, `${result.stdout ?? ""}${result.stderr ?? ""}`);
   assert.equal(result.error, undefined, program);
   assert.equal(result.status, 0, `${program}: ${log}`);
@@ -98,7 +102,7 @@ for (const name of cases) {
   const client = new CtxmuxClient({ socketPath: socket });
   const runs = [];
   let failure;
-  const report = { name, base, selected, implementationSha256: digest(path.join(source, owned[0])), daemonSha256: digest(path.resolve(daemonBinary)), sdkSha256: digest(path.resolve(sdkPath)) };
+  const report = { name, base, selected, nativeTestBuild: { profile: "dev", incremental: false, debugInfo: false }, implementationSha256: digest(path.join(source, owned[0])), daemonSha256: digest(path.resolve(daemonBinary)), sdkSha256: digest(path.resolve(sdkPath)) };
   try {
     await until(() => fs.existsSync(socket), "private daemon socket");
     report.runtime = await client.runtimeInfo();
@@ -168,7 +172,7 @@ for (const name of cases) {
     const target = path.join(directory, "target");
     const libLog = path.join(directory, "known-model-source-gap.log");
     const args = ["test", "--locked", "-p", "ctxmux-daemon", "--target-dir", target, "--lib", "tests::history_gap_distinction_keeps_true_source_gap_unknown", "--", "--exact", "--nocapture"];
-    const result = spawnSync("cargo", args, { cwd: source, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
+    const result = spawnSync("cargo", args, { cwd: source, env: buildEnvironment, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 });
     const raw = `${result.stdout ?? ""}${result.stderr ?? ""}`;
     fs.writeFileSync(libLog, raw);
     assert.equal(result.error, undefined);
@@ -212,7 +216,7 @@ for (const name of cases) {
       const protocolLog = path.join(directory, "public-backend-source-gap.log");
       const protocolResult = spawnSync("cargo", ["test", "--locked", "-p", "ctxmux-daemon", "--target-dir", target, "--test", "tmux_adapter", "public_pause_emits_exact_gap_and_requests_control_mode_continue", "--", "--exact", "--nocapture"], {
         cwd: source, encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
-        env: { ...process.env, CTXMUX_TEST_HISTORY_GAP_DAEMON: path.resolve(daemonBinary) },
+        env: { ...buildEnvironment, CTXMUX_TEST_HISTORY_GAP_DAEMON: path.resolve(daemonBinary) },
       });
       const protocolRaw = `${protocolResult.stdout ?? ""}${protocolResult.stderr ?? ""}`;
       fs.writeFileSync(protocolLog, protocolRaw);
