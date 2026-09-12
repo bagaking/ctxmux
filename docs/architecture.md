@@ -493,6 +493,17 @@ of this contract. Any unavoidable pressure or unsupported recovery class is
 reported explicitly. Both fault scope and resource cost require two real Runs
 and public clients before a shared-owner change is qualified.
 
+Shared raw-history reclamation observes each candidate's attachment state and
+best-effort retained-byte count at most once per scan, then sorts those fixed keys.
+Unattached candidates precede attached ones, known larger byte counts precede
+smaller counts and busy/unknown counts, Run identity breaks ties, and the
+triggering Run is last. Reclamation rechecks the actual output owner and
+protected byte fence; an observation does not grant authority to drop bytes.
+Cached keys use transient space proportional to participating Runs and avoid
+repeated output try-locks and identity-string allocations during comparison.
+This prevents a changing observation from invalidating the sort order; it
+does not make a previously stopped native owner recoverable.
+
 The entry guard checks actual Native owner completion before PTY creation,
 registration and handoff. A finished owner rejects Start before launch.
 Completion retains its stopped/unwound or observed syscall stage/errno and

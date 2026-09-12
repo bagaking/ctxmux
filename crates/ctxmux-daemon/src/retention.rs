@@ -4,6 +4,7 @@
 //! No production budget is derived from, or forced above, a fixture workload.
 
 use std::{
+    cmp::Reverse,
     collections::HashMap,
     sync::{
         Arc, Mutex, Weak,
@@ -247,17 +248,19 @@ impl RetentionBudget {
             participants.values().filter_map(Weak::upgrade).collect()
         };
 
-        // Order victims: unattached before attached, then most-retained first,
-        // then by RunId for determinism. The Run that just pushed sorts last so
-        // it is the last resort, not the first casualty.
-        victims.sort_by(|a, b| {
-            let a_except = a.run_id() == except;
-            let b_except = b.run_id() == except;
-            a_except
-                .cmp(&b_except)
-                .then_with(|| a.is_attached().cmp(&b.is_attached()))
-                .then_with(|| b.retained_output_bytes().cmp(&a.retained_output_bytes()))
-                .then_with(|| a.run_id().to_string().cmp(&b.run_id().to_string()))
+        // Attachment and try-lock observations can change between comparisons.
+        // Cache each key once so sorting has a total order, without locking any
+        // Run across the scan. Actual reclamation revalidates its own owner and
+        // protected byte fence below. None remains after known byte counts.
+        // Unattached/largest first, deterministic RunId ties, triggering Run last.
+        victims.sort_by_cached_key(|victim| {
+            let id = victim.run_id();
+            (
+                id == except,
+                victim.is_attached(),
+                Reverse(victim.retained_output_bytes()),
+                id,
+            )
         });
 
         let mut remaining = over;
@@ -280,7 +283,13 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::{
+        cmp::Reverse,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::{RETENTION_BUDGET_BYTES, RetentionBudget, RetentionVictim};
     use ctxmux_protocol::RunId;
@@ -478,5 +487,271 @@ mod tests {
             "a single-flight loser must not reclaim"
         );
         drop(held);
+    }
+
+    #[test]
+    fn changing_observations_cannot_change_one_reclamation_order() {
+        // These observations have the same best-effort contract as a live
+        // attachment counter and a busy/free output try-lock. Later reads may
+        // disagree with the first; actual reclamation still owns its byte fence.
+        struct ChangingVictim {
+            victim: Arc<FakeVictim>,
+            first_attached: bool,
+            first_bytes: Option<usize>,
+            attachment_reads: AtomicUsize,
+            byte_reads: AtomicUsize,
+            reclaimed: Arc<Mutex<Vec<RunId>>>,
+        }
+        impl RetentionVictim for ChangingVictim {
+            fn run_id(&self) -> RunId {
+                self.victim.run_id()
+            }
+            fn is_attached(&self) -> bool {
+                if self.attachment_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    self.first_attached
+                } else {
+                    !self.first_attached
+                }
+            }
+            fn retained_output_bytes(&self) -> Option<usize> {
+                if self.byte_reads.fetch_add(1, Ordering::AcqRel) == 0 {
+                    self.first_bytes
+                } else {
+                    self.first_bytes.is_none().then_some(usize::MAX)
+                }
+            }
+            fn reclaimable_output_bytes(&self) -> usize {
+                self.victim.reclaimable_output_bytes()
+            }
+            fn reclaim_output(&self, drop_at_least: usize) -> usize {
+                self.reclaimed.lock().unwrap().push(self.run_id());
+                self.victim.reclaim_output(drop_at_least)
+            }
+        }
+
+        let budget = RetentionBudget::with_limit(1);
+        let reclaimed = Arc::new(Mutex::new(Vec::new()));
+        let victims: Vec<_> = (0..64)
+            .map(|index| {
+                let victim = Arc::new(ChangingVictim {
+                    victim: FakeVictim::new(&budget, false, &[index + 2]),
+                    first_attached: index % 3 == 0,
+                    first_bytes: (index % 5 != 0).then_some(index % 7),
+                    attachment_reads: AtomicUsize::new(0),
+                    byte_reads: AtomicUsize::new(0),
+                    reclaimed: Arc::clone(&reclaimed),
+                });
+                let participant: Arc<dyn RetentionVictim + Send + Sync> = victim.clone();
+                budget.register(&participant);
+                victim
+            })
+            .collect();
+        let except = victims[7].run_id();
+        let mut expected: Vec<_> = victims
+            .iter()
+            .map(|victim| {
+                (
+                    victim.run_id() == except,
+                    victim.first_attached,
+                    Reverse(victim.first_bytes),
+                    victim.run_id(),
+                )
+            })
+            .collect();
+        expected.sort();
+
+        budget.reclaim_excess(except);
+
+        assert_eq!(
+            budget.retained_total(),
+            1,
+            "actual byte accounting survives stale keys"
+        );
+        assert_eq!(
+            *reclaimed.lock().unwrap(),
+            expected.iter().map(|key| key.3).collect::<Vec<_>>(),
+            "one decision uses the original observations, including busy None and except-last"
+        );
+        for victim in victims {
+            assert_eq!(victim.attachment_reads.load(Ordering::Acquire), 1);
+            assert_eq!(victim.byte_reads.load(Ordering::Acquire), 1);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::too_many_lines)] // Keep the two-Run lifetime and cleanup in one proof.
+    async fn two_real_runs_keep_serving_across_retention_pressure_and_reconnect() {
+        use ctxmux_client::{Client, replay_bytes};
+        use ctxmux_protocol::{
+            DaemonInstanceId, InputOperationKey, NativeInputPhase, NativeOutputStatus,
+            NativeOwnerStatus, RecoverableInput, RunInfo, RunSpec, TerminalSize,
+        };
+        use futures_util::FutureExt;
+        use std::{panic::AssertUnwindSafe, time::Duration};
+
+        async fn output_through(client: &Client, id: RunId, through: u64) -> RunInfo {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let info = client.status(id).await.expect("public Run status");
+                    if info.latest_output_bytes >= through {
+                        return info;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("real PTY output makes progress")
+        }
+
+        let manager = Arc::new(crate::RunManager::with_instance_stats_and_resources(
+            DaemonInstanceId::new(),
+            crate::QualificationStats::default(),
+            crate::ResourceLimits {
+                // The flood exceeds the shared bound but not the per-Run bound,
+                // so a truncated raw tail proves shared reclamation ran.
+                hot_output_bytes: 8192,
+                run_output_bytes: 65536,
+                ..crate::ResourceLimits::default()
+            },
+        ));
+        let server = crate::tests::InProcessServer::start(Arc::clone(&manager));
+        let mut children = Vec::new();
+        let proof = AssertUnwindSafe(async {
+            let client = &server.client;
+            let runtime = client.runtime_info().await.expect("private Runtime");
+            let spec = RunSpec {
+                program: "python3".to_owned(),
+                args: vec![
+                    "-u".to_owned(),
+                    "-c".to_owned(),
+                    "import os,sys,tty\ntty.setraw(0)\nos.write(1,b'READY\\n')\nwhile True:\n b=os.read(0,1)\n if not b: break\n sys.stdout.buffer.write(b'x'*32768+b'\\nFLOOD\\n' if b==b'f' else b)\n sys.stdout.buffer.flush()\n".to_owned(),
+                ],
+                cwd: Some(server.directory.path().to_string_lossy().into_owned()),
+                env: std::collections::BTreeMap::new(),
+                initial_size: TerminalSize { rows: 4, cols: 80 },
+                declared_inputs: Vec::new(),
+            };
+            let active = client.start(spec.clone()).await.expect("start flood Run");
+            children.push(active.clone());
+            let quiet = client.start(spec).await.expect("start unrelated Run");
+            children.push(quiet.clone());
+            assert_ne!(active.id, quiet.id);
+            assert_ne!(active.pid, quiet.pid);
+            assert!(active.pid.is_some() && quiet.pid.is_some());
+            output_through(client, active.id, 6).await;
+            output_through(client, quiet.id, 6).await;
+            let (active_view, _) = client.attach(active.id, 0).await.expect("attach active");
+            let (quiet_view, _) = client.attach(quiet.id, 0).await.expect("attach quiet");
+            let observing = async {
+                for _ in 0..20 {
+                    let (view, _) = client.attach(quiet.id, 0).await.expect("concurrent attach");
+                    view.detach().await.expect("concurrent detach");
+                }
+            };
+            let pressure = async {
+                let accepted = client
+                    .recoverable_input(RecoverableInput {
+                        daemon_instance: runtime.daemon_instance_id,
+                        operation_key: InputOperationKey::new("retention-flood").unwrap(),
+                        id: active.id,
+                        expected_byte: 0,
+                        data: b"f".to_vec(),
+                    })
+                    .await
+                    .expect("flood input is applied");
+                assert_eq!(accepted.receipt.start_byte, 0);
+                assert_eq!(accepted.receipt.end_byte, 1);
+                output_through(client, active.id, 6 + 32768 + 7).await;
+            };
+            tokio::join!(observing, pressure);
+            active_view.detach().await.expect("detach active");
+            quiet_view.detach().await.expect("detach quiet");
+
+            let (tail_view, tail) = client.attach(active.id, 0).await.expect("raw retained tail");
+            assert!(tail.replay.first_available_byte > 0, "shared budget reclaimed bytes");
+            assert!(replay_bytes(&tail.replay.chunks).ends_with(b"\nFLOOD\n"));
+            tail_view.detach().await.expect("detach tail");
+
+            // A fresh public client observes the same Runs and exact input
+            // cursor. Repeating one operation must not write it a second time.
+            let reconnected = Client::new(server.directory.path().join("ctxmux.sock"));
+            for (index, byte) in [b'a', b'b'].into_iter().enumerate() {
+                let operation = RecoverableInput {
+                    daemon_instance: runtime.daemon_instance_id,
+                    operation_key: InputOperationKey::new(format!("retention-reconnect-{index}"))
+                        .unwrap(),
+                    id: quiet.id,
+                    expected_byte: index as u64,
+                    data: vec![byte],
+                };
+                let accepted = reconnected.recoverable_input(operation.clone()).await.unwrap();
+                assert_eq!(accepted.receipt.start_byte, index as u64);
+                assert_eq!(accepted.receipt.end_byte, index as u64 + 1);
+                let repeated = reconnected.recoverable_input(operation).await.unwrap();
+                assert_eq!(repeated.receipt, accepted.receipt);
+                output_through(&reconnected, quiet.id, 7 + index as u64).await;
+            }
+            let (view, snapshot) = reconnected.attach(quiet.id, 6).await.unwrap();
+            assert_eq!(replay_bytes(&snapshot.replay.chunks), b"ab");
+            view.detach().await.unwrap();
+            for original in [active, quiet] {
+                let info = reconnected.status(original.id).await.unwrap();
+                assert_eq!(info.pid, original.pid, "no replacement child");
+                assert!(info.state.is_running());
+                let service = info.native_service.expect("live native service");
+                assert_eq!(service.owner, NativeOwnerStatus::Serving {});
+                assert_eq!(service.output, NativeOutputStatus::Serving {});
+                assert_eq!(service.input.phase, NativeInputPhase::Open {});
+                eprintln!("retention public proof: id={} pid={:?} head={} owner={:?} input_bytes={:?}",
+                    info.id, info.pid, info.latest_output_bytes, service.owner,
+                    service.input.completed_input_bytes);
+            }
+        })
+        .catch_unwind()
+        .await;
+        // This fixture owns only its private manager and children. Always reap
+        // them, including after a failed assertion; never touch a user daemon.
+        let mut cleanup_failures = Vec::new();
+        for child in children {
+            let id = child.id;
+            match tokio::time::timeout(Duration::from_secs(5), server.client.stop_once(id)).await {
+                Ok(Ok(stopped)) if !stopped.run.state.is_running() => {
+                    eprintln!(
+                        "retention cleanup proof: id={id} state={:?}",
+                        stopped.run.state
+                    );
+                }
+                result => cleanup_failures.push(format!("private Run {id}: {result:?}")),
+            }
+            // Even an unexpected shared-owner failure must not orphan this
+            // fixture. Reuse retained-child test cleanup, without admitting
+            // the failed public Stop as a passing result.
+            let run = manager.get(id).unwrap();
+            if let Some(crate::RunControl::Native(control)) = &run.incarnation_control
+                && control.retains_failed_child()
+            {
+                let mut session = crate::native_session::NativeSession::from_child_pid(
+                    child.pid.expect("actual native child"),
+                )
+                .unwrap();
+                if let Err(error) = control.cleanup_retained_owner_child_for_test(&mut session) {
+                    cleanup_failures.push(error);
+                }
+            }
+            let pid = rustix::process::Pid::from_raw(
+                i32::try_from(child.pid.expect("actual native child")).unwrap(),
+            )
+            .unwrap();
+            if rustix::process::test_kill_process(pid) != Err(rustix::io::Errno::SRCH) {
+                cleanup_failures.push(format!("private child {pid:?} still exists"));
+            }
+        }
+        manager
+            .shutdown_owned_controls(Duration::from_secs(5))
+            .expect("clean up private PTY processes");
+        assert!(cleanup_failures.is_empty(), "{cleanup_failures:?}");
+        if let Err(panic) = proof {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
