@@ -98,6 +98,16 @@ those tasks.
 
 ## P0 — shared Native owner failure containment and recovery qualification
 
+The user configuration and defense continuation is recorded in resource
+Feature `f-22tcz9d9r/T-013` and the
+[source audit](reviews/runtime-defense-and-configuration-audit.md). The first
+delivery makes ordinary configuration explicit in README and records every
+current resource field's owner and disposition. Root implementation still
+requires owner-derived internal settings, funded terminal/parser allocation
+and complete public failure/recovery qualification. Existing Native
+`f-22vcz84zn` and resource tasks retain those outcomes; a documentation result
+does not replace their behavioral acceptance.
+
 Feature `f-22vcz84zn` owns the accepted ctxmux optimization plan and final
 qualification for the [P0 incident](reviews/native-owner-failure-case-study.md).
 The original Native repair is preserved in its author worktree; ctxmux Root

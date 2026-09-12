@@ -62,6 +62,51 @@ PTY control, ordered output cursor, and recoverable-Input retry truth continue
 in the incoming image. Existing attachment connections close and reconnect
 from their last observed output cursor.
 
+## Configuration: choose persistence, then use the defaults
+
+**Ordinary use requires no resource tuning.** The CLI chooses its socket and
+activates a memory-only daemon. Choose `--state-dir` when you need historical
+Run identity and committed output after a cold restart; choose `--socket` only
+when selecting a different Runtime. Persistence does not preserve live process
+control across a crash or host reboot.
+
+| Choice                 | Default                                                              | When to change it                                                                                                                                             |
+| ---------------------- | -------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Socket                 | `$XDG_RUNTIME_DIR/ctxmux/ctxmux.sock`, otherwise a process-temp path | Select another Runtime with `--socket` or `CTXMUX_SOCKET`.                                                                                                    |
+| Persistent state       | Memory-only                                                          | Start `ctxmuxd` with `--state-dir <path>` to retain committed history across cold restart.                                                                    |
+| Hot output history     | 1 GiB shared across Runs                                             | Optionally set `hot_output_bytes` to change the in-memory raw replay allowance. This is not a whole-daemon memory limit.                                      |
+| Durable output history | Derived from available filesystem resources                          | Optionally set `durable_replay_bytes` to reserve a smaller logical output-history allowance. Database, checkpoints and compaction need additional disk space. |
+
+For example, a persistent daemon with 128 MiB of hot replay and a 4 GiB durable
+replay quota:
+
+```bash
+target/debug/ctxmuxd \
+  --socket target/ctxmux.sock \
+  --state-dir target/ctxmux-state \
+  --resource-limits '{"hot_output_bytes":134217728,"durable_replay_bytes":4294967296}'
+```
+
+History budgets retain a recent window, not permanent archival. Reclamation
+reports the actual first available byte and truncation; it preserves retained
+Run identity and confirmed byte heads. There is no fixed default Run-count
+ceiling or independent 4 MiB per-Run history ceiling. Host FD/PTY availability,
+metadata funding and other owner budgets still constrain admission. Actual
+storage pressure can prevent new writes even below an explicit history quota.
+
+Resource settings apply **when a daemon starts**. `--resource-limits` overrides
+`CTXMUX_RESOURCE_LIMITS`; omitted fields use defaults. Connecting to an existing
+daemon does not reconfigure it, and a planned exec carries its established
+policy. The SDK uses the same startup policy through `activateRuntime`'s
+`resourceLimits` option.
+
+Worker counts, queue sizes, WAL staging and handoff budgets are advanced owner
+controls, not ordinary setup requirements. The current interface still exposes
+30 resource fields; reducing that interface and proving derived terminal-memory
+funding remain open architecture work. See the complete current
+[resource policy](docs/architecture/choices/019-resource-policy-and-honest-qualification.md)
+and the [source audit](docs/reviews/runtime-defense-and-configuration-audit.md).
+
 ## Why this exists
 
 A shell, coding agent, or dev server should not die with the window that
@@ -168,12 +213,12 @@ when the daemon runs with `--state-dir`. Details live in
 
 Pre-alpha. The daemon owns a real native PTY Run. The CLI and SDK are both
 clients of that Run. Interactive attach reconstructs the current screen;
-the generation-14 protocol carries raw PTY bytes as strict padded base64 on
+the versioned protocol carries raw PTY bytes as strict padded base64 on
 the JSON wire and exposes decoded `Uint8Array` chunks to SDK callers. A
 raw-output `Gap` can be recovered by reattaching from the caller's last observed byte cursor; a
 non-output observation discontinuity ends that attachment because byte replay
 cannot restore the missing semantics. Persistent mode recovers committed
-history after cold restart, retries an exact ordered mutation while SQLite
-reports `DiskFull`, and preserves live PTY control across a planned
+history after cold restart, retains accepted write debt under storage pressure
+while preserving reads and healthy controls, and preserves live PTY control across a planned
 exec-in-place `SIGHUP` upgrade. Crash-time adoption and host-reboot process
 continuity remain unsupported.

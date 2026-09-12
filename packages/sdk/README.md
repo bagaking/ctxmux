@@ -131,7 +131,6 @@ const activation = await activateRuntime({
   executable: "/opt/ctxmux/bin/ctxmuxd",
   socketPath: "/tmp/my-product/ctxmux.sock",
   stateDir: "/tmp/my-product/state",
-  env: { CTXMUX_LOG: "warn" },
   timeoutMs: 30_000,
   childDisposition: "detached",
   requiredCapabilities: { "native.start": 1 },
@@ -142,7 +141,7 @@ const run = await activation.client.start({
   args: ["-c", "printf 'hello\\n'; sleep 30"],
   cwd: null,
   env: {},
-  size: { cols: 80, rows: 24 },
+  initial_size: { cols: 80, rows: 24 },
   declared_inputs: [],
 });
 
@@ -150,7 +149,7 @@ await activation.dispose(); // client-only: the daemon and Run remain alive
 ```
 
 Activation first `lstat`s the target without following symlinks, probes an
-existing socket with the public generation-13 Hello, and reuses it only when
+existing socket with the public versioned Hello, and reuses it only when
 the requested Runtime identity/build/capabilities match. An inactive Unix
 socket is treated as stale; the daemon performs its own identity-checked socket
 cleanup. If a launch is needed, the helper passes `--readiness-fd 3` and waits
@@ -187,6 +186,41 @@ closed: an incompatible live endpoint is left running, and an ordinary file,
 symlink, stale replacement, or unrelated socket is never unlinked by the SDK.
 The helper owns only the child it started and has no credential, Electron,
 plugin-discovery, Provider, or remote-runtime policy.
+
+### Resource configuration
+
+Omit `resourceLimits` for ordinary activation. Select `stateDir` when historical
+Run identity and committed output must survive cold restart. Resource policy is
+applied only when this activation starts a daemon; it does not reconfigure a
+Runtime that is already serving.
+
+When the host needs an explicit raw-history allowance, use the two aggregate
+history fields:
+
+```ts
+const activation = await activateRuntime({
+  executable: "/opt/ctxmux/bin/ctxmuxd",
+  socketPath: "/tmp/my-product/ctxmux.sock",
+  stateDir: "/tmp/my-product/state",
+  resourceLimits: {
+    hot_output_bytes: 134_217_728,
+    durable_replay_bytes: 4_294_967_296,
+  },
+});
+```
+
+The hot default is 1 GiB shared across Runs, not a total-process memory cap.
+Durable replay defaults to actual filesystem funding; an explicit quota covers
+logical replay payload rather than all database, checkpoint and compaction
+space. Omitted per-Run quotas follow their aggregate owners. Retention is a
+recent window with explicit truncation, not permanent archival.
+
+The current `RuntimeResourceLimits` type also exposes advanced worker, queue
+and owner-budget fields. They are not required setup, and reducing that surface
+remains open work. Defaults, CLI/environment precedence, startup-only semantics
+and the complete current field contract are described in the
+[root configuration guide](../../README.md#configuration-choose-persistence-then-use-the-defaults)
+and [resource policy](../../docs/architecture/choices/019-resource-policy-and-honest-qualification.md).
 
 `start` and `fork` accept an optional caller-retained creation operation key.
 When a connection closes before its response is known, retry the exact request

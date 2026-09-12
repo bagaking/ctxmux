@@ -681,6 +681,37 @@ promise that an unmodified tmux client can attach to ctxmux.
 
 ## Security, durability, and resource boundaries
 
+### Small user configuration and owner-derived execution policy
+
+Accepted architecture direction: ordinary users choose the Runtime endpoint
+and whether historical state persists. Resource tuning is optional. The
+ordinary operator-facing history choices are the aggregate hot replay
+allowance and an optional durable replay quota; these do not constitute a
+whole-process memory or whole-directory disk limit. README is the entrypoint
+for defaults, consequences, pressure and startup-only semantics.
+
+Execution settings must follow their actual owners. Worker widths, queue and
+fairness work units, WAL staging and handoff encoding allowances should be
+derived where their resource relation is known. An independent override needs
+a legitimate workload and a user-relevant effect; a qualified fixture size or
+an implementation convenience is insufficient. Reducing user choices must
+preserve real owner funding and exact operation results, rather than merely
+hiding existing knobs or silently moving limits elsewhere.
+
+The durable correction has three parts: retain original bytes and actual
+process authority before derived work; contain Run-local/view-local failures;
+and distinguish current resource policy from structural integrity and durable
+recovery. Each owner must maintain forward progress or truthful local pressure
+without making an unrelated Run depend on its derived work. There is no new
+supervisor, replacement Runtime or policy ledger.
+
+Today's CLI/SDK still accepts thirty low-level resource fields. Terminal
+allocation/history/restore and some derived allowances remain unfinished
+resource work. The [source-level defense and configuration audit](reviews/runtime-defense-and-configuration-audit.md)
+records the dispositions and existing execution owners. This accepted direction
+and the README update do not claim that interface reduction, runtime refactoring
+or full two-Run qualification is complete.
+
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 
 [Decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md)

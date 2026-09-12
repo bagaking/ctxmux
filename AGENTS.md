@@ -139,6 +139,15 @@ slice needs them.
     rebuildable caches. Preserve failed runs, recovery evidence and user
     Runtime state; leave other owners' edits visible and untouched. Never hide
     files or delete evidence merely to make repository status look clean.
+16. Keep user configuration small and explicit. Ordinary use must not require
+    tuning worker counts, queue sizes, fairness turns, WAL batches or handoff
+    internals. Prefer owner-derived settings; retain an operator control only
+    for a real user choice or independently justified workload need. Document
+    every supported user-facing control's default, units, scope, pressure
+    behavior and activation timing prominently in README or its linked
+    advanced contract. An advanced escape hatch does not close configuration
+    simplification, and removing protection without funding its owner does not
+    close the defense audit.
 
 ## Required Validation
 
