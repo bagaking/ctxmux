@@ -48,7 +48,7 @@ use crate::{ResourceLimits, creation::HandoffStopOperation, native_control::Hand
 /// bump on an upgrade that would have been safe. `the_schema_string_is_pinned_to_the_manifest_shape`
 /// is the lock: it moves with the shape, so it fails on the first kind of change
 /// and stays quiet through the second.
-pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v8";
+pub const HANDOFF_SCHEMA: &str = "ctxmux.daemon-handoff.v9";
 
 /// How this binary declares its handoff schema in `--version` output.
 ///
@@ -223,15 +223,16 @@ impl HandoffManifest {
     }
 
     /// Total actual recoverable-Input request bytes across every retained Run.
-    /// The aggregate policy protects this owner independently of Run count.
+    /// Regression evidence only: production funding belongs to control state.
+    #[cfg(test)]
     fn retained_input_request_bytes(&self) -> usize {
         self.input_states().fold(0, |sum, state| {
             sum.saturating_add(state.retained_request_bytes())
         })
     }
 
-    /// All retained Input and Stop diagnostics share one manifest byte owner.
-    /// Per-Run validation cannot substitute for a daemon-wide aggregate bound.
+    /// Regression evidence for preserving every original diagnostic.
+    #[cfg(test)]
     fn diagnostic_bytes(&self) -> usize {
         let input = self.input_states().fold(0_usize, |sum, state| {
             sum.saturating_add(state.retained_diagnostic_bytes())
@@ -285,29 +286,6 @@ impl HandoffManifest {
                 format!("invalid handoff daemon epoch: {error}"),
             )
         })?;
-        // Aggregate byte bounds, not Run-count bounds: what must fit across the
-        // exec is the daemon-wide recoverable-Input total and the Stop-diagnostic
-        // total, each shared by every retained Run rather than multiplied by it.
-        let input_bytes = self.retained_input_request_bytes();
-        if input_bytes > self.resources.handoff_input_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "handoff retains {input_bytes} recoverable Input request bytes; maximum is {}",
-                    self.resources.handoff_input_bytes
-                ),
-            ));
-        }
-        let diagnostic_bytes = self.diagnostic_bytes();
-        if diagnostic_bytes > self.resources.handoff_diagnostic_bytes {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "handoff retains {diagnostic_bytes} native control diagnostic bytes; maximum is {}",
-                    self.resources.handoff_diagnostic_bytes
-                ),
-            ));
-        }
         let mut fds = HashSet::new();
         for fd in self.all_fds() {
             if fd < 3 || fd == manifest_fd || !fds.insert(fd) {
@@ -387,14 +365,7 @@ impl HandoffManifest {
 ///
 /// Returns an error if the descriptor cannot be read or the content is not a
 /// current-schema manifest.
-pub fn read_manifest(fd: OwnedFd) -> std::io::Result<HandoffManifest> {
-    read_manifest_with_limit(fd, ResourceLimits::DEFAULT.handoff_bytes)
-}
-
-pub(crate) fn read_manifest_with_limit(
-    fd: OwnedFd,
-    limit: u64,
-) -> std::io::Result<HandoffManifest> {
+pub(crate) fn read_manifest(fd: OwnedFd, limit: u64) -> std::io::Result<HandoffManifest> {
     use std::io::Read;
     let manifest_fd = fd.as_raw_fd();
     let mut file = std::fs::File::from(fd);
@@ -470,7 +441,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"\n").unwrap();
         drop(writer);
-        read_manifest(reader)
+        read_manifest(reader, manifest.resources.handoff_bytes)
     }
 
     #[test]
@@ -505,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn policy_optional_quotas_round_trip_through_private_v8_manifest() {
+    fn policy_optional_quotas_round_trip_through_private_v9_manifest() {
         for quotas in [
             (None, None, None),
             (Some(128 * 1024), Some(8192), Some(4096)),
@@ -520,7 +491,7 @@ mod tests {
                 parsed.resources, manifest.resources,
                 "original configured quotas must survive planned exec unchanged"
             );
-            assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v8");
+            assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v9");
         }
     }
 
@@ -545,7 +516,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"\n").unwrap();
         drop(writer); // EOF so read_to_end returns
-        let parsed = read_manifest(reader).unwrap(); // reader is an OwnedFd → moved in
+        let parsed = read_manifest(reader, manifest.resources.handoff_bytes).unwrap(); // reader is an OwnedFd → moved in
         assert_eq!(parsed, manifest);
     }
 
@@ -605,7 +576,7 @@ mod tests {
         );
 
         let parsed = read_fixture(&manifest).expect("read handed-off Stop ledger");
-        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v8");
+        assert_eq!(parsed.schema, "ctxmux.daemon-handoff.v9");
         assert_eq!(parsed.stop_operations, [operation]);
     }
 
@@ -635,15 +606,15 @@ mod tests {
         let original = manifest.runs.clone();
         // The original complete diagnostic remains unchanged. This is an
         // operator-policy boundary, not a permanent 4096-byte semantic limit.
-        manifest.resources.handoff_diagnostic_bytes =
-            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES;
+        manifest.resources.control_state_bytes =
+            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES as u64;
         assert_eq!(
             manifest.validate(99).unwrap_err().kind(),
             std::io::ErrorKind::InvalidData
         );
         assert_eq!(manifest.runs, original);
-        manifest.resources.handoff_diagnostic_bytes =
-            super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1;
+        manifest.resources.control_state_bytes =
+            (super::super::native_control::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1) as u64;
         manifest.validate(99).unwrap();
         assert_eq!(read_fixture(&manifest).unwrap(), manifest);
     }
@@ -746,8 +717,6 @@ mod tests {
             ".resources.durable_run_output_bytes:null",
             ".resources.database_bytes:null",
             ".resources.wal_checkpoint_bytes:number",
-            ".resources.handoff_input_bytes:number",
-            ".resources.handoff_diagnostic_bytes:number",
             ".resources.handoff_bytes:number",
             ".resources.control_state_bytes:number",
             ".resources.diagnostic_queue_bytes:number",
@@ -920,15 +889,56 @@ mod tests {
         let original = manifest.clone();
         let complete = diagnostic.len() * 3;
         assert_eq!(manifest.diagnostic_bytes(), complete);
-        manifest.resources.handoff_diagnostic_bytes = complete - 1;
+        let funded = manifest
+            .input_states()
+            .map(HandoffInputState::control_memory_bytes)
+            .sum::<u64>()
+            + manifest
+                .stop_operations
+                .iter()
+                .map(HandoffStopOperation::control_memory_bytes)
+                .sum::<u64>();
+        manifest.resources.control_state_bytes = funded - 1;
         let mut file = tempfile::tempfile().unwrap();
         assert!(manifest.write_preflight(&mut file).is_err());
         assert_eq!(manifest.runs, original.runs);
         assert_eq!(manifest.stop_operations, original.stop_operations);
-        manifest.resources.handoff_diagnostic_bytes = complete;
+        manifest.resources.control_state_bytes = funded;
         manifest.write_preflight(&mut file).unwrap();
-        let restored = read_manifest(OwnedFd::from(file)).unwrap();
+        let restored =
+            read_manifest(OwnedFd::from(file), manifest.resources.handoff_bytes).unwrap();
         assert_eq!(restored, manifest);
+    }
+
+    #[test]
+    fn funded_diagnostics_can_exceed_the_former_handoff_only_quota() {
+        let message = "e".repeat(16 * 1024 * 1024 + 1);
+        let operation = HandoffStopOperation {
+            run_id: RunId::new(),
+            operation_key: StopOperationKey::new("funded-large-diagnostic").unwrap(),
+            outcome: HandoffStopOutcome::Unknown {
+                failure: ctxmux_protocol::ControlFailure {
+                    disposition: ctxmux_protocol::CommandDisposition::Unknown,
+                    confirmed_input_bytes: None,
+                    error: ProtocolError::new(ErrorCode::Io, message),
+                },
+            },
+        };
+        let mut manifest = HandoffManifest::new_with_stop_operations(
+            DaemonInstanceId::new().to_string(),
+            100,
+            101,
+            Vec::new(),
+            vec![operation],
+        );
+        manifest.resources.control_state_bytes = manifest.stop_operations[0].control_memory_bytes();
+        let mut file = tempfile::tempfile().unwrap();
+        manifest.write_preflight(&mut file).unwrap();
+        let restored = read_manifest(file.into(), manifest.resources.handoff_bytes).unwrap();
+        assert_eq!(
+            restored, manifest,
+            "full unknown outcome survives without a second quota"
+        );
     }
 
     #[test]
@@ -1069,6 +1079,23 @@ mod tests {
     }
 
     #[test]
+    fn funded_multi_run_inputs_can_exceed_the_former_handoff_only_quota() {
+        // 129 one-MiB receipts cross the historical 128-MiB transfer quota.
+        // This is a regression workload, not a production Run-count requirement.
+        let runs = (0..129)
+            .map(|index| run_with_input("funded", 102 + index, &[1024 * 1024]))
+            .collect();
+        let mut manifest =
+            HandoffManifest::new(DaemonInstanceId::new().to_string(), 100, 101, runs);
+        manifest.resources.control_state_bytes = manifest
+            .input_states()
+            .map(HandoffInputState::control_memory_bytes)
+            .sum();
+        assert!(manifest.retained_input_request_bytes() > 128 * 1024 * 1024);
+        manifest.validate(99).unwrap();
+    }
+
+    #[test]
     fn upgrade_refuses_pressure_without_discarding_results() {
         let mut manifest = HandoffManifest::new(
             DaemonInstanceId::new().to_string(),
@@ -1079,18 +1106,22 @@ mod tests {
                 run_with_input("run-b", 103, &[600, 600]),
             ],
         );
-        manifest.resources.handoff_input_bytes = 1000;
+        let funded = manifest
+            .input_states()
+            .map(HandoffInputState::control_memory_bytes)
+            .sum::<u64>();
+        manifest.resources.control_state_bytes = funded - 1;
         let original = manifest.clone();
         let mut file = tempfile::tempfile().unwrap();
         assert!(manifest.write_preflight(&mut file).is_err());
         assert_eq!(manifest, original);
         assert_eq!(manifest.retained_input_request_bytes(), 2400);
-        manifest.resources.handoff_input_bytes = 2400;
+        manifest.resources.control_state_bytes = funded;
         manifest.resources.handoff_bytes = 32;
         assert!(manifest.write_preflight(&mut file).is_err());
         manifest.resources.handoff_bytes = 64 * 1024;
         manifest.write_preflight(&mut file).unwrap();
-        let parsed = read_manifest(file.into()).unwrap();
+        let parsed = read_manifest(file.into(), manifest.resources.handoff_bytes).unwrap();
         assert_eq!(parsed, manifest);
     }
 
@@ -1114,11 +1145,12 @@ mod tests {
             Vec::new(),
             vec![operation.clone()],
         );
-        manifest.resources.handoff_diagnostic_bytes = 3;
+        let funded = operation.control_memory_bytes();
+        manifest.resources.control_state_bytes = funded - 1;
         let mut file = tempfile::tempfile().unwrap();
         assert!(manifest.write_preflight(&mut file).is_err());
         assert_eq!(manifest.stop_operations, [operation]);
-        manifest.resources.handoff_diagnostic_bytes = 64;
+        manifest.resources.control_state_bytes = funded;
         manifest.write_preflight(&mut file).unwrap();
     }
 }

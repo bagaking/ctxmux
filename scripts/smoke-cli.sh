@@ -137,6 +137,7 @@ CTXMUX_SMOKE_RUNTIME="$ctxmux_cli_runtime" CTXMUX_SMOKE_RUN_ID="$ctxmux_cli_run"
       "native.recoverable_input": 1,
       "native.recoverable_stop": 1,
       "native.start": 1,
+      "services.storage_observation": 1,
       "tmux.discover": 1,
       "tmux.import": 1,
     });

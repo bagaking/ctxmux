@@ -967,6 +967,28 @@ test(
   },
 );
 
+test("removed handoff quotas fail before activation effects", async (context) => {
+  const directory = await temporaryDirectory(context, "ctxmux-removed-policy-");
+  const stateDir = join(directory, "state");
+  for (const field of ["handoff_input_bytes", "handoff_diagnostic_bytes"]) {
+    await assert.rejects(
+      activateRuntime({
+        executable: daemonBinary,
+        socketPath: join(directory, "sock"),
+        stateDir,
+        resourceLimits: { hot_output_bytes: 8192, [field]: 1024 },
+      }),
+      (error: unknown) =>
+        error instanceof TypeError &&
+        error.message === `unknown resource limit ${field}`,
+    );
+    await assert.rejects(
+      lstat(stateDir),
+      (error: unknown) => (error as { code?: string }).code === "ENOENT",
+    );
+  }
+});
+
 test("invalid resource policy fails before creating a Runtime directory", async (context) => {
   const directory = await temporaryDirectory(context, "ctxmux-invalid-policy-");
   const stateDir = join(directory, "never-created");

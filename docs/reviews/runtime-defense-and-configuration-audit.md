@@ -6,6 +6,14 @@ complete. [Architecture](../architecture.md#small-user-configuration-and-owner-d
 owns the boundary; [decision 019](../architecture/choices/019-resource-policy-and-honest-qualification.md)
 owns current resource policy; Feature Tracker owns execution and evidence.
 
+The [runtime policy refactor](runtime-policy-refactor.md) implements separate
+sparse startup and complete exec contracts, derives observation funding from the
+selected worker width, and removes `handoff_input_bytes` /
+`handoff_diagnostic_bytes`. The original field census below remains historical
+evidence; those two transfer quotas now belong to the original control owner.
+The current advanced CLI/SDK surface has twenty-eight fields. Terminal funding
+and complete recovery/scale acceptance remain open.
+
 ## Requirement and review boundary
 
 The user requires fundamental architecture correction, examination of excessive
@@ -21,7 +29,7 @@ allocation paths, reject/retry paths and the existing incident corpus. It
 distinguishes test-only constants from serving policy. Build/benchmark fixture
 sizes remain historical evidence, not capacity requirements.
 
-All thirty current `ResourceLimits` fields and their SDK counterparts are
+All thirty `ResourceLimits` fields in the original source review and their SDK counterparts are
 accounted for below. Constraint families are reviewed at source level; this
 is not a claim that every interleaving, host limit or allocation failure has
 been executed. Existing behavioral evidence is identified separately. No new
@@ -35,7 +43,7 @@ replay and durable replay retention; their allowances do not bound total RSS
 or all state-directory storage. Startup overrides do not reconfigure a running
 Runtime, and planned exec retains its established policy.
 
-The present flat resource interface has thirty fields. The following table
+The originally reviewed flat resource interface had thirty fields. The following table
 accounts for every field, its units, owner, current pressure effect and target
 disposition. These are families of controls, not thirty proven bugs. Sources:
 [`resources.rs`](../../crates/ctxmux-daemon/src/resources.rs),
@@ -107,7 +115,7 @@ The required correction is at causal owners, with these acceptance boundaries:
    this audit. Resource Feature `f-22tcz9d9r` and the Native owner retain the
    corresponding implementation and qualification work.
 3. **Reduce the configuration interface in implementation.** README now gives
-   the ordinary choices. The thirty-field CLI/SDK surface still needs a
+   the ordinary choices. The remaining twenty-eight-field CLI/SDK surface still needs a
    source-bound reduction with validated derived alternatives and a justified
    advanced escape hatch. Renaming or hiding the same thirty knobs does not
    finish this outcome. Any genuinely necessary new control must document its

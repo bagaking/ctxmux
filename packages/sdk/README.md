@@ -216,8 +216,11 @@ space. Omitted per-Run quotas follow their aggregate owners. Retention is a
 recent window with explicit truncation, not permanent archival.
 
 The current `RuntimeResourceLimits` type also exposes advanced worker, queue
-and owner-budget fields. They are not required setup, and reducing that surface
-remains open work. Defaults, CLI/environment precedence, startup-only semantics
+and owner-budget fields. They are not required setup. The two handoff-only Input
+and diagnostic quotas are removed; their original control owner funds retained
+state. Omitted foreground observation memory follows the selected worker width,
+and a planned exec restores the complete established policy. Further surface
+reduction remains open work. Defaults, CLI/environment precedence, startup-only semantics
 and the complete current field contract are described in the
 [root configuration guide](../../README.md#configuration-choose-persistence-then-use-the-defaults)
 and [resource policy](../../docs/architecture/choices/019-resource-policy-and-honest-qualification.md).

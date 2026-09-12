@@ -105,7 +105,12 @@ delivery makes ordinary configuration explicit in README and records every
 current resource field's owner and disposition. `T-014` separates sparse startup
 choices from complete preserved exec policy; it does not complete the remaining
 resource work. `T-015` derives omitted foreground observation funding from
-the selected worker owner, while preserving explicit allowances. Root implementation still
+the selected worker owner, while preserving explicit allowances. `T-016` removes
+the two redundant Input/diagnostic handoff quotas and preserves original control
+funding plus pre-extraction encoded-file admission. The [local refactor proof](reviews/runtime-policy-refactor.md)
+records real child/receipt continuity and two-Run service after encoded pressure.
+The changed current qualification policy needs new scale observations; historical
+receipts and workload/budget contracts are preserved. Root implementation still
 requires owner-derived internal settings, funded terminal/parser allocation
 and complete public failure/recovery qualification. Existing Native
 `f-22vcz84zn` and resource tasks retain those outcomes; a documentation result

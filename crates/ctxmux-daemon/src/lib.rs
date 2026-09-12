@@ -2,7 +2,7 @@
 
 #![allow(
     clippy::large_types_passed_by_value,
-    reason = "ResourceLimits is one immutable Copy owner snapshot; optional disk quotas make it 280 bytes, and construction/dispatch copies preserve established ownership without borrowed configuration lifetimes"
+    reason = "ResourceLimits is one immutable Copy owner snapshot; optional disk quotas make it 264 bytes, and construction/dispatch copies preserve established ownership without borrowed configuration lifetimes"
 )]
 
 #[cfg(not(unix))]
@@ -304,7 +304,7 @@ pub async fn serve_configured(
     };
     let handoff = match handoff_fd {
         Some(fd) => Some(
-            crate::handoff::read_manifest_with_limit(fd, resources.handoff_bytes)
+            crate::handoff::read_manifest(fd, resources.handoff_bytes)
                 .map_err(|source| ServerError::io("<handoff-fd>", source))?,
         ),
         None => None,

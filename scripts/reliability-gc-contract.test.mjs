@@ -60,6 +60,30 @@ test("qualification scopes the historical GC quota without inheriting candidate 
   assert.deepEqual(changed, ["retained_runs"]);
 });
 
+test("removing handoff quotas preserves every other qualification operating point", () => {
+  const current = qualificationResourceLimits(loaded);
+  assert.equal(Object.hasOwn(current, "handoff_input_bytes"), false);
+  assert.equal(Object.hasOwn(current, "handoff_diagnostic_bytes"), false);
+  // Actual producer at a623f11; its independent aad59bfd... pin was already stale.
+  const historical = {
+    ...current,
+    handoff_input_bytes: 128 * MIB,
+    handoff_diagnostic_bytes: 16 * MIB,
+  };
+  const encoded = JSON.stringify(
+    Object.fromEntries(
+      Object.keys(historical)
+        .sort()
+        .map((key) => [key, historical[key]]),
+    ),
+  );
+  assert.equal(
+    createHash("sha256").update(encoded).digest("hex"),
+    "dce194e55752fcbb77a9346cf7d574e66c355cea4d3d236d6d24bea327bccaa1",
+    "only the two deleted transfer quotas may differ from the historical envelope",
+  );
+});
+
 test("GC contract fixes internally consistent payload and resource ceilings", () => {
   assert.equal(loaded.workload_contract.sha256, GC_CONTRACT_SHA256);
   assert.equal(contract.schema, "ctxmux.reliability-gc-contract.v1");

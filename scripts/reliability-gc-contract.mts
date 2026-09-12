@@ -126,7 +126,10 @@ export interface LoadedReliabilityGcContract {
 // Fixed qualification operating points, independently of candidate defaults or
 // ambient CTXMUX_RESOURCE_LIMITS. Budgets permit the same work on every arm;
 // neither these byte budgets nor the GC workload define production capacity.
-const QUALIFICATION_RESOURCE_LIMITS: Readonly<Required<RuntimeResourceLimits>> =
+// Foreground observation choices remain omitted (host-derived), as before.
+// Handoff-only payload/diagnostic quotas were removed with private schema v9;
+// original control funding and every remaining explicit operating point stay exact.
+const QUALIFICATION_RESOURCE_LIMITS: Readonly<RuntimeResourceLimits> =
   Object.freeze({
     live_runs: null,
     retained_runs: null,
@@ -138,8 +141,6 @@ const QUALIFICATION_RESOURCE_LIMITS: Readonly<Required<RuntimeResourceLimits>> =
     durable_run_output_bytes: 4 * 1024 * 1024,
     database_bytes: 384 * 1024 * 1024,
     wal_checkpoint_bytes: 8 * 1024 * 1024,
-    handoff_input_bytes: 128 * 1024 * 1024,
-    handoff_diagnostic_bytes: 16 * 1024 * 1024,
     handoff_bytes: 256 * 1024 * 1024,
     control_state_bytes: 128 * 1024 * 1024,
     diagnostic_queue_bytes: 64 * 1024 * 1024,
@@ -160,7 +161,7 @@ const QUALIFICATION_RESOURCE_LIMITS: Readonly<Required<RuntimeResourceLimits>> =
 export function qualificationResourceLimits(
   loaded: LoadedReliabilityGcContract,
   gcPolicy = false,
-): Readonly<Required<RuntimeResourceLimits>> {
+): Readonly<RuntimeResourceLimits> {
   return {
     ...QUALIFICATION_RESOURCE_LIMITS,
     ...(gcPolicy

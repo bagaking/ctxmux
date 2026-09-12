@@ -637,10 +637,6 @@ impl HandoffInputState {
         let mut keys = HashSet::<InputOperationKey>::new();
         let mut completed_end = 0_u64;
         let mut unknown_count = 0_usize;
-        let mut diagnostic_bytes = self
-            .input_failure
-            .as_ref()
-            .map_or(0, |failure| failure.message.len());
         for operation in &self.operations {
             let (key, expected_byte, data) = match operation {
                 HandoffInputOperation::Completed {
@@ -674,9 +670,6 @@ impl HandoffInputState {
                     failure,
                 } => {
                     unknown_count += 1;
-                    diagnostic_bytes = diagnostic_bytes
-                        .checked_add(failure.error.message.len())
-                        .ok_or("handoff native Input diagnostic size overflows")?;
                     validate_handoff_unknown_prefix(data.len(), failure)?;
                     if *expected_byte != self.applied_input_bytes {
                         return Err(
@@ -718,12 +711,15 @@ impl HandoffInputState {
                 "handoff native Input ledger contains multiple unknown operations".to_owned(),
             );
         }
-        validate_handoff_diagnostic_bytes(diagnostic_bytes, resources.handoff_diagnostic_bytes)
+        if self.control_memory_bytes() > resources.control_state_bytes {
+            return Err("handoff native Input state exceeds control owner funding".to_owned());
+        }
+        Ok(())
     }
 
     /// Original recoverable-Input payload bytes this Run carries across handoff.
-    /// The manifest funds the actual daemon-wide sum; Run-local retention uses
-    /// its configured policy, rather than a test population or fixed multiplier.
+    /// The original control owner funds the actual daemon-wide state.
+    #[cfg(test)]
     pub(crate) fn retained_request_bytes(&self) -> usize {
         self.operations
             .iter()
@@ -772,25 +768,14 @@ impl HandoffInputState {
 }
 
 impl HandoffInputOperation {
-    /// Recoverable request payload length this operation carries in the manifest.
+    /// Recoverable request payload length used by regression evidence.
+    #[cfg(test)]
     fn request_len(&self) -> usize {
         match self {
             HandoffInputOperation::Completed { data, .. }
             | HandoffInputOperation::Unknown { data, .. } => data.len(),
         }
     }
-}
-
-fn validate_handoff_diagnostic_bytes(
-    diagnostic_bytes: usize,
-    maximum_bytes: usize,
-) -> Result<(), String> {
-    if diagnostic_bytes > maximum_bytes {
-        return Err(format!(
-            "handoff native Input diagnostics retain {diagnostic_bytes} bytes; maximum is {maximum_bytes}"
-        ));
-    }
-    Ok(())
 }
 
 mod handoff_bytes {
@@ -3302,7 +3287,7 @@ mod tests {
     use crate::native_runtime::NativeRunOwner;
 
     #[test]
-    fn handoff_input_diagnostics_follow_the_configured_aggregate_budget() {
+    fn handoff_input_diagnostics_follow_the_original_control_owner() {
         // Preserve the former 4 KiB characterization as a boundary example,
         // not the configurable aggregate handoff resource owner's capacity.
         let message = "e".repeat(super::INPUT_RESULT_DIAGNOSTIC_RESERVE_BYTES + 1);
@@ -3358,9 +3343,9 @@ mod tests {
             "the real diagnostic lease follows its actual control owner"
         );
         let mut exact = resources;
-        exact.handoff_diagnostic_bytes = aggregate_bytes;
+        exact.control_state_bytes = original.control_memory_bytes();
         original.validate_with_resources(exact).unwrap();
-        exact.handoff_diagnostic_bytes -= 1;
+        exact.control_state_bytes -= 1;
         assert!(
             original.validate_with_resources(exact).is_err(),
             "a real configured aggregate byte refusal does not truncate or weaken the ledger"

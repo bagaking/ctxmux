@@ -907,16 +907,19 @@ write, while later attachment commands receive an explicit retryable
 `backend_unavailable` result with `not_applied`. Drain timeout, handoff-file
 setup failure, or all-owner preflight failure restores normal admission. After
 extraction, ownership has been relinquished to the pending exec and any error is
-fail-stop. The schema-v8 handoff manifest carries the complete established
+fail-stop. The schema-v9 handoff manifest carries the complete established
 resource policy, live owners and retained terminal Input receipts. It and every
 carried descriptor are validated, and serialized manifest/control funding is
-preflighted before extraction. Known persistence failure rejects upgrade before
+preflighted before extraction. Input payload and complete diagnostics use the
+original aggregate control owner; there are no handoff-only transfer quotas.
+An encoded-file budget refusal preserves original Runs and exact applied/unknown
+receipts in the serving image. Known persistence failure rejects upgrade before
 target probing or extraction. Durable waits remain Ctrl-C cancellable; cancellation
 and exec serialize through one final gate. Protocol generation 22 has no upgrade
 wire operation.
 
 The handoff schema declares manifest shape, independently of the public protocol
-generation. A matching `ctxmux.daemon-handoff.v8` in the selected target's
+generation. A matching `ctxmux.daemon-handoff.v9` in the selected target's
 `--version` is necessary for preflight; it does not qualify a cross-generation
 upgrade. Generation-21 clients must reconnect using generation-22 clients after
 an upgrade to this image. The complete selected-source live upgrade qualification
@@ -1001,7 +1004,7 @@ The effective per-Run and shared raw budgets, database/WAL policy and VT limits
 come from the current owner's policy, including handoff-preserved values.
 Database policy is the serving connection's effective SQLite page ceiling, not
 sampled occupancy. Default disk quotas are omitted or `null`; explicit positive
-quotas remain supported by daemon/SDK activation and private schema-v8 handoff.
+quotas remain supported by daemon/SDK activation and private schema-v9 handoff.
 Default replay numbers are the most recently sampled filesystem-funded allowance,
 not reserved bytes or a configured permanent ceiling. Unfunded or unknown
 filesystem observation can yield zero new-write allowance without asserting zero

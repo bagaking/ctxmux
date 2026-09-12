@@ -719,12 +719,19 @@ recovery. Each owner must maintain forward progress or truthful local pressure
 without making an unrelated Run depend on its derived work. There is no new
 supervisor, replacement Runtime or policy ledger.
 
-Today's CLI/SDK still accepts thirty low-level resource fields. Terminal
+The CLI/SDK accepts twenty-eight advanced resource fields. Handoff preserves
+Input/Stop state under the original aggregate control owner, without separate
+transfer quotas for payload or diagnostics. Its encoded-file allowance still
+protects staging/read memory and is preflighted before ownership extraction.
+The private manifest is v9 because two policy fields were removed; public
+protocol generation 22 is unchanged. Terminal
 allocation/history/restore and some derived allowances remain unfinished
 resource work. The [source-level defense and configuration audit](reviews/runtime-defense-and-configuration-audit.md)
 records the dispositions and existing execution owners. This accepted direction
-and the README update do not claim that interface reduction, runtime refactoring
-or full two-Run qualification is complete.
+and the README update do not claim that the remaining interface reduction,
+terminal allocation work or full recovery/scale qualification is complete.
+The [runtime policy refactor](reviews/runtime-policy-refactor.md) records the
+implemented boundaries and their local behavioral proof.
 
 The Unix socket is created with mode `0600`. Startup refuses to replace an ordinary file or symlink and removes an existing socket only after it is not accepting connections. Startup stale cleanup revalidates device/inode identity and liveness immediately before unlink and fails closed on an observed replacement. Shutdown retains the device/inode of the socket this daemon bound and removes the published pathname only while it still names that identity; an independently substituted listener is preserved. Pathname recheck and unlink remain separate kernel operations, and a renamed original socket cannot be rediscovered through its old pathname, so an attacker-writable parent directory stays outside the guarantee; authentication beyond filesystem access and peer-credential policy is open.
 

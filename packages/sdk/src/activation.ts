@@ -97,8 +97,6 @@ export interface RuntimeResourceLimits {
   readonly durable_run_output_bytes?: number | null;
   readonly database_bytes?: number | null;
   readonly wal_checkpoint_bytes?: number;
-  readonly handoff_input_bytes?: number;
-  readonly handoff_diagnostic_bytes?: number;
   readonly handoff_bytes?: number;
   readonly control_state_bytes?: number;
   readonly diagnostic_queue_bytes?: number;
@@ -746,8 +744,6 @@ function normalizeResourceLimits(
     "durable_run_output_bytes",
     "database_bytes",
     "wal_checkpoint_bytes",
-    "handoff_input_bytes",
-    "handoff_diagnostic_bytes",
     "handoff_bytes",
     "control_state_bytes",
     "diagnostic_queue_bytes",

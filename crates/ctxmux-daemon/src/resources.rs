@@ -82,8 +82,6 @@ resource_policy! {
     /// None retains `SQLite`'s own page ceiling on the serving connection.
     pub database_bytes: Option<u64>,
     pub wal_checkpoint_bytes: u64,
-    pub handoff_input_bytes: usize,
-    pub handoff_diagnostic_bytes: usize,
     pub handoff_bytes: u64,
     pub control_state_bytes: u64,
     pub diagnostic_queue_bytes: u64,
@@ -184,8 +182,6 @@ impl ResourceLimits {
         durable_run_output_bytes: None,
         database_bytes: None,
         wal_checkpoint_bytes: 8 * 1024 * 1024,
-        handoff_input_bytes: 128 * 1024 * 1024,
-        handoff_diagnostic_bytes: 16 * 1024 * 1024,
         handoff_bytes: 256 * 1024 * 1024,
         control_state_bytes: 128 * 1024 * 1024,
         diagnostic_queue_bytes: 64 * 1024 * 1024,
@@ -229,11 +225,6 @@ impl ResourceLimits {
             ("run_output_bytes", self.run_output_bytes as u64),
             ("metadata_bytes", self.metadata_bytes),
             ("wal_checkpoint_bytes", self.wal_checkpoint_bytes),
-            ("handoff_input_bytes", self.handoff_input_bytes as u64),
-            (
-                "handoff_diagnostic_bytes",
-                self.handoff_diagnostic_bytes as u64,
-            ),
             ("handoff_bytes", self.handoff_bytes),
             ("control_state_bytes", self.control_state_bytes),
             (
@@ -552,6 +543,8 @@ mod tests {
             r#"{"live_run":5000}"#,
             r#"{"durable_replay_bytes":null,"durable_replay_bytes":8192}"#,
             r#"{"hot_output_bytes":null}"#,
+            r#"{"handoff_input_bytes":1024}"#,
+            r#"{"handoff_diagnostic_bytes":1024}"#,
             r#"{"live_runs":0}"#,
             r#"{"database_bytes":4097}"#,
             r#"{"durable_replay_bytes":9223372036854775807}"#,

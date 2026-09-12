@@ -67,10 +67,14 @@ const EXPECTED_QUALIFICATION_LAUNCHER_SHA256 =
 // ADR 019's inherited qualification operating points, encoded as a flat JSON
 // object with ASCII-sorted field names. This independent pin prevents a changed
 // producer policy from certifying itself against the old resource ceilings.
-// A policy change needs independent observations and an explicit review; it
-// must never silently refreeze the envelope merely to obtain a passing score.
+// The previous aad59bfd... pin was stale against the a623f11 producer's actual
+// 27-field dce194e5... envelope. A reconstruction test pins those actual values.
+// Private handoff v9 removes the two redundant transfer quotas; all remaining
+// workload, byte, timing and owner budgets remain unchanged. This new contract
+// needs fresh scale observations; historical receipts are not requalified.
+// See docs/reviews/runtime-policy-refactor.md for the behavioral review.
 const EXPECTED_QUALIFICATION_RESOURCE_LIMITS_SHA256 =
-  "aad59bfd4701af66957b9bd913e67ad779a771667caa30538c6eaeb85d45c449";
+  "7ec1d882d2eec61ff8f4bac10b8fdea33e44b96ffb6a2c4e70106b81ea38e119";
 const EXPECTED_QUALIFICATION_POLICY = {
   schema: "ctxmux.reliability-qualification-policy.v1",
   profiles: {

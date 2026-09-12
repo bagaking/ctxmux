@@ -80,11 +80,14 @@ recoverable-Input operations remain addressable after reconnect.
 
 ### Handoff and reconciliation
 
-The upgrade carries a schema-v5 manifest containing the epoch and, for every
+The upgrade carries a schema-v9 manifest containing the epoch and, for every
 live Run, `{ RunId, child PID, master fd, complete settled input state }`,
 complete settled Stop operations, descriptor-free terminal Input ledgers and the
-established resource policy. These additional required fields distinguish v5
-from v4. It is
+complete established resource policy. V5 introduced the additional required
+control/policy fields; v9 removes redundant Input/diagnostic transfer quotas from
+the policy shape. Every remaining policy field is required, including nullable
+quotas. Admission uses original control funding plus an encoded-file budget,
+with no result shedding. It is
 written to an owner-only regular file created inside the state directory and
 immediately unlinked, avoiding pipe-capacity deadlock for bounded ledgers while
 leaving no pathname. Close-on-exec is cleared on exactly the listener, state
@@ -166,7 +169,7 @@ by definition the same live-control owner.
 
 The logical Runtime ID is also preserved. It is reloaded from schema-5
 `runtime_meta` through the existing SQLite owner; it is not copied into the
-schema-v5 handoff manifest. Public Hello remains
+schema-v9 handoff manifest. Public Hello remains
 `runtimeIdPersistence: "state_dir"`. The incoming image constructs its own
 build label, Rust target `platform` and `arch`, and advertised capability
 record from that image and the active persistence mode. These facts may remain

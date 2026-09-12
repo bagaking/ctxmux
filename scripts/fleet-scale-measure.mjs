@@ -379,8 +379,6 @@ const FLEET_RESOURCE_POLICY = Object.freeze({
   durable_run_output_bytes: 4194304,
   database_bytes: 402653184,
   wal_checkpoint_bytes: 8388608,
-  handoff_input_bytes: 134217728,
-  handoff_diagnostic_bytes: 16777216,
   handoff_bytes: 268435456,
   control_state_bytes: 134217728,
   diagnostic_queue_bytes: 67108864,

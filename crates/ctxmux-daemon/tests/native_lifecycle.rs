@@ -4130,6 +4130,80 @@ async fn sighup_memory_only_noop() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_handoff_pressure_preserves_two_real_runs_and_input_receipts() {
+    let daemon = TestDaemon::start_persistent_with_resources(r#"{"handoff_bytes":32}"#).await;
+    let identity = daemon.client.runtime_info().await.unwrap();
+    let mut runs = Vec::new();
+    for index in 0..2 {
+        let run = daemon.client.start(interactive_shell()).await.unwrap();
+        let (mut attachment, snapshot) = daemon.client.attach(run.id, 0).await.unwrap();
+        let mut bytes = replay_bytes(&snapshot.replay.chunks);
+        let mut cursor = snapshot.replay.latest_output_bytes;
+        if !bytes.windows(5).any(|window| window == b"READY") {
+            wait_for_output(&mut attachment, &mut bytes, &mut cursor, b"READY").await;
+        }
+        let operation = RecoverableInput {
+            daemon_instance: identity.daemon_instance_id,
+            operation_key: InputOperationKey::new(format!("encoded-pressure-{index}")).unwrap(),
+            id: run.id,
+            expected_byte: 0,
+            data: b"before-abort\n".to_vec(),
+        };
+        let receipt = daemon
+            .client
+            .recoverable_input(operation.clone())
+            .await
+            .unwrap()
+            .receipt;
+        wait_for_output(
+            &mut attachment,
+            &mut bytes,
+            &mut cursor,
+            b"OUT:before-abort",
+        )
+        .await;
+        runs.push((run, attachment, bytes, cursor, operation, receipt));
+    }
+
+    daemon.sighup();
+    let abort = daemon
+        .wait_stderr_line(
+            "upgrade aborted before extract, continuing to serve",
+            5,
+            "encoded pressure must refuse while original owners still hold authority",
+        )
+        .await;
+    assert!(abort.contains("handoff exceeds handoff_bytes"), "{abort}");
+    let after = daemon.client.runtime_info().await.unwrap();
+    assert_eq!(after.runtime_id, identity.runtime_id);
+    assert_eq!(after.daemon_instance_id, identity.daemon_instance_id);
+    for (run, mut attachment, mut bytes, mut cursor, operation, receipt) in runs {
+        let status = daemon.client.status(run.id).await.unwrap();
+        assert_eq!(status.pid, run.pid);
+        assert_eq!(status.state, RunState::Running);
+        assert!(process_exists(run.pid.unwrap()));
+        assert_eq!(
+            daemon
+                .client
+                .recoverable_input(operation)
+                .await
+                .unwrap()
+                .receipt,
+            receipt
+        );
+        attachment.input(b"after-abort\n".to_vec()).await.unwrap();
+        wait_for_output(&mut attachment, &mut bytes, &mut cursor, b"OUT:after-abort").await;
+        assert_eq!(
+            bytes
+                .windows(b"OUT:before-abort".len())
+                .filter(|part| *part == b"OUT:before-abort")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_upgrade_before_extract_restores_complete_service() {
     let daemon = TestDaemon::start_persistent().await;
     let run = daemon

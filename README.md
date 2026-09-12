@@ -101,9 +101,13 @@ policy. The SDK uses the same startup policy through `activateRuntime`'s
 `resourceLimits` option.
 
 Worker counts, queue sizes, WAL staging and handoff budgets are advanced owner
-controls, not ordinary setup requirements. The current interface still exposes
-30 resource fields; reducing that interface and proving derived terminal-memory
-funding remain open architecture work. See the complete current
+controls, not ordinary setup requirements. The advanced interface has 28 fields;
+Input and diagnostic handoff quotas have been removed because their original
+control owner already funds that state. Omitted observation memory follows the
+selected worker width. Further interface reduction and terminal-memory funding
+remain open architecture work. An explicitly small `handoff_bytes` allowance can
+refuse planned exec before ownership transfer; the original Runs and exact
+receipts remain available. See the complete current
 [resource policy](docs/architecture/choices/019-resource-policy-and-honest-qualification.md)
 and the [source audit](docs/reviews/runtime-defense-and-configuration-audit.md).
 

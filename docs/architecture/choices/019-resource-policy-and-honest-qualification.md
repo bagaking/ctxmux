@@ -12,13 +12,20 @@ durable replay quota when needed. Defaults, units, retention costs, pressure
 and startup-only semantics must be prominent in [README](../../../README.md#configuration-choose-persistence-then-use-the-defaults).
 
 The table below is the current advanced interface, not a recommended setup
-checklist. Its thirty fields mix user history policy and internal execution
-budgets. The accepted direction is to derive internal settings at their causal
+checklist. Its twenty-eight fields include optional user history policy and
+advanced execution budgets. The accepted direction is to derive internal settings at their causal
 owners and retain independent controls only when a legitimate workload requires
 them. This must preserve capacity, fidelity, unknown outcomes and recovery.
 The [source audit](../../reviews/runtime-defense-and-configuration-audit.md)
 records every field family and the unfinished architectural repairs. No
-existing field is removed by this documentation slice.
+historical evidence is rewritten by the implementation continuation.
+`handoff_input_bytes` and `handoff_diagnostic_bytes` have been deleted: retained
+Input payloads and complete Input/Stop diagnostics already follow the aggregate
+`control_state_bytes` owner. The encoded `handoff_bytes` budget remains separate
+for staging and incoming decoding, with refusal before ownership extraction.
+Missing snapshot fields and obsolete startup names receive no compatibility
+fallback; ordinary startup omissions still resolve the documented defaults.
+See the [behavioral refactor review](../../reviews/runtime-policy-refactor.md).
 
 ## Decision
 
@@ -39,6 +46,9 @@ reconfigure it. Planned exec preserves the complete established policy in its
 versioned handoff manifest and explicit incoming CLI arguments. Startup
 `ResourceConfig` resolves sparse choices once; the immutable `ResourceLimits`
 snapshot requires every established field, including explicitly nullable quotas.
+Removing the two transfer-quota fields changes private manifest shape to v9;
+public protocol generation 22 remains unchanged. Incompatible targets refuse
+before ownership extraction rather than silently interpreting an old snapshot.
 Handoff never fills missing saved settings from fresh host defaults. Omitted
 foreground observation memory is derived from the selected worker width at one
 maximum protocol frame per admitted OS job, using checked byte arithmetic. An
@@ -61,8 +71,6 @@ null remain distinct without reparsing the original JSON.
 | `database_bytes`                    | null                               | Optional operator page quota; otherwise the actual SQLite engine ceiling                                                       |
 | `wal_checkpoint_bytes`              | 8 MiB                              | Maximum staged transaction page charge and committed baseline checkpoint trigger                                               |
 | `control_state_bytes`               | 128 MiB                            | Shared Input payload/result and Stop receipt leases; refusal before effects, duplicate lookup before new admission             |
-| `handoff_input_bytes`               | 128 MiB                            | Input receipt payload carried intact across exec                                                                               |
-| `handoff_diagnostic_bytes`          | 16 MiB                             | Aggregate handoff diagnostics                                                                                                  |
 | `handoff_bytes`                     | 256 MiB                            | Serialized manifest admission before relinquishing native ownership                                                            |
 | `creation_workers`                  | 8                                  | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
 | `foreground_observation_workers`    | max(1, available logical CPUs / 4) | Read-only OS observation jobs; separate from Input/Stop capacity. This is a width heuristic, not CPU reservation.              |
