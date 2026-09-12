@@ -6,6 +6,32 @@ PTY children; it never connects to a user Runtime. Run it on a qualified Linux
 host to obtain `/proc` and cgroup resource measurements. macOS runs can verify
 behavior but leave Linux resource fields unavailable.
 
+Storage batching/compression qualification additionally follows the
+[storage contract](../../docs/replay-storage-benchmark.md). The existing fleet
+harness does not yet measure codec, tail-read amplification, decode-cache cost
+or every crash point in that contract. Keep those cells explicitly unqualified.
+
+For an explicitly authorized read-only census of an existing store:
+
+```sh
+python3 scripts/bench/ground_storage.py \
+  --database "$GROUNDING_DATABASE" --output "$GROUNDING_REPORT" \
+  --observe-seconds 30 --interval-seconds 5
+```
+
+The output contains aggregate numeric facts, not Run IDs, terminal bytes,
+commands, machine paths or wall-clock times. Write it outside the observed
+Runtime directory. The collector rejects an existing output to preserve prior
+observations, uses SQLite read-only/WAL visibility, closes each observation
+connection, and never checkpoints or mutates the Runtime. It supports the
+current schema-6 layout only; another schema is unqualified, not called corrupt.
+The optional observation is committed head movement, not read demand, service
+health, producer rate or exact-source performance. Extent histograms describe
+stored records, not PTY reads. Physical file stats are not atomic with SQL.
+The sampling window and histogram boundaries select evidence, not production
+limits. Bind the selected serving artifact externally; a version string alone
+cannot identify a build, particularly during installation or planned exec.
+
 ```sh
 python3 -m unittest discover -s scripts/bench -v
 cc -std=c11 -O2 -Wall -Wextra -Werror scripts/bench/run_fixture.c -o "$BENCH_FIXTURE"

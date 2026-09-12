@@ -6,6 +6,10 @@ bytes, narrowing accepted workloads, weakening durability, or concealing failed
 input is a regression. This standard owns benchmark claims; the
 [comparison conventions](benchmark-comparison-conventions.md) additionally own
 competitor comparisons. The [protocol](protocol.md) owns product semantics.
+The [replay storage benchmark contract](replay-storage-benchmark.md) specializes
+this standard for batching, indexing, lossless compression and repeated reads.
+Its [local usage grounding](reviews/replay-storage-usage-grounding.md) informs
+workload selection without becoming a capacity limit or a production SLA.
 
 ## What a result must establish
 

@@ -84,6 +84,11 @@ child boundaries, and judges completion work alongside resource cost. Local
 macOS validation and harness self-tests do not qualify Linux 4000-Run performance.
 The revised fleet objectives require an independently reviewed, committed
 baseline before candidate acceptance; historical thresholds are not rewritten.
+The same owner now includes [replay storage qualification](replay-storage-benchmark.md):
+first freeze the grounded byte, write/read, physical-space and recovery matrix,
+then compare raw transaction sync/index improvements and lossless indexed codecs
+on private source-bound candidates. Local usage and geometry evidence do not
+replace the original fleet soak, change policy budgets or qualify compression.
 
 ## P0 — shared Native owner failure containment and recovery qualification
 
@@ -321,13 +326,15 @@ boundary. The main
 database ceiling remains fixed and old schema versions are rejected without
 migration.
 [replay-capacity-beyond-the-384-mib-ceiling](plans/replay-capacity-beyond-the-384-mib-ceiling.md)
-measures three candidates and ranks compression last — it is a constant factor
-against linear growth. Moving cold replay out of SQLite means the main-database
+preserves the historical storage measurements. Its earlier blanket compression
+deferral and arbitrary-cursor objection are superseded by the
+[storage benchmark contract](replay-storage-benchmark.md). Moving cold replay out of SQLite means the main-database
 ceiling no longer caps replay payloads, while explicit logical and aggregate
 state-directory limits remain. It also removes the dependency that makes
-freeing SQLite space require SQLite space. Compression remains deliberately
-deferred: it is a constant-factor optimization after the storage boundary is
-correct.
+freeing SQLite space require SQLite space. Compression remains unimplemented;
+its active evaluation includes whole-store capacity, repeated range reads,
+timer-flushed continuation, index cost and durable recovery, rather than a
+fixed-ratio or whole-file-only objective.
 
 ## M4 — tmux adapter
 

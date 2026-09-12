@@ -766,6 +766,10 @@ the R36 assumption invalidated by the Stop-then-List reproduction.
 The governing rule is compact: terminals are views, Runs are durable, and every stronger claim needs public-behavior evidence.
 
 Current resource policy and qualification objective: [decision 019](architecture/choices/019-resource-policy-and-honest-qualification.md).
+Replay payloads remain uncompressed. The [storage benchmark contract](replay-storage-benchmark.md)
+owns the accepted evidence requirements for evaluating transaction-scoped sync,
+index density and indexed lossless compression; the [local usage grounding](reviews/replay-storage-usage-grounding.md)
+is observational input, not a shipped compression or recovery guarantee.
 
 ## Output delivery observations
 
