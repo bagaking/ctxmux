@@ -55,7 +55,10 @@ function cargoExecutable(name, args, target) {
     .filter((item) => item.reason === "compiler-artifact" && item.executable);
   const executable = artifacts.find((item) => item.target.name === target);
   assert.ok(executable, `cargo did not identify ${target}`);
-  return executable.executable;
+  const retained = join(evidence, target);
+  cpSync(executable.executable, retained);
+  assert.equal(hash(retained), hash(executable.executable));
+  return retained;
 }
 
 const inputs = passes("source-inputs", "git", [
@@ -66,6 +69,7 @@ const inputs = passes("source-inputs", "git", [
   "crates",
   "packages/sdk/src",
   "packages/sdk/test/creation-failure.e2e.test.ts",
+  "packages/sdk/test/creation-recovery.e2e.test.ts",
   "scripts/check-creation-failure.mjs",
   "Cargo.lock",
   "Cargo.toml",
@@ -81,25 +85,34 @@ const daemon = cargoExecutable(
   "ctxmux_daemon",
 );
 const cli = cargoExecutable("cli-build", ["build", "-p", "ctxmux"], "ctxmux");
+const daemonServer = cargoExecutable(
+  "daemon-server-build",
+  ["build", "-p", "ctxmux-daemon", "--bin", "ctxmuxd"],
+  "ctxmuxd",
+);
 passes("sdk-build", "npm", ["run", "build", "--workspace", "@ctxmux/sdk"]);
 const testEnv = {
   ...env,
   CTXMUX_CREATION_TEST_DAEMON: daemon,
+  CTXMUXD_BIN: daemonServer,
   CTXMUX_BIN: cli,
 };
 const tsx = join(root, "node_modules", ".bin", "tsx");
-const testPath = "test/creation-failure.e2e.test.ts";
+const testPaths = [
+  "test/creation-failure.e2e.test.ts",
+  "test/creation-recovery.e2e.test.ts",
+];
 const candidate = passes(
   "candidate",
   tsx,
-  ["--test", "--test-reporter=tap", testPath],
+  ["--test", "--test-reporter=tap", ...testPaths],
   {
     cwd: join(root, "packages", "sdk"),
     env: testEnv,
   },
 );
-assert.match(candidate, /# tests 2\b/u);
-assert.match(candidate, /# pass 2\b/u);
+assert.match(candidate, /# tests 6\b/u);
+assert.match(candidate, /# pass 6\b/u);
 
 const variant = join(evidence, "mutant");
 mkdirSync(variant);
@@ -129,14 +142,19 @@ passes("mutant-build", join(root, "node_modules", ".bin", "tsc"), [
   "-p",
   join(variant, "tsconfig.build.json"),
 ]);
-const mutant = run("mutant", tsx, ["--test", "--test-reporter=tap", testPath], {
-  cwd: variant,
-  env: testEnv,
-});
+const mutant = run(
+  "mutant",
+  tsx,
+  ["--test", "--test-reporter=tap", ...testPaths],
+  {
+    cwd: variant,
+    env: testEnv,
+  },
+);
 assert.equal(mutant.status, 1, "dropping original owner facts must fail");
 assert.ok(mutant.stdout.includes("ERR_ASSERTION"));
-assert.match(mutant.stdout, /# tests 2\b/u);
-assert.match(mutant.stdout, /# fail 1\b/u);
+assert.match(mutant.stdout, /# tests 6\b/u);
+assert.match(mutant.stdout, /# fail 5\b/u);
 for (const [file, expected] of Object.entries(sourceHashes))
   assert.equal(hash(join(root, file)), expected, `source drift: ${file}`);
 writeFileSync(
@@ -147,6 +165,7 @@ writeFileSync(
       artifacts: Object.fromEntries(
         [
           daemon,
+          daemonServer,
           cli,
           join(root, "packages", "sdk", "dist", "control.js"),
           join(variant, "dist", "control.js"),

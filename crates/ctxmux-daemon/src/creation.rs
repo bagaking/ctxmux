@@ -161,6 +161,12 @@ impl CreationFlightOwner {
         Arc::clone(&self.inner.admission).acquire_owned().await.ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn begin_test(&self) -> Option<CreationFlight> {
+        let admission = Arc::clone(&self.inner.admission).try_acquire_owned().ok()?;
+        self.try_begin(admission)
+    }
+
     /// Linearize one admitted launch against the shutdown fence.
     pub(crate) fn try_begin(&self, admission: OwnedSemaphorePermit) -> Option<CreationFlight> {
         let mut state = self

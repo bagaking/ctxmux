@@ -29,6 +29,7 @@ fn creation_failure_public_subprocess() {
             if before_commit {
                 persistence.fail_next_start_before_commit();
             } else {
+                persistence.hold_start_outcome_observation_for_test();
                 persistence.fail_next_insert_after_commit();
             }
             std::fs::write(
@@ -51,6 +52,7 @@ fn creation_failure_public_subprocess() {
                 1,
                 "all retries and prelaunch refusals retain one physical launch"
             );
+            persistence.release_start_commit_probe_for_test();
             for run in server.manager.list_all() {
                 if run.state.is_running() {
                     server.manager.get(run.id).unwrap().stop().await.unwrap();
@@ -2662,7 +2664,7 @@ fn creation_hooked_server() -> (
     (InProcessServer::start(manager), hook, reached_rx)
 }
 
-fn creation_hook(
+pub(super) fn creation_hook(
     point: CreationHookPoint,
     armed: bool,
 ) -> (Arc<CreationTestHook>, mpsc::UnboundedReceiver<()>) {

@@ -520,5 +520,7 @@ declarations have not drifted.
 
 `npm run test:creation-failure` at the repository root builds the actual Native
 failure fixture, CLI and SDK. It checks before- and after-COMMIT process effects,
-exact operation receipts, and a separately built SDK mutation that drops those
-facts. Its source and executable identities are recorded under `target/`.
+exact operation receipts, and original unknown Start/Fork recovery through
+independent Node/CLI readers and a real daemon restart. It also builds a separate
+SDK mutation that drops the owner facts. Source and executable identities are
+recorded under `target/`.

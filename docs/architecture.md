@@ -831,10 +831,12 @@ The writer releases its handle before adaptive transaction reduction; its
 destructor never decides commit disposition. Empty payload performs no replay
 sync. The actor queue and output grants fund pending work; ordinary append
 offers do not block the shared PTY reader when the queue is full. Uncertain
-commit/rollback, replay conflicts, integrity and owner-invariant failures remain
-fail-stop for later durable mutations. A latched persistence failure marks the
-replay history gap and preserves its lagging durable head. It does not invalidate
-an intact live terminal model that has consumed every ordered PTY byte. Actual
+commit/rollback fences later durable mutations until the same owner establishes
+the original outcome. Replay conflicts, integrity and owner-invariant failures
+remain fenced. Persistence failure preserves accepted bytes, the protected
+unoffered suffix and the last confirmed durable head; it neither invents a
+history Gap nor invalidates an intact live terminal model that has consumed
+every ordered PTY byte. Actual
 source discontinuity still discards that model; a missing model is not rebuilt
 from a later screen or guessed state. Startup performs journal
 recovery and exact schema/application validation against the schema-6 format
@@ -939,7 +941,8 @@ also defers while necessary startup mutations retain their actual page and
 commit proofs. Idle pending compaction shares the same capacity-debt boundary:
 unchanged funding does not repeat copy, sync or coordinate mutation. Shared durable debt appears through existing public native
 `Backpressured` service state, including quiet Runs with their own accepted debt, and clears only after actual
-settlement. Its reason stays separate from the fatal first-failure latch. A
+settlement. Its reason stays separate from an unresolved transaction's original
+failure or a permanent integrity fence. A
 persistence client reconnect neither changes policy nor clears an uncertain
 outcome fence; upgrade cannot extract healthy owners past unresolved work.
 
@@ -963,15 +966,46 @@ Fatal and uncertain outcomes retain accepted output copies, queue funding and
 terminal settlement under the original owner. The native output buffer protects
 the unoffered suffix even while persistence is fenced, applying its existing
 bounded backpressure instead of releasing those bytes as disposable history.
-`storage_failure` reports the current structured blocking fault and clears only
-after actual debt settlement; `first_failure` remains the permanent-fence reason.
+`storage_failure` reports the current structured blocking fault. The original
+`first_failure` is retained until its precise transaction is reconciled; a
+foreign owner, corrupt witness or unqualified fault remains fenced. Clearing a
+fault does not acknowledge other queued debt: offered/committed heads and
+terminal settlement retain their own original completion conditions.
 
-Online recovery of an uncertain `COMMIT` is not yet implemented: original bytes
-are retained, but the exact transaction witness and post-commit continuation
-are not yet transferred from every failed transaction into resumable owner
-state. Such an outcome remains fenced; neither free space nor a reconnect
-proves its disposition. This limitation is distinct from the pre-commit
-recovery implementation and must not be described as automatic reconciliation.
+The same `StateStore` now retains the exact old/new witness and continuation of
+an uncertain transaction. Its bounded deadline first revalidates the original
+physical namespace. If SQLite still holds the original uncommitted transaction,
+only that transaction's rollback may complete before inspecting its outcome.
+While such a private transaction remains active, durable Replay and checkpoint
+reads report unavailable instead of exposing its uncommitted rows; live bytes,
+process controls and in-memory observations remain available. Autocommit reads
+then distinguish exact Old, New and hybrid/unknown. Neither free space nor a
+client reconnect proves an outcome. No alternative database, migration, repair
+store or full historical scan participates.
+
+Old returns only the original work to its existing funded owner and permits
+truncating only that transaction's unindexed payload. New settles only the
+committed subtransaction: its original output/metadata counters and terminal
+waiter, its published replay-generation identity, or its coordinate-migration
+cursor. A committed maintenance step before an Append does not acknowledge the
+Append. A finalized row is not finalized again. Source-file retirement waits
+for its original migration cursor, and restoring connection settings remains
+part of the original continuation even after a proven rollback. Reconciliation
+wakes the existing native owner so quiet Runs can offer their protected suffix
+without requiring another input or output event.
+
+Creation keeps the original prepared SQL unit, receipt, publication reservation,
+physical Run and cleanup owner. Exact New publishes that original live or
+already-ended Run. After an authorized COMMIT, exact Old can resume the original
+SQL publication; it cannot spawn again. An aborted or pre-ready transaction's
+Old instead releases its original reservation. Original Abort completion keeps
+its recovery receipt; loss of the actor is not represented as a live recovery
+owner. Exact terminal removal uses the same transaction witness: New commits
+its existing Registry removal guard, Old releases it, and neither result repeats
+process effects. These persistence uncertainties do not close healthy Run
+controls or fail the daemon incarnation. Shutdown still waits for the original
+creation/removal continuations and reports unresolved ownership at its real
+deadline rather than declaring success early.
 
 #### Recoverability and antifragility
 

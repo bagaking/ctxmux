@@ -82,7 +82,7 @@ still zero. Likewise, an unknown COMMIT can leave disk ahead of the last
 confirmed watermark; a difference in byte counters is not itself proof of
 physical loss. These distinctions matter before any recovery action.
 
-The source mechanisms are:
+The incident source mechanisms were:
 
 - [`persistence.rs`](../../crates/ctxmux-daemon/src/persistence.rs):
   `is_transient_storage` recognizes SQLite FULL, selected write-side IOERR,
@@ -249,14 +249,14 @@ promise unlimited persistence on a full disk.
 
 ## Current implementation boundary
 
-The current source adds a first repair slice under the existing persistence
+The current source repairs the failure boundary under the existing persistence
 actor. Known pre-commit removable open/write failures preserve their structured
 SQLite/OS evidence and accepted byte/lifecycle debt. Rechecking the original
 physical paths permits same-owner recovery after directory or permission repair;
 capacity recovery continues to use actual funding. Repeated failures have a
 bounded retry schedule, and held WAL readers return execution to the actor's
-read/observation lane. Wrong physical identities and uncertain commits remain
-fenced. Failed persistence no longer makes the unoffered live-output suffix
+read/observation lane. Wrong physical identities remain fenced; uncertain
+commits now retain an exact same-owner reconciliation continuation. Failed persistence no longer makes the unoffered live-output suffix
 eligible for reclamation.
 
 Focused owner tests exercise a real SQLite CANTOPEN/ENOENT observation, two
@@ -271,13 +271,42 @@ with the owner recheck disabled fails the same-owner recovery assertion.
 These checks do not establish that this incident's old daemon recovered or that
 a new artifact has been installed.
 
-The next unresolved boundary is online uncertain-COMMIT reconciliation. Keeping
-accepted bytes is necessary, but the failed transaction's exact old/new witness
-and specific continuation must also stay with the original owner. Clearing a
-latch, replaying a Finalize against an already-terminal row, or treating a new
-compaction generation as the old one is not a recovery transition. Creation
-uncertainty additionally owns the actual child and publication reservation;
-its durable result cannot authorize another spawn.
+Online uncertain-COMMIT reconciliation now retains the exact witness and the
+specific continuation, in addition to accepted bytes. Old and New are checked
+against the original SQLite unit. Output, terminal metadata, replay-generation
+publication, coordinate migration, original creation and exact removal settle
+at their actual owners. The original child and publication reservation survive
+creation uncertainty; a terminal child remains terminal, and no unknown Start
+is resent. The architecture contract above is the sole definition of these
+recovery rules.
+
+Review and executable counterexamples exposed related causes within this same
+boundary. A failed rollback left private rows visible to reads on the owning
+connection; those reads now report unavailable until the original transaction
+ends. A lost Abort recovery receipt could turn a retained, recoverable SQL unit
+into an incarnation failure; the receipt now remains with its original owner.
+Unknown removal leaked its Registry guard and fenced the daemon; it now awaits
+its exact old/new outcome. Shutdown must await those original guards as well as
+creation flights. A quiet Run also needed an explicit recovery wake to offer
+bytes protected during the outage, and a replay migration needed to consume its
+original cursor before retiring its source file. These are owner-ordering and
+completion defects, not reasons to add client retries or another fact store.
+
+Focused reconciliation tests cover repeated unknown Append Old/New, original
+Finalize acknowledgement and metadata, replay publication/coordinate outcomes,
+active rollback read isolation, connection-setting restoration, hybrid witness
+and substituted-inode rejection. A real Unix client with two real PTYs exercises
+continued control and exact bytes during the fault, same-owner recovery without
+resending input, and a separate cold reader process using the saved original
+state. Fault seams execute real SQLite COMMIT or ROLLBACK and hold the subsequent
+observation; they do not fill the host disk or establish the original incident's
+missing errno. Source-bound static analysis and independently compiled mutations
+also check the selected native candidate: treating committed New as Old breaks
+cold recovery, and bypassing the active-transaction read boundary exposes private
+rows. Joined artifact/consumer qualification remains separate. A fragmented
+maintenance timing case passed alone but exceeded its unchanged deadline under
+concurrent test/build load; that evidence does not establish general loaded
+performance.
 
 ## Required proof and remaining gaps
 
@@ -307,6 +336,9 @@ and make the corresponding behavior test fail.
 
 Remaining gaps: the original syscall/errno and precise failed transaction are
 unknown; the user-reported service failures were not converted into test writes;
-the amount of unconfirmed output across all Runs is unmeasured; online uncertain-COMMIT continuation, full artifact/consumer qualification and
-safe old-instance repair remain incomplete. Independent source review and documentation checks
-do not close these implementation gaps.
+the amount of unconfirmed output across all Runs is unmeasured. The new source
+implements online continuation, but full artifact/consumer qualification and a
+safe remedy for the already-failed old instance remain separate delivery work.
+The original live daemon has not been replaced or proven healed by these tests;
+source review, an installed binary or a newly created empty Run cannot substitute
+for that evidence.

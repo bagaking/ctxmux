@@ -250,7 +250,9 @@ pub enum PersistenceError {
         required: u64,
         detail: String,
     },
-    #[error("ctxmux durable storage is unavailable (available={available:?} bytes): {error}")]
+    #[error(
+        "ctxmux durable storage is unavailable (available={available:?} bytes; None means funding is unknown): {error}"
+    )]
     StorageUnavailable {
         available: Option<u64>,
         #[source]
@@ -743,6 +745,9 @@ struct PersistenceTestHooks {
     maintenance_commits_before_error: AtomicU64,
     maintenance_commits_before_stat_error: AtomicU64,
     maintenance_error_committed: AtomicBool,
+    maintenance_probe_unavailable: AtomicBool,
+    original_rollback_unavailable: AtomicBool,
+    cache_spill_restore_unavailable: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
     maintenance_turn_barrier: Mutex<Option<FinalizeTestBarrier>>,
@@ -764,6 +769,8 @@ struct PersistenceTestHooks {
     force_startup_over_budget_once: AtomicBool,
     start_commit_crash_phase: AtomicU8,
     fail_next_start_commit_as: Mutex<Option<CommitProbe>>,
+    start_probe_unavailable: AtomicBool,
+    start_probe_attempts: AtomicUsize,
     fail_next_append_as_disk_full: AtomicBool,
     force_append_storage_full: AtomicBool,
     force_compaction_storage_full: AtomicBool,
@@ -846,38 +853,40 @@ impl PersistentCandidate {
 ///
 /// Removal has no successor row, so a rolled-back or rejected removal simply
 /// leaves the exact candidate present and is safe to surface as a typed error.
-/// An unclassifiable rollback failure latches the persistence actor exactly as
-/// a start `CommitUnknown` does, so the daemon fail-stops rather than diverging
-/// durable and in-memory truth.
+/// An unclassified transaction retains its exact witness and the caller's
+/// existing Registry guard until the original actor proves Old or New.
 pub(crate) enum RemovalDisposition {
     /// The exact row and its cascading replay were deleted and committed.
     Removed,
     /// No durable mutation occurred; the exact candidate remains present.
     NotRemoved(PersistenceError),
-    /// The rollback or classification could not be proven; restart is required.
-    Unknown(PersistenceError),
+    /// The original guard awaits exact Old/New without repeating the removal.
+    Unknown {
+        error: PersistenceError,
+        completion: mpsc::Receiver<bool>,
+    },
 }
 
 /// One indexed SQL effect of an atomic maintenance transaction. A witness is
 /// useful only when apply actually changes it: an unchanged row cannot prove
 /// that a COMMIT error rolled back unrelated effects.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum MaintenanceWitness {
     Run(RunId),
+    Runs(Vec<RunId>),
     ReplayChunk(i64),
     ActiveReplay,
-    Unchanged,
 }
 
 impl MaintenanceWitness {
     fn read(
-        self,
+        &self,
         connection: &Connection,
     ) -> Result<Option<Vec<rusqlite::types::Value>>, PersistenceError> {
         use rusqlite::types::Value;
         let (sql, key) = match self {
             Self::Run(id) => (
-                "SELECT state_kind, state_json, pid, durable_first_available_byte,
+                "SELECT creation_key, state_kind, state_json, pid, durable_first_available_byte,
                  durable_output_bytes, replay_bytes, replay_truncated, metadata_bytes,
                  updated_at_ms, terminal_at_ms FROM runs WHERE id = ?1",
                 Value::Text(id.to_string()),
@@ -885,13 +894,24 @@ impl MaintenanceWitness {
             Self::ReplayChunk(ordinal) => (
                 "SELECT run_id, start_byte, end_byte, data_file, data_offset,
                  data_bytes FROM replay_chunks WHERE ordinal = ?1",
-                Value::Integer(ordinal),
+                Value::Integer(*ordinal),
             ),
             Self::ActiveReplay => (
                 "SELECT replay_file FROM runtime_meta WHERE singleton = ?1",
                 Value::Integer(1),
             ),
-            Self::Unchanged => return Ok(None),
+            Self::Runs(ids) => {
+                let mut values = Vec::new();
+                for id in ids {
+                    values.push(Value::Text(id.to_string()));
+                    if let Some(row) = Self::Run(*id).read(connection)? {
+                        values.extend(row);
+                    } else {
+                        values.push(Value::Null);
+                    }
+                }
+                return Ok(Some(values));
+            }
         };
         connection
             .prepare_cached(sql)
@@ -908,6 +928,60 @@ impl MaintenanceWitness {
     }
 }
 
+/// The unresolved transaction stays with the unique connection owner. The
+/// existing queued Command owns its payload; this record only owns the exact
+/// indexed witness, WAL proof and the counters/files that need settlement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitAttempt {
+    NotIssued,
+    Unconfirmed,
+    Confirmed,
+}
+
+struct UnresolvedMaintenance {
+    witness: MaintenanceWitness,
+    old: Option<Vec<rusqlite::types::Value>>,
+    new: Option<Vec<rusqlite::types::Value>>,
+    commit: CommitAttempt,
+    baseline: u64,
+    charge: Option<u64>,
+    cache_spill: Option<i64>,
+    check_files: bool,
+    retry: bool,
+    settlement: MaintenanceSettlement,
+}
+
+enum MaintenanceSettlement {
+    IndexedRows,
+    Removal {
+        id: RunId,
+        reply: mpsc::SyncSender<bool>,
+    },
+    Output {
+        path: PathBuf,
+        identity: (u64, u64),
+        before: u64,
+        heads: Vec<(Arc<AtomicU64>, u64)>,
+        metadata: Option<(Arc<AtomicU64>, u64)>,
+        terminal: Option<RunId>,
+    },
+    ReplayPublication {
+        name: String,
+        identity: (u64, u64),
+        sources: VecDeque<String>,
+    },
+    ReplayMove {
+        path: PathBuf,
+        identity: (u64, u64),
+        before: u64,
+        through: i64,
+    },
+}
+
+struct MaintenanceReconciled {
+    terminal: Option<RunId>,
+}
+
 /// Monotonic durable disposition of one staged Run start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StartDisposition {
@@ -920,12 +994,16 @@ pub(crate) enum StartDisposition {
 #[derive(Clone, Debug)]
 pub(crate) struct StartReceipt {
     disposition: Arc<Mutex<StartDisposition>>,
+    commit_authorized: Arc<AtomicBool>,
+    cache_spill: Arc<Mutex<Option<i64>>>,
 }
 
 impl StartReceipt {
     fn pending() -> Self {
         Self {
             disposition: Arc::new(Mutex::new(StartDisposition::Pending)),
+            commit_authorized: Arc::new(AtomicBool::new(false)),
+            cache_spill: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -943,6 +1021,19 @@ impl StartReceipt {
         true
     }
 
+    fn resolve(&self, disposition: StartDisposition) {
+        debug_assert!(matches!(
+            disposition,
+            StartDisposition::Committed | StartDisposition::NotCommitted
+        ));
+        let mut current = mutex_lock(&self.disposition);
+        if *current == StartDisposition::CommitUnknown {
+            *current = disposition;
+        } else {
+            debug_assert_eq!(*current, disposition);
+        }
+    }
+
     fn unknown_if_pending(&self) -> StartDisposition {
         let _ = self.decide(StartDisposition::CommitUnknown);
         self.disposition()
@@ -956,6 +1047,7 @@ pub(crate) struct PersistentStartFailure {
     capacity: bool,
     #[source]
     error: PersistenceError,
+    recovery: Option<StartReceipt>,
 }
 
 impl PersistentStartFailure {
@@ -964,6 +1056,7 @@ impl PersistentStartFailure {
             disposition,
             capacity: false,
             error,
+            recovery: None,
         }
     }
 
@@ -972,6 +1065,7 @@ impl PersistentStartFailure {
             disposition,
             capacity: stage_failure.capacity,
             error: stage_failure.error,
+            recovery: None,
         }
     }
 
@@ -1002,15 +1096,25 @@ impl PersistentStartFailure {
         failure
     }
 
+    pub(crate) fn recovery_receipt(&self) -> Option<StartReceipt> {
+        self.recovery.clone()
+    }
+
     pub(crate) fn into_error(self) -> PersistenceError {
         self.error
     }
 }
 
+pub(crate) struct UnknownStart {
+    pub(crate) failure: PersistentStartFailure,
+    pub(crate) durable: PersistentRun,
+    pub(crate) receipt: StartReceipt,
+}
+
 pub(crate) enum PersistentStartCompletion {
     NotCommitted(PersistentStartFailure),
     Committed(CommittedStart),
-    CommitUnknown(PersistentStartFailure),
+    CommitUnknown(UnknownStart),
 }
 
 /// Affine decision owner for one `SQLite` transaction already staged in memory.
@@ -1134,9 +1238,8 @@ pub(crate) struct PersistentRun {
     ///
     /// This is deliberately NOT `durable_head`. Every accepted append either
     /// commits or latches persistence off daemon-wide (`remember_failure`);
-    /// there is no third outcome in which a queued append is silently dropped.
-    /// So "offered" already implies "will be durable, or nothing is", and
-    /// re-sending bytes that are merely still IN FLIGHT buys no safety while
+    /// it remains exact original debt until its owner settles the outcome.
+    /// Re-sending bytes that are merely still IN FLIGHT buys no safety while
     /// costing the whole difference between the two watermarks — which under
     /// load is an entire queue depth of output.
     ///
@@ -1927,7 +2030,11 @@ impl Persistence {
             }),
             Ok(Err(error)) => {
                 let disposition = receipt.disposition();
-                Err(PersistentStartFailure::from_stage(disposition, error))
+                let mut failure = PersistentStartFailure::from_stage(disposition, error);
+                if disposition == StartDisposition::CommitUnknown {
+                    failure.recovery = Some(receipt);
+                }
+                Err(failure)
             }
             Err(_) => {
                 let disposition = receipt.unknown_if_pending();
@@ -1972,8 +2079,8 @@ impl Persistence {
             .map_err(PersistentStartFailure::into_error)?;
         match staged.commit() {
             PersistentStartCompletion::Committed(start) => Ok(start),
-            PersistentStartCompletion::NotCommitted(failure)
-            | PersistentStartCompletion::CommitUnknown(failure) => Err(failure.into_error()),
+            PersistentStartCompletion::NotCommitted(failure) => Err(failure.into_error()),
+            PersistentStartCompletion::CommitUnknown(unknown) => Err(unknown.failure.into_error()),
         }
     }
 
@@ -1999,6 +2106,83 @@ impl Persistence {
             .test_hooks
             .start_commit_crash_phase
             .store(phase as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_original_rollback_for_test(&self) {
+        self.inner
+            .test_hooks
+            .original_rollback_unavailable
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_original_rollback_for_test(&self) {
+        self.inner
+            .test_hooks
+            .original_rollback_unavailable
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_maintenance_commit_probe_for_test(&self, committed: bool) {
+        self.inner
+            .test_hooks
+            .maintenance_probe_unavailable
+            .store(true, Ordering::Release);
+        self.inner
+            .test_hooks
+            .maintenance_error_committed
+            .store(committed, Ordering::Release);
+        self.inner
+            .test_hooks
+            .maintenance_commits_before_error
+            .store(1, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_maintenance_commit_probe_for_test(&self) {
+        self.inner
+            .test_hooks
+            .maintenance_probe_unavailable
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_start_outcome_observation_for_test(&self) {
+        self.inner
+            .test_hooks
+            .start_probe_unavailable
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_start_commit_probe_for_test(&self, committed: bool) {
+        self.inner
+            .test_hooks
+            .start_probe_unavailable
+            .store(true, Ordering::Release);
+        *mutex_lock(&self.inner.test_hooks.fail_next_start_commit_as) = Some(if committed {
+            CommitProbe::NewUnit
+        } else {
+            CommitProbe::OldUnit
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_start_commit_probe_for_test(&self) {
+        self.inner
+            .test_hooks
+            .start_probe_unavailable
+            .store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_commit_probe_attempts_for_test(&self) -> usize {
+        self.inner
+            .test_hooks
+            .start_probe_attempts
+            .load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -2210,10 +2394,12 @@ impl StagedPersistentStart {
                     error,
                 ))
             }
-            Ok(StageCompletion::CommitUnknown(error)) => Err(PersistentStartFailure::new(
-                StartDisposition::CommitUnknown,
-                error,
-            )),
+            Ok(StageCompletion::CommitUnknown(error)) => {
+                let mut failure =
+                    PersistentStartFailure::new(StartDisposition::CommitUnknown, error);
+                failure.recovery = Some(self.receipt.clone());
+                Err(failure)
+            }
             Err(_) => {
                 let disposition = self.receipt.unknown_if_pending();
                 Err(PersistentStartFailure::new(
@@ -2255,9 +2441,13 @@ impl StagedPersistentStart {
                     post_commit_error,
                 })
             }
-            Ok(StageCompletion::CommitUnknown(error)) => PersistentStartCompletion::CommitUnknown(
-                PersistentStartFailure::new(StartDisposition::CommitUnknown, error),
-            ),
+            Ok(StageCompletion::CommitUnknown(error)) => {
+                PersistentStartCompletion::CommitUnknown(UnknownStart {
+                    failure: PersistentStartFailure::new(StartDisposition::CommitUnknown, error),
+                    durable: self.take_durable(),
+                    receipt: self.receipt.clone(),
+                })
+            }
             Err(_) => {
                 let disposition = self.receipt.unknown_if_pending();
                 let failure =
@@ -2278,7 +2468,11 @@ impl StagedPersistentStart {
             }),
             StartDisposition::NotCommitted => PersistentStartCompletion::NotCommitted(failure),
             StartDisposition::Pending | StartDisposition::CommitUnknown => {
-                PersistentStartCompletion::CommitUnknown(failure)
+                PersistentStartCompletion::CommitUnknown(UnknownStart {
+                    failure,
+                    durable: self.take_durable(),
+                    receipt: self.receipt.clone(),
+                })
             }
         }
     }
@@ -2399,6 +2593,22 @@ impl Command {
             _ => unreachable!("only lifecycle commands use lifecycle admission"),
         }
     }
+}
+
+struct UnresolvedStart {
+    prepared: Box<PreparedPersistentStart>,
+    candidates: Vec<PersistentCandidate>,
+    receipt: StartReceipt,
+    retry: bool,
+}
+
+#[derive(Clone, Copy)]
+enum StageDecisionOwner<'a> {
+    Caller {
+        ready: &'a mpsc::SyncSender<Result<(), StageFailure>>,
+        decision: &'a mpsc::Receiver<StageDecision>,
+    },
+    OriginalCommit,
 }
 
 struct StageRequest {
@@ -2522,6 +2732,10 @@ fn actor_main(
     let mut external_capacity = false;
     let mut filesystem_debt = false;
     loop {
+        if store.reconciliation_pending() && recovery_retry.is_none() {
+            recovery_retry = Some(Instant::now() + recovery_backoff);
+            capacity_blocked.store(true, Ordering::Release);
+        }
         if pending.is_empty()
             && queue_depth.load(Ordering::Acquire) == 0
             && !capacity_blocked.load(Ordering::Acquire)
@@ -2719,6 +2933,60 @@ fn actor_main(
                 }
             };
         lifecycle_yielded = false;
+        if store.reconciliation_pending()
+            && recovery_retry.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            match store.reconcile_transaction() {
+                Ok(Some(reconciled)) => {
+                    // Only the retained original transaction can release its
+                    // own fence; free space or a successful unrelated read cannot.
+                    *mutex_lock(failure) = None;
+                    *mutex_lock(storage_failure) = None;
+                    recovery_retry = None;
+                    recovery_backoff = STORAGE_RETRY_INTERVAL;
+                    capacity_blocked.store(false, Ordering::Release);
+                    capacity_progress = true;
+                    // A quiet Run can have protected, unoffered bytes from
+                    // this outage. It needs an owner wake even when the
+                    // capacity-pressure flag did not change.
+                    if let Some(wake) = &*mutex_lock(output_wake) {
+                        wake.wake();
+                    }
+                    if let Some(id) = reconciled.terminal {
+                        settle_original_finalize(&mut pending, id);
+                        settle_original_finalize(&mut lifecycle_pending, id);
+                        if matches!(&command, Command::Finalize { id: current, .. } if *current == id)
+                        {
+                            if let Command::Finalize { reply, .. } = command {
+                                let _ = reply.send(Ok(()));
+                            }
+                            continue;
+                        }
+                    }
+                    pending.push_front(command);
+                    continue;
+                }
+                Ok(None) => {
+                    recovery_retry = Some(Instant::now() + recovery_backoff);
+                    recovery_backoff = (recovery_backoff * 2).min(Duration::from_secs(1));
+                }
+                Err(error) if error.is_transient_storage() => {
+                    recovery_retry = Some(Instant::now() + recovery_backoff);
+                    recovery_backoff = (recovery_backoff * 2).min(Duration::from_secs(1));
+                }
+                Err(error) => {
+                    let _ = crate::diagnostics::record(format_args!(
+                        "original transaction reconciliation remains fenced: {error}"
+                    ));
+                    if let Some(unresolved) = store.unresolved.as_mut() {
+                        unresolved.retry = false;
+                    } else if let Some(unresolved) = store.unresolved_start.as_mut() {
+                        unresolved.retry = false;
+                    }
+                    recovery_retry = None;
+                }
+            }
+        }
         if capacity_blocked.load(Ordering::Acquire) {
             if matches!(command, Command::Finalize { .. }) {
                 // Finalize may arrive on the priority lane while its accepted
@@ -2731,7 +2999,8 @@ fn actor_main(
             // Removable syscall failures have no capacity delta to observe (a
             // directory can be restored or permissions corrected). Recheck at
             // a bounded owner deadline, never once per client read, and never
-            // reopen/create a replacement store. Unknown commits have no timer.
+            // reopen/create a replacement store. Unknown transactions use
+            // their separate exact-witness continuation above.
             if mutex_lock(failure).is_none()
                 && recovery_retry.is_some_and(|deadline| Instant::now() >= deadline)
             {
@@ -2765,7 +3034,7 @@ fn actor_main(
                 continue;
             }
             if matches!(command, Command::Append { .. })
-                || (mutex_lock(failure).is_none()
+                || ((mutex_lock(failure).is_none() || store.reconciliation_pending())
                     && matches!(&command, Command::Finalize { id, .. }
                     if pending.iter().any(|queued| matches!(queued, Command::Append { id: queued_id, .. } if queued_id == id))))
             {
@@ -2846,7 +3115,11 @@ fn actor_main(
                 through,
                 reply,
             } => {
-                let result = require_path_identity(&store.replay_dir, store.recovery_identity[2])
+                let result = store
+                    .require_committed_read()
+                    .and_then(|()| {
+                        require_path_identity(&store.replay_dir, store.recovery_identity[2])
+                    })
                     .and_then(|()| {
                         load_replay_page(&store.connection, &store.replay_dir, id, after, through)
                     })
@@ -2885,8 +3158,10 @@ fn actor_main(
                     &request.prepared,
                     &request.candidates,
                     &request.receipt,
-                    &request.ready,
-                    &request.decision,
+                    StageDecisionOwner::Caller {
+                        ready: &request.ready,
+                        decision: &request.decision,
+                    },
                     Some(shutdown),
                 );
                 let Ok(result) = result else {
@@ -2894,7 +3169,29 @@ fn actor_main(
                     // conflict must not be latched as durable corruption.
                     return;
                 };
+                let unresolved = matches!(
+                    request.receipt.disposition(),
+                    StartDisposition::CommitUnknown
+                ) || matches!(
+                    &result,
+                    StageDriveResult::Completed(StageCompletion::Committed(Some(_)))
+                );
                 handle_staged_start_result(&request, result, failure, storage_failure);
+                if unresolved {
+                    let StageRequest {
+                        prepared,
+                        candidates,
+                        receipt,
+                        ..
+                    } = *request;
+                    store.unresolved_start = Some(UnresolvedStart {
+                        prepared,
+                        candidates,
+                        receipt,
+                        retry: true,
+                    });
+                    continue;
+                }
                 for candidate in &request.candidates {
                     if store.connection.query_row(
                         "SELECT EXISTS(SELECT 1 FROM runs WHERE id=?1)",
@@ -2920,7 +3217,7 @@ fn actor_main(
                 } else {
                     match store.remove_terminal_with_shutdown(&candidate, Some(shutdown)) {
                         Some(disposition) => {
-                            if let RemovalDisposition::Unknown(error) = &disposition {
+                            if let RemovalDisposition::Unknown { error, .. } = &disposition {
                                 remember_failure(failure, storage_failure, error);
                             }
                             disposition
@@ -2940,8 +3237,6 @@ fn actor_main(
                 replay,
                 durable_head,
             } => {
-                #[cfg(test)]
-                pause_before_append(test_hooks);
                 // One `Append` has left the channel. Decrement here rather than
                 // at the two dequeue sites above so the counter tracks appends
                 // only — a `StageStart` or `RemoveTerminal` never incremented it.
@@ -2949,6 +3244,8 @@ fn actor_main(
                 if !held_credits {
                     queue_depth.fetch_sub(1, Ordering::AcqRel);
                 }
+                #[cfg(test)]
+                pause_before_append(test_hooks);
                 let mut batch = vec![(id, replay, durable_head)];
                 let mut payload = replay_payload(&batch[0].1);
                 let window = APPEND_BATCH_WINDOW;
@@ -3194,6 +3491,21 @@ fn actor_main(
             } => {
                 #[cfg(test)]
                 pause_before_finalize(test_hooks);
+                if store.reconciliation_pending() {
+                    drop(lifecycle_permit);
+                    pending.push_back(Command::Finalize {
+                        lifecycle_permit: None,
+                        id,
+                        actual_pid,
+                        replay,
+                        state,
+                        source_gap_after_byte,
+                        durable_head,
+                        metadata_bytes,
+                        reply,
+                    });
+                    continue;
+                }
                 let result = if let Some(message) = mutex_lock(failure).clone() {
                     Some(Err(PersistenceError::Mutation(message)))
                 } else {
@@ -3298,8 +3610,15 @@ fn actor_main(
                         continue;
                     }
                     remember_failure(failure, storage_failure, error);
-                    let _ = reply.send(result.map(|_| ()));
-                    let (reply, _) = mpsc::sync_channel(0);
+                    // Preserve the original terminal waiter when this exact
+                    // transaction has a continuation. A permanent fault still
+                    // reports promptly without releasing the terminal facts.
+                    let reply = if store.reconciliation_pending() {
+                        reply
+                    } else {
+                        let _ = reply.send(result.map(|_| ()));
+                        mpsc::sync_channel(0).0
+                    };
                     drop(lifecycle_permit);
                     pending.push_back(Command::Finalize {
                         lifecycle_permit: None,
@@ -3340,7 +3659,10 @@ fn actor_main(
                         .last()
                         .map_or(s.checkpoint.through_byte, |r| r.through_byte)
                 });
-                let result = if let Err(error) = store.validate_recovery_namespace() {
+                let result = if let Err(error) = store
+                    .require_committed_read()
+                    .and_then(|()| store.validate_recovery_namespace())
+                {
                     Err(error.to_string())
                 } else if !exists || latest_fence > durable_head.load(Ordering::Acquire) {
                     Err("checkpoint does not have a committed original-output fence".to_owned())
@@ -3494,6 +3816,19 @@ fn take_required_append(
         pending.push_back(command);
     }
     None
+}
+
+/// Completing the original terminal transaction is distinct from retrying
+/// its UPDATE against a row that is already terminal. Its waiter and funding
+/// are released exactly once, under the same actor that owns the Command.
+fn settle_original_finalize(queue: &mut VecDeque<Command>, id: RunId) {
+    while let Some(index) = queue.iter().position(
+        |command| matches!(command, Command::Finalize { id: queued, .. } if *queued == id),
+    ) {
+        if let Some(Command::Finalize { reply, .. }) = queue.remove(index) {
+            let _ = reply.send(Ok(()));
+        }
+    }
 }
 
 fn retry_transient_storage<T>(
@@ -3851,6 +4186,8 @@ struct StateStore {
     shm_path: PathBuf,
     connection: Connection,
     recovery_identity: [(u64, u64); 5],
+    unresolved: Option<UnresolvedMaintenance>,
+    unresolved_start: Option<UnresolvedStart>,
     runtime_id: RuntimeId,
     epoch: String,
     /// Runs handed off live across an exec-in-place upgrade: excluded from
@@ -3957,6 +4294,301 @@ impl StateStore {
             require_path_identity(path, expected)?;
         }
         Ok(())
+    }
+
+    fn rollback_original_transaction(&self) -> Result<(), PersistenceError> {
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .original_rollback_unavailable
+            .load(Ordering::Acquire)
+        {
+            return Err(PersistenceError::io(
+                &self.database_path,
+                io::Error::from_raw_os_error(2),
+            ));
+        }
+        self.connection
+            .execute_batch("ROLLBACK")
+            .map_err(|error| PersistenceError::database_at(&self.connection, error))
+    }
+
+    fn reconcile_transaction(&mut self) -> Result<Option<MaintenanceReconciled>, PersistenceError> {
+        if self.unresolved.is_some() {
+            let result = self.reconcile_maintenance()?;
+            return Ok(if self.unresolved_start.is_some() {
+                None
+            } else {
+                result
+            });
+        }
+        let Some(pending) = self.unresolved_start.take() else {
+            return Ok(None);
+        };
+        match self.reconcile_start(&pending) {
+            Ok(true) => Ok(Some(MaintenanceReconciled { terminal: None })),
+            result => {
+                self.unresolved_start = Some(pending);
+                result.map(|_| None)
+            }
+        }
+    }
+
+    fn reconcile_start(&mut self, pending: &UnresolvedStart) -> Result<bool, PersistenceError> {
+        self.validate_recovery_identity()?;
+        if !self.connection.is_autocommit() {
+            self.rollback_original_transaction()?;
+            if !self.connection.is_autocommit() {
+                return Ok(false);
+            }
+        }
+        if let Some(previous) = *mutex_lock(&pending.receipt.cache_spill) {
+            self.restore_cache_spill(previous)?;
+        }
+        match self.probe_exact_replacement(&pending.prepared, &pending.candidates)? {
+            CommitProbe::Hybrid => Err(PersistenceError::Corrupt(
+                "original creation has hybrid durable rows".to_owned(),
+            )),
+            CommitProbe::NewUnit => {
+                self.validate_files()?;
+                pending.receipt.resolve(StartDisposition::Committed);
+                for candidate in &pending.candidates {
+                    let _ =
+                        fs::remove_file(terminal_checkpoint_path(&self.state_dir, candidate.id));
+                }
+                Ok(true)
+            }
+            CommitProbe::OldUnit => {
+                if pending.receipt.disposition() == StartDisposition::Committed {
+                    return Err(PersistenceError::Corrupt(
+                        "confirmed creation changed back to its old durable unit".to_owned(),
+                    ));
+                }
+                if !pending.receipt.commit_authorized.load(Ordering::Acquire) {
+                    pending.receipt.resolve(StartDisposition::NotCommitted);
+                    return Ok(true);
+                }
+                // The physical child and original publication remain with the
+                // Run owner. Only the previously authorized SQL unit resumes.
+                let attempt = StartReceipt::pending();
+                let result = self.drive_staged_start_with_shutdown(
+                    &pending.prepared,
+                    &pending.candidates,
+                    &attempt,
+                    StageDecisionOwner::OriginalCommit,
+                    None,
+                )?;
+                match result {
+                    StageDriveResult::Completed(StageCompletion::Committed(None)) => {
+                        pending.receipt.resolve(StartDisposition::Committed);
+                        for candidate in &pending.candidates {
+                            let _ = fs::remove_file(terminal_checkpoint_path(
+                                &self.state_dir,
+                                candidate.id,
+                            ));
+                        }
+                        Ok(true)
+                    }
+                    StageDriveResult::ReadyFailed(failure)
+                    | StageDriveResult::Completed(StageCompletion::NotCommitted(failure)) => {
+                        if failure.error.is_admission_failure() {
+                            Ok(false)
+                        } else {
+                            Err(failure.error)
+                        }
+                    }
+                    StageDriveResult::Completed(
+                        StageCompletion::Committed(Some(_)) | StageCompletion::CommitUnknown(_),
+                    ) => {
+                        if let Some(previous) = *mutex_lock(&attempt.cache_spill) {
+                            *mutex_lock(&pending.receipt.cache_spill) = Some(previous);
+                        }
+                        Ok(false)
+                    }
+                }
+            }
+        }
+    }
+
+    fn require_committed_read(&self) -> Result<(), PersistenceError> {
+        if self.connection.is_autocommit() {
+            Ok(())
+        } else {
+            Err(PersistenceError::Uncertain {
+                message: "original durable transaction is still active; its private rows are not a committed replay observation".to_owned(),
+                error: Box::new(PersistenceError::Mutation("original rollback is unresolved".to_owned())),
+            })
+        }
+    }
+
+    fn read_maintenance_witness(
+        &self,
+        witness: &MaintenanceWitness,
+    ) -> Result<Option<Vec<rusqlite::types::Value>>, PersistenceError> {
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .maintenance_probe_unavailable
+            .load(Ordering::Acquire)
+        {
+            return Err(PersistenceError::io(
+                &self.database_path,
+                io::Error::from_raw_os_error(2),
+            ));
+        }
+        witness.read(&self.connection)
+    }
+
+    fn reconciliation_pending(&self) -> bool {
+        self.unresolved.as_ref().map_or_else(
+            || {
+                self.unresolved_start
+                    .as_ref()
+                    .is_some_and(|value| value.retry)
+            },
+            |value| value.retry,
+        )
+    }
+
+    /// Observe exactly the original transaction under the original lock. The
+    /// only SQL mutation here is completing its own uncommitted ROLLBACK.
+    /// Neither a COMMIT nor any physical process effect is retried by a probe.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "exact outcome, original counters and physical generation settlement form one owner transition"
+    )]
+    fn reconcile_maintenance(&mut self) -> Result<Option<MaintenanceReconciled>, PersistenceError> {
+        self.validate_recovery_identity()?;
+        let Some(unresolved) = self.unresolved.as_ref() else {
+            return Ok(None);
+        };
+        if !self.connection.is_autocommit() {
+            self.rollback_original_transaction()?;
+            if !self.connection.is_autocommit() {
+                return Ok(None);
+            }
+        }
+        let actual = self.read_maintenance_witness(&unresolved.witness)?;
+        let committed = if unresolved.commit == CommitAttempt::Confirmed {
+            if actual != unresolved.new {
+                return Err(PersistenceError::Corrupt(
+                    "confirmed transaction witness changed".to_owned(),
+                ));
+            }
+            true
+        } else if unresolved.commit == CommitAttempt::NotIssued {
+            // No COMMIT was issued. Once the original transaction is gone,
+            // SQLite's rollback establishes Old even for a partial apply.
+            false
+        } else if unresolved.old == unresolved.new {
+            return Ok(None);
+        } else if actual == unresolved.old {
+            false
+        } else if actual == unresolved.new {
+            true
+        } else {
+            return Err(PersistenceError::Corrupt(
+                "unresolved transaction has neither exact Old nor exact New witness".to_owned(),
+            ));
+        };
+        if committed {
+            let actual_wal = file_len(&self.wal_path)?;
+            if actual_wal.saturating_sub(unresolved.baseline) > unresolved.charge.unwrap_or(0) {
+                return Err(PersistenceError::Corrupt(
+                    "reconciled WAL exceeds the original admitted charge".to_owned(),
+                ));
+            }
+        }
+        if let Some(previous) = unresolved.cache_spill {
+            self.restore_cache_spill(previous)?;
+        }
+        if unresolved.check_files {
+            self.validate_files()?;
+        }
+        let mut terminal = None;
+        match &unresolved.settlement {
+            MaintenanceSettlement::IndexedRows => {}
+            MaintenanceSettlement::Removal { id, reply } => {
+                if committed {
+                    let _ = fs::remove_file(terminal_checkpoint_path(&self.state_dir, *id));
+                }
+                let _ = reply.try_send(committed);
+            }
+            MaintenanceSettlement::Output {
+                path,
+                identity,
+                before,
+                heads,
+                metadata,
+                terminal: settled_terminal,
+            } => {
+                require_path_identity(path, *identity)?;
+                if committed {
+                    for (head, value) in heads {
+                        head.store(*value, Ordering::Release);
+                    }
+                    if let Some((owner, bytes)) = metadata {
+                        owner.store(*bytes, Ordering::Release);
+                    }
+                    terminal = *settled_terminal;
+                } else {
+                    truncate_replay_tail(path, *before)?;
+                }
+            }
+            MaintenanceSettlement::ReplayPublication {
+                name,
+                identity,
+                sources,
+            } => {
+                let path = self.replay_dir.join(name);
+                if committed {
+                    require_path_identity(&path, *identity)?;
+                    self.replay_file.clone_from(name);
+                    self.recovery_identity[3] = *identity;
+                    self.compaction_sources_pending.clone_from(sources);
+                    self.compaction_cursor = i64::MIN;
+                    self.compaction_pending = true;
+                    self.replay_cleanup_needed = true;
+                } else {
+                    // The destination is proven unreferenced. Remove only our
+                    // original file; a substituted file is never ours to undo.
+                    match require_path_identity(&path, *identity) {
+                        Ok(()) => fs::remove_file(&path)
+                            .map_err(|error| PersistenceError::io(&path, error))?,
+                        Err(PersistenceError::Io { source, .. })
+                            if source.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            MaintenanceSettlement::ReplayMove {
+                path,
+                identity,
+                before,
+                through,
+            } => {
+                require_path_identity(path, *identity)?;
+                if committed {
+                    self.compaction_cursor = *through;
+                    // The original source still belongs to its migration turn.
+                    // Retiring unreferenced files before that turn consumes its
+                    // cursor would remove the very source it must finish.
+                    self.replay_cleanup_needed = false;
+                } else {
+                    truncate_replay_tail(path, *before)?;
+                }
+            }
+        }
+        self.unresolved = None;
+        let _ = crate::diagnostics::record(format_args!(
+            "ctxmux reconciled original durable transaction as {}; retained work resumes under the same owner",
+            if committed {
+                "committed"
+            } else {
+                "rolled back"
+            }
+        ));
+        Ok(Some(MaintenanceReconciled { terminal }))
     }
 
     fn effective_storage_policy(&self) -> EffectiveStoragePolicy {
@@ -4308,6 +4940,8 @@ impl StateStore {
         .expect("five original owned paths");
         let mut store = Self {
             recovery_identity,
+            unresolved: None,
+            unresolved_start: None,
             state_dir: state_dir.to_path_buf(),
             replay_dir,
             replay_file,
@@ -4400,7 +5034,10 @@ impl StateStore {
     ) -> Result<bool, PersistenceError> {
         match result.map_err(|error| self.write_capacity_error(error)) {
             Ok(()) => Ok(true),
-            Err(error @ PersistenceError::FilesystemCapacity { .. }) => {
+            Err(
+                error @ (PersistenceError::FilesystemCapacity { .. }
+                | PersistenceError::StorageUnavailable { .. }),
+            ) => {
                 self.replay_cleanup_needed = true;
                 let _ = crate::diagnostics::record(format_args!(
                     "optional recovery maintenance deferred: {error}"
@@ -4677,9 +5314,7 @@ impl StateStore {
             self.test_hooks
                 .startup_over_budget_attempts
                 .fetch_add(1, Ordering::AcqRel);
-            self.connection
-                .execute_batch("ROLLBACK")
-                .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
+            self.rollback_original_transaction()?;
             return Ok(StartupBatchDisposition::OverBudget);
         }
         if let Err(commit_error) = self.connection.execute_batch("COMMIT") {
@@ -4842,8 +5477,7 @@ impl StateStore {
         prepared: &PreparedPersistentStart,
         candidates: &[PersistentCandidate],
         receipt: &StartReceipt,
-        ready: &mpsc::SyncSender<Result<(), StageFailure>>,
-        decision: &mpsc::Receiver<StageDecision>,
+        decision_owner: StageDecisionOwner<'_>,
         shutdown: Option<&AtomicBool>,
     ) -> Result<StageDriveResult, PersistenceError> {
         if let Err(error) = self.validate_prepared_start(prepared) {
@@ -4901,13 +5535,15 @@ impl StateStore {
             prepared,
             candidates,
             receipt,
-            ready,
-            decision,
+            decision_owner,
             wal_baseline,
         );
         match self.restore_cache_spill(previous_cache_spill) {
             Ok(()) => Ok(result),
-            Err(error) => Ok(result.with_restore_failure(error)),
+            Err(error) => {
+                *mutex_lock(&receipt.cache_spill) = Some(previous_cache_spill);
+                Ok(result.with_restore_failure(error))
+            }
         }
     }
 
@@ -4924,8 +5560,7 @@ impl StateStore {
         prepared: &PreparedPersistentStart,
         candidates: &[PersistentCandidate],
         receipt: &StartReceipt,
-        ready: &mpsc::SyncSender<Result<(), StageFailure>>,
-        decision: &mpsc::Receiver<StageDecision>,
+        decision_owner: StageDecisionOwner<'_>,
         mut wal_baseline: u64,
     ) -> StageDriveResult {
         loop {
@@ -5053,10 +5688,16 @@ impl StateStore {
             );
         }
 
-        if ready.send(Ok(())).is_err() {
-            return self.rollback_after_ready_loss(receipt);
-        }
-        match decision.recv().unwrap_or(StageDecision::Abort) {
+        let decision = match decision_owner {
+            StageDecisionOwner::Caller { ready, decision } => {
+                if ready.send(Ok(())).is_err() {
+                    return self.rollback_after_ready_loss(receipt);
+                }
+                decision.recv().unwrap_or(StageDecision::Abort)
+            }
+            StageDecisionOwner::OriginalCommit => StageDecision::Commit,
+        };
+        match decision {
             StageDecision::Abort => self.abort_staged_start(receipt),
             StageDecision::Commit => self.commit_staged_start(prepared, candidates, receipt),
         }
@@ -5158,6 +5799,17 @@ impl StateStore {
     }
 
     fn restore_cache_spill(&self, previous: i64) -> Result<(), PersistenceError> {
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .cache_spill_restore_unavailable
+            .load(Ordering::Acquire)
+        {
+            return Err(PersistenceError::io(
+                &self.database_path,
+                io::Error::from_raw_os_error(2),
+            ));
+        }
         self.connection
             .pragma_update(None, "cache_spill", previous)
             .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
@@ -5273,198 +5925,52 @@ impl StateStore {
         shutdown: Option<&AtomicBool>,
     ) -> Result<RemovalDisposition, PersistenceError> {
         self.validate_recovery_identity()?;
-        let wal_baseline = self.fold_wal_below_ceiling(shutdown)?;
-        self.connection
-            .release_memory()
-            .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
-        let previous_cache_spill = self
-            .disable_cache_spill()
-            .map_err(|failure| failure.error)?;
-        let result = self.remove_terminal_spill_disabled(candidate, wal_baseline);
-        match self.restore_cache_spill(previous_cache_spill) {
-            Ok(()) => Ok(result),
-            Err(restore_error) => match result {
-                // A committed delete whose only later failure is the spill
-                // restore is still durably gone; surface removal, not unknown.
-                RemovalDisposition::Removed => Ok(RemovalDisposition::Removed),
-                RemovalDisposition::NotRemoved(error) | RemovalDisposition::Unknown(error) => Ok(
-                    RemovalDisposition::Unknown(combine_errors(&error, &restore_error)),
-                ),
-            },
+        if shutdown.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            return Err(PersistenceError::ActorStopped);
         }
-    }
-
-    fn remove_terminal_spill_disabled(
-        &self,
-        candidate: &PersistentCandidate,
-        wal_baseline: u64,
-    ) -> RemovalDisposition {
-        if let Err(error) = ctxmux_sqlite_status::reset_cache_io(&self.connection) {
-            return RemovalDisposition::NotRemoved(
-                admission_failure(format!(
-                    "persistent removal could not reset cache counters: {error}"
-                ))
-                .error,
-            );
-        }
-        if let Err(error) = self.connection.execute_batch("BEGIN IMMEDIATE") {
-            return RemovalDisposition::NotRemoved(PersistenceError::database_at(
-                &self.connection,
-                error,
-            ));
-        }
-        match file_len(&self.wal_path) {
-            Ok(bytes) if bytes == wal_baseline => {}
-            Ok(_) => {
-                return self.rollback_removal(
-                    PersistenceError::Mutation(
-                        "persistent WAL changed before exact removal".to_owned(),
-                    ),
-                    false,
-                );
-            }
-            Err(error) => return self.rollback_removal(error, false),
-        }
-        if let Err(error) = self.delete_exact_terminal(candidate) {
-            return self.rollback_removal(error, false);
-        }
-        let snapshot = match ctxmux_sqlite_status::cache_admission_snapshot(&self.connection) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return self.rollback_removal(
-                    admission_failure(format!(
-                        "persistent removal could not observe cache status: {error}"
-                    ))
-                    .error,
-                    false,
-                );
-            }
-        };
-        let wal_bytes = match file_len(&self.wal_path) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.rollback_removal(error, false),
-        };
-        let charge = wal_charge_for_cache(snapshot.used_bytes);
-        if wal_bytes != wal_baseline
-            || snapshot.writes != 0
-            || snapshot.spills != 0
-            || charge
-                .is_none_or(|charge| charge > self.admission_limits.resources.wal_checkpoint_bytes)
-            || charge.is_none_or(|charge| {
-                wal_baseline.saturating_add(charge) > self.admission_limits.resources.wal_bytes()
-            })
-        {
-            return self.rollback_removal(
-                admission_failure(format!(
-                    "persistent removal exceeds or cannot prove its configured WAL charge: \
-                     cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
-                    snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes, wal_baseline
-                ))
-                .error,
-                false,
-            );
-        }
-        match self.connection.execute_batch("COMMIT") {
-            Ok(()) => match self.validate_files() {
-                Ok(()) => RemovalDisposition::Removed,
-                // The row is durably gone even if a post-commit file check
-                // fails; latch that as a fatal removal, never as retained.
-                Err(error) => RemovalDisposition::Unknown(error),
-            },
-            Err(commit_error) => self.classify_failed_removal(candidate, commit_error),
-        }
-    }
-
-    /// Roll back a staged removal. `after_commit` is only ever false here (no SQL
-    /// runs after COMMIT), so a rollback failure is `Unknown`, matching the start
-    /// path's fail-closed classification.
-    fn rollback_removal(&self, error: PersistenceError, after_commit: bool) -> RemovalDisposition {
-        match self.connection.execute_batch("ROLLBACK") {
-            Ok(()) if after_commit => RemovalDisposition::Unknown(error),
-            Ok(()) => RemovalDisposition::NotRemoved(error),
-            Err(rollback_error) => RemovalDisposition::Unknown(PersistenceError::Mutation(
-                format!("{error}; removal rollback failed: {rollback_error}"),
-            )),
-        }
-    }
-
-    fn classify_failed_removal(
-        &self,
-        candidate: &PersistentCandidate,
-        commit_error: rusqlite::Error,
-    ) -> RemovalDisposition {
-        if !self.connection.is_autocommit()
-            && let Err(rollback_error) = self.connection.execute_batch("ROLLBACK")
-        {
-            return RemovalDisposition::Unknown(PersistenceError::Mutation(format!(
-                "persistent removal COMMIT failed ({commit_error}) and rollback failed \
-                 ({rollback_error})"
-            )));
-        }
-        match self.exact_terminal_present(candidate) {
-            Ok(true) => RemovalDisposition::NotRemoved(PersistenceError::database(commit_error)),
-            Ok(false) => RemovalDisposition::Removed,
-            Err(probe_error) => RemovalDisposition::Unknown(PersistenceError::Mutation(format!(
-                "persistent removal COMMIT failed ({commit_error}) and exact probe failed: \
-                 {probe_error}"
-            ))),
-        }
-    }
-
-    fn delete_exact_terminal(
-        &self,
-        candidate: &PersistentCandidate,
-    ) -> Result<(), PersistenceError> {
-        let deleted = self
-            .connection
-            .execute(
-                "DELETE FROM runs WHERE id = ?1 AND creation_key = ?2 COLLATE BINARY
+        match self.commit_maintenance_batch_with_admission(MaintenanceWitness::Run(candidate.id), true, |connection| {
+            let deleted = connection
+                .execute(
+                    "DELETE FROM runs WHERE id = ?1 AND creation_key = ?2 COLLATE BINARY
                  AND metadata_bytes = ?3 AND state_kind != 'running'",
-                params![
-                    candidate.id.to_string(),
-                    candidate.operation_key.as_str(),
-                    i64::try_from(candidate.metadata_bytes).map_err(|_| {
-                        PersistenceError::Mutation(
-                            "candidate metadata does not fit SQLite".to_owned(),
-                        )
-                    })?
-                ],
-            )
-            .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
-        if deleted != 1 {
-            return Err(PersistenceError::Mutation(format!(
-                "persistent removal candidate {} does not match its exact terminal snapshot",
-                candidate.id
-            )));
+                    params![
+                        candidate.id.to_string(),
+                        candidate.operation_key.as_str(),
+                        i64::try_from(candidate.metadata_bytes).map_err(|_| {
+                            PersistenceError::Mutation(
+                                "candidate metadata does not fit SQLite".to_owned(),
+                            )
+                        })?
+                    ],
+                )
+                .map_err(|error| PersistenceError::database_at(connection, error))?;
+            if deleted != 1 {
+                return Err(PersistenceError::Mutation(format!(
+                    "persistent removal candidate {} does not match its exact terminal snapshot",
+                    candidate.id
+                )));
+            }
+            Ok(true)
+        }) {
+            Ok(true) => Ok(RemovalDisposition::Removed),
+            Ok(false) => Ok(RemovalDisposition::NotRemoved(
+                PersistenceError::ResourcePressure(
+                    "persistent removal exceeds its original WAL admission".to_owned(),
+                ),
+            )),
+            Err(error) => {
+                if let Some(unresolved) = self.unresolved.as_mut() {
+                    let (reply, completion) = mpsc::sync_channel(1);
+                    unresolved.settlement = MaintenanceSettlement::Removal {
+                        id: candidate.id,
+                        reply,
+                    };
+                    Ok(RemovalDisposition::Unknown { error, completion })
+                } else {
+                    Ok(RemovalDisposition::NotRemoved(error))
+                }
+            }
         }
-        Ok(())
-    }
-
-    fn exact_terminal_present(
-        &self,
-        candidate: &PersistentCandidate,
-    ) -> Result<bool, PersistenceError> {
-        let stored: Option<(String, i64, String, String)> = self
-            .connection
-            .query_row(
-                "SELECT creation_key, metadata_bytes, state_kind, state_json
-                 FROM runs WHERE id = ?1",
-                [candidate.id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
-        let Some((key, metadata, state_kind, state_json)) = stored else {
-            return Ok(false);
-        };
-        let state: RunState =
-            serde_json::from_str(&state_json).map_err(PersistenceError::serialization)?;
-        Ok(
-            key.as_bytes() == candidate.operation_key.as_str().as_bytes()
-                && nonnegative_u64(metadata, "candidate metadata")? == candidate.metadata_bytes
-                && state_kind == state_kind_for(&state)
-                && !state.is_running(),
-        )
     }
 
     fn stage_exact_replacement(
@@ -5657,7 +6163,7 @@ impl StateStore {
         match if self.connection.is_autocommit() {
             Ok(())
         } else {
-            self.connection.execute_batch("ROLLBACK")
+            self.rollback_original_transaction()
         } {
             Ok(()) => {
                 let _ = receipt.decide(StartDisposition::NotCommitted);
@@ -5678,7 +6184,7 @@ impl StateStore {
     }
 
     fn rollback_after_ready_loss(&self, receipt: &StartReceipt) -> StageDriveResult {
-        match self.connection.execute_batch("ROLLBACK") {
+        match self.rollback_original_transaction() {
             Ok(()) => {
                 let _ = receipt.decide(StartDisposition::NotCommitted);
                 StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
@@ -5698,7 +6204,7 @@ impl StateStore {
     }
 
     fn abort_staged_start(&self, receipt: &StartReceipt) -> StageDriveResult {
-        match self.connection.execute_batch("ROLLBACK") {
+        match self.rollback_original_transaction() {
             Ok(()) => {
                 let _ = receipt.decide(StartDisposition::NotCommitted);
                 StageDriveResult::Completed(StageCompletion::NotCommitted(StageFailure {
@@ -5725,6 +6231,7 @@ impl StateStore {
         candidates: &[PersistentCandidate],
         receipt: &StartReceipt,
     ) -> StageDriveResult {
+        receipt.commit_authorized.store(true, Ordering::Release);
         #[cfg(test)]
         if let Some(result) = self.abort_start_before_commit_if_armed(receipt) {
             return result;
@@ -5915,6 +6422,22 @@ impl StateStore {
         prepared: &PreparedPersistentStart,
         candidates: &[PersistentCandidate],
     ) -> Result<CommitProbe, PersistenceError> {
+        #[cfg(test)]
+        {
+            self.test_hooks
+                .start_probe_attempts
+                .fetch_add(1, Ordering::AcqRel);
+            if self
+                .test_hooks
+                .start_probe_unavailable
+                .load(Ordering::Acquire)
+            {
+                return Err(PersistenceError::io(
+                    &self.database_path,
+                    io::Error::from_raw_os_error(2),
+                ));
+            }
+        }
         let mut old_present = 0_usize;
         for candidate in candidates {
             let stored: Option<(String, i64, String, String)> = self
@@ -6318,112 +6841,110 @@ impl StateStore {
                 .fetch_add(1, Ordering::AcqRel);
         }
         let mut settlement = None;
-        let witness = batch.first().map_or_else(
-            || {
-                terminal
-                    .as_ref()
-                    .map_or(MaintenanceWitness::Unchanged, |value| {
-                        MaintenanceWitness::Run(value.0)
-                    })
-            },
-            |value| MaintenanceWitness::Run(value.0),
-        );
+        let mut witness_runs: Vec<_> = batch.iter().map(|(id, _, _)| *id).collect();
+        if let Some((id, ..)) = terminal
+            && !witness_runs.contains(&id)
+        {
+            witness_runs.push(id);
+        }
+        let witness = MaintenanceWitness::Runs(witness_runs);
         let row_funding =
             usize::try_from(self.admission_limits.resources.wal_checkpoint_bytes / WAL_FRAME_BYTES)
                 .expect("validated WAL row funding fits usize")
                 .max(1);
-        let committed = self.commit_maintenance_batch_with_admission(witness, |transaction| {
-            let mut cursor_updates = HashMap::new();
-            for (id, replay, _) in coalesce_batch(batch) {
-                let _ = append_replay_with_storage(
-                    transaction,
-                    id,
-                    &replay,
-                    &mut writer,
-                    effective.durable_run_output_bytes,
-                )?;
-                let head = read_run_head(transaction, id)?;
-                cursor_updates.insert(id, head);
-            }
-            // This first probe must obey the same page-turn work funding as
-            // continuation: a global byte quota can cover arbitrarily many
-            // tiny historical extents. Never walk them all before admission.
-            if !prune_global_replay_with_row_funding(
-                transaction,
-                effective.durable_replay_bytes,
-                row_funding,
-            )? {
-                return Ok(false);
-            }
-            let mut terminal_metadata = None;
-            if let Some((id, actual_pid, state, metadata_owner, source_gap)) = terminal {
-                let (kind, mut state_json) = encoded_state(state)?;
-                if let Some(cursor) = source_gap {
-                    let mut facts: serde_json::Value = serde_json::from_str(&state_json)
-                        .map_err(PersistenceError::database_message)?;
-                    facts["ctxmux_source_gap_after_byte"] = serde_json::Value::from(cursor);
-                    state_json = serde_json::to_string(&facts)
-                        .map_err(PersistenceError::database_message)?;
+        let committed =
+            self.commit_maintenance_batch_with_admission(witness, true, |transaction| {
+                let mut cursor_updates = HashMap::new();
+                for (id, replay, _) in coalesce_batch(batch) {
+                    let _ = append_replay_with_storage(
+                        transaction,
+                        id,
+                        &replay,
+                        &mut writer,
+                        effective.durable_run_output_bytes,
+                    )?;
+                    let head = read_run_head(transaction, id)?;
+                    cursor_updates.insert(id, head);
                 }
-                let (id_text, creation_key, spec_json, lineage_json, source_epoch): (
-                    String,
-                    String,
-                    String,
-                    Option<String>,
-                    String,
-                ) = transaction
-                    .query_row(
-                        "SELECT id, creation_key, spec_json, lineage_json, source_epoch
+                // This first probe must obey the same page-turn work funding as
+                // continuation: a global byte quota can cover arbitrarily many
+                // tiny historical extents. Never walk them all before admission.
+                if !prune_global_replay_with_row_funding(
+                    transaction,
+                    effective.durable_replay_bytes,
+                    row_funding,
+                )? {
+                    return Ok(false);
+                }
+                let mut terminal_metadata = None;
+                if let Some((id, actual_pid, state, metadata_owner, source_gap)) = terminal {
+                    let (kind, mut state_json) = encoded_state(state)?;
+                    if let Some(cursor) = source_gap {
+                        let mut facts: serde_json::Value = serde_json::from_str(&state_json)
+                            .map_err(PersistenceError::database_message)?;
+                        facts["ctxmux_source_gap_after_byte"] = serde_json::Value::from(cursor);
+                        state_json = serde_json::to_string(&facts)
+                            .map_err(PersistenceError::database_message)?;
+                    }
+                    let (id_text, creation_key, spec_json, lineage_json, source_epoch): (
+                        String,
+                        String,
+                        String,
+                        Option<String>,
+                        String,
+                    ) = transaction
+                        .query_row(
+                            "SELECT id, creation_key, spec_json, lineage_json, source_epoch
                      FROM runs WHERE id = ?1",
-                        [id.to_string()],
-                        |row| {
-                            Ok((
-                                row.get(0)?,
-                                row.get(1)?,
-                                row.get(2)?,
-                                row.get(3)?,
-                                row.get(4)?,
-                            ))
-                        },
-                    )
-                    .map_err(|error| PersistenceError::database_at(transaction, error))?;
-                let metadata_bytes = metadata_size(
-                    &id_text,
-                    &creation_key,
-                    &spec_json,
-                    lineage_json.as_deref(),
-                    &state_json,
-                    &source_epoch,
-                )?;
-                let now = now_millis();
-                let updated = transaction
-                    .execute(
-                        "UPDATE runs SET state_kind = ?2, state_json = ?3, updated_at_ms = ?4,
+                            [id.to_string()],
+                            |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ))
+                            },
+                        )
+                        .map_err(|error| PersistenceError::database_at(transaction, error))?;
+                    let metadata_bytes = metadata_size(
+                        &id_text,
+                        &creation_key,
+                        &spec_json,
+                        lineage_json.as_deref(),
+                        &state_json,
+                        &source_epoch,
+                    )?;
+                    let now = now_millis();
+                    let updated = transaction
+                        .execute(
+                            "UPDATE runs SET state_kind = ?2, state_json = ?3, updated_at_ms = ?4,
                      terminal_at_ms = ?4, metadata_bytes = ?5, pid = ?6
                      WHERE id = ?1 AND state_kind = 'running'",
-                        params![
-                            id.to_string(),
-                            kind,
-                            state_json,
-                            now,
-                            i64::try_from(metadata_bytes).expect("metadata budget fits SQLite"),
-                            i64::from(actual_pid),
-                        ],
-                    )
-                    .map_err(|error| PersistenceError::database_at(transaction, error))?;
-                if updated != 1 {
-                    return Err(PersistenceError::Mutation(format!(
-                        "Run {id} is not durable running state"
-                    )));
+                            params![
+                                id.to_string(),
+                                kind,
+                                state_json,
+                                now,
+                                i64::try_from(metadata_bytes).expect("metadata budget fits SQLite"),
+                                i64::from(actual_pid),
+                            ],
+                        )
+                        .map_err(|error| PersistenceError::database_at(transaction, error))?;
+                    if updated != 1 {
+                        return Err(PersistenceError::Mutation(format!(
+                            "Run {id} is not durable running state"
+                        )));
+                    }
+                    terminal_metadata = Some((Arc::clone(metadata_owner), metadata_bytes));
                 }
-                terminal_metadata = Some((Arc::clone(metadata_owner), metadata_bytes));
-            }
-            // All indexed payload belongs to this transaction. Publish none of
-            // its coordinates or watermarks until the shared file is synced.
-            writer.sync()?;
-            settlement = Some((cursor_updates, terminal_metadata));
-            Ok(true)
-        });
+                // All indexed payload belongs to this transaction. Publish none of
+                // its coordinates or watermarks until the shared file is synced.
+                writer.sync()?;
+                settlement = Some((cursor_updates, terminal_metadata));
+                Ok(true)
+            });
         // Release the file before adaptive rollback reduction recurses. Tail
         // disposition belongs to the transaction result below, never Drop.
         drop(writer);
@@ -6434,6 +6955,22 @@ impl StateStore {
                 return Ok(false);
             }
             Err(error) => {
+                if let Some(unresolved) = self.unresolved.as_mut() {
+                    let (updates, metadata) = settlement.unwrap_or_default();
+                    unresolved.settlement = MaintenanceSettlement::Output {
+                        identity: self.recovery_identity[3],
+                        path: path.clone(),
+                        before,
+                        heads: batch
+                            .iter()
+                            .filter_map(|(id, _, head)| {
+                                updates.get(id).map(|value| (Arc::clone(head), *value))
+                            })
+                            .collect(),
+                        metadata,
+                        terminal: terminal.map(|value| value.0),
+                    };
+                }
                 // Unknown COMMIT/rollback leaves every possibly indexed byte
                 // intact. A proven pre-commit storage failure may discard its
                 // unindexed append tail before the actor retries.
@@ -6457,7 +6994,7 @@ impl StateStore {
         if let Some((metadata_owner, metadata_bytes)) = terminal_metadata {
             metadata_owner.store(metadata_bytes, Ordering::Release);
         }
-        self.finish_transaction().map(|()| true)
+        Ok(true)
     }
 
     fn reduce_output_transaction(
@@ -6895,15 +7432,15 @@ impl StateStore {
 
     /// Apply a maintenance transaction using the same measured, spill-disabled
     /// page proof as Start and Remove. `false` means a proven rollback exceeded
-    /// the transaction budget; the caller can shrink its work unit. An unknown
-    /// A storage-pressure COMMIT error is retryable only after an exact Old
-    /// disposition. A committed or uncertain outcome remains non-retryable.
+    /// the transaction budget; the caller can shrink its work unit. A storage
+    /// COMMIT error retries only after exact Old. Unknown/New instead retains
+    /// the original witness until its specific continuation can settle.
     fn commit_maintenance_batch(
         &mut self,
         witness: MaintenanceWitness,
         apply: impl FnOnce(&Connection) -> Result<(), PersistenceError>,
     ) -> Result<bool, PersistenceError> {
-        self.commit_maintenance_batch_with_admission(witness, |connection| {
+        self.commit_maintenance_batch_with_admission(witness, false, |connection| {
             apply(connection).map(|()| true)
         })
     }
@@ -6911,6 +7448,7 @@ impl StateStore {
     fn commit_maintenance_batch_with_admission(
         &mut self,
         witness: MaintenanceWitness,
+        check_files: bool,
         apply: impl FnOnce(&Connection) -> Result<bool, PersistenceError>,
     ) -> Result<bool, PersistenceError> {
         let baseline = self.fold_wal_below_ceiling(None)?;
@@ -6920,19 +7458,52 @@ impl StateStore {
         let previous = self
             .disable_cache_spill()
             .map_err(|failure| failure.error)?;
-        let result = self.commit_maintenance_batch_without_spill(baseline, witness, apply);
+        let result =
+            self.commit_maintenance_batch_without_spill(baseline, witness, check_files, apply);
         match self.restore_cache_spill(previous) {
-            Ok(()) => result,
-            Err(error) => Err(PersistenceError::Mutation(format!(
-                "maintenance cache state could not be restored: {error}"
-            ))),
+            Ok(()) => {
+                if result.is_ok() {
+                    self.unresolved = None;
+                }
+                result
+            }
+            Err(error) => {
+                let retry = result.is_ok()
+                    || result
+                        .as_ref()
+                        .is_err_and(PersistenceError::is_admission_failure);
+                let unresolved = self
+                    .unresolved
+                    .get_or_insert_with(|| UnresolvedMaintenance {
+                        witness: MaintenanceWitness::Runs(Vec::new()),
+                        old: Some(Vec::new()),
+                        new: None,
+                        commit: CommitAttempt::NotIssued,
+                        baseline,
+                        charge: None,
+                        cache_spill: None,
+                        check_files,
+                        retry,
+                        settlement: MaintenanceSettlement::IndexedRows,
+                    });
+                unresolved.cache_spill = Some(previous);
+                Err(PersistenceError::Uncertain {
+                    message: "maintenance cache state could not be restored".to_owned(),
+                    error: Box::new(error),
+                })
+            }
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one bounded SQL transaction retains its witness across admission, commit, rollback and post-commit validation"
+    )]
     fn commit_maintenance_batch_without_spill(
-        &self,
+        &mut self,
         baseline: u64,
         witness: MaintenanceWitness,
+        check_files: bool,
         apply: impl FnOnce(&Connection) -> Result<bool, PersistenceError>,
     ) -> Result<bool, PersistenceError> {
         ctxmux_sqlite_status::reset_cache_io(&self.connection)
@@ -6940,8 +7511,10 @@ impl StateStore {
         self.connection
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|error| PersistenceError::database_at(&self.connection, error))?;
+        let mut observed_old = None;
         let proof = (|| {
             let old = witness.read(&self.connection)?;
+            observed_old.clone_from(&old);
             let applied = apply(&self.connection)?;
             let new = witness.read(&self.connection)?;
             let snapshot = ctxmux_sqlite_status::cache_admission_snapshot(&self.connection)
@@ -6962,17 +7535,61 @@ impl StateStore {
         })();
         let (charge, old, new) = match proof {
             Ok(charge) => charge,
-            Err(error) => return self.rollback_maintenance_error(error),
+            Err(error) => {
+                let result = self.rollback_maintenance_error(error);
+                if !self.connection.is_autocommit() {
+                    self.unresolved = Some(UnresolvedMaintenance {
+                        witness,
+                        old: observed_old,
+                        new: None,
+                        commit: CommitAttempt::NotIssued,
+                        baseline,
+                        charge: None,
+                        cache_spill: None,
+                        check_files,
+                        retry: true,
+                        settlement: MaintenanceSettlement::IndexedRows,
+                    });
+                }
+                return result;
+            }
         };
         if charge.is_none_or(|charge| {
             charge > self.admission_limits.resources.wal_checkpoint_bytes
                 || baseline.saturating_add(charge) > self.admission_limits.resources.wal_bytes()
         }) {
-            self.connection.execute_batch("ROLLBACK").map_err(|error| {
-                PersistenceError::Mutation(format!("maintenance rollback failed: {error}"))
-            })?;
+            if let Err(error) = self.connection.execute_batch("ROLLBACK") {
+                self.unresolved = Some(UnresolvedMaintenance {
+                    witness,
+                    old,
+                    new,
+                    commit: CommitAttempt::NotIssued,
+                    baseline,
+                    charge,
+                    cache_spill: None,
+                    check_files,
+                    retry: true,
+                    settlement: MaintenanceSettlement::IndexedRows,
+                });
+                return Err(PersistenceError::Uncertain {
+                    message: "maintenance admission rollback failed".to_owned(),
+                    error: Box::new(PersistenceError::database_at(&self.connection, error)),
+                });
+            }
             return Ok(false);
         }
+        self.unresolved = Some(UnresolvedMaintenance {
+            witness: witness.clone(),
+            old: old.clone(),
+            new: new.clone(),
+            commit: CommitAttempt::Unconfirmed,
+            baseline,
+            charge,
+            cache_spill: None,
+            check_files,
+            retry: true,
+            settlement: MaintenanceSettlement::IndexedRows,
+        });
         #[cfg(test)]
         let injected = self
             .test_hooks
@@ -7002,13 +7619,21 @@ impl StateStore {
             .execute_batch("COMMIT")
             .map_err(|error| PersistenceError::database_at(&self.connection, error));
         if let Err(error) = committed {
-            return Err(self.classify_maintenance_commit_error(
+            let error = self.classify_maintenance_commit_error(
                 error,
-                witness,
+                &witness,
                 old.as_deref(),
                 new.as_deref(),
-            ));
+            );
+            if !error.requires_reconciliation() {
+                self.unresolved = None;
+            }
+            return Err(error);
         }
+        self.unresolved
+            .as_mut()
+            .expect("the original COMMIT has its witness")
+            .commit = CommitAttempt::Confirmed;
         let actual =
             self.committed_maintenance_wal_len()
                 .map_err(|error| PersistenceError::Operation {
@@ -7022,13 +7647,16 @@ impl StateStore {
                 "maintenance WAL exceeded its admitted page charge: {actual} bytes"
             )));
         }
+        if check_files {
+            self.finish_transaction()?;
+        }
         Ok(true)
     }
 
     fn classify_maintenance_commit_error(
         &self,
         error: PersistenceError,
-        witness: MaintenanceWitness,
+        witness: &MaintenanceWitness,
         old: Option<&[rusqlite::types::Value]>,
         new: Option<&[rusqlite::types::Value]>,
     ) -> PersistenceError {
@@ -7045,8 +7673,8 @@ impl StateStore {
             // genuinely changed effect at its original value proves Old; New,
             // a mismatched row or a failed read remains unknown. The unique
             // actor owns every write and SQLite commits these effects atomically.
-            if witness
-                .read(&self.connection)
+            if self
+                .read_maintenance_witness(witness)
                 .is_ok_and(|actual| actual.as_deref() == old)
             {
                 return error;
@@ -7091,7 +7719,7 @@ impl StateStore {
         if self.connection.is_autocommit() {
             return Err(error);
         }
-        match self.connection.execute_batch("ROLLBACK") {
+        match self.rollback_original_transaction() {
             Ok(()) if self.connection.is_autocommit() => Err(error),
             Ok(()) => Err(PersistenceError::Uncertain {
                 message: "maintenance rollback left a transaction active".to_owned(),
@@ -7190,6 +7818,8 @@ impl StateStore {
                 .sync_all()
                 .map_err(|source| PersistenceError::io(&new_path, source))?;
             sync_directory(&self.replay_dir)?;
+            let new_identity = path_identity(&new_path)?;
+            let sources: VecDeque<_> = self.compaction_sources_for(&new_file)?.into();
             #[cfg(test)]
             crash_replay_compaction_if_armed("before_commit");
             let result =
@@ -7202,6 +7832,13 @@ impl StateStore {
                         .map_err(|error| PersistenceError::database_at(connection, error))?;
                     Ok(())
                 });
+            if let Some(unresolved) = self.unresolved.as_mut() {
+                unresolved.settlement = MaintenanceSettlement::ReplayPublication {
+                    name: new_file.clone(),
+                    identity: new_identity,
+                    sources: sources.clone(),
+                };
+            }
             // A COMMIT error can still have published the destination name.
             // Preserve it on every error; recovery removes it if unreferenced.
             if (matches!(&result, Ok(true))
@@ -7216,15 +7853,10 @@ impl StateStore {
                     "active replay publication cannot fit wal_checkpoint_bytes; increase the policy".to_owned(),
                 ));
             }
-            self.recovery_identity[3] = path_identity(&new_path).map_err(|error| {
-                error.at(
-                    StorageFailureStage::Maintenance,
-                    StorageTransactionOutcome::Committed,
-                )
-            })?;
+            self.recovery_identity[3] = new_identity;
             self.replay_file = new_file;
             self.compaction_pending = true;
-            self.compaction_sources_pending = self.compaction_sources()?.into();
+            self.compaction_sources_pending = sources;
             self.compaction_cursor = i64::MIN;
             // An empty old generation has no indexed sources to migrate.
             if self.compaction_sources_pending.is_empty() {
@@ -7254,10 +7886,14 @@ impl StateStore {
     }
 
     fn compaction_sources(&self) -> Result<Vec<String>, PersistenceError> {
+        self.compaction_sources_for(&self.replay_file)
+    }
+
+    fn compaction_sources_for(&self, active: &str) -> Result<Vec<String>, PersistenceError> {
         self.connection
             .prepare("SELECT DISTINCT data_file FROM replay_chunks WHERE data_file != ?1")
             .map_err(|error| PersistenceError::database_at(&self.connection, error))?
-            .query_map([&self.replay_file], |row| row.get(0))
+            .query_map([active], |row| row.get(0))
             .map_err(|error| PersistenceError::database_at(&self.connection, error))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| PersistenceError::database_at(&self.connection, error))
@@ -7403,6 +8039,14 @@ impl StateStore {
             let committed = match commit_result {
                 Ok(committed) => committed,
                 Err(error) => {
+                    if let Some(unresolved) = self.unresolved.as_mut() {
+                        unresolved.settlement = MaintenanceSettlement::ReplayMove {
+                            path: target_path.clone(),
+                            identity: self.recovery_identity[3],
+                            before: start,
+                            through: moves.last().expect("nonempty coordinate batch").0,
+                        };
+                    }
                     // Only a proved rollback or pre-commit refusal permits
                     // dropping this copied, unindexed tail. Unknown/New keeps
                     // every possibly referenced byte for exact recovery.
@@ -10122,8 +10766,16 @@ mod tests {
                     assert!(persistence.is_failed());
                 }
                 (CommitProbe::Hybrid, PersistentStartCompletion::CommitUnknown(failure)) => {
-                    assert!(failure.to_string().contains("durable rows are hybrid"));
-                    assert_eq!(failure.disposition(), StartDisposition::CommitUnknown);
+                    assert!(
+                        failure
+                            .failure
+                            .to_string()
+                            .contains("durable rows are hybrid")
+                    );
+                    assert_eq!(
+                        failure.failure.disposition(),
+                        StartDisposition::CommitUnknown
+                    );
                     assert!(persistence.is_failed());
                 }
                 (_, _) => panic!("failed COMMIT actor returned the wrong disposition"),
@@ -10385,14 +11037,26 @@ mod tests {
         else {
             panic!("store-level duplicate must be a fatal owner invariant breach");
         };
-        assert!(matches!(error, PersistenceError::Mutation(_)));
+        assert!(
+            matches!(
+                error,
+                PersistenceError::Database {
+                    code: Some(rusqlite::ErrorCode::ConstraintViolation),
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
         let later = running_info(RunId::new());
         let Err(latched) =
             persistence.insert_start(&CreateOperationKey::new("later").unwrap(), &later)
         else {
             panic!("fatal store conflict must latch the actor");
         };
-        assert!(matches!(latched, PersistenceError::Mutation(_)));
+        assert!(
+            matches!(latched, PersistenceError::RetainedFailure { .. }),
+            "{latched:?}"
+        );
 
         drop(persistence);
         let (reopened, recovered) = Persistence::open(state_dir).expect("reopen prior unit");
@@ -12774,8 +13438,12 @@ mod tests {
             "actual FULL must exercise SQLite automatic rollback"
         );
         assert_eq!(witness.read(&store.connection).unwrap(), old);
-        let classified =
-            store.classify_maintenance_commit_error(error, witness, old.as_deref(), new.as_deref());
+        let classified = store.classify_maintenance_commit_error(
+            error,
+            &witness,
+            old.as_deref(),
+            new.as_deref(),
+        );
         assert!(
             classified.is_disk_full(),
             "proven automatic rollback retains original typed FULL"
@@ -12835,7 +13503,7 @@ mod tests {
             }
             let classified = store.classify_maintenance_commit_error(
                 PersistenceError::injected_disk_full(),
-                witness,
+                &witness,
                 old.as_deref(),
                 new.as_deref(),
             );
@@ -12934,8 +13602,344 @@ mod tests {
         }
     }
 
+    fn wait_for_persistence(condition: impl Fn() -> bool, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while !condition() {
+            assert!(Instant::now() < deadline, "{message}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
-    fn uncertain_compaction_commit_latches_even_when_error_looks_like_disk_full() {
+    fn unresolved_rollback_never_exposes_private_rows_as_committed_replay() {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"first")])));
+        persistence.barrier().unwrap();
+        persistence.hold_original_rollback_for_test();
+        persistence
+            .inner
+            .test_hooks
+            .fail_next_replay_payload_sync
+            .store(true, Ordering::Release);
+        expect_queued(durable.append(info.id, replay(vec![chunk(5, b"tail")])));
+        wait_for_persistence(
+            || persistence.is_failed(),
+            "failed original rollback remains visible",
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(durable.read_replay_page(info.id, 0, 9))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("private rows are not a committed replay observation")
+        );
+        assert_eq!(durable.durable_head.load(Ordering::Acquire), 5);
+        thread::sleep(Duration::from_millis(80));
+        assert!(persistence.is_failed());
+        persistence.release_original_rollback_for_test();
+        wait_for_persistence(
+            || !persistence.is_failed() && durable.durable_head.load(Ordering::Acquire) == 9,
+            "original rollback and accepted append must settle without another offer",
+        );
+        let restored = runtime
+            .block_on(durable.read_replay_page(info.id, 0, 9))
+            .unwrap();
+        assert_eq!(
+            restored
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            b"firsttail"
+        );
+    }
+
+    #[test]
+    fn cache_restore_failure_retains_proven_old_and_committed_continuations() {
+        for committed in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let hooks = Arc::new(PersistenceTestHooks::default());
+            let (mut store, _) = StateStore::open(
+                &temp.path().join("state"),
+                &AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::clone(&hooks),
+            )
+            .unwrap();
+            let ids = insert_valid_replay_test_runs(&mut store);
+            let head = Arc::new(AtomicU64::new(0));
+            hooks
+                .cache_spill_restore_unavailable
+                .store(true, Ordering::Release);
+            let result = if committed {
+                store.append_batch(&[(
+                    ids[0],
+                    replay(vec![chunk(0, b"original")]),
+                    Arc::clone(&head),
+                )])
+            } else {
+                store
+                    .commit_maintenance_batch_with_admission(
+                        MaintenanceWitness::Run(ids[0]),
+                        false,
+                        |_| Ok(false),
+                    )
+                    .map(|_| ())
+            };
+            assert!(result.is_err());
+            assert!(
+                store.reconciliation_pending(),
+                "connection-state restoration keeps its original continuation even after Old"
+            );
+            assert!(store.connection.is_autocommit());
+            assert_eq!(head.load(Ordering::Acquire), 0);
+            hooks
+                .cache_spill_restore_unavailable
+                .store(false, Ordering::Release);
+            assert!(store.reconcile_transaction().unwrap().is_some());
+            assert_eq!(head.load(Ordering::Acquire), if committed { 8 } else { 0 });
+            assert!(store.unresolved.is_none());
+            let spill: i64 = store
+                .connection
+                .pragma_query_value(None, "cache_spill", |row| row.get(0))
+                .unwrap();
+            assert_ne!(spill, 0, "the original connection policy is restored");
+        }
+    }
+
+    #[test]
+    fn unknown_commit_rejects_hybrid_witness_and_substituted_replay_inode() {
+        for hybrid in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let hooks = Arc::new(PersistenceTestHooks::default());
+            let (mut store, _) = StateStore::open(
+                &temp.path().join("state"),
+                &AdmissionLimits::OPERATIONAL,
+                None,
+                Arc::clone(&hooks),
+            )
+            .unwrap();
+            let ids = insert_valid_replay_test_runs(&mut store);
+            let head = Arc::new(AtomicU64::new(0));
+            hooks
+                .maintenance_error_committed
+                .store(true, Ordering::Release);
+            hooks
+                .maintenance_commits_before_error
+                .store(1, Ordering::Release);
+            assert!(
+                store
+                    .append_batch(&[(
+                        ids[0],
+                        replay(vec![chunk(0, b"original")]),
+                        Arc::clone(&head)
+                    )])
+                    .is_err()
+            );
+            let path = store.replay_dir.join(&store.replay_file);
+            let before = fs::read(&path).unwrap();
+            if hybrid {
+                store
+                    .connection
+                    .execute("UPDATE runs SET pid=987 WHERE id=?1", [ids[0].to_string()])
+                    .unwrap();
+            } else {
+                let old = path.with_extension("held");
+                fs::rename(&path, &old).unwrap();
+                fs::copy(&old, &path).unwrap();
+            }
+            assert!(matches!(
+                store.reconcile_transaction(),
+                Err(PersistenceError::Corrupt(_))
+            ));
+            assert!(store.unresolved.is_some());
+            assert_eq!(head.load(Ordering::Acquire), 0);
+            assert_eq!(
+                fs::read(path).unwrap(),
+                before,
+                "unresolved bytes never become cleanup input"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_output_commit_recovers_exact_old_and_new_without_resubmission() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (persistence, _) = Persistence::open(&state_dir).unwrap();
+        let runtime = persistence.runtime_id();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let other = running_info(RunId::new());
+        let other_durable = persistence
+            .insert_start(&test_operation_key(other.id), &other)
+            .unwrap();
+        let hooks = &persistence.inner.test_hooks;
+        hooks.suppress_idle_fold.store(true, Ordering::Release);
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"first")])));
+        persistence.barrier().unwrap();
+        for (round, committed) in [false, true].into_iter().enumerate() {
+            let from = 5 + u64::try_from(round).unwrap() * 4;
+            hooks
+                .maintenance_probe_unavailable
+                .store(true, Ordering::Release);
+            hooks
+                .maintenance_error_committed
+                .store(committed, Ordering::Release);
+            hooks
+                .maintenance_commits_before_error
+                .store(1, Ordering::Release);
+            expect_queued(durable.append(info.id, replay(vec![chunk(from, b"tail")])));
+            wait_for_persistence(
+                || persistence.is_failed(),
+                "unknown output must first remain visible",
+            );
+            assert!(persistence.barrier().is_err());
+            assert_eq!(durable.durable_head.load(Ordering::Acquire), from);
+            assert!(persistence.inner.queue_depth.load(Ordering::Acquire) > 0);
+            let original = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(durable.read_replay_page(info.id, 0, 5))
+                .unwrap();
+            assert_eq!(
+                original
+                    .chunks
+                    .iter()
+                    .flat_map(|c| c.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                b"first"
+            );
+            thread::sleep(Duration::from_millis(80));
+            assert!(
+                persistence.is_failed(),
+                "an unreadable witness must not clear the fence"
+            );
+            hooks
+                .maintenance_probe_unavailable
+                .store(false, Ordering::Release);
+            wait_for_persistence(
+                || {
+                    !persistence.is_failed()
+                        && durable.durable_head.load(Ordering::Acquire) == from + 4
+                },
+                "same owner must settle exact Old/New without resubmitting accepted bytes",
+            );
+            persistence.barrier().unwrap();
+            assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+            assert_eq!(persistence.runtime_id(), runtime);
+        }
+        expect_queued(other_durable.append(other.id, replay(vec![chunk(0, b"independent")])));
+        persistence.barrier().unwrap();
+        drop(other_durable);
+        drop(durable);
+        drop(persistence);
+        let (_, recovered) = Persistence::open(&state_dir).unwrap();
+        for (id, expected) in [
+            (info.id, b"firsttailtail".as_slice()),
+            (other.id, b"independent".as_slice()),
+        ] {
+            let run = recovered.iter().find(|run| run.info.id == id).unwrap();
+            assert_eq!(
+                run.replay
+                    .chunks
+                    .iter()
+                    .flat_map(|c| c.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_finalize_settles_original_waiter_and_metadata_once() {
+        for committed in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let state_dir = temp.path().join("state");
+            let (persistence, _) = Persistence::open(&state_dir).unwrap();
+            let info = running_info(RunId::new());
+            let durable = persistence
+                .insert_start(&test_operation_key(info.id), &info)
+                .unwrap();
+            let hooks = &persistence.inner.test_hooks;
+            hooks
+                .maintenance_probe_unavailable
+                .store(true, Ordering::Release);
+            hooks
+                .maintenance_error_committed
+                .store(committed, Ordering::Release);
+            hooks
+                .maintenance_commits_before_error
+                .store(1, Ordering::Release);
+            let ending = durable.clone();
+            let original_id = info.id;
+            let ended = thread::spawn(move || {
+                ending.finalize(
+                    original_id,
+                    123,
+                    replay(vec![chunk(0, b"original-terminal-bytes")]),
+                    RunState::Exited {
+                        code: 7,
+                        signal: None,
+                    },
+                );
+            });
+            wait_for_persistence(
+                || persistence.is_failed(),
+                "uncertain Finalize must be observable",
+            );
+            assert!(
+                !ended.is_finished(),
+                "unknown cannot ACK original terminal persistence"
+            );
+            assert_eq!(durable.durable_head.load(Ordering::Acquire), 0);
+            hooks
+                .maintenance_probe_unavailable
+                .store(false, Ordering::Release);
+            wait_for_persistence(
+                || ended.is_finished(),
+                "original terminal waiter must finish after exact outcome reconciliation",
+            );
+            ended.join().unwrap();
+            assert!(!persistence.is_failed());
+            assert_eq!(durable.durable_head.load(Ordering::Acquire), 23);
+            let metadata = durable.metadata_bytes.load(Ordering::Acquire);
+            assert!(metadata > 0);
+            drop(durable);
+            drop(persistence);
+            let (_, recovered) = Persistence::open(&state_dir).unwrap();
+            assert_eq!(recovered[0].info.id, original_id);
+            assert_eq!(
+                recovered[0].info.state,
+                RunState::Exited {
+                    code: 7,
+                    signal: None
+                }
+            );
+            assert_eq!(recovered[0].info.pid, Some(123));
+            assert_eq!(recovered[0].metadata_bytes, metadata);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "four physical commit boundaries share original generation and cold-byte assertions"
+    )]
+    fn uncertain_compaction_preserves_then_settles_original_generation_and_debt() {
         for (committed, lost_at_commit, stat_failure) in [
             (true, 1, false),
             (true, 2, false),
@@ -12977,6 +13981,9 @@ mod tests {
             // First publish the active destination, then lose the response to
             // the first coordinate COMMIT (in either physical outcome).
             let hooks = &persistence.inner.test_hooks;
+            hooks
+                .maintenance_probe_unavailable
+                .store(true, Ordering::Release);
             if stat_failure {
                 hooks
                     .maintenance_commits_before_stat_error
@@ -13027,12 +14034,36 @@ mod tests {
                     )
                     .is_err()
             );
+            hooks
+                .maintenance_probe_unavailable
+                .store(false, Ordering::Release);
+            let expected = [
+                b"committed-before-maintenance".as_slice(),
+                b"must-not-commit-after-unknown-maintenance".as_slice(),
+            ]
+            .concat();
+            wait_for_persistence(
+                || {
+                    !persistence.is_failed()
+                        && durable.durable_head.load(Ordering::Acquire) == expected.len() as u64
+                },
+                "same owner must settle original generation then original append debt",
+            );
+            persistence.barrier().unwrap();
             drop(durable);
             drop(persistence);
             let (reopened, recovered) = Persistence::open(&state_dir)
-                .expect("recovery resolves either committed coordinate outcome");
+                .expect("recovery resolves the original maintenance and append");
             assert_eq!(recovered.len(), 1);
-            assert_eq!(recovered[0].replay, first);
+            assert_eq!(
+                recovered[0]
+                    .replay
+                    .chunks
+                    .iter()
+                    .flat_map(|c| c.data.iter().copied())
+                    .collect::<Vec<_>>(),
+                expected
+            );
             assert!(!reopened.is_failed());
         }
     }
@@ -15189,7 +16220,10 @@ mod tests {
         let Err(error) = persistence.insert_start(&test_operation_key(later.id), &later) else {
             panic!("fatal replay conflict admitted a later mutation");
         };
-        assert!(matches!(error, PersistenceError::Mutation(_)));
+        assert!(
+            matches!(error, PersistenceError::RetainedFailure { .. }),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("changed bytes"));
         assert_eq!(durable.durable_head(), b"committed".len() as u64);
         drop(durable);
@@ -16215,7 +17249,7 @@ mod tests {
             );
             assert!(matches!(
                 store.write_capacity_error(PersistenceError::injected_disk_full()),
-                PersistenceError::FilesystemCapacity { .. }
+                PersistenceError::StorageUnavailable { available: Some(_), error } if matches!(*error, PersistenceError::Database { code: Some(rusqlite::ErrorCode::DiskFull), .. })
             ));
             assert_eq!(
                 MaintenanceWitness::Run(ids[0])
@@ -17271,9 +18305,11 @@ mod tests {
             MaintenanceWitness::Run(ids[0]),
             MaintenanceWitness::Run(ids[1]),
         ];
-        let old = witnesses.map(|witness| witness.read(&store.connection).unwrap());
+        let old = witnesses
+            .each_ref()
+            .map(|witness| witness.read(&store.connection).unwrap());
         let error = store
-            .commit_maintenance_batch(witnesses[0], |connection| {
+            .commit_maintenance_batch(witnesses[0].clone(), |connection| {
                 connection
                     .execute(
                         "UPDATE runs SET durable_output_bytes = durable_output_bytes + 1
@@ -17297,7 +18333,9 @@ mod tests {
             "FULL actually rolled back"
         );
         assert_eq!(
-            witnesses.map(|witness| witness.read(&store.connection).unwrap()),
+            witnesses
+                .each_ref()
+                .map(|witness| witness.read(&store.connection).unwrap()),
             old,
             "both confirmed Run rows must remain exactly Old"
         );

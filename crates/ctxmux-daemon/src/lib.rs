@@ -89,7 +89,7 @@ use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
 use crate::adopted_pty::AdoptedMasterPty;
 use crate::creation::{
     CommitUnknownReservation, CreationFlight, CreationFlightOwner, CreationRequest,
-    HandoffStopOperation, PendingPublication, PersistentCollectionCandidate,
+    HandoffStopOperation, PendingPublication, PersistentCollectionCandidate, PersistentRemoval,
     PublicationReservation, RecoverableStopAdmission, RecoverableStopFlight,
     RecoverableStopSettlement, RunRegistry, TerminalOrdinal, TerminalPublicationOwner,
     TmuxCleanupReservation, UnpublishedCleanupOwner, UnpublishedCleanupReservation,
@@ -105,7 +105,7 @@ use crate::native_session::{AdoptedChild, NativeSession};
 use crate::persistence::{
     CommittedStart, HandoffHint, Persistence, PersistentCandidate, PersistentRun,
     PersistentStartCompletion, PersistentStartFailure, RecoveredRun, RemovalDisposition,
-    StagedPersistentStart, StartDisposition,
+    StagedPersistentStart, StartDisposition, StartReceipt, UnknownStart,
 };
 use crate::qualification_stats::{Gauge as QualificationGauge, QualificationStats};
 use crate::retention::{RetentionBudget, RetentionVictim};
@@ -694,6 +694,7 @@ async fn serve_with_publication(
         let listener = Arc::clone(&publication.listener);
         tokio::select! {
             _ = publication_tick.tick() => {
+                manager.advance_pending_persistence();
                 if publication.observe() {
                     publish_readiness(&mut readiness_fd, &manager)?;
                 }
@@ -1575,6 +1576,7 @@ struct RunManager {
     resources: ResourceLimits,
     persistence: Option<Persistence>,
     commit_unknown_reservations: Mutex<Vec<CommitUnknownReservation>>,
+    pending_persistence: Mutex<Vec<PendingPersistence>>,
     incarnation_failure: IncarnationFailure,
     upgrade_requests: UpgradeRequestGate,
     tmux_shutting_down: AtomicBool,
@@ -1849,7 +1851,33 @@ struct PersistentPublicationOwner<'a> {
     manager: &'a RunManager,
     reservation: Option<PublicationReservation>,
     staged: Option<StagedPersistentStart>,
+    flight: Option<CreationFlight>,
     phase: PersistentPublicationPhase,
+}
+
+/// Only unresolved work admitted by the existing durable owners lives here.
+/// The original Registry reservation and creation/overlap permits fund it;
+/// this is neither a second operation index nor an unbounded retry queue.
+enum PendingPersistence {
+    Admission {
+        reservation: PublicationReservation,
+        receipt: StartReceipt,
+        flight: CreationFlight,
+    },
+    Creation(Box<PendingPersistentCreation>),
+    Removal {
+        removal: PersistentRemoval,
+        completion: std::sync::mpsc::Receiver<bool>,
+    },
+}
+
+struct PendingPersistentCreation {
+    operation_key: CreateOperationKey,
+    pending: PendingPublication,
+    reservation: PublicationReservation,
+    durable: PersistentRun,
+    receipt: StartReceipt,
+    flight: CreationFlight,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1862,14 +1890,14 @@ enum PersistentPublicationPhase {
 }
 
 enum CreationPublication<'a> {
-    Memory(PublicationReservation),
+    Memory(PublicationReservation, CreationFlight),
     Persistent(PersistentPublicationOwner<'a>),
 }
 
 impl CreationPublication<'_> {
     fn abort(self) -> Result<(), PersistentStartFailure> {
         match self {
-            Self::Memory(_) => Ok(()),
+            Self::Memory(..) => Ok(()),
             Self::Persistent(owner) => owner.abort(),
         }
     }
@@ -1880,11 +1908,13 @@ impl<'a> PersistentPublicationOwner<'a> {
         manager: &'a RunManager,
         reservation: PublicationReservation,
         staged: StagedPersistentStart,
+        flight: CreationFlight,
     ) -> Self {
         Self {
             manager,
             reservation: Some(reservation),
             staged: Some(staged),
+            flight: Some(flight),
             phase: PersistentPublicationPhase::Staged,
         }
     }
@@ -1918,7 +1948,7 @@ impl<'a> PersistentPublicationOwner<'a> {
             Err(failure) if failure.disposition() == StartDisposition::NotCommitted => {
                 self.phase = PersistentPublicationPhase::NotCommitted;
             }
-            Err(failure) => self.retain_unknown(&failure.to_string()),
+            Err(failure) => self.retain_aborted(failure),
         }
         result
     }
@@ -1967,6 +1997,39 @@ impl<'a> PersistentPublicationOwner<'a> {
         self.phase = PersistentPublicationPhase::Finished;
         self.manager.fail_stop_persistence(reservation, message);
     }
+
+    fn retain_aborted(&mut self, failure: &PersistentStartFailure) {
+        if let Some(receipt) = failure.recovery_receipt() {
+            mutex_lock(&self.manager.pending_persistence).push(PendingPersistence::Admission {
+                reservation: self.reservation.take().expect("one original reservation"),
+                receipt,
+                flight: self.flight.take().expect("one original creation flight"),
+            });
+            self.phase = PersistentPublicationPhase::Finished;
+        } else {
+            self.retain_unknown(&failure.to_string());
+        }
+    }
+
+    fn retain_creation(
+        &mut self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+        durable: PersistentRun,
+        receipt: StartReceipt,
+    ) {
+        mutex_lock(&self.manager.pending_persistence).push(PendingPersistence::Creation(Box::new(
+            PendingPersistentCreation {
+                operation_key,
+                pending,
+                reservation: self.reservation.take().expect("one original reservation"),
+                durable,
+                receipt,
+                flight: self.flight.take().expect("one original creation flight"),
+            },
+        )));
+        self.phase = PersistentPublicationPhase::Finished;
+    }
 }
 
 impl Drop for PersistentPublicationOwner<'_> {
@@ -1980,7 +2043,7 @@ impl Drop for PersistentPublicationOwner<'_> {
                         "ctxmuxd failed to finish staged persistence rollback: {failure}"
                     ));
                 }
-                Err(failure) => self.retain_unknown(&failure.to_string()),
+                Err(failure) => self.retain_aborted(&failure),
             }
         }
         if matches!(
@@ -2172,6 +2235,7 @@ impl RunManager {
             resources,
             persistence: None,
             commit_unknown_reservations: Mutex::new(Vec::new()),
+            pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
             upgrade_requests: UpgradeRequestGate::default(),
             tmux_shutting_down: AtomicBool::new(false),
@@ -2304,6 +2368,7 @@ impl RunManager {
             resources,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
+            pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure: IncarnationFailure::default(),
             upgrade_requests: UpgradeRequestGate::default(),
             tmux_shutting_down: AtomicBool::new(false),
@@ -2438,6 +2503,7 @@ impl RunManager {
             resources,
             persistence: Some(persistence),
             commit_unknown_reservations: Mutex::new(Vec::new()),
+            pending_persistence: Mutex::new(Vec::new()),
             incarnation_failure,
             upgrade_requests: UpgradeRequestGate::default(),
             foreground_observations: foreground_observation::ForegroundObservationOwner::new(
@@ -2511,13 +2577,13 @@ impl RunManager {
         thread::Builder::new()
             .name("ctxmux-create".to_owned())
             .spawn(move || {
-                let _flight = flight;
                 let _operation_guard = operation_guard;
                 let result = manager.create_unique(
                     operation_key,
                     materialized,
                     cleanup_reservation,
                     new_run_id,
+                    flight,
                 );
                 let _ = result_tx.send(result);
             })
@@ -2565,16 +2631,120 @@ impl RunManager {
         ));
     }
 
+    /// Inspect only the bounded unresolved owners. Publishing an already-ended
+    /// child can wait for its original Finalize, so it must use the original
+    /// creation flight off the listener thread.
+    fn advance_pending_persistence(self: &Arc<Self>) {
+        let mut pending = mutex_lock(&self.pending_persistence);
+        let mut index = 0;
+        while index < pending.len() {
+            match &pending[index] {
+                PendingPersistence::Admission { receipt, .. }
+                    if receipt.disposition() == StartDisposition::NotCommitted =>
+                {
+                    let PendingPersistence::Admission {
+                        reservation,
+                        flight,
+                        ..
+                    } = pending.swap_remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    drop(reservation);
+                    drop(flight);
+                }
+                PendingPersistence::Removal { completion, .. } => {
+                    let Ok(committed) = completion.try_recv() else {
+                        index += 1;
+                        continue;
+                    };
+                    let PendingPersistence::Removal { removal, .. } = pending.swap_remove(index)
+                    else {
+                        unreachable!()
+                    };
+                    if committed {
+                        removal.commit();
+                    } else {
+                        drop(removal);
+                    }
+                }
+                PendingPersistence::Creation(original)
+                    if original.receipt.disposition() == StartDisposition::Committed =>
+                {
+                    let recovery = Arc::new(Mutex::new(Some(pending.swap_remove(index))));
+                    let worker_recovery = Arc::clone(&recovery);
+                    let manager = Arc::clone(self);
+                    if let Err(error) = thread::Builder::new()
+                        .name("ctxmux-publish".to_owned())
+                        .spawn(move || {
+                            let original = mutex_lock(&worker_recovery)
+                                .take()
+                                .expect("one original publication continuation");
+                            manager.publish_recovered_creation(original);
+                        })
+                    {
+                        pending.push(
+                            mutex_lock(&recovery)
+                                .take()
+                                .expect("unstarted worker retained its original owner"),
+                        );
+                        let _ = crate::diagnostics::record(format_args!(
+                            "ctxmuxd could not resume original durable publication: {error}"
+                        ));
+                        // A host thread failure must not become a busy retry
+                        // loop in this one publication-observation turn.
+                        break;
+                    }
+                }
+                _ => index += 1,
+            }
+        }
+    }
+
+    fn publish_recovered_creation(&self, original: PendingPersistence) {
+        let PendingPersistence::Creation(original) = original else {
+            unreachable!("only a committed creation enters its original flight")
+        };
+        let PendingPersistentCreation {
+            operation_key,
+            pending,
+            reservation,
+            durable,
+            flight,
+            ..
+        } = *original;
+        let mut publication = PersistentPublicationOwner {
+            manager: self,
+            reservation: Some(reservation),
+            staged: None,
+            flight: Some(flight),
+            phase: PersistentPublicationPhase::CommittedUnpublished,
+        };
+        let (run, _) = publication.publish_committed(
+            operation_key,
+            pending,
+            CommittedStart {
+                durable,
+                post_commit_error: None,
+            },
+        );
+        let _ = crate::diagnostics::record(format_args!(
+            "ctxmuxd recovered original durable publication for Run {}",
+            run.id
+        ));
+    }
+
     fn create_unique(
         &self,
         operation_key: CreateOperationKey,
         materialized: MaterializedCreation,
         cleanup_reservation: UnpublishedCleanupReservation,
         new_run_id: RunId,
+        flight: CreationFlight,
     ) -> Result<RunInfo, ProtocolError> {
         let persistence_mode = self.persistence_mode();
         let publication =
-            self.prepare_creation_publication(&operation_key, &materialized, new_run_id)?;
+            self.prepare_creation_publication(&operation_key, &materialized, new_run_id, flight)?;
         let MaterializedCreation {
             request,
             spec,
@@ -2616,10 +2786,11 @@ impl RunManager {
         if let Some(hook) = &self.creation_hook {
             hook.record_physical_spawn();
         }
-        let result = match publication {
-            CreationPublication::Memory(reservation) => {
-                Ok(self.publish_memory_creation(operation_key, pending, reservation))
-            }
+        let (result, _flight) = match publication {
+            CreationPublication::Memory(reservation, flight) => (
+                Ok(self.publish_memory_creation(operation_key, pending, reservation)),
+                Some(flight),
+            ),
             CreationPublication::Persistent(publication) => {
                 self.publish_persistent_creation(operation_key, pending, publication)
             }
@@ -2636,6 +2807,7 @@ impl RunManager {
         operation_key: &CreateOperationKey,
         materialized: &MaterializedCreation,
         new_run_id: RunId,
+        flight: CreationFlight,
     ) -> Result<CreationPublication<'a>, ProtocolError> {
         let Some(persistence) = &self.persistence else {
             let reservation = self
@@ -2649,7 +2821,7 @@ impl RunManager {
                     ),
                 )
                 .map_err(|error| creation_not_applied(error, operation_key))?;
-            return Ok(CreationPublication::Memory(reservation));
+            return Ok(CreationPublication::Memory(reservation, flight));
         };
         let prospective = materialized.persistence_start_info(new_run_id);
         let prepared = persistence
@@ -2675,7 +2847,7 @@ impl RunManager {
             .collect();
         match persistence.stage_start(prepared, candidates) {
             Ok(staged) => Ok(CreationPublication::Persistent(
-                PersistentPublicationOwner::new(self, reservation, staged),
+                PersistentPublicationOwner::new(self, reservation, staged, flight),
             )),
             Err(failure) => {
                 let disposition = failure.disposition();
@@ -2685,9 +2857,18 @@ impl RunManager {
                     ErrorCode::Persistence
                 };
                 let storage_failure = Some(failure.storage_failure());
+                let recovery = failure.recovery_receipt();
                 let message = failure.into_error().to_string();
                 if disposition == StartDisposition::CommitUnknown {
-                    self.fail_stop_persistence(reservation.into_commit_unknown(), &message);
+                    if let Some(receipt) = recovery {
+                        mutex_lock(&self.pending_persistence).push(PendingPersistence::Admission {
+                            reservation,
+                            receipt,
+                            flight,
+                        });
+                    } else {
+                        self.fail_stop_persistence(reservation.into_commit_unknown(), &message);
+                    }
                 }
                 let mut error = ProtocolError::new(code, message);
                 error.storage_failure = storage_failure;
@@ -2723,6 +2904,16 @@ impl RunManager {
         operation_key: CreateOperationKey,
         pending: PendingPublication,
         mut publication: PersistentPublicationOwner<'_>,
+    ) -> (Result<RunInfo, ProtocolError>, Option<CreationFlight>) {
+        let result = self.finish_persistent_creation(operation_key, pending, &mut publication);
+        (result, publication.flight.take())
+    }
+
+    fn finish_persistent_creation(
+        &self,
+        operation_key: CreateOperationKey,
+        pending: PendingPublication,
+        publication: &mut PersistentPublicationOwner<'_>,
     ) -> Result<RunInfo, ProtocolError> {
         debug_assert!(std::ptr::eq(self, publication.manager));
         #[cfg(test)]
@@ -2739,12 +2930,16 @@ impl RunManager {
             PersistentStartCompletion::NotCommitted(failure) => {
                 return cleanup_failed_persistent_creation(pending, failure);
             }
-            PersistentStartCompletion::CommitUnknown(failure) => {
+            PersistentStartCompletion::CommitUnknown(UnknownStart {
+                failure,
+                durable,
+                receipt,
+            }) => {
                 let storage_failure = Some(failure.storage_failure());
                 let mut error = persistence_protocol_error(&failure.into_error());
                 error.storage_failure = storage_failure;
-                publication.retain_unknown(&error.message);
-                return cleanup_unknown_persistent_creation(pending, error);
+                publication.retain_creation(operation_key, pending, durable, receipt);
+                return Err(error);
             }
         };
         let (info, post_commit_error) =
@@ -2769,7 +2964,17 @@ impl RunManager {
         let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        self.create_unique(operation_key, materialized, cleanup_reservation, new_run_id)
+        let flight = self
+            .creation_flights
+            .begin_test()
+            .expect("test creation admission");
+        self.create_unique(
+            operation_key,
+            materialized,
+            cleanup_reservation,
+            new_run_id,
+            flight,
+        )
     }
 
     #[cfg(test)]
@@ -2781,7 +2986,17 @@ impl RunManager {
         let materialized = self.materialize_creation(request)?;
         let cleanup_reservation = self.unpublished_cleanups.reserve(&operation_key)?;
         let new_run_id = RunId::new();
-        self.create_unique(operation_key, materialized, cleanup_reservation, new_run_id)
+        let flight = self
+            .creation_flights
+            .begin_test()
+            .expect("test creation admission");
+        self.create_unique(
+            operation_key,
+            materialized,
+            cleanup_reservation,
+            new_run_id,
+            flight,
+        )
     }
 
     #[cfg(test)]
@@ -2962,12 +3177,49 @@ impl RunManager {
         }
     }
 
-    fn shutdown_owned_controls(&self, timeout: Duration) -> Result<(), ServerError> {
+    fn await_pending_persistence(self: &Arc<Self>, deadline: Instant) -> bool {
+        loop {
+            self.advance_pending_persistence();
+            let flights_drained = self
+                .creation_flights
+                .wait_until(deadline.min(Instant::now() + CHILD_CONTROL_POLL));
+            if flights_drained && mutex_lock(&self.pending_persistence).is_empty() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if flights_drained {
+                thread::sleep(
+                    CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one shutdown deadline joins tmux cleanup and original durable continuations"
+    )]
+    fn shutdown_owned_controls(self: &Arc<Self>, timeout: Duration) -> Result<(), ServerError> {
         let deadline = Instant::now() + timeout;
         self.creation_flights.fence();
         self.tmux_shutting_down.store(true, Ordering::Release);
 
         let mut failures = Vec::new();
+        // The original unpublished child remains owned even after the client
+        // got an unknown reply. Shutdown requests its cleanup without dropping
+        // the durable witness, original output, or publication reservation.
+        for original in mutex_lock(&self.pending_persistence).iter() {
+            if let PendingPersistence::Creation(original) = original
+                && let Err(error) = original.pending.run().request_unpublished_cleanup()
+            {
+                failures.push(format!(
+                    "unpublished Run {} cleanup: {error}",
+                    original.pending.run().id
+                ));
+            }
+        }
         let operation_guard = loop {
             match self.tmux_operation_gate.try_write() {
                 Ok(guard) => break Some(guard),
@@ -3037,8 +3289,11 @@ impl RunManager {
             thread::sleep(CHILD_CONTROL_POLL.min(deadline.saturating_duration_since(now)));
         }
 
-        if !self.creation_flights.wait_until(deadline) {
-            failures.push("timed out waiting for in-flight Run creation to finish".to_owned());
+        if !self.await_pending_persistence(deadline) {
+            failures.push(
+                "timed out waiting for original Run creation or durable mutation to settle"
+                    .to_owned(),
+            );
         }
         failures.extend(
             self.unpublished_cleanups
@@ -3081,8 +3336,8 @@ impl RunManager {
     /// fences the entry, deletes the exact durable row on the persistence actor
     /// off the async runtime, then commits the in-memory removal; a durable
     /// failure restores the fence and the Run stays intact. An unclassifiable
-    /// durable outcome fail-stops the incarnation, exactly like a start's
-    /// `CommitUnknown`, so durable and in-memory truth never diverge.
+    /// durable outcome retains the exact removal fence until the same
+    /// persistence owner proves Old or New; independent Runs remain available.
     async fn remove(self: &Arc<Self>, id: RunId) -> Result<(), ProtocolError> {
         let Some(_persistence) = &self.persistence else {
             return self.registry.remove_memory(id);
@@ -3135,22 +3390,12 @@ impl RunManager {
                     format!("durable Run removal was rejected: {error}"),
                 ))
             }
-            RemovalDisposition::Unknown(error) => {
-                let message = error.to_string();
-                // The durable outcome is unknown: never guess in memory. Keep
-                // the fence (leak the owner) and fail-stop the incarnation so
-                // restart's SQLite recovery is the only authority.
-                std::mem::forget(removal);
-                self.incarnation_failure.record(format!(
-                    "durable Run removal outcome is unknown; restart is required: {message}"
-                ));
-                self.creation_flights.fence();
-                Err(ProtocolError::new(
-                    ErrorCode::Persistence,
-                    format!(
-                        "durable Run removal outcome is unknown; restart is required: {message}"
-                    ),
-                ))
+            RemovalDisposition::Unknown { error, completion } => {
+                mutex_lock(&self.pending_persistence).push(PendingPersistence::Removal {
+                    removal,
+                    completion,
+                });
+                Err(persistence_protocol_error(&error))
             }
         }
     }
@@ -7209,19 +7454,6 @@ fn cleanup_failed_persistent_creation(
     Err(error)
 }
 
-fn cleanup_unknown_persistent_creation(
-    pending: PendingPublication,
-    mut error: ProtocolError,
-) -> Result<RunInfo, ProtocolError> {
-    if let Err(cleanup_error) = pending.cleanup_unpublished() {
-        error.message = format!(
-            "{}; cleanup pending after unknown COMMIT: {cleanup_error}",
-            error.message
-        );
-    }
-    Err(error)
-}
-
 fn spawn_error(action: &str, error: impl fmt::Display) -> ProtocolError {
     ProtocolError::new(
         ErrorCode::SpawnFailed,
@@ -7884,6 +8116,8 @@ mod tests {
     use crate::native_control::NativeControlOwner;
 
     mod creation;
+    mod creation_recovery;
+    mod persistence_reconciliation;
 
     /// Build a `RunInfo` whose echoed spec carries a declared input of exactly
     /// `reference_bytes`, so the caller can dial the encoded frame size across the
@@ -8228,7 +8462,7 @@ mod tests {
         assert!(message.contains(&run_id.to_string()));
         assert!(message.contains("fixture wait authority lost"));
 
-        let manager = RunManager::default();
+        let manager = Arc::new(RunManager::default());
         manager.registry.publish_unkeyed_for_test(run);
         let shutdown = manager
             .shutdown_owned_controls(Duration::ZERO)

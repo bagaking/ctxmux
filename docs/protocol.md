@@ -359,7 +359,7 @@ A spawn failure before a child exists does not consume its key. The daemon
 prepares every fallible PTY reader and writer view before physical launch.
 Immediately after launch it constructs native control and arms one private
 publication owner before output/wait owner registration can fail or unwind.
-Persistence rejection before durable `COMMIT` asks the daemon-wide child owner
+A proven uncommitted persistence rejection asks the daemon-wide child owner
 to clean up; only the final cleanup-owned `child.wait()` proves child reap, and the key
 becomes reusable only after the output, lifecycle, control, input, and Run owners
 are also quiescent. Until then the first request reports `persistence` with an
@@ -372,7 +372,8 @@ permit, and is reported by bounded shutdown. It is not a durable tombstone and
 cannot survive daemon crash.
 
 Durable `COMMIT` is the point of no return. If a post-commit physical-file
-check fails, persistence is latched and the first request reports
+check fails, writes remain fenced until the original evidence can be checked,
+and the first request reports
 `persistence`, but the daemon still publishes the committed Run and key in its
 registry; a same-key retry returns that Run rather than launching another
 process. Likewise, failure to deliver a response does not roll back the Run or
@@ -398,6 +399,16 @@ or unproven creation completion is `unknown`. These are physical-effect facts:
 `creation_failure.disposition: "not_applied"`. Neither a missing field nor an
 absent list entry proves a negative. Unknown does not authorize another launch.
 Retained committed keys continue to resolve the original Run.
+An unresolved creation keeps its original Registry reservation, child and
+creation funding while the persistence owner checks its retained transaction
+evidence. Restored storage can complete that original publication, including a
+child that already exited; no Start, Fork or input is resent. A proven old
+database transaction after launch permits only completion of the original SQL
+publication. A pre-launch transaction without commit authorization can instead
+release its reservation after its rollback is proven. Neither recovery clears
+an unrelated shutdown or native child-wait failure. The original response
+remains unknown; subsequent read-only creation observation returns the settled
+original Run when publication is complete.
 The disposition describes this dispatched request, within the retained-key
 contract above. It is not a timeless claim about every earlier use of a key.
 A consumer already holding an unknown original result must not resend it to
@@ -1021,13 +1032,14 @@ transactions. Both generations can be durably referenced during migration;
 startup validates their indexed extents and resumes before serving. Source files
 are removed only after their last reference moves. An uncertain maintenance
 COMMIT fences later writes even when its underlying error resembles storage
-pressure. A maintenance COMMIT error remains retryable only when its original
-transient storage error and a successful explicit rollback, or an indexed
-transaction effect observed at its original value after automatic rollback,
-prove that the transaction did not commit. The automatic-rollback proof requires
-a changed effect: an unchanged, committed, mismatched or unreadable witness
-remains uncertain. Uncertain outcomes preserve possibly indexed payload and
-never clear an existing persistence failure latch. Compaction precedes
+pressure. The original store retains its exact old/new witness and the
+transaction-specific settlement. A bounded owner check may finish only the
+original still-active transaction's rollback before comparing committed state.
+Proven old state returns only to the original pending storage work; proven new
+state settles only that committed subtransaction. Hybrid, foreign or unreadable
+state retains the fence and possibly indexed payload. Unchanged witness values
+alone cannot prove a COMMIT. No Start, Input or Remove command is resent by
+this reconciliation. Compaction precedes
 append/finalize COMMIT and remains transparent to
 protocol cursors. Its file budget includes the required source/destination
 scratch overlap; the main-database ceiling is unchanged.
@@ -1070,14 +1082,15 @@ response naming another Run. Generation 23 adds structured failure facts;
 a missing capability is explicit unsupported, not a failure of the original Run.
 
 The memory floor and latest byte are one bounded output-facts snapshot. The
-optional persistence object independently samples the actor's original first
-latched failure, actor completion, advisory queued/owned append command credits, including retained retry debt,
+optional persistence object independently samples the actor's first unresolved
+failure, actor completion, advisory queued/owned append command credits, including retained retry debt,
 accepted-output watermark and **last confirmed committed** watermark. An unknown
 COMMIT can leave disk ahead of the confirmed watermark: differences do not prove
 lost or uncommitted bytes. Null persistence denotes a Run with no persistence
 owner. Null first failure alone promises neither health nor complete durability.
 Required nullable `storage_failure` reports the current unsettled storage fact;
-it is separate from historical `first_failure` text. The same object may appear
+`first_failure` provides its human-readable description. Successful settlement
+clears the original fault; a free-space sample alone cannot clear it. The same object may appear
 as optional `ProtocolError.storage_failure` on the original failed request:
 
 ```ts

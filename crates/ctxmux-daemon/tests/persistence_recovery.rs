@@ -1513,6 +1513,10 @@ fn assert_startup_rejected(socket: &Path, state_dir: &Path, expected: &str) {
 /// Real filesystem fault and real PTY, then a different daemon process reads
 /// the original committed bytes. Restoring the same inode is the only repair.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real owner and its cold successor prove both original path and permission restoration"
+)]
 async fn removable_replay_path_recovers_same_live_owner_and_cold_process() {
     use ctxmux_protocol::StorageTransactionOutcome;
     use std::fs;
@@ -1545,7 +1549,7 @@ async fn removable_replay_path_recovers_same_live_owner_and_cold_process() {
         let replay = state.join("replay");
         let held = state.join("held-original-replay");
         if permission_fault {
-            fs::set_permissions(&replay, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(&replay, fs::Permissions::from_mode(0o0)).unwrap();
         } else {
             fs::rename(&replay, &held).unwrap();
         }
