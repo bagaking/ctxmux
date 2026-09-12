@@ -3755,9 +3755,18 @@ mod tests {
 
         // The first entry passed preflight before the second failed. It must
         // still own its PTY, proving validation did not relinquish a prefix.
-        controls[0]
-            .resize(TerminalSize { rows: 25, cols: 81 }, |_| {})
+        // Use the actual Run admission path: its temporary owner lock is not
+        // evidence of a relinquished PTY. Keep the existing two-second budget
+        // and require the original owner to apply and confirm the real ioctl.
+        let size = TerminalSize { rows: 25, cols: 81 };
+        let receipt = tokio::time::timeout(Duration::from_secs(2), runs[0].resize_async(size))
+            .await
+            .expect("earlier owner admits resize within the original preflight budget")
             .expect("earlier owner remains live after later preflight failure");
+        assert_eq!(
+            receipt,
+            ctxmux_protocol::ControlReceipt::Resize { applied_size: size }
+        );
         for pid in &pids {
             assert!(
                 Command::new("kill")

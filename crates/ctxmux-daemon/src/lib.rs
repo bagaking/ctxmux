@@ -109,8 +109,10 @@ use crate::tmux::{
     BoundedLineRead, ControlItem, ControlParser, SocketIdentity as TmuxSocketIdentity,
 };
 
+// Explicit regression policy for eviction-boundary tests, not a production
+// capacity requirement. Keep the original 4 MiB and larger test workloads.
 #[cfg(test)]
-const OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
+const TEST_OUTPUT_RETENTION_BYTES: usize = 4 * 1024 * 1024;
 const CHILD_CONTROL_POLL: Duration = Duration::from_millis(20);
 const STOP_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_GRACEFUL_TIMEOUT: Duration = Duration::from_millis(500);
@@ -7571,16 +7573,16 @@ mod tests {
     use super::{
         AttachmentHookPoint, AttachmentTestHook, CreationHookPoint, CreationRequest,
         CreationTestHook, HandoffInputState, LaunchSetupStep, NativeRuntimeOwner,
-        NativeWaitFailure, OUTPUT_RETENTION_BYTES, OutputLog, OutputReplay, PendingTmuxPublication,
-        Persistence, PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager,
-        ServerError, ServerFrame, TMUX_DISCOVERY_TIMEOUT, TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT,
-        TMUX_IMPORT_DISCOVERY_TIMEOUT, TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT,
-        TMUX_SHUTDOWN_TIMEOUT, TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker,
-        TmuxCommandWriter, TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination,
-        TmuxRunControl, TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission,
-        UpgradeRequestGate, codec, mutex_lock, prepare_socket_path, prepare_socket_path_with_hook,
-        resolve_tmux_termination, send_capped, serve_with_manager, serve_with_persistence_manager,
-        spawn_error,
+        NativeWaitFailure, OutputLog, OutputReplay, PendingTmuxPublication, Persistence,
+        PersistenceBinding, PersistenceMode, RecoveredRun, Run, RunManager, ServerError,
+        ServerFrame, TEST_OUTPUT_RETENTION_BYTES, TMUX_DISCOVERY_TIMEOUT,
+        TMUX_FAILED_IMPORT_CLEANUP_TIMEOUT, TMUX_IMPORT_DISCOVERY_TIMEOUT,
+        TMUX_IMPORT_PREPARE_TIMEOUT, TMUX_IMPORT_TOTAL_TIMEOUT, TMUX_SHUTDOWN_TIMEOUT,
+        TmuxCommandKind, TmuxCommandResultKind, TmuxCommandTracker, TmuxCommandWriter,
+        TmuxCompletion, TmuxCompletionObservation, TmuxReaderTermination, TmuxRunControl,
+        TmuxTermination, TmuxWaitCause, UpgradeRequestAdmission, UpgradeRequestGate, codec,
+        mutex_lock, prepare_socket_path, prepare_socket_path_with_hook, resolve_tmux_termination,
+        send_capped, serve_with_manager, serve_with_persistence_manager, spawn_error,
     };
     use crate::creation::{TerminalPublicationOwner, UnpublishedCleanupOwner};
 
@@ -9193,6 +9195,17 @@ mod tests {
         Arc<AttachmentTestHook>,
         mpsc::UnboundedReceiver<()>,
     ) {
+        hooked_server_with_resources(point, super::ResourceLimits::default())
+    }
+
+    fn hooked_server_with_resources(
+        point: AttachmentHookPoint,
+        resources: super::ResourceLimits,
+    ) -> (
+        InProcessServer,
+        Arc<AttachmentTestHook>,
+        mpsc::UnboundedReceiver<()>,
+    ) {
         let (reached_tx, reached_rx) = mpsc::unbounded_channel();
         let hook = Arc::new(AttachmentTestHook {
             point,
@@ -9203,7 +9216,11 @@ mod tests {
         let manager = Arc::new(RunManager {
             attachment_hook: Some(Arc::clone(&hook)),
 
-            ..RunManager::default()
+            ..RunManager::with_instance_stats_and_resources(
+                ctxmux_protocol::DaemonInstanceId::new(),
+                super::QualificationStats::default(),
+                resources,
+            )
         });
         (InProcessServer::start(manager), hook, reached_rx)
     }
@@ -10008,7 +10025,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn public_attach_accepts_retention_advancing_during_initial_replay() {
-        let (server, hook, mut reached) = hooked_server(AttachmentHookPoint::AfterReplayPage);
+        let (server, hook, mut reached) = hooked_server_with_resources(
+            AttachmentHookPoint::AfterReplayPage,
+            super::ResourceLimits {
+                run_output_bytes: TEST_OUTPUT_RETENTION_BYTES,
+                ..super::ResourceLimits::default()
+            },
+        );
         let info = server.client.start(long_running_spec()).await.unwrap();
         let run = server.manager.get(info.id).unwrap();
         run.record_output(vec![b'a'; 192 * 1024]);
@@ -10370,7 +10393,10 @@ mod tests {
 
     #[test]
     fn replay_marks_a_cursor_older_than_retained_output_as_truncated() {
-        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::with_limits(
+            u64::MAX,
+            TEST_OUTPUT_RETENTION_BYTES,
+        ));
         for _ in 0..600 {
             output.push(vec![0; 8192]);
         }
@@ -10383,14 +10409,16 @@ mod tests {
     #[test]
     fn output_log_reports_its_bytes_to_the_shared_budget() {
         // Each OutputLog's live bytes count against the daemon-wide total, and
-        // the per-Run cap keeps one log's contribution at or below 4 MiB.
-        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        // the explicitly configured per-Run cap keeps one log's contribution
+        // at or below 4 MiB.
+        let budget =
+            crate::retention::RetentionBudget::with_limits(u64::MAX, TEST_OUTPUT_RETENTION_BYTES);
         let mut output = OutputLog::new(budget.clone());
         for _ in 0..8 {
             output.push(vec![0_u8; 1024 * 1024]); // 1 MiB each, 8 MiB pushed
         }
         // Per-Run eviction held the log itself at or below the 4 MiB cap...
-        assert!(output.retained_bytes() <= OUTPUT_RETENTION_BYTES);
+        assert!(output.retained_bytes() <= TEST_OUTPUT_RETENTION_BYTES);
         // ...and the shared total exactly mirrors that surviving payload.
         assert_eq!(budget.retained_total(), output.retained_bytes() as u64);
     }
@@ -10447,7 +10475,23 @@ mod tests {
                 }
                 let bytes = replay_bytes(&snapshot.replay.chunks);
                 assert!(expected.starts_with(&bytes), "original bytes changed");
-                view.detach().await.unwrap();
+                match view.detach().await {
+                    Ok(()) => {}
+                    Err(
+                        ClientError::Closed
+                        | ClientError::AttachmentUnavailable {
+                            reason: ctxmux_client::AttachmentUnavailableReason::Closed,
+                        },
+                    ) => {
+                        // A terminal replay may close before Detach is dispatched.
+                        // Prove normal child exit on this original Run; a lost
+                        // live attachment or interrupted owner still fails.
+                        let status = client.status(original.id).await.unwrap();
+                        assert_eq!(status.id, original.id);
+                        assert!(matches!(status.state, RunState::Exited { .. }));
+                    }
+                    Err(error) => panic!("detach original raw view: {error}"),
+                }
                 if bytes == expected {
                     break;
                 }
@@ -10963,13 +11007,14 @@ mod tests {
         // harness that mixed them up would look correct on a fresh fleet — the
         // bug only appears once the daemon starts trimming, which is exactly
         // when a retention cap is worth checking.
-        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let budget =
+            crate::retention::RetentionBudget::with_limits(u64::MAX, TEST_OUTPUT_RETENTION_BYTES);
         let mut output = OutputLog::new(budget);
         output.push(vec![0_u8; 1024]);
         assert_eq!(output.latest_output_bytes(), 1024);
         assert_eq!(output.retained_bytes() as u64, output.latest_output_bytes());
 
-        // Push well past the 4 MiB per-Run cap so eviction has to run.
+        // Push well past the configured 4 MiB per-Run cap so eviction has to run.
         for _ in 0..8 {
             output.push(vec![0_u8; 1024 * 1024]);
         }
@@ -10977,7 +11022,7 @@ mod tests {
         // The lifetime counter keeps every byte that ever passed through...
         assert_eq!(output.latest_output_bytes(), 1024 + 8 * 1024 * 1024);
         // ...while the retained count fell back under the per-Run cap.
-        assert!(output.retained_bytes() <= OUTPUT_RETENTION_BYTES);
+        assert!(output.retained_bytes() <= TEST_OUTPUT_RETENTION_BYTES);
         // The gap is the whole point: reading the lifetime total as "memory
         // held" would report this Run at 8 MiB against a 4 MiB cap and fail a
         // healthy daemon.
@@ -10996,7 +11041,8 @@ mod tests {
         // passes every other test in the suite — an external harness would then
         // sum lifetime totals, read a healthy fleet as far over its retention
         // cap, and the defect would only surface as a false gate failure.
-        let budget = crate::retention::RetentionBudget::with_limit(u64::MAX);
+        let budget =
+            crate::retention::RetentionBudget::with_limits(u64::MAX, TEST_OUTPUT_RETENTION_BYTES);
         let id = RunId::new();
         let native_runs = NativeRuntimeOwner::default();
         let run = Run::new_native_for_owner_test_with_budget(
@@ -11007,7 +11053,7 @@ mod tests {
             budget,
         );
 
-        // Push well past the 4 MiB per-Run cap so the log has to evict.
+        // Push well past the configured 4 MiB per-Run cap so the log has to evict.
         for _ in 0..128 {
             run.record_output(vec![0_u8; 64 * 1024]); // 8 MiB total
         }
@@ -11021,7 +11067,7 @@ mod tests {
         );
         assert_eq!(summary.latest_output_bytes, 128 * 64 * 1024);
         assert!(
-            summary.retained_output_bytes <= OUTPUT_RETENTION_BYTES as u64,
+            summary.retained_output_bytes <= TEST_OUTPUT_RETENTION_BYTES as u64,
             "a listed Run must never report holding more than the per-Run cap"
         );
         assert!(
@@ -11203,7 +11249,8 @@ mod tests {
         // Rendering the durable-watermark catch-up on EVERY push is safe but
         // ruinous: `OutputLog::replay` copies every retained chunk above the
         // start byte, so as soon as the actor lags at all, each push copies up
-        // to `OUTPUT_RETENTION_BYTES` — inline, on the single daemon-wide thread
+        // to its configured hot-history budget — inline, on the single
+        // daemon-wide thread
         // that reads every Run's pty. The lag then feeds itself. Measured on
         // a 512-Run fleet at 40 chunks/s that wedged admission at 211 Runs with
         // the reactor thread at 97.4% USER time, against 512/512 admitted for
@@ -11712,16 +11759,22 @@ mod tests {
     fn replay_cursor_and_retention_boundaries_are_exact() {
         // OR-002: exact retention and byte-cursor semantics, independent of
         // private packing boundaries. Keep the same full 4 MiB + 1 workload.
-        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
-        let first_size = OUTPUT_RETENTION_BYTES / 2;
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::with_limits(
+            u64::MAX,
+            TEST_OUTPUT_RETENTION_BYTES,
+        ));
+        let first_size = TEST_OUTPUT_RETENTION_BYTES / 2;
         let mut expected = vec![b'a'; first_size];
-        expected.extend(vec![b'b'; OUTPUT_RETENTION_BYTES - first_size]);
+        expected.extend(vec![b'b'; TEST_OUTPUT_RETENTION_BYTES - first_size]);
         output.push(expected[..first_size].to_vec());
         output.push(expected[first_size..].to_vec());
         let exact = output.replay(0);
         assert!(!exact.truncated);
         assert_eq!(exact.first_available_byte, 0);
-        assert_eq!(exact.latest_output_bytes, OUTPUT_RETENTION_BYTES as u64);
+        assert_eq!(
+            exact.latest_output_bytes,
+            TEST_OUTPUT_RETENTION_BYTES as u64
+        );
         assert_eq!(
             exact
                 .chunks
@@ -11738,9 +11791,9 @@ mod tests {
         assert_eq!(evicted.first_available_byte, 1);
         assert_eq!(
             evicted.latest_output_bytes,
-            OUTPUT_RETENTION_BYTES as u64 + 1
+            TEST_OUTPUT_RETENTION_BYTES as u64 + 1
         );
-        assert_eq!(output.retained_bytes(), OUTPUT_RETENTION_BYTES);
+        assert_eq!(output.retained_bytes(), TEST_OUTPUT_RETENTION_BYTES);
         assert_eq!(
             evicted
                 .chunks
@@ -11758,12 +11811,15 @@ mod tests {
         );
         assert!(!output.replay(1).truncated);
         assert_eq!(output.replay(1).chunks, evicted.chunks);
-        let tail = output.replay(OUTPUT_RETENTION_BYTES as u64);
+        let tail = output.replay(TEST_OUTPUT_RETENTION_BYTES as u64);
         assert_eq!(tail.chunks[0].data, b"c");
-        assert_eq!(tail.chunks[0].start_byte, OUTPUT_RETENTION_BYTES as u64);
+        assert_eq!(
+            tail.chunks[0].start_byte,
+            TEST_OUTPUT_RETENTION_BYTES as u64
+        );
         assert!(
             output
-                .replay(OUTPUT_RETENTION_BYTES as u64 + 1)
+                .replay(TEST_OUTPUT_RETENTION_BYTES as u64 + 1)
                 .chunks
                 .is_empty()
         );
@@ -11804,8 +11860,11 @@ mod tests {
 
     #[test]
     fn oversized_output_preserves_exact_tail_and_monotone_cursors() {
-        let mut output = OutputLog::new(crate::retention::RetentionBudget::production());
-        let oversized = vec![0xa5; OUTPUT_RETENTION_BYTES + 1];
+        let mut output = OutputLog::new(crate::retention::RetentionBudget::with_limits(
+            u64::MAX,
+            TEST_OUTPUT_RETENTION_BYTES,
+        ));
+        let oversized = vec![0xa5; TEST_OUTPUT_RETENTION_BYTES + 1];
         let live = output.push(oversized.clone());
         assert_eq!(live.data, oversized);
         let replay = output.replay(0);
@@ -11821,7 +11880,7 @@ mod tests {
                 .eq(oversized[1..].iter().copied()),
             "packing boundaries cannot change the exact retained suffix"
         );
-        assert_eq!(output.retained_bytes(), OUTPUT_RETENTION_BYTES);
+        assert_eq!(output.retained_bytes(), TEST_OUTPUT_RETENTION_BYTES);
         output.push(vec![0x5a]);
         let tail = output.replay(oversized.len() as u64);
         assert!(!tail.truncated);
