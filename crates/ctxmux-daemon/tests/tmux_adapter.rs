@@ -2229,6 +2229,8 @@ async fn oversized_control_mode_after_readiness_is_a_protocol_interruption() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Keep gap provenance, continuation and the healthy native Run in one scenario.
+#[allow(clippy::too_many_lines)]
 async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
     let fake = FakeTmuxControl::create();
     let mut daemon = TestDaemon::start_with_tmux_bin(&fake.executable).await;
@@ -2352,7 +2354,7 @@ async fn public_pause_emits_exact_gap_and_requests_control_mode_continue() {
         .unwrap();
     assert_eq!(
         receipt.receipt.written_bytes,
-        b"SECOND_AFTER_GAP".len() as u32
+        u32::try_from(b"SECOND_AFTER_GAP".len()).expect("fixture input fits its receipt")
     );
     timeout(scaled(Duration::from_secs(5)), async {
         loop {
