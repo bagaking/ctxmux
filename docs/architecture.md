@@ -901,6 +901,24 @@ a tight retry loop, an unbounded second queue or a reason to disable authoritati
 reads and healthy process controls. Actual child reap and durable terminal
 confirmation remain separate facts when settlement cannot yet be saved.
 
+Normal cumulative retained history must not turn an unrelated Run's append or
+Start admission into a scan of every immutable specification. Aggregate accounting
+belongs to the same transactional store owner and follows actual canonical row
+changes and rollback; reconstruction uses validated saved state, without a second
+durable registry or guessed zero totals. Read-only cache residency is not a WAL
+write charge. Spill-disabled admission still proves the original dirty-write and
+post-commit WAL bounds. Retention work must leave independent lifecycle and live
+Run consumers able to progress while preserving accepted bytes, identities and
+truthful floor/head/Gap facts. A progressing page continuation keeps its original
+waiting admission; page continuations do not add queue funding. Proven capacity
+shortage remains debt of the original Run and its accepted bytes, rather than
+holding every waiting-message slot needed by authoritative reads or an exact
+terminal removal that can restore funding. Returning that waiting slot never
+ACKs terminal settlement or releases accepted Append credits. Independent Runs
+share maintenance turns fairly, while an exact candidate replacement cannot overtake that Run's
+original terminal settlement. Append barriers cover their prior accepted byte
+prefix, without waiting for later unrelated lifecycle work.
+
 External typed `DiskFull` or write-side storage pressure gets a bounded exact
 retry after a proven rollback. Continued shortage becomes original ordered debt;
 the actor keeps serving reads, lifecycle observation and healthy controls rather

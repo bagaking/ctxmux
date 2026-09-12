@@ -11,11 +11,13 @@ use std::{
 use ctxmux_client::{Attachment, Client, ClientError, replay_bytes};
 use ctxmux_protocol::{
     CreateOperationKey, ErrorCode, ForkFidelity, ForkPlan, InterruptionReason, PROTOCOL_VERSION,
+    RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
     RUNTIME_CAPABILITY_NATIVE_EXECUTE_MATERIALIZED_LEVEL_B, RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A,
     RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT, RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
     RUNTIME_CAPABILITY_NATIVE_START, RUNTIME_CAPABILITY_PERSISTENT_STATE,
-    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent,
-    RunId, RunInfo, RunSpec, RunState, RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
+    RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY, RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
+    RUNTIME_CAPABILITY_TMUX_DISCOVER, RunEvent, RunId, RunInfo, RunSpec, RunState,
+    RuntimeIdPersistence, RuntimeIdentity, TerminalSize,
 };
 use ctxmux_test_support::{daemon_spawn_permit, scaled};
 use serde_json::{Value, json};
@@ -177,12 +179,18 @@ async fn recovered_creation_keys_resolve_before_current_fork_state_checks() {
 
 impl Daemon {
     async fn start(socket: PathBuf, state_dir: &Path) -> Self {
+        Self::start_with_policy(socket, state_dir, json!({})).await
+    }
+
+    async fn start_with_policy(socket: PathBuf, state_dir: &Path, policy: Value) -> Self {
         let _permit = daemon_spawn_permit().await;
         let child = Command::new(env!("CARGO_BIN_EXE_ctxmuxd"))
             .arg("--socket")
             .arg(&socket)
             .arg("--state-dir")
             .arg(state_dir)
+            .arg("--resource-limits")
+            .arg(policy.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -227,6 +235,224 @@ impl Daemon {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_history_does_not_block_public_start_finalize_or_restart() {
+    let temp = TempDir::new().unwrap();
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    // Each immutable specification fits its own write allowance. Their total
+    // legitimately exceeds it; retained history is not one output transaction.
+    let policy = json!({ "wal_checkpoint_bytes": 128 * 1024 });
+    let mut first = Daemon::start_with_policy(socket.clone(), &state_dir, policy.clone()).await;
+    let client = first.client();
+    let runtime = client.runtime_info().await.unwrap();
+    let mut originals = Vec::new();
+    for ordinal in 0..32 {
+        let body = format!("saved-{ordinal}");
+        let mut spec = shell_spec(&format!("printf '{body}'"));
+        spec.env
+            .insert("RETAINED_SPECIFICATION".to_owned(), "x".repeat(16 * 1024));
+        let key = CreateOperationKey::new(format!("retained-history-{ordinal}")).unwrap();
+        let run = timeout(
+            scaled(Duration::from_secs(10)),
+            client.start_with_operation_key(spec.clone(), key.clone()),
+        )
+        .await
+        .expect("unrelated retained specifications cannot strand Start")
+        .expect("each current specification fits its own durable admission");
+        let ended = wait_terminal(&client, run.id).await;
+        assert_eq!(ended.durable_output_bytes, Some(body.len() as u64));
+        assert_eq!(ended.first_available_byte, 0);
+        originals.push((run.id, spec, key, body));
+    }
+    assert_eq!(
+        client.runtime_info().await.unwrap().daemon_instance_id,
+        runtime.daemon_instance_id
+    );
+    // A further independent lifecycle exercises the already nonempty store.
+    let live = client
+        .start(shell_spec(
+            "stty -echo; printf ready; read line; printf '%s' \"$line\"",
+        ))
+        .await
+        .unwrap();
+    timeout(scaled(Duration::from_secs(5)), async {
+        while client.status(live.id).await.unwrap().latest_output_bytes < 5 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the original shell disables echo before input");
+    client
+        .input(live.id, b"continued\n".to_vec())
+        .await
+        .unwrap();
+    let ended = wait_terminal(&client, live.id).await;
+    assert_eq!(ended.durable_output_bytes, Some(14));
+    first.kill_and_wait();
+
+    let second = Daemon::start_with_policy(socket, &state_dir, policy).await;
+    let recovered = second.client();
+    assert_eq!(
+        recovered.runtime_info().await.unwrap().runtime_id,
+        runtime.runtime_id
+    );
+    assert_eq!(recovered.list().await.unwrap().len(), originals.len() + 1);
+    for (id, spec, key, body) in originals {
+        let same = recovered
+            .start_with_operation_key(spec.clone(), key)
+            .await
+            .unwrap();
+        assert_eq!(
+            same.id, id,
+            "cold creation-key recovery retains the original identity"
+        );
+        assert_eq!(same.spec, Some(spec));
+        assert!(matches!(same.state, RunState::Exited { code: 0, .. }));
+        assert_eq!(same.durable_output_bytes, Some(body.len() as u64));
+        let (_attachment, saved) = recovered.attach(id, 0).await.unwrap();
+        assert_eq!(saved.replay.first_available_byte, 0);
+        assert!(!saved.replay.truncated);
+        assert_eq!(replay_bytes(&saved.replay.chunks), body.as_bytes());
+    }
+    let (_attachment, saved) = recovered.attach(live.id, 0).await.unwrap();
+    assert_eq!(replay_bytes(&saved.replay.chunks), b"readycontinued");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one continuous real producer and independent lifecycle across actual restart"
+)]
+async fn global_retention_pressure_preserves_public_lifecycle_progress() {
+    let temp = TempDir::new().unwrap();
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let replay_allowance = 16 * 1024;
+    let policy = json!({ "wal_checkpoint_bytes": 128 * 1024,
+        "durable_replay_bytes": replay_allowance, "durable_run_output_bytes": replay_allowance });
+    let mut first = Daemon::start_with_policy(socket.clone(), &state_dir, policy.clone()).await;
+    let client = first.client();
+    let pattern = b"0123456789abcdef";
+    let producer = client
+        .start(shell_spec(
+            "stty -echo; while :; do printf 0123456789abcdef; done",
+        ))
+        .await
+        .unwrap();
+    timeout(scaled(Duration::from_secs(10)), async {
+        while client
+            .status(producer.id)
+            .await
+            .unwrap()
+            .durable_output_bytes
+            .unwrap_or(0)
+            <= replay_allowance * 4
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("real output crosses the shared retention allowance");
+    let before = client.status(producer.id).await.unwrap();
+    let interactive = timeout(
+        scaled(Duration::from_secs(5)),
+        client.start(shell_spec(
+            "stty -echo; printf ready; read line; printf '%s' \"$line\"",
+        )),
+    )
+    .await
+    .expect("continuous retained output cannot monopolize independent Start")
+    .unwrap();
+    timeout(scaled(Duration::from_secs(5)), async {
+        while client
+            .status(interactive.id)
+            .await
+            .unwrap()
+            .latest_output_bytes
+            < 5
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("independent real PTY output continues under retention pressure");
+    timeout(
+        scaled(Duration::from_secs(5)),
+        client.input(interactive.id, b"done\n".to_vec()),
+    )
+    .await
+    .expect("independent input remains available")
+    .unwrap();
+    let interactive_end =
+        wait_terminal_within(&client, interactive.id, Duration::from_secs(5)).await;
+    assert_eq!(interactive_end.durable_output_bytes, Some(9));
+    let after = client.status(producer.id).await.unwrap();
+    assert_eq!(after.pid, before.pid);
+    assert!(
+        after.durable_output_bytes > before.durable_output_bytes,
+        "the original output debt settles while the independent lifecycle progresses"
+    );
+    timeout(
+        scaled(Duration::from_secs(5)),
+        client.stop_once(producer.id),
+    )
+    .await
+    .expect("original Stop reaches terminal publication under retention pressure")
+    .unwrap();
+    let producer_end = wait_terminal(&client, producer.id).await;
+    assert_eq!(
+        producer_end.durable_output_bytes,
+        Some(producer_end.latest_output_bytes)
+    );
+    let (_, observed) = client.observe_storage(producer.id).await.unwrap();
+    let persistence = observed.persistence.unwrap();
+    assert!(persistence.first_failure.is_none());
+    assert!(!persistence.actor_stopped);
+    first.kill_and_wait();
+
+    let second = Daemon::start_with_policy(socket, &state_dir, policy).await;
+    let recovered = second.client();
+    let original = recovered.status(producer.id).await.unwrap();
+    assert_eq!(original.spec, producer.spec);
+    assert_eq!(
+        original.durable_output_bytes,
+        producer_end.durable_output_bytes
+    );
+    let (_attachment, saved) = recovered.attach(producer.id, 0).await.unwrap();
+    assert!(
+        saved.replay.truncated,
+        "actual global pressure must retire a confirmed prefix"
+    );
+    assert!(saved.replay.first_available_byte > 0);
+    let bytes = replay_bytes(&saved.replay.chunks);
+    assert_eq!(
+        bytes.len() as u64,
+        original.latest_output_bytes - saved.replay.first_available_byte
+    );
+    for (offset, byte) in bytes.iter().enumerate() {
+        let position = (saved.replay.first_available_byte + offset as u64) % pattern.len() as u64;
+        assert_eq!(
+            *byte,
+            pattern[usize::try_from(position).unwrap()],
+            "retained bytes preserve exact original order"
+        );
+    }
+    let (_attachment, reply) = recovered.attach(interactive.id, 0).await.unwrap();
+    assert_eq!(reply.run.durable_output_bytes, Some(9));
+    assert_eq!(
+        replay_bytes(&reply.replay.chunks),
+        b"readydone"[usize::try_from(reply.replay.first_available_byte).unwrap()..]
+    );
+    let later = recovered.start(shell_spec("printf later")).await.unwrap();
+    assert_eq!(
+        wait_terminal(&recovered, later.id)
+            .await
+            .durable_output_bytes,
+        Some(5)
+    );
+}
+
 impl Drop for Daemon {
     fn drop(&mut self) {
         self.kill_and_wait();
@@ -256,6 +482,8 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
         runtime.capabilities,
         BTreeMap::from([
             (RUNTIME_CAPABILITY_NATIVE_START.to_owned(), 1),
+            (RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION.to_owned(), 1),
+            (RUNTIME_CAPABILITY_STORAGE_OBSERVATION.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_INPUT.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP.to_owned(), 1),
             (RUNTIME_CAPABILITY_NATIVE_FORK_LEVEL_A.to_owned(), 1),
@@ -271,6 +499,190 @@ fn assert_persistent_runtime_identity(runtime: &RuntimeIdentity) {
             ),
         ])
     );
+}
+
+/// Construct fragmentation only in this stopped, test-owned historical Run.
+/// Its original public identity/spec remain canonical; startup must validate
+/// the same schema and exact replay geometry before any new public consumer.
+fn seed_fragmented_history(state_dir: &Path, id: RunId, extents: i64) {
+    let mut connection = rusqlite::Connection::open(state_dir.join("state.sqlite3")).unwrap();
+    let file: String = connection
+        .query_row(
+            "SELECT data_file FROM replay_chunks WHERE run_id=?1 LIMIT 1",
+            [id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let path = state_dir.join("replay").join(&file);
+    std::fs::write(&path, vec![b'x'; usize::try_from(extents).unwrap()]).unwrap();
+    std::fs::File::open(&path).unwrap().sync_all().unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "DELETE FROM replay_chunks WHERE run_id=?1",
+            [id.to_string()],
+        )
+        .unwrap();
+    {
+        let mut insert = transaction.prepare("INSERT INTO replay_chunks (run_id,start_byte,end_byte,data_file,data_offset,data_bytes) VALUES (?1,?2,?2+1,?3,?2,1)").unwrap();
+        for byte in 0..extents {
+            insert
+                .execute(rusqlite::params![id.to_string(), byte, &file])
+                .unwrap();
+        }
+    }
+    transaction.execute("UPDATE runs SET durable_output_bytes=?2,replay_bytes=?2,durable_first_available_byte=0 WHERE id=?1", rusqlite::params![id.to_string(), extents]).unwrap();
+    transaction.commit().unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one original fragmented history and public independent lifecycle across real restarts"
+)]
+async fn fragmented_retention_yields_to_public_independent_start_and_finalize() {
+    let temp = TempDir::new().unwrap();
+    let state_dir = temp.path().join("state");
+    let socket = temp.path().join("ctxmux.sock");
+    let extents = 121_733;
+    let payload = 70_013;
+    let policy = json!({"wal_checkpoint_bytes": 1024 * 1024,
+        "durable_replay_bytes": extents, "durable_run_output_bytes": extents});
+    let mut seed = Daemon::start_with_policy(socket.clone(), &state_dir, policy.clone()).await;
+    let history_key = CreateOperationKey::new("original-fragmented-history").unwrap();
+    let history = seed
+        .client()
+        .start_with_operation_key(shell_spec("printf x"), history_key.clone())
+        .await
+        .unwrap();
+    wait_terminal(&seed.client(), history.id).await;
+    seed.kill_and_wait();
+    seed_fragmented_history(&state_dir, history.id, extents);
+    let mut first = Daemon::start_with_policy(socket.clone(), &state_dir, policy.clone()).await;
+    let client = first.client();
+    let saved_history = client.status(history.id).await.unwrap();
+    assert_eq!(saved_history.spec, history.spec);
+    assert_eq!(
+        saved_history.durable_output_bytes,
+        Some(u64::try_from(extents).unwrap())
+    );
+    let producer_key = CreateOperationKey::new("fragmented-retirement-producer").unwrap();
+    let producer = client
+        .start_with_operation_key(
+            shell_spec(r"stty -echo; head -c 70013 /dev/zero | tr '\000' y; read end"),
+            producer_key.clone(),
+        )
+        .await
+        .unwrap();
+    timeout(scaled(Duration::from_secs(5)), async {
+        loop {
+            let info = client.status(producer.id).await.unwrap();
+            if info.latest_output_bytes == payload && info.durable_output_bytes == Some(0) {
+                break;
+            }
+            assert!(
+                info.durable_output_bytes.unwrap_or(0) < payload,
+                "fixture must observe original unsettled debt"
+            );
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("real output is offered before its fragmented retirement commits");
+    let interactive = timeout(
+        scaled(Duration::from_secs(5)),
+        client.start(shell_spec(
+            "stty -echo; printf ready; read line; printf '%s' \"$line\"",
+        )),
+    )
+    .await
+    .expect("page-boundary maintenance yields to independent public Start")
+    .unwrap();
+    timeout(scaled(Duration::from_secs(5)), async {
+        while client
+            .status(interactive.id)
+            .await
+            .unwrap()
+            .latest_output_bytes
+            < 5
+        {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("independent real PTY produces ready bytes");
+    client
+        .input(interactive.id, b"done\n".to_vec())
+        .await
+        .unwrap();
+    let interactive_end =
+        wait_terminal_within(&client, interactive.id, Duration::from_secs(5)).await;
+    assert_eq!(interactive_end.durable_output_bytes, Some(9));
+    assert!(
+        client
+            .status(producer.id)
+            .await
+            .unwrap()
+            .durable_output_bytes
+            .unwrap()
+            < payload,
+        "independent Start/input/Finalize must finish while original retirement is still unsettled"
+    );
+    client.input(producer.id, b"end\n".to_vec()).await.unwrap();
+    let producer_end = timeout(scaled(Duration::from_secs(10)), async {
+        loop {
+            let info = client.status(producer.id).await.unwrap();
+            if !info.state.is_running() {
+                break info;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let Ok(producer_end) = producer_end else {
+        panic!(
+            "original producer did not finalize: status={:?}; storage={:?}",
+            client.status(producer.id).await,
+            client.observe_storage(producer.id).await
+        );
+    };
+    assert_eq!(producer_end.durable_output_bytes, Some(payload));
+    let (_, storage) = client.observe_storage(producer.id).await.unwrap();
+    let persistence = storage.persistence.unwrap();
+    assert_eq!(persistence.queued_append_commands, 0);
+    assert!(persistence.first_failure.is_none());
+    assert!(!persistence.actor_stopped);
+    first.kill_and_wait();
+    let second = Daemon::start_with_policy(socket, &state_dir, policy).await;
+    let recovered = second.client();
+    let original = recovered
+        .start_with_operation_key(shell_spec("printf x"), history_key)
+        .await
+        .unwrap();
+    assert_eq!(original.id, history.id);
+    let producer_again = recovered
+        .start_with_operation_key(producer.spec.unwrap(), producer_key)
+        .await
+        .unwrap();
+    assert_eq!(producer_again.id, producer.id);
+    assert_eq!(producer_again.durable_output_bytes, Some(payload));
+    let (_, original_bytes) = recovered.attach(history.id, 0).await.unwrap();
+    assert!(original_bytes.replay.truncated);
+    assert_eq!(original_bytes.replay.first_available_byte, payload + 9);
+    assert_eq!(
+        replay_bytes(&original_bytes.replay.chunks),
+        vec![b'x'; usize::try_from(extents).unwrap() - usize::try_from(payload + 9).unwrap()]
+    );
+    let (_, producer_bytes) = recovered.attach(producer.id, 0).await.unwrap();
+    assert_eq!(
+        replay_bytes(&producer_bytes.replay.chunks),
+        vec![b'y'; usize::try_from(payload).unwrap()]
+    );
+    let (_, reply) = recovered.attach(interactive.id, 0).await.unwrap();
+    assert_eq!(replay_bytes(&reply.replay.chunks), b"readydone");
 }
 
 const ORDINARY_TERMINAL_WAIT: Duration = Duration::from_secs(10);
@@ -612,7 +1024,9 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
     let temp = TempDir::new().expect("create durable retention fixture directory");
     let state_dir = temp.path().join("state");
     let socket = temp.path().join("ctxmux.sock");
-    let mut first = Daemon::start(socket.clone(), &state_dir).await;
+    let policy =
+        json!({"run_output_bytes": RETENTION_BYTES, "durable_run_output_bytes": RETENTION_BYTES});
+    let mut first = Daemon::start_with_policy(socket.clone(), &state_dir, policy.clone()).await;
     let client = first.client();
     let run = client
         .start(shell_spec(
@@ -636,7 +1050,7 @@ async fn persisted_replay_prunes_to_the_exact_per_run_budget_and_recovers_the_ta
     assert!(live_bytes.iter().all(|byte| *byte == b'Z'));
     first.kill_and_wait();
 
-    let second = Daemon::start(socket, &state_dir).await;
+    let second = Daemon::start_with_policy(socket, &state_dir, policy).await;
     let (_, recovered_snapshot) = second
         .client()
         .attach(run.id, 0)

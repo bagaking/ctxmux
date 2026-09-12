@@ -36,7 +36,12 @@ pub fn reset_cache_io(connection: &Connection) -> Result<(), Error> {
     Ok(())
 }
 
-/// Read the cache footprint and the I/O counters used by staged admission.
+/// Release clean read pages, then measure the spill-disabled WAL charge.
+///
+/// `SQLite` keeps dirty pages pinned until transaction settlement. Shrinking its
+/// recyclable cache therefore removes unrelated read residency without writing
+/// or losing any pending page. The remaining cache still bounds every dirty
+/// page; write and spill counters are observed without resetting their proof.
 ///
 /// # Errors
 ///
@@ -44,6 +49,7 @@ pub fn reset_cache_io(connection: &Connection) -> Result<(), Error> {
 /// connection-status observations differ from the source-bound proof.
 pub fn cache_admission_snapshot(connection: &Connection) -> Result<CacheStatus, Error> {
     ensure_proven_version()?;
+    connection.release_memory()?;
     Ok(CacheStatus {
         used_bytes: read_status(connection, ffi::SQLITE_DBSTATUS_CACHE_USED, false)?,
         writes: read_status(connection, ffi::SQLITE_DBSTATUS_CACHE_WRITE, false)?,
@@ -122,6 +128,85 @@ mod tests {
     const WAL_HEADER_BYTES: u64 = 32;
     const CHECKPOINT_CEILING: u64 = 8 * 1024 * 1024;
     const TOTAL_CEILING: u64 = 16 * 1024 * 1024;
+
+    #[test]
+    fn clean_read_cache_is_released_before_dirty_wal_admission() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("clean-read.sqlite3");
+        let wal = directory.path().join("clean-read.sqlite3-wal");
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA page_size=4096; PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0; PRAGMA cache_spill=OFF;
+             PRAGMA cache_size=-4096;
+             CREATE TABLE facts(id INTEGER PRIMARY KEY, payload BLOB, tick INTEGER);
+             WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<256)
+             INSERT INTO facts SELECT id, zeroblob(16384), 0 FROM n;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        // Both outcomes keep the same legitimate read workload and tiny write.
+        // Read pages must not make either operation exceed this WAL allowance.
+        let allowance = 128 * 1024;
+        for commit in [false, true] {
+            connection.release_memory().unwrap();
+            reset_cache_io(&connection).unwrap();
+            let baseline = fs::metadata(&wal).unwrap().len();
+            connection
+                .execute_batch("BEGIN IMMEDIATE; UPDATE facts SET tick=tick+1 WHERE id=1;")
+                .unwrap();
+            let bytes: i64 = connection
+                .query_row(
+                    "SELECT sum(length(substr(payload, 1, 16384))) FROM facts",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                bytes,
+                256 * 16384,
+                "the clean-page workload must actually be read"
+            );
+            let before = super::read_status(
+                &connection,
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
+                false,
+            )
+            .unwrap();
+            assert!(
+                before > allowance,
+                "the read cache must exceed the small write allowance: {before}"
+            );
+            let snapshot = cache_admission_snapshot(&connection).unwrap();
+            assert_eq!((snapshot.writes, snapshot.spills), (0, 0));
+            assert_eq!(fs::metadata(&wal).unwrap().len(), baseline);
+            let charge = WAL_HEADER_BYTES + snapshot.used_bytes.div_ceil(PAGE_BYTES) * FRAME_BYTES;
+            assert!(
+                charge <= allowance,
+                "clean reads falsely charged the tiny mutation: {charge}"
+            );
+            connection
+                .execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            let delta = fs::metadata(&wal).unwrap().len() - baseline;
+            assert!(
+                delta <= charge,
+                "confirmed WAL growth {delta} exceeds admission {charge}"
+            );
+            if !commit {
+                assert_eq!(delta, 0);
+            }
+            let tick: i64 = connection
+                .query_row("SELECT tick FROM facts WHERE id=1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                tick,
+                i64::from(commit),
+                "clean-cache release cannot commit or discard the pending write"
+            );
+        }
+    }
 
     /// One staged spill-disabled transaction on a WAL that already carries
     /// `baseline_target` bytes of frames.

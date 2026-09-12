@@ -477,6 +477,8 @@ struct PersistenceInner {
     /// exists to avoid a send-side stall, not to absorb a burst. Kafka's
     /// KIP-291 sized its controller queue at 20 on the same reasoning.
     lifecycle: mpsc::SyncSender<Command>,
+    lifecycle_slots: Mutex<mpsc::Receiver<()>>,
+    lifecycle_release: mpsc::SyncSender<()>,
     /// Appends handed to `sender` that the actor has not yet dequeued.
     ///
     /// The channel itself cannot be asked how full it is, and finding out by
@@ -525,6 +527,7 @@ struct PersistenceTestHooks {
     maintenance_error_committed: AtomicBool,
     fail_next_start_before_commit: AtomicBool,
     finalize_barrier: Mutex<Option<FinalizeTestBarrier>>,
+    maintenance_turn_barrier: Mutex<Option<FinalizeTestBarrier>>,
     /// Stalls the actor inside an append so a test can hold it there while the
     /// queue fills, standing in for a slow fsync.
     append_barrier: Mutex<Option<FinalizeTestBarrier>>,
@@ -824,12 +827,52 @@ impl PersistenceInner {
     /// channel is full, and a full append channel means the actor is not parked
     /// in `recv()`, so it reaches the top of the loop on its own and finds the
     /// command there.
-    fn send_lifecycle(&self, command: Command) -> bool {
+    fn send_lifecycle(&self, mut command: Command) -> bool {
+        // A dequeued continuation still owns its original admission. Release
+        // only when the exact command settles or is rejected, never at a page
+        // boundary; otherwise draining the channel would create extra funding.
+        if mutex_lock(&self.lifecycle_slots).recv().is_err() {
+            return false;
+        }
+        *command.lifecycle_permit_mut() = Some(LifecyclePermit {
+            release: self.lifecycle_release.clone(),
+            wake: Arc::clone(&self.lifecycle_space),
+        });
         if self.lifecycle.send(command).is_err() {
             return false;
         }
         let _ = self.sender.try_send(Command::LifecycleWake);
         true
+    }
+    #[allow(
+        clippy::result_large_err,
+        reason = "bounded channel returns the same owned command and permit without allocating another queue item"
+    )]
+    fn try_send_lifecycle(&self, mut command: Command) -> Result<(), mpsc::TrySendError<Command>> {
+        if command.lifecycle_permit_mut().is_none() {
+            let slots = match self.lifecycle_slots.try_lock() {
+                Ok(slots) => slots,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(mpsc::TrySendError::Full(command));
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            };
+            match slots.try_recv() {
+                Ok(()) => {
+                    *command.lifecycle_permit_mut() = Some(LifecyclePermit {
+                        release: self.lifecycle_release.clone(),
+                        wake: Arc::clone(&self.lifecycle_space),
+                    });
+                }
+                Err(mpsc::TryRecvError::Empty) => return Err(mpsc::TrySendError::Full(command)),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return Err(mpsc::TrySendError::Disconnected(command));
+                }
+            }
+        }
+        // Keep the acquired permit in a Full return until the channel has room.
+        // Releasing it here would notify this same async waiter in a busy loop.
+        self.lifecycle.try_send(command)
     }
 }
 
@@ -985,6 +1028,7 @@ impl PersistentRun {
         // Async bounded admission: a stalled disk does not block a Tokio worker
         // or allocate one waiting OS thread per attachment.
         let mut command = Command::ReadReplay {
+            lifecycle_permit: None,
             id,
             after,
             through,
@@ -994,7 +1038,7 @@ impl PersistentRun {
             let room = self.persistence.inner.lifecycle_space.notified();
             tokio::pin!(room);
             room.as_mut().enable();
-            match self.persistence.inner.lifecycle.try_send(command) {
+            match self.persistence.inner.try_send_lifecycle(command) {
                 Ok(()) => break,
                 Err(mpsc::TrySendError::Full(returned)) => {
                     command = returned;
@@ -1255,6 +1299,7 @@ impl PersistentRun {
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
         if !self.persistence.inner.send_lifecycle(Command::Finalize {
+            lifecycle_permit: None,
             id,
             actual_pid,
             replay,
@@ -1449,6 +1494,13 @@ impl Persistence {
         let actor_lifecycle_space = Arc::clone(&lifecycle_space);
         let (command_tx, command_rx) = mpsc::sync_channel(PERSISTENCE_QUEUE_CAPACITY);
         let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel(LIFECYCLE_QUEUE_CAPACITY);
+        let (lifecycle_release, lifecycle_slots) = mpsc::sync_channel(LIFECYCLE_QUEUE_CAPACITY + 1);
+        // Original channel geometry: eight waiting commands plus one actor turn.
+        for _ in 0..=LIFECYCLE_QUEUE_CAPACITY {
+            lifecycle_release
+                .try_send(())
+                .expect("initial lifecycle admission slot");
+        }
         let (init_tx, init_rx) = mpsc::sync_channel(0);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let actor_queue_depth = Arc::clone(&queue_depth);
@@ -1508,6 +1560,8 @@ impl Persistence {
                 state_dir,
                 sender: command_tx,
                 lifecycle: lifecycle_tx,
+                lifecycle_slots: Mutex::new(lifecycle_slots),
+                lifecycle_release,
                 queue_depth,
                 capacity_blocked,
                 capacity_pressure,
@@ -1595,6 +1649,7 @@ impl Persistence {
         if !self
             .inner
             .send_lifecycle(Command::StageStart(Box::new(StageRequest {
+                lifecycle_permit: None,
                 prepared: Box::new(prepared),
                 candidates,
                 receipt: receipt.clone(),
@@ -1649,6 +1704,7 @@ impl Persistence {
         }
         let (reply_tx, reply_rx) = mpsc::sync_channel(0);
         if !self.inner.send_lifecycle(Command::RemoveTerminal {
+            lifecycle_permit: None,
             candidate,
             reply: reply_tx,
         }) {
@@ -2003,17 +2059,35 @@ enum CapacityTestAction {
     Release,
 }
 
+struct LifecyclePermit {
+    release: mpsc::SyncSender<()>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for LifecyclePermit {
+    fn drop(&mut self) {
+        // A settled or abandoned command returns precisely its original slot.
+        // Nonblocking drop also handles receiver teardown during shutdown.
+        let returned = self.release.try_send(());
+        self.wake.notify_waiters();
+        debug_assert!(!matches!(returned, Err(mpsc::TrySendError::Full(()))));
+    }
+}
+
 enum Command {
     #[cfg(test)]
     TestPrepareIdleCompaction {
+        lifecycle_permit: Option<LifecyclePermit>,
         reply: mpsc::SyncSender<Result<bool, PersistenceError>>,
     },
     #[cfg(test)]
     TestCapacityFunding {
+        lifecycle_permit: Option<LifecyclePermit>,
         action: CapacityTestAction,
         reply: mpsc::SyncSender<Result<(u64, u64, u64), PersistenceError>>,
     },
     ReadReplay {
+        lifecycle_permit: Option<LifecyclePermit>,
         id: RunId,
         after: u64,
         through: u64,
@@ -2027,6 +2101,7 @@ enum Command {
     },
     StageStart(Box<StageRequest>),
     RemoveTerminal {
+        lifecycle_permit: Option<LifecyclePermit>,
         candidate: PersistentCandidate,
         reply: mpsc::SyncSender<RemovalDisposition>,
     },
@@ -2036,6 +2111,7 @@ enum Command {
         durable_head: Arc<AtomicU64>,
     },
     Finalize {
+        lifecycle_permit: Option<LifecyclePermit>,
         id: RunId,
         actual_pid: u32,
         replay: OutputReplay,
@@ -2055,7 +2131,33 @@ enum Command {
     Shutdown,
 }
 
+impl Command {
+    fn lifecycle_permit_mut(&mut self) -> &mut Option<LifecyclePermit> {
+        match self {
+            Self::StageStart(request) => &mut request.lifecycle_permit,
+            Self::Finalize {
+                lifecycle_permit, ..
+            }
+            | Self::RemoveTerminal {
+                lifecycle_permit, ..
+            }
+            | Self::ReadReplay {
+                lifecycle_permit, ..
+            } => lifecycle_permit,
+            #[cfg(test)]
+            Self::TestPrepareIdleCompaction {
+                lifecycle_permit, ..
+            }
+            | Self::TestCapacityFunding {
+                lifecycle_permit, ..
+            } => lifecycle_permit,
+            _ => unreachable!("only lifecycle commands use lifecycle admission"),
+        }
+    }
+}
+
 struct StageRequest {
+    lifecycle_permit: Option<LifecyclePermit>,
     prepared: Box<PreparedPersistentStart>,
     candidates: Vec<PersistentCandidate>,
     receipt: StartReceipt,
@@ -2163,6 +2265,8 @@ fn actor_main(
 
     let mut pending = VecDeque::new();
     let mut pending_lifecycle = None;
+    let mut lifecycle_pending = VecDeque::new();
+    let mut lifecycle_yielded = false;
     let mut blocked_funding = None;
     let mut capacity_debt = false;
     let mut capacity_progress = false;
@@ -2180,163 +2284,164 @@ fn actor_main(
             }
             capacity_progress = false;
         }
-        // Lifecycle first, at every dequeue. This is the whole of R25: the
-        // command was never short of a slot (measured: 1 us blocked at
-        // admission), it was standing behind up to a full depth of appends
-        // (measured: 93.0 ms of a 94.9 ms `finalize` at eight chatty Runs).
-        //
-        // Checking here rather than reordering inside a batch is what keeps the
-        // R21 latch intact: lifecycle commands stay FIFO among themselves, so
-        // the lifecycle-vs-lifecycle edge that a `StageStart` must not cross —
-        // it may not overtake the `Finalize` of a candidate it evicts — is
-        // preserved by the single channel's own ordering.
-        let mut command = match (if capacity_debt && !capacity_blocked.load(Ordering::Acquire) {
-            pending.pop_front()
-        } else {
-            None
-        })
-        .or_else(|| {
-            pending_lifecycle
-                .take()
-                .or_else(|| lifecycle_rx.try_recv().ok())
-        }) {
-            Some(command) => command,
-            None => {
-                match if capacity_blocked.load(Ordering::Acquire) {
-                    pending
-                        .iter()
-                        .position(|queued| {
-                            matches!(
-                                queued,
-                                Command::Barrier { .. }
-                                    | Command::ReadReplay { .. }
-                                    | Command::LifecycleWake
-                                    | Command::Shutdown
-                            )
-                        })
-                        .and_then(|index| pending.remove(index))
-                } else {
-                    pending.pop_front()
-                } {
-                    Some(command) => command,
-                    None => match receiver.try_recv() {
-                        Ok(command) => command,
-                        Err(mpsc::TryRecvError::Disconnected) => return,
-                        Err(mpsc::TryRecvError::Empty) => {
-                            // Nothing is queued, so nothing is waiting on this thread.
-                            // Fold the WAL now, while the cost is nobody's latency, so
-                            // a later lifecycle verb inherits a small baseline rather
-                            // than an 8 MiB one. Measured on cn3 (Linux,
-                            // synchronous=FULL): folding costs ~1.6 ms/MiB, linear to
-                            // the 8 MiB admission ceiling (12.6 ms there), against
-                            // 0.016 ms for the same call on an already-zero WAL.
-                            //
-                            // This is an optimization only, and a weak one under load:
-                            // a chatty fleet's queue never empties, so this never fires
-                            // exactly when the WAL is largest. `fold_wal_below_ceiling`
-                            // is what actually bounds the baseline on the paths that
-                            // must prove a charge.
-                            //
-                            // Errors are deliberately dropped rather than latched: an
-                            // idle fold has no receipt to fail and no caller to inform,
-                            // and every path that depends on a bounded WAL still folds
-                            // and still proves its charge. A failure here costs only
-                            // the optimization.
-                            if mutex_lock(failure).is_none()
-                                && !capacity_blocked.load(Ordering::Acquire)
-                                && store.compaction_pending
-                            {
-                                let compacted = store
-                                    .compact_replay_step()
-                                    .map_err(|error| store.write_capacity_error(error));
-                                match compacted {
-                                    Ok(()) => {
-                                        if pending.is_empty()
-                                            && queue_depth.load(Ordering::Acquire) == 0
-                                        {
+        // A successful maintenance page yields one turn to independent lifecycle
+        // work. The original Finalize remains ahead of any command touching its
+        // Run, including a StageStart that names it as an eviction candidate.
+        // Disjoint work may progress without weakening that original dependency.
+        if let Some(command) = pending_lifecycle.take() {
+            lifecycle_pending.push_front(command);
+        }
+        let mut command =
+            match take_lifecycle_turn(&mut lifecycle_pending, lifecycle_rx, lifecycle_yielded)
+                .or_else(|| {
+                    if capacity_debt && !capacity_blocked.load(Ordering::Acquire) {
+                        pending.pop_front()
+                    } else {
+                        None
+                    }
+                }) {
+                Some(command) => command,
+                None => {
+                    match if capacity_blocked.load(Ordering::Acquire) {
+                        pending
+                            .iter()
+                            .position(|queued| {
+                                matches!(
+                                    queued,
+                                    Command::Barrier { .. }
+                                        | Command::ReadReplay { .. }
+                                        | Command::LifecycleWake
+                                        | Command::Shutdown
+                                )
+                            })
+                            .and_then(|index| pending.remove(index))
+                    } else {
+                        pending.pop_front()
+                    } {
+                        Some(command) => command,
+                        None => match receiver.try_recv() {
+                            Ok(command) => command,
+                            Err(mpsc::TryRecvError::Disconnected) => return,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                // Nothing is queued, so nothing is waiting on this thread.
+                                // Fold the WAL now, while the cost is nobody's latency, so
+                                // a later lifecycle verb inherits a small baseline rather
+                                // than an 8 MiB one. Measured on cn3 (Linux,
+                                // synchronous=FULL): folding costs ~1.6 ms/MiB, linear to
+                                // the 8 MiB admission ceiling (12.6 ms there), against
+                                // 0.016 ms for the same call on an already-zero WAL.
+                                //
+                                // This is an optimization only, and a weak one under load:
+                                // a chatty fleet's queue never empties, so this never fires
+                                // exactly when the WAL is largest. `fold_wal_below_ceiling`
+                                // is what actually bounds the baseline on the paths that
+                                // must prove a charge.
+                                //
+                                // Errors are deliberately dropped rather than latched: an
+                                // idle fold has no receipt to fail and no caller to inform,
+                                // and every path that depends on a bounded WAL still folds
+                                // and still proves its charge. A failure here costs only
+                                // the optimization.
+                                if mutex_lock(failure).is_none()
+                                    && !capacity_blocked.load(Ordering::Acquire)
+                                    && store.compaction_pending
+                                {
+                                    let compacted = store
+                                        .compact_replay_step()
+                                        .map_err(|error| store.write_capacity_error(error));
+                                    match compacted {
+                                        Ok(()) => {
+                                            if pending.is_empty()
+                                                && queue_depth.load(Ordering::Acquire) == 0
+                                            {
+                                                publish_capacity_pressure(
+                                                    capacity_pressure,
+                                                    false,
+                                                    output_wake,
+                                                );
+                                            }
+                                            continue;
+                                        }
+                                        Err(error) if error.is_capacity_debt() => {
+                                            pending_reason = error.to_string();
+                                            filesystem_debt = matches!(
+                                                error,
+                                                PersistenceError::FilesystemCapacity { .. }
+                                            );
+                                            external_capacity = matches!(
+                                                error,
+                                                PersistenceError::DatabaseCapacity { .. }
+                                                    | PersistenceError::FilesystemCapacity { .. }
+                                            );
+                                            blocked_funding = store
+                                                .capacity_funding(
+                                                    external_capacity,
+                                                    filesystem_debt,
+                                                )
+                                                .ok();
+                                            capacity_progress = false;
                                             publish_capacity_pressure(
                                                 capacity_pressure,
-                                                false,
+                                                true,
                                                 output_wake,
                                             );
+                                            capacity_blocked.store(true, Ordering::Release);
+                                            let _ =
+                                                crate::diagnostics::record(format_args!("{error}"));
                                         }
-                                        continue;
-                                    }
-                                    Err(error) if error.is_capacity_debt() => {
-                                        pending_reason = error.to_string();
-                                        filesystem_debt = matches!(
-                                            error,
-                                            PersistenceError::FilesystemCapacity { .. }
-                                        );
-                                        external_capacity = matches!(
-                                            error,
-                                            PersistenceError::DatabaseCapacity { .. }
-                                                | PersistenceError::FilesystemCapacity { .. }
-                                        );
-                                        blocked_funding = store
-                                            .capacity_funding(external_capacity, filesystem_debt)
-                                            .ok();
-                                        capacity_progress = false;
-                                        publish_capacity_pressure(
-                                            capacity_pressure,
-                                            true,
-                                            output_wake,
-                                        );
-                                        capacity_blocked.store(true, Ordering::Release);
-                                        let _ = crate::diagnostics::record(format_args!("{error}"));
-                                    }
-                                    Err(error) if error.is_transient_storage() => {
-                                        if wait_for_shutdown(shutdown, STORAGE_RETRY_INTERVAL) {
-                                            return;
+                                        Err(error) if error.is_transient_storage() => {
+                                            if wait_for_shutdown(shutdown, STORAGE_RETRY_INTERVAL) {
+                                                return;
+                                            }
+                                            continue;
                                         }
-                                        continue;
+                                        Err(error) => remember_failure(failure, &error),
                                     }
-                                    Err(error) => remember_failure(failure, &error),
+                                }
+                                if mutex_lock(failure).is_none()
+                                    && !capacity_blocked.load(Ordering::Acquire)
+                                {
+                                    idle_fold_wal(&store, shutdown);
+                                }
+                                // Block on the append channel alone. A lifecycle
+                                // sender that arrives while this thread is parked
+                                // pushes a `LifecycleWake` here to break it out —
+                                // and if that push is refused because the append
+                                // channel is full, the thread is not parked, so the
+                                // loop's own next turn finds the command. Polling
+                                // both channels instead would cost idle wakeups,
+                                // which this daemon spent a round driving to zero.
+                                let next = if capacity_blocked.load(Ordering::Acquire)
+                                    && external_capacity
+                                    && (filesystem_debt
+                                        || blocked_funding.as_ref().is_some_and(
+                                            |(pages, free, limit, _)| pages < limit || *free > 0,
+                                        )) {
+                                    // A filesystem can regain space without a
+                                    // client command. Observe that funding only;
+                                    // unchanged capacity never reruns a mutation.
+                                    match receiver.recv_timeout(STORAGE_RETRY_INTERVAL) {
+                                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                                            Ok(Command::LifecycleWake)
+                                        }
+                                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                            Err(mpsc::RecvError)
+                                        }
+                                        Ok(command) => Ok(command),
+                                    }
+                                } else {
+                                    receiver.recv()
+                                };
+                                match next {
+                                    Ok(command) => command,
+                                    Err(_) => return,
                                 }
                             }
-                            if mutex_lock(failure).is_none()
-                                && !capacity_blocked.load(Ordering::Acquire)
-                            {
-                                idle_fold_wal(&store, shutdown);
-                            }
-                            // Block on the append channel alone. A lifecycle
-                            // sender that arrives while this thread is parked
-                            // pushes a `LifecycleWake` here to break it out —
-                            // and if that push is refused because the append
-                            // channel is full, the thread is not parked, so the
-                            // loop's own next turn finds the command. Polling
-                            // both channels instead would cost idle wakeups,
-                            // which this daemon spent a round driving to zero.
-                            let next = if capacity_blocked.load(Ordering::Acquire)
-                                && external_capacity
-                                && (filesystem_debt
-                                    || blocked_funding.as_ref().is_some_and(
-                                        |(pages, free, limit, _)| pages < limit || *free > 0,
-                                    )) {
-                                // A filesystem can regain space without a
-                                // client command. Observe that funding only;
-                                // unchanged capacity never reruns a mutation.
-                                match receiver.recv_timeout(STORAGE_RETRY_INTERVAL) {
-                                    Err(mpsc::RecvTimeoutError::Timeout) => {
-                                        Ok(Command::LifecycleWake)
-                                    }
-                                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                                        Err(mpsc::RecvError)
-                                    }
-                                    Ok(command) => Ok(command),
-                                }
-                            } else {
-                                receiver.recv()
-                            };
-                            match next {
-                                Ok(command) => command,
-                                Err(_) => return,
-                            }
-                        }
-                    },
+                        },
+                    }
                 }
-            }
-        };
+            };
+        lifecycle_yielded = false;
         if capacity_blocked.load(Ordering::Acquire) {
             if matches!(command, Command::Finalize { .. }) {
                 // Finalize may arrive on the priority lane while its accepted
@@ -2360,6 +2465,15 @@ fn actor_main(
                 || matches!(&command, Command::Finalize { id, .. }
                     if pending.iter().any(|queued| matches!(queued, Command::Append { id: queued_id, .. } if queued_id == id)))
             {
+                if let Command::Finalize {
+                    lifecycle_permit, ..
+                } = &mut command
+                {
+                    // Its prefix is already original Run-owned capacity debt.
+                    // The waiting transport slot must remain available to
+                    // reads and exact removals that can fund that same debt.
+                    lifecycle_permit.take();
+                }
                 pending.push_back(command);
                 continue;
             }
@@ -2393,7 +2507,10 @@ fn actor_main(
         lifecycle_space.notify_waiters();
         match command {
             #[cfg(test)]
-            Command::TestPrepareIdleCompaction { reply } => {
+            Command::TestPrepareIdleCompaction {
+                lifecycle_permit: _lifecycle_permit,
+                reply,
+            } => {
                 // Prepare real unfinished generation migration on this actor;
                 // the controlled write failure starts only on its idle step.
                 store.force_compaction = true;
@@ -2406,7 +2523,11 @@ fn actor_main(
                 let _ = reply.send(result);
             }
             #[cfg(test)]
-            Command::TestCapacityFunding { action, reply } => {
+            Command::TestCapacityFunding {
+                lifecycle_permit: _lifecycle_permit,
+                action,
+                reply,
+            } => {
                 if matches!(action, CapacityTestAction::Release) {
                     test_hooks
                         .force_append_capacity
@@ -2415,6 +2536,7 @@ fn actor_main(
                 let _ = reply.send(controlled_capacity_funding(&store, action));
             }
             Command::ReadReplay {
+                lifecycle_permit: _lifecycle_permit,
                 id,
                 after,
                 through,
@@ -2475,7 +2597,11 @@ fn actor_main(
                     }
                 }
             }
-            Command::RemoveTerminal { candidate, reply } => {
+            Command::RemoveTerminal {
+                lifecycle_permit: _lifecycle_permit,
+                candidate,
+                reply,
+            } => {
                 // Fail closed before touching the store, mirroring StageStart: a
                 // latched fatal failure rejects the removal without database work.
                 let disposition = if let Some(message) = mutex_lock(failure).clone() {
@@ -2524,6 +2650,9 @@ fn actor_main(
                     // draining that queue cannot turn into a timed wait with a
                     // lifecycle receipt already pending. Preserve this command
                     // ahead of newer lifecycle commands on the next actor turn.
+                    if !lifecycle_pending.is_empty() {
+                        break;
+                    }
                     if pending_lifecycle.is_none()
                         && let Ok(command) = lifecycle_rx.try_recv()
                     {
@@ -2635,6 +2764,27 @@ fn actor_main(
                     let result = result
                         .map(|result| result.map_err(|error| store.write_capacity_error(error)));
                     match result {
+                        Some(Ok(false)) => {
+                            // One admitted reclamation transaction advanced the
+                            // original debt. Keep its credits and yield the
+                            // actor before another page transaction, allowing
+                            // independent lifecycle work to make progress.
+                            if !held_credits {
+                                queue_depth.fetch_add(batch.len(), Ordering::AcqRel);
+                            }
+                            capacity_debt = true;
+                            for (id, replay, durable_head) in batch.into_iter().rev() {
+                                pending.push_front(Command::Append {
+                                    id,
+                                    replay,
+                                    durable_head,
+                                });
+                            }
+                            lifecycle_yielded = pending_lifecycle.is_some();
+                            #[cfg(test)]
+                            pause_after_maintenance_turn(test_hooks);
+                            continue;
+                        }
                         Some(Err(PersistenceError::ActorStopped))
                             if shutdown.load(Ordering::Acquire) =>
                         {
@@ -2672,7 +2822,7 @@ fn actor_main(
                             continue;
                         }
                         Some(Err(error)) => remember_failure(failure, &error),
-                        Some(Ok(())) => {
+                        Some(Ok(true)) => {
                             capacity_progress = true;
                         }
                         None => return,
@@ -2683,6 +2833,7 @@ fn actor_main(
                 }
             }
             Command::Finalize {
+                lifecycle_permit,
                 id,
                 actual_pid,
                 replay,
@@ -2728,6 +2879,24 @@ fn actor_main(
                 ) {
                     return;
                 }
+                if matches!(&result, Ok(false)) {
+                    lifecycle_yielded = true;
+                    let continuation = Command::Finalize {
+                        lifecycle_permit,
+                        id,
+                        actual_pid,
+                        replay,
+                        state,
+                        source_gap_after_byte,
+                        durable_head,
+                        metadata_bytes,
+                        reply,
+                    };
+                    requeue_lifecycle_continuation(&mut lifecycle_pending, continuation);
+                    #[cfg(test)]
+                    pause_after_maintenance_turn(test_hooks);
+                    continue;
+                }
                 if let Err(error) = &result {
                     if error.is_capacity_debt() {
                         let _ = crate::diagnostics::record(format_args!("{error}"));
@@ -2746,7 +2915,14 @@ fn actor_main(
                         publish_capacity_pressure(capacity_pressure, true, output_wake);
                         capacity_blocked.store(true, Ordering::Release);
                         capacity_debt = true;
+                        // Proven capacity shortage moves this accepted terminal
+                        // settlement back to its existing Run debt owner. Its
+                        // original bytes/metadata/reply remain owned; only the
+                        // bounded waiting-message admission is returned so
+                        // in-band reads/removals can recover the funding.
+                        drop(lifecycle_permit);
                         pending.push_back(Command::Finalize {
+                            lifecycle_permit: None,
                             id,
                             actual_pid,
                             replay,
@@ -2763,7 +2939,7 @@ fn actor_main(
                     capacity_blocked.store(false, Ordering::Release);
                     capacity_progress = true;
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|_| ()));
             }
             Command::TerminalCheckpoint {
                 id,
@@ -2828,6 +3004,77 @@ fn actor_main(
     }
 }
 
+/// Preserve lifecycle dependencies while granting one independent turn after a
+/// committed maintenance page. The bounded channel remains the admission owner;
+/// this deque retains commands already accepted while their original work yields.
+fn take_lifecycle_turn(
+    pending: &mut VecDeque<Command>,
+    receiver: &mpsc::Receiver<Command>,
+    yielded: bool,
+) -> Option<Command> {
+    while pending.len() < LIFECYCLE_QUEUE_CAPACITY
+        && let Ok(command) = receiver.try_recv()
+    {
+        pending.push_back(command);
+    }
+    let next = if yielded {
+        (1..pending.len())
+            .find(|index| {
+                pending
+                    .iter()
+                    .take(*index)
+                    .all(|earlier| !lifecycle_conflicts(earlier, &pending[*index]))
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    pending.remove(next)
+}
+
+fn requeue_lifecycle_continuation(pending: &mut VecDeque<Command>, command: Command) {
+    // Move behind independent accepted work, but never across an original
+    // target/candidate dependency. Multiple long continuations therefore take
+    // round-robin page turns instead of bouncing forever ahead of a short Run.
+    let before = pending
+        .iter()
+        .position(|later| lifecycle_conflicts(&command, later))
+        .unwrap_or(pending.len());
+    pending.insert(before, command);
+}
+
+fn lifecycle_conflicts(earlier: &Command, later: &Command) -> bool {
+    match earlier {
+        Command::StageStart(request) => {
+            lifecycle_touches(later, request.prepared.id)
+                || request
+                    .candidates
+                    .iter()
+                    .any(|candidate| lifecycle_touches(later, candidate.id))
+        }
+        Command::RemoveTerminal { candidate, .. } => lifecycle_touches(later, candidate.id),
+        Command::Finalize { id, .. } => lifecycle_touches(later, *id),
+        _ => false,
+    }
+}
+
+fn lifecycle_touches(command: &Command, id: RunId) -> bool {
+    match command {
+        Command::StageStart(request) => {
+            request.prepared.id == id
+                || request
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.id == id)
+        }
+        Command::RemoveTerminal { candidate, .. } => candidate.id == id,
+        Command::Finalize { id: target, .. } | Command::TerminalCheckpoint { id: target, .. } => {
+            *target == id
+        }
+        _ => false,
+    }
+}
+
 fn publish_capacity_pressure(
     blocked: &AtomicBool,
     value: bool,
@@ -2862,10 +3109,10 @@ fn take_required_append(
     None
 }
 
-fn retry_transient_storage(
+fn retry_transient_storage<T>(
     shutdown: &AtomicBool,
-    mut mutation: impl FnMut() -> Result<(), PersistenceError>,
-) -> Option<Result<(), PersistenceError>> {
+    mut mutation: impl FnMut() -> Result<T, PersistenceError>,
+) -> Option<Result<T, PersistenceError>> {
     let mut storage_retried = false;
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -2981,6 +3228,15 @@ fn wait_for_shutdown(shutdown: &AtomicBool, duration: Duration) -> bool {
         remaining = remaining.saturating_sub(interval);
     }
     shutdown.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+fn pause_after_maintenance_turn(test_hooks: &PersistenceTestHooks) {
+    let barrier = mutex_lock(&test_hooks.maintenance_turn_barrier).take();
+    if let Some(barrier) = barrier {
+        let _ = barrier.reached.send(());
+        let _ = barrier.release.recv();
+    }
 }
 
 #[cfg(test)]
@@ -3216,6 +3472,9 @@ struct StateStore {
     compaction_sources_pending: VecDeque<String>,
     compaction_cursor: i64,
     replay_cleanup_needed: bool,
+    /// Scheduling hints for exact accepted output debt, never durable facts.
+    /// Each resumed turn rechecks the original prefix against canonical rows.
+    reclaiming_output: HashSet<RunId>,
     // Fields drop in declaration order: close SQLite before releasing ownership.
     _state_lock: StateLockGuard,
     #[cfg(test)]
@@ -3429,7 +3688,7 @@ impl StateStore {
                 let retained: i64 = self
                     .connection
                     .query_row(
-                        "SELECT coalesce(sum(replay_bytes), 0) FROM runs",
+                        "SELECT replay_bytes FROM temp.persistence_accounting WHERE singleton=1",
                         [],
                         |row| row.get(0),
                     )
@@ -3602,6 +3861,7 @@ impl StateStore {
         }
         validate_quick_check(&connection)?;
         validate_application_state(&connection, &replay_dir, &replay_file)?;
+        initialize_transaction_accounting(&connection)?;
 
         let compaction_pending = connection
             .query_row(
@@ -3628,6 +3888,7 @@ impl StateStore {
             compaction_sources_pending: VecDeque::new(),
             compaction_cursor: i64::MIN,
             replay_cleanup_needed: false,
+            reclaiming_output: HashSet::new(),
             _state_lock: state_lock,
             #[cfg(test)]
             test_hooks,
@@ -4339,7 +4600,7 @@ impl StateStore {
             return self.rollback_before_ready(
                 receipt,
                 admission_failure(format!(
-                    "persistent exact replacement exceeds or cannot prove its 8 MiB WAL charge: \
+                    "persistent exact replacement exceeds or cannot prove its configured WAL charge: \
                      cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
                     snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes, wal_baseline
                 )),
@@ -4652,7 +4913,7 @@ impl StateStore {
         {
             return self.rollback_removal(
                 admission_failure(format!(
-                    "persistent removal exceeds or cannot prove its 8 MiB WAL charge: \
+                    "persistent removal exceeds or cannot prove its configured WAL charge: \
                      cache={} bytes, writes={}, spills={}, wal={} bytes, baseline={} bytes",
                     snapshot.used_bytes, snapshot.writes, snapshot.spills, wal_bytes, wal_baseline
                 ))
@@ -4836,7 +5097,7 @@ impl StateStore {
         let (records, metadata): (i64, i64) = self
             .connection
             .query_row(
-                "SELECT count(*), coalesce(sum(metadata_bytes), 0) FROM runs",
+                "SELECT records, metadata_bytes FROM temp.persistence_accounting WHERE singleton=1",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -5250,14 +5511,18 @@ impl StateStore {
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
     ) -> Result<(), PersistenceError> {
-        self.append_batch_with_shutdown(batch, None)
+        let mut remaining = batch.to_vec();
+        while !self.append_batch_with_shutdown(&remaining, None)? {
+            remaining = self.remaining_append_batch(&remaining)?;
+        }
+        Ok(())
     }
 
     fn append_batch_with_shutdown(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
         shutdown: Option<&AtomicBool>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         let mut transaction_batch = Vec::new();
         let mut transaction_payload = 0_usize;
         let mut expected_heads = HashMap::new();
@@ -5271,6 +5536,7 @@ impl StateStore {
                 .and_then(|mut statement| statement.exists([id.to_string()]))
                 .map_err(PersistenceError::database)?;
             if !exists {
+                self.reclaiming_output.remove(id);
                 continue;
             }
             let groups = split_chunks(&replay.chunks)?;
@@ -5325,17 +5591,21 @@ impl StateStore {
                         > MAX_TRANSACTION_PAYLOAD_BYTES
                         || !is_fresh_contiguous)
                 {
-                    self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
+                    if !self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)? {
+                        return Ok(false);
+                    }
                     transaction_batch.clear();
                     transaction_payload = 0;
                     expected_heads.clear();
                 }
                 if !is_fresh_contiguous {
-                    self.append_transaction_with_shutdown(
+                    if !self.append_transaction_with_shutdown(
                         &[(*id, partial, Arc::clone(durable_head))],
                         None,
                         shutdown,
-                    )?;
+                    )? {
+                        return Ok(false);
+                    }
                     continue;
                 }
                 transaction_payload = transaction_payload.saturating_add(partial_payload);
@@ -5343,10 +5613,12 @@ impl StateStore {
                 transaction_batch.push((*id, partial, Arc::clone(durable_head)));
             }
         }
-        if !transaction_batch.is_empty() {
-            self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?;
+        if !transaction_batch.is_empty()
+            && !self.append_transaction_with_shutdown(&transaction_batch, None, shutdown)?
+        {
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5360,7 +5632,7 @@ impl StateStore {
         metadata_owner: &Arc<AtomicU64>,
         source_gap_after_byte: Option<u64>,
         shutdown: Option<&AtomicBool>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         if state.is_running() {
             return Err(PersistenceError::Mutation(
                 "cannot persist a running terminal transition".to_owned(),
@@ -5387,11 +5659,13 @@ impl StateStore {
                 latest_output_bytes: chunk_group.last().map_or(0, |chunk| chunk.end_byte),
                 truncated: replay.truncated,
             };
-            self.append_transaction_with_shutdown(
+            if !self.append_transaction_with_shutdown(
                 &[(id, prefix_replay, Arc::clone(durable_head))],
                 None,
                 shutdown,
-            )?;
+            )? {
+                return Ok(false);
+            }
         }
         let terminal_replay = OutputReplay {
             chunks: final_chunks,
@@ -5459,29 +5733,49 @@ impl StateStore {
             .collect()
     }
 
-    #[allow(clippy::too_many_lines)]
     fn append_transaction_with_shutdown(
         &mut self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
         terminal: Option<TerminalSettlement<'_>>,
         shutdown: Option<&AtomicBool>,
-    ) -> Result<(), PersistenceError> {
-        let mut retry_batch = None;
-        loop {
-            let current = retry_batch.as_deref().unwrap_or(batch);
-            let result = self.append_transaction_once(current, terminal, shutdown);
-            if let Err(error) = &result
-                && self.reclaim_database_pages(error)?
-            {
-                // Adaptive reduction may have committed an original prefix.
-                // Retry its remaining debt, not bytes retention already retired.
-                retry_batch = Some(self.remaining_append_batch(batch)?);
-                continue;
+    ) -> Result<bool, PersistenceError> {
+        let grouped = coalesce_batch(batch);
+        if let [(id, replay, _)] = grouped.as_slice()
+            && self.reclaiming_output.contains(id)
+        {
+            if self.reclaim_output_prefix(*id, replay)? {
+                return Ok(false);
             }
-            return result;
+            self.reclaiming_output.remove(id);
+        }
+        let result = self.append_transaction_once(batch, terminal, shutdown);
+        if let Err(error) = &result
+            && self.reclaim_database_pages(error)?
+        {
+            // Real confirmed-prefix retirement funds the same original debt.
+            // Return to the actor before another page; its resumed command
+            // re-derives missing bytes from the canonical committed head/floor.
+            return Ok(false);
+        }
+        match result {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                if let [(id, replay, _)] = grouped.as_slice()
+                    && self.reclaim_output_prefix(*id, replay)?
+                {
+                    self.reclaiming_output.insert(*id);
+                    return Ok(false);
+                }
+                // Payload reduction stays logarithmic in funded work. A
+                // successful maintenance page propagates false, never another
+                // recursive retry of the original fragmented prefix.
+                self.reduce_output_transaction(batch, terminal, shutdown)
+            }
+            Err(error) => Err(error),
         }
     }
 
+    #[cfg(test)]
     fn remaining_append_batch(
         &self,
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
@@ -5502,7 +5796,7 @@ impl StateStore {
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
         terminal: Option<TerminalSettlement<'_>>,
         shutdown: Option<&AtomicBool>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         let payload = batch
             .iter()
             .map(|(_, replay, _)| replay_payload(replay))
@@ -5557,7 +5851,11 @@ impl StateStore {
             },
             |value| MaintenanceWitness::Run(value.0),
         );
-        let committed = self.commit_maintenance_batch(witness, |transaction| {
+        let row_funding =
+            usize::try_from(self.admission_limits.resources.wal_checkpoint_bytes / WAL_FRAME_BYTES)
+                .expect("validated WAL row funding fits usize")
+                .max(1);
+        let committed = self.commit_maintenance_batch_with_admission(witness, |transaction| {
             let mut cursor_updates = HashMap::new();
             for (id, replay, _) in coalesce_batch(batch) {
                 let _ = append_replay_with_storage(
@@ -5570,7 +5868,16 @@ impl StateStore {
                 let head = read_run_head(transaction, id)?;
                 cursor_updates.insert(id, head);
             }
-            let _ = prune_global_replay_to(transaction, effective.durable_replay_bytes)?;
+            // This first probe must obey the same page-turn work funding as
+            // continuation: a global byte quota can cover arbitrarily many
+            // tiny historical extents. Never walk them all before admission.
+            if !prune_global_replay_with_row_funding(
+                transaction,
+                effective.durable_replay_bytes,
+                row_funding,
+            )? {
+                return Ok(false);
+            }
             let mut terminal_metadata = None;
             if let Some((id, actual_pid, state, metadata_owner, source_gap)) = terminal {
                 let (kind, mut state_json) = encoded_state(state)?;
@@ -5638,7 +5945,7 @@ impl StateStore {
             // its coordinates or watermarks until the shared file is synced.
             writer.sync()?;
             settlement = Some((cursor_updates, terminal_metadata));
-            Ok(())
+            Ok(true)
         });
         // Release the file before adaptive rollback reduction recurses. Tail
         // disposition belongs to the transaction result below, never Drop.
@@ -5647,7 +5954,7 @@ impl StateStore {
             Ok(true) => {}
             Ok(false) => {
                 truncate_replay_tail(&path, before)?;
-                return self.reduce_output_transaction(batch, terminal, shutdown);
+                return Ok(false);
             }
             Err(error) => {
                 // Unknown COMMIT/rollback leaves every possibly indexed byte
@@ -5673,7 +5980,7 @@ impl StateStore {
         if let Some((metadata_owner, metadata_bytes)) = terminal_metadata {
             metadata_owner.store(metadata_bytes, Ordering::Release);
         }
-        self.finish_transaction()
+        self.finish_transaction().map(|()| true)
     }
 
     fn reduce_output_transaction(
@@ -5681,10 +5988,12 @@ impl StateStore {
         batch: &[(RunId, OutputReplay, Arc<AtomicU64>)],
         terminal: Option<TerminalSettlement<'_>>,
         shutdown: Option<&AtomicBool>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         if batch.len() > 1 {
             let middle = batch.len() / 2;
-            self.append_transaction_with_shutdown(&batch[..middle], None, shutdown)?;
+            if !self.append_transaction_with_shutdown(&batch[..middle], None, shutdown)? {
+                return Ok(false);
+            }
             return self.append_transaction_with_shutdown(&batch[middle..], terminal, shutdown);
         }
         let Some((id, replay, durable)) = batch.first() else {
@@ -5700,11 +6009,13 @@ impl StateStore {
                 latest_output_bytes: chunks[middle - 1].end_byte,
                 ..replay.clone()
             };
-            self.append_transaction_with_shutdown(
+            if !self.append_transaction_with_shutdown(
                 &[(*id, prefix, Arc::clone(durable))],
                 None,
                 shutdown,
-            )?;
+            )? {
+                return Ok(false);
+            }
             let tail = OutputReplay {
                 chunks: chunks[middle..].to_vec(),
                 ..replay.clone()
@@ -5714,12 +6025,6 @@ impl StateStore {
                 terminal,
                 shutdown,
             );
-        }
-        // Splitting payload cannot shrink a large old-index deletion. Reclaim
-        // only the prefix this accepted output would evict, in admitted batches,
-        // then retry the original byte-complete logical operation.
-        if self.reclaim_output_prefix(*id, replay)? {
-            return self.append_transaction_with_shutdown(batch, terminal, shutdown);
         }
         if let Some(chunk) = chunks.first().filter(|chunk| chunk.data.len() > 1) {
             let middle = chunk.data.len() / 2;
@@ -5733,11 +6038,13 @@ impl StateStore {
                 latest_output_bytes: split_byte,
                 ..replay.clone()
             };
-            self.append_transaction_with_shutdown(
+            if !self.append_transaction_with_shutdown(
                 &[(*id, prefix, Arc::clone(durable))],
                 None,
                 shutdown,
-            )?;
+            )? {
+                return Ok(false);
+            }
             let tail = OutputReplay {
                 chunks: vec![OutputChunk {
                     start_byte: split_byte,
@@ -5783,7 +6090,7 @@ impl StateStore {
         let global: i64 = self
             .connection
             .query_row(
-                "SELECT coalesce(sum(replay_bytes), 0) FROM runs",
+                "SELECT replay_bytes FROM temp.persistence_accounting WHERE singleton=1",
                 [],
                 |row| row.get(0),
             )
@@ -5863,6 +6170,7 @@ impl StateStore {
             if self.commit_maintenance_batch(
                 MaintenanceWitness::ReplayChunk(candidates[0].0),
                 |connection| {
+                    let mut retired = HashMap::new();
                     for (ordinal, run_id, bytes, shed) in &candidates {
                         if shed == bytes {
                             connection
@@ -5877,7 +6185,10 @@ impl StateStore {
                                 )
                                 .map_err(PersistenceError::database)?;
                         }
-                        shed_run_bytes(connection, run_id, *shed)?;
+                        *retired.entry(run_id).or_insert(0_i64) += *shed;
+                    }
+                    for (run_id, shed) in retired {
+                        shed_run_bytes(connection, run_id, shed)?;
                     }
                     Ok(())
                 },
@@ -6106,6 +6417,16 @@ impl StateStore {
         witness: MaintenanceWitness,
         apply: impl FnOnce(&Connection) -> Result<(), PersistenceError>,
     ) -> Result<bool, PersistenceError> {
+        self.commit_maintenance_batch_with_admission(witness, |connection| {
+            apply(connection).map(|()| true)
+        })
+    }
+
+    fn commit_maintenance_batch_with_admission(
+        &mut self,
+        witness: MaintenanceWitness,
+        apply: impl FnOnce(&Connection) -> Result<bool, PersistenceError>,
+    ) -> Result<bool, PersistenceError> {
         let baseline = self.fold_wal_below_ceiling(None)?;
         self.connection
             .release_memory()
@@ -6126,7 +6447,7 @@ impl StateStore {
         &self,
         baseline: u64,
         witness: MaintenanceWitness,
-        apply: impl FnOnce(&Connection) -> Result<(), PersistenceError>,
+        apply: impl FnOnce(&Connection) -> Result<bool, PersistenceError>,
     ) -> Result<bool, PersistenceError> {
         ctxmux_sqlite_status::reset_cache_io(&self.connection)
             .map_err(PersistenceError::database)?;
@@ -6135,7 +6456,7 @@ impl StateStore {
             .map_err(PersistenceError::database)?;
         let proof = (|| {
             let old = witness.read(&self.connection)?;
-            apply(&self.connection)?;
+            let applied = apply(&self.connection)?;
             let new = witness.read(&self.connection)?;
             let snapshot = ctxmux_sqlite_status::cache_admission_snapshot(&self.connection)
                 .map_err(PersistenceError::database)?;
@@ -6145,7 +6466,13 @@ impl StateStore {
                     "maintenance changed the WAL before admission".to_owned(),
                 ));
             }
-            Ok((wal_charge_for_cache(snapshot.used_bytes), old, new))
+            Ok((
+                applied
+                    .then(|| wal_charge_for_cache(snapshot.used_bytes))
+                    .flatten(),
+                old,
+                new,
+            ))
         })();
         let (charge, old, new) = match proof {
             Ok(charge) => charge,
@@ -6754,6 +7081,44 @@ fn validate_state_file(path: &Path) -> Result<(), PersistenceError> {
         });
     }
     Ok(())
+}
+
+/// This connection-local projection is owned by `SQLite` transactions, not a
+/// second durable registry. Every canonical mutation and its rollback changes
+/// the totals through the same engine. Cold/exec startup reconstructs them only
+/// after the saved rows have passed format and application validation.
+fn initialize_transaction_accounting(connection: &Connection) -> Result<(), PersistenceError> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE persistence_accounting (
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+            records INTEGER NOT NULL CHECK(typeof(records)='integer' AND records>=0),
+            metadata_bytes INTEGER NOT NULL CHECK(typeof(metadata_bytes)='integer' AND metadata_bytes>=0),
+            replay_bytes INTEGER NOT NULL CHECK(typeof(replay_bytes)='integer' AND replay_bytes>=0),
+            replay_runs INTEGER NOT NULL CHECK(typeof(replay_runs)='integer' AND replay_runs>=0)
+         );
+         INSERT INTO temp.persistence_accounting
+         SELECT 1, count(*), coalesce(sum(metadata_bytes),0),
+                coalesce(sum(replay_bytes),0), coalesce(sum(replay_bytes>0),0) FROM main.runs;
+         CREATE TEMP TRIGGER persistence_account_insert AFTER INSERT ON main.runs BEGIN
+            UPDATE persistence_accounting SET records=records+1,
+                metadata_bytes=metadata_bytes+NEW.metadata_bytes,
+                replay_bytes=replay_bytes+NEW.replay_bytes,
+                replay_runs=replay_runs+(NEW.replay_bytes>0) WHERE singleton=1;
+         END;
+         CREATE TEMP TRIGGER persistence_account_delete AFTER DELETE ON main.runs BEGIN
+            UPDATE persistence_accounting SET records=records-1,
+                metadata_bytes=metadata_bytes-OLD.metadata_bytes,
+                replay_bytes=replay_bytes-OLD.replay_bytes,
+                replay_runs=replay_runs-(OLD.replay_bytes>0) WHERE singleton=1;
+         END;
+         CREATE TEMP TRIGGER persistence_account_update
+         AFTER UPDATE OF metadata_bytes,replay_bytes ON main.runs BEGIN
+            UPDATE persistence_accounting SET
+                metadata_bytes=metadata_bytes-OLD.metadata_bytes+NEW.metadata_bytes,
+                replay_bytes=replay_bytes-OLD.replay_bytes+NEW.replay_bytes,
+                replay_runs=replay_runs-(OLD.replay_bytes>0)+(NEW.replay_bytes>0) WHERE singleton=1;
+         END;"
+    ).map_err(PersistenceError::database)
 }
 
 fn create_schema(
@@ -8316,36 +8681,63 @@ fn prune_run_replay_to(
 /// back in place, which sheds exactly the bytes needed and keeps the Run's
 /// window contiguous. A row is only ever shortened from the front, never
 /// emptied, which is what preserves the invariant the skip was there to protect.
+const GLOBAL_REPLAY_CANDIDATE_SQL: &str = "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, chunk.data_bytes
+                 FROM replay_chunks AS chunk
+                 WHERE EXISTS(SELECT 1 FROM replay_chunks AS retained
+                        WHERE retained.run_id = chunk.run_id AND retained.start_byte > chunk.start_byte)
+                 ORDER BY chunk.ordinal LIMIT 1";
+
+#[cfg(test)]
 fn prune_global_replay_to(
     transaction: &Connection,
     replay_limit: u64,
 ) -> Result<bool, PersistenceError> {
-    let mut evicted = false;
+    let total: i64 = transaction
+        .query_row(
+            "SELECT replay_bytes FROM temp.persistence_accounting WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(PersistenceError::database)?;
+    prune_global_replay_with_row_funding(transaction, replay_limit, usize::MAX)?;
+    Ok(nonnegative_u64(total, "global replay bytes")? > replay_limit)
+}
+
+/// Return whether the exact global quota was reached within this transaction's
+/// already configured page funding; false requires rollback of its fresh output.
+fn prune_global_replay_with_row_funding(
+    transaction: &Connection,
+    replay_limit: u64,
+    mut rows: usize,
+) -> Result<bool, PersistenceError> {
     loop {
         let total: i64 = transaction
-            .prepare_cached("SELECT coalesce(sum(replay_bytes), 0) FROM runs")
+            .prepare_cached(
+                "SELECT replay_bytes FROM temp.persistence_accounting WHERE singleton=1",
+            )
             .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
             .map_err(PersistenceError::database)?;
         if nonnegative_u64(total, "global replay bytes")? <= replay_limit {
-            return Ok(evicted);
+            return Ok(true);
         }
+        if rows == 0 {
+            return Ok(false);
+        }
+        rows -= 1;
         let candidate: Option<(i64, String, i64, i64)> = transaction
-            .query_row(
-                "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, chunk.data_bytes
-                 FROM replay_chunks AS chunk
-                 WHERE EXISTS(SELECT 1 FROM replay_chunks AS retained
-                        WHERE retained.run_id = chunk.run_id AND retained.start_byte > chunk.start_byte)
-                 ORDER BY chunk.ordinal LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
+            .prepare_cached(GLOBAL_REPLAY_CANDIDATE_SQL)
+            .and_then(|mut statement| {
+                statement.query_row([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+            })
             .optional()
             .map_err(PersistenceError::database)?;
         let Some((ordinal, run_id, _start_byte, bytes)) = candidate else {
             // Every Run is down to one row. Trim the globally-oldest row's
             // front in place instead of dropping it: the ceiling still has to
             // be met, and shortening a row sheds bytes without emptying a Run.
-            return trim_oldest_row(transaction, replay_limit, evicted);
+            return trim_oldest_row(transaction, replay_limit, rows);
         };
         let needed = total - i64::try_from(replay_limit).unwrap_or(i64::MAX);
         let shed = bytes.min(needed);
@@ -8362,14 +8754,13 @@ fn prune_global_replay_to(
                 )
                 .map_err(PersistenceError::database)?;
         }
-        evicted = true;
         shed_run_bytes(transaction, &run_id, shed)?;
     }
 }
 
 /// Cut the front off the largest Run's row until the daemon-wide total fits.
 ///
-/// The last resort for [`prune_global_replay_to`], reached when every Run holds
+/// The last resort for [`prune_global_replay_with_row_funding`], reached when every Run holds
 /// exactly one row and dropping any of them would empty a Run. Trimming in
 /// place sheds the same bytes without that cost: the row keeps its tail, the
 /// Run's window stays a single contiguous range, and `replay_truncated` records
@@ -8391,18 +8782,22 @@ fn prune_global_replay_to(
 fn trim_oldest_row(
     transaction: &Connection,
     replay_limit: u64,
-    mut evicted: bool,
+    mut rows: usize,
 ) -> Result<bool, PersistenceError> {
     loop {
         let (total, runs): (i64, i64) = transaction
             .prepare_cached(
-                "SELECT coalesce(sum(replay_bytes), 0), count(*) FROM runs WHERE replay_bytes > 0",
+                "SELECT replay_bytes, replay_runs FROM temp.persistence_accounting WHERE singleton=1",
             )
             .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
             .map_err(PersistenceError::database)?;
         if nonnegative_u64(total, "global replay bytes")? <= replay_limit || runs == 0 {
-            return Ok(evicted);
+            return Ok(true);
         }
+        if rows == 0 {
+            return Ok(false);
+        }
+        rows -= 1;
         let largest: Option<(i64, String, i64, i64, i64)> = transaction
             .query_row(
                 "SELECT chunk.ordinal, chunk.run_id, chunk.start_byte, chunk.data_bytes,
@@ -8438,7 +8833,7 @@ fn trim_oldest_row(
         if shed <= 0 {
             // Every Run is already at or below its share and still cannot be
             // trimmed further without emptying one. Stop rather than spin.
-            return Ok(evicted);
+            return Ok(false);
         }
         if data_offset < 0 {
             return Err(PersistenceError::Corrupt(
@@ -8458,7 +8853,6 @@ fn trim_oldest_row(
                 )
                 .map_err(PersistenceError::database)?;
         }
-        evicted = true;
         shed_run_bytes(transaction, &run_id, shed)?;
     }
 }
@@ -8467,7 +8861,7 @@ fn trim_oldest_row(
 /// trimmed, and slide `durable_first_available_byte` up to the new oldest chunk.
 ///
 /// This single statement is what keeps the durable window one contiguous range:
-/// both eviction paths (whole-row drop in [`prune_global_replay_to`] and
+/// both eviction paths (whole-row drop in [`prune_global_replay_with_row_funding`] and
 /// in-place front trim in [`trim_oldest_row`]) must apply it identically, so it
 /// lives here rather than being copied. `coalesce(..., 0)` handles the Run that
 /// just lost its last chunk.
@@ -8730,18 +9124,23 @@ fn controlled_capacity_funding(
                     "CREATE TABLE capacity_test_ballast(id INTEGER PRIMARY KEY, payload BLOB)",
                 )
                 .map_err(PersistenceError::database)?;
-            loop {
-                match store.connection.execute(
-                    "INSERT INTO capacity_test_ballast(payload) VALUES(zeroblob(4096))",
-                    [],
-                ) {
-                    Ok(_) => {}
-                    Err(error) => {
-                        let error = PersistenceError::database(error);
-                        if !error.is_disk_full() || !store.connection.is_autocommit() {
-                            return Err(error);
+            // A 4096-byte record can need both a leaf and an overflow page.
+            // Finish with a sub-page record so FULL is observed at the actual
+            // fixed page ceiling, rather than one unusable page short of it.
+            for payload_bytes in [4096, 1024] {
+                loop {
+                    match store.connection.execute(
+                        "INSERT INTO capacity_test_ballast(payload) VALUES(zeroblob(?1))",
+                        [payload_bytes],
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            let error = PersistenceError::database(error);
+                            if !error.is_disk_full() || !store.connection.is_autocommit() {
+                                return Err(error);
+                            }
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -8797,6 +9196,7 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
         },
         thread,
         time::{Duration, Instant},
@@ -9437,6 +9837,154 @@ mod tests {
             assert_eq!((oldest, head, bytes, truncated), expected);
         }
         transaction.commit().expect("commit replay pruning");
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one canonical transaction, rollback, retention and cold reconstruction proof"
+    )]
+    fn derived_accounting_tracks_canonical_commit_rollback_and_reopen() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let totals = |connection: &Connection| -> (i64, i64, i64, i64) {
+            connection
+                .query_row(
+                    "SELECT records, metadata_bytes, replay_bytes, replay_runs
+                 FROM temp.persistence_accounting WHERE singleton=1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(totals(&store.connection), (0, 0, 0, 0));
+        let ids = insert_valid_replay_test_runs(&mut store);
+        let original = totals(&store.connection);
+        assert_eq!((original.0, original.2, original.3), (2, 0, 0));
+        assert!(original.1 > 0);
+        {
+            let transaction = store.connection.transaction().unwrap();
+            insert_test_run(&transaction, RunId::new(), "running", 7);
+            transaction
+                .execute(
+                    "UPDATE runs SET metadata_bytes=metadata_bytes+9, replay_bytes=11 WHERE id=?1",
+                    [ids[0].to_string()],
+                )
+                .unwrap();
+            transaction
+                .execute("DELETE FROM runs WHERE id=?1", [ids[1].to_string()])
+                .unwrap();
+            assert_eq!(
+                (
+                    totals(&transaction).0,
+                    totals(&transaction).2,
+                    totals(&transaction).3
+                ),
+                (2, 11, 1)
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            totals(&store.connection),
+            original,
+            "all three canonical triggers share the rollback"
+        );
+        let legacy = "SELECT coalesce(sum(replay_bytes), 0) FROM runs";
+        store
+            .connection
+            .prepare_cached(legacy)
+            .unwrap()
+            .reset_status(rusqlite::StatementStatus::FullscanStep);
+        let heads = [Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0))];
+        store
+            .append_batch(&[
+                (
+                    ids[0],
+                    replay(vec![chunk(0, b"abcdef")]),
+                    Arc::clone(&heads[0]),
+                ),
+                (ids[1], replay(vec![chunk(0, b"xy")]), Arc::clone(&heads[1])),
+            ])
+            .unwrap();
+        assert_eq!(
+            (totals(&store.connection).2, totals(&store.connection).3),
+            (8, 2)
+        );
+        let transaction = store.connection.transaction().unwrap();
+        assert!(prune_global_replay_to(&transaction, 5).unwrap());
+        transaction.commit().unwrap();
+        assert_eq!(
+            (totals(&store.connection).2, totals(&store.connection).3),
+            (5, 2)
+        );
+        assert_eq!(
+            store
+                .connection
+                .prepare_cached(legacy)
+                .unwrap()
+                .get_status(rusqlite::StatementStatus::FullscanStep),
+            0,
+            "real append and retention must not execute the unrelated-history SUM"
+        );
+        assert_eq!(
+            heads[0].load(Ordering::Acquire),
+            6,
+            "retention never rewinds the committed head"
+        );
+        store
+            .connection
+            .execute("DELETE FROM runs WHERE id=?1", [ids[1].to_string()])
+            .unwrap();
+        assert_eq!(
+            (
+                totals(&store.connection).0,
+                totals(&store.connection).2,
+                totals(&store.connection).3
+            ),
+            (1, 3, 1)
+        );
+        store.truncate_wal_to_zero().unwrap();
+        drop(store);
+        let (reopened, recovered) = StateStore::open(
+            &state_dir,
+            &AdmissionLimits::OPERATIONAL,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].info.id, ids[0]);
+        assert_eq!(recovered[0].operation_key, test_operation_key(ids[0]));
+        assert_eq!(recovered[0].info.durable_output_bytes, Some(6));
+        assert_eq!(recovered[0].replay.first_available_byte, 3);
+        assert!(recovered[0].replay.truncated);
+        assert_eq!(
+            recovered[0]
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            b"def"
+        );
+        let rebuilt = totals(&reopened.connection);
+        assert_eq!((rebuilt.0, rebuilt.2, rebuilt.3), (1, 3, 1));
+        let canonical: i64 = reopened
+            .connection
+            .query_row("SELECT sum(metadata_bytes) FROM runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            rebuilt.1, canonical,
+            "cold reconciliation updates the same derived transaction total"
+        );
+        validate_existing_schema(&reopened.connection).unwrap();
     }
 
     /// The daemon-wide ceiling must still be enforceable when every Run holds
@@ -10506,7 +11054,7 @@ mod tests {
     fn disk_full_retry_observes_shutdown() {
         let shutdown = AtomicBool::new(false);
         let mut attempts = 0_u8;
-        let result = retry_transient_storage(&shutdown, || {
+        let result = retry_transient_storage::<()>(&shutdown, || {
             attempts = attempts.saturating_add(1);
             shutdown.store(true, Ordering::Release);
             Err(PersistenceError::injected_disk_full())
@@ -10933,6 +11481,498 @@ mod tests {
         let mut expected = vec![b'x'; usize::try_from(extents).unwrap() - payload.len()];
         expected.extend_from_slice(&payload);
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn fragmented_global_first_probe_is_bounded_by_original_wal_funding() {
+        let temp = TempDir::new().unwrap();
+        let extents = 121_733_i64;
+        let resources = ResourceLimits {
+            wal_checkpoint_bytes: 1024 * 1024,
+            durable_replay_bytes: Some(u64::try_from(extents).unwrap()),
+            ..ResourceLimits::DEFAULT
+        };
+        let (mut store, _) = StateStore::open(
+            &temp.path().join("state"),
+            &AdmissionLimits::from(resources),
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let historical = RunId::new();
+        let fresh = RunId::new();
+        fs::write(
+            store.replay_dir.join(&store.replay_file),
+            vec![b'x'; usize::try_from(extents).unwrap()],
+        )
+        .unwrap();
+        let transaction = store.connection.transaction().unwrap();
+        for id in [historical, fresh] {
+            let metadata = insert_test_run(
+                &transaction,
+                id,
+                if id == historical {
+                    "exited"
+                } else {
+                    "running"
+                },
+                0,
+            );
+            transaction
+                .execute(
+                    "UPDATE runs SET metadata_bytes=?2 WHERE id=?1",
+                    params![id.to_string(), metadata],
+                )
+                .unwrap();
+        }
+        {
+            let mut insert = transaction.prepare("INSERT INTO replay_chunks (run_id,start_byte,end_byte,data_file,data_offset,data_bytes) VALUES (?1,?2,?2+1,?3,?2,1)").unwrap();
+            for byte in 0..extents {
+                insert
+                    .execute(params![historical.to_string(), byte, &store.replay_file])
+                    .unwrap();
+            }
+        }
+        transaction
+            .execute(
+                "UPDATE runs SET durable_output_bytes=?2,replay_bytes=?2 WHERE id=?1",
+                params![historical.to_string(), extents],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        store.truncate_wal_to_zero_with_shutdown(None).unwrap();
+        let head = Arc::new(AtomicU64::new(0));
+        let payload = vec![b'y'; 70_013];
+        let result = store
+            .append_transaction_once(
+                &[(fresh, replay(vec![chunk(0, &payload)]), Arc::clone(&head))],
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(
+            !result,
+            "the full original retirement cannot fit one configured page turn"
+        );
+        let executions = store
+            .connection
+            .prepare_cached(super::GLOBAL_REPLAY_CANDIDATE_SQL)
+            .unwrap()
+            .get_status(rusqlite::StatementStatus::Run);
+        let funded =
+            i32::try_from(resources.wal_checkpoint_bytes / super::WAL_FRAME_BYTES).unwrap();
+        assert!(
+            executions > 0 && executions <= funded,
+            "first probe must not execute an unbounded historical retirement before page admission: executed={executions}, funded={funded}"
+        );
+        assert_eq!(head.load(Ordering::Acquire), 0);
+        assert_eq!(super::read_run_head(&store.connection, fresh).unwrap(), 0);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM replay_chunks WHERE run_id=?1",
+                    [historical.to_string()],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            extents,
+            "unadmitted first probe proves rollback of all original coordinates"
+        );
+        assert_eq!(
+            file_len(&store.replay_dir.join(&store.replay_file)).unwrap(),
+            u64::try_from(extents).unwrap()
+        );
+    }
+
+    #[test]
+    fn async_replay_uses_original_lifecycle_funding_and_wakes_on_shutdown() {
+        let temp = TempDir::new().unwrap();
+        let (persistence, _) = Persistence::open(temp.path().join("state")).unwrap();
+        let info = running_info(RunId::new());
+        let durable = persistence
+            .insert_start(&test_operation_key(info.id), &info)
+            .unwrap();
+        let (append_paused, append_release) = persistence.pause_next_append();
+        expect_queued(durable.append(info.id, replay(vec![chunk(0, b"x")])));
+        append_paused.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (finalize_paused, finalize_release) = persistence.pause_next_finalize();
+        let (reply, _finalized) = mpsc::sync_channel(1);
+        assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+            lifecycle_permit: None,
+            id: info.id,
+            actual_pid: 42,
+            replay: replay(vec![chunk(0, b"x")]),
+            state: exited_state(),
+            source_gap_after_byte: None,
+            durable_head: Arc::clone(&durable.durable_head),
+            metadata_bytes: Arc::clone(&durable.metadata_bytes),
+            reply,
+        }));
+        let mut reads = Vec::new();
+        let mut last = None;
+        for index in 0..super::LIFECYCLE_QUEUE_CAPACITY {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            reads.push(result);
+            let command = super::Command::ReadReplay {
+                lifecycle_permit: None,
+                id: info.id,
+                after: 0,
+                through: 1,
+                reply,
+            };
+            match persistence.inner.try_send_lifecycle(command) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(command))
+                    if index + 1 == super::LIFECYCLE_QUEUE_CAPACITY =>
+                {
+                    last = Some(command);
+                }
+                _ => panic!("original waiting depth plus active turn must fund nine commands"),
+            }
+        }
+        append_release.send(()).unwrap();
+        finalize_paused
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        if let Some(command) = last {
+            assert!(persistence.inner.try_send_lifecycle(command).is_ok());
+        }
+        assert!(matches!(
+            mutex_lock(&persistence.inner.lifecycle_slots).try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let reader = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let observed = durable.clone();
+        reader.block_on(async {
+            let mut waiting = tokio::spawn(async move { observed.read_replay_page(info.id, 0, 1).await });
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut waiting).await.is_err(),
+                "bounded admission waits without blocking this Tokio worker");
+            let mut physical_room = 0;
+            while persistence.inner.lifecycle.try_send(super::Command::LifecycleWake).is_ok() { physical_room += 1; }
+            assert_eq!(physical_room, super::LIFECYCLE_QUEUE_CAPACITY - 1,
+                "async replay cannot take an unfinanced second channel slot while the original nine commands are owned");
+            persistence.inner.shutdown.store(true, Ordering::Release);
+            finalize_release.send(()).unwrap();
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(5), waiting).await.unwrap().unwrap(), Err(PersistenceError::ActorStopped)),
+                "actor teardown returns original permits and wakes async admission to the actual disconnected owner");
+        });
+        drop(reads);
+    }
+
+    fn pause_maintenance_turn(
+        persistence: &Persistence,
+    ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (reached, received) = mpsc::sync_channel(1);
+        let (release, released) = mpsc::sync_channel(1);
+        assert!(
+            mutex_lock(&persistence.inner.test_hooks.maintenance_turn_barrier)
+                .replace(super::FinalizeTestBarrier {
+                    reached,
+                    release: released
+                })
+                .is_none()
+        );
+        (received, release)
+    }
+
+    fn enqueue_staged_fixture(
+        persistence: &Persistence,
+        info: &RunInfo,
+        candidates: Vec<PersistentCandidate>,
+    ) -> mpsc::Receiver<Result<(), super::StageFailure>> {
+        let prepared = persistence
+            .prepare_start(&test_operation_key(info.id), info)
+            .unwrap();
+        let (ready, received) = mpsc::sync_channel(1);
+        let (decision, decided) = mpsc::sync_channel(1);
+        let (completion, _completed) = mpsc::sync_channel(1);
+        decision.send(super::StageDecision::Commit).unwrap();
+        assert!(
+            persistence
+                .inner
+                .send_lifecycle(super::Command::StageStart(Box::new(super::StageRequest {
+                    lifecycle_permit: None,
+                    prepared: Box::new(prepared),
+                    candidates,
+                    receipt: StartReceipt::pending(),
+                    ready,
+                    decision: decided,
+                    completion,
+                })))
+        );
+        received
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one controlled real fragmented schedule joins original funding, target dependency, round-robin fairness and barrier fence"
+    )]
+    fn fragmented_maintenance_turns_preserve_funding_dependencies_and_barrier_fence() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let extents = 121_733_i64;
+        let resources = ResourceLimits {
+            wal_checkpoint_bytes: 1024 * 1024,
+            durable_run_output_bytes: Some(u64::try_from(extents).unwrap()),
+            ..ResourceLimits::DEFAULT
+        };
+        let limits = AdmissionLimits::from(resources);
+        let (mut store, _) = StateStore::open(
+            &state_dir,
+            &limits,
+            None,
+            Arc::new(PersistenceTestHooks::default()),
+        )
+        .unwrap();
+        let ids = [RunId::new(), RunId::new()];
+        fs::write(
+            store.replay_dir.join(&store.replay_file),
+            vec![b'x'; usize::try_from(extents * 2).unwrap()],
+        )
+        .unwrap();
+        let transaction = store.connection.transaction().unwrap();
+        let mut metadata = Vec::new();
+        let mut terminal_metadata = Vec::new();
+        for (index, id) in ids.iter().enumerate() {
+            metadata.push(u64::try_from(insert_test_run(&transaction, *id, "running", 0)).unwrap());
+            let (previous, epoch, spec): (String, String, String) = transaction
+                .query_row(
+                    "SELECT state_json, source_epoch, spec_json FROM runs WHERE id=?1",
+                    [id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            terminal_metadata.push(
+                metadata_size(
+                    &id.to_string(),
+                    test_operation_key(*id).as_str(),
+                    &spec,
+                    None,
+                    &serde_json::to_string(&exited_state()).unwrap(),
+                    &epoch,
+                )
+                .unwrap(),
+            );
+            assert!(!previous.is_empty());
+            {
+                let mut insert = transaction.prepare("INSERT INTO replay_chunks (run_id,start_byte,end_byte,data_file,data_offset,data_bytes) VALUES (?1,?2,?2+1,?3,?4,1)").unwrap();
+                for byte in 0..extents {
+                    insert
+                        .execute(params![
+                            id.to_string(),
+                            byte,
+                            &store.replay_file,
+                            byte + i64::try_from(index).unwrap() * extents
+                        ])
+                        .unwrap();
+                }
+            }
+            transaction.execute("UPDATE runs SET durable_output_bytes=?2,replay_bytes=?2,metadata_bytes=?3 WHERE id=?1",
+                params![id.to_string(), extents, i64::try_from(metadata[index]).unwrap()]).unwrap();
+        }
+        transaction.commit().unwrap();
+        store.truncate_wal_to_zero_with_shutdown(None).unwrap();
+        let epoch = store.epoch.clone();
+        drop(store);
+        let (persistence, _) = Persistence::open_with_admission_limits(
+            state_dir.clone(),
+            &limits,
+            Some(super::HandoffHint {
+                epoch,
+                live_set: HashSet::from(ids),
+                state_lock_fd: None,
+            }),
+        )
+        .unwrap();
+        let start = u64::try_from(extents).unwrap();
+        let a = persistence.recovered_run(start, metadata[0]);
+        let b = persistence.recovered_run(start, metadata[1]);
+        let payload = vec![b'y'; 70_013];
+        let (first_page, first_release) = pause_maintenance_turn(&persistence);
+        expect_queued(a.append(ids[0], replay(vec![chunk(start, &payload)])));
+        first_page
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first real reclamation transaction commits");
+        assert_eq!(a.durable_head(), start);
+        assert_eq!(
+            persistence.inner.queue_depth.load(Ordering::Acquire),
+            1,
+            "original append retains its funded slot while yielding"
+        );
+        expect_queued(a.append(
+            ids[0],
+            replay(vec![chunk(start + payload.len() as u64, b"z")]),
+        ));
+        let (barrier_reply, barrier) = mpsc::sync_channel(1);
+        persistence
+            .inner
+            .sender
+            .send(super::Command::Barrier {
+                reply: barrier_reply,
+            })
+            .unwrap();
+        let mut finalized = Vec::new();
+        for (index, durable) in [&a, &b].into_iter().enumerate() {
+            let (reply, received) = mpsc::sync_channel(1);
+            let mut chunks = vec![chunk(start, &payload)];
+            if index == 0 {
+                chunks.push(chunk(start + payload.len() as u64, b"z"));
+            }
+            assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+                lifecycle_permit: None,
+                id: ids[index],
+                actual_pid: 42,
+                replay: replay(chunks),
+                state: exited_state(),
+                source_gap_after_byte: None,
+                durable_head: Arc::clone(&durable.durable_head),
+                metadata_bytes: Arc::clone(&durable.metadata_bytes),
+                reply,
+            }));
+            finalized.push(received);
+        }
+        let replacement = running_info(RunId::new());
+        let dependent = enqueue_staged_fixture(
+            &persistence,
+            &replacement,
+            vec![PersistentCandidate::new(
+                ids[0],
+                test_operation_key(ids[0]),
+                terminal_metadata[0],
+            )],
+        );
+        let independent = running_info(RunId::new());
+        let ready = enqueue_staged_fixture(&persistence, &independent, Vec::new());
+        let (second_page, second_release) = pause_maintenance_turn(&persistence);
+        first_release.send(()).unwrap();
+        second_page.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (third_page, third_release) = pause_maintenance_turn(&persistence);
+        second_release.send(()).unwrap();
+        third_page.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (fourth_page, fourth_release) = pause_maintenance_turn(&persistence);
+        third_release.send(()).unwrap();
+        fourth_page.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|error| {
+            let candidate_receipt = dependent.try_recv().ok().map(|result| result.err().map(|failure| failure.error.to_string()));
+            panic!("original page must remain available without candidate overtaking Finalize: {error}; owner failure={:?}; candidate receipt={candidate_receipt:?}", mutex_lock(&persistence.inner.failure));
+        });
+        assert!(
+            ready
+                .try_recv()
+                .expect("short C progresses between the two long original debts")
+                .is_ok()
+        );
+        assert!(
+            dependent.try_recv().is_err(),
+            "candidate replacement cannot overtake the original Finalize"
+        );
+        assert!(
+            finalized.iter().all(|reply| reply.try_recv().is_err()),
+            "neither terminal transition may ACK an uncommitted suffix"
+        );
+        assert!(
+            barrier.try_recv().is_err(),
+            "barrier cannot ACK the original prior append debt"
+        );
+        assert_eq!(a.durable_head(), start);
+        assert_eq!(b.durable_head(), start);
+        assert_eq!(
+            persistence.inner.queue_depth.load(Ordering::Acquire),
+            2,
+            "both original same-Run append slots remain funded across every page turn"
+        );
+        let slots = mutex_lock(&persistence.inner.lifecycle_slots);
+        let mut available = 0;
+        while slots.try_recv().is_ok() {
+            available += 1;
+        }
+        for _ in 0..available {
+            persistence.inner.lifecycle_release.try_send(()).unwrap();
+        }
+        drop(slots);
+        assert_eq!(
+            available,
+            super::LIFECYCLE_QUEUE_CAPACITY + 1 - 3,
+            "two unfinished Finalizes and the original dependent Start retain their admission; C alone releases its settled slot"
+        );
+        fourth_release.send(()).unwrap();
+        for received in finalized {
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("original Finalize completes on the same actor")
+                .unwrap();
+        }
+        let rejection = match dependent.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Ok(()) => panic!(
+                "whole retained candidate must not fit the fixed 1 MiB atomic replacement window"
+            ),
+            Err(failure) => failure,
+        };
+        assert!(rejection.capacity && !rejection.fatal);
+        assert!(
+            rejection
+                .error
+                .to_string()
+                .contains("exact replacement exceeds"),
+            "original terminal snapshot is checked only after Finalize, then its real dirty-page charge is honestly rejected"
+        );
+        barrier
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            a.durable_head(),
+            start + payload.len() as u64 + 1,
+            "same-Run FIFO preserves the newer z suffix"
+        );
+        assert_eq!(b.durable_head(), start + payload.len() as u64);
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+        assert!(!persistence.is_failed());
+        drop(a);
+        drop(b);
+        drop(persistence);
+        let (_, recovered) =
+            Persistence::open_with_admission_limits(state_dir, &limits, None).unwrap();
+        assert!(recovered.iter().any(|run| run.info.id == independent.id));
+        assert!(!recovered.iter().any(|run| run.info.id == replacement.id));
+        assert!(recovered.iter().any(|run| run.info.id == ids[0]));
+        let original_a = recovered.iter().find(|run| run.info.id == ids[0]).unwrap();
+        assert_eq!(original_a.info.state, exited_state());
+        assert_eq!(
+            original_a.replay.first_available_byte,
+            payload.len() as u64 + 1
+        );
+        let mut expected_a = vec![b'x'; usize::try_from(extents).unwrap() - payload.len() - 1];
+        expected_a.extend_from_slice(&payload);
+        expected_a.push(b'z');
+        assert_eq!(
+            original_a
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            expected_a,
+            "rejected replacement preserves exact original terminal bytes including the newer FIFO suffix"
+        );
+        let original_b = recovered.iter().find(|run| run.info.id == ids[1]).unwrap();
+        assert_eq!(original_b.info.state, exited_state());
+        assert_eq!(original_b.replay.first_available_byte, payload.len() as u64);
+        let mut expected = vec![b'x'; usize::try_from(extents).unwrap() - payload.len()];
+        expected.extend_from_slice(&payload);
+        assert_eq!(
+            original_b
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]
@@ -12555,6 +13595,7 @@ mod tests {
         // transition owner does when finalization overtakes queued Appends.
         assert!(
             persistence.inner.send_lifecycle(super::Command::Finalize {
+                lifecycle_permit: None,
                 id: info.id,
                 actual_pid: 42,
                 replay: replay(
@@ -12963,6 +14004,7 @@ mod tests {
         whole.extend([b'c'; 64]);
         let (reply, completed) = std::sync::mpsc::sync_channel(1);
         assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+            lifecycle_permit: None,
             id: info.id,
             actual_pid: 42,
             replay: replay(vec![chunk(0, &whole)]),
@@ -13554,6 +14596,8 @@ mod tests {
             &format!("replay-test-{}.bin", uuid::Uuid::new_v4()),
         )
         .expect("create test persistence schema");
+        super::initialize_transaction_accounting(&connection)
+            .expect("initialize test transaction accounting");
         connection
             .execute(
                 "UPDATE runtime_meta SET current_epoch = ?1 WHERE singleton = 1",
@@ -14620,7 +15664,10 @@ mod tests {
         assert!(
             persistence
                 .inner
-                .send_lifecycle(super::Command::TestPrepareIdleCompaction { reply })
+                .send_lifecycle(super::Command::TestPrepareIdleCompaction {
+                    lifecycle_permit: None,
+                    reply
+                })
         );
         assert!(
             received
@@ -14837,6 +15884,176 @@ mod tests {
         assert!(!persistence.is_failed());
     }
 
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one actual SQLite FULL owner schedule preserves nine original debts through in-band observation and exact deletion"
+    )]
+    fn full_capacity_finalization_debt_does_not_block_original_replay_or_in_band_removal() {
+        let temp = TempDir::new().unwrap();
+        let state_dir = temp.path().join("state");
+        let resources = ResourceLimits {
+            database_bytes: Some(128 * 1024),
+            ..ResourceLimits::DEFAULT
+        };
+        let (persistence, _) =
+            Persistence::open_with_resources(state_dir.clone(), resources, None).unwrap();
+        let mut terminal = running_info(RunId::new());
+        terminal
+            .spec
+            .as_mut()
+            .unwrap()
+            .env
+            .insert("RETAINED_METADATA".to_owned(), "x".repeat(12_731));
+        let terminal_key = test_operation_key(terminal.id);
+        let old = persistence.insert_start(&terminal_key, &terminal).unwrap();
+        old.finalize(terminal.id, 42, replay(Vec::new()), exited_state());
+        let candidate = PersistentCandidate::new(
+            terminal.id,
+            terminal_key,
+            old.metadata_bytes_owner().load(Ordering::Acquire),
+        );
+        let mut runs = Vec::new();
+        for _ in 0..=super::LIFECYCLE_QUEUE_CAPACITY {
+            let info = running_info(RunId::new());
+            let durable = persistence
+                .insert_start(&test_operation_key(info.id), &info)
+                .unwrap();
+            runs.push((info, durable));
+        }
+        expect_queued(
+            runs[0]
+                .1
+                .append(runs[0].0.id, replay(vec![chunk(0, b"confirmed")])),
+        );
+        persistence.barrier().unwrap();
+        let funding = controlled_capacity_action(&persistence, super::CapacityTestAction::Fill);
+        assert_eq!(
+            funding.0, funding.2,
+            "actual SQLite pages reach the fixed cap"
+        );
+        assert_eq!(funding.1, 0, "no reusable pages fund an unchanged retry");
+        persistence
+            .inner
+            .test_hooks
+            .force_append_capacity
+            .store(true, Ordering::Release);
+        let (failed, release) = pause_controlled_capacity_failure(&persistence);
+        expect_queued(
+            runs[0]
+                .1
+                .append(runs[0].0.id, replay(vec![chunk(9, b"debt")])),
+        );
+        failed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut original_replies = Vec::new();
+        for (index, (info, durable)) in runs.iter().enumerate() {
+            let start = if index == 0 { 9 } else { 0 };
+            if index > 0 {
+                expect_queued(durable.append(info.id, replay(vec![chunk(start, b"debt")])));
+            }
+            if index == super::LIFECYCLE_QUEUE_CAPACITY {
+                release.send(()).unwrap();
+            }
+            let (reply, received) = mpsc::sync_channel(1);
+            assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+                lifecycle_permit: None,
+                id: info.id,
+                actual_pid: 42,
+                replay: replay(vec![chunk(start, b"debt")]),
+                state: exited_state(),
+                source_gap_after_byte: None,
+                durable_head: Arc::clone(&durable.durable_head),
+                metadata_bytes: Arc::clone(&durable.metadata_bytes),
+                reply,
+            }));
+            original_replies.push(received);
+        }
+        let reader = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let saved = reader.block_on(async {
+            tokio::time::timeout(Duration::from_secs(3), runs[0].1.read_replay_page(runs[0].0.id,0,9)).await
+                .expect("nine confirmed capacity debts cannot strand original durable Replay behind waiting-slot funding")
+                .unwrap()
+        });
+        assert_eq!(
+            saved
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>(),
+            b"confirmed"
+        );
+        assert!(persistence.is_capacity_blocked());
+        assert!(!persistence.is_failed());
+        assert_eq!(
+            persistence.inner.queue_depth.load(Ordering::Acquire),
+            runs.len()
+        );
+        assert!(
+            original_replies
+                .iter()
+                .all(|reply| reply.try_recv().is_err()),
+            "neither terminal reply nor byte credit is released on the capacity transfer"
+        );
+        assert_eq!(runs[0].1.durable_head(), 9);
+        assert_eq!(runs[0].1.next_replay_start(), 13);
+        persistence
+            .inner
+            .test_hooks
+            .force_append_capacity
+            .store(false, Ordering::Release);
+        assert!(
+            matches!(
+                persistence.remove_terminal(candidate),
+                super::RemovalDisposition::Removed
+            ),
+            "accurate terminal deletion remains an admitted in-band recovery operation"
+        );
+        for received in original_replies {
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("exact deletion funds the same original Finalize")
+                .unwrap();
+        }
+        persistence.barrier().unwrap();
+        assert!(!persistence.is_capacity_blocked());
+        assert!(!persistence.is_failed());
+        assert_eq!(persistence.inner.queue_depth.load(Ordering::Acquire), 0);
+        for (index, (_, durable)) in runs.iter().enumerate() {
+            assert_eq!(durable.durable_head(), if index == 0 { 13 } else { 4 });
+        }
+        // Only after the exact removal has settled every original debt, remove
+        // fixture-only ballast so cold startup sees the unchanged schema-6 set.
+        controlled_capacity_action(&persistence, super::CapacityTestAction::Release);
+        let original_ids: HashSet<_> = runs.iter().map(|(info, _)| info.id).collect();
+        drop(old);
+        drop(runs);
+        drop(persistence);
+        let (_, recovered) = Persistence::open_with_resources(state_dir, resources, None).unwrap();
+        assert_eq!(recovered.len(), super::LIFECYCLE_QUEUE_CAPACITY + 1);
+        assert_eq!(
+            recovered
+                .iter()
+                .map(|run| run.info.id)
+                .collect::<HashSet<_>>(),
+            original_ids,
+            "in-band funding recovery retains every original debt identity"
+        );
+        assert!(!recovered.iter().any(|run| run.info.id == terminal.id));
+        for run in recovered {
+            assert_eq!(run.info.state, exited_state());
+            let bytes = run
+                .replay
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.data.iter().copied())
+                .collect::<Vec<_>>();
+            assert!(bytes == b"debt" || bytes == b"confirmeddebt");
+        }
+    }
+
     fn controlled_capacity_action(
         persistence: &Persistence,
         action: super::CapacityTestAction,
@@ -14845,7 +16062,11 @@ mod tests {
         assert!(
             persistence
                 .inner
-                .send_lifecycle(super::Command::TestCapacityFunding { action, reply })
+                .send_lifecycle(super::Command::TestCapacityFunding {
+                    lifecycle_permit: None,
+                    action,
+                    reply
+                })
         );
         let funding = received
             .recv_timeout(Duration::from_secs(3))
@@ -14898,6 +16119,10 @@ mod tests {
         };
         let (persistence, _) =
             Persistence::open_with_resources(state_dir.clone(), resources, None).unwrap();
+        // This controlled schedule changes only real SQLite page funding.
+        // Concurrent build I/O must not create unrelated filesystem funding
+        // observations and legitimately trigger extra retries in this oracle.
+        persistence.set_filesystem_available_for_test(Some(128 * 1024 * 1024));
         let first = running_info(RunId::new());
         let second = running_info(RunId::new());
         let first_durable = persistence
@@ -14939,6 +16164,7 @@ mod tests {
             .inner
             .sender
             .send(super::Command::ReadReplay {
+                lifecycle_permit: None,
                 id: second.id,
                 after: 0,
                 through: 0,
@@ -14947,6 +16173,7 @@ mod tests {
             .unwrap();
         let (finalize_reply, finalize_received) = std::sync::mpsc::sync_channel(1);
         assert!(persistence.inner.send_lifecycle(super::Command::Finalize {
+            lifecycle_permit: None,
             id: second.id,
             actual_pid: 42,
             replay: replay(vec![chunk(0, &second_bytes)]),
