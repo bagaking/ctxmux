@@ -799,6 +799,84 @@ mod tests {
         state
     }
 
+    #[tokio::test]
+    async fn creation_observation_reads_exact_keys_without_the_creation_stripe() {
+        let registry = super::RunRegistry::default();
+        let mut state = eligible_registry_state(2);
+        let mut ids: Vec<_> = state.runs.keys().copied().collect();
+        ids.sort();
+        let keys = [
+            CreateOperationKey::new("first-key").unwrap(),
+            CreateOperationKey::new("second-key").unwrap(),
+        ];
+        for (key, id) in keys.iter().zip(&ids) {
+            state.creation_runs.insert(key.clone(), *id);
+            state.runs.get_mut(id).unwrap().operation_key = Some(key.clone());
+        }
+        *super::write_lock(&registry.state) = state;
+        let _held = registry.lock_creation(&keys[0]).await;
+        for (key, id) in keys.iter().zip(&ids) {
+            let observed = registry.observe_creation(key).unwrap();
+            assert_eq!(observed.operation_key(), key);
+            assert!(
+                matches!(observed, ctxmux_protocol::CreationObservation::Retained { run, .. } if run.id == *id)
+            );
+        }
+        let absent = CreateOperationKey::new("absent-key").unwrap();
+        assert_eq!(
+            registry.observe_creation(&absent).unwrap(),
+            ctxmux_protocol::CreationObservation::NotRetained {
+                operation_key: absent
+            }
+        );
+        let state = super::read_lock(&registry.state);
+        assert_eq!(state.runs.len(), 2);
+        assert_eq!(state.creation_runs.len(), 2);
+        assert!(state.reservations.is_empty());
+    }
+
+    #[test]
+    fn creation_observation_preserves_reservation_and_owner_failure_boundaries() {
+        let registry = super::RunRegistry::default();
+        let key = CreateOperationKey::new("reserved-key").unwrap();
+        let reservation = registry
+            .reserve_memory_publication(RunId::new(), Some(key.clone()), 256)
+            .unwrap();
+        assert_eq!(
+            registry.observe_creation(&key).unwrap_err().code,
+            ErrorCode::BackendUnavailable
+        );
+        drop(reservation);
+        assert!(matches!(
+            registry.observe_creation(&key).unwrap(),
+            ctxmux_protocol::CreationObservation::NotRetained { .. }
+        ));
+        let mut state = eligible_registry_state(1);
+        let id = *state.runs.keys().next().unwrap();
+        state.creation_runs.insert(key.clone(), id);
+        state.runs.get_mut(&id).unwrap().operation_key = Some(key.clone());
+        state.runs.get_mut(&id).unwrap().residency = RegistryResidency::Removing;
+        *super::write_lock(&registry.state) = state;
+        assert_eq!(
+            registry.observe_creation(&key).unwrap_err().code,
+            ErrorCode::BackendUnavailable
+        );
+        super::write_lock(&registry.state)
+            .runs
+            .get_mut(&id)
+            .unwrap()
+            .operation_key = None;
+        assert_eq!(
+            registry.observe_creation(&key).unwrap_err().code,
+            ErrorCode::Internal
+        );
+        super::write_lock(&registry.state).runs.remove(&id);
+        assert_eq!(
+            registry.observe_creation(&key).unwrap_err().code,
+            ErrorCode::Internal
+        );
+    }
+
     /// The no-pressure creation path — the common case, run under the Registry
     /// write lock on *every* Run creation — must not scan the Registry.
     ///
@@ -1441,6 +1519,29 @@ struct RegistryState {
     control_budget: crate::resources::ByteBudget,
 }
 
+/// The two creation consumers share the exact forward/reverse owner invariant.
+fn creation_entry<'a>(
+    state: &'a RegistryState,
+    operation_key: &CreateOperationKey,
+) -> Result<Option<&'a RegistryEntry>, ProtocolError> {
+    let Some(id) = state.creation_runs.get(operation_key) else {
+        return Ok(None);
+    };
+    let entry = state.runs.get(id).ok_or_else(|| {
+        ProtocolError::new(
+            ErrorCode::Internal,
+            "Run creation registry lost its retained Run",
+        )
+    })?;
+    if entry.operation_key.as_ref() != Some(operation_key) {
+        return Err(ProtocolError::new(
+            ErrorCode::Internal,
+            "Run creation registry lost its exact key owner",
+        ));
+    }
+    Ok(Some(entry))
+}
+
 impl Default for RegistryState {
     fn default() -> Self {
         Self {
@@ -1916,6 +2017,46 @@ impl RunRegistry {
         self.creation_stripe(left) == self.creation_stripe(right)
     }
 
+    /// Read the existing key owner without creation admission or Backend work.
+    pub(crate) fn observe_creation(
+        &self,
+        operation_key: &CreateOperationKey,
+    ) -> Result<ctxmux_protocol::CreationObservation, ProtocolError> {
+        operation_key
+            .validate()
+            .map_err(|error| ProtocolError::new(ErrorCode::InvalidRequest, error.to_string()))?;
+        let state = read_lock(&self.state);
+        // Reservations are bounded by the existing admitted creation owners;
+        // they are not retained history or a second key index.
+        if state
+            .reservations
+            .values()
+            .any(|reservation| reservation.operation_key.as_ref() == Some(operation_key))
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::BackendUnavailable,
+                "Run creation is temporarily fenced by an unpublished Registry reservation",
+            ));
+        }
+        let Some(entry) = creation_entry(&state, operation_key)? else {
+            return Ok(ctxmux_protocol::CreationObservation::NotRetained {
+                operation_key: operation_key.clone(),
+            });
+        };
+        match entry.residency {
+            RegistryResidency::Retained => Ok(ctxmux_protocol::CreationObservation::Retained {
+                operation_key: operation_key.clone(),
+                run: Box::new(entry.run.info()),
+            }),
+            RegistryResidency::Collecting(_) | RegistryResidency::Removing => {
+                Err(ProtocolError::new(
+                    ErrorCode::BackendUnavailable,
+                    "Run creation is temporarily unavailable while its retained owner is being replaced or removed",
+                ))
+            }
+        }
+    }
+
     /// Resolve a completed creation while its key stripe is exclusively held.
     pub(crate) fn resolve_creation_info(
         &self,
@@ -1946,21 +2087,9 @@ impl RunRegistry {
                 },
             );
         }
-        let Some(id) = state.creation_runs.get(operation_key) else {
+        let Some(entry) = creation_entry(&state, operation_key)? else {
             return Ok(None);
         };
-        let entry = state.runs.get(id).ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCode::Internal,
-                "Run creation registry lost its retained Run",
-            )
-        })?;
-        if entry.operation_key.as_ref() != Some(operation_key) {
-            return Err(ProtocolError::new(
-                ErrorCode::Internal,
-                "Run creation registry lost its exact key owner",
-            ));
-        }
         if !request.matches_run(&entry.run) {
             return Err(ProtocolError::new(
                 ErrorCode::CreationConflict,

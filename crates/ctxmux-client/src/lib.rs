@@ -491,6 +491,42 @@ impl Client {
         }
     }
 
+    /// Read one retained creation key from the same connection's Runtime.
+    ///
+    /// Absence is not evidence that creation was never applied.
+    /// # Errors
+    /// Returns operation-local unsupported capability, transport, protocol or
+    /// exact-key response errors without dispatching Start or Fork.
+    pub async fn observe_creation(
+        &self,
+        operation_key: CreateOperationKey,
+    ) -> Result<(RuntimeIdentity, ctxmux_protocol::CreationObservation), ClientError> {
+        let (mut wire, runtime) = self.connect_for_dispatch().await?;
+        let capability = ctxmux_protocol::RUNTIME_CAPABILITY_CREATION_OBSERVATION;
+        validate_runtime_capability_requirements(
+            &runtime,
+            &BTreeMap::from([(capability.to_owned(), 1)]),
+        )?;
+        send(
+            &mut wire,
+            &ClientFrame::Request {
+                request: Request::ObserveCreation {
+                    operation_key: operation_key.clone(),
+                },
+            },
+        )
+        .await?;
+        match receive(&mut wire).await? {
+            ServerFrame::Response {
+                response: Response::CreationObservation { observation },
+            } if observation.operation_key() == &operation_key => Ok((runtime, observation)),
+            ServerFrame::Error { error } => Err(error.into()),
+            _ => Err(ClientError::UnexpectedFrame(
+                "expected exact creation observation",
+            )),
+        }
+    }
+
     /// Return the identity of the currently reachable daemon incarnation.
     ///
     /// # Errors

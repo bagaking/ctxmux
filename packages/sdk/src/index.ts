@@ -103,6 +103,7 @@ export {
   RUNTIME_CAPABILITY_NATIVE_RECOVERABLE_STOP,
   RUNTIME_CAPABILITY_FOREGROUND_OBSERVATION,
   RUNTIME_CAPABILITY_STORAGE_OBSERVATION,
+  RUNTIME_CAPABILITY_CREATION_OBSERVATION,
   RUNTIME_CAPABILITY_NATIVE_START,
   RUNTIME_CAPABILITY_PERSISTENT_STATE,
   RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY,
@@ -119,6 +120,7 @@ export type { ControlFailure } from "./generated/ControlFailure.js";
 export type { ControlOutcome } from "./generated/ControlOutcome.js";
 export type { ControlReceipt } from "./generated/ControlReceipt.js";
 export type { CreateOperationKey } from "./generated/CreateOperationKey.js";
+export type { CreationObservation } from "./generated/CreationObservation.js";
 export type { DaemonInstanceId } from "./generated/DaemonInstanceId.js";
 export type { ErrorCode } from "./generated/ErrorCode.js";
 export type { ForkFidelity } from "./generated/ForkFidelity.js";

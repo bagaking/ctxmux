@@ -125,6 +125,7 @@ The initial availability record is:
 | `tmux.discover`                            |        1 |           1 |
 | `tmux.import`                              |        1 |      absent |
 | `services.persistent_state`                |   absent |           1 |
+| `services.creation_observation`            |        1 |           1 |
 | `services.planned_exec_upgrade_continuity` |   absent |           1 |
 
 An advertised endpoint capability does not promise that a particular Run,
@@ -311,6 +312,26 @@ preserved richer state; the Integration capability gate and its behavioral
 evidence own that claim.
 
 ### Retry-safe Run creation
+
+`observe_creation { operation_key }` reads the existing retained key mapping
+without submitting a Start or Fork. Its optional `services.creation_observation`
+version 1 capability is checked only for this operation. A `creation_observation`
+response contains an `observation` with the exact echoed `operation_key` and
+either `outcome: "retained"` plus the original current `run: RunInfo`, or
+`outcome: "not_retained"`. The latter means no mapping is currently retained;
+it is not a `not_applied`, never-dispatched or safe-retry receipt. An in-flight
+creation may not yet have published its mapping, and removal can reclaim it.
+An unpublished Registry reservation or a collecting/removing retained owner
+returns the existing `backend_unavailable` error. Registry invariant failures
+remain errors rather than absence.
+
+This lookup does not acquire a creation stripe, dispatch Backend work, query
+the persistence actor, prune state or activate a daemon. SDK receipts pair the
+result with the Hello identity from the same connection and validate the
+echoed key. The key is not authority to input, attach or stop a Run. The CLI
+`ctxmux --socket <path> creation <key>` (or explicit `CTXMUX_SOCKET`) uses this
+read-only endpoint; it never starts a daemon. This observation adds no
+persistent records.
 
 Every `start` and `fork` request carries one caller-owned
 `CreateOperationKey`. It is a non-empty opaque UTF-8 string of at most 128

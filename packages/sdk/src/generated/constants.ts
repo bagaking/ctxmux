@@ -25,4 +25,6 @@ export const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY =
   "services.planned_exec_upgrade_continuity" as const;
 export const RUNTIME_CAPABILITY_STORAGE_OBSERVATION =
   "services.storage_observation" as const;
+export const RUNTIME_CAPABILITY_CREATION_OBSERVATION =
+  "services.creation_observation" as const;
 export const REMOTE_ENDPOINT_CONTRACT_VERSION = 1 as const;

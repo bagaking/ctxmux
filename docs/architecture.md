@@ -603,6 +603,15 @@ The important guarantees are behavioral, not implied by lock types.
   `creation_conflict`, and unrelated keys can use released stripes and launch
   permits. A matching published Fork retry is resolved before current parent
   capability or lifecycle checks.
+- Creation observation reads the existing Registry key mapping without a
+  creation stripe, Backend work, persistence request or retention mutation.
+  Its optional capability is operation-local. A retained result identifies
+  that exact original Run; absence is only `not_retained`, never proof that
+  creation was not applied. Unpublished reservations and collecting/removing
+  owners keep their existing temporary-unavailability boundary. No permanent
+  operation ledger, negative receipt or duplicate key index is maintained.
+  Clients validate the echoed key together with the same connection's Hello
+  identity; observation grants no lifecycle or input authority.
 - Daemon shutdown first fences new unbound creation flights, then cleans up tmux
   control owners and drains already-started creation threads within one shared
   deadline. Fencing closes launch admission and wakes queued unbound waiters;

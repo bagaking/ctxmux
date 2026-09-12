@@ -2,6 +2,7 @@
 import type { AppliedInputRange } from "./AppliedInputRange.js";
 import type { ControlFailure } from "./ControlFailure.js";
 import type { ControlReceipt } from "./ControlReceipt.js";
+import type { CreationObservation } from "./CreationObservation.js";
 import type { DiagnosticsSnapshot } from "./DiagnosticsSnapshot.js";
 import type { RunForegroundObservation } from "./RunForegroundObservation.js";
 import type { RunId } from "./RunId.js";
@@ -14,6 +15,7 @@ import type { TmuxPaneInfo } from "./TmuxPaneInfo.js";
  * Result of one request or the control phase of one composite attachment.
  */
 export type Response =
+  | { type: "creation_observation"; observation: CreationObservation }
   | { type: "foreground_observation"; observation: RunForegroundObservation }
   | { type: "diagnostics"; diagnostics: DiagnosticsSnapshot }
   | { type: "storage_observation"; observation: RunStorageObservation }

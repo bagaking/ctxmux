@@ -45,6 +45,9 @@ pub const RUNTIME_CAPABILITY_PERSISTENT_STATE: &str = "services.persistent_state
 /// Observe bounded Run storage facts without waiting for the persistence actor.
 pub const RUNTIME_CAPABILITY_STORAGE_OBSERVATION: &str = "services.storage_observation";
 
+/// Read the current retained creation-key mapping without creating a Run.
+pub const RUNTIME_CAPABILITY_CREATION_OBSERVATION: &str = "services.creation_observation";
+
 /// Preserve live ownership across a validated planned exec-in-place upgrade.
 pub const RUNTIME_CAPABILITY_PLANNED_EXEC_UPGRADE_CONTINUITY: &str =
     "services.planned_exec_upgrade_continuity";
@@ -1588,6 +1591,8 @@ pub enum AttachmentView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    /// Read one exact caller-owned creation key without dispatching creation.
+    ObserveCreation { operation_key: CreateOperationKey },
     /// Read only the foreground facts of one original Run.
     ObserveForeground {
         #[serde(rename = "runId")]
@@ -1760,6 +1765,8 @@ pub enum ControlOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    /// One exact retained key mapping, not a negative creation receipt.
+    CreationObservation { observation: CreationObservation },
     /// One-shot facts only; never Agent or continuous working-state truth.
     ForegroundObservation {
         observation: RunForegroundObservation,
@@ -1803,6 +1810,32 @@ pub enum Response {
         run: RunInfo,
         range: AppliedInputRange,
     },
+}
+
+/// The current retained mapping of one caller-owned creation key.
+/// Absence does not establish that the original request was never applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CreationObservation {
+    /// The exact key still owns this original retained Run.
+    Retained {
+        operation_key: CreateOperationKey,
+        run: Box<RunInfo>,
+    },
+    /// No mapping is currently retained; this is not replay permission.
+    NotRetained { operation_key: CreateOperationKey },
+}
+
+impl CreationObservation {
+    /// The exact key whose mapping was observed.
+    #[must_use]
+    pub fn operation_key(&self) -> &CreateOperationKey {
+        match self {
+            Self::Retained { operation_key, .. } | Self::NotRetained { operation_key } => {
+                operation_key
+            }
+        }
+    }
 }
 
 /// Opaque physical identity of one process in the original foreground group.

@@ -349,3 +349,41 @@ async fn closed_cli_listing_pipe_exits_cleanly_and_preserves_the_run() {
     );
     assert_eq!(status.pid, run.pid);
 }
+
+#[test]
+fn creation_observation_never_activates_an_absent_explicit_endpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("observe.sock");
+    let _guard = SpawnedSocket {
+        socket: socket.clone(),
+    };
+    let result = Command::new(ctxmux_bin())
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["creation", "original-key"])
+        .env_remove("CTXMUX_SOCKET")
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        !socket.exists(),
+        "a read-only key lookup must not create a listener"
+    );
+}
+
+#[test]
+fn creation_observation_requires_an_explicit_endpoint_without_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let _guard = SpawnedSocket {
+        socket: directory.path().join("ctxmux/ctxmux.sock"),
+    };
+    let result = Command::new(ctxmux_bin())
+        .args(["creation", "original-key"])
+        .env_remove("CTXMUX_SOCKET")
+        .env("XDG_RUNTIME_DIR", directory.path())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("explicit"));
+    assert!(!directory.path().join("ctxmux/ctxmux.sock").exists());
+}

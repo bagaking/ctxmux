@@ -34,6 +34,7 @@ usage:
   ctxmux [--socket <path>] runtime
   ctxmux [--socket <path>] diagnostics
   ctxmux [--socket <path>] storage <run-id>
+  ctxmux --socket <path> creation <key>
   ctxmux [--socket <path>] start [--operation-key <key>] [--cwd <path>] [--cols <n>] [--rows <n>] -- <program> [args...]
   ctxmux [--socket <path>] tmux-list <tmux-socket>
   ctxmux [--socket <path>] tmux-import <tmux-socket> <pane-id>
@@ -50,7 +51,8 @@ usage:
 
 CTXMUX_SOCKET may be used instead of --socket. When neither is set, ctxmux uses
 $XDG_RUNTIME_DIR/ctxmux/ctxmux.sock or a process-temp path, and starts ctxmuxd
-if nothing is listening."
+if nothing is listening. The read-only creation command requires --socket or
+CTXMUX_SOCKET and never starts a daemon; not_retained is not replay permission."
 }
 
 // One socket round trip per invocation, and `attach` multiplexes with
@@ -79,6 +81,8 @@ async fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    let explicit_socket = args.first().is_some_and(|arg| arg == "--socket")
+        || env::var_os("CTXMUX_SOCKET").is_some_and(|value| !value.is_empty());
     let socket = take_socket(&mut args)?;
     let command = take_string(&mut args, "command")?;
     if !matches!(
@@ -87,6 +91,7 @@ async fn run() -> Result<(), String> {
             | "runtime"
             | "diagnostics"
             | "storage"
+            | "creation"
             | "start"
             | "tmux-list"
             | "tmux-import"
@@ -102,7 +107,16 @@ async fn run() -> Result<(), String> {
     ) {
         return Err(format!("unknown command {command:?}\n\n{}", usage()));
     }
-    daemon::ensure_listening(&socket).await?;
+    if command == "creation" {
+        if !explicit_socket {
+            return Err(
+                "creation requires an explicit --socket or CTXMUX_SOCKET; no daemon was started"
+                    .to_owned(),
+            );
+        }
+    } else {
+        daemon::ensure_listening(&socket).await?;
+    }
     let client = Client::new(socket);
     dispatch_command(&client, &command, args).await
 }
@@ -158,6 +172,7 @@ async fn dispatch_command(
                 .map_err(|error| format!("failed to encode storage observation: {error}"))?
             ))?;
         }
+        "creation" => creation(client, args).await?,
         "start" => start(client, args).await?,
         "tmux-list" => tmux_list(client, args).await?,
         "tmux-import" => tmux_import(client, args).await?,
@@ -213,6 +228,25 @@ fn take_socket(args: &mut Vec<OsString>) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(value));
     }
     Ok(env::var_os("CTXMUX_SOCKET").map_or_else(daemon::default_socket_path, PathBuf::from))
+}
+
+async fn creation(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {
+    let key = CreateOperationKey::new(take_string(&mut args, "creation key")?)
+        .map_err(|error| error.to_string())?;
+    ensure_empty(&args)?;
+    let (runtime, observation) = client
+        .observe_creation(key)
+        .await
+        .map_err(|error| error.to_string())?;
+    print_stdout(format_args!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "runtime": runtime, "observation": observation,
+        }))
+        .map_err(|error| format!("failed to encode creation observation: {error}"))?
+    ))?;
+
+    Ok(())
 }
 
 async fn start(client: &Client, mut args: Vec<OsString>) -> Result<(), String> {

@@ -13,6 +13,7 @@ import type { TerminalSize } from "./TerminalSize.js";
  * Initial request sent after one successful connection handshake.
  */
 export type Request =
+  | { type: "observe_creation"; operation_key: CreateOperationKey }
   | { type: "observe_foreground"; runId: RunId }
   | { type: "diagnostics" }
   | { type: "start"; operation_key: CreateOperationKey; spec: RunSpec }

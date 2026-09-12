@@ -2187,6 +2187,10 @@ impl RunManager {
         let persistent = self.persistence.is_some();
         let mut capabilities = BTreeMap::from([
             (
+                ctxmux_protocol::RUNTIME_CAPABILITY_CREATION_OBSERVATION.to_owned(),
+                1,
+            ),
+            (
                 ctxmux_protocol::RUNTIME_CAPABILITY_STORAGE_OBSERVATION.to_owned(),
                 1,
             ),
@@ -7448,6 +7452,9 @@ async fn execute_request(
     foreground_bytes: &mut Option<crate::resources::BytePermit>,
 ) -> Result<Response, ProtocolError> {
     match request {
+        Request::ObserveCreation { operation_key } => Ok(Response::CreationObservation {
+            observation: manager.registry.observe_creation(&operation_key)?,
+        }),
         Request::ObserveForeground { run_id } => {
             let run = manager.pin(run_id)?;
             let (observation, permit) = manager

@@ -2,6 +2,7 @@ import type { ErrorCode } from "./generated/ErrorCode.js";
 import type { RunSpec } from "./generated/RunSpec.js";
 import type { ServerFrame } from "./generated/ServerFrame.js";
 import {
+  MAX_CREATE_OPERATION_KEY_BYTES,
   MAX_RUNTIME_BUILD_ID_BYTES,
   MAX_RUNTIME_CAPABILITY_VERSION,
 } from "./generated/constants.js";
@@ -409,6 +410,34 @@ export function validateRunSpec(value: unknown, path = "$runSpec"): RunSpec {
 function response(value: unknown, path: string): void {
   const valueRecord = record(value, path);
   switch (discriminant(valueRecord, path)) {
+    case "creation_observation": {
+      exactFields(valueRecord, path, ["type", "observation"]);
+      const p = `${path}.observation`,
+        observation = record(valueRecord.observation, p);
+      const outcome = observation.outcome;
+      if (outcome !== "retained" && outcome !== "not_retained") {
+        throw invalid(`${p}.outcome`, "retained or not_retained");
+      }
+      exactFields(
+        observation,
+        p,
+        outcome === "retained"
+          ? ["outcome", "operation_key", "run"]
+          : ["outcome", "operation_key"],
+      );
+      const operationKey = string(
+        observation.operation_key,
+        `${p}.operation_key`,
+      );
+      if (
+        operationKey.length === 0 ||
+        Buffer.byteLength(operationKey) > MAX_CREATE_OPERATION_KEY_BYTES
+      ) {
+        throw invalid(`${p}.operation_key`, "a valid creation operation key");
+      }
+      if (outcome === "retained") runInfo(observation.run, `${p}.run`);
+      return;
+    }
     case "foreground_observation":
       exactFields(valueRecord, path, ["type", "observation"]);
       foregroundObservation(valueRecord.observation, `${path}.observation`);
