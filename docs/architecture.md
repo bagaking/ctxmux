@@ -934,6 +934,102 @@ settlement. Its reason stays separate from the fatal first-failure latch. A
 persistence client reconnect neither changes policy nor clears an uncertain
 outcome fence; upgrade cannot extract healthy owners past unresolved work.
 
+#### Recoverability and antifragility
+
+**可恢复、抗脆弱** are design requirements for the persistence owner. Recoverable
+means that, after a removable fault ends, the original owner can establish the
+outcome of its original work and resume the permitted operations without losing
+identity or requiring live Runs to be destroyed. Antifragility here has a
+concrete engineering meaning: a fault leaves enough evidence to improve the
+fault model and an executable regression, so another fault in the same family
+has a smaller, bounded effect. It does not mean disks cannot fill or that a
+runtime can automatically repair arbitrary corruption.
+
+The [persistent-failure case study](architecture/case-study-persistence-failure-latch.md)
+shows an implementation gap at source `ad69f47`: an unclassified open failure
+becomes a permanent string latch, and there is no qualified same-owner
+reconciliation path. The following requirements are normative targets, **not
+claims that this recovery protocol, public fields or live repair are already
+implemented**. The current protocol continues to describe shipped behavior.
+
+- **Separate availability, transaction outcome and physical effects.** Record
+  the storage condition and its scope, the original transaction's confirmed
+  old/new/unknown disposition, and whether the exact process/control effect
+  occurred. A failed database commit does not prove a child never ran; a live
+  child does not prove its identity or output was saved. No error string,
+  absent list entry, elapsed timeout or recovery policy grants replay of an
+  unknown Start/Input.
+- **Capture faults where their meaning is still available.** Preserve stage,
+  affected store/Run/operation, engine and extended error code, available system
+  error, transaction state and last confirmed progress. Missing evidence stays
+  unknown. An I/O code by itself is neither a corruption verdict nor proof that
+  retry is safe. First failure, current condition and recovery progress are
+  different observations; a writable probe or another successful operation
+  cannot clear the original unresolved outcome.
+- **Make recovery an original-owner transition.** Reuse the single state lock,
+  Runtime/Run identities and commit witnesses. If the connection must reopen,
+  revalidate the same existing store and epoch without creating an empty
+  database, adopting metadata PIDs or applying cold-start interruption to live
+  Runs. Resolve the outstanding transaction and reconstruct accepted work from
+  retained authoritative evidence before lifting its fence. A missing or
+  inconsistent source remains isolated and observable. Corruption and unknown
+  commit require their own evidence; neither is silently retried as pressure.
+- **Conserve accepted work through failure.** Every accepted output range and
+  lifecycle operation keeps one owner and its resource funding until confirmed
+  settlement or an explicit, contractually permitted loss disposition. Offered
+  and committed watermarks remain distinct. Queue cleanup, an empty queue,
+  actor liveness or clearing a diagnostic cannot acknowledge bytes or forget
+  finalization. Recovery must account for retained memory, indexed bytes,
+  uncertain tails and actual gaps, rather than inventing contiguous replay.
+- **Fence the smallest proven dependency.** A derived view or one Run's debt
+  does not disable unrelated live controls and observations. An unresolved
+  transaction in the shared database can legitimately fence that database's
+  later mutations; represent that scope honestly. Once the connection and
+  transaction boundary are sound, an independent Start need not wait for every
+  Run's old output debt to drain if its own durable admission is funded. Keep
+  same-Run ordering, exact-key effect fences, accepted-debt credits and fair
+  progress. New admissions must not starve old debt. Separate scheduling and
+  bounded maintenance within the existing owner before adding databases,
+  processes or a second recovery authority.
+- **Fund recovery as real work.** Admission and reclamation must account for
+  necessary WAL, replay, directory, checkpoint and lifecycle-settlement work,
+  including the scratch needed to release space. Filesystem free-space samples
+  are not reservations against other writers. Recovery cannot depend on
+  allocating an unbounded replacement, enlarging the original quota or deleting
+  durable identities. Use bounded retry driven by actual progress or changed
+  conditions, plus an explicit recheck path; retry exhaustion ends that active
+  attempt, not the possibility of later recovery. Avoid unchanged-condition
+  busy loops and public reads waiting behind all maintenance.
+- **Declare the physical limit instead of silently changing the promise.**
+  Indefinitely unavailable storage, finite memory, unrestricted output and
+  complete lossless retention cannot all hold. Honor the existing retention
+  contract and expose any allowed Gap with exact byte boundaries. Otherwise
+  apply funded backpressure at the affected producer, without blocking the
+  shared PTY reader from servicing other Runs. Never silently turn admitted
+  durable identity/control into memory-only success. A new loss or backpressure
+  policy needs an explicit product decision and behavioral proof.
+- **Keep repair independent of the failed success path.** Same-owner recovery
+  must not require a healthy persistence barrier merely to be entered. Planned
+  upgrade still cannot discard outstanding work: degraded handoff is only
+  supportable if the original debt, operations, failure evidence and actual
+  live ownership can be transferred and validated. Removing preflight or
+  restarting healthy Runs is not recovery. Safe repair of an already-latched
+  old daemon must be qualified separately from prevention in a new build.
+- **Expose original-operation results through the public boundary.** Native,
+  CLI, SDK and embedding clients must retain confirmed dispositions and exact
+  identities, with current storage pressure separate from the operation result.
+  Observation must have explicit effect semantics: querying an unknown result
+  cannot implicitly repeat a launch or input. A client may not bypass a real
+  durable precondition merely because many of its services need ctxmux.
+- **Turn each incident into a transferable proof.** Pair temporary and
+  permanent faults, pre- and post-effect failures, repeated recovery failures,
+  noisy and quiet Runs, and hot recovery followed by real cold restart. Restore
+  resources in an isolated environment and prove original identity, retained
+  bytes/Gap, operation outcome, independent-Run service and bounded cost.
+  Include a near-miss where retry must remain refused. Record evidence, gaps
+  and a regression for the fault family; a new error-specific branch or a test
+  that only starts a fresh daemon does not establish antifragility.
+
 ## Technical decision index
 
 Status is explicit so a target document cannot masquerade as shipped architecture.
