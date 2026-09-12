@@ -135,9 +135,22 @@ impl ResourceConfig {
         if self.durable_run_output_bytes.is_none() {
             limits.durable_run_output_bytes = limits.durable_replay_bytes;
         }
+        if self.foreground_observation_bytes.is_none() {
+            limits.foreground_observation_bytes =
+                observation_bytes(limits.foreground_observation_workers)?;
+        }
         limits.validate()?;
         Ok(limits)
     }
+}
+
+// Each admitted read-only OS job reserves one maximum protocol frame for its
+// temporary process result. Width and aggregate funding share that owner.
+fn observation_bytes(workers: usize) -> Result<u64, String> {
+    u64::try_from(workers)
+        .ok()
+        .and_then(|count| count.checked_mul(ctxmux_protocol::MAX_FRAME_BYTES as u64))
+        .ok_or_else(|| "foreground observation worker funding overflows".to_owned())
 }
 
 impl Default for ResourceLimits {
@@ -145,11 +158,12 @@ impl Default for ResourceLimits {
         let mut limits = Self::DEFAULT;
         // One read-only OS worker per four available logical CPUs. This is
         // a conservative width heuristic, not a CPU reservation guarantee.
-        // Operators can override the real jobs/bytes/wait policy together.
+        // Explicit startup widths derive their funding by the same relation.
         limits.foreground_observation_workers =
             std::thread::available_parallelism().map_or(1, |cpus| (cpus.get() / 4).max(1));
         limits.foreground_observation_bytes =
-            limits.foreground_observation_workers as u64 * ctxmux_protocol::MAX_FRAME_BYTES as u64;
+            observation_bytes(limits.foreground_observation_workers)
+                .expect("available host CPU width fits observation funding");
         limits
     }
 }
@@ -472,6 +486,44 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ResourceLimits>(&encoded).unwrap(),
             limits
+        );
+    }
+
+    #[test]
+    fn omitted_observation_funding_follows_the_selected_worker_owner() {
+        for workers in [1, 3, 37, 5000] {
+            let limits = parse(&format!(
+                r#"{{"foreground_observation_workers":{workers}}}"#
+            ))
+            .unwrap();
+            assert_eq!(limits.foreground_observation_workers, workers);
+            assert_eq!(
+                limits.foreground_observation_bytes,
+                workers as u64 * ctxmux_protocol::MAX_FRAME_BYTES as u64
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_observation_funding_survives_resolution_and_exec_snapshot() {
+        for bytes in [1, 5 * ctxmux_protocol::MAX_FRAME_BYTES] {
+            let limits = parse(&format!(
+                r#"{{"foreground_observation_workers":3,"foreground_observation_bytes":{bytes}}}"#
+            ))
+            .unwrap();
+            assert_eq!(limits.foreground_observation_bytes, bytes as u64);
+            assert_eq!(
+                serde_json::from_value::<ResourceLimits>(serde_json::to_value(limits).unwrap())
+                    .unwrap(),
+                limits
+            );
+        }
+        assert!(
+            parse(&format!(
+                r#"{{"foreground_observation_workers":{}}}"#,
+                usize::MAX
+            ))
+            .is_err()
         );
     }
 

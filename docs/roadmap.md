@@ -104,7 +104,8 @@ Feature `f-22tcz9d9r/T-013` and the
 delivery makes ordinary configuration explicit in README and records every
 current resource field's owner and disposition. `T-014` separates sparse startup
 choices from complete preserved exec policy; it does not complete the remaining
-resource work. Root implementation still
+resource work. `T-015` derives omitted foreground observation funding from
+the selected worker owner, while preserving explicit allowances. Root implementation still
 requires owner-derived internal settings, funded terminal/parser allocation
 and complete public failure/recovery qualification. Existing Native
 `f-22vcz84zn` and resource tasks retain those outcomes; a documentation result

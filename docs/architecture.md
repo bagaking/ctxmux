@@ -698,6 +698,12 @@ exec. Missing saved policy is invalid handoff state, not permission to recompute
 it from the incoming host. The shared field catalogue keeps these two schemas
 aligned without parsing JSON a second time.
 
+Read-only foreground observation is one implemented relation: omitted memory
+follows the selected worker width at one maximum protocol frame per admitted
+job, rather than the host's unrelated default width. An explicit lower budget
+reduces each job's result allowance and can return budget-exhausted unknown;
+a complete exec snapshot preserves either choice.
+
 Execution settings must follow their actual owners. Worker widths, queue and
 fairness work units, WAL staging and handoff encoding allowances should be
 derived where their resource relation is known. An independent override needs

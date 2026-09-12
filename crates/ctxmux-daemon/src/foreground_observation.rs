@@ -205,6 +205,33 @@ mod tests {
     #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt as _;
 
+    #[test]
+    fn startup_width_funds_the_actual_observation_owner() {
+        let limits = crate::ResourceConfig::from_json(r#"{"foreground_observation_workers":3}"#)
+            .unwrap()
+            .resolve()
+            .unwrap();
+        let owner = ForegroundObservationOwner::new(limits);
+        assert_eq!(owner.slots.available_permits(), 3);
+        assert_eq!(owner.bytes_per_job, MAX_FRAME_BYTES);
+        let permits: Vec<_> = (0..3)
+            .map(|_| owner.memory.reserve(MAX_FRAME_BYTES).unwrap())
+            .collect();
+        assert!(owner.memory.reserve(1).is_none());
+        drop(permits);
+        assert_eq!(owner.memory.used(), 0);
+
+        let smaller = crate::ResourceConfig::from_json(
+            r#"{"foreground_observation_workers":3,"foreground_observation_bytes":3}"#,
+        )
+        .unwrap()
+        .resolve()
+        .unwrap();
+        let owner = ForegroundObservationOwner::new(smaller);
+        assert_eq!(owner.slots.available_permits(), 3);
+        assert_eq!(owner.bytes_per_job, 1);
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn retained_nonempty_foreground_result_stays_funded_until_response_release() {

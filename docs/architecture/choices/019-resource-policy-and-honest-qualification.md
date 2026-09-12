@@ -39,7 +39,12 @@ reconfigure it. Planned exec preserves the complete established policy in its
 versioned handoff manifest and explicit incoming CLI arguments. Startup
 `ResourceConfig` resolves sparse choices once; the immutable `ResourceLimits`
 snapshot requires every established field, including explicitly nullable quotas.
-Handoff never fills missing saved settings from fresh host defaults. Unknown
+Handoff never fills missing saved settings from fresh host defaults. Omitted
+foreground observation memory is derived from the selected worker width at one
+maximum protocol frame per admitted OS job, using checked byte arithmetic. An
+explicit memory allowance remains exact: the owner divides it among the
+selected slots, bounds each result to one frame, and reports budget-exhausted
+unknown when a result cannot fit. It never silently receives extra memory. Unknown
 and duplicate JSON fields fail in both contracts; startup omission and explicit
 null remain distinct without reparsing the original JSON.
 
@@ -61,7 +66,7 @@ null remain distinct without reparsing the original JSON.
 | `handoff_bytes`                     | 256 MiB                            | Serialized manifest admission before relinquishing native ownership                                                            |
 | `creation_workers`                  | 8                                  | Concurrent launch/physical-overlap owners; awaited admission, host FD reserve follows this policy                              |
 | `foreground_observation_workers`    | max(1, available logical CPUs / 4) | Read-only OS observation jobs; separate from Input/Stop capacity. This is a width heuristic, not CPU reservation.              |
-| `foreground_observation_bytes`      | worker count × 1 MiB               | Temporary observation allocations; admitted permits survive caller timeout.                                                    |
+| `foreground_observation_bytes`      | worker count × 1 MiB               | Omission follows the selected worker count, including explicit widths; admitted permits survive caller timeout.                |
 | `foreground_observation_timeout_ms` | 1000 ms                            | Caller wait; expiration reports unknown while issued observation work drains.                                                  |
 | `input_turn_commands`               | 64                                 | Completed commands before yielding a reactor turn; pending original commands remain owned                                      |
 | `input_turn_bytes`                  | 256 KiB                            | Written bytes before yielding a reactor turn; not a payload limit                                                              |
