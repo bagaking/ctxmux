@@ -3627,13 +3627,15 @@ fn closed_or_conflicting_readiness_descriptor_fails_before_startup() {
     );
 }
 
-#[test]
-fn readiness_write_failure_removes_the_unpublished_socket() {
-    let directory = tempfile::tempdir().expect("create readiness write fixture directory");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readiness_write_failure_preserves_the_serving_socket() {
+    let _permit = daemon_spawn_permit().await;
+    let directory =
+        Arc::new(tempfile::tempdir().expect("create readiness write fixture directory"));
     let socket = directory.path().join("ctxmux.sock");
     let sentinel = directory.path().join("read-only");
     std::fs::write(&sentinel, b"read-only").expect("write readiness sentinel");
-    let output = std::process::Command::new("/bin/sh")
+    let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg("exec 3<\"$1\"; shift; exec \"$@\" --readiness-fd 3")
         .arg("ctxmux-readiness-write-failure-fixture")
@@ -3641,14 +3643,27 @@ fn readiness_write_failure_removes_the_unpublished_socket() {
         .arg(env!("CARGO_BIN_EXE_ctxmuxd"))
         .arg("--socket")
         .arg(&socket)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run ctxmuxd with a read-only readiness descriptor");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("<readiness-fd>"));
+    let lines = TestDaemon::drain_stderr(&mut child);
+    let daemon =
+        TestDaemon::from_spawned_with_stderr(child, directory, socket, Some(lines.clone())).await;
+    daemon
+        .client
+        .runtime_info()
+        .await
+        .expect("public Runtime identity after failed receipt");
     assert!(
-        !socket.exists(),
-        "failed readiness publication must remove the socket"
+        lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("readiness observer unavailable"))
     );
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"read-only");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

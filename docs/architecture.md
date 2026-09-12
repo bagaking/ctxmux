@@ -487,6 +487,14 @@ through the existing public observation boundary, with exact input operation
 and byte boundaries retained where known. A transport fault cannot invent
 an exited child or authorize replay of an unknown input.
 
+The optional inherited startup readiness descriptor is a launcher observation
+channel, not a Runtime lease. Once the listener and manager are initialized,
+failure to write or flush its `ctxmux.daemon-ready.v1` receipt is diagnosed but
+does not terminate the Runtime or remove its socket. The launcher cannot infer
+readiness or ownership from a failed receipt; it may observe the existing public
+Runtime identity and service. Invalid or conflicting inherited descriptor
+arguments are still rejected before initialization.
+
 Containment belongs at the sole daemon owner. A second runtime, client-owned
 PTY reader, blanket restart, or one permanent thread per Run is not acceptance
 of this contract. Any unavoidable pressure or unsupported recovery class is

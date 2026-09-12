@@ -655,11 +655,16 @@ async fn serve_with_manager(
             "daemon_instance": manager.daemon_instance.to_string(),
         }))
         .map_err(|source| ServerError::io("<readiness-fd>", io::Error::other(source)))?;
-        readiness
+        if let Err(error) = readiness
             .write_all(&record)
             .and_then(|()| readiness.write_all(b"\n"))
             .and_then(|()| readiness.flush())
-            .map_err(|source| ServerError::io("<readiness-fd>", source))?;
+        {
+            // The launcher observes readiness; it does not own this Runtime.
+            let _ = crate::diagnostics::record(format_args!(
+                "ctxmuxd: readiness observer unavailable ({error}); Runtime keeps serving"
+            ));
+        }
     }
 
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
